@@ -1,0 +1,12 @@
+[package]
+name = "clinker-record"
+version.workspace = true
+edition.workspace = true
+description = "Core data types (Value, Schema, Record) for the Clinker ETL engine"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+ahash = { workspace = true }
+indexmap = { workspace = true }

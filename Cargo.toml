@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clinker-record",
+    "crates/cxl",
+    "crates/cxl-cli",
+    "crates/clinker-format",
+    "crates/clinker-core",
+    "crates/clinker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+clinker-record = { path = "crates/clinker-record" }
+cxl = { path = "crates/cxl" }
+clinker-format = { path = "crates/clinker-format" }
+clinker-core = { path = "crates/clinker-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = "0.0.22"
+chrono = { version = "0.4", features = ["serde"] }
+miette = { version = "7", features = ["fancy"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+ahash = "0.8"
+indexmap = "2"
+tracing = "0.1"
+
+[workspace.metadata.release]
+shared-version = true
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

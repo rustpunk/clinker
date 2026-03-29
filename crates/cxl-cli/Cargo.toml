@@ -1,0 +1,12 @@
+[package]
+name = "cxl-cli"
+version.workspace = true
+edition.workspace = true
+description = "Standalone CXL language validator and REPL"
+
+[dependencies]
+cxl = { workspace = true }
+clinker-record = { workspace = true }
+clap = { workspace = true }
+miette = { workspace = true }
+serde_json = { workspace = true }

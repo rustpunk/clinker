@@ -1,0 +1,12 @@
+[package]
+name = "cxl"
+version.workspace = true
+edition.workspace = true
+description = "CXL language parser, type checker, and evaluator"
+
+[dependencies]
+clinker-record = { workspace = true }
+miette = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+ahash = { workspace = true }

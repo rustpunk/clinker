@@ -1,0 +1,12 @@
+[package]
+name = "clinker"
+version.workspace = true
+edition.workspace = true
+description = "CLI for the Clinker ETL engine"
+
+[dependencies]
+clinker-core = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+miette = { workspace = true }
