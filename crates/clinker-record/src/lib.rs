@@ -1,1 +1,2 @@
-// Placeholder — modules added in Tasks 1.2–1.5
+pub mod coercion;
+pub mod value;
