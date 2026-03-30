@@ -9,7 +9,7 @@ use crate::components::{
 };
 use crate::demo::DEFAULT_YAML;
 use crate::state::{AppState, LayoutPreset};
-use crate::sync::{parse_yaml, EditSource};
+use crate::sync::{parse_yaml, serialize_yaml, EditSource};
 
 const KILN_CSS: Asset = asset!("/assets/kiln.css");
 
@@ -28,7 +28,7 @@ pub fn App() -> Element {
     let inspector_width = use_signal(|| 340.0_f32);
 
     // ── Phase 2b: Pipeline model signals ──────────────────────────────────
-    let yaml_text = use_signal(|| DEFAULT_YAML.to_string());
+    let mut yaml_text = use_signal(|| DEFAULT_YAML.to_string());
     let mut pipeline = use_signal(|| parse_yaml(DEFAULT_YAML).ok());
     let mut parse_errors = use_signal(|| Vec::<String>::new());
     let edit_source = use_signal(|| EditSource::None);
@@ -63,6 +63,22 @@ pub fn App() -> Element {
                 // Keep last valid pipeline config; just show errors
                 parse_errors.set(errors);
             }
+        }
+    });
+
+    // ── Sync: pipeline model → YAML text (when inspector/notes is the source) ─
+    use_effect(move || {
+        let source = (edit_source)();
+        let pipeline_val = (pipeline)();
+
+        if source != EditSource::Inspector {
+            return;
+        }
+
+        if let Some(ref config) = pipeline_val {
+            let yaml = serialize_yaml(config);
+            yaml_text.set(yaml);
+            parse_errors.set(Vec::new());
         }
     });
 

@@ -1097,6 +1097,79 @@ html, body {
   margin-bottom: 4px;
 }
 
+/* Notes edit button */
+.kiln-notes-edit-btn {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--kiln-border-subtle);
+  color: var(--kiln-iron);
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 8px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: border-color 150ms, color 150ms;
+}
+
+.kiln-notes-edit-btn:hover {
+  border-color: var(--kiln-iron);
+  color: var(--kiln-bone);
+}
+
+/* Notes textarea (edit mode for stage note) */
+.kiln-notes-textarea {
+  width: 100%;
+  min-height: 60px;
+  padding: 8px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-bone);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  outline: none;
+  resize: vertical;
+  white-space: pre-wrap;
+  tab-size: 2;
+}
+
+.kiln-notes-textarea:focus {
+  border-color: var(--kiln-iron);
+}
+
+/* Notes empty state text */
+.kiln-notes-empty {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+/* Field annotation inline input */
+.kiln-notes-field-input {
+  width: 100%;
+  padding: 6px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--kiln-bone);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  outline: none;
+}
+
+.kiln-notes-field-input:focus {
+  border-color: var(--kiln-iron);
+}
+
 /* ── 19. Scrollbar theming (WebKit) ─────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
