@@ -21,7 +21,7 @@ pub fn StageCard(
     rsx! {
         div {
             class: "kiln-stage-card",
-            style: "border-left-color: {accent};",
+            style: "border-top-color: {accent};",
 
             // Header: index + label + type badge
             div {

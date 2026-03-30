@@ -2,5 +2,8 @@ pub mod canvas;
 pub mod inspector;
 pub mod run_log;
 pub mod schematics;
+pub mod tab_bar;
 pub mod title_bar;
+pub mod toast;
+pub mod welcome_screen;
 pub mod yaml_sidebar;

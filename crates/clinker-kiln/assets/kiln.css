@@ -7,7 +7,7 @@
    Chakra Petch: UI labels, section headers, brand badge (weight 600).
    JetBrains Mono: code, YAML editor, log timestamps (weight 400).
    ─────────────────────────────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
 
 /* ── 2. CSS Custom Properties (Rustpunk colour palette) ────────────────────
    Token names follow the spec exactly. All UI colours reference these vars.
@@ -26,15 +26,15 @@
   --kiln-iron:        #8A7E6E;
   --kiln-text-floor:  #5C4A30;
 
-  /* Surface layers (darkest → lightest) */
-  --kiln-char:        #1A1512;
-  --kiln-char-raised: #211C18;
-  --kiln-char-surface:#2A231E;
+  /* Surface layers (darkest → lightest) — aligned to RUSTPUNK_AESTHETICS.md */
+  --kiln-char:        #0D0A08;
+  --kiln-char-raised: #14110C;
+  --kiln-char-surface:#0A0804;
 
-  /* Border tiers */
-  --kiln-border-subtle: #3A3028;
-  --kiln-border-medium: #5A4A38;
-  --kiln-border-strong: #7A6A50;
+  /* Border tiers — aligned to RUSTPUNK_AESTHETICS.md */
+  --kiln-border-subtle: #1A1510;
+  --kiln-border-medium: #2A211A;
+  --kiln-border-strong: #3D2E1E;
 
   /* Typography */
   --kiln-font-ui:   'Chakra Petch', 'Segoe UI', sans-serif;
@@ -213,6 +213,234 @@ html, body {
   text-transform: uppercase;
 }
 
+/* ── 5b. Tab bar ──────────────────────────────────────────────────────────
+   Spec §F3.1: 28px height, below title bar, full viewport width.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-tab-bar {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  min-height: 28px;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-tab-bar::-webkit-scrollbar { display: none; }
+
+.kiln-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 10px;
+  max-width: 160px;
+  border-right: 1px solid var(--kiln-border-subtle);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-raised);
+  cursor: pointer;
+  transition: background 150ms ease, color 150ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-tab:hover {
+  background: var(--kiln-char-surface);
+}
+
+.kiln-tab--active {
+  background: var(--kiln-border-strong);
+  border-bottom-color: transparent;
+  border-top: 2px solid var(--kiln-verdigris);
+}
+
+.kiln-tab--active .kiln-tab-name {
+  color: var(--kiln-bone);
+}
+
+.kiln-tab-dirty {
+  color: var(--kiln-bone);
+  font-size: 8px;
+}
+
+.kiln-tab-name {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--kiln-text-floor);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-tab-close {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  margin-left: auto;
+}
+
+.kiln-tab:hover .kiln-tab-close,
+.kiln-tab--active .kiln-tab-close {
+  display: block;
+}
+
+.kiln-tab-close:hover {
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-tab-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  min-width: 28px;
+  height: 100%;
+  background: none;
+  border: none;
+  border-right: 1px solid var(--kiln-border-subtle);
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  transition: color 150ms;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-tab-new:hover {
+  color: var(--kiln-bone);
+  background: var(--kiln-char-raised);
+}
+
+/* ── 5c. Welcome screen ───────────────────────────────────────────────────
+   Spec §F7: shown when no tabs are open.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-welcome {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--kiln-char-surface);
+}
+
+.kiln-welcome-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+.kiln-welcome-brand-top {
+  font-family: var(--kiln-font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--kiln-bone);
+  background: var(--kiln-border-medium);
+  padding: 4px 14px;
+  border-top-left-radius: 2px;
+  border-top-right-radius: 2px;
+}
+
+.kiln-welcome-brand-bottom {
+  font-family: var(--kiln-font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--kiln-bone);
+  background: var(--kiln-oxide-red);
+  padding: 4px 14px;
+  border-bottom-left-radius: 2px;
+  border-bottom-right-radius: 2px;
+}
+
+.kiln-welcome-subtitle {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-welcome .kiln-rust-line {
+  width: 200px;
+}
+
+.kiln-welcome-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.kiln-welcome-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  color: var(--kiln-bone);
+  padding: 6px 16px;
+  cursor: pointer;
+  transition: border-color 300ms ease, background 300ms ease;
+}
+
+.kiln-welcome-btn:hover {
+  border-color: var(--kiln-border-strong);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-welcome-shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-welcome-key {
+  font-family: var(--kiln-font-code);
+  color: var(--kiln-iron);
+  margin-right: 6px;
+}
+
+/* ── 5d. Toast notifications ──────────────────────────────────────────────
+   Spec §F2.2: anchored bottom-right, 16px from edges, auto-dismiss.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-toast {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 100;
+  background: var(--kiln-char-raised);
+  border: 1px solid rgba(67, 179, 174, 0.4);
+  border-left: 3px solid var(--kiln-verdigris);
+  border-radius: 2px;
+  padding: 8px 14px;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-bone);
+  cursor: pointer;
+  animation: toast-in 300ms ease;
+  max-width: 360px;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 /* ── 6. Main panel area ────────────────────────────────────────────────────
    Horizontal row: canvas | inspector | yaml sidebar.
    Layout presets are driven by `data-layout` attribute.
@@ -253,8 +481,9 @@ html, body {
   display: flex;
 }
 
-/* Hide inspector in canvas-focus, editor-focus, and schematics layouts */
-.kiln-main[data-layout="canvas-focus"] .kiln-inspector { display: none; }
+/* Hide inspector in editor-focus and schematics layouts.
+   Canvas-focus and Hybrid both show inspector when a node is selected
+   (the inspector component is conditionally mounted, so no CSS hide needed). */
 .kiln-main[data-layout="editor-focus"] .kiln-inspector { display: none; }
 .kiln-main[data-layout="schematics"] .kiln-inspector { display: none; }
 
@@ -275,16 +504,15 @@ html, body {
   overflow: hidden;
   background-color: var(--kiln-char);
 
-  /* Dot grid at 20 px spacing — subtle positional reference. */
-  background-image: radial-gradient(
-    circle,
-    var(--kiln-border-subtle) 1px,
-    transparent 1px
-  );
-  background-size: 20px 20px;
+  /* Two-tier Blueprint line grid: 20px minor + 100px major
+     RUSTPUNK_AESTHETICS.md §Grid Paper */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cdefs%3E%3Cpattern id='minor' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Cpath d='M 20 0 L 0 0 0 20' fill='none' stroke='%2343B3AE' stroke-width='0.3' opacity='0.08'/%3E%3C/pattern%3E%3Cpattern id='major' width='100' height='100' patternUnits='userSpaceOnUse'%3E%3Crect width='100' height='100' fill='url(%23minor)'/%3E%3Cpath d='M 100 0 L 0 0 0 100' fill='none' stroke='%2343B3AE' stroke-width='0.8' opacity='0.08'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='100' height='100' fill='url(%23major)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 100px 100px;
 }
 
-/* Scanline overlay — ::before */
+/* Scanline overlay — ::before
+   RUSTPUNK_AESTHETICS.md §Scanlines: 2px transparent + 2px rgba(0,0,0,0.06) */
 .kiln-canvas-panel::before {
   content: '';
   position: absolute;
@@ -294,24 +522,26 @@ html, body {
   background-image: repeating-linear-gradient(
     0deg,
     transparent,
-    transparent 1px,
-    rgba(0, 0, 0, 0.12) 1px,
-    rgba(0, 0, 0, 0.12) 2px
+    transparent 2px,
+    rgba(0, 0, 0, 0.06) 2px,
+    rgba(0, 0, 0, 0.06) 4px
   );
 }
 
 /* Noise / grain overlay — ::after
-   Inline SVG feTurbulence — CSS-only, no JS canvas required. */
+   RUSTPUNK_AESTHETICS.md §Noise Overlay: 256x256 warm-weighted grain,
+   blend overlay, opacity 0.6. feColorMatrix warm-weights: R×1.0, G×0.7, B×0.4 */
 .kiln-canvas-panel::after {
   content: '';
   position: absolute;
   inset: 0;
   pointer-events: none;
   z-index: 11;
-  opacity: 0.04;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: 0.6;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='1 0 0 0 0 0 0.7 0 0 0 0 0 0.4 0 0 0 0 0 0.16 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   background-repeat: repeat;
-  background-size: 200px 200px;
+  background-size: 256px 256px;
 }
 
 /* Transformed viewport div — receives pan/zoom CSS transform.
@@ -353,7 +583,7 @@ html, body {
   );
   padding: 10px 12px 10px 12px;
   cursor: default;
-  transition: border-color 150ms, box-shadow 150ms;
+  transition: border-color 300ms ease, box-shadow 300ms ease;
 }
 
 .kiln-node:hover {
@@ -412,17 +642,14 @@ html, body {
   text-overflow: ellipsis;
 }
 
-/* Rust-line separator — gradient fade to transparent at edges */
+/* Rust-line separator — oxidation spread gradient, RUSTPUNK_AESTHETICS.md §Surface Treatment */
 .kiln-rust-line {
   border: none;
   height: 1px;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    var(--kiln-border-medium) 20%,
-    var(--kiln-border-medium) 80%,
-    transparent 100%
-  );
+  background: linear-gradient(90deg,
+    transparent 0%, #5C3A1E 8%, #B7410E 20%, #C75B2A 35%,
+    #8B4513 50%, #B7410E 65%, #5C3A1E 85%, transparent 100%);
+  opacity: 0.6;
   margin: 4px 0 6px;
 }
 
@@ -1005,32 +1232,11 @@ html, body {
   background: rgba(212, 160, 23, 0.04);
 }
 
-/* Docs drawer — Blueprint gridline overlay */
+/* Docs drawer — Blueprint two-tier SVG grid (same as schematics content) */
 .kiln-drawer-content--docs {
-  background:
-    linear-gradient(var(--kiln-verdigris) 1px, transparent 1px),
-    linear-gradient(90deg, var(--kiln-verdigris) 1px, transparent 1px);
-  background-size: 16px 16px;
-  background-color: var(--kiln-char);
-  /* Grid opacity via the alpha channel in the gradient colour */
-}
-
-.kiln-drawer-content--docs {
-  background:
-    repeating-linear-gradient(
-      0deg,
-      rgba(67, 179, 174, 0.04) 0px,
-      rgba(67, 179, 174, 0.04) 1px,
-      transparent 1px,
-      transparent 16px
-    ),
-    repeating-linear-gradient(
-      90deg,
-      rgba(67, 179, 174, 0.04) 0px,
-      rgba(67, 179, 174, 0.04) 1px,
-      transparent 1px,
-      transparent 16px
-    );
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cdefs%3E%3Cpattern id='minor' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Cpath d='M 20 0 L 0 0 0 20' fill='none' stroke='%2343B3AE' stroke-width='0.3' opacity='0.08'/%3E%3C/pattern%3E%3Cpattern id='major' width='100' height='100' patternUnits='userSpaceOnUse'%3E%3Crect width='100' height='100' fill='url(%23minor)'/%3E%3Cpath d='M 100 0 L 0 0 0 100' fill='none' stroke='%2343B3AE' stroke-width='0.8' opacity='0.08'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='100' height='100' fill='url(%23major)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 100px 100px;
   background-color: var(--kiln-char);
 }
 
@@ -1087,8 +1293,8 @@ html, body {
   border-radius: 2px;
   padding: 8px 10px;
   font-family: var(--kiln-font-code);
-  font-size: 10px;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.7;
   color: var(--kiln-bone);
   white-space: pre-wrap;
 }
@@ -1192,8 +1398,8 @@ html, body {
   border-radius: 2px;
   padding: 10px 12px;
   font-family: var(--kiln-font-code);
-  font-size: 10px;
-  line-height: 1.6;
+  font-size: 12px;
+  line-height: 1.7;
   color: var(--kiln-bone);
   margin-bottom: 12px;
 }
@@ -1325,6 +1531,37 @@ html, body {
   flex-direction: column;
   overflow: hidden;
   background: var(--kiln-char);
+  position: relative;
+}
+
+/* Scanline overlay for schematics — matches canvas panel */
+.kiln-schematics::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.06) 2px,
+    rgba(0, 0, 0, 0.06) 4px
+  );
+}
+
+/* Noise / grain overlay for schematics — matches canvas panel */
+.kiln-schematics::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 11;
+  opacity: 0.6;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='1 0 0 0 0 0 0.7 0 0 0 0 0 0.4 0 0 0 0 0 0.16 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
 }
 
 .kiln-schematics-empty {
@@ -1401,27 +1638,17 @@ html, body {
 }
 
 /* ── Scrollable content area with Blueprint gridlines ── */
+/* Two-tier SVG grid: 20px minor (0.3 stroke) + 100px major (0.8 stroke),
+   verdigris at 0.08 opacity. RUSTPUNK_AESTHETICS.md §Grid Paper */
 .kiln-schematics-content {
   flex: 1;
   overflow-y: auto;
   padding: 20px 32px;
   scrollbar-width: thin;
   scrollbar-color: var(--kiln-border-subtle) transparent;
-  background:
-    repeating-linear-gradient(
-      0deg,
-      rgba(67, 179, 174, 0.03) 0px,
-      rgba(67, 179, 174, 0.03) 1px,
-      transparent 1px,
-      transparent 16px
-    ),
-    repeating-linear-gradient(
-      90deg,
-      rgba(67, 179, 174, 0.03) 0px,
-      rgba(67, 179, 174, 0.03) 1px,
-      transparent 1px,
-      transparent 16px
-    );
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cdefs%3E%3Cpattern id='minor' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Cpath d='M 20 0 L 0 0 0 20' fill='none' stroke='%2343B3AE' stroke-width='0.3' opacity='0.08'/%3E%3C/pattern%3E%3Cpattern id='major' width='100' height='100' patternUnits='userSpaceOnUse'%3E%3Crect width='100' height='100' fill='url(%23minor)'/%3E%3Cpath d='M 100 0 L 0 0 0 100' fill='none' stroke='%2343B3AE' stroke-width='0.8' opacity='0.08'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='100' height='100' fill='url(%23major)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 100px 100px;
   background-color: var(--kiln-char);
 }
 
@@ -1443,9 +1670,9 @@ html, body {
 }
 
 .kiln-schematics-section-title {
-  font-family: var(--kiln-font-code);
+  font-family: var(--kiln-font-ui);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--kiln-verdigris);
@@ -1465,12 +1692,52 @@ html, body {
 
 /* ── Stage detail cards ── */
 .kiln-stage-card {
+  position: relative;
   background: var(--kiln-char-surface);
   border: 1px solid rgba(67, 179, 174, 0.15);
-  border-left: 3px solid var(--kiln-verdigris);
+  border-top: 3px solid var(--kiln-verdigris);
   border-radius: 2px;
-  padding: 14px 16px;
+  padding: 20px 24px;
   margin-bottom: 0;
+  /* Eroded corners: top-right 24px, bottom-left 16px — RUSTPUNK_AESTHETICS.md §Surface Treatment */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 24px) 0,
+    100% 24px,
+    100% 100%,
+    16px 100%,
+    0 calc(100% - 16px)
+  );
+}
+
+/* Registration marks — L-shaped corner indicators at non-eroded corners
+   RUSTPUNK_AESTHETICS.md §Registration Marks: 8x8px, 1.5px accent, 50% opacity */
+.kiln-stage-card::before,
+.kiln-stage-card::after {
+  content: '';
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-color: rgba(67, 179, 174, 0.5);
+  border-style: solid;
+  border-width: 0;
+  pointer-events: none;
+}
+
+/* Top-left L-mark */
+.kiln-stage-card::before {
+  top: 4px;
+  left: 4px;
+  border-top-width: 1.5px;
+  border-left-width: 1.5px;
+}
+
+/* Bottom-right L-mark */
+.kiln-stage-card::after {
+  bottom: 4px;
+  right: 4px;
+  border-bottom-width: 1.5px;
+  border-right-width: 1.5px;
 }
 
 .kiln-stage-card-header {
@@ -1488,8 +1755,9 @@ html, body {
 
 .kiln-stage-card-label {
   font-family: var(--kiln-font-ui);
-  font-size: 14px;
+  font-size: 20px;
   font-weight: 600;
+  letter-spacing: 0.04em;
   color: var(--kiln-bone);
 }
 
@@ -1504,17 +1772,21 @@ html, body {
   border-radius: 2px;
 }
 
+/* Blueprint rust-line — verdigris-tinted oxidation gradient */
 .kiln-stage-card-rule {
   border: none;
   height: 1px;
-  background: rgba(67, 179, 174, 0.3);
+  background: linear-gradient(90deg,
+    transparent 0%, #1E5C5A 8%, #2A8A86 20%, #43B3AE 35%,
+    #2D7A76 50%, #43B3AE 65%, #1E5C5A 85%, transparent 100%);
+  opacity: 0.6;
   margin: 6px 0 10px;
 }
 
 .kiln-stage-card-description {
   font-family: var(--kiln-font-code);
-  font-size: 10px;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.7;
   color: var(--kiln-iron);
   margin-bottom: 8px;
 }
@@ -1541,8 +1813,8 @@ html, body {
   border-radius: 2px;
   padding: 6px 10px;
   font-family: var(--kiln-font-code);
-  font-size: 10px;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.7;
   color: var(--kiln-bone);
   white-space: pre-wrap;
 }
@@ -1575,7 +1847,7 @@ html, body {
 .kiln-stage-card-meta-value {
   flex: 1;
   font-family: var(--kiln-font-code);
-  font-size: 10px;
+  font-size: 11px;
   color: var(--kiln-bone);
 }
 

@@ -5,10 +5,14 @@ mod autodoc;
 mod components;
 mod cxl_bridge;
 mod demo;
+mod file_ops;
+mod keyboard;
 mod notes;
 mod pipeline_view;
+mod recent_files;
 mod state;
 mod sync;
+mod tab;
 
 fn main() {
     dioxus::LaunchBuilder::new()
@@ -23,5 +27,5 @@ fn main() {
                 )
                 .with_disable_context_menu(true),
         )
-        .launch(app::App);
+        .launch(app::AppShell);
 }
