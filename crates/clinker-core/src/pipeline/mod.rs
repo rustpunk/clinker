@@ -5,4 +5,5 @@ pub mod memory;
 pub mod shutdown;
 pub mod sort;
 pub mod spill;
+pub mod threshold;
 pub mod window_context;
