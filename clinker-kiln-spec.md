@@ -82,7 +82,9 @@ Pipeline {
 StageConfig {
   id: StageId,              // stable UUID, not YAML position
   step_type: StepType,      // filter, map, lookup_join, distinct, ...
-  config: serde_yaml::Value, // arbitrary config per step type
+  config: serde_json::Value, // arbitrary config per step type (serde-saphyr for
+                             // YAML parsing; serde_json::Value for the in-memory
+                             // representation — serde_yaml is archived, do not use)
   position: CanvasPosition,  // x, y on canvas (not persisted to YAML)
   pass: PassAssignment,      // P1 (scan) or P2 (transform)
   validation: ValidationState,
@@ -570,7 +572,12 @@ Recommended: Start with the CSS transform approach (Phase 1), migrate to wgpu if
 
 For the YAML editor, options include:
 
-— **tree-sitter-yaml** for incremental parsing and syntax highlighting. Rust-native, fast, error-tolerant.
+— **serde-saphyr** for parsing (already a workspace dep). Panic-free, pure Rust,
+  passes the full yaml-test-suite. Used for model ↔ YAML round-trips in Phase 2.
+— **`yaml-rust2`** for syntax tokenisation (pure Rust, no C bindings). Used for
+  the Phase 1 static tokeniser; suitable for Phase 2 incremental syntax highlighting.
+  tree-sitter-yaml is **not used** — it is a C binding and violates the Pure Rust
+  policy for this project.
 — **Custom Rope data structure** for efficient text editing (large files). Consider `ropey` crate.
 — **Monaco-style editing** features (cursor, selection, undo/redo) will need a custom text editor component or integration with an existing Rust editor widget.
 
@@ -578,7 +585,8 @@ For the YAML editor, options include:
 
 — Load `clinker-pipeline-schema-3.json` at startup using `serde_json`.
 — Validate using the `jsonschema` crate (or `valico`).
-— Map validation errors back to YAML source positions using `serde_yaml`'s `Location` tracking.
+— Map validation errors back to YAML source positions using `serde-saphyr`'s
+  span/location tracking (`serde_yaml` is archived — do not use it).
 — Debounce validation (100ms after last edit) to avoid blocking the UI thread.
 
 ### 10.5 CLI Execution
