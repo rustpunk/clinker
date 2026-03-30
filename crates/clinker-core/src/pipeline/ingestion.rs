@@ -183,7 +183,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::*;
+    use crate::config::{self, *};
     use crate::pipeline::shutdown;
     use crate::plan::execution::ExecutionPlan;
     use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
@@ -209,24 +209,24 @@ mod tests {
                 .into_iter()
                 .map(|(name, path)| InputConfig {
                     name: name.into(),
-                    r#type: FormatKind::Csv,
+                    format: InputFormat::Csv(None),
                     path: path.into(),
                     schema: None,
                     schema_overrides: None,
-                    options: None,
+                    array_paths: None,
+                    sort_order: None,
                 })
                 .collect(),
             outputs: vec![OutputConfig {
                 name: "output".into(),
-                r#type: FormatKind::Csv,
                 path: "out.csv".into(),
                 include_unmapped: true,
                 include_header: None,
                 mapping: None,
                 exclude: None,
-                options: None,
                 sort_order: None,
                 preserve_nulls: None,
+                format: OutputFormat::Csv(None),
             }],
             transformations: transforms
                 .into_iter()

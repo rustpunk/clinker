@@ -42,28 +42,99 @@ pub struct ConcurrencyConfig {
 
 /// Input source configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InputConfig {
     pub name: String,
-    pub r#type: FormatKind,
     pub path: String,
     pub schema: Option<String>,
     pub schema_overrides: Option<Vec<SchemaOverride>>,
-    pub options: Option<InputOptions>,
+    pub array_paths: Option<Vec<ArrayPathConfig>>,
+    pub sort_order: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub format: InputFormat,
 }
 
-/// Format-specific input options.
+/// Adjacently tagged format enum for inputs.
+/// `type` selects the format, `options` provides format-specific settings.
+/// `options` is optional — `type: csv` with no `options:` key gives `Csv(None)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InputOptions {
+#[serde(tag = "type", content = "options", rename_all = "snake_case")]
+pub enum InputFormat {
+    Csv(Option<CsvInputOptions>),
+    Json(Option<JsonInputOptions>),
+    Xml(Option<XmlInputOptions>),
+}
+
+/// CSV-specific input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CsvInputOptions {
     pub delimiter: Option<String>,
     pub quote_char: Option<String>,
     pub has_header: Option<bool>,
     pub encoding: Option<String>,
-    // JSON/XML stubs
-    pub array_paths: Option<Vec<String>>,
-    pub record_element: Option<String>,
-    pub root_element: Option<String>,
+}
+
+/// JSON-specific input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct JsonInputOptions {
+    pub format: Option<JsonFormat>,
+    pub record_path: Option<String>,
+}
+
+/// XML-specific input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct XmlInputOptions {
+    pub record_path: Option<String>,
+    pub attribute_prefix: Option<String>,
+    pub namespace_handling: Option<NamespaceHandling>,
+}
+
+/// JSON input format mode (auto-detect if not specified).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonFormat {
+    Array,
+    Ndjson,
+    Object,
+}
+
+/// XML namespace handling mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceHandling {
+    #[default]
+    Strip,
+    Qualify,
+}
+
+/// Array path configuration for nested array explosion/joining.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArrayPathConfig {
+    pub path: String,
+    #[serde(default)]
+    pub mode: ArrayMode,
+    pub separator: Option<String>,
+}
+
+/// Array path processing mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrayMode {
+    #[default]
+    Explode,
+    Join,
+}
+
+impl InputConfig {
+    /// Get CSV input options, if this is a CSV input.
+    pub fn csv_options(&self) -> Option<&CsvInputOptions> {
+        match &self.format {
+            InputFormat::Csv(opts) => opts.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Schema override for a named column.
@@ -77,30 +148,59 @@ pub struct SchemaOverride {
 
 /// Output destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub name: String,
-    pub r#type: FormatKind,
     pub path: String,
     #[serde(default)]
     pub include_unmapped: bool,
     pub include_header: Option<bool>,
     pub mapping: Option<IndexMap<String, String>>,
     pub exclude: Option<Vec<String>>,
-    pub options: Option<OutputOptions>,
-    // Spec stubs
     pub sort_order: Option<Vec<SortField>>,
     pub preserve_nulls: Option<bool>,
+    #[serde(flatten)]
+    pub format: OutputFormat,
 }
 
-/// Format-specific output options.
+/// Adjacently tagged format enum for outputs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OutputOptions {
+#[serde(tag = "type", content = "options", rename_all = "snake_case")]
+pub enum OutputFormat {
+    Csv(Option<CsvOutputOptions>),
+    Json(Option<JsonOutputOptions>),
+    Xml(Option<XmlOutputOptions>),
+}
+
+/// CSV-specific output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CsvOutputOptions {
     pub delimiter: Option<String>,
+}
+
+/// JSON-specific output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct JsonOutputOptions {
+    pub format: Option<JsonOutputFormat>,
     pub pretty: Option<bool>,
-    pub record_element: Option<String>,
+}
+
+/// JSON output format mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonOutputFormat {
+    #[default]
+    Array,
+    Ndjson,
+}
+
+/// XML-specific output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct XmlOutputOptions {
     pub root_element: Option<String>,
+    pub record_element: Option<String>,
 }
 
 /// Sort field specification for output and window partition ordering.
@@ -333,7 +433,7 @@ transformations:
         assert_eq!(config.pipeline.name, "test-pipeline");
         assert_eq!(config.inputs.len(), 1);
         assert_eq!(config.inputs[0].name, "source");
-        assert_eq!(config.inputs[0].r#type, FormatKind::Csv);
+        assert!(matches!(config.inputs[0].format, InputFormat::Csv(_)));
         assert_eq!(config.inputs[0].path, "/tmp/input.csv");
         assert_eq!(config.outputs.len(), 1);
         assert_eq!(config.transformations.len(), 1);
@@ -587,7 +687,7 @@ error_handling:
         // Input
         assert_eq!(config.inputs[0].name, "employees");
         assert_eq!(config.inputs[0].schema_overrides.as_ref().unwrap().len(), 1);
-        assert_eq!(config.inputs[0].options.as_ref().unwrap().has_header, Some(true));
+        assert_eq!(config.inputs[0].csv_options().unwrap().has_header, Some(true));
 
         // Output
         assert!(config.outputs[0].include_unmapped);
@@ -608,5 +708,213 @@ error_handling:
         let dlq = config.error_handling.dlq.as_ref().unwrap();
         assert_eq!(dlq.include_reason, Some(true));
         assert_eq!(config.error_handling.type_error_threshold, Some(0.05));
+    }
+
+    // ── Phase 7 Task 7.0 gate tests ─────────────────────────────────
+
+    #[test]
+    fn test_config_csv_input_parses() {
+        let yaml = r#"
+pipeline:
+  name: csv-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/input.csv
+    options:
+      delimiter: "|"
+      has_header: false
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/output.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        assert!(matches!(config.inputs[0].format, InputFormat::Csv(Some(_))));
+        let opts = config.inputs[0].csv_options().unwrap();
+        assert_eq!(opts.delimiter.as_deref(), Some("|"));
+        assert_eq!(opts.has_header, Some(false));
+    }
+
+    #[test]
+    fn test_config_json_input_parses() {
+        let yaml = r#"
+pipeline:
+  name: json-test
+inputs:
+  - name: src
+    type: json
+    path: /tmp/input.json
+    options:
+      format: ndjson
+      record_path: data.results
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/output.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        match &config.inputs[0].format {
+            InputFormat::Json(Some(opts)) => {
+                assert!(matches!(opts.format, Some(JsonFormat::Ndjson)));
+                assert_eq!(opts.record_path.as_deref(), Some("data.results"));
+            }
+            other => panic!("Expected Json with options, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_config_xml_input_parses() {
+        let yaml = r#"
+pipeline:
+  name: xml-test
+inputs:
+  - name: src
+    type: xml
+    path: /tmp/input.xml
+    options:
+      record_path: Orders/Order
+      attribute_prefix: "_"
+      namespace_handling: qualify
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/output.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        match &config.inputs[0].format {
+            InputFormat::Xml(Some(opts)) => {
+                assert_eq!(opts.record_path.as_deref(), Some("Orders/Order"));
+                assert_eq!(opts.attribute_prefix.as_deref(), Some("_"));
+                assert!(matches!(opts.namespace_handling, Some(NamespaceHandling::Qualify)));
+            }
+            other => panic!("Expected Xml with options, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_config_unknown_field_rejected() {
+        // attribute_prefix is XML-only — should fail on CSV input
+        let yaml = r#"
+pipeline:
+  name: reject-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/input.csv
+    options:
+      attribute_prefix: "@"
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/output.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let result = parse_config(yaml);
+        assert!(result.is_err(), "CSV input with attribute_prefix should fail to parse");
+    }
+
+    #[test]
+    fn test_config_array_path_struct() {
+        let yaml = r#"
+pipeline:
+  name: array-test
+inputs:
+  - name: src
+    type: json
+    path: /tmp/input.json
+    array_paths:
+      - path: orders
+        mode: explode
+      - path: tags
+        mode: join
+        separator: "|"
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/output.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        let aps = config.inputs[0].array_paths.as_ref().unwrap();
+        assert_eq!(aps.len(), 2);
+        assert_eq!(aps[0].path, "orders");
+        assert!(matches!(aps[0].mode, ArrayMode::Explode));
+        assert_eq!(aps[1].path, "tags");
+        assert!(matches!(aps[1].mode, ArrayMode::Join));
+        assert_eq!(aps[1].separator.as_deref(), Some("|"));
+    }
+
+    #[test]
+    fn test_config_json_output_parses() {
+        let yaml = r#"
+pipeline:
+  name: json-out-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/input.csv
+outputs:
+  - name: dest
+    type: json
+    path: /tmp/output.json
+    options:
+      format: ndjson
+      pretty: true
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        match &config.outputs[0].format {
+            OutputFormat::Json(Some(opts)) => {
+                assert!(matches!(opts.format, Some(JsonOutputFormat::Ndjson)));
+                assert_eq!(opts.pretty, Some(true));
+            }
+            other => panic!("Expected Json output with options, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_config_xml_output_parses() {
+        let yaml = r#"
+pipeline:
+  name: xml-out-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/input.csv
+outputs:
+  - name: dest
+    type: xml
+    path: /tmp/output.xml
+    options:
+      root_element: Data
+      record_element: Row
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        match &config.outputs[0].format {
+            OutputFormat::Xml(Some(opts)) => {
+                assert_eq!(opts.root_element.as_deref(), Some("Data"));
+                assert_eq!(opts.record_element.as_deref(), Some("Row"));
+            }
+            other => panic!("Expected Xml output with options, got {:?}", other),
+        }
     }
 }

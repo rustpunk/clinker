@@ -443,24 +443,24 @@ mod tests {
                 .into_iter()
                 .map(|(name, path)| InputConfig {
                     name: name.into(),
-                    r#type: FormatKind::Csv,
                     path: path.into(),
                     schema: None,
                     schema_overrides: None,
-                    options: None,
+                    array_paths: None,
+                    sort_order: None,
+                    format: InputFormat::Csv(None),
                 })
                 .collect(),
             outputs: vec![OutputConfig {
                 name: "output".into(),
-                r#type: FormatKind::Csv,
                 path: "out.csv".into(),
                 include_unmapped: true,
                 include_header: None,
                 mapping: None,
                 exclude: None,
-                options: None,
                 sort_order: None,
                 preserve_nulls: None,
+                format: OutputFormat::Csv(None),
             }],
             transformations: transforms
                 .into_iter()

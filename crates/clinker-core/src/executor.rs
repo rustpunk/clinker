@@ -405,7 +405,7 @@ impl PipelineExecutor {
 /// Build a CsvReaderConfig from the input config options.
 fn build_reader_config(input: &crate::config::InputConfig) -> CsvReaderConfig {
     let mut config = CsvReaderConfig::default();
-    if let Some(ref opts) = input.options {
+    if let Some(opts) = input.csv_options() {
         if let Some(ref d) = opts.delimiter {
             if let Some(b) = d.as_bytes().first() {
                 config.delimiter = *b;
@@ -429,7 +429,7 @@ fn build_writer_config(output: &OutputConfig) -> CsvWriterConfig {
     if let Some(h) = output.include_header {
         config.include_header = h;
     }
-    if let Some(ref opts) = output.options {
+    if let crate::config::OutputFormat::Csv(Some(ref opts)) = output.format {
         if let Some(ref d) = opts.delimiter {
             if let Some(b) = d.as_bytes().first() {
                 config.delimiter = *b;

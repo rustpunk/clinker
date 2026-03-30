@@ -85,13 +85,12 @@ mod tests {
 
         let config = OutputConfig {
             name: "out".into(),
-            r#type: crate::config::FormatKind::Csv,
+            format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,
             mapping: None,
             exclude: None,
-            options: None,
             sort_order: None,
             preserve_nulls: None,
         };
@@ -109,13 +108,12 @@ mod tests {
 
         let config = OutputConfig {
             name: "out".into(),
-            r#type: crate::config::FormatKind::Csv,
+            format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,
             mapping: None,
             exclude: Some(vec!["secret".into()]),
-            options: None,
             sort_order: None,
             preserve_nulls: None,
         };
@@ -135,13 +133,12 @@ mod tests {
 
         let config = OutputConfig {
             name: "out".into(),
-            r#type: crate::config::FormatKind::Csv,
+            format: crate::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: true,
             include_header: None,
             mapping: Some(mapping),
             exclude: None,
-            options: None,
             sort_order: None,
             preserve_nulls: None,
         };
