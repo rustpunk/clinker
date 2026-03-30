@@ -130,6 +130,16 @@ html, body {
   background: var(--kiln-border-medium);
 }
 
+/* Workspace name in title bar (§F5.1) */
+.kiln-title-workspace {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  color: var(--kiln-verdigris);
+  -webkit-app-region: no-drag;
+}
+
 .kiln-title-filename {
   font-family: var(--kiln-font-code);
   font-size: 10px;
@@ -439,6 +449,103 @@ html, body {
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── 5e. Confirmation dialog ───────────────────────────────────────────────
+   Spec §F2.5: modal for unsaved changes. Backdrop blur, hazard accent.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.kiln-confirm-dialog {
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 20px 28px;
+  min-width: 320px;
+  max-width: 420px;
+}
+
+.kiln-confirm-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-bone);
+  margin-bottom: 10px;
+}
+
+.kiln-confirm-diamond {
+  color: var(--kiln-hazard);
+  margin-right: 4px;
+}
+
+.kiln-confirm-body {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.kiln-confirm-filename {
+  color: var(--kiln-bone);
+}
+
+.kiln-confirm-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.kiln-confirm-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: border-color 300ms ease, background 300ms ease;
+}
+
+.kiln-confirm-btn--cancel {
+  color: var(--kiln-iron);
+}
+
+.kiln-confirm-btn--cancel:hover {
+  border-color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-confirm-btn--discard {
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-confirm-btn--discard:hover {
+  border-color: var(--kiln-oxide-red);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-confirm-btn--save {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-confirm-btn--save:hover {
+  border-color: var(--kiln-verdigris);
+  background: var(--kiln-border-subtle);
 }
 
 /* ── 6. Main panel area ────────────────────────────────────────────────────

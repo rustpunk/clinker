@@ -4,6 +4,7 @@
 
 use dioxus::prelude::*;
 
+use crate::keyboard;
 use crate::state::TabManagerState;
 use crate::tab::TabEntry;
 
@@ -39,20 +40,7 @@ pub fn WelcomeScreen() -> Element {
                 button {
                     class: "kiln-welcome-btn",
                     onclick: move |_| {
-                        // Open file dialog
-                        if let Some(path) = crate::file_ops::open_file_dialog(None) {
-                            match crate::file_ops::read_pipeline_file(&path) {
-                                Ok(yaml) => {
-                                    let new_tab = TabEntry::from_file(path, yaml);
-                                    let new_id = new_tab.id;
-                                    tab_mgr.tabs.write().push(new_tab);
-                                    tab_mgr.active_tab_id.set(Some(new_id));
-                                }
-                                Err(_e) => {
-                                    // TODO: show error toast
-                                }
-                            }
-                        }
+                        keyboard::open_file(&mut tab_mgr);
                     },
                     "Open File"
                 }

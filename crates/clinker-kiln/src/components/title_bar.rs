@@ -28,6 +28,9 @@ pub fn TitleBar() -> Element {
         .map(|t| t.display_name())
         .unwrap_or_default();
     let is_dirty = active_tab.map(|t| t.is_dirty()).unwrap_or(false);
+    let ws_name = (tab_mgr.workspace)()
+        .as_ref()
+        .map(|ws| ws.display_name());
 
     rsx! {
         div {
@@ -43,6 +46,15 @@ pub fn TitleBar() -> Element {
             }
 
             span { class: "kiln-title-divider" }
+
+            // Workspace name (if in workspace mode)
+            if let Some(ref name) = ws_name {
+                span {
+                    class: "kiln-title-workspace",
+                    "{name}"
+                }
+                span { class: "kiln-title-divider" }
+            }
 
             // Filename with dirty indicator
             span {

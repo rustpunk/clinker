@@ -24,6 +24,8 @@ use crate::components::{
     welcome_screen::WelcomeScreen,
     yaml_sidebar::YamlSidebar,
 };
+use crate::components::confirm_dialog::{ConfirmAction, ConfirmDialog, PendingConfirm};
+use crate::components::toast::ToastState;
 use crate::demo::DEFAULT_YAML;
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
@@ -53,9 +55,13 @@ pub fn AppShell() -> Element {
         Some(tabs.peek().first().map(|t| t.id).unwrap_or_else(TabId::new))
     });
     let recent_files = use_signal(load_recent_files);
+    let workspace = use_signal(|| None);
 
     // ── Toast notifications ──────────────────────────────────────────────
-    let toast_message: Signal<Option<(String, &'static str)>> = use_signal(|| None);
+    let toast_message: Signal<Option<ToastState>> = use_signal(|| None);
+
+    // ── Confirmation dialog state ────────────────────────────────────────
+    let pending_confirm: Signal<Option<PendingConfirm>> = use_signal(|| None);
 
     // ── Fallback per-tab signals (used when no tab is active) ────────────
     let fallback_yaml = use_signal(String::new);
@@ -84,6 +90,7 @@ pub fn AppShell() -> Element {
         tabs,
         active_tab_id,
         recent_files,
+        workspace,
     });
 
     use_context_provider(move || AppState {
@@ -98,12 +105,14 @@ pub fn AppShell() -> Element {
     });
 
     use_context_provider(move || toast_message);
+    use_context_provider(move || pending_confirm);
 
     // ── Keyboard handler ─────────────────────────────────────────────────
     let mut kb_tab_mgr = TabManagerState {
         tabs,
         active_tab_id,
         recent_files,
+        workspace,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
@@ -179,6 +188,36 @@ pub fn AppShell() -> Element {
 
             RunLogDrawer {}
             ToastOverlay {}
+
+            // Confirmation dialog (rendered above everything when pending)
+            if let Some(pending) = (pending_confirm)() {
+                ConfirmDialog {
+                    pending: pending.clone(),
+                    on_action: move |action: ConfirmAction| {
+                        let mut confirm = pending_confirm;
+                        let tab_id = pending.tab_id;
+                        match action {
+                            ConfirmAction::Save => {
+                                // Save first, then close
+                                crate::keyboard::save_and_close_tab(
+                                    &mut kb_tab_mgr, tab_id,
+                                );
+                                confirm.set(None);
+                            }
+                            ConfirmAction::Discard => {
+                                // Close without saving
+                                crate::keyboard::force_close_tab(
+                                    &mut kb_tab_mgr, tab_id,
+                                );
+                                confirm.set(None);
+                            }
+                            ConfirmAction::Cancel => {
+                                confirm.set(None);
+                            }
+                        }
+                    },
+                }
+            }
         }
     }
 }

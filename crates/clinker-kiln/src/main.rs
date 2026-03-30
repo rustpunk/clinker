@@ -13,6 +13,7 @@ mod recent_files;
 mod state;
 mod sync;
 mod tab;
+mod workspace;
 
 fn main() {
     dioxus::LaunchBuilder::new()

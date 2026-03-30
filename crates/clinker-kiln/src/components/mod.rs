@@ -1,4 +1,5 @@
 pub mod canvas;
+pub mod confirm_dialog;
 pub mod inspector;
 pub mod run_log;
 pub mod schematics;

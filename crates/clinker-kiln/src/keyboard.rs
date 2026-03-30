@@ -5,10 +5,13 @@
 
 use dioxus::prelude::*;
 
+use crate::components::confirm_dialog::PendingConfirm;
+use crate::components::toast::{toast_error, toast_success, ToastState};
 use crate::file_ops;
 use crate::state::TabManagerState;
 use crate::sync::serialize_yaml;
-use crate::tab::TabEntry;
+use crate::tab::{TabEntry, TabId};
+use crate::workspace;
 
 /// Handle a global keyboard event. Returns `true` if the event was consumed.
 pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> bool {
@@ -30,32 +33,7 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
 
         // Ctrl+O — Open file
         Key::Character(ref c) if c == "o" && !event.modifiers().shift() => {
-            if let Some(path) = file_ops::open_file_dialog(None) {
-                match file_ops::read_pipeline_file(&path) {
-                    Ok(yaml) => {
-                        // Check if already open
-                        let already_open = tab_mgr.tabs.read().iter().find_map(|t| {
-                            if t.file_path.as_ref() == Some(&path) {
-                                Some(t.id)
-                            } else {
-                                None
-                            }
-                        });
-
-                        if let Some(existing_id) = already_open {
-                            tab_mgr.active_tab_id.set(Some(existing_id));
-                        } else {
-                            let new_tab = TabEntry::from_file(path, yaml);
-                            let new_id = new_tab.id;
-                            tab_mgr.tabs.write().push(new_tab);
-                            tab_mgr.active_tab_id.set(Some(new_id));
-                        }
-                    }
-                    Err(_e) => {
-                        // TODO: show error toast
-                    }
-                }
-            }
+            open_file(tab_mgr);
             true
         }
 
@@ -71,10 +49,10 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
-        // Ctrl+W — Close active tab
+        // Ctrl+W — Close active tab (with dirty confirmation)
         Key::Character(ref c) if c == "w" && !event.modifiers().shift() => {
             if let Some(active_id) = (tab_mgr.active_tab_id)() {
-                close_tab(tab_mgr, active_id);
+                request_close_tab(tab_mgr, active_id);
             }
             true
         }
@@ -110,23 +88,68 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
     }
 }
 
-/// Save the active tab to disk.
-fn save_active_tab(tab_mgr: &mut TabManagerState, force_save_as: bool) {
+/// Open a file via native dialog.
+pub fn open_file(tab_mgr: &mut TabManagerState) {
+    if let Some(path) = file_ops::open_file_dialog(None) {
+        match file_ops::read_pipeline_file(&path) {
+            Ok(yaml) => {
+                // Check if already open
+                let already_open = tab_mgr.tabs.read().iter().find_map(|t| {
+                    if t.file_path.as_ref() == Some(&path) {
+                        Some(t.id)
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(existing_id) = already_open {
+                    tab_mgr.active_tab_id.set(Some(existing_id));
+                } else {
+                    // Detect workspace from file location
+                    if let Some(ws_root) = workspace::detect_workspace(&path) {
+                        if tab_mgr.workspace.peek().is_none() {
+                            if let Some(ws) = workspace::load_workspace(&ws_root) {
+                                tab_mgr.workspace.set(Some(ws));
+                            }
+                        }
+                    }
+
+                    let new_tab = TabEntry::from_file(path, yaml);
+                    let new_id = new_tab.id;
+                    tab_mgr.tabs.write().push(new_tab);
+                    tab_mgr.active_tab_id.set(Some(new_id));
+                }
+            }
+            Err(e) => {
+                let mut toast: Signal<Option<ToastState>> = use_context();
+                toast_error(&mut toast, e);
+            }
+        }
+    }
+}
+
+/// Save the active tab to disk. Handles save-as for untitled tabs.
+/// Auto-creates workspace (kiln.toml) on first save per §F4.3.
+pub fn save_active_tab(tab_mgr: &mut TabManagerState, force_save_as: bool) {
     let active_id = match (tab_mgr.active_tab_id)() {
         Some(id) => id,
         None => return,
     };
 
+    save_tab_by_id(tab_mgr, active_id, force_save_as);
+}
+
+/// Save a specific tab by ID.
+fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: bool) {
     let mut tabs = tab_mgr.tabs;
 
-    // Find the active tab and get its current YAML + file path
+    // Get current YAML + file path
     let (yaml, current_path) = {
         let tabs_read = tabs.read();
-        let Some(tab) = tabs_read.iter().find(|t| t.id == active_id) else {
+        let Some(tab) = tabs_read.iter().find(|t| t.id == tab_id) else {
             return;
         };
 
-        // Serialize from pipeline model if available, otherwise use raw YAML
         let yaml = match (tab.pipeline)() {
             Some(ref config) => serialize_yaml(config),
             None => (tab.yaml_text)(),
@@ -135,7 +158,7 @@ fn save_active_tab(tab_mgr: &mut TabManagerState, force_save_as: bool) {
         (yaml, tab.file_path.clone())
     };
 
-    // Determine the save path
+    // Determine save path
     let save_path = if force_save_as || current_path.is_none() {
         let suggested = current_path
             .as_ref()
@@ -156,20 +179,67 @@ fn save_active_tab(tab_mgr: &mut TabManagerState, force_save_as: bool) {
     // Write to disk
     match file_ops::write_pipeline_file(&path, &yaml) {
         Ok(()) => {
-            // Update tab state: mark saved with new path
+            // Mark tab as saved
             let mut tabs_write = tabs.write();
-            if let Some(tab) = tabs_write.iter_mut().find(|t| t.id == active_id) {
-                tab.mark_saved(path);
+            if let Some(tab) = tabs_write.iter_mut().find(|t| t.id == tab_id) {
+                tab.mark_saved(path.clone());
+            }
+
+            // Auto-create workspace if needed (§F4.3)
+            if let Some(parent) = path.parent() {
+                if workspace::detect_workspace(&path).is_none() {
+                    if workspace::auto_create_workspace(parent) {
+                        let mut toast: Signal<Option<ToastState>> = use_context();
+                        toast_success(&mut toast, "Workspace created \u{00B7} kiln.toml");
+                    }
+                }
             }
         }
-        Err(_e) => {
-            // TODO: show error toast
+        Err(e) => {
+            let mut toast: Signal<Option<ToastState>> = use_context();
+            toast_error(&mut toast, e);
         }
     }
 }
 
-/// Close a tab by ID. TODO: dirty confirmation in Phase 2.5c.
-fn close_tab(tab_mgr: &mut TabManagerState, tab_id: crate::tab::TabId) {
+/// Request to close a tab — shows confirm dialog if dirty.
+pub fn request_close_tab(tab_mgr: &mut TabManagerState, tab_id: TabId) {
+    let is_dirty = tab_mgr
+        .tabs
+        .read()
+        .iter()
+        .find(|t| t.id == tab_id)
+        .map(|t| t.is_dirty())
+        .unwrap_or(false);
+
+    if is_dirty {
+        // Show confirmation dialog
+        let filename = tab_mgr
+            .tabs
+            .read()
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.display_name())
+            .unwrap_or_else(|| "untitled.yaml".to_string());
+
+        let mut confirm: Signal<Option<PendingConfirm>> = use_context();
+        confirm.set(Some(PendingConfirm {
+            tab_id,
+            filename,
+        }));
+    } else {
+        force_close_tab(tab_mgr, tab_id);
+    }
+}
+
+/// Save a tab then close it (called from confirm dialog "Save" action).
+pub fn save_and_close_tab(tab_mgr: &mut TabManagerState, tab_id: TabId) {
+    save_tab_by_id(tab_mgr, tab_id, false);
+    force_close_tab(tab_mgr, tab_id);
+}
+
+/// Close a tab unconditionally (no dirty check).
+pub fn force_close_tab(tab_mgr: &mut TabManagerState, tab_id: TabId) {
     let mut tabs = tab_mgr.tabs;
     let mut active = tab_mgr.active_tab_id;
 

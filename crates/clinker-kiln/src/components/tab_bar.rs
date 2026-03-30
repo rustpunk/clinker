@@ -4,6 +4,7 @@
 
 use dioxus::prelude::*;
 
+use crate::keyboard;
 use crate::state::TabManagerState;
 use crate::tab::TabEntry;
 
@@ -20,7 +21,7 @@ pub fn TabBar() -> Element {
         div {
             class: "kiln-tab-bar",
 
-            for (i, tab) in tabs.read().iter().enumerate() {
+            for tab in tabs.read().iter() {
                 {
                     let tab_id = tab.id;
                     let is_active = current_active == Some(tab_id);
@@ -51,7 +52,7 @@ pub fn TabBar() -> Element {
                                 class: "kiln-tab-close",
                                 onclick: move |e: MouseEvent| {
                                     e.stop_propagation();
-                                    close_tab(tab_mgr, tab_id);
+                                    keyboard::request_close_tab(&mut tab_mgr, tab_id);
                                 },
                                 "\u{00D7}"
                             }
@@ -71,37 +72,6 @@ pub fn TabBar() -> Element {
                 },
                 "+"
             }
-        }
-    }
-}
-
-/// Close a tab by ID. TODO: add dirty confirmation dialog in Phase 2.5c.
-fn close_tab(tab_mgr: TabManagerState, tab_id: crate::tab::TabId) {
-    let mut tabs = tab_mgr.tabs;
-    let mut active = tab_mgr.active_tab_id;
-
-    let current_active = (active)();
-    let tab_count = tabs.read().len();
-
-    // Find the index of the tab to close
-    let Some(idx) = tabs.read().iter().position(|t| t.id == tab_id) else {
-        return;
-    };
-
-    // Remove the tab
-    tabs.write().remove(idx);
-
-    // If we closed the active tab, select an adjacent one
-    if current_active == Some(tab_id) {
-        let remaining = tabs.read().len();
-        if remaining == 0 {
-            active.set(None);
-        } else {
-            // Prefer the tab at the same index (which is now the next tab),
-            // or the last tab if we closed the rightmost one
-            let new_idx = idx.min(remaining - 1);
-            let new_id = tabs.read()[new_idx].id;
-            active.set(Some(new_id));
         }
     }
 }

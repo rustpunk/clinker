@@ -12,6 +12,7 @@ use dioxus::prelude::*;
 use crate::recent_files::RecentFileEntry;
 use crate::sync::EditSource;
 use crate::tab::{TabEntry, TabId};
+use crate::workspace::Workspace;
 
 /// Pipeline canvas layout preset.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -70,4 +71,5 @@ pub struct TabManagerState {
     pub tabs: Signal<Vec<TabEntry>>,
     pub active_tab_id: Signal<Option<TabId>>,
     pub recent_files: Signal<Vec<RecentFileEntry>>,
+    pub workspace: Signal<Option<Workspace>>,
 }
