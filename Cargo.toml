@@ -8,6 +8,7 @@ members = [
     "crates/clinker-core",
     "crates/clinker-channel",
     "crates/clinker",
+    "crates/clinker-kiln",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 static_assertions = "1"
+dioxus = { version = "=0.7.4", features = ["desktop"] }
 
 [workspace.metadata.release]
 shared-version = true

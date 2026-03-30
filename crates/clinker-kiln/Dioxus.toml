@@ -1,0 +1,3 @@
+[application]
+name = "clinker-kiln"
+default_platform = "desktop"

@@ -1,0 +1,8 @@
+[package]
+name = "clinker-kiln"
+version.workspace = true
+edition.workspace = true
+description = "Clinker Kiln — IDE for authoring Clinker YAML pipeline configurations"
+
+[dependencies]
+dioxus.workspace = true

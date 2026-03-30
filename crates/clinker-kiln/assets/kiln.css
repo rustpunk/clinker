@@ -1,0 +1,656 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   CLINKER KILN — Rustpunk Theme (Oxide sub-aesthetic)
+   Spec: clinker-kiln-spec.md §4.3, §5, §6, §7
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 1. Google Fonts ───────────────────────────────────────────────────────
+   Chakra Petch: UI labels, section headers, brand badge (weight 600).
+   JetBrains Mono: code, YAML editor, log timestamps (weight 400).
+   ─────────────────────────────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap');
+
+/* ── 2. CSS Custom Properties (Rustpunk colour palette) ────────────────────
+   Token names follow the spec exactly. All UI colours reference these vars.
+   ─────────────────────────────────────────────────────────────────────── */
+:root {
+  /* Accent colours */
+  --kiln-verdigris:   #43B3AE;
+  --kiln-hazard:      #E8A524;
+  --kiln-ember:       #C75B2A;
+  --kiln-phosphor:    #D4A017;
+  --kiln-oxide-red:   #B7410E;
+  --kiln-ok-green:    #7ab648;
+
+  /* Neutral palette */
+  --kiln-bone:        #C4A882;
+  --kiln-iron:        #8A7E6E;
+  --kiln-text-floor:  #5C4A30;
+
+  /* Surface layers (darkest → lightest) */
+  --kiln-char:        #1A1512;
+  --kiln-char-raised: #211C18;
+  --kiln-char-surface:#2A231E;
+
+  /* Border tiers */
+  --kiln-border-subtle: #3A3028;
+  --kiln-border-medium: #5A4A38;
+  --kiln-border-strong: #7A6A50;
+
+  /* Typography */
+  --kiln-font-ui:   'Chakra Petch', 'Segoe UI', sans-serif;
+  --kiln-font-code: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+}
+
+/* ── 3. Reset & base ───────────────────────────────────────────────────────
+   ─────────────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: var(--kiln-char);
+  color: var(--kiln-bone);
+  font-family: var(--kiln-font-ui);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ── 4. App shell ──────────────────────────────────────────────────────────
+   Full-viewport column flex: title bar → main → run log drawer.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-app {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  background: var(--kiln-char);
+  overflow: hidden;
+}
+
+/* ── 5. Title bar ──────────────────────────────────────────────────────────
+   Fixed height, no native decorations. Draggable via window.drag() in Rust.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-title-bar {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  min-height: 36px;
+  padding: 0 12px;
+  background: var(--kiln-char-raised);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  gap: 8px;
+  flex-shrink: 0;
+  /* Draggable region — interactive children override with no-drag. */
+  -webkit-app-region: drag;
+}
+
+/* Brand badge: [clinker][kiln] */
+.kiln-brand {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-brand-label {
+  padding: 0 7px;
+  background: var(--kiln-border-medium);
+  color: var(--kiln-bone);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+}
+
+.kiln-brand-value {
+  padding: 0 7px;
+  background: var(--kiln-border-strong);
+  color: var(--kiln-oxide-red);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+}
+
+.kiln-title-divider {
+  display: inline-block;
+  width: 1px;
+  height: 14px;
+  background: var(--kiln-border-medium);
+}
+
+.kiln-title-filename {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-title-spacer {
+  flex: 1;
+}
+
+/* Layout preset switcher — three-segment toggle group */
+.kiln-layout-switcher {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-layout-btn {
+  padding: 0 10px;
+  height: 22px;
+  background: var(--kiln-char-raised);
+  color: var(--kiln-text-floor);
+  border: none;
+  border-right: 1px solid var(--kiln-border-medium);
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 150ms, color 150ms;
+}
+
+.kiln-layout-btn:last-child {
+  border-right: none;
+}
+
+.kiln-layout-btn:hover {
+  background: var(--kiln-char-surface);
+  color: var(--kiln-bone);
+}
+
+.kiln-layout-btn[data-active="true"] {
+  background: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+/* Validation LED */
+.kiln-validation-led {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-led-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+
+.kiln-led-dot--ok {
+  background: var(--kiln-ok-green);
+  box-shadow: 0 0 4px 1px rgba(122, 182, 72, 0.6);
+}
+
+.kiln-led-dot--err {
+  background: var(--kiln-oxide-red);
+  box-shadow: 0 0 4px 1px rgba(183, 65, 14, 0.6);
+}
+
+.kiln-led-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--kiln-ok-green);
+  text-transform: uppercase;
+}
+
+/* ── 6. Main panel area ────────────────────────────────────────────────────
+   Horizontal row: canvas | inspector | yaml sidebar.
+   Layout presets are driven by `data-layout` attribute.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  transition: flex 300ms ease-out;
+}
+
+/* ── Canvas panel widths per layout preset ── */
+.kiln-main[data-layout="hybrid"] .kiln-canvas-panel {
+  flex: 1;
+  min-width: 0;
+}
+
+.kiln-main[data-layout="hybrid"] .kiln-yaml-sidebar {
+  flex: 0 0 360px;
+  display: flex;
+}
+
+.kiln-main[data-layout="canvas-focus"] .kiln-canvas-panel {
+  flex: 1;
+  min-width: 0;
+}
+
+.kiln-main[data-layout="canvas-focus"] .kiln-yaml-sidebar {
+  display: none;
+}
+
+.kiln-main[data-layout="editor-focus"] .kiln-canvas-panel {
+  display: none;
+}
+
+.kiln-main[data-layout="editor-focus"] .kiln-yaml-sidebar {
+  flex: 1;
+  display: flex;
+}
+
+/* Inspector stub — hidden in Phase 1 */
+.kiln-inspector-stub {
+  display: none;
+}
+
+/* ── 7. Canvas panel ───────────────────────────────────────────────────────
+   Infinite world-space viewport. Phase 3 adds CSS transform for pan/zoom.
+   Visual layers: dot grid → noise → scanlines → SVG connectors → nodes.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-canvas-panel {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--kiln-char);
+
+  /* Dot grid at 20 px spacing — subtle positional reference. */
+  background-image: radial-gradient(
+    circle,
+    var(--kiln-border-subtle) 1px,
+    transparent 1px
+  );
+  background-size: 20px 20px;
+}
+
+/* Scanline overlay — ::before */
+.kiln-canvas-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 1px,
+    rgba(0, 0, 0, 0.12) 1px,
+    rgba(0, 0, 0, 0.12) 2px
+  );
+}
+
+/* Noise / grain overlay — ::after
+   Inline SVG feTurbulence — CSS-only, no JS canvas required. */
+.kiln-canvas-panel::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 11;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 200px 200px;
+}
+
+/* SVG connector overlay — sits below nodes */
+.kiln-canvas-svg {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* ── 8. Node cards ─────────────────────────────────────────────────────────
+   Spec §4.2: 160 px wide, accent border-top, eroded asymmetric corners.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-node {
+  position: absolute;
+  z-index: 5;
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-top-width: 3px;
+  /* Eroded corners: top-right 16 px, bottom-left 14 px — spec §4.2 */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 16px) 0,
+    100% 16px,
+    100% 100%,
+    14px 100%,
+    0 calc(100% - 14px)
+  );
+  padding: 10px 12px 10px 12px;
+  cursor: default;
+  transition: border-color 150ms, box-shadow 150ms;
+}
+
+.kiln-node:hover {
+  border-color: var(--kiln-border-medium);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+}
+
+/* Badge row: pass pill + type label */
+.kiln-node-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 7px;
+}
+
+.kiln-node-pass-pill {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--kiln-border-medium);
+  color: var(--kiln-iron);
+  letter-spacing: 0.05em;
+}
+
+.kiln-node-type-badge {
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  /* Colour is driven by inline `color:` from accent. */
+}
+
+/* Primary node label */
+.kiln-node-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  letter-spacing: 0.02em;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Rust-line separator — gradient fade to transparent at edges */
+.kiln-rust-line {
+  border: none;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--kiln-border-medium) 20%,
+    var(--kiln-border-medium) 80%,
+    transparent 100%
+  );
+  margin: 4px 0 6px;
+}
+
+/* Subtitle / secondary info line */
+.kiln-node-subtitle {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-iron);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Port squares — left (in) and right (out) */
+.kiln-node-port {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-node-port--in {
+  left: -5px;
+}
+
+.kiln-node-port--out {
+  right: -5px;
+}
+
+/* ── 9. YAML Sidebar ───────────────────────────────────────────────────────
+   Spec §6: full-height column with section header + scrollable code area.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-yaml-sidebar {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char);
+  overflow: hidden;
+}
+
+/* Section header row */
+.kiln-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+}
+
+.kiln-diamond {
+  color: var(--kiln-border-medium);
+  font-size: 10px;
+}
+
+.kiln-section-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-section-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-section-filename {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+}
+
+/* Scrollable code area — horizontal row of gutter + code */
+.kiln-yaml-code-area {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kiln-yaml-gutter {
+  flex: 0 0 36px;
+  background: var(--kiln-char);
+  border-right: 1px solid var(--kiln-border-subtle);
+  padding: 8px 0;
+  overflow: hidden;
+}
+
+.kiln-yaml-line-num {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 20px;
+  color: var(--kiln-text-floor);
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+}
+
+.kiln-yaml-code {
+  flex: 1;
+  padding: 8px 12px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+.kiln-yaml-line {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 20px;
+  white-space: pre;
+  color: var(--kiln-bone);
+}
+
+/* YAML syntax colours via data-token attribute — spec §6.2 */
+[data-token="comment"] { color: var(--kiln-text-floor); }
+[data-token="key"]     { color: var(--kiln-verdigris); }
+[data-token="value"]   { color: var(--kiln-phosphor); }
+[data-token="punct"]   { color: var(--kiln-iron); }
+[data-token="indent"]  { /* whitespace — no colour */ }
+
+/* ── 10. Run-log drawer ────────────────────────────────────────────────────
+   Spec §7: bottom-anchored, pushes content up (not an overlay).
+   Collapsed: 28 px tab bar. Expanded: 220 px.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-run-log {
+  flex-shrink: 0;
+  border-top: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-raised);
+  height: 28px;
+  overflow: hidden;
+  transition: height 300ms ease-out;
+}
+
+.kiln-run-log[data-expanded="true"] {
+  height: 220px;
+}
+
+/* Tab bar (always visible) */
+.kiln-run-log-tab {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 12px;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.kiln-run-log-tab:hover .kiln-run-log-label {
+  color: var(--kiln-bone);
+}
+
+.kiln-run-log-led {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--kiln-ok-green);
+  box-shadow: 0 0 4px 1px rgba(122, 182, 72, 0.5);
+}
+
+.kiln-run-log-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  transition: color 150ms;
+}
+
+.kiln-run-log-chevron {
+  margin-left: auto;
+  font-size: 8px;
+  color: var(--kiln-text-floor);
+}
+
+/* Scrollable log content (visible when expanded) */
+.kiln-run-log-content {
+  height: calc(220px - 28px);
+  overflow-y: auto;
+  padding: 4px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Individual log line */
+.kiln-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  padding: 0 12px;
+  line-height: 18px;
+}
+
+.kiln-log-ts {
+  flex: 0 0 72px;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-log-tag {
+  flex: 0 0 32px;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.kiln-log-msg {
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Level colours — spec §7.3 */
+.kiln-log-line[data-level="cmd"]  .kiln-log-tag,
+.kiln-log-line[data-level="cmd"]  .kiln-log-msg  { color: var(--kiln-bone); font-weight: 600; }
+
+.kiln-log-line[data-level="info"] .kiln-log-tag,
+.kiln-log-line[data-level="info"] .kiln-log-msg  { color: var(--kiln-iron); }
+
+.kiln-log-line[data-level="stat"] .kiln-log-tag,
+.kiln-log-line[data-level="stat"] .kiln-log-msg  { color: var(--kiln-verdigris); }
+
+.kiln-log-line[data-level="ok"]   .kiln-log-tag,
+.kiln-log-line[data-level="ok"]   .kiln-log-msg  { color: var(--kiln-ok-green); font-weight: 600; }
+
+.kiln-log-line[data-level="warn"] {
+  background: rgba(232, 165, 36, 0.08);
+}
+.kiln-log-line[data-level="warn"] .kiln-log-tag,
+.kiln-log-line[data-level="warn"] .kiln-log-msg  { color: var(--kiln-hazard); }
+
+.kiln-log-line[data-level="err"]  {
+  background: rgba(183, 65, 14, 0.08);
+}
+.kiln-log-line[data-level="err"]  .kiln-log-tag,
+.kiln-log-line[data-level="err"]  .kiln-log-msg  { color: var(--kiln-oxide-red); }
+
+/* ── 11. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--kiln-border-subtle);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--kiln-border-medium); }
