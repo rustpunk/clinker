@@ -219,6 +219,19 @@ html, body {
   color: var(--kiln-bone);
 }
 
+/* Version button: ok-green accent when active */
+.kiln-layout-btn--version-active {
+  background: rgba(122, 182, 72, 0.15) !important;
+  color: var(--kiln-ok-green) !important;
+  border-bottom: 2px solid var(--kiln-ok-green) !important;
+}
+
+/* Disabled layout button (Version when no git repo) */
+.kiln-layout-btn--disabled {
+  opacity: 0.35;
+  cursor: not-allowed !important;
+}
+
 /* Validation LED */
 .kiln-validation-led {
   display: flex;

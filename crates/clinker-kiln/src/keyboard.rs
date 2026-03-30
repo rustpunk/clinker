@@ -30,11 +30,18 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
-        // Ctrl+Shift+G — Version Mode
+        // Ctrl+Shift+G — Toggle Version Mode layout
         Key::Character(ref c) if c == "G" && event.modifiers().shift() => {
-            // Toggle to/from Version layout — need AppState for layout
-            // For now, just toggle command palette with git: prefix hint
-            // Full Version Mode switching is handled via command palette
+            if (tab_mgr.git_state)().is_some() {
+                let app_state_sig = use_context::<Signal<crate::state::AppState>>();
+                let app = *app_state_sig.read();
+                let mut layout = app.layout;
+                if (layout)() == crate::state::LayoutPreset::Version {
+                    layout.set(crate::state::LayoutPreset::Hybrid);
+                } else {
+                    layout.set(crate::state::LayoutPreset::Version);
+                }
+            }
             true
         }
 

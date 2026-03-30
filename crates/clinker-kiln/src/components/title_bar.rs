@@ -132,16 +132,35 @@ pub fn TitleBar() -> Element {
                     class: "kiln-layout-switcher",
                     onmousedown: move |e| e.stop_propagation(),
 
-                    for preset in [LayoutPreset::CanvasFocus, LayoutPreset::Hybrid, LayoutPreset::EditorFocus, LayoutPreset::Schematics] {
-                        button {
-                            key: "{preset.label()}",
-                            class: "kiln-layout-btn",
-                            "data-active": if (state.layout)() == preset { "true" } else { "false" },
-                            onclick: move |_| {
-                                let mut layout = state.layout;
-                                layout.set(preset);
-                            },
-                            "{preset.label()}"
+                    for preset in [LayoutPreset::CanvasFocus, LayoutPreset::Hybrid, LayoutPreset::EditorFocus, LayoutPreset::Schematics, LayoutPreset::Version] {
+                        {
+                            let is_active = (state.layout)() == preset;
+                            let is_version = preset == LayoutPreset::Version;
+                            let has_git = (tab_mgr.git_state)().is_some();
+
+                            // Version button: disabled when no git repo, ok-green accent when active
+                            let class = if is_version && is_active {
+                                "kiln-layout-btn kiln-layout-btn--version-active"
+                            } else if is_version && !has_git {
+                                "kiln-layout-btn kiln-layout-btn--disabled"
+                            } else {
+                                "kiln-layout-btn"
+                            };
+
+                            rsx! {
+                                button {
+                                    key: "{preset.label()}",
+                                    class: "{class}",
+                                    "data-active": if is_active { "true" } else { "false" },
+                                    disabled: is_version && !has_git,
+                                    title: if is_version && !has_git { "No git repository detected" } else { "" },
+                                    onclick: move |_| {
+                                        let mut layout = state.layout;
+                                        layout.set(preset);
+                                    },
+                                    "{preset.label()}"
+                                }
+                            }
                         }
                     }
                 }
