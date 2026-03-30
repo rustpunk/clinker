@@ -9,6 +9,8 @@ use std::fmt;
 pub enum FormatError {
     Io(std::io::Error),
     Csv(csv::Error),
+    Json(String),
+    Xml(String),
     InvalidRecord { row: u64, message: String },
     SchemaInference(String),
 }
@@ -18,6 +20,8 @@ impl fmt::Display for FormatError {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Csv(e) => write!(f, "CSV error: {e}"),
+            Self::Json(msg) => write!(f, "JSON error: {msg}"),
+            Self::Xml(msg) => write!(f, "XML error: {msg}"),
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }
