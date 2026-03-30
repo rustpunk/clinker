@@ -84,11 +84,15 @@ fn run(cli: &Cli) -> Result<u8, PipelineError> {
                     r.schema().map_err(|e| PipelineError::Format(e))?
                 };
                 let dlq_writer = std::fs::File::create(dlq_path)?;
+                let include_reason = dlq_config.include_reason.unwrap_or(true);
+                let include_source_row = dlq_config.include_source_row.unwrap_or(true);
                 clinker_core::dlq::write_dlq(
                     dlq_writer,
                     &dlq_entries,
                     &input_schema,
                     input_path,
+                    include_reason,
+                    include_source_row,
                 )
                 .map_err(PipelineError::Format)?;
             }

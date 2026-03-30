@@ -40,6 +40,7 @@ struct CompiledTransform {
 /// Record that failed evaluation, queued for DLQ output.
 pub struct DlqEntry {
     pub source_row: u64,
+    pub category: crate::dlq::DlqErrorCategory,
     pub error_message: String,
     pub original_record: Record,
 }
@@ -595,6 +596,7 @@ fn handle_error<W: Write + Send>(
             counters.dlq_count += 1;
             dlq_entries.push(DlqEntry {
                 source_row: row_num,
+                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                 error_message: eval_err.to_string(),
                 original_record: record.clone(),
             });
@@ -604,6 +606,7 @@ fn handle_error<W: Write + Send>(
             counters.dlq_count += 1;
             dlq_entries.push(DlqEntry {
                 source_row: row_num,
+                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                 error_message: eval_err.to_string(),
                 original_record: record.clone(),
             });
