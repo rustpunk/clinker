@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 
 mod app;
@@ -21,7 +24,33 @@ mod tab;
 mod template;
 mod workspace;
 
+/// Workspace path passed via `--workspace <path>` CLI arg.
+///
+/// Highest priority in session restore — overrides last-used workspace and CWD detection.
+static CLI_WORKSPACE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Get the CLI-specified workspace path, if any.
+pub fn cli_workspace() -> Option<&'static PathBuf> {
+    CLI_WORKSPACE.get()
+}
+
 fn main() {
+    // Parse --workspace <path> from CLI args
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(idx) = args.iter().position(|a| a == "--workspace") {
+        if let Some(path_str) = args.get(idx + 1) {
+            let path = PathBuf::from(path_str);
+            let resolved = if path.is_relative() {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&path))
+                    .unwrap_or(path)
+            } else {
+                path
+            };
+            let _ = CLI_WORKSPACE.set(resolved);
+        }
+    }
+
     dioxus::LaunchBuilder::new()
         .with_cfg(
             Config::new()

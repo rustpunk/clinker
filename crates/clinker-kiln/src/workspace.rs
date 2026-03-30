@@ -505,16 +505,24 @@ pub struct SessionInit {
 /// Restore the previous session on app startup.
 ///
 /// Priority order:
-/// 1. Last-used workspace (from `~/.local/share/clinker-kiln/last-workspace.json`)
-/// 2. Workspace detected from CWD (ancestor walk for `kiln.toml`)
-/// 3. Defaults (empty tabs, no workspace, Hybrid layout)
+/// 1. `--workspace <path>` CLI argument (highest priority)
+/// 2. Last-used workspace (from `~/.local/share/clinker-kiln/last-workspace.json`)
+/// 3. Workspace detected from CWD (ancestor walk for `kiln.toml`)
+/// 4. Defaults (empty tabs, no workspace, Hybrid layout)
 pub fn restore_session() -> SessionInit {
-    // 1. Try last-used workspace
+    // 1. Try CLI --workspace arg
+    if let Some(ws_path) = crate::cli_workspace() {
+        if let Some(init) = try_restore_from_workspace_root(ws_path) {
+            return init;
+        }
+    }
+
+    // 2. Try last-used workspace
     if let Some(init) = try_restore_from_last_workspace() {
         return init;
     }
 
-    // 2. Try CWD workspace detection
+    // 3. Try CWD workspace detection
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(ws_root) = detect_workspace(&cwd) {
             if let Some(init) = try_restore_from_workspace_root(&ws_root) {
@@ -523,7 +531,7 @@ pub fn restore_session() -> SessionInit {
         }
     }
 
-    // 3. Defaults
+    // 4. Defaults
     SessionInit {
         tabs: Vec::new(),
         active_tab_id: None,
