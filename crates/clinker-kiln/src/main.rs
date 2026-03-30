@@ -10,9 +10,11 @@ mod keyboard;
 mod notes;
 mod pipeline_view;
 mod recent_files;
+mod search;
 mod state;
 mod sync;
 mod tab;
+mod template;
 mod workspace;
 
 fn main() {

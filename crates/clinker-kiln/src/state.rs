@@ -7,12 +7,25 @@
 /// `TabManagerState` is the global context for tab/file operations.
 
 use clinker_core::config::PipelineConfig;
+use clinker_schema::SchemaIndex;
 use dioxus::prelude::*;
 
 use crate::recent_files::RecentFileEntry;
 use crate::sync::EditSource;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace::Workspace;
+
+/// Which left-side panel is currently open (280px slide-in slot).
+///
+/// Only one panel can be open at a time. Search and Schemas share the same
+/// slot. `None` means the slot is collapsed.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum LeftPanel {
+    #[default]
+    None,
+    Search,
+    Schemas,
+}
 
 /// Pipeline canvas layout preset.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -82,4 +95,10 @@ pub struct TabManagerState {
     pub active_tab_id: Signal<Option<TabId>>,
     pub recent_files: Signal<Vec<RecentFileEntry>>,
     pub workspace: Signal<Option<Workspace>>,
+    /// Which left panel is currently open (Search or Schemas).
+    pub left_panel: Signal<LeftPanel>,
+    /// Workspace schema index — populated on workspace load, refreshed on file changes.
+    pub schema_index: Signal<SchemaIndex>,
+    /// Whether the template gallery overlay is visible.
+    pub show_template_gallery: Signal<bool>,
 }

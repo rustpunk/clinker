@@ -631,6 +631,852 @@ html, body {
 /* Default: schematics hidden */
 .kiln-schematics { display: none; }
 
+/* ── 6b. Left panel slot (search / schemas) ─────────────────────────────────
+   280px slide-in from left. Only one open at a time. Pushes canvas narrower.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-left-panel {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+  border-right: 1px solid var(--border-medium);
+  overflow: hidden;
+}
+
+.kiln-left-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-left-panel__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-floor);
+  text-transform: uppercase;
+}
+
+.kiln-left-panel__close {
+  background: none;
+  border: none;
+  color: var(--text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-left-panel__close:hover {
+  background: var(--border-medium);
+  color: var(--bone);
+}
+
+.kiln-left-panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-floor);
+}
+
+/* ── 6c. Search panel ────────────────────────────────────────────────────
+   Workspace-wide text/structural search with results list.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-search-panel {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+  border-right: 1px solid var(--border-medium);
+  overflow: hidden;
+}
+
+.kiln-search-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-search-panel__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-floor);
+  text-transform: uppercase;
+}
+
+.kiln-search-panel__close {
+  background: none;
+  border: none;
+  color: var(--text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-search-panel__close:hover {
+  background: var(--border-medium);
+  color: var(--bone);
+}
+
+/* Mode tabs */
+.kiln-search-panel__tabs {
+  display: flex;
+  padding: 6px 12px;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-search-mode-tab {
+  background: none;
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 3px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  cursor: pointer;
+}
+
+.kiln-search-mode-tab:hover {
+  border-color: var(--border-strong);
+  color: var(--bone);
+}
+
+.kiln-search-mode-tab--active {
+  border-color: var(--verdigris);
+  color: var(--verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+/* Input row */
+.kiln-search-panel__input-row {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-search-panel__input {
+  flex: 1;
+  background: var(--bg-char);
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 5px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--bone);
+  outline: none;
+  min-width: 0;
+}
+
+.kiln-search-panel__input:focus {
+  border-color: var(--verdigris);
+}
+
+.kiln-search-panel__input::placeholder {
+  color: var(--text-floor);
+}
+
+/* Search option toggles */
+.kiln-search-toggle {
+  background: none;
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 3px 5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  cursor: pointer;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.kiln-search-toggle:hover {
+  border-color: var(--border-strong);
+  color: var(--bone);
+}
+
+.kiln-search-toggle--active {
+  border-color: var(--verdigris);
+  color: var(--verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+.kiln-search-toggle--expand {
+  padding: 3px 4px;
+  font-size: 8px;
+}
+
+/* Replace row */
+.kiln-search-panel__replace-row {
+  display: flex;
+  padding: 4px 12px 8px;
+  padding-left: 30px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-search-panel__input--replace {
+  width: 100%;
+}
+
+/* Structural placeholder */
+.kiln-search-panel__structural-placeholder {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-floor);
+}
+
+/* Results area */
+.kiln-search-panel__results {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.kiln-search-panel__empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-floor);
+}
+
+/* Search results */
+.kiln-search-results__summary {
+  padding: 6px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-search-file-group {
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-search-file-group__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.kiln-search-file-group__path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--bone);
+  font-weight: 600;
+}
+
+.kiln-search-file-group__count {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  background: var(--border-medium);
+  padding: 1px 5px;
+  border-radius: 8px;
+}
+
+.kiln-search-match {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 12px 2px 20px;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+
+.kiln-search-match:hover {
+  background: rgba(67, 179, 174, 0.06);
+}
+
+.kiln-search-match__line {
+  color: var(--text-floor);
+  font-size: 9px;
+  min-width: 24px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.kiln-search-match__content {
+  color: var(--bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.kiln-search-match__highlight {
+  background: rgba(67, 179, 174, 0.2);
+  color: var(--verdigris);
+  border-radius: 1px;
+}
+
+/* ── 6c2. Template gallery overlay ────────────────────────────────────────
+   Centered 560px overlay for browsing and instantiating templates.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-gallery-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 100;
+}
+
+.kiln-gallery {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 560px;
+  max-height: 80vh;
+  background: var(--bg-base);
+  border: 1px solid var(--border-medium);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  z-index: 101;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.kiln-gallery__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-gallery__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--bone);
+  text-transform: uppercase;
+}
+
+.kiln-gallery__close {
+  background: none;
+  border: none;
+  color: var(--text-floor);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-gallery__close:hover {
+  background: var(--border-medium);
+  color: var(--bone);
+}
+
+.kiln-gallery__search {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-gallery__search-input {
+  width: 100%;
+  background: var(--bg-char);
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 7px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--bone);
+  outline: none;
+}
+
+.kiln-gallery__search-input:focus {
+  border-color: var(--verdigris);
+}
+
+.kiln-gallery__search-input::placeholder {
+  color: var(--text-floor);
+}
+
+.kiln-gallery__tabs {
+  display: flex;
+  padding: 8px 16px;
+  gap: 6px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-gallery-tab {
+  background: none;
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 4px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-floor);
+  cursor: pointer;
+}
+
+.kiln-gallery-tab:hover {
+  border-color: var(--border-strong);
+  color: var(--bone);
+}
+
+.kiln-gallery-tab--active {
+  border-color: var(--verdigris);
+  color: var(--verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+.kiln-gallery__grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  align-content: start;
+}
+
+.kiln-gallery__empty {
+  grid-column: 1 / -1;
+  padding: 24px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-floor);
+}
+
+/* Template card */
+.kiln-gallery-card {
+  background: var(--bg-char);
+  border: 1px solid var(--border-medium);
+  border-radius: 3px;
+  border-top: 2px solid var(--border-medium);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 150ms;
+}
+
+.kiln-gallery-card:hover {
+  border-color: var(--border-strong);
+}
+
+.kiln-gallery-card--csv  { border-top-color: var(--verdigris); }
+.kiln-gallery-card--json { border-top-color: var(--hazard); }
+.kiln-gallery-card--xml  { border-top-color: var(--ember); }
+.kiln-gallery-card--other { border-top-color: var(--text-floor); }
+
+.kiln-gallery-card__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.kiln-gallery-card__name {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bone);
+}
+
+.kiln-gallery-card__source {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  color: var(--text-floor);
+}
+
+.kiln-gallery-card__desc {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  line-height: 1.4;
+}
+
+.kiln-gallery-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-gallery-card__tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  color: var(--text-floor);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+
+.kiln-gallery-card__use-btn {
+  background: none;
+  border: 1px solid var(--verdigris);
+  border-radius: 2px;
+  padding: 5px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--verdigris);
+  cursor: pointer;
+  text-align: center;
+  margin-top: 4px;
+}
+
+.kiln-gallery-card__use-btn:hover {
+  background: rgba(67, 179, 174, 0.1);
+}
+
+/* ── 6d. Schema panel ────────────────────────────────────────────────────
+   Format-grouped cards with expandable field lists.
+   Format accents: CSV verdigris, JSON hazard, XML ember, Parquet phosphor.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-schema-panel {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+  border-right: 1px solid var(--border-medium);
+  overflow: hidden;
+}
+
+.kiln-schema-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-schema-panel__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-floor);
+  text-transform: uppercase;
+}
+
+.kiln-schema-panel__close {
+  background: none;
+  border: none;
+  color: var(--text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-schema-panel__close:hover {
+  background: var(--border-medium);
+  color: var(--bone);
+}
+
+/* Search input */
+.kiln-schema-panel__search {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-schema-panel__search-input {
+  width: 100%;
+  background: var(--bg-char);
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 5px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--bone);
+  outline: none;
+}
+
+.kiln-schema-panel__search-input:focus {
+  border-color: var(--verdigris);
+}
+
+.kiln-schema-panel__search-input::placeholder {
+  color: var(--text-floor);
+}
+
+/* Format filter tabs */
+.kiln-schema-panel__tabs {
+  display: flex;
+  padding: 6px 12px;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-medium);
+}
+
+.kiln-schema-tab {
+  background: none;
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 3px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  cursor: pointer;
+}
+
+.kiln-schema-tab:hover {
+  border-color: var(--border-strong);
+  color: var(--bone);
+}
+
+.kiln-schema-tab--active {
+  border-color: var(--verdigris);
+  color: var(--verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+/* Schema list */
+.kiln-schema-panel__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.kiln-schema-panel__empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-floor);
+  line-height: 1.6;
+}
+
+.kiln-schema-panel__section-header {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-floor);
+  text-transform: uppercase;
+  padding: 8px 12px 4px;
+  border-top: 1px solid var(--border-medium);
+  margin-top: 4px;
+}
+
+.kiln-schema-panel__section-header:first-child {
+  border-top: none;
+  margin-top: 0;
+}
+
+/* Schema card */
+.kiln-schema-card {
+  margin: 2px 8px;
+  padding: 8px;
+  border-radius: 2px;
+  border-left: 2px solid var(--border-medium);
+  transition: background 150ms;
+}
+
+.kiln-schema-card:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Format accent borders */
+.kiln-schema-card--csv  { border-left-color: var(--verdigris); }
+.kiln-schema-card--tsv  { border-left-color: var(--verdigris); }
+.kiln-schema-card--json { border-left-color: var(--hazard); }
+.kiln-schema-card--jsonl { border-left-color: var(--hazard); }
+.kiln-schema-card--xml  { border-left-color: var(--ember); }
+
+.kiln-schema-card__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.kiln-schema-card__diamond {
+  font-size: 8px;
+  color: var(--text-floor);
+}
+
+.kiln-schema-card--csv .kiln-schema-card__diamond,
+.kiln-schema-card--tsv .kiln-schema-card__diamond { color: var(--verdigris); }
+.kiln-schema-card--json .kiln-schema-card__diamond,
+.kiln-schema-card--jsonl .kiln-schema-card__diamond { color: var(--hazard); }
+.kiln-schema-card--xml .kiln-schema-card__diamond { color: var(--ember); }
+
+.kiln-schema-card__name {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bone);
+  flex: 1;
+}
+
+.kiln-schema-card__count {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+}
+
+.kiln-schema-card__meta {
+  padding-left: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  line-height: 1.5;
+}
+
+.kiln-schema-card__path {
+  opacity: 0.7;
+}
+
+.kiln-schema-card__format {
+  color: var(--text-floor);
+}
+
+.kiln-schema-card__sep {
+  color: var(--border-medium);
+}
+
+.kiln-schema-card__usage {
+  color: var(--text-floor);
+}
+
+.kiln-schema-card__desc {
+  padding: 4px 14px 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  font-style: italic;
+  opacity: 0.8;
+}
+
+/* Field list */
+.kiln-field-list {
+  padding: 4px 0 2px;
+}
+
+.kiln-field-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  line-height: 1.6;
+}
+
+.kiln-field__prefix {
+  color: var(--border-medium);
+  user-select: none;
+}
+
+.kiln-field__name {
+  color: var(--bone);
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+.kiln-field__type {
+  padding: 0 3px;
+  border-radius: 1px;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.kiln-field__type--str   { color: var(--bone); background: rgba(255,255,255,0.06); }
+.kiln-field__type--int   { color: var(--verdigris); background: rgba(67,179,174,0.1); }
+.kiln-field__type--float { color: var(--verdigris); background: rgba(67,179,174,0.1); }
+.kiln-field__type--bool  { color: var(--hazard); background: rgba(230,126,34,0.1); }
+.kiln-field__type--date  { color: var(--phosphor); background: rgba(57,255,20,0.08); }
+.kiln-field__type--dt    { color: var(--phosphor); background: rgba(57,255,20,0.08); }
+.kiln-field__type--obj   { color: var(--text-floor); background: rgba(255,255,255,0.04); }
+.kiln-field__type--arr   { color: var(--text-floor); background: rgba(255,255,255,0.04); }
+
+.kiln-field__nullable {
+  font-size: 8px;
+  font-weight: 600;
+}
+
+.kiln-field__nullable--no  { color: var(--oxide-red); }
+.kiln-field__nullable--yes { color: var(--text-floor); }
+
+.kiln-field__tag {
+  padding: 0 3px;
+  border-radius: 1px;
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.kiln-field__tag--attr {
+  color: var(--ember);
+  background: rgba(183, 65, 14, 0.1);
+}
+
+.kiln-field__tag--enum {
+  color: var(--hazard);
+  background: rgba(230, 126, 34, 0.1);
+}
+
+.kiln-field__tag--children {
+  color: var(--text-floor);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.kiln-field__desc {
+  color: var(--text-floor);
+  font-style: italic;
+  opacity: 0.7;
+  font-size: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Bottom actions */
+.kiln-schema-panel__actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-medium);
+}
+
+.kiln-schema-panel__action-btn {
+  flex: 1;
+  background: var(--bg-char);
+  border: 1px solid var(--border-medium);
+  border-radius: 2px;
+  padding: 5px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  cursor: pointer;
+  text-align: center;
+}
+
+.kiln-schema-panel__action-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--bone);
+}
+
+.kiln-schema-panel__action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* ── 7. Canvas panel ───────────────────────────────────────────────────────
    Infinite world-space viewport. Phase 3 adds CSS transform for pan/zoom.
    Visual layers: dot grid → noise → scanlines → SVG connectors → nodes.

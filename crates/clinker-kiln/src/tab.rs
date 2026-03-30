@@ -116,6 +116,42 @@ impl TabEntry {
         }
     }
 
+    /// Create a new untitled tab pre-loaded with given YAML content.
+    ///
+    /// Used for template instantiation — the tab opens dirty (unsaved)
+    /// with the template content ready for editing.
+    pub fn new_from_yaml(existing_tabs: &[TabEntry], yaml: String) -> Self {
+        let untitled_count = existing_tabs
+            .iter()
+            .filter(|t| t.file_path.is_none())
+            .count();
+
+        let name = if untitled_count == 0 {
+            "untitled.yaml".to_string()
+        } else {
+            format!("untitled-{}.yaml", untitled_count + 1)
+        };
+
+        let (config, errors) = match parse_yaml(&yaml) {
+            Ok(c) => (Some(c), Vec::new()),
+            Err(e) => (None, e),
+        };
+
+        Self {
+            id: TabId::new(),
+            file_path: None,
+            untitled_name: Some(name),
+            content_hash: None,
+            snapshot: TabSnapshot {
+                yaml_text: yaml,
+                pipeline: config,
+                parse_errors: errors,
+                edit_source: EditSource::None,
+                selected_stage: None,
+            },
+        }
+    }
+
     /// Create a tab pre-loaded with demo YAML.
     pub fn new_demo(yaml: &str) -> Self {
         let (config, errors) = match parse_yaml(yaml) {

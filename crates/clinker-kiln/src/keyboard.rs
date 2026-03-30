@@ -1,6 +1,7 @@
 /// Global keyboard shortcut handler.
 ///
 /// Spec §F6: Ctrl+N/O/S/Shift+S/W/Q/Tab/Shift+Tab/1-9.
+/// Spec §S5.3: Ctrl+Shift+F (search), Ctrl+Shift+E (schemas), Ctrl+Shift+N (templates).
 /// Attached at the AppShell level to capture shortcuts regardless of focus.
 
 use dioxus::prelude::*;
@@ -8,7 +9,7 @@ use dioxus::prelude::*;
 use crate::components::confirm_dialog::PendingConfirm;
 use crate::components::toast::{toast_error, toast_success, ToastState};
 use crate::file_ops;
-use crate::state::TabManagerState;
+use crate::state::{LeftPanel, TabManagerState};
 use crate::sync::serialize_yaml;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
@@ -22,6 +23,35 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
     let key = event.key();
 
     match key {
+        // Ctrl+Shift+F — Toggle search panel
+        Key::Character(ref c) if c == "F" && event.modifiers().shift() => {
+            let current = (tab_mgr.left_panel)();
+            tab_mgr.left_panel.set(if current == LeftPanel::Search {
+                LeftPanel::None
+            } else {
+                LeftPanel::Search
+            });
+            true
+        }
+
+        // Ctrl+Shift+E — Toggle schema panel
+        Key::Character(ref c) if c == "E" && event.modifiers().shift() => {
+            let current = (tab_mgr.left_panel)();
+            tab_mgr.left_panel.set(if current == LeftPanel::Schemas {
+                LeftPanel::None
+            } else {
+                LeftPanel::Schemas
+            });
+            true
+        }
+
+        // Ctrl+Shift+N — Template gallery
+        Key::Character(ref c) if c == "N" && event.modifiers().shift() => {
+            let current = (tab_mgr.show_template_gallery)();
+            tab_mgr.show_template_gallery.set(!current);
+            true
+        }
+
         // Ctrl+N — New untitled tab
         Key::Character(ref c) if c == "n" && !event.modifiers().shift() => {
             let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());

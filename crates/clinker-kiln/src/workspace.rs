@@ -43,9 +43,25 @@ pub struct PipelineDiscovery {
     pub exclude: Vec<String>,
 }
 
+/// Schema configuration from `[schemas]` in kiln.toml.
+///
+/// Spec §S3.8: directory for `.schema.yaml` files, inference sample size.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaConfig {
-    pub path: Option<String>,
+    /// Schema file directory (default: "schemas").
+    #[serde(default = "default_schema_dir")]
+    pub directory: String,
+    /// Number of rows to sample during schema inference (default: 1000).
+    #[serde(default = "default_infer_sample_rows")]
+    pub infer_sample_rows: usize,
+}
+
+fn default_schema_dir() -> String {
+    "schemas".to_string()
+}
+
+fn default_infer_sample_rows() -> usize {
+    1000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,6 +88,20 @@ pub struct WorkspaceState {
     pub pipelines: HashMap<String, PipelineEditorState>,
     #[serde(default)]
     pub last_open_directory: Option<String>,
+    /// Search history and saved queries (spec §S2.6).
+    #[serde(default)]
+    pub search: Option<SearchState>,
+}
+
+/// Persisted search state — recent and saved queries.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SearchState {
+    /// Last 10 search queries.
+    #[serde(default)]
+    pub recent: Vec<crate::search::SearchHistoryEntry>,
+    /// User-saved queries with labels.
+    #[serde(default)]
+    pub saved: Vec<crate::search::SearchHistoryEntry>,
 }
 
 fn default_version() -> u32 {
@@ -159,6 +189,49 @@ impl Workspace {
             .unwrap_or(path)
             .display()
             .to_string()
+    }
+
+    /// Schema directory path, resolved from manifest or default.
+    pub fn schema_dir(&self) -> String {
+        self.manifest
+            .schema
+            .as_ref()
+            .map(|s| s.directory.clone())
+            .unwrap_or_else(|| "schemas".to_string())
+    }
+
+    /// Pipeline include globs from manifest.
+    pub fn pipeline_include_globs(&self) -> Vec<String> {
+        self.manifest
+            .pipelines
+            .as_ref()
+            .map(|p| p.include.clone())
+            .unwrap_or_default()
+    }
+
+    /// Pipeline exclude globs from manifest.
+    pub fn pipeline_exclude_globs(&self) -> Vec<String> {
+        self.manifest
+            .pipelines
+            .as_ref()
+            .map(|p| p.exclude.clone())
+            .unwrap_or_default()
+    }
+
+    /// Build the schema index for this workspace.
+    ///
+    /// Discovers `.schema.yaml` files, parses them, resolves pipeline
+    /// references, and builds a `SchemaIndex`. Returns the index and
+    /// any parse errors encountered.
+    pub fn build_schema_index(
+        &self,
+    ) -> (clinker_schema::SchemaIndex, Vec<(PathBuf, clinker_schema::SchemaParseError)>) {
+        clinker_schema::build_workspace_schema_index(
+            &self.root,
+            &self.schema_dir(),
+            &self.pipeline_include_globs(),
+            &self.pipeline_exclude_globs(),
+        )
     }
 }
 
@@ -353,6 +426,7 @@ pub fn build_state_snapshot(
         }),
         pipelines: HashMap::new(),
         last_open_directory: None,
+        search: None,
     }
 }
 

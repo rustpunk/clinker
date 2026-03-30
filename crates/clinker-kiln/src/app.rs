@@ -14,8 +14,11 @@ use crate::components::{
     canvas::CanvasPanel,
     inspector::InspectorPanel,
     run_log::RunLogDrawer,
+    schema_panel::SchemaPanel,
     schematics::SchematicsPanel,
+    search_panel::SearchPanel,
     tab_bar::TabBar,
+    template_gallery::TemplateGallery,
     title_bar::TitleBar,
     toast::ToastOverlay,
     welcome_screen::WelcomeScreen,
@@ -23,9 +26,11 @@ use crate::components::{
 };
 use crate::components::confirm_dialog::{ConfirmAction, ConfirmDialog, PendingConfirm};
 use crate::components::toast::ToastState;
+use clinker_schema::SchemaIndex;
+
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
-use crate::state::{AppState, LayoutPreset, TabManagerState, use_app_state};
+use crate::state::{AppState, LayoutPreset, LeftPanel, TabManagerState, use_app_state};
 use crate::sync::{parse_yaml, serialize_yaml, EditSource};
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
@@ -68,6 +73,24 @@ pub fn AppShell() -> Element {
     let workspace: Signal<Option<workspace::Workspace>> = use_signal(|| {
         session_data.write().as_mut().and_then(|s| s.workspace.take())
     });
+
+    // ── Left panel + schema index + template gallery ──────────────────────
+    let left_panel: Signal<LeftPanel> = use_signal(|| LeftPanel::None);
+    let mut schema_index: Signal<SchemaIndex> = use_signal(SchemaIndex::default);
+    let show_template_gallery: Signal<bool> = use_signal(|| false);
+
+    // ── Schema index: rebuild when workspace changes ─────────────────────
+    {
+        use_effect(move || {
+            let ws = (workspace)();
+            if let Some(ref ws) = ws {
+                let (index, _errors) = ws.build_schema_index();
+                schema_index.set(index);
+            } else {
+                schema_index.set(SchemaIndex::default());
+            }
+        });
+    }
 
     // ── Toast + confirm dialog ───────────────────────────────────────────
     let toast_message: Signal<Option<ToastState>> = use_signal(|| None);
@@ -151,6 +174,9 @@ pub fn AppShell() -> Element {
         active_tab_id,
         recent_files,
         workspace,
+        left_panel,
+        schema_index,
+        show_template_gallery,
     });
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
@@ -161,6 +187,9 @@ pub fn AppShell() -> Element {
         active_tab_id,
         recent_files,
         workspace,
+        left_panel,
+        schema_index,
+        show_template_gallery,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
@@ -261,6 +290,11 @@ pub fn AppShell() -> Element {
             RunLogDrawer {}
             ToastOverlay {}
 
+            // ── Template gallery overlay ──────────────────────────────────
+            if (show_template_gallery)() {
+                TemplateGallery {}
+            }
+
             if let Some(pending) = (pending_confirm)() {
                 ConfirmDialog {
                     pending: pending.clone(),
@@ -297,11 +331,24 @@ fn ActiveTabContent() -> Element {
     let state = use_app_state();
     let layout = state.layout;
     let selected_stage = state.selected_stage;
+    let mut tab_mgr = use_context::<TabManagerState>();
+    let left_panel = (tab_mgr.left_panel)();
 
     rsx! {
         div {
             class: "kiln-main",
             "data-layout": layout.read().as_data_attr(),
+
+            // ── Left panel slot (280px, shared between Search and Schemas) ──
+            match left_panel {
+                LeftPanel::Search => rsx! {
+                    SearchPanel {}
+                },
+                LeftPanel::Schemas => rsx! {
+                    SchemaPanel {}
+                },
+                LeftPanel::None => rsx! {},
+            }
 
             CanvasPanel {}
 
