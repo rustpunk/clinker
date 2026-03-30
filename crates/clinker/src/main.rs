@@ -6,6 +6,7 @@ use clap::Parser;
 use clinker_core::config;
 use clinker_core::error::PipelineError;
 use clinker_core::executor::PipelineExecutor;
+use clinker_core::pipeline::memory::parse_memory_limit_bytes;
 use clinker_format::FormatReader;
 
 /// CXL streaming ETL engine.
@@ -14,6 +15,26 @@ use clinker_format::FormatReader;
 pub struct Cli {
     /// Path to the pipeline YAML configuration file
     pub config: PathBuf,
+
+    /// Memory budget (supports K/M/G suffixes), default 256M
+    #[arg(long)]
+    pub memory_limit: Option<String>,
+
+    /// Thread pool size, default num_cpus
+    #[arg(long)]
+    pub threads: Option<usize>,
+
+    /// Max DLQ records before abort, 0 = unlimited
+    #[arg(long, default_value = "0")]
+    pub error_threshold: u64,
+
+    /// Pipeline batch_id, default generated UUID v7
+    #[arg(long)]
+    pub batch_id: Option<String>,
+
+    /// CXL module search path
+    #[arg(long, default_value = "./rules/")]
+    pub rules_path: PathBuf,
 
     /// Print execution plan and exit (no data read)
     #[arg(long)]
@@ -27,9 +48,35 @@ pub struct Cli {
     #[arg(long)]
     pub quiet: bool,
 
+    /// Allow output file overwrite
+    #[arg(long)]
+    pub force: bool,
+
+    /// Base directory for relative path resolution
+    #[arg(long)]
+    pub base_dir: Option<PathBuf>,
+
+    /// Permit absolute paths in YAML config
+    #[arg(long)]
+    pub allow_absolute_paths: bool,
+
     /// Log level: error, warn, info, debug, trace
     #[arg(long, default_value = "info")]
     pub log_level: String,
+}
+
+impl Cli {
+    /// Resolve memory limit from CLI flag or default (256MB).
+    pub fn memory_limit_bytes(&self) -> u64 {
+        parse_memory_limit_bytes(self.memory_limit.as_deref().or(Some("256M")))
+    }
+
+    /// Resolve batch_id from CLI flag or generate UUID v7.
+    pub fn resolved_batch_id(&self) -> String {
+        self.batch_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
+    }
 }
 
 fn main() -> ExitCode {
@@ -61,7 +108,6 @@ fn run(cli: &Cli) -> Result<u8, PipelineError> {
     let pipeline_config = config::load_config(&cli.config)?;
 
     if cli.explain {
-        // Compile execution plan without reading any data
         let plan_output = PipelineExecutor::explain(&pipeline_config)?;
         println!("{}", plan_output);
         return Ok(0);
@@ -119,7 +165,7 @@ fn run(cli: &Cli) -> Result<u8, PipelineError> {
         counters.total_count, counters.ok_count, counters.dlq_count
     );
 
-    // Exit codes per spec SS10.2
+    // Exit codes per spec §10.2
     if counters.dlq_count > 0 {
         Ok(2) // Partial success
     } else {
@@ -149,5 +195,64 @@ mod tests {
     fn test_cli_log_level_default() {
         let cli = Cli::try_parse_from(["clinker", "pipeline.yaml"]).unwrap();
         assert_eq!(cli.log_level, "info");
+    }
+
+    // ── Phase 8 Task 8.4 gate tests ─────────────────────────────
+
+    #[test]
+    fn test_cli_memory_limit_suffix_k() {
+        let cli = Cli::try_parse_from(["clinker", "--memory-limit", "512K", "p.yaml"]).unwrap();
+        assert_eq!(cli.memory_limit_bytes(), 524288);
+    }
+
+    #[test]
+    fn test_cli_memory_limit_suffix_m() {
+        let cli = Cli::try_parse_from(["clinker", "--memory-limit", "256M", "p.yaml"]).unwrap();
+        assert_eq!(cli.memory_limit_bytes(), 268435456);
+    }
+
+    #[test]
+    fn test_cli_memory_limit_suffix_g() {
+        let cli = Cli::try_parse_from(["clinker", "--memory-limit", "2G", "p.yaml"]).unwrap();
+        assert_eq!(cli.memory_limit_bytes(), 2147483648);
+    }
+
+    #[test]
+    fn test_cli_memory_limit_bare_bytes() {
+        let cli = Cli::try_parse_from(["clinker", "--memory-limit", "1000000", "p.yaml"]).unwrap();
+        assert_eq!(cli.memory_limit_bytes(), 1000000);
+    }
+
+    #[test]
+    fn test_cli_default_memory_limit() {
+        let cli = Cli::try_parse_from(["clinker", "p.yaml"]).unwrap();
+        assert_eq!(cli.memory_limit_bytes(), 256 * 1024 * 1024); // 256MB
+    }
+
+    #[test]
+    fn test_cli_error_threshold_zero() {
+        let cli = Cli::try_parse_from(["clinker", "p.yaml"]).unwrap();
+        assert_eq!(cli.error_threshold, 0); // 0 = unlimited
+    }
+
+    #[test]
+    fn test_cli_batch_id_default_uuid() {
+        let cli = Cli::try_parse_from(["clinker", "p.yaml"]).unwrap();
+        assert!(cli.batch_id.is_none());
+        let id = cli.resolved_batch_id();
+        // Should be a valid UUID
+        uuid::Uuid::parse_str(&id).expect("default batch_id should be valid UUID");
+    }
+
+    #[test]
+    fn test_cli_quiet_flag() {
+        let cli = Cli::try_parse_from(["clinker", "--quiet", "p.yaml"]).unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_force_flag() {
+        let cli = Cli::try_parse_from(["clinker", "--force", "p.yaml"]).unwrap();
+        assert!(cli.force);
     }
 }

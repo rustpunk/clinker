@@ -10,4 +10,5 @@ clinker-format = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+uuid = { version = "1", features = ["v7"] }
 miette = { workspace = true }

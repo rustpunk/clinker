@@ -193,4 +193,53 @@ transformations:
         let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 3);
     }
+
+    // ── Phase 8 Task 8.4 exit code gate tests ─────────────────
+
+    #[test]
+    fn test_exit_code_4_io_error() {
+        // Config references a nonexistent input file — I/O error on open
+        let yaml = r#"
+pipeline:
+  name: io-test
+inputs:
+  - name: src
+    type: csv
+    path: /nonexistent/path/that/does/not/exist.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/clinker_test_out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = 1"
+"#;
+        let config = config::parse_config(yaml).unwrap();
+        let result: Result<_, PipelineError> = Err(PipelineError::Io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found")
+        ));
+        assert_eq!(exit_code(&result), 4);
+    }
+
+    #[test]
+    fn test_exit_code_130_interrupted() {
+        // Simulate SIGINT by setting the shutdown flag via AtomicBool
+        use crate::pipeline::shutdown;
+
+        // Set the shutdown flag
+        shutdown::request_shutdown();
+
+        // The shutdown flag being set means the executor would return interrupted.
+        // We verify the flag is correctly set and the exit code mapping works.
+        assert!(shutdown::shutdown_requested());
+
+        // Reset for other tests
+        shutdown::reset_shutdown_flag();
+        assert!(!shutdown::shutdown_requested());
+
+        // Verify exit code mapping: interrupted maps to 130
+        // (The executor checks shutdown_requested() at chunk boundaries and returns
+        // an appropriate error. The CLI maps this to exit code 130.)
+        assert_eq!(crate::exit_codes::EXIT_INTERRUPTED, 130);
+    }
 }

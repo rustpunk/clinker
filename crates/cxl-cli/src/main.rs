@@ -29,13 +29,20 @@ enum Command {
         /// Path to the .cxl file
         file: String,
     },
-    /// Parse, type-check, and evaluate a .cxl file against a JSON record.
+    /// Evaluate a CXL expression against provided field values.
     Eval {
-        /// Path to the .cxl file
-        file: String,
-        /// JSON record to evaluate against
-        #[arg(long)]
-        record: String,
+        /// Path to a .cxl file (required unless -e is provided)
+        #[arg(required_unless_present = "expr")]
+        file: Option<String>,
+        /// Inline CXL expression to evaluate
+        #[arg(short = 'e', long)]
+        expr: Option<String>,
+        /// JSON record to evaluate against (mutually exclusive with --field)
+        #[arg(long, conflicts_with = "fields")]
+        record: Option<String>,
+        /// Field values as name=value pairs with auto-type inference
+        #[arg(long = "field")]
+        fields: Vec<String>,
     },
     /// Parse and pretty-print a .cxl file (canonical formatting).
     Fmt {
@@ -49,7 +56,7 @@ fn main() {
 
     match cli.command {
         Command::Check { file } => cmd_check(&file),
-        Command::Eval { file, record } => cmd_eval(&file, &record),
+        Command::Eval { file, expr, record, fields } => cmd_eval(file.as_deref(), expr.as_deref(), record.as_deref(), &fields),
         Command::Fmt { file } => cmd_fmt(&file),
     }
 }
@@ -110,36 +117,53 @@ fn cmd_check(file: &str) {
     }
 }
 
-fn cmd_eval(file: &str, record_json: &str) {
-    let source = match std::fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read '{}': {}", file, e);
-            process::exit(2);
-        }
-    };
-
-    // Parse the JSON record
-    let json_value: serde_json::Value = match serde_json::from_str(record_json) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: invalid JSON record: {}", e);
-            process::exit(2);
-        }
-    };
-
-    let record_map = match json_value {
-        serde_json::Value::Object(map) => {
-            let mut hm = HashMap::new();
-            for (k, v) in map {
-                hm.insert(k, json_to_value(v));
+fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, fields: &[String]) {
+    // Get CXL source from file or inline expression
+    let source = if let Some(expr) = expr {
+        expr.to_string()
+    } else if let Some(file) = file {
+        match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", file, e);
+                process::exit(2);
             }
-            hm
         }
-        _ => {
-            eprintln!("error: --record must be a JSON object");
-            process::exit(2);
+    } else {
+        eprintln!("error: provide a file path or use -e for inline expression");
+        process::exit(2);
+    };
+
+    let source_name = file.unwrap_or("<inline>");
+
+    // Build field map from --record JSON or --field key=value pairs
+    let record_map: HashMap<String, Value> = if let Some(json) = record_json {
+        let json_value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: invalid JSON record: {}", e);
+                process::exit(2);
+            }
+        };
+        match json_value {
+            serde_json::Value::Object(map) => {
+                map.into_iter().map(|(k, v)| (k, json_to_value(v))).collect()
+            }
+            _ => {
+                eprintln!("error: --record must be a JSON object");
+                process::exit(2);
+            }
         }
+    } else if !fields.is_empty() {
+        fields.iter().map(|f| {
+            let (name, value) = f.split_once('=').unwrap_or_else(|| {
+                eprintln!("error: --field must be name=value, got '{}'", f);
+                process::exit(2);
+            });
+            (name.to_string(), parse_field_value(value))
+        }).collect()
+    } else {
+        HashMap::new()
     };
 
     let field_names: Vec<String> = record_map.keys().cloned().collect();
@@ -181,7 +205,7 @@ fn cmd_eval(file: &str, record_json: &str) {
         pipeline_name: "cxl-eval".into(),
         pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
         pipeline_counters: clinker_record::PipelineCounters::default(),
-        source_file: std::sync::Arc::from(file),
+        source_file: std::sync::Arc::from(source_name),
         source_row: 1,
         pipeline_vars: indexmap::IndexMap::new(),
     };
@@ -201,6 +225,30 @@ fn cmd_eval(file: &str, record_json: &str) {
             process::exit(1);
         }
     }
+}
+
+/// Parse a field value string, inferring type: integer → float → bool → null → string.
+fn parse_field_value(s: &str) -> Value {
+    // Try integer
+    if let Ok(n) = s.parse::<i64>() {
+        return Value::Integer(n);
+    }
+    // Try float
+    if let Ok(f) = s.parse::<f64>() {
+        return Value::Float(f);
+    }
+    // Try bool
+    match s {
+        "true" => return Value::Bool(true),
+        "false" => return Value::Bool(false),
+        _ => {}
+    }
+    // Try null
+    if s == "null" {
+        return Value::Null;
+    }
+    // Default: string
+    Value::String(s.into())
 }
 
 fn cmd_fmt(file: &str) {
@@ -396,5 +444,110 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
             s.push_str(" }");
             s
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_field_value_integer() {
+        assert_eq!(parse_field_value("42"), Value::Integer(42));
+        assert_eq!(parse_field_value("-5"), Value::Integer(-5));
+        assert_eq!(parse_field_value("0"), Value::Integer(0));
+    }
+
+    #[test]
+    fn test_parse_field_value_float() {
+        assert_eq!(parse_field_value("3.14"), Value::Float(3.14));
+        assert_eq!(parse_field_value("-0.5"), Value::Float(-0.5));
+    }
+
+    #[test]
+    fn test_parse_field_value_bool() {
+        assert_eq!(parse_field_value("true"), Value::Bool(true));
+        assert_eq!(parse_field_value("false"), Value::Bool(false));
+    }
+
+    #[test]
+    fn test_parse_field_value_null() {
+        assert_eq!(parse_field_value("null"), Value::Null);
+    }
+
+    #[test]
+    fn test_parse_field_value_string() {
+        assert_eq!(parse_field_value("hello"), Value::String("hello".into()));
+        assert_eq!(parse_field_value("hello world"), Value::String("hello world".into()));
+    }
+
+    // Note: cmd_check/cmd_eval/cmd_fmt call process::exit() and cannot be tested
+    // as unit tests. The logic is tested via direct evaluator calls below.
+
+    #[test]
+    fn test_cxl_eval_simple_expr_via_evaluator() {
+        // Test the evaluation path directly without process::exit
+        let source = "emit result = 1 + 2";
+        let parsed = cxl::parser::Parser::parse(source);
+        assert!(parsed.errors.is_empty());
+
+        let resolved = cxl::resolve::resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
+        let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
+
+        let ctx = EvalContext {
+            clock: Box::new(WallClock),
+            pipeline_start_time: chrono::Utc::now().naive_utc(),
+            pipeline_name: "test".into(),
+            pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
+            pipeline_counters: clinker_record::PipelineCounters::default(),
+            source_file: std::sync::Arc::from("test"),
+            source_row: 1,
+            pipeline_vars: indexmap::IndexMap::new(),
+        };
+
+        let resolver = HashMapResolver::new(HashMap::new());
+        let output = cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+        assert_eq!(output.get("result"), Some(&Value::Integer(3)));
+    }
+
+    #[test]
+    fn test_cxl_eval_with_fields_via_evaluator() {
+        let source = "emit total = Price * Qty";
+        let fields: HashMap<String, Value> = [
+            ("Price".to_string(), Value::Float(10.5)),
+            ("Qty".to_string(), Value::Integer(3)),
+        ].into();
+        let field_refs: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+
+        let parsed = cxl::parser::Parser::parse(source);
+        assert!(parsed.errors.is_empty());
+
+        let resolved = cxl::resolve::resolve_program(parsed.ast, &field_refs, parsed.node_count).unwrap();
+        let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
+
+        let ctx = EvalContext {
+            clock: Box::new(WallClock),
+            pipeline_start_time: chrono::Utc::now().naive_utc(),
+            pipeline_name: "test".into(),
+            pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
+            pipeline_counters: clinker_record::PipelineCounters::default(),
+            source_file: std::sync::Arc::from("test"),
+            source_row: 1,
+            pipeline_vars: indexmap::IndexMap::new(),
+        };
+
+        let resolver = HashMapResolver::new(fields);
+        let output = cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+        assert_eq!(output.get("total"), Some(&Value::Float(31.5)));
+    }
+
+    #[test]
+    fn test_cxl_fmt_canonical_via_parser() {
+        let source = "emit   x  =   1 +  2";
+        let parsed = cxl::parser::Parser::parse(source);
+        assert!(parsed.errors.is_empty());
+        // format_statement should normalize whitespace
+        let formatted = format_statement(&parsed.ast.statements[0]);
+        assert!(formatted.contains("emit x = 1 + 2"));
     }
 }
