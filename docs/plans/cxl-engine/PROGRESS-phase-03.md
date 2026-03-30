@@ -4,14 +4,14 @@
 **Validation:** docs/plans/cxl-engine/VALIDATION-phase-03.md (READY — all blockers resolved)
 **Started:** 2026-03-29
 **Last updated:** 2026-03-29
-**Status:** 🔄 In Progress
+**Status:** ✅ Complete
 
 ---
 
 ## Current state
 
-**Active task:** [3.4] Core Evaluator + All Built-in Methods + cxl-cli
-**Completed:** 3 of 4 tasks
+**Active task:** none — Phase 3 complete
+**Completed:** 4 of 4 tasks
 **Blocked:** none
 
 ---
@@ -84,13 +84,13 @@
 
 ---
 
-### 🔄 [3.4] Core Evaluator + All Built-in Methods + cxl-cli  ← ACTIVE
+### ✅ [3.4] Core Evaluator + All Built-in Methods + cxl-cli  ← COMPLETE
 **Sub-tasks:**
-- [ ] [3.4.1] Define EvalError/EvalErrorKind, Clock trait, EvalContext struct
-- [ ] [3.4.2] Core evaluator: binary ops, null propagation, let/emit, match, if/then/else, coalesce, now
-- [ ] [3.4.3] All ~60 built-in methods (string, path, array, numeric, date, conversion, introspection, debug)
-- [ ] [3.4.4] cxl-cli crate: check, eval, fmt subcommands
-- [ ] [3.4.5] Write all 19 gate tests
+- [x] [3.4.1] Define EvalError/EvalErrorKind, Clock trait, EvalContext struct
+- [x] [3.4.2] Core evaluator: binary ops, null propagation, let/emit, match, if/then/else, coalesce, now
+- [x] [3.4.3] All ~60 built-in methods (string, path, array, numeric, date, conversion, introspection, debug)
+- [x] [3.4.4] cxl-cli crate: check, eval, fmt subcommands
+- [x] [3.4.5] Write all 19 gate tests (20 total including extras)
 
 **Gate tests that must pass before Phase 4 unlocks:**
 - `test_eval_arithmetic_null_propagation` — Null + 1 → Null; 2 + 3 → 5
@@ -115,7 +115,7 @@
 
 **Done when:** All 19 gate tests pass; ~60 built-in methods work; cxl check/eval/fmt operational
 **Commit:** `feat(cxl): implement evaluator with ~60 built-in methods and cxl-cli`
-**Commit ID:** --
+**Commit ID:** 1fd756f
 
 ---
 
@@ -174,6 +174,7 @@
 | 3.1 | FieldResolver + WindowContext Traits | feat(cxl): add FieldResolver and WindowContext traits with HashMapResolver test double | 8272050 | 2026-03-29 |
 | 3.2 | Resolver Pass (Phase B) | feat(cxl): add NodeId to AST, implement Phase B resolver pass | 128b4f3 | 2026-03-29 |
 | 3.3 | Type Checker (Phase C) | feat(cxl): implement two-pass type checker with constraint inference | 284c380 | 2026-03-29 |
+| 3.4 | Core Evaluator + Built-ins + cxl-cli | feat(cxl): implement evaluator with ~60 built-in methods and cxl-cli | 1fd756f | 2026-03-29 |
 
 ---
 
