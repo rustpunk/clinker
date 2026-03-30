@@ -4,6 +4,7 @@ mod app;
 mod components;
 mod cxl_bridge;
 mod demo;
+mod notes;
 mod pipeline_view;
 mod state;
 mod sync;

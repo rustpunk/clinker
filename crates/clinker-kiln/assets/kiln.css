@@ -1040,7 +1040,64 @@ html, body {
   font-style: italic;
 }
 
-/* ── 18. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+/* ── 18. Notes drawer content ───────────────────────────────────────────────
+   Stage-level note and field-level annotations. Iron accent.
+   Spec §A5A.2–A5A.4.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-notes-section {
+  margin-bottom: 12px;
+}
+
+.kiln-notes-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.kiln-notes-section-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-notes-count {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+  margin-left: auto;
+}
+
+.kiln-notes-block {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  padding: 8px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-bone);
+  white-space: pre-wrap;
+}
+
+.kiln-notes-annotation {
+  margin-bottom: 8px;
+}
+
+.kiln-notes-field-key {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 4px;
+}
+
+/* ── 19. Scrollbar theming (WebKit) ─────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {

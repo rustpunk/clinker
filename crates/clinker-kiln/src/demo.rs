@@ -1,10 +1,13 @@
 /// Default pipeline YAML loaded when the app starts (no file selected).
 ///
-/// This is a realistic `PipelineConfig`-compatible YAML that exercises the
-/// full config schema: inputs, transforms with CXL expressions, outputs,
-/// and error handling.
+/// Includes `_notes` metadata to exercise the Notes drawer.
 pub const DEFAULT_YAML: &str = r#"pipeline:
   name: customer_etl
+
+_notes:
+  pipeline: |
+    Customer ETL pipeline for the marketing analytics team.
+    Runs nightly via cron. Output feeds the Looker dashboard.
 
 inputs:
   - name: customers
@@ -12,18 +15,32 @@ inputs:
     path: ./data/customers.csv
     options:
       has_header: true
+    _notes:
+      stage: Source data from the CRM export.
+      fields:
+        path: "Updated quarterly when the CRM team changes export locations."
 
 transformations:
   - name: active_only
     description: Filter to active customers
     cxl: |
       emit status_ok = status == "active"
+    _notes:
+      stage: |
+        Active-only filtering was added in Q3 2025 to exclude
+        churned accounts from the marketing dataset.
+      fields:
+        cxl: "The status field uses lowercase string values."
 
   - name: enrich
     description: Compute derived fields
     cxl: |
       emit full_name = first_name + " " + last_name
       emit email_lower = lower(email)
+    _notes:
+      stage: Derived fields for the email personalization service.
+      fields:
+        cxl: "full_name format must be 'First Last' — no middle names."
 
 outputs:
   - name: results

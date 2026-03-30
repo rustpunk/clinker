@@ -15,6 +15,9 @@ pub struct PipelineConfig {
     pub transformations: Vec<TransformEntry>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
+    /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
+    #[serde(default, rename = "_notes")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// Pipeline-level metadata and global settings.
@@ -69,6 +72,9 @@ pub struct InputConfig {
     pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(flatten)]
     pub format: InputFormat,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// Adjacently tagged format enum for inputs.
@@ -170,6 +176,9 @@ pub struct OutputConfig {
     pub preserve_nulls: Option<bool>,
     #[serde(flatten)]
     pub format: OutputFormat,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// Adjacently tagged format enum for outputs.
@@ -394,6 +403,9 @@ pub struct TransformConfig {
     pub local_window: Option<serde_json::Value>,
     pub log: Option<Vec<LogDirective>>,
     pub validations: Option<Vec<ValidationEntry>>,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// A declarative validation attached to a transform.
