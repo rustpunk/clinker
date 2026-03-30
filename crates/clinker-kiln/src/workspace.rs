@@ -400,3 +400,89 @@ pub fn open_workspace_dialog() -> Option<Workspace> {
         None
     }
 }
+
+// ── Session restore (single entry point for app startup) ────────────────
+
+use crate::tab::TabId;
+
+/// Everything needed to initialize the app from a restored session.
+pub struct SessionInit {
+    pub tabs: Vec<TabEntry>,
+    pub active_tab_id: Option<TabId>,
+    pub workspace: Option<Workspace>,
+    pub layout: LayoutPreset,
+}
+
+/// Restore the previous session on app startup.
+///
+/// Priority order:
+/// 1. Last-used workspace (from `~/.local/share/clinker-kiln/last-workspace.json`)
+/// 2. Workspace detected from CWD (ancestor walk for `kiln.toml`)
+/// 3. Defaults (empty tabs, no workspace, Hybrid layout)
+pub fn restore_session() -> SessionInit {
+    // 1. Try last-used workspace
+    if let Some(init) = try_restore_from_last_workspace() {
+        return init;
+    }
+
+    // 2. Try CWD workspace detection
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(ws_root) = detect_workspace(&cwd) {
+            if let Some(init) = try_restore_from_workspace_root(&ws_root) {
+                return init;
+            }
+        }
+    }
+
+    // 3. Defaults
+    SessionInit {
+        tabs: Vec::new(),
+        active_tab_id: None,
+        workspace: None,
+        layout: LayoutPreset::Hybrid,
+    }
+}
+
+fn try_restore_from_last_workspace() -> Option<SessionInit> {
+    let ws_root = load_last_workspace()?;
+    try_restore_from_workspace_root(&ws_root)
+}
+
+fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
+    let ws = load_workspace(ws_root)?;
+
+    // Extract layout before moving ws
+    let layout = ws.state.layout.as_ref()
+        .map(|ls| parse_layout_preset(&ls.preset))
+        .unwrap_or(LayoutPreset::Hybrid);
+
+    let (restored_tabs, active_path) = restore_tabs(&ws.state);
+
+    if restored_tabs.is_empty() {
+        return Some(SessionInit {
+            tabs: Vec::new(),
+            active_tab_id: None,
+            workspace: Some(ws),
+            layout,
+        });
+    }
+
+    // Find the active tab by matching the saved active path
+    let active_tab_id = active_path
+        .as_ref()
+        .and_then(|ap| {
+            restored_tabs.iter().find(|t| {
+                t.file_path.as_ref()
+                    .map(|p| p.display().to_string())
+                    .as_deref() == Some(ap)
+            }).map(|t| t.id)
+        })
+        .or_else(|| restored_tabs.first().map(|t| t.id));
+
+    Some(SessionInit {
+        tabs: restored_tabs,
+        active_tab_id,
+        workspace: Some(ws),
+        layout,
+    })
+}

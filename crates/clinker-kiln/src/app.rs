@@ -45,35 +45,28 @@ pub fn AppShell() -> Element {
     let mut edit_source = use_signal(|| EditSource::None);
     let mut selected_stage = use_signal(|| None::<String>);
 
-    // ── Tab management (restore from last workspace if available) ────────
-    // Session restore runs once on mount via use_signal initializers.
-    // We compute the initial values eagerly in a non-hook closure.
-    let layout = use_signal(|| {
-        workspace::load_last_workspace()
-            .and_then(|root| workspace::load_workspace(&root))
-            .and_then(|ws| ws.state.layout.as_ref().map(|ls| workspace::parse_layout_preset(&ls.preset)))
-            .unwrap_or(LayoutPreset::Hybrid)
-    });
+    // ── Session restore (single call on first mount per use_signal) ─────
+    // restore_session() is called in the first use_signal closure. The result
+    // is cached — subsequent closures read from the same signal. On re-renders,
+    // use_signal closures don't re-execute, so disk I/O happens only once.
+    let mut session_data: Signal<Option<workspace::SessionInit>> =
+        use_signal(|| Some(workspace::restore_session()));
 
+    let layout = use_signal(|| {
+        session_data.peek().as_ref().map(|s| s.layout).unwrap_or(LayoutPreset::Hybrid)
+    });
     let mut tabs: Signal<Vec<TabEntry>> = use_signal(|| {
-        workspace::load_last_workspace()
-            .and_then(|root| workspace::load_workspace(&root))
-            .map(|ws| workspace::restore_tabs(&ws.state).0)
+        session_data.write().as_mut()
+            .map(|s| std::mem::take(&mut s.tabs))
             .unwrap_or_default()
     });
-
     let active_tab_id: Signal<Option<TabId>> = use_signal(|| {
-        // If we have restored tabs, activate the first one
-        let t = tabs.peek();
-        if t.is_empty() { None } else { Some(t[0].id) }
+        session_data.peek().as_ref().and_then(|s| s.active_tab_id)
     });
-
     let mut prev_tab_id: Signal<Option<TabId>> = use_signal(|| None);
     let recent_files = use_signal(load_recent_files);
-
     let workspace: Signal<Option<workspace::Workspace>> = use_signal(|| {
-        workspace::load_last_workspace()
-            .and_then(|root| workspace::load_workspace(&root))
+        session_data.write().as_mut().and_then(|s| s.workspace.take())
     });
 
     // ── Toast + confirm dialog ───────────────────────────────────────────
