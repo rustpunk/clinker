@@ -1,10 +1,10 @@
 use indexmap::IndexMap;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
@@ -16,7 +16,7 @@ pub struct PipelineConfig {
 }
 
 /// Pipeline-level metadata and global settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineMeta {
     pub name: String,
@@ -33,7 +33,7 @@ pub struct PipelineMeta {
 }
 
 /// Concurrency settings for parallel chunk processing.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     pub threads: Option<usize>,
@@ -41,7 +41,7 @@ pub struct ConcurrencyConfig {
 }
 
 /// Input source configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
     pub name: String,
@@ -53,7 +53,7 @@ pub struct InputConfig {
 }
 
 /// Format-specific input options.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputOptions {
     pub delimiter: Option<String>,
@@ -67,7 +67,7 @@ pub struct InputOptions {
 }
 
 /// Schema override for a named column.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaOverride {
     pub name: String,
@@ -76,7 +76,7 @@ pub struct SchemaOverride {
 }
 
 /// Output destination configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub name: String,
@@ -94,7 +94,7 @@ pub struct OutputConfig {
 }
 
 /// Format-specific output options.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputOptions {
     pub delimiter: Option<String>,
@@ -104,7 +104,7 @@ pub struct OutputOptions {
 }
 
 /// Sort field specification for output ordering.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SortField {
     pub field: String,
@@ -113,7 +113,7 @@ pub struct SortField {
 }
 
 /// Sort direction.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SortDirection {
     Asc,
@@ -125,7 +125,7 @@ fn default_sort_direction() -> SortDirection {
 }
 
 /// Supported format types.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FormatKind {
     Csv,
@@ -140,7 +140,7 @@ pub enum FormatKind {
 /// The `cxl` field contains the multi-line CXL source text.
 /// `local_window`, `log`, and `validations` are structurally present
 /// but processed in later phases (Phase 5, 10).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformConfig {
     pub name: String,
     pub description: Option<String>,
@@ -151,7 +151,7 @@ pub struct TransformConfig {
 }
 
 /// Error handling strategy and DLQ configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorHandlingConfig {
     #[serde(default = "default_strategy")]
@@ -171,7 +171,7 @@ impl Default for ErrorHandlingConfig {
 }
 
 /// Error handling strategy variants.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorStrategy {
     FailFast,
@@ -184,7 +184,7 @@ fn default_strategy() -> ErrorStrategy {
 }
 
 /// Dead-letter queue configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DlqConfig {
     pub path: Option<String>,
