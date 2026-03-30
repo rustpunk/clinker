@@ -166,6 +166,48 @@ pub fn AppShell() -> Element {
         });
     }
 
+    // ── Session persistence: save on quit + periodic autosave ─────────────
+    // use_drop fires when AppShell's scope drops (window close, app exit).
+    use_drop({
+        let tabs = tabs;
+        let workspace = workspace;
+        let active_tab_id = active_tab_id;
+        let layout = layout;
+        let run_log_expanded = run_log_expanded;
+        move || {
+            workspace::save_full_session(
+                &workspace.peek(),
+                &tabs.peek(),
+                *active_tab_id.peek(),
+                *layout.peek(),
+                *run_log_expanded.peek(),
+            );
+        }
+    });
+
+    // Periodic autosave: flush state to disk every 5 seconds.
+    // Catches all state changes even if the user never switches tabs.
+    // Worst case on force-kill: lose last 5 seconds of layout/tab state.
+    use_future(move || {
+        let tabs = tabs;
+        let workspace = workspace;
+        let active_tab_id = active_tab_id;
+        let layout = layout;
+        let run_log_expanded = run_log_expanded;
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                workspace::save_full_session(
+                    &workspace.peek(),
+                    &tabs.peek(),
+                    *active_tab_id.peek(),
+                    *layout.peek(),
+                    *run_log_expanded.peek(),
+                );
+            }
+        }
+    });
+
     // ── Toast + confirm dialog ───────────────────────────────────────────
     let toast_message: Signal<Option<ToastState>> = use_signal(|| None);
     let pending_confirm: Signal<Option<PendingConfirm>> = use_signal(|| None);

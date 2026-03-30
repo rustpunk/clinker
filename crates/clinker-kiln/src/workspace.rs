@@ -334,16 +334,18 @@ pub fn auto_create_workspace(dir: &Path) -> bool {
 pub fn save_workspace_state(root: &Path, state: &WorkspaceState) {
     let state_path = root.join(".kiln-state.json");
     let Ok(json) = serde_json::to_string_pretty(state) else {
+        eprintln!("[kiln] failed to serialize workspace state");
         return;
     };
 
     // Best-effort atomic write: write to temp then rename
     let temp_path = root.join(".kiln-state.json.tmp");
     if fs::write(&temp_path, &json).is_ok() {
-        let _ = fs::rename(&temp_path, &state_path);
-    } else {
-        // Fallback: direct write
-        let _ = fs::write(&state_path, &json);
+        if let Err(e) = fs::rename(&temp_path, &state_path) {
+            eprintln!("[kiln] failed to rename state file: {e}");
+        }
+    } else if let Err(e) = fs::write(&state_path, &json) {
+        eprintln!("[kiln] failed to write state file: {e}");
     }
 }
 
@@ -383,12 +385,48 @@ fn last_workspace_path() -> Option<PathBuf> {
 
 /// Remember which workspace was last used (so we can restore on next launch).
 pub fn save_last_workspace(root: &Path) {
-    let Some(path) = last_workspace_path() else { return };
+    let Some(path) = last_workspace_path() else {
+        eprintln!("[kiln] cannot determine app data directory for last-workspace tracking");
+        return;
+    };
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("[kiln] failed to create app data dir: {e}");
+            return;
+        }
     }
     let json = serde_json::json!({ "root": root.display().to_string() });
-    let _ = fs::write(&path, json.to_string());
+    if let Err(e) = fs::write(&path, json.to_string()) {
+        eprintln!("[kiln] failed to write last-workspace.json: {e}");
+    }
+}
+
+/// Save the full session: workspace state (.kiln-state.json) + last workspace tracker.
+///
+/// This is the single entry point for all session persistence. Called from:
+/// - `use_drop` (window close)
+/// - Periodic autosave (every 5s)
+/// - File save (Ctrl+S)
+/// - Workspace/file open
+pub fn save_full_session(
+    workspace: &Option<Workspace>,
+    tabs: &[TabEntry],
+    active_tab_id: Option<crate::tab::TabId>,
+    layout: LayoutPreset,
+    run_log_expanded: bool,
+) {
+    let Some(ws) = workspace else { return };
+
+    let active_file = active_tab_id.and_then(|id| {
+        tabs.iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.file_path.as_ref())
+            .map(|p| p.display().to_string())
+    });
+
+    let state = build_state_snapshot(tabs, active_file.as_deref(), layout, run_log_expanded);
+    save_workspace_state(&ws.root, &state);
+    save_last_workspace(&ws.root);
 }
 
 /// Load the last-used workspace root path.

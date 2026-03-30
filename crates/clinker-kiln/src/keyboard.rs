@@ -85,6 +85,12 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
+        // Ctrl+Q — Graceful quit (triggers use_drop → session save)
+        Key::Character(ref c) if c == "q" && !event.modifiers().shift() => {
+            dioxus::desktop::window().close();
+            true
+        }
+
         // Ctrl+N — New untitled tab
         Key::Character(ref c) if c == "n" && !event.modifiers().shift() => {
             let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
@@ -187,6 +193,8 @@ pub fn open_workspace(tab_mgr: &mut TabManagerState) {
         };
 
         tab_mgr.active_tab_id.set(active_id);
+        // Immediately persist this as the last-used workspace
+        workspace::save_last_workspace(&ws.root);
         tab_mgr.workspace.set(Some(ws));
     }
 }
@@ -220,6 +228,8 @@ pub fn open_file(tab_mgr: &mut TabManagerState) {
                     if let Some(ws_root) = workspace::detect_workspace(&path) {
                         if tab_mgr.workspace.peek().is_none() {
                             if let Some(ws) = workspace::load_workspace(&ws_root) {
+                                // Immediately persist as last-used workspace
+                                workspace::save_last_workspace(&ws.root);
                                 tab_mgr.workspace.set(Some(ws));
                             }
                         }
