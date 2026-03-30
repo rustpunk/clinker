@@ -819,9 +819,12 @@ html, body {
   border-top: 1px solid var(--kiln-border-subtle);
 }
 
-/* Scoped YAML code area reuses the sidebar's gutter + code layout */
+/* Scoped YAML code area reuses the sidebar's gutter + code layout.
+   Background matches the gutter (--kiln-char) not the inspector panel
+   (--kiln-char-raised) so the two columns look unified. */
 .kiln-inspector-yaml-area {
   overflow: auto;
+  background: var(--kiln-char);
 }
 
 /* ── 15. Scrollbar theming (WebKit) ─────────────────────────────────────── */
