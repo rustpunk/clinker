@@ -202,7 +202,6 @@ mod tests {
                 concurrency: None,
                 date_locale: None,
                 log_rules: None,
-                sort_output: None,
                 include_provenance: None,
             },
             inputs: inputs

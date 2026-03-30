@@ -298,10 +298,6 @@ pipeline:
                                     # us: ambiguous "01/02/2024" → January 2. eu: → February 1.
   rules_path: <string>              # Module search path for .cxl files (see §5.9). Default: ./rules/
   log_rules: <string>               # Path to external log rules YAML (see §5.10). Optional.
-  sort_output:                      # Optional global sort before flushing to disk
-    - field: <string>
-      order: <ascending | descending>
-      nulls: <first | last>         # Default: last
   concurrency:
     worker_threads: <integer | "auto">  # Rayon pool size. Default: min(num_cpus - 2, 4)
     chunk_size: <integer>               # Records per parallel chunk. Default: 1024
@@ -344,7 +340,14 @@ inputs:
       - path: <string>             # e.g., "items" or "items.details"
         mode: <explode | join>      # explode = one row per element; join = comma-delimited string
         separator: <string>         # For join mode. Default: ","
-    sort_order: [<string>]          # Declare pre-sorted fields (enables optimizations)
+    sort_order:                     # Ensure source records are in this order before transformation.
+                                    # Accepts string shorthand or full {field, order, nulls} objects.
+                                    # If source is already sorted, is_sorted() fast-path skips the sort.
+                                    # In streaming mode, forces buffered mode with spill-to-disk.
+      - <string>                    # Shorthand: field name, ascending, nulls last
+      - field: <string>             # Full form
+        order: <ascending | descending>
+        nulls: <first | last>       # Default: last. Drop not permitted on source sort.
 
 outputs:
   - name: <string>
@@ -358,6 +361,14 @@ outputs:
     mapping:                        # Rename fields: {internal: output}
       <string>: <string>
     exclude: [<string>]             # Drop these fields from output
+    sort_order:                     # Optional per-output sort before flushing to disk.
+                                    # Accepts string shorthand or full {field, order, nulls} objects.
+                                    # Buffers all output records, sorts, then flushes.
+                                    # For large outputs, uses external merge sort with spill-to-disk.
+      - <string>                    # Shorthand: field name, ascending, nulls last
+      - field: <string>             # Full form
+        order: <ascending | descending>
+        nulls: <first | last>       # Default: last
     options:                        # Format-specific output options
       # CSV
       delimiter: <string>
@@ -764,7 +775,7 @@ inputs:
 
 - **`schema_overrides:` on inputs replaces the old top-level `schema_overrides:`**. Per-input schemas are more precise — the old global overrides couldn't distinguish fields with the same name across different inputs.
 - **`array_paths:`** remains on the input, not in the schema. Array explosion is a pipeline-level concern, not a schema concern.
-- **`sort_order:`** remains on the input. It describes the physical file's ordering, not the schema.
+- **`sort_order:`** remains on the input, not in the schema. It means "ensure records are in this order before transformation" — an active sort instruction, not just a declaration. The `is_sorted()` fast-path skips the sort if data is already in the declared order.
 - **Provenance fields** (`_source_file`, etc.) are not part of the schema — they are injected by the pipeline independently.
 - **Fixed-width reader**: new module in `clinker-format`. Reads lines, applies the schema's field positions, produces `Record` objects with the schema's field names and parsed types.
 - **Multi-record dispatcher**: reads each line, matches the discriminator, routes to the appropriate record type's Arena during Phase 1 and record stream during Phase 2.
@@ -1620,7 +1631,9 @@ Sort pointers in-place by looking up their sort_by fields in the Arena. Apply `n
 
 This is a CPU-bound operation on small vectors (partition sizes). Parallelize across partitions via `rayon::par_iter_mut` on the HashMap values.
 
-**`sort_order` optimization**: If a source declares `sort_order: [field_a, field_b]` in config, and a window definition for that source has `sort_by: [{field: field_a, ...}, {field: field_b, ...}]` with matching fields and directions, Phase 1.5 pointer sorting for that window is **skipped** — the Arena was built in source order, which is already the correct partition order. This is the "declared pre-sorted" optimization: Phase E emits the window with `already_sorted: true` and Phase 1.5 skips the sort for those partitions. If `sort_order` only partially matches, the optimization does not apply.
+**`sort_order` semantics**: `sort_order` on an input means "ensure records are in this order before transformation." If the source is already in the declared order (detected via a linear `is_sorted()` scan), the sort is a no-op. If not, records are actively sorted via `SortBuffer` (in-memory for small sources, external merge sort with spill-to-disk for large ones). In streaming mode, `sort_order` forces buffered mode with spill support.
+
+**`sort_order` optimization for windows**: If a source's `sort_order` matches a window definition's `sort_by` fields and directions, Phase 1.5 pointer sorting for that window is **skipped** — the source sort guarantees the Arena was built in the correct partition order. Phase E emits the window with `already_sorted: true` and Phase 1.5 skips the sort for those partitions. If `sort_order` only partially matches, the optimization does not apply.
 
 ### 7.3 Phase 1.7: API Intercept (Optional — v2)
 
@@ -1677,8 +1690,8 @@ pub struct ExecutionContext<'a> {
 - `preserve_nulls: false` → XML: tag omitted, JSON: key omitted, CSV: empty cell (CSV always emits the column)
 
 **Streaming vs. buffered output**:
-- No `sort_output` → stream directly to output writers. O(1) memory.
-- With `sort_output` → buffer all transformed records, sort, then flush. For large outputs, use external merge sort: sort chunks of `spill_threshold / estimated_record_size` records in memory, spill sorted chunks to temp files as NDJSON+LZ4, k-way merge via loser tree, stream merged output to final file.
+- No `sort_order` on output → stream directly to output writers. O(1) memory.
+- With `sort_order` on output → buffer all transformed records for that output, sort, then flush. Each output sorts independently — output A can sort by name while output B sorts by date and output C streams unsorted. For large outputs, use external merge sort: sort chunks of `spill_threshold / estimated_record_size` records in memory, spill sorted chunks to temp files as NDJSON+LZ4, k-way merge via loser tree, stream merged output to final file.
 
 ---
 
@@ -1730,7 +1743,7 @@ Output writing is always single-threaded per output file. The pattern:
 
 Each output gets its own writer thread (for multi-cast) connected via a bounded `crossbeam::channel`. Channel capacity: 4 chunks (back-pressure if the writer falls behind). Chunk ordering is preserved (chunks enter the channel in sequence number order).
 
-For `sort_output`, chunks are collected into a `Vec<Record>`, sorted after all chunks arrive, then streamed to the writer.
+For outputs with `sort_order`, chunks are collected into a `SortBuffer`, sorted after all chunks arrive (with spill-to-disk if needed), then streamed to the writer.
 
 ### 8.5 Deterministic Output Guarantee
 
@@ -1774,7 +1787,7 @@ Rationale: Arrow IPC would be faster but violates the "no Arrow" constraint. NDJ
 
 ### 9.3 External Merge Sort
 
-When `sort_output` requires sorting more data than fits in memory:
+When per-output `sort_order` or per-source `sort_order` requires sorting more data than fits in memory:
 
 1. Read chunks of records into memory (sized to `spill_threshold / estimated_record_size`)
 2. Sort each chunk in memory via `sort_by` with the compound key comparator
@@ -2263,7 +2276,7 @@ With `strip` and `panic = "abort"`, target ≤10MB release binary for the `clink
 - `cxl`: CXL parser, type checker, evaluator with full function library
 - `cxl-cli`: Standalone `cxl check` / `cxl eval` validator
 - `clinker-format`: CSV, XML, JSON, fixed-width readers/writers; multi-record dispatcher; schema loading + override resolution
-- `clinker-core`: Config parsing with `serde-saphyr`, two-pass pipeline (Skinny Pass → Pointer Sort → Fat Pass → Projection), source-level and chunk-level parallelism, memory budget with spill-to-disk, DLQ, external merge sort for `sort_output`
+- `clinker-core`: Config parsing with `serde-saphyr`, two-pass pipeline (Skinny Pass → Pointer Sort → Fat Pass → Projection), source-level and chunk-level parallelism, memory budget with spill-to-disk, DLQ, external merge sort for per-source and per-output `sort_order`
 - `clinker`: CLI binary with `--explain`, `--dry-run`, progress reporting, signal handling (graceful shutdown), exit codes
 
 ### v2 (Deferred)

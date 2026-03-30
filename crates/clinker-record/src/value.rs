@@ -116,6 +116,22 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    /// Estimated heap bytes owned by this value (excludes the enum itself).
+    ///
+    /// Used by SortBuffer for self-tracking allocation counting.
+    /// Scalar variants (Null, Bool, Integer, Float, Date, DateTime) store
+    /// data inline in the enum — zero heap allocation.
+    pub fn heap_size(&self) -> usize {
+        match self {
+            Value::String(s) => s.len(),
+            Value::Array(arr) => {
+                arr.capacity() * std::mem::size_of::<Value>()
+                    + arr.iter().map(Value::heap_size).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
 }
 
 use serde::de::{self, SeqAccess, Visitor};
@@ -295,6 +311,33 @@ mod tests {
         assert!(matches!(v, Value::Integer(42)));
         let v: Value = serde_json::from_str("42.0").unwrap();
         assert!(matches!(v, Value::Float(_)));
+    }
+
+    #[test]
+    fn test_value_heap_size_scalar() {
+        assert_eq!(Value::Null.heap_size(), 0);
+        assert_eq!(Value::Bool(true).heap_size(), 0);
+        assert_eq!(Value::Integer(42).heap_size(), 0);
+        assert_eq!(Value::Float(3.14).heap_size(), 0);
+        let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        assert_eq!(Value::Date(d).heap_size(), 0);
+        assert_eq!(Value::DateTime(d.and_hms_opt(10, 30, 0).unwrap()).heap_size(), 0);
+    }
+
+    #[test]
+    fn test_value_heap_size_string() {
+        assert_eq!(Value::String("hello".into()).heap_size(), 5);
+        assert_eq!(Value::String("".into()).heap_size(), 0);
+        assert_eq!(Value::String("a longer string value".into()).heap_size(), 21);
+    }
+
+    #[test]
+    fn test_value_heap_size_array() {
+        let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
+        let expected = 2 * std::mem::size_of::<Value>() // Vec backing (capacity=2)
+            + 0   // Integer heap = 0
+            + 2;  // String "ab" heap = 2
+        assert_eq!(arr.heap_size(), expected);
     }
 
     #[test]

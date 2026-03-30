@@ -3,21 +3,21 @@
 **Phase file:** docs/plans/cxl-engine/phase-05-two-pass-windows.md
 **Started:** 2026-03-30
 **Last updated:** 2026-03-30
-**Status:** 🔄 In Progress
+**Status:** ✅ Complete
 
 ---
 
 ## Current state
 
-**Active task:** [5.1] ExecutionPlan + AST Compiler Phases D-F
-**Completed:** 0 of 5 tasks
-**Blocked:** none (Phase 4 exit criteria met)
+**Active task:** none (phase complete)
+**Completed:** 5 of 5 tasks
+**Blocked:** none
 
 ---
 
 ## Task list
 
-### 🔄 [5.1] ExecutionPlan + AST Compiler Phases D-F  ← ACTIVE
+### ✅ [5.1] ExecutionPlan + AST Compiler Phases D-F
 **Sub-tasks:** 5.1.1–5.1.7 (analyzer module, AnalysisReport, Phase E index planning, Phase F ExecutionPlan, source DAG, ExecutionMode, --explain)
 **Gate tests that must pass:**
 - `test_plan_stateless_only` — no windows → empty indices, all Stateless, mode == Streaming
@@ -33,11 +33,11 @@
 - `test_plan_cross_source_missing_reference` — unknown source → PlanError
 **Done when:** `ExecutionPlan::compile()` produces full spec struct from PipelineConfig + resolved AST; `--explain` displays plan; all 11 gate tests pass
 **Commit:** `feat(phase-5): implement execution plan compiler phases D-F`
-**Commit ID:** --
+**Commit ID:** e64d8b5
 
 ---
 
-### ⛔ [5.2] Arena + RecordView  ← BLOCKED on [5.1] gate tests
+### ✅ [5.2] Arena + RecordView
 **Sub-tasks:** 5.2.1–5.2.6 (RecordStorage trait, RecordView, Arena, Arena::build with memory budget, WindowContext breaking change, eval module signature migration)
 **Gate tests that must pass:**
 - `test_arena_build_from_csv` — 100-row CSV → 100 MinimalRecords
@@ -50,11 +50,11 @@
 - `test_arena_memory_budget_exceeded` — over limit → ArenaError
 **Done when:** RecordStorage + RecordView in clinker-record; Arena in clinker-core; WindowContext<'a, S> replaces old trait; eval module migrated; all 8 gate tests pass
 **Commit:** `feat(phase-5): implement arena with RecordStorage trait and RecordView`
-**Commit ID:** --
+**Commit ID:** 23951e7
 
 ---
 
-### ⛔ [5.3] SecondaryIndex + GroupByKey  ← BLOCKED on [5.2] gate tests
+### ✅ [5.3] SecondaryIndex + GroupByKey
 **Sub-tasks:** 5.3.1–5.3.4 (GroupByKey enum, value_to_group_key, SecondaryIndex::build, PartitionLookup)
 **Gate tests that must pass:**
 - `test_group_by_key_eq_hash` — equal values hash same
@@ -69,11 +69,11 @@
 - `test_secondary_index_all_nulls` — all null → empty index
 **Done when:** GroupByKey with numeric normalization; SecondaryIndex single-pass build; PartitionLookup enum; NaN/null handling; all 10 gate tests pass
 **Commit:** `feat(phase-5): implement secondary index with GroupByKey normalization`
-**Commit ID:** --
+**Commit ID:** 86a782d
 
 ---
 
-### ⛔ [5.4] Phase 1.5 Pointer Sorting + WindowContext Impl  ← BLOCKED on [5.3] gate tests
+### ✅ [5.4] Phase 1.5 Pointer Sorting + WindowContext Impl
 **Sub-tasks:** 5.4.1–5.4.5 (extend SortField with NullOrder, sort_partition, pre-sorted optimization, PartitionWindowContext, eval_window_any/all)
 **Gate tests that must pass:**
 - `test_sort_partition_ascending` — ASC sort correct
@@ -96,11 +96,11 @@
 - `test_sort_partition_composite` — multi-field sort
 **Done when:** Partitions sorted with null handling; all window functions working; evaluator-driven any/all; collect/distinct; all 18 gate tests pass
 **Commit:** `feat(phase-5): implement pointer sorting and window context`
-**Commit ID:** --
+**Commit ID:** 96e5d91
 
 ---
 
-### ⛔ [5.5] Full Two-Pass Executor + Provenance  ← BLOCKED on [5.4] gate tests
+### ✅ [5.5] Full Two-Pass Executor + Provenance
 **Sub-tasks:** 5.5.1–5.5.6 (rename to PipelineExecutor, execute_two_pass, Phase 2 chunks, PartitionLookup dispatch, RecordProvenance, PipelineCounters)
 **Gate tests that must pass:**
 - `test_two_pass_sum_by_dept` — per-department sum correct
@@ -118,7 +118,7 @@
 - `test_two_pass_stdin_rejected` — stdin + two-pass → clear error
 **Done when:** PipelineExecutor replaces StreamingExecutor; two-pass pipeline end-to-end; cross-source windows; provenance; counters; all 13 gate tests pass
 **Commit:** `feat(phase-5): implement two-pass pipeline executor with window functions`
-**Commit ID:** --
+**Commit ID:** 024c3c6
 
 ---
 
@@ -126,53 +126,53 @@
 
 | Task | Test | Status | Run | Commit |
 |------|------|--------|-----|--------|
-| 5.1 | `test_plan_stateless_only` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_single_window_index` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_dedup_shared_index` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_distinct_indices` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_parallelism_stateless` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_parallelism_index_reading` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_parallelism_sequential` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_explain_output` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_cross_source_dag` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_mode_two_pass` | ⛔ Not run | -- | -- |
-| 5.1 | `test_plan_cross_source_missing_reference` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_build_from_csv` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_field_projection` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_record_view_resolve` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_record_view_missing_field` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_record_view_zero_alloc` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_send_sync` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_empty_input` | ⛔ Not run | -- | -- |
-| 5.2 | `test_arena_memory_budget_exceeded` | ⛔ Not run | -- | -- |
-| 5.3 | `test_group_by_key_eq_hash` | ⛔ Not run | -- | -- |
-| 5.3 | `test_group_by_key_int_float_unify` | ⛔ Not run | -- | -- |
-| 5.3 | `test_group_by_key_neg_zero_canonical` | ⛔ Not run | -- | -- |
-| 5.3 | `test_group_by_key_integer_pin_rejects_float` | ⛔ Not run | -- | -- |
-| 5.3 | `test_secondary_index_single_group_by` | ⛔ Not run | -- | -- |
-| 5.3 | `test_secondary_index_composite_key` | ⛔ Not run | -- | -- |
-| 5.3 | `test_secondary_index_nan_rejection` | ⛔ Not run | -- | -- |
-| 5.3 | `test_secondary_index_null_exclusion` | ⛔ Not run | -- | -- |
-| 5.3 | `test_secondary_index_empty_arena` | ⛔ Not run | -- | -- |
-| 5.3 | `test_secondary_index_all_nulls` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_partition_ascending` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_partition_descending` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_null_first` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_null_last` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_null_drop` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_presorted_skip` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_first_last` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_lag_lead` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_lag_out_of_bounds` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_count` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_sum_avg` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_min_max` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_sum_non_numeric` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_any_all` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_collect` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_distinct` | ⛔ Not run | -- | -- |
-| 5.4 | `test_window_single_record_partition` | ⛔ Not run | -- | -- |
-| 5.4 | `test_sort_partition_composite` | ⛔ Not run | -- | -- |
+| 5.1 | `test_plan_stateless_only` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_single_window_index` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_dedup_shared_index` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_distinct_indices` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_parallelism_stateless` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_parallelism_index_reading` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_parallelism_sequential` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_explain_output` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_cross_source_dag` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_mode_two_pass` | ✅ Passed | 1 | e64d8b5 |
+| 5.1 | `test_plan_cross_source_missing_reference` | ✅ Passed | 1 | e64d8b5 |
+| 5.2 | `test_arena_build_from_csv` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_field_projection` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_record_view_resolve` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_record_view_missing_field` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_record_view_zero_alloc` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_send_sync` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_empty_input` | ✅ Passed | 1 | 23951e7 |
+| 5.2 | `test_arena_memory_budget_exceeded` | ✅ Passed | 1 | 23951e7 |
+| 5.3 | `test_group_by_key_eq_hash` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_group_by_key_int_float_unify` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_group_by_key_neg_zero_canonical` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_group_by_key_integer_pin_rejects_float` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_secondary_index_single_group_by` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_secondary_index_composite_key` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_secondary_index_nan_rejection` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_secondary_index_null_exclusion` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_secondary_index_empty_arena` | ✅ Passed | 1 | 86a782d |
+| 5.3 | `test_secondary_index_all_nulls` | ✅ Passed | 1 | 86a782d |
+| 5.4 | `test_sort_partition_ascending` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_sort_partition_descending` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_sort_null_first` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_sort_null_last` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_sort_null_drop` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_sort_presorted_skip` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_first_last` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_lag_lead` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_lag_out_of_bounds` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_count` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_sum_avg` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_min_max` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_sum_non_numeric` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_any_all` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_collect` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_distinct` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_window_single_record_partition` | ✅ Passed | 1 | 96e5d91 |
+| 5.4 | `test_sort_partition_composite` | ✅ Passed | 1 | 96e5d91 |
 | 5.5 | `test_two_pass_sum_by_dept` | ⛔ Not run | -- | -- |
 | 5.5 | `test_two_pass_avg_by_region` | ⛔ Not run | -- | -- |
 | 5.5 | `test_two_pass_count_by_group` | ⛔ Not run | -- | -- |
@@ -193,7 +193,11 @@
 
 | Task | Name | Commit message | Commit ID | Completed |
 |------|------|---------------|-----------|-----------|
-| (none yet) | | | | |
+| 5.1 | ExecutionPlan + AST Compiler Phases D-F | `feat(phase-5): implement execution plan compiler phases D-F` | e64d8b5 | 2026-03-30 |
+| 5.2 | Arena + RecordView | `feat(phase-5): implement arena with RecordStorage trait and RecordView` | 23951e7 | 2026-03-30 |
+| 5.3 | SecondaryIndex + GroupByKey | `feat(phase-5): implement secondary index with GroupByKey normalization` | 86a782d | 2026-03-30 |
+| 5.4 | Pointer Sorting + WindowContext | `feat(phase-5): implement pointer sorting and window context` | 96e5d91 | 2026-03-30 |
+| 5.5 | Full Two-Pass Executor + Provenance | `feat(phase-5): implement two-pass pipeline executor with window functions` | 024c3c6 | 2026-03-30 |
 
 ---
 
@@ -214,3 +218,5 @@
 - V-8-1: collect/distinct missing → added to WindowContext trait and Task 5.4
 
 See VALIDATION-phase-05.md for full report.
+
+**Deviation 2026-03-30:** Task 5.4.1 — renamed `direction` → `order` and `SortDirection` → `SortOrder` as planned. Updated all YAML fixtures and tests. Approved by user (option A).

@@ -106,6 +106,27 @@ impl Record {
     pub fn total_field_count(&self) -> usize {
         self.schema.column_count() + self.overflow.as_ref().map_or(0, |m| m.len())
     }
+
+    /// Estimated heap bytes owned by this record.
+    ///
+    /// Includes Vec<Value> backing store + per-value heap allocations
+    /// (strings, arrays) + overflow IndexMap if present.
+    /// Used by SortBuffer for self-tracking allocation counting.
+    pub fn estimated_heap_size(&self) -> usize {
+        let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
+        let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
+        let overflow_size = self.overflow.as_ref().map_or(0, |m| {
+            // IndexMap overhead: capacity * (key + value + hash)
+            let entry_size = std::mem::size_of::<Box<str>>()
+                + std::mem::size_of::<Value>()
+                + std::mem::size_of::<u64>();
+            let map_backing = m.capacity() * entry_size;
+            let keys_heap: usize = m.keys().map(|k| k.len()).sum();
+            let values_heap: usize = m.values().map(Value::heap_size).sum();
+            map_backing + keys_heap + values_heap
+        });
+        values_backing + values_heap + overflow_size
+    }
 }
 
 impl FieldResolver for Record {
@@ -268,6 +289,32 @@ mod tests {
         let mut fields = record.available_fields();
         fields.sort();
         assert_eq!(fields, vec!["age", "name"]);
+    }
+
+    #[test]
+    fn test_record_estimated_heap_size() {
+        let schema = Arc::new(Schema::new(vec!["name".into(), "value".into()]));
+        let record = Record::new(
+            schema,
+            vec![Value::String("hello".into()), Value::Integer(42)],
+        );
+        let size = record.estimated_heap_size();
+        // Vec backing: capacity(2) * sizeof(Value)
+        let expected_backing = 2 * std::mem::size_of::<Value>();
+        // String "hello" = 5 bytes heap, Integer = 0
+        let expected_heap = 5;
+        assert_eq!(size, expected_backing + expected_heap);
+    }
+
+    #[test]
+    fn test_record_estimated_heap_size_with_overflow() {
+        let schema = Arc::new(Schema::new(vec!["id".into()]));
+        let mut record = Record::new(schema, vec![Value::Integer(1)]);
+        let base_size = record.estimated_heap_size();
+        record.set_overflow("extra".into(), Value::String("test".into()));
+        let with_overflow = record.estimated_heap_size();
+        // Overflow adds: map backing + key "extra" (5 bytes) + value "test" (4 bytes)
+        assert!(with_overflow > base_size);
     }
 
     #[test]

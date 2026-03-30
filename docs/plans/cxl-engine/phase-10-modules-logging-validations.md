@@ -264,4 +264,43 @@ Verify zero C dependencies in the dependency tree.
 | `test_benchmark_json_10mb_runs` | 10MB JSON benchmark completes and reports records/sec | ⛔ Hard gate |
 | `test_benchmark_xml_50mb_runs` | 50MB XML benchmark completes and reports records/sec | ⛔ Hard gate |
 
+> ⛔ **Hard gate:** Task 10.6 status remains `Blocked` until all tests above pass.
+
+---
+
+### Task 10.6: --dry-run -n Partial Processing
+**Status:** ⛔ Blocked (waiting on Task 10.5)
+**Blocked by:** Task 10.5 — security hardening must be in place before partial processing
+
+**Description:**
+Implement `clinker --dry-run -n <N> pipeline.yaml` which runs the full pipeline on the
+first N records per input. Validates types, CXL evaluation, output format. Writes output
+to stdout (or a temp file with `--dry-run-output`). Deferred from Phase 8 (decision #34).
+
+**Implementation notes:**
+- `-n <N>` flag on `Cli` struct: `Option<u64>`, only valid with `--dry-run`.
+- When `-n` is set, each `FormatReader` wraps in a `Take` adapter that yields at most N records.
+- Pipeline runs normally through all phases (ingestion, transform, projection, output).
+- Output defaults to stdout; `--dry-run-output <PATH>` writes to file instead.
+- Exit codes: same as normal run (0 for success, 2 for partial DLQ, etc.).
+- Without `-n`, `--dry-run` remains config-validation-only (Phase 8 behavior).
+
+**Acceptance criteria:**
+- [ ] `-n 100` processes only the first 100 records per input
+- [ ] `-n` without `--dry-run` produces an error
+- [ ] `--dry-run` without `-n` validates config only (existing behavior preserved)
+- [ ] Output written to stdout by default
+- [ ] `--dry-run-output <PATH>` redirects to file
+- [ ] Exit codes match normal pipeline run
+
+**Required unit tests (must pass before Phase 10 exit):**
+
+| Test name | What it verifies | Gate |
+|-----------|-----------------|------|
+| `test_dry_run_n_limits_records` | `-n 10` with 1000-record input produces 10 output records | ⛔ Hard gate |
+| `test_dry_run_n_without_dry_run_error` | `-n 100` without `--dry-run` produces CLI error | ⛔ Hard gate |
+| `test_dry_run_without_n_config_only` | `--dry-run` alone validates config, reads no data | ⛔ Hard gate |
+| `test_dry_run_output_to_file` | `--dry-run-output out.csv` writes to file instead of stdout | ⛔ Hard gate |
+| `test_dry_run_n_exit_code_2_dlq` | Partial DLQ during dry-run produces exit code 2 | ⛔ Hard gate |
+
 > ⛔ **Hard gate:** Phase 10 exit criteria not met until all tests above pass.

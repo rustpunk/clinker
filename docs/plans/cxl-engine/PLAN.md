@@ -37,6 +37,19 @@ with spill-to-disk under a configurable memory budget.
 | 19 | Adjacently tagged serde enum for format config (`InputFormat`/`OutputFormat`) replaces flat `InputOptions`/`OutputOptions` (Phase 7 decision) | Research: `deny_unknown_fields` broken with internally tagged enums (serde #2123). Adjacently tagged preserves YAML shape. Empirically validated with serde-saphyr. `FormatKind` enum removed. |
 | 20 | Streaming `DeserializeSeed` + `IgnoredAny` for JSON path navigation — O(1 record) memory (Phase 7 decision, revised) | Original plan used `Value::pointer()` (3-11x overhead). Replaced with serde's `DeserializeSeed` + `IgnoredAny` which navigates the tree via `visit_map` without buffering. ~10KB + 1 record. |
 | 21 | Plain `quick_xml::Reader` with `QName::local_name()` for namespace stripping (Phase 7 decision) | `NsReader` resolves URIs (overkill). `local_name()` strips prefix. Config flag selects strip vs qualify. |
+| 22 | `SortBuffer` shared sort-and-spill engine for both source-sort and output-sort (Phase 8 decision) | One implementation of external merge sort + loser tree; executor calls SortBuffer at two intercept points; window sort unchanged in sort.rs |
+| 23 | `SortFieldSpec` untagged serde enum (`Short(String)` / `Full(SortField)`) for sort config (Phase 8 decision) | serde-saphyr supports untagged; YAML scalars vs mappings unambiguous; unified type for InputConfig and OutputConfig sort_order |
+| 24 | `PipelineMeta.sort_output` removed; sort lives only on per-source `InputConfig.sort_order` and per-output `OutputConfig.sort_order` (Phase 8 decision) | Per-source and per-output sorts independently optional; global sort creates ambiguous precedence; stub was untyped serde_json::Value |
+| 25 | `InputConfig.sort_order` means "ensure this order" (active sort), not pre-sorted declaration (Phase 8 decision) | Subsumes pre-sorted optimization via is_sorted() fast path; one field, one semantic; no silent correctness bugs from false declarations |
+| 26 | Hybrid comparator: closure sort_by for in-memory, memcomparable byte encoding for loser tree merge (Phase 8 decision) | In-memory sorts don't need encoding overhead; loser tree needs Ord; Arrow-rs/DataFusion/Polars converge on this split |
+| 27 | Hand-rolled loser tree (~80 lines), DataFusion-style flat array (Phase 8 decision) | No usable crate exists (all "tournament" crates are BinaryHeap wrappers); 50-72% faster than BinaryHeap (DataFusion PR #4301) |
+| 28 | Self-tracking allocation counting for sort buffer memory budget (Phase 8 decision) | Industry consensus (DataFusion, Spark, SQLite); deterministic and testable; Value::heap_size() + running counter |
+| 29 | Structured DlqErrorCategory enum (6 variants) passed from error site (Phase 8 decision) | Correct by construction; replaces fragile classify_error() string matching |
+| 30 | DLQ always CSV per spec §10.4; JSON/XML sources get _cxl_source_record column (Phase 8 decision) | Industry consensus (Spark, Beam): fixed envelope + raw record as string; one DLQ file, cross-source queryable |
+| 31 | `--explain` plain text output; structured JSON deferred for Kiln (Phase 8 decision) | ExecutionPlan struct is the right abstraction; adding Serialize for Kiln's JSON-RPC is mechanical |
+| 32 | Callback-based ProgressReporter trait with phase-specific counters (Phase 8 decision) | Testable via VecReporter; NullReporter for --quiet; extensible for Kiln Tier 1 JSON Lines |
+| 33 | `cxl eval`: -e for inline, positional for file, --field + --record (Phase 8 decision) | Follows sed/perl -e convention; --field auto-type-inferred; no auto-detection (anti-pattern per clig.dev) |
+| 34 | `-n` partial processing deferred to Phase 10; --dry-run stays config-validation-only (Phase 8 decision) | Phase 8 scope is large enough; -n is closer to "sample mode" than dry run |
 
 ## Open Questions
 
@@ -51,12 +64,12 @@ with spill-to-disk under a configurable memory budget.
 | 2 | CXL Lexer + Parser | ✅ Complete | 4 | 4 | — |
 | 3 | CXL Resolver, Type Checker, Evaluator | ✅ Complete | 4 | 4 | — |
 | 4 | CSV + Minimal End-to-End Pipeline | ✅ Complete | 5 | 5 | — |
-| 5 | Two-Pass Pipeline — Arena, Indexing, Windows | 🔲 Ready (drilled + validated) | 5 | 0 | — |
+| 5 | Two-Pass Pipeline — Arena, Indexing, Windows | ✅ Complete | 5 | 5 | — |
 | 6 | Parallelism + Memory Management | ✅ Complete | 5 | 5 | Phase 5 |
 | 7 | JSON + XML Readers/Writers | ✅ Complete | 5 | 5 | Phase 4 |
-| 8 | Sort, DLQ Polish, CLI Completion | 🔲 Not Started | 4 | 0 | Phase 6, 7 |
+| 8 | Sort, DLQ Polish, CLI Completion | 🔲 Ready (drilled + validated) | 4 | 0 | Phase 6, 7 |
 | 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Not Started | 4 | 0 | Phase 7 |
-| 10 | Modules, Logging, Validations, Polish | 🔲 Not Started | 5 | 0 | Phase 9 |
+| 10 | Modules, Logging, Validations, Polish | 🔲 Not Started | 6 | 0 | Phase 9 |
 
 > Status key: 🔲 Not Started · 🔄 In Progress · ⛔ Blocked · ✅ Complete
 
@@ -107,5 +120,7 @@ Phase 10 needs Phase 9 (validations reference schemas and modules).
 | RSS measurement is process-wide, not pipeline-scoped | Low | Low — premature spill triggers | 60% threshold provides headroom. Acceptable for v1. v2 could use custom allocator wrapper. |
 | Mixed parallelism classes force conservative sequential dispatch | Low | Medium — reduced parallelism | If any transform is Sequential, entire chunk is sequential. v2 could interleave parallel/sequential per-transform. |
 | CXL `now` keyword makes output non-reproducible | Low | Low — by design | Document that `now` is wall-clock. Golden file tests must not use `now`. `pipeline.start_time` is deterministic. |
-| Phase 8 Task 8.4 exit codes contradict spec §10.2 | Medium | Medium — Phase 8 plan needs correction | Phase 6 matches spec. Phase 8 exit code semantics for codes 2/3/4 must be corrected before Phase 8 implementation. |
-| Memory ceiling best-effort until Phase 8 spill triggers | Low | Medium — RSS can exceed 512MB during Phase 2 | Arena hard cap covers dominant consumer. Phase 6 adds `tracing::warn` on RSS ceiling breach. Full enforcement in Phase 8. |
+| Phase 8 Task 8.4 exit codes contradict spec §10.2 | ~~Medium~~ Resolved | ~~Medium~~ | Phase 8 drill corrected exit codes to match spec. Phase 6 owns constants; Phase 8 owns CLI flags + integration tests. |
+| Memory ceiling best-effort until Phase 8 spill triggers | Low | Medium — RSS can exceed 512MB during Phase 2 | Arena hard cap covers dominant consumer. Phase 6 adds `tracing::warn` on RSS ceiling breach. Phase 8 adds self-tracking allocation counting in SortBuffer. |
+| Memcomparable encoding correctness for Date/DateTime | Low | Medium — wrong sort order for temporal values | Must use days-since-epoch (Date) and micros-since-epoch (DateTime) with sign-flip. Chrono's public API is stable. Covered by sort key encoding tests. |
+| DlqErrorCategory threading through evaluator | Low | Medium — touches cxl + clinker-core crates | Mechanical change: evaluator error types gain category field. Scope is bounded — 6 error sites, each constructs one variant. |

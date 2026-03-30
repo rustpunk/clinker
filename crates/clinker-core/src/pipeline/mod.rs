@@ -1,9 +1,13 @@
 pub mod arena;
 pub mod index;
 pub mod ingestion;
+pub mod loser_tree;
 pub mod memory;
 pub mod shutdown;
 pub mod sort;
+pub mod sort_buffer;
+mod sort_integration;
+pub mod sort_key;
 pub mod spill;
 pub mod threshold;
 pub mod window_context;

@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use clinker_record::{RecordStorage, Value};
+use clinker_record::{Record, RecordStorage, Value};
 
 use crate::config::{NullOrder, SortField, SortOrder};
 
@@ -65,8 +65,26 @@ fn compare_records<S: RecordStorage>(
     Ordering::Equal
 }
 
+/// Compare two records directly by sort_by fields.
+///
+/// Unlike `compare_records` which uses RecordStorage + position indices,
+/// this operates on Record references — used by SortBuffer for in-memory sorting.
+pub fn compare_records_by_fields(a: &Record, b: &Record, sort_by: &[SortField]) -> Ordering {
+    for sf in sort_by {
+        let va = a.get(&sf.field);
+        let vb = b.get(&sf.field);
+        let null_order = sf.null_order.unwrap_or(NullOrder::Last);
+
+        let ord = compare_values_with_nulls(va, vb, sf.order, null_order);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// Compare two optional values with null handling and sort direction.
-fn compare_values_with_nulls(
+pub fn compare_values_with_nulls(
     a: Option<&Value>,
     b: Option<&Value>,
     order: SortOrder,
@@ -96,7 +114,7 @@ fn compare_values_with_nulls(
 }
 
 /// Compare two non-null values using the same ordering as the evaluator.
-fn compare_values(a: &Value, b: &Value) -> Ordering {
+pub fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),

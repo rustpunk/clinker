@@ -28,7 +28,6 @@ pub struct PipelineMeta {
     // Spec stubs — processed in later phases
     pub date_locale: Option<String>,
     pub log_rules: Option<serde_json::Value>,
-    pub sort_output: Option<serde_json::Value>,
     pub include_provenance: Option<bool>,
 }
 
@@ -48,7 +47,7 @@ pub struct InputConfig {
     pub schema: Option<String>,
     pub schema_overrides: Option<Vec<SchemaOverride>>,
     pub array_paths: Option<Vec<ArrayPathConfig>>,
-    pub sort_order: Option<Vec<String>>,
+    pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(flatten)]
     pub format: InputFormat,
 }
@@ -156,7 +155,7 @@ pub struct OutputConfig {
     pub include_header: Option<bool>,
     pub mapping: Option<IndexMap<String, String>>,
     pub exclude: Option<Vec<String>>,
-    pub sort_order: Option<Vec<SortField>>,
+    pub sort_order: Option<Vec<SortFieldSpec>>,
     pub preserve_nulls: Option<bool>,
     #[serde(flatten)]
     pub format: OutputFormat,
@@ -220,6 +219,34 @@ pub struct SortField {
 pub enum SortOrder {
     Asc,
     Desc,
+}
+
+/// Accepts either a plain string shorthand or a full SortField object in YAML.
+///
+/// Shorthand: `"field_name"` expands to `SortField { field: "field_name", order: Asc, null_order: None }`.
+/// Full: `{ field: "name", order: desc, null_order: first }` deserializes as SortField.
+///
+/// This is a serde-only type. Resolve to `Vec<SortField>` via `into_sort_field()`
+/// at config load time. All downstream code uses `Vec<SortField>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SortFieldSpec {
+    Short(String),
+    Full(SortField),
+}
+
+impl SortFieldSpec {
+    /// Resolve to a concrete SortField.
+    pub fn into_sort_field(self) -> SortField {
+        match self {
+            SortFieldSpec::Short(name) => SortField {
+                field: name,
+                order: SortOrder::Asc,
+                null_order: None,
+            },
+            SortFieldSpec::Full(sf) => sf,
+        }
+    }
 }
 
 fn default_sort_order() -> SortOrder {
@@ -694,7 +721,9 @@ error_handling:
         assert_eq!(config.outputs[0].mapping.as_ref().unwrap().len(), 2);
         assert_eq!(config.outputs[0].exclude.as_ref().unwrap().len(), 2);
         assert_eq!(config.outputs[0].sort_order.as_ref().unwrap().len(), 2);
-        assert_eq!(config.outputs[0].sort_order.as_ref().unwrap()[0].order, SortOrder::Asc);
+        // SortFieldSpec resolves to SortField — verify via into_sort_field()
+        let sf = config.outputs[0].sort_order.as_ref().unwrap()[0].clone().into_sort_field();
+        assert_eq!(sf.order, SortOrder::Asc);
         assert_eq!(config.outputs[0].preserve_nulls, Some(false));
 
         // Transforms
@@ -916,5 +945,132 @@ transformations:
             }
             other => panic!("Expected Xml output with options, got {:?}", other),
         }
+    }
+
+    // ── Phase 8 SortFieldSpec tests ─────────────────────────────────
+
+    #[test]
+    fn test_sort_field_spec_shorthand_yaml() {
+        let yaml = r#"
+pipeline:
+  name: sort-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+    sort_order:
+      - field_a
+      - field_b
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        let sort = config.inputs[0].sort_order.as_ref().unwrap();
+        assert_eq!(sort.len(), 2);
+        let sf0 = sort[0].clone().into_sort_field();
+        assert_eq!(sf0.field, "field_a");
+        assert_eq!(sf0.order, SortOrder::Asc);
+        assert!(sf0.null_order.is_none());
+    }
+
+    #[test]
+    fn test_sort_field_spec_full_yaml() {
+        let yaml = r#"
+pipeline:
+  name: sort-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+    sort_order:
+      - field: name
+        order: desc
+        null_order: first
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        let sort = config.outputs[0].sort_order.as_ref().unwrap();
+        assert_eq!(sort.len(), 1);
+        let sf = sort[0].clone().into_sort_field();
+        assert_eq!(sf.field, "name");
+        assert_eq!(sf.order, SortOrder::Desc);
+        assert_eq!(sf.null_order, Some(NullOrder::First));
+    }
+
+    #[test]
+    fn test_sort_field_spec_mixed_yaml() {
+        let yaml = r#"
+pipeline:
+  name: sort-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+    sort_order:
+      - simple_field
+      - field: complex_field
+        order: desc
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let config = parse_config(yaml).unwrap();
+        let sort = config.inputs[0].sort_order.as_ref().unwrap();
+        assert_eq!(sort.len(), 2);
+        let sf0 = sort[0].clone().into_sort_field();
+        assert_eq!(sf0.field, "simple_field");
+        assert_eq!(sf0.order, SortOrder::Asc);
+        let sf1 = sort[1].clone().into_sort_field();
+        assert_eq!(sf1.field, "complex_field");
+        assert_eq!(sf1.order, SortOrder::Desc);
+    }
+
+    #[test]
+    fn test_sort_field_spec_into_sort_field() {
+        let short = SortFieldSpec::Short("name".into());
+        let sf = short.into_sort_field();
+        assert_eq!(sf.field, "name");
+        assert_eq!(sf.order, SortOrder::Asc);
+        assert!(sf.null_order.is_none());
+    }
+
+    #[test]
+    fn test_sort_output_removed_from_pipeline_meta() {
+        // sort_output at pipeline level should be rejected (deny_unknown_fields)
+        let yaml = r#"
+pipeline:
+  name: sort-test
+  sort_output:
+    - field: name
+      order: asc
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let result = parse_config(yaml);
+        assert!(result.is_err(), "sort_output at pipeline level should be rejected");
     }
 }
