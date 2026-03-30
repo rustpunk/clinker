@@ -192,8 +192,16 @@ pub fn open_workspace(tab_mgr: &mut TabManagerState) {
 }
 
 /// Open a file via native dialog.
+///
+/// Defaults the file explorer to the workspace root if a workspace is active,
+/// otherwise falls back to the OS default (usually ~/).
 pub fn open_file(tab_mgr: &mut TabManagerState) {
-    if let Some(path) = file_ops::open_file_dialog(None) {
+    let starting_dir = tab_mgr
+        .workspace
+        .peek()
+        .as_ref()
+        .map(|ws| ws.root.clone());
+    if let Some(path) = file_ops::open_file_dialog(starting_dir.as_deref()) {
         match file_ops::read_pipeline_file(&path) {
             Ok(yaml) => {
                 // Check if already open

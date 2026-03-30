@@ -1,0 +1,25 @@
+_compose:
+  name: "Clean Names"
+  description: "Normalize and deduplicate name fields"
+  version: "1.0"
+  contract:
+    requires:
+      - name: first_name
+        type: string
+      - name: last_name
+        type: string
+    produces:
+      - name: full_name
+        type: string
+      - name: name_key
+        type: string
+
+transformations:
+  - name: normalize_names
+    cxl: |
+      emit full_name = first_name.trim() + " " + last_name.trim()
+      emit name_key = lower(first_name.trim() + "_" + last_name.trim())
+  - name: drop_raw_names
+    cxl: |
+      drop first_name
+      drop last_name

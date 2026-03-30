@@ -1,74 +1,57 @@
 pipeline:
   name: customer_etl
-  memory_limit: null
-  vars: null
-  date_formats: null
-  rules_path: null
-  concurrency: null
-  date_locale: null
-  log_rules: null
-  sort_output: null
-  include_provenance: null
+
 inputs:
-- name: customers
-  type: csv
-  path: ./data/customers.csv
-  schema: null
-  schema_overrides: null
-  options:
-    delimiter: null
-    quote_char: null
-    has_header: true
-    encoding: null
-    array_paths: null
-    record_element: null
-    root_element: null
-  _notes:
-    fields:
-      path: Updated quarterly when the CRM team changes export locations.
-    stage: Source data from the CRM export.
+  - name: customers
+    type: csv
+    path: ./data/customers.csv
+    options:
+      has_header: true
+    _notes:
+      fields:
+        path: Updated quarterly when the CRM team changes export locations.
+      stage: Source data from the CRM export.
+
 outputs:
-- name: results
-  type: csv
-  path: ./output/customers.csv
-  include_unmapped: true
-  include_header: null
-  mapping: null
-  exclude: null
-  options: null
-  sort_order: null
-  preserve_nulls: null
-  _notes: null
+  - name: results
+    type: csv
+    path: ./output/customers.csv
+    include_unmapped: true
+
 transformations:
-- name: active_only
-  description: Filter to active customers
-  cxl: |
-    emit status_ok = status == "active"
-  local_window: null
-  log: null
-  validations: null
-  _notes:
-    fields:
-      cxl: The status field uses lowercase string values.
-    stage: |
-      Active-only filtering was added in Q3 2025 to exclude
-      churned accounts from the marketing dataset.
-- name: enrich
-  description: Compute derived fields
-  cxl: |
-    emit full_name = first_name + " " + last_name
-    emit email_lower = lower(email)
-  local_window: null
-  log: null
-  validations: null
-  _notes:
-    fields:
-      cxl: full_name format must be 'First Last' — no middle names.
-    stage: Derived fields for the email personalization service.
+  - name: active_only
+    description: Filter to active customers
+    cxl: |
+      if status != "active"
+        drop
+      end
+    _notes:
+      fields:
+        cxl: The status field uses lowercase string values.
+      stage: |
+        Active-only filtering was added in Q3 2025 to exclude
+        churned accounts from the marketing dataset.
+
+  - _import: compositions/clean_names.comp.yaml
+
+  - _import: compositions/validate_email.comp.yaml
+    overrides:
+      check_email_format:
+        cxl: |
+          emit email_valid = email_lower matches "^[^@]+@(acme|globex)\\.com$"
+
+  - name: final_flag
+    description: Flag high-value customers
+    cxl: |
+      if lifetime_value > 10000
+        emit tier = "gold"
+      else
+        emit tier = "standard"
+      end
+
 error_handling:
   strategy: fail_fast
-  dlq: null
-  type_error_threshold: null
+
 _notes:
   pipeline: |
     Customer ETL pipeline for the marketing analytics team.

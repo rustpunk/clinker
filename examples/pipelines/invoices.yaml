@@ -18,7 +18,11 @@ transformations:
   - name: recent_only
     description: Filter to last 90 days
     cxl: |
-      emit is_recent = days_since(invoice_date) < 90
+      if days_since(invoice_date) >= 90
+        drop
+      end
+
+  - _import: compositions/fiscal_date.comp.yaml
 
   - name: totals
     description: Sum by customer

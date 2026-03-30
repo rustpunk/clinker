@@ -1,0 +1,26 @@
+_compose:
+  name: "Validate Email"
+  description: "Normalize and validate email addresses"
+  version: "1.1"
+  contract:
+    requires:
+      - name: email
+        type: string
+    produces:
+      - name: email_lower
+        type: string
+      - name: email_valid
+        type: bool
+      - name: email_domain
+        type: string
+
+transformations:
+  - name: normalize_email
+    cxl: |
+      emit email_lower = lower(email.trim())
+  - name: check_email_format
+    cxl: |
+      emit email_valid = email_lower matches "^[^@]+@[^@]+\\.[^@]+$"
+  - name: extract_domain
+    cxl: |
+      emit email_domain = email_lower.split("@").last()

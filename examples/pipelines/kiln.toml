@@ -1,2 +1,18 @@
-# kiln.toml — Clinker Kiln workspace
-# Created automatically. Edit freely or delete to disable workspace features.
+# kiln.toml — Clinker Kiln workspace manifest
+# This is the example workspace for developing and testing Kiln features.
+
+[workspace]
+name = "clinker-examples"
+
+[pipelines]
+include = ["*.yaml"]
+
+[schema]
+directory = "schemas"
+infer_sample_rows = 1000
+
+[compositions]
+directory = "compositions"
+
+[cli]
+binary = "clinker"

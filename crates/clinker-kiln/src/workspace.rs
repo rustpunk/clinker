@@ -27,7 +27,21 @@ pub struct WorkspaceManifest {
     #[serde(default)]
     pub schema: Option<SchemaConfig>,
     #[serde(default)]
+    pub compositions: Option<CompositionsConfig>,
+    #[serde(default)]
     pub cli: Option<CliConfig>,
+}
+
+/// Composition configuration from `[compositions]` in kiln.toml.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompositionsConfig {
+    /// Directory for `.comp.yaml` files (default: "compositions").
+    #[serde(default = "default_compositions_dir")]
+    pub directory: String,
+}
+
+fn default_compositions_dir() -> String {
+    "compositions".to_string()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
