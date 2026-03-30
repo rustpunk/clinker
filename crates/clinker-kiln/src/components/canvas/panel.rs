@@ -5,6 +5,7 @@ use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
 use crate::demo::demo_pipeline;
+use crate::state::AppState;
 
 use super::connector::Connector;
 use super::node::CanvasNode;
@@ -49,6 +50,7 @@ struct DragState {
 /// Doc: spec §4.1 — Viewport.
 #[component]
 pub fn CanvasPanel() -> Element {
+    let state = use_context::<AppState>();
     let stages = demo_pipeline();
     let connections: Vec<_> = stages.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
 
@@ -155,6 +157,12 @@ pub fn CanvasPanel() -> Element {
             // Cancel drag if pointer leaves the panel entirely.
             onmouseleave: move |_| { drag.borrow_mut().active = false; },
             onwheel: on_wheel,
+            // Clicking empty canvas deselects any selected node.
+            // Node clicks call stop_propagation(), so this only fires on empty space.
+            onclick: move |_| {
+                let mut sel = state.selected_stage;
+                sel.set(None);
+            },
 
             // ── Transformed viewport ──────────────────────────────────────
             div {

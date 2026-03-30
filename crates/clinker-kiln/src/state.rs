@@ -42,9 +42,10 @@ pub struct AppState {
     pub layout: Signal<LayoutPreset>,
     /// Whether the run-log drawer is expanded (220 px) or collapsed (28 px).
     pub run_log_expanded: Signal<bool>,
-    /// Whether the node-inspector panel is open (Phase 2+, stubbed in Phase 1).
-    #[allow(dead_code)]
-    pub inspector_open: Signal<bool>,
+    /// ID of the currently selected pipeline stage, or `None` if nothing is
+    /// selected. Drives canvas highlight, YAML sidebar line tinting, and
+    /// inspector panel visibility.
+    pub selected_stage: Signal<Option<&'static str>>,
     /// Inspector panel width in pixels; range 260–520, default 340.
     #[allow(dead_code)]
     pub inspector_width: Signal<f32>,

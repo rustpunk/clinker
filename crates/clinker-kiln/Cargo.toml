@@ -6,3 +6,4 @@ description = "Clinker Kiln — IDE for authoring Clinker YAML pipeline configur
 
 [dependencies]
 dioxus.workspace = true
+cxl.workspace = true

@@ -50,7 +50,20 @@ impl StepType {
     }
 }
 
-/// A single pipeline stage as rendered in the Phase 1 static canvas.
+/// A named CXL expression field within a pipeline stage.
+///
+/// For example a filter stage has one expression (`expr`), while a map stage
+/// has one per output field (`full_name`, `email_lower`, etc.).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DemoExprField {
+    /// Label shown in the inspector (e.g., "expr", "full_name").
+    pub label: &'static str,
+    /// Initial CXL expression text.
+    pub expr: &'static str,
+}
+
+/// A single pipeline stage as rendered in the canvas and inspected in the
+/// side panel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DemoStage {
     /// Stable string ID used as the RSX iterator key. Never index-based.
@@ -65,6 +78,12 @@ pub struct DemoStage {
     pub canvas_x: f32,
     /// Canvas world-space Y position (top-left of the node card).
     pub canvas_y: f32,
+    /// CXL expression fields for this stage (empty for Source/Sink).
+    pub expr_fields: Vec<DemoExprField>,
+    /// First line of this stage's block in DEMO_YAML (1-indexed, inclusive).
+    pub yaml_line_start: usize,
+    /// Last line of this stage's block in DEMO_YAML (1-indexed, inclusive).
+    pub yaml_line_end: usize,
 }
 
 /// Approximate rendered node height in px (used for port-centre calculations).
@@ -95,6 +114,9 @@ pub fn demo_pipeline() -> Vec<DemoStage> {
             subtitle: "customers_*.csv",
             canvas_x: 60.0,
             canvas_y: 100.0,
+            expr_fields: vec![],
+            yaml_line_start: 5,
+            yaml_line_end: 11,
         },
         DemoStage {
             id: "demo-filter",
@@ -104,6 +126,12 @@ pub fn demo_pipeline() -> Vec<DemoStage> {
             subtitle: "status == \"active\"",
             canvas_x: 300.0,
             canvas_y: 140.0,
+            expr_fields: vec![DemoExprField {
+                label: "expr",
+                expr: r#"status == "active""#,
+            }],
+            yaml_line_start: 14,
+            yaml_line_end: 16,
         },
         DemoStage {
             id: "demo-map",
@@ -113,6 +141,22 @@ pub fn demo_pipeline() -> Vec<DemoStage> {
             subtitle: "full_name, email_lower",
             canvas_x: 540.0,
             canvas_y: 80.0,
+            expr_fields: vec![
+                DemoExprField {
+                    label: "full_name",
+                    expr: r#"first_name + " " + last_name"#,
+                },
+                DemoExprField {
+                    label: "email_lower",
+                    expr: "lower(email)",
+                },
+                DemoExprField {
+                    label: "region_label",
+                    expr: r#"map("region_labels", region)"#,
+                },
+            ],
+            yaml_line_start: 18,
+            yaml_line_end: 27,
         },
         DemoStage {
             id: "demo-sink",
@@ -122,6 +166,9 @@ pub fn demo_pipeline() -> Vec<DemoStage> {
             subtitle: "output/customers.json",
             canvas_x: 780.0,
             canvas_y: 120.0,
+            expr_fields: vec![],
+            yaml_line_start: 29,
+            yaml_line_end: 32,
         },
     ]
 }

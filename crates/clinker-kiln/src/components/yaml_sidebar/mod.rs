@@ -1,4 +1,4 @@
 mod panel;
-mod tokenizer;
+pub(crate) mod tokenizer;
 
 pub use panel::YamlSidebar;

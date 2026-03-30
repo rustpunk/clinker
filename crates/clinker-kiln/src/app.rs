@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 
 use crate::components::{
     canvas::CanvasPanel,
+    inspector::InspectorPanel,
     run_log::RunLogDrawer,
     title_bar::TitleBar,
     yaml_sidebar::YamlSidebar,
@@ -19,8 +20,8 @@ const KILN_CSS: Asset = asset!("/assets/kiln.css");
 ///
 /// Layout (column flex):
 ///   ┌─ TitleBar ─────────────────────────────────────────────────────────┐
-///   │  CanvasPanel  │  [Inspector stub]  │  YamlSidebar                  │
-///   │  (flex-main)  │  (Phase 2)         │  (360 px fixed)               │
+///   │  CanvasPanel  │  InspectorPanel?  │  YamlSidebar                   │
+///   │  (flex-main)  │  (if selected)    │  (360 px fixed)                │
 ///   ├─ RunLogDrawer ─────────────────────────────────────────────────────┤
 ///   └────────────────────────────────────────────────────────────────────┘
 ///
@@ -31,14 +32,14 @@ pub fn App() -> Element {
     // ── Hooks: all unconditional, at top level (AP-3 compliance) ──────────
     let layout = use_signal(|| LayoutPreset::Hybrid);
     let run_log_expanded = use_signal(|| false);
-    let inspector_open = use_signal(|| false);
+    let selected_stage = use_signal(|| None::<&'static str>);
     let inspector_width = use_signal(|| 340.0_f32);
 
     // ── Provide context: struct-of-signals, not Signal<struct> (AP-4) ─────
     use_context_provider(|| AppState {
         layout,
         run_log_expanded,
-        inspector_open,
+        selected_stage,
         inspector_width,
     });
 
@@ -62,8 +63,14 @@ pub fn App() -> Element {
 
                 CanvasPanel {}
 
-                // Inspector panel — stub div for Phase 1, implemented in Phase 2.
-                div { class: "kiln-inspector-stub" }
+                // Inspector panel — keyed on stage_id so that selection
+                // changes cause a full remount with fresh local signals.
+                if let Some(stage_id) = (selected_stage)() {
+                    InspectorPanel {
+                        key: "{stage_id}",
+                        stage_id,
+                    }
+                }
 
                 YamlSidebar {}
             }

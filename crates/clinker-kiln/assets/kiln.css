@@ -253,10 +253,9 @@ html, body {
   display: flex;
 }
 
-/* Inspector stub — hidden in Phase 1 */
-.kiln-inspector-stub {
-  display: none;
-}
+/* Hide inspector in canvas-focus and editor-focus layouts */
+.kiln-main[data-layout="canvas-focus"] .kiln-inspector { display: none; }
+.kiln-main[data-layout="editor-focus"] .kiln-inspector { display: none; }
 
 /* ── 7. Canvas panel ───────────────────────────────────────────────────────
    Infinite world-space viewport. Phase 3 adds CSS transform for pan/zoom.
@@ -351,6 +350,15 @@ html, body {
 .kiln-node:hover {
   border-color: var(--kiln-border-medium);
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+/* Selected node — accent border glow, eroded corners removed (spec §4.5) */
+.kiln-node--selected {
+  border-color: var(--kiln-verdigris) !important;
+  box-shadow: 0 0 12px 2px rgba(67, 179, 174, 0.3),
+              0 2px 16px rgba(0, 0, 0, 0.5);
+  clip-path: none;
 }
 
 /* Badge row: pass pill + type label */
@@ -656,7 +664,171 @@ html, body {
 .kiln-log-line[data-level="err"]  .kiln-log-tag,
 .kiln-log-line[data-level="err"]  .kiln-log-msg  { color: var(--kiln-oxide-red); }
 
-/* ── 11. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+/* ── 11. YAML selection sync ────────────────────────────────────────────────
+   When a stage is selected, its YAML lines get a tinted background and
+   accent left border. Line numbers shift to verdigris colour.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-yaml-line[data-selected="true"] {
+  background: rgba(67, 179, 174, 0.08);
+  border-left: 2px solid var(--kiln-verdigris);
+  padding-left: 10px;
+}
+
+.kiln-yaml-line-num[data-selected="true"] {
+  color: var(--kiln-verdigris);
+}
+
+/* ── 12. Inspector panel ───────────────────────────────────────────────────
+   Spec §5: slide-in panel between canvas and YAML sidebar.
+   340 px default width, vertical flex with scrollable content.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-inspector {
+  flex: 0 0 340px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--kiln-border-subtle);
+  border-right: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-raised);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Inspector header — accent border-top, type badge, label, close button */
+.kiln-inspector-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  /* border-top set inline from accent colour */
+}
+
+.kiln-inspector-badge {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 2px;
+  border: 1px solid;
+}
+
+.kiln-inspector-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-inspector-close {
+  background: none;
+  border: 1px solid var(--kiln-border-subtle);
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  width: 22px;
+  height: 22px;
+  border-radius: 2px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 150ms, color 150ms;
+}
+
+.kiln-inspector-close:hover {
+  border-color: var(--kiln-oxide-red);
+  color: var(--kiln-oxide-red);
+}
+
+/* Inspector section (Configuration, etc.) */
+.kiln-inspector-section {
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+/* ── 13. CXL expression input + diagnostics ────────────────────────────────
+   Text input for CXL expressions with real-time parse validation.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-cxl-field {
+  padding: 8px 16px;
+}
+
+.kiln-cxl-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 4px;
+}
+
+.kiln-cxl-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-phosphor);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  outline: none;
+  transition: border-color 150ms;
+}
+
+.kiln-cxl-input:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-cxl-input--error {
+  border-color: var(--kiln-oxide-red);
+}
+
+.kiln-cxl-input--error:focus {
+  border-color: var(--kiln-oxide-red);
+  box-shadow: 0 0 4px rgba(183, 65, 14, 0.3);
+}
+
+/* CXL diagnostic messages */
+.kiln-cxl-diagnostics {
+  margin-top: 4px;
+}
+
+.kiln-cxl-diag {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  line-height: 16px;
+  padding: 1px 0;
+}
+
+.kiln-cxl-diag--error .kiln-cxl-diag-msg { color: var(--kiln-oxide-red); }
+.kiln-cxl-diag--warning .kiln-cxl-diag-msg { color: var(--kiln-hazard); }
+
+.kiln-cxl-diag-fix {
+  color: var(--kiln-iron);
+  font-style: italic;
+}
+
+/* ── 14. Inspector scoped YAML ─────────────────────────────────────────────
+   Bottom section showing just the selected stage's YAML lines.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-inspector-yaml {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--kiln-border-subtle);
+  min-height: 0;
+}
+
+.kiln-inspector-yaml-code {
+  padding: 8px 16px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* ── 15. Scrollbar theming (WebKit) ─────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
