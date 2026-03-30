@@ -8,8 +8,23 @@ use dioxus::prelude::*;
 use clinker_schema::{FormatCategory, SourceFormat, SourceSchema};
 
 use crate::state::{LeftPanel, TabManagerState};
+use crate::tab::TabEntry;
 
 use super::schema_card::SchemaCard;
+
+/// Scaffold YAML for new schema files.
+const NEW_SCHEMA_SCAFFOLD: &str = r#"_schema:
+  name: new_schema
+  format: csv
+  description: ""
+
+fields:
+  - name: id
+    type: int
+    nullable: false
+  - name: name
+    type: string
+"#;
 
 /// Active format filter tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -173,14 +188,16 @@ pub fn SchemaPanel() -> Element {
             div { class: "kiln-schema-panel__actions",
                 button {
                     class: "kiln-schema-panel__action-btn",
-                    disabled: true,
-                    title: "Schema inference requires clinker schema infer (coming soon)",
-                    "⟲ Infer Schema"
-                }
-                button {
-                    class: "kiln-schema-panel__action-btn",
-                    disabled: true,
-                    title: "Coming soon",
+                    onclick: move |_| {
+                        let yaml = NEW_SCHEMA_SCAFFOLD;
+                        let new_tab = TabEntry::new_from_yaml(
+                            &tab_mgr.tabs.read(),
+                            yaml.to_string(),
+                        );
+                        let new_id = new_tab.id;
+                        tab_mgr.tabs.write().push(new_tab);
+                        tab_mgr.active_tab_id.set(Some(new_id));
+                    },
                     "+ New Schema"
                 }
             }
