@@ -14,7 +14,6 @@ use crate::demo::{DemoStage, DEMO_YAML};
 /// Doc: spec §5.3 — Scoped YAML Editor.
 #[component]
 pub fn ScopedYaml(stage: DemoStage) -> Element {
-    let accent = stage.step_type.accent_color();
     let all_lines = tokenize(DEMO_YAML);
     let start = stage.yaml_line_start.saturating_sub(1); // 0-indexed
     let end = stage.yaml_line_end.min(all_lines.len());
@@ -23,7 +22,6 @@ pub fn ScopedYaml(stage: DemoStage) -> Element {
     rsx! {
         div {
             class: "kiln-inspector-yaml",
-            style: "border-left: 3px solid {accent};",
 
             // Section header
             div {
