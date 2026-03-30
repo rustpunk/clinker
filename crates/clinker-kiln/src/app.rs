@@ -1,8 +1,12 @@
-/// Root application shell: owns global state + tab manager.
+/// Root application shell: owns all reactive signals.
 ///
-/// `AppState` is provided as `Signal<AppState>` in context. When the active
-/// tab changes, the signal is updated with the new tab's signal handles.
-/// Downstream components call `use_app_state()` to read through the signal.
+/// Per-tab state is stored as plain data in `TabEntry::snapshot`. AppShell
+/// owns one set of signals (yaml_text, pipeline, etc.) that always reflect
+/// the active tab. On tab switch, the departing tab's snapshot is updated
+/// from the signals, and the arriving tab's snapshot is loaded into them.
+///
+/// This avoids Dioxus signal scope-ownership issues — all signals live in
+/// AppShell's scope, which outlives every child component.
 
 use dioxus::prelude::*;
 
@@ -34,9 +38,17 @@ pub fn AppShell() -> Element {
     let run_log_expanded = use_signal(|| false);
     let inspector_width = use_signal(|| 340.0_f32);
 
+    // ── Per-tab signals (owned here, swapped on tab switch) ──────────────
+    let mut yaml_text = use_signal(String::new);
+    let mut pipeline = use_signal(|| None);
+    let mut parse_errors = use_signal(Vec::new);
+    let mut edit_source = use_signal(|| EditSource::None);
+    let mut selected_stage = use_signal(|| None::<String>);
+
     // ── Tab management ───────────────────────────────────────────────────
-    let tabs: Signal<Vec<TabEntry>> = use_signal(Vec::new);
+    let mut tabs: Signal<Vec<TabEntry>> = use_signal(Vec::new);
     let active_tab_id: Signal<Option<TabId>> = use_signal(|| None);
+    let mut prev_tab_id: Signal<Option<TabId>> = use_signal(|| None);
     let recent_files = use_signal(load_recent_files);
     let workspace = use_signal(|| None);
 
@@ -44,29 +56,46 @@ pub fn AppShell() -> Element {
     let toast_message: Signal<Option<ToastState>> = use_signal(|| None);
     let pending_confirm: Signal<Option<PendingConfirm>> = use_signal(|| None);
 
-    // ── Fallback per-tab signals (used when no tab is active) ────────────
-    let fallback_yaml = use_signal(String::new);
-    let fallback_pipeline = use_signal(|| None);
-    let fallback_errors = use_signal(Vec::new);
-    let fallback_edit = use_signal(|| EditSource::None);
-    let fallback_selected = use_signal(|| None::<String>);
+    // ── Tab switch: snapshot departing tab, load arriving tab ─────────────
+    let current_active = (active_tab_id)();
+    let previous = (prev_tab_id)();
 
-    // ── Build AppState from active tab ───────────────────────────────────
-    // This runs on every render. The Signal<AppState> is provided as context
-    // and updated here so children always see the active tab's signals.
-    let active_id = (active_tab_id)();
-    let active_tab_index = active_id.and_then(|id| {
-        tabs.read().iter().position(|t| t.id == id)
-    });
+    if current_active != previous {
+        // Save departing tab's state from signals → snapshot
+        if let Some(old_id) = previous {
+            let mut tabs_w = tabs.write();
+            if let Some(old_tab) = tabs_w.iter_mut().find(|t| t.id == old_id) {
+                old_tab.snapshot.yaml_text = (yaml_text)();
+                old_tab.snapshot.pipeline = (pipeline)();
+                old_tab.snapshot.parse_errors = (parse_errors)();
+                old_tab.snapshot.edit_source = (edit_source)();
+                old_tab.snapshot.selected_stage = (selected_stage)();
+            }
+        }
 
-    let (yaml_text, pipeline, parse_errors, edit_source, selected_stage) =
-        if let Some(idx) = active_tab_index {
-            let t = &tabs.read()[idx];
-            (t.yaml_text, t.pipeline, t.parse_errors, t.edit_source, t.selected_stage)
+        // Load arriving tab's snapshot → signals
+        if let Some(new_id) = current_active {
+            let tabs_r = tabs.read();
+            if let Some(new_tab) = tabs_r.iter().find(|t| t.id == new_id) {
+                yaml_text.set(new_tab.snapshot.yaml_text.clone());
+                pipeline.set(new_tab.snapshot.pipeline.clone());
+                parse_errors.set(new_tab.snapshot.parse_errors.clone());
+                edit_source.set(new_tab.snapshot.edit_source);
+                selected_stage.set(new_tab.snapshot.selected_stage.clone());
+            }
         } else {
-            (fallback_yaml, fallback_pipeline, fallback_errors, fallback_edit, fallback_selected)
-        };
+            // No active tab — clear signals
+            yaml_text.set(String::new());
+            pipeline.set(None);
+            parse_errors.set(Vec::new());
+            edit_source.set(EditSource::None);
+            selected_stage.set(None);
+        }
 
+        prev_tab_id.set(current_active);
+    }
+
+    // ── Build AppState ───────────────────────────────────────────────────
     let current_app_state = AppState {
         layout,
         run_log_expanded,
@@ -78,12 +107,7 @@ pub fn AppShell() -> Element {
         edit_source,
     };
 
-    // Provide AppState as a Signal so it can be updated on tab switch.
-    // use_context_provider runs once; we update the signal's value every render.
     let mut app_state_signal = use_signal(|| current_app_state);
-
-    // Update the signal with current tab's state on every render
-    // (this is cheap — Signal handles are Copy)
     *app_state_signal.write() = current_app_state;
 
     // ── Provide contexts ─────────────────────────────────────────────────
@@ -150,6 +174,32 @@ pub fn AppShell() -> Element {
         });
     }
 
+    // ── Sync active tab snapshot from signals periodically ───────────────
+    // Keep the active tab's snapshot in sync with live signal values
+    // so is_dirty() and save work correctly.
+    {
+        use_effect(move || {
+            let text = (yaml_text)();
+            let pl = (pipeline)();
+            let errs = (parse_errors)();
+            let src = (edit_source)();
+            let sel = (selected_stage)();
+
+            if let Some(active_id) = (active_tab_id)() {
+                let mut tabs_w = tabs.write();
+                if let Some(tab) = tabs_w.iter_mut().find(|t| t.id == active_id) {
+                    tab.snapshot.yaml_text = text;
+                    tab.snapshot.pipeline = pl;
+                    tab.snapshot.parse_errors = errs;
+                    tab.snapshot.edit_source = src;
+                    tab.snapshot.selected_stage = sel;
+                }
+            }
+        });
+    }
+
+    let has_active_tab = current_active.is_some();
+
     rsx! {
         document::Stylesheet { href: KILN_CSS }
         document::Title { "clinker kiln" }
@@ -166,9 +216,9 @@ pub fn AppShell() -> Element {
             TitleBar {}
             TabBar {}
 
-            if active_tab_index.is_some() {
+            if has_active_tab {
                 ActiveTabContent {
-                    key: "{active_id.map(|id| id.to_string()).unwrap_or_default()}",
+                    key: "{current_active.map(|id| id.to_string()).unwrap_or_default()}",
                 }
             } else {
                 WelcomeScreen {}

@@ -143,16 +143,16 @@ pub fn save_active_tab(tab_mgr: &mut TabManagerState, force_save_as: bool) {
 fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: bool) {
     let mut tabs = tab_mgr.tabs;
 
-    // Get current YAML + file path
+    // Get current YAML + file path from snapshot
     let (yaml, current_path) = {
         let tabs_read = tabs.read();
         let Some(tab) = tabs_read.iter().find(|t| t.id == tab_id) else {
             return;
         };
 
-        let yaml = match (tab.pipeline)() {
+        let yaml = match tab.snapshot.pipeline {
             Some(ref config) => serialize_yaml(config),
-            None => (tab.yaml_text)(),
+            None => tab.snapshot.yaml_text.clone(),
         };
 
         (yaml, tab.file_path.clone())
@@ -182,7 +182,7 @@ fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: b
             // Mark tab as saved
             let mut tabs_write = tabs.write();
             if let Some(tab) = tabs_write.iter_mut().find(|t| t.id == tab_id) {
-                tab.mark_saved(path.clone());
+                tab.mark_saved(path.clone(), &yaml);
             }
 
             // Auto-create workspace if needed (§F4.3)

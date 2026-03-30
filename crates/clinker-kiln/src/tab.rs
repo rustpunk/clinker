@@ -1,14 +1,15 @@
-/// Per-tab data model: each open pipeline gets its own signals and file state.
+/// Per-tab data model: each open pipeline stores its state as plain data.
 ///
-/// `TabEntry` holds the reactive signals that downstream components read via
-/// `AppState` context. When the user switches tabs, `ActiveTabContent` remounts
-/// with the new tab's signals — no double-indirection needed.
+/// Signals live in `AppShell` (one set for the active tab). When switching
+/// tabs, the active tab's signal values are snapshotted into the departing
+/// `TabEntry`, and the arriving `TabEntry`'s snapshot is loaded into the
+/// signals. This avoids Dioxus scope-ownership issues where signals created
+/// in child components get dropped when the component unmounts.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clinker_core::config::PipelineConfig;
-use dioxus::prelude::*;
 use uuid::Uuid;
 
 use crate::file_ops::compute_hash;
@@ -40,37 +41,32 @@ impl fmt::Display for TabId {
     }
 }
 
-/// One open pipeline tab with its own reactive signals and file state.
-///
-/// The signal handles here are the same types that `AppState` exposes.
-/// When this tab is active, `ActiveTabContent` provides these via context.
+/// Snapshot of a tab's editable state (plain data, no signals).
+#[derive(Clone)]
+pub struct TabSnapshot {
+    pub yaml_text: String,
+    pub pipeline: Option<PipelineConfig>,
+    pub parse_errors: Vec<String>,
+    pub edit_source: EditSource,
+    pub selected_stage: Option<String>,
+}
+
+/// One open pipeline tab with its file info and state snapshot.
 pub struct TabEntry {
     pub id: TabId,
     /// `None` for unsaved / untitled tabs.
     pub file_path: Option<PathBuf>,
-    /// Display name for untitled tabs (e.g. "untitled.yaml", "untitled-2.yaml").
+    /// Display name for untitled tabs.
     untitled_name: Option<String>,
-    /// Raw YAML text shown in the sidebar editor.
-    pub yaml_text: Signal<String>,
-    /// Parsed pipeline config (`None` if YAML is invalid).
-    pub pipeline: Signal<Option<PipelineConfig>>,
-    /// Parse error messages (empty when valid).
-    pub parse_errors: Signal<Vec<String>>,
-    /// Which view last edited the model (sync-loop prevention).
-    pub edit_source: Signal<EditSource>,
-    /// Currently selected stage on canvas / inspector.
-    pub selected_stage: Signal<Option<String>>,
     /// Blake3 hash of the YAML at last save/open. `None` for never-saved tabs.
     content_hash: Option<[u8; 32]>,
+    /// The tab's current state (updated on tab-switch-away, read on switch-to).
+    pub snapshot: TabSnapshot,
 }
 
 impl TabEntry {
     /// Create a new untitled tab with scaffold YAML.
-    ///
-    /// Pass the current list of tabs to generate a unique display name
-    /// (untitled.yaml, untitled-2.yaml, untitled-3.yaml, ...).
     pub fn new_untitled(existing_tabs: &[TabEntry]) -> Self {
-        // Count existing untitled tabs to pick the next number
         let untitled_count = existing_tabs
             .iter()
             .filter(|t| t.file_path.is_none())
@@ -86,20 +82,21 @@ impl TabEntry {
             id: TabId::new(),
             file_path: None,
             untitled_name: Some(name),
-            yaml_text: Signal::new(SCAFFOLD_YAML.to_string()),
-            pipeline: Signal::new(parse_yaml(SCAFFOLD_YAML).ok()),
-            parse_errors: Signal::new(Vec::new()),
-            edit_source: Signal::new(EditSource::None),
-            selected_stage: Signal::new(None),
-            content_hash: None, // never saved → always dirty
+            content_hash: None,
+            snapshot: TabSnapshot {
+                yaml_text: SCAFFOLD_YAML.to_string(),
+                pipeline: parse_yaml(SCAFFOLD_YAML).ok(),
+                parse_errors: Vec::new(),
+                edit_source: EditSource::None,
+                selected_stage: None,
+            },
         }
     }
 
     /// Create a tab from a file on disk.
     pub fn from_file(path: PathBuf, yaml: String) -> Self {
         let hash = compute_hash(&yaml);
-        let pipeline = parse_yaml(&yaml);
-        let (config, errors) = match pipeline {
+        let (config, errors) = match parse_yaml(&yaml) {
             Ok(c) => (Some(c), Vec::new()),
             Err(e) => (None, e),
         };
@@ -108,19 +105,20 @@ impl TabEntry {
             id: TabId::new(),
             file_path: Some(path),
             untitled_name: None,
-            yaml_text: Signal::new(yaml),
-            pipeline: Signal::new(config),
-            parse_errors: Signal::new(errors),
-            edit_source: Signal::new(EditSource::None),
-            selected_stage: Signal::new(None),
             content_hash: Some(hash),
+            snapshot: TabSnapshot {
+                yaml_text: yaml,
+                pipeline: config,
+                parse_errors: errors,
+                edit_source: EditSource::None,
+                selected_stage: None,
+            },
         }
     }
 
-    /// Create a tab from a file, pre-loading with the demo YAML.
+    /// Create a tab pre-loaded with demo YAML.
     pub fn new_demo(yaml: &str) -> Self {
-        let pipeline = parse_yaml(yaml);
-        let (config, errors) = match pipeline {
+        let (config, errors) = match parse_yaml(yaml) {
             Ok(c) => (Some(c), Vec::new()),
             Err(e) => (None, e),
         };
@@ -129,30 +127,38 @@ impl TabEntry {
             id: TabId::new(),
             file_path: None,
             untitled_name: Some("demo.yaml".to_string()),
-            yaml_text: Signal::new(yaml.to_string()),
-            pipeline: Signal::new(config),
-            parse_errors: Signal::new(errors),
-            edit_source: Signal::new(EditSource::None),
-            selected_stage: Signal::new(None),
             content_hash: None,
+            snapshot: TabSnapshot {
+                yaml_text: yaml.to_string(),
+                pipeline: config,
+                parse_errors: errors,
+                edit_source: EditSource::None,
+                selected_stage: None,
+            },
         }
     }
 
     /// Whether the tab has unsaved changes.
-    ///
-    /// Untitled tabs (no `content_hash`) are always dirty.
-    /// Saved tabs compare current YAML against the last-saved hash.
     pub fn is_dirty(&self) -> bool {
         let Some(saved_hash) = self.content_hash else {
             return true;
         };
-        let current = compute_hash(&(self.yaml_text)());
+        let current = compute_hash(&self.snapshot.yaml_text);
         current != saved_hash
     }
 
-    /// Mark the current YAML as saved (updates the content hash).
-    pub fn mark_saved(&mut self, path: PathBuf) {
-        self.content_hash = Some(compute_hash(&(self.yaml_text)()));
+    /// Check dirty against live signal values (for the active tab).
+    pub fn is_dirty_with_yaml(&self, current_yaml: &str) -> bool {
+        let Some(saved_hash) = self.content_hash else {
+            return true;
+        };
+        let current = compute_hash(current_yaml);
+        current != saved_hash
+    }
+
+    /// Mark the current YAML as saved.
+    pub fn mark_saved(&mut self, path: PathBuf, yaml: &str) {
+        self.content_hash = Some(compute_hash(yaml));
         self.file_path = Some(path);
     }
 
