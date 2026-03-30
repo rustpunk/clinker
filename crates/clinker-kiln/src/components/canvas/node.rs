@@ -14,9 +14,19 @@ pub fn CanvasNode(stage: DemoStage) -> Element {
     let badge = stage.step_type.badge_label();
     let pass_label = stage.pass.label();
 
-    // Port centre offsets used for connector anchor visibility.
-    // The port square is 8×8 px centred on each edge's midpoint.
-    let port_y = NODE_HEIGHT / 2.0 - 4.0; // top of port square
+    // Port centre must align with the connector endpoint at canvas_y + NODE_HEIGHT/2.
+    //
+    // `top` on an absolutely-positioned child is measured from the padding box
+    // (i.e. INSIDE the border). The node card has `border-top: 3px`, so the
+    // padding box starts 3 px below `canvas_y`. To land the port centre at
+    // `canvas_y + NODE_HEIGHT/2`, we solve:
+    //
+    //   canvas_y + 3 (border-top) + port_y + 4 (port_half) = canvas_y + NODE_HEIGHT/2
+    //   port_y = NODE_HEIGHT/2 - 4 - 3
+    //
+    const BORDER_TOP: f32 = 3.0;
+    const PORT_HALF: f32 = 4.0; // half of 8px port square
+    let port_y = NODE_HEIGHT / 2.0 - PORT_HALF - BORDER_TOP;
 
     rsx! {
         // Node card — positioned absolutely within the canvas panel.
