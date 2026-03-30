@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use crate::autodoc::generate_stage_doc;
 use crate::notes::parse_notes;
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 /// Docs drawer — auto-generated stage documentation with Blueprint sub-aesthetic.
 ///
@@ -14,7 +14,7 @@ use crate::state::AppState;
 /// 5. Footer: "AUTODOC"
 #[component]
 pub fn DrawerDocs(stage_id: String) -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
 
     let pipeline_guard = (state.pipeline).read();
     let Some(config) = pipeline_guard.as_ref() else {

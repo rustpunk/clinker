@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use dioxus::prelude::*;
 
 use crate::pipeline_view::derive_pipeline_view;
-use crate::state::AppState;
+use crate::state::use_app_state;
 use crate::sync::EditSource;
 
 use super::tokenizer::tokenize;
@@ -21,7 +21,7 @@ use super::tokenizer::tokenize;
 /// Doc: spec §6 — YAML Editor (Sidebar).
 #[component]
 pub fn YamlSidebar() -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
     let text = (state.yaml_text)();
     let errors = (state.parse_errors)();
     let lines = tokenize(&text);

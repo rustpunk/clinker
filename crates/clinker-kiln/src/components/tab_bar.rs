@@ -65,7 +65,7 @@ pub fn TabBar() -> Element {
             button {
                 class: "kiln-tab-new",
                 onclick: move |_| {
-                    let new_tab = TabEntry::new_untitled();
+                    let new_tab = TabEntry::new_untitled(&tabs.read());
                     let new_id = new_tab.id;
                     tabs.write().push(new_tab);
                     tab_mgr.active_tab_id.set(Some(new_id));

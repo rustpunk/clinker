@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 use super::cxl_input::CxlInput;
 use super::drawer_bar::{ActiveDrawer, DrawerToggleBar};
@@ -18,7 +18,7 @@ use super::stage_header::StageHeader;
 /// Spec §A2.1: Panel structure (Config + toggle bar + drawer).
 #[component]
 pub fn InspectorPanel(stage_id: String) -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
     let mut active_drawer = use_signal(|| ActiveDrawer::None);
 
     let pipeline_guard = (state.pipeline).read();

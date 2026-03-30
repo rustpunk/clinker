@@ -1,15 +1,8 @@
 /// Root application shell: owns global state + tab manager.
 ///
-/// The architecture splits into two components:
-///
-/// - `AppShell` — top-level owner of global signals (layout, run log)
-///   and tab management (open tabs, active tab, recent files). Provides
-///   `AppState` context built from the active tab's signals so that
-///   TitleBar, RunLogDrawer, and other shell-level components can read it.
-///
-/// - `ActiveTabContent` — keyed on the active tab's ID, so Dioxus
-///   remounts it on tab switch. Contains the YAML↔model sync effects.
-///   Renders canvas, inspector, YAML sidebar, and schematics.
+/// `AppState` is provided as `Signal<AppState>` in context. When the active
+/// tab changes, the signal is updated with the new tab's signal handles.
+/// Downstream components call `use_app_state()` to read through the signal.
 
 use dioxus::prelude::*;
 
@@ -26,20 +19,14 @@ use crate::components::{
 };
 use crate::components::confirm_dialog::{ConfirmAction, ConfirmDialog, PendingConfirm};
 use crate::components::toast::ToastState;
-use crate::demo::DEFAULT_YAML;
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
-use crate::state::{AppState, LayoutPreset, TabManagerState};
+use crate::state::{AppState, LayoutPreset, TabManagerState, use_app_state};
 use crate::sync::{parse_yaml, serialize_yaml, EditSource};
 use crate::tab::{TabEntry, TabId};
 
 const KILN_CSS: Asset = asset!("/assets/kiln.css");
 
-/// Root application component.
-///
-/// Owns global signals and the tab collection. Provides both `TabManagerState`
-/// and `AppState` contexts — `AppState` is built from the active tab's signals
-/// so shell-level components (TitleBar, RunLogDrawer) always have access.
 #[component]
 pub fn AppShell() -> Element {
     // ── Global signals (shared across all tabs) ──────────────────────────
@@ -48,16 +35,13 @@ pub fn AppShell() -> Element {
     let inspector_width = use_signal(|| 340.0_f32);
 
     // ── Tab management ───────────────────────────────────────────────────
-    // Start with no tabs — the welcome screen provides Open/New buttons.
     let tabs: Signal<Vec<TabEntry>> = use_signal(Vec::new);
     let active_tab_id: Signal<Option<TabId>> = use_signal(|| None);
     let recent_files = use_signal(load_recent_files);
     let workspace = use_signal(|| None);
 
-    // ── Toast notifications ──────────────────────────────────────────────
+    // ── Toast + confirm dialog ───────────────────────────────────────────
     let toast_message: Signal<Option<ToastState>> = use_signal(|| None);
-
-    // ── Confirmation dialog state ────────────────────────────────────────
     let pending_confirm: Signal<Option<PendingConfirm>> = use_signal(|| None);
 
     // ── Fallback per-tab signals (used when no tab is active) ────────────
@@ -67,13 +51,14 @@ pub fn AppShell() -> Element {
     let fallback_edit = use_signal(|| EditSource::None);
     let fallback_selected = use_signal(|| None::<String>);
 
-    // ── Find the active tab's signals ────────────────────────────────────
+    // ── Build AppState from active tab ───────────────────────────────────
+    // This runs on every render. The Signal<AppState> is provided as context
+    // and updated here so children always see the active tab's signals.
     let active_id = (active_tab_id)();
     let active_tab_index = active_id.and_then(|id| {
         tabs.read().iter().position(|t| t.id == id)
     });
 
-    // Build AppState from active tab or fallbacks
     let (yaml_text, pipeline, parse_errors, edit_source, selected_stage) =
         if let Some(idx) = active_tab_index {
             let t = &tabs.read()[idx];
@@ -82,15 +67,7 @@ pub fn AppShell() -> Element {
             (fallback_yaml, fallback_pipeline, fallback_errors, fallback_edit, fallback_selected)
         };
 
-    // ── Provide global contexts ──────────────────────────────────────────
-    use_context_provider(|| TabManagerState {
-        tabs,
-        active_tab_id,
-        recent_files,
-        workspace,
-    });
-
-    use_context_provider(move || AppState {
+    let current_app_state = AppState {
         layout,
         run_log_expanded,
         selected_stage,
@@ -99,8 +76,24 @@ pub fn AppShell() -> Element {
         pipeline,
         parse_errors,
         edit_source,
-    });
+    };
 
+    // Provide AppState as a Signal so it can be updated on tab switch.
+    // use_context_provider runs once; we update the signal's value every render.
+    let mut app_state_signal = use_signal(|| current_app_state);
+
+    // Update the signal with current tab's state on every render
+    // (this is cheap — Signal handles are Copy)
+    *app_state_signal.write() = current_app_state;
+
+    // ── Provide contexts ─────────────────────────────────────────────────
+    use_context_provider(|| app_state_signal);
+    use_context_provider(|| TabManagerState {
+        tabs,
+        active_tab_id,
+        recent_files,
+        workspace,
+    });
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
 
@@ -113,8 +106,6 @@ pub fn AppShell() -> Element {
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
-    // These run at AppShell level using the active tab's signals.
-    // When the active tab changes, the signals change, triggering re-sync.
     {
         let mut pipeline = pipeline;
         let mut parse_errors = parse_errors;
@@ -186,7 +177,6 @@ pub fn AppShell() -> Element {
             RunLogDrawer {}
             ToastOverlay {}
 
-            // Confirmation dialog (rendered above everything when pending)
             if let Some(pending) = (pending_confirm)() {
                 ConfirmDialog {
                     pending: pending.clone(),
@@ -195,14 +185,12 @@ pub fn AppShell() -> Element {
                         let tab_id = pending.tab_id;
                         match action {
                             ConfirmAction::Save => {
-                                // Save first, then close
                                 crate::keyboard::save_and_close_tab(
                                     &mut kb_tab_mgr, tab_id,
                                 );
                                 confirm.set(None);
                             }
                             ConfirmAction::Discard => {
-                                // Close without saving
                                 crate::keyboard::force_close_tab(
                                     &mut kb_tab_mgr, tab_id,
                                 );
@@ -220,12 +208,9 @@ pub fn AppShell() -> Element {
 }
 
 /// Active tab's content area — keyed on tab ID for clean remount.
-///
-/// Reads `AppState` from context (provided by AppShell with the active tab's
-/// signals). Renders canvas, inspector, YAML sidebar, and schematics.
 #[component]
 fn ActiveTabContent() -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
     let layout = state.layout;
     let selected_stage = state.selected_stage;
 

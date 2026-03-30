@@ -24,7 +24,7 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
     match key {
         // Ctrl+N — New untitled tab
         Key::Character(ref c) if c == "n" && !event.modifiers().shift() => {
-            let new_tab = TabEntry::new_untitled();
+            let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
             let new_id = new_tab.id;
             tab_mgr.tabs.write().push(new_tab);
             tab_mgr.active_tab_id.set(Some(new_id));

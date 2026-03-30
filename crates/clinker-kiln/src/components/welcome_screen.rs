@@ -48,7 +48,7 @@ pub fn WelcomeScreen() -> Element {
                 button {
                     class: "kiln-welcome-btn",
                     onclick: move |_| {
-                        let new_tab = TabEntry::new_untitled();
+                        let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
                         let new_id = new_tab.id;
                         tab_mgr.tabs.write().push(new_tab);
                         tab_mgr.active_tab_id.set(Some(new_id));

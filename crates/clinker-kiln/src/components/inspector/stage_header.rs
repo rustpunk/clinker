@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 /// Inspector header row: accent border-top + type badge + stage label + close button.
 #[component]
@@ -10,7 +10,7 @@ pub fn StageHeader(
     accent: &'static str,
     label: String,
 ) -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
 
     rsx! {
         div {

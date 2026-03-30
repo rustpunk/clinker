@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 /// Severity level of a run-log line.
 /// All variants used in Phase 5 live log streaming; Phase 1 demo uses a subset.
@@ -76,7 +76,7 @@ fn demo_log() -> Vec<LogLine> {
 /// Doc: spec §7 — Run Log.
 #[component]
 pub fn RunLogDrawer() -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
 
     rsx! {
         div {

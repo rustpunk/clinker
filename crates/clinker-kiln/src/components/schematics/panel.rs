@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use crate::autodoc::generate_stage_doc;
 use crate::notes::parse_notes;
 use crate::pipeline_view::derive_pipeline_view;
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 use super::flow_bar::FlowBar;
 use super::stage_card::StageCard;
@@ -16,7 +16,7 @@ use super::stage_card::StageCard;
 /// Spec §A7.2: mode indicator + flow bar + content area.
 #[component]
 pub fn SchematicsPanel() -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
 
     let pipeline_guard = (state.pipeline).read();
     let Some(config) = pipeline_guard.as_ref() else {

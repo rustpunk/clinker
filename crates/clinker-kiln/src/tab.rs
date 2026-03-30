@@ -48,6 +48,8 @@ pub struct TabEntry {
     pub id: TabId,
     /// `None` for unsaved / untitled tabs.
     pub file_path: Option<PathBuf>,
+    /// Display name for untitled tabs (e.g. "untitled.yaml", "untitled-2.yaml").
+    untitled_name: Option<String>,
     /// Raw YAML text shown in the sidebar editor.
     pub yaml_text: Signal<String>,
     /// Parsed pipeline config (`None` if YAML is invalid).
@@ -64,10 +66,26 @@ pub struct TabEntry {
 
 impl TabEntry {
     /// Create a new untitled tab with scaffold YAML.
-    pub fn new_untitled() -> Self {
+    ///
+    /// Pass the current list of tabs to generate a unique display name
+    /// (untitled.yaml, untitled-2.yaml, untitled-3.yaml, ...).
+    pub fn new_untitled(existing_tabs: &[TabEntry]) -> Self {
+        // Count existing untitled tabs to pick the next number
+        let untitled_count = existing_tabs
+            .iter()
+            .filter(|t| t.file_path.is_none())
+            .count();
+
+        let name = if untitled_count == 0 {
+            "untitled.yaml".to_string()
+        } else {
+            format!("untitled-{}.yaml", untitled_count + 1)
+        };
+
         Self {
             id: TabId::new(),
             file_path: None,
+            untitled_name: Some(name),
             yaml_text: Signal::new(SCAFFOLD_YAML.to_string()),
             pipeline: Signal::new(parse_yaml(SCAFFOLD_YAML).ok()),
             parse_errors: Signal::new(Vec::new()),
@@ -89,6 +107,7 @@ impl TabEntry {
         Self {
             id: TabId::new(),
             file_path: Some(path),
+            untitled_name: None,
             yaml_text: Signal::new(yaml),
             pipeline: Signal::new(config),
             parse_errors: Signal::new(errors),
@@ -109,6 +128,7 @@ impl TabEntry {
         Self {
             id: TabId::new(),
             file_path: None,
+            untitled_name: Some("demo.yaml".to_string()),
             yaml_text: Signal::new(yaml.to_string()),
             pipeline: Signal::new(config),
             parse_errors: Signal::new(errors),
@@ -143,7 +163,10 @@ impl TabEntry {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "untitled.yaml".to_string()),
-            None => "untitled.yaml".to_string(),
+            None => self
+                .untitled_name
+                .clone()
+                .unwrap_or_else(|| "untitled.yaml".to_string()),
         }
     }
 

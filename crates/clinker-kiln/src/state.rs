@@ -65,6 +65,16 @@ pub struct AppState {
     pub edit_source: Signal<EditSource>,
 }
 
+/// Read the current `AppState` from context.
+///
+/// The context holds a `Signal<AppState>` which is updated when the active
+/// tab changes. This helper reads through the signal so callers get the
+/// current tab's state.
+pub fn use_app_state() -> AppState {
+    let sig = use_context::<Signal<AppState>>();
+    *sig.read()
+}
+
 /// Global tab management context — used by tab bar, title bar, keyboard handlers.
 #[derive(Clone, Copy)]
 pub struct TabManagerState {

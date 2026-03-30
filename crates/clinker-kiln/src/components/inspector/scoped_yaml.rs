@@ -1,14 +1,14 @@
 use dioxus::prelude::*;
 
 use crate::components::yaml_sidebar::tokenizer::tokenize;
-use crate::state::AppState;
+use crate::state::use_app_state;
 use crate::sync::compute_yaml_ranges;
 
 /// Bottom section of the inspector showing the selected stage's YAML block
 /// with absolute line numbers from the full YAML.
 #[component]
 pub fn ScopedYaml(stage_id: String, accent: &'static str) -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
     let text = (state.yaml_text)();
     let pipeline_guard = (state.pipeline).read();
 

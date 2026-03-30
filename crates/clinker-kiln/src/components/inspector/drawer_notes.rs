@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::notes::{parse_notes, serialize_notes, StageNotes};
-use crate::state::AppState;
+use crate::state::use_app_state;
 use crate::sync::EditSource;
 
 /// Notes drawer — editable stage-level note + field-level annotations.
@@ -13,7 +13,7 @@ use crate::sync::EditSource;
 /// Spec §A5A.2–A5A.4.
 #[component]
 pub fn DrawerNotes(stage_id: String) -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
 
     // Read current notes from the pipeline config
     let (stage_note_text, annotations) = {

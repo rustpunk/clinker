@@ -2,7 +2,7 @@ use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 
 use crate::keyboard;
-use crate::state::{AppState, LayoutPreset, TabManagerState};
+use crate::state::{use_app_state, LayoutPreset, TabManagerState};
 use crate::tab::TabEntry;
 
 /// Custom frameless title bar with file action buttons.
@@ -15,7 +15,7 @@ use crate::tab::TabEntry;
 #[component]
 pub fn TitleBar() -> Element {
     let window = use_window();
-    let state = use_context::<AppState>();
+    let state = use_app_state();
     let mut tab_mgr: TabManagerState = use_context();
 
     // Derive filename + dirty state from active tab
@@ -70,7 +70,7 @@ pub fn TitleBar() -> Element {
                     class: "kiln-file-btn",
                     title: "New pipeline (Ctrl+N)",
                     onclick: move |_| {
-                        let new_tab = TabEntry::new_untitled();
+                        let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
                         let new_id = new_tab.id;
                         tab_mgr.tabs.write().push(new_tab);
                         tab_mgr.active_tab_id.set(Some(new_id));

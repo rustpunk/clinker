@@ -5,7 +5,7 @@ use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
 use crate::pipeline_view::derive_pipeline_view;
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 use super::connector::Connector;
 use super::node::CanvasNode;
@@ -50,7 +50,7 @@ struct DragState {
 /// Doc: spec §4.1 — Viewport.
 #[component]
 pub fn CanvasPanel() -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
 
     // Derive canvas stages from the pipeline model (if parsed successfully).
     let stages = match &*(state.pipeline).read() {

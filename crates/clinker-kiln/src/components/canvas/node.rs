@@ -1,12 +1,12 @@
 use dioxus::prelude::*;
 
 use crate::pipeline_view::{StageView, NODE_HEIGHT, NODE_WIDTH};
-use crate::state::AppState;
+use crate::state::use_app_state;
 
 /// A single pipeline stage rendered as a rustpunk node card on the canvas.
 #[component]
 pub fn CanvasNode(stage: StageView) -> Element {
-    let state = use_context::<AppState>();
+    let state = use_app_state();
     let accent = stage.kind.accent_color();
     let badge = stage.kind.badge_label();
     let stage_id = stage.id.clone();
