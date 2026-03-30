@@ -1,6 +1,8 @@
 pub mod config;
+pub mod dlq;
 pub mod error;
 pub mod executor;
+mod integration_tests;
 pub mod projection;
 
 #[allow(unused_imports)]
