@@ -533,23 +533,39 @@ html, body {
   color: var(--kiln-bone);
 }
 
-/* YAML editable textarea — monospace, full-height, dark background */
-.kiln-yaml-textarea {
+/* Editor container: stacks syntax overlay + textarea */
+.kiln-yaml-editor {
   flex: 1;
+  position: relative;
   min-width: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Syntax-highlighted overlay — visible, pointer-events none */
+.kiln-yaml-highlight {
+  padding: 8px 12px;
+  pointer-events: none;
+  white-space: pre;
+}
+
+/* Transparent textarea — captures input, sits on top */
+.kiln-yaml-textarea {
+  position: absolute;
+  inset: 0;
   padding: 8px 12px;
   font-family: var(--kiln-font-code);
   font-size: 11px;
   line-height: 20px;
-  color: var(--kiln-bone);
-  background: var(--kiln-char);
+  color: transparent;
+  caret-color: var(--kiln-bone);
+  background: transparent;
   border: none;
   outline: none;
   resize: none;
   white-space: pre;
-  overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--kiln-border-subtle) transparent;
+  overflow: hidden;
   tab-size: 2;
 }
 

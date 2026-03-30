@@ -3,6 +3,7 @@ use dioxus::prelude::*;
 use crate::state::AppState;
 
 use super::cxl_input::CxlInput;
+use super::scoped_yaml::ScopedYaml;
 use super::stage_header::StageHeader;
 
 /// Inspector panel showing the selected stage's configuration.
@@ -78,6 +79,12 @@ pub fn InspectorPanel(stage_id: String) -> Element {
                         initial_value: cxl.clone(),
                     }
                 }
+            }
+
+            // Scoped YAML — shows this stage's YAML block with line numbers
+            ScopedYaml {
+                stage_id: stage_id.clone(),
+                accent,
             }
         }
     }
