@@ -200,6 +200,70 @@ pub fn strip_template_block(yaml: &str) -> String {
     result.trim_start_matches('\n').to_string()
 }
 
+// ── Pipeline-from-schema generation (spec §S4.7) ────────────────────────
+
+/// Generate a pipeline YAML scaffold from a schema.
+///
+/// Creates a pipeline with: source (format + placeholder path + schema link),
+/// identity map stage with all fields, sink with same format.
+pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> String {
+    let name = &schema.metadata.name;
+    let format = schema.metadata.format.label();
+    let schema_path = schema.path.display();
+
+    // Determine clinker format type
+    let clinker_format = match schema.metadata.format {
+        clinker_schema::SourceFormat::Csv | clinker_schema::SourceFormat::Tsv => "csv",
+        clinker_schema::SourceFormat::Json | clinker_schema::SourceFormat::Jsonl => "json",
+        clinker_schema::SourceFormat::Xml => "xml",
+        clinker_schema::SourceFormat::Parquet => "csv", // fallback
+    };
+
+    let mut yaml = String::new();
+    yaml.push_str(&format!("# Auto-generated from {schema_path}\n"));
+    yaml.push_str(&format!("pipeline:\n  name: {name}-pipeline\n\n"));
+
+    // Input
+    yaml.push_str("inputs:\n");
+    yaml.push_str(&format!("  - name: {name}\n"));
+    yaml.push_str(&format!("    type: {clinker_format}\n"));
+    yaml.push_str(&format!("    path: \"./data/{name}_*.{format}\"\n"));
+    yaml.push_str(&format!("    schema: {schema_path}\n"));
+
+    if clinker_format == "csv" {
+        yaml.push_str("    options:\n      has_header: true\n");
+    }
+    if clinker_format == "xml" {
+        if let Some(ref elem) = schema.metadata.record_element {
+            yaml.push_str(&format!("    options:\n      record_element: {elem}\n"));
+        }
+    }
+
+    // Identity map transformation
+    yaml.push_str("\ntransformations:\n");
+    yaml.push_str("  - name: select_fields\n");
+    yaml.push_str("    cxl: |\n");
+
+    let top_level_fields: Vec<&str> = schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+
+    for field in &top_level_fields {
+        let clean = field.trim_start_matches('@');
+        yaml.push_str(&format!("      emit {clean} = {clean}\n"));
+    }
+
+    // Output
+    yaml.push_str(&format!("\noutputs:\n"));
+    yaml.push_str(&format!("  - name: {name}_output\n"));
+    yaml.push_str(&format!("    type: {clinker_format}\n"));
+    yaml.push_str(&format!("    path: \"./output/{name}_output.{format}\"\n"));
+
+    yaml
+}
+
 /// All available format categories for gallery filtering.
 pub const FORMAT_CATEGORIES: &[&str] = &["All", "CSV", "JSON", "XML", "Multi"];
 
@@ -276,5 +340,39 @@ inputs:
         assert!(format_filter_matches("CSV", "csv"));
         assert!(!format_filter_matches("CSV", "json"));
         assert!(format_filter_matches("JSON", "json"));
+    }
+
+    #[test]
+    fn test_generate_pipeline_from_schema() {
+        let schema_yaml = r#"
+_schema:
+  name: customers
+  format: csv
+  description: "Customer data"
+
+fields:
+  - name: id
+    type: int
+    nullable: false
+  - name: email
+    type: string
+  - name: status
+    type: string
+"#;
+        let schema = clinker_schema::parse_schema(
+            schema_yaml,
+            std::path::Path::new("schemas/customers.schema.yaml"),
+        )
+        .unwrap();
+
+        let yaml = generate_pipeline_from_schema(&schema);
+
+        assert!(yaml.contains("name: customers-pipeline"));
+        assert!(yaml.contains("type: csv"));
+        assert!(yaml.contains("schema: schemas/customers.schema.yaml"));
+        assert!(yaml.contains("emit id = id"));
+        assert!(yaml.contains("emit email = email"));
+        assert!(yaml.contains("emit status = status"));
+        assert!(yaml.contains("has_header: true"));
     }
 }

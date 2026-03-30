@@ -347,6 +347,159 @@ fn discover_yaml_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+// ── Structural search engine ────────────────────────────────────────────
+
+/// Valid structural search keys.
+pub const STRUCTURAL_KEYS: &[&str] = &[
+    "input", "transform", "output", "field", "schema", "expr", "has", "pipeline",
+];
+
+/// Parse a raw DSL string into structural tags.
+///
+/// Input: "input:employees field:email" → [("input","employees"), ("field","email")]
+/// Handles both space-separated and typed pill format.
+pub fn parse_structural_query(query: &str) -> Vec<StructuralTag> {
+    let mut tags = Vec::new();
+
+    for token in query.split_whitespace() {
+        if let Some((key, value)) = token.split_once(':') {
+            if !key.is_empty() && !value.is_empty() {
+                tags.push(StructuralTag {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
+    }
+
+    tags
+}
+
+/// Execute a structural search across workspace pipeline files.
+///
+/// All tags combine with AND — a stage must match every tag to appear in results.
+pub fn structural_search(
+    workspace_root: &Path,
+    tags: &[StructuralTag],
+) -> Vec<StructuralSearchMatch> {
+    if tags.is_empty() {
+        return Vec::new();
+    }
+
+    let yaml_files = discover_yaml_files(workspace_root);
+    let mut results = Vec::new();
+
+    for file_path in yaml_files {
+        let Ok(content) = fs::read_to_string(&file_path) else {
+            continue;
+        };
+
+        let relative = file_path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&file_path)
+            .display()
+            .to_string();
+
+        // Parse as pipeline config for structural matching
+        let Ok(config) = clinker_core::config::parse_config(&content) else {
+            continue;
+        };
+
+        // Check pipeline-level tags
+        for tag in tags {
+            if tag.key == "pipeline" {
+                let name_lower = config.pipeline.name.to_lowercase();
+                if name_lower.contains(&tag.value.to_lowercase()) {
+                    results.push(StructuralSearchMatch {
+                        pipeline_path: relative.clone(),
+                        stage_name: config.pipeline.name.clone(),
+                        stage_type: "pipeline".to_string(),
+                        matched_detail: format!("name: {}", config.pipeline.name),
+                    });
+                }
+            }
+        }
+
+        // Check inputs
+        for input in &config.inputs {
+            if stage_matches_tags(tags, "input", &input.name, &content_for_input(input)) {
+                let detail = format!("type: {:?}, path: {}", input.r#type, input.path);
+                results.push(StructuralSearchMatch {
+                    pipeline_path: relative.clone(),
+                    stage_name: input.name.clone(),
+                    stage_type: "input".to_string(),
+                    matched_detail: detail,
+                });
+            }
+        }
+
+        // Check transformations
+        for transform in &config.transformations {
+            if stage_matches_tags(tags, "transform", &transform.name, &transform.cxl) {
+                let detail = transform
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| transform.cxl.lines().next().unwrap_or("").to_string());
+                results.push(StructuralSearchMatch {
+                    pipeline_path: relative.clone(),
+                    stage_name: transform.name.clone(),
+                    stage_type: "transform".to_string(),
+                    matched_detail: detail,
+                });
+            }
+        }
+
+        // Check outputs
+        for output in &config.outputs {
+            if stage_matches_tags(tags, "output", &output.name, &format!("{:?} {}", output.r#type, output.path)) {
+                let detail = format!("type: {:?}, path: {}", output.r#type, output.path);
+                results.push(StructuralSearchMatch {
+                    pipeline_path: relative.clone(),
+                    stage_name: output.name.clone(),
+                    stage_type: "output".to_string(),
+                    matched_detail: detail,
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Check if a stage matches all structural tags (AND logic).
+fn stage_matches_tags(tags: &[StructuralTag], stage_type: &str, name: &str, content: &str) -> bool {
+    let content_lower = content.to_lowercase();
+    let name_lower = name.to_lowercase();
+
+    tags.iter().all(|tag| {
+        let val_lower = tag.value.to_lowercase();
+        match tag.key.as_str() {
+            "input" => stage_type == "input" && name_lower.contains(&val_lower),
+            "transform" => stage_type == "transform" && name_lower.contains(&val_lower),
+            "output" => stage_type == "output" && name_lower.contains(&val_lower),
+            "field" | "column" => content_lower.contains(&val_lower),
+            "expr" => content_lower.contains(&val_lower),
+            "schema" => content_lower.contains(&val_lower),
+            "has" => match val_lower.as_str() {
+                "_notes" => content_lower.contains("_notes"),
+                "description" => content_lower.contains("description"),
+                _ => false,
+            },
+            "pipeline" => false, // Handled separately
+            _ => false,
+        }
+    })
+}
+
+/// Build searchable content string for an input stage.
+fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
+    let mut content = format!("{} {:?} {}", input.name, input.r#type, input.path);
+    if let Some(ref schema) = input.schema {
+        content.push_str(&format!(" schema:{schema}"));
+    }
+    content
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +590,36 @@ mod tests {
         let (result, count) = text_replace(content, "a", "X", &opts, false);
         assert_eq!(count, 1);
         assert_eq!(result, "X b a b a");
+    }
+
+    #[test]
+    fn test_parse_structural_query() {
+        let tags = parse_structural_query("input:employees field:email");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], StructuralTag { key: "input".to_string(), value: "employees".to_string() });
+        assert_eq!(tags[1], StructuralTag { key: "field".to_string(), value: "email".to_string() });
+    }
+
+    #[test]
+    fn test_parse_structural_query_empty() {
+        assert!(parse_structural_query("").is_empty());
+        assert!(parse_structural_query("no-colon").is_empty());
+    }
+
+    #[test]
+    fn test_stage_matches_tags_and_logic() {
+        let tags = vec![
+            StructuralTag { key: "transform".to_string(), value: "compute".to_string() },
+            StructuralTag { key: "expr".to_string(), value: "email".to_string() },
+        ];
+
+        // Both match
+        assert!(stage_matches_tags(&tags, "transform", "compute_fields", "emit domain = email.split"));
+
+        // Name doesn't match
+        assert!(!stage_matches_tags(&tags, "transform", "filter_step", "emit domain = email.split"));
+
+        // Content doesn't match
+        assert!(!stage_matches_tags(&tags, "transform", "compute_fields", "emit x = y + z"));
     }
 }
