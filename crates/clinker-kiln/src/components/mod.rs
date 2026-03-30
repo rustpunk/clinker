@@ -5,6 +5,7 @@ pub mod run_log;
 pub mod schema_panel;
 pub mod schematics;
 pub mod search_panel;
+pub mod status_bar;
 pub mod template_gallery;
 pub mod tab_bar;
 pub mod title_bar;

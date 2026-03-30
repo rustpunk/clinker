@@ -787,11 +787,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "clinker-git"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "clinker-kiln"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "clinker-core",
+ "clinker-git",
  "clinker-schema",
  "cxl",
  "dioxus",
@@ -5635,6 +5643,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

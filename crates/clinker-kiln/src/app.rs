@@ -8,6 +8,7 @@
 /// This avoids Dioxus signal scope-ownership issues — all signals live in
 /// AppShell's scope, which outlives every child component.
 
+use clinker_git::GitOps;
 use dioxus::prelude::*;
 
 use crate::components::{
@@ -17,6 +18,7 @@ use crate::components::{
     schema_panel::SchemaPanel,
     schematics::SchematicsPanel,
     search_panel::SearchPanel,
+    status_bar::StatusBar,
     tab_bar::TabBar,
     template_gallery::TemplateGallery,
     title_bar::TitleBar,
@@ -79,6 +81,26 @@ pub fn AppShell() -> Element {
     let left_panel: Signal<LeftPanel> = use_signal(|| LeftPanel::None);
     let mut schema_index: Signal<SchemaIndex> = use_signal(SchemaIndex::default);
     let show_template_gallery: Signal<bool> = use_signal(|| false);
+    let mut git_state: Signal<Option<clinker_git::RepoStatus>> = use_signal(|| None);
+
+    // ── Git: detect repo and compute status on workspace change ──────────
+    {
+        use_effect(move || {
+            let ws = (workspace)();
+            if let Some(ref ws) = ws {
+                match clinker_git::GitCliOps::discover(&ws.root) {
+                    Ok(ops) => {
+                        if let Ok(status) = ops.status() {
+                            git_state.set(Some(status));
+                        }
+                    }
+                    Err(_) => git_state.set(None),
+                }
+            } else {
+                git_state.set(None);
+            }
+        });
+    }
 
     // ── Schema index: rebuild when workspace changes ─────────────────────
     {
@@ -179,6 +201,7 @@ pub fn AppShell() -> Element {
         left_panel,
         schema_index,
         show_template_gallery,
+        git_state,
     });
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
@@ -192,6 +215,7 @@ pub fn AppShell() -> Element {
         left_panel,
         schema_index,
         show_template_gallery,
+        git_state,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
@@ -306,6 +330,7 @@ pub fn AppShell() -> Element {
             }
 
             RunLogDrawer {}
+            StatusBar {}
             ToastOverlay {}
 
             // ── Template gallery overlay ──────────────────────────────────

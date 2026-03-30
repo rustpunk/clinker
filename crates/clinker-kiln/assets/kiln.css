@@ -335,6 +335,23 @@ html, body {
   color: var(--kiln-oxide-red);
 }
 
+/* Git status indicators on tabs */
+.kiln-tab-git {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  font-weight: 600;
+  margin-left: 4px;
+  padding: 0 3px;
+  border-radius: 2px;
+  line-height: 1.4;
+}
+
+.kiln-tab-git--modified { color: var(--kiln-hazard); background: rgba(232, 165, 36, 0.12); }
+.kiln-tab-git--added    { color: var(--kiln-ok-green); background: rgba(122, 182, 72, 0.12); }
+.kiln-tab-git--deleted  { color: var(--kiln-oxide-red); background: rgba(183, 65, 14, 0.12); }
+.kiln-tab-git--renamed  { color: var(--kiln-verdigris); background: rgba(67, 179, 174, 0.12); }
+.kiln-tab-git--untracked { color: var(--kiln-text-floor); background: rgba(255, 255, 255, 0.04); }
+
 .kiln-tab-new {
   display: flex;
   align-items: center;
@@ -1597,6 +1614,95 @@ html, body {
 .kiln-schema-panel__action-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* ── 6e. Status bar ──────────────────────────────────────────────────────
+   22px bottom bar with git branch, changes, cursor, encoding, language.
+   Git segments hidden when no repo detected. Spec §G3.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-status-bar {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  min-height: 22px;
+  background: var(--kiln-char);
+  border-top: 1px solid var(--kiln-border-subtle);
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  padding: 0 8px;
+  gap: 0;
+  user-select: none;
+}
+
+.kiln-status-segment {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  height: 100%;
+  white-space: nowrap;
+}
+
+.kiln-status-segment:hover {
+  background: var(--kiln-border-strong);
+  transition: background 150ms;
+}
+
+.kiln-status-divider {
+  width: 1px;
+  height: 10px;
+  background: var(--kiln-border-medium);
+  flex-shrink: 0;
+}
+
+.kiln-status-spacer {
+  flex: 1;
+}
+
+/* Branch segment */
+.kiln-status__branch-icon {
+  color: var(--kiln-verdigris);
+  font-size: 10px;
+}
+
+.kiln-status__branch-name {
+  color: var(--kiln-bone);
+}
+
+.kiln-status__ahead {
+  color: var(--kiln-ok-green);
+}
+
+.kiln-status__behind {
+  color: var(--kiln-hazard);
+}
+
+/* Changes segment */
+.kiln-status__added {
+  color: var(--kiln-ok-green);
+}
+
+.kiln-status__modified {
+  color: var(--kiln-hazard);
+}
+
+.kiln-status__deleted {
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-status__untracked {
+  color: var(--kiln-text-floor);
+}
+
+/* Static segments */
+.kiln-status-segment--cursor {
+  color: var(--kiln-iron);
+}
+
+.kiln-status-segment--encoding,
+.kiln-status-segment--lang,
+.kiln-status-segment--engine {
+  color: var(--kiln-text-floor);
 }
 
 /* ── 7. Canvas panel ───────────────────────────────────────────────────────

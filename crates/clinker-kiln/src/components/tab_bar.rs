@@ -27,6 +27,13 @@ pub fn TabBar() -> Element {
                     let is_active = current_active == Some(tab_id);
                     let is_dirty = tab.is_dirty();
                     let name = tab.display_name();
+
+                    // Git status for this tab's file
+                    let git_status = (tab_mgr.git_state)().as_ref().and_then(|gs| {
+                        tab.file_path.as_ref().and_then(|fp| {
+                            gs.files.iter().find(|f| fp.ends_with(&f.path)).map(|f| f.status)
+                        })
+                    });
                     let class = if is_active {
                         "kiln-tab kiln-tab--active"
                     } else {
@@ -47,6 +54,21 @@ pub fn TabBar() -> Element {
                                 span { class: "kiln-tab-dirty", "\u{25CF} " }
                             }
                             span { class: "kiln-tab-name", "{name}" }
+                            if let Some(status) = git_status {
+                                {
+                                    let letter = status.letter();
+                                    let css_class = match status {
+                                        clinker_git::StatusKind::Modified => "kiln-tab-git kiln-tab-git--modified",
+                                        clinker_git::StatusKind::Added => "kiln-tab-git kiln-tab-git--added",
+                                        clinker_git::StatusKind::Deleted => "kiln-tab-git kiln-tab-git--deleted",
+                                        clinker_git::StatusKind::Renamed => "kiln-tab-git kiln-tab-git--renamed",
+                                        clinker_git::StatusKind::Untracked => "kiln-tab-git kiln-tab-git--untracked",
+                                    };
+                                    rsx! {
+                                        span { class: "{css_class}", "{letter}" }
+                                    }
+                                }
+                            }
 
                             button {
                                 class: "kiln-tab-close",

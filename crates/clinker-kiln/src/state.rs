@@ -7,6 +7,7 @@
 /// `TabManagerState` is the global context for tab/file operations.
 
 use clinker_core::config::PipelineConfig;
+use clinker_git::RepoStatus;
 use clinker_schema::{SchemaIndex, SchemaWarning};
 use dioxus::prelude::*;
 
@@ -103,4 +104,6 @@ pub struct TabManagerState {
     pub schema_index: Signal<SchemaIndex>,
     /// Whether the template gallery overlay is visible.
     pub show_template_gallery: Signal<bool>,
+    /// Git repository status — branch, ahead/behind, file changes.
+    pub git_state: Signal<Option<RepoStatus>>,
 }
