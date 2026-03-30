@@ -2,7 +2,7 @@
 mod tests {
     use crate::config;
     use crate::error::PipelineError;
-    use crate::executor::{DlqEntry, StreamingExecutor};
+    use crate::executor::{DlqEntry, PipelineExecutor};
 
     /// Helper: run executor with in-memory CSV input/output.
     fn run_pipeline(
@@ -14,7 +14,7 @@ mod tests {
         let mut output_buf: Vec<u8> = Vec::new();
 
         let (counters, dlq) =
-            StreamingExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
+            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
 
         let output = String::from_utf8(output_buf).unwrap();
         Ok((counters, dlq, output))

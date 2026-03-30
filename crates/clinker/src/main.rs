@@ -5,7 +5,7 @@ use clap::Parser;
 
 use clinker_core::config;
 use clinker_core::error::PipelineError;
-use clinker_core::executor::StreamingExecutor;
+use clinker_core::executor::PipelineExecutor;
 use clinker_format::FormatReader;
 
 /// CXL streaming ETL engine.
@@ -69,7 +69,7 @@ fn run(cli: &Cli) -> Result<u8, PipelineError> {
     let writer = std::fs::File::create(output_path)?;
 
     let (counters, dlq_entries) =
-        StreamingExecutor::run_with_readers_writers(&pipeline_config, reader, writer)?;
+        PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer)?;
 
     // Write DLQ if there are entries and DLQ path is configured
     if !dlq_entries.is_empty() {
