@@ -28,13 +28,13 @@ use crate::recent_files::load_recent_files;
 use crate::state::{AppState, LayoutPreset, TabManagerState, use_app_state};
 use crate::sync::{parse_yaml, serialize_yaml, EditSource};
 use crate::tab::{TabEntry, TabId};
+use crate::workspace;
 
 const KILN_CSS: Asset = asset!("/assets/kiln.css");
 
 #[component]
 pub fn AppShell() -> Element {
     // ── Global signals (shared across all tabs) ──────────────────────────
-    let layout = use_signal(|| LayoutPreset::Hybrid);
     let run_log_expanded = use_signal(|| false);
     let inspector_width = use_signal(|| 340.0_f32);
 
@@ -45,12 +45,36 @@ pub fn AppShell() -> Element {
     let mut edit_source = use_signal(|| EditSource::None);
     let mut selected_stage = use_signal(|| None::<String>);
 
-    // ── Tab management ───────────────────────────────────────────────────
-    let mut tabs: Signal<Vec<TabEntry>> = use_signal(Vec::new);
-    let active_tab_id: Signal<Option<TabId>> = use_signal(|| None);
+    // ── Tab management (restore from last workspace if available) ────────
+    // Session restore runs once on mount via use_signal initializers.
+    // We compute the initial values eagerly in a non-hook closure.
+    let layout = use_signal(|| {
+        workspace::load_last_workspace()
+            .and_then(|root| workspace::load_workspace(&root))
+            .and_then(|ws| ws.state.layout.as_ref().map(|ls| workspace::parse_layout_preset(&ls.preset)))
+            .unwrap_or(LayoutPreset::Hybrid)
+    });
+
+    let mut tabs: Signal<Vec<TabEntry>> = use_signal(|| {
+        workspace::load_last_workspace()
+            .and_then(|root| workspace::load_workspace(&root))
+            .map(|ws| workspace::restore_tabs(&ws.state).0)
+            .unwrap_or_default()
+    });
+
+    let active_tab_id: Signal<Option<TabId>> = use_signal(|| {
+        // If we have restored tabs, activate the first one
+        let t = tabs.peek();
+        if t.is_empty() { None } else { Some(t[0].id) }
+    });
+
     let mut prev_tab_id: Signal<Option<TabId>> = use_signal(|| None);
     let recent_files = use_signal(load_recent_files);
-    let workspace = use_signal(|| None);
+
+    let workspace: Signal<Option<workspace::Workspace>> = use_signal(|| {
+        workspace::load_last_workspace()
+            .and_then(|root| workspace::load_workspace(&root))
+    });
 
     // ── Toast + confirm dialog ───────────────────────────────────────────
     let toast_message: Signal<Option<ToastState>> = use_signal(|| None);
@@ -93,6 +117,23 @@ pub fn AppShell() -> Element {
         }
 
         prev_tab_id.set(current_active);
+
+        // Save workspace state on tab switch
+        if let Some(ref ws) = *workspace.read() {
+            let active_file = current_active.and_then(|id| {
+                tabs.read().iter().find(|t| t.id == id)
+                    .and_then(|t| t.file_path.as_ref())
+                    .map(|p| p.display().to_string())
+            });
+            let state = workspace::build_state_snapshot(
+                &tabs.read(),
+                active_file.as_deref(),
+                (layout)(),
+                (run_log_expanded)(),
+            );
+            workspace::save_workspace_state(&ws.root, &state);
+            workspace::save_last_workspace(&ws.root);
+        }
     }
 
     // ── Build AppState ───────────────────────────────────────────────────

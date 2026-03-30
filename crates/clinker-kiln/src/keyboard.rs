@@ -37,6 +37,12 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
+        // Ctrl+Shift+O — Open workspace
+        Key::Character(ref c) if c == "O" && event.modifiers().shift() => {
+            open_workspace(tab_mgr);
+            true
+        }
+
         // Ctrl+S — Save active tab
         Key::Character(ref c) if c == "s" && !event.modifiers().shift() => {
             save_active_tab(tab_mgr, false);
@@ -85,6 +91,40 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         }
 
         _ => false,
+    }
+}
+
+/// Open a workspace via native directory picker.
+///
+/// Loads the workspace manifest + state, restores tabs from state.
+pub fn open_workspace(tab_mgr: &mut TabManagerState) {
+    if let Some(ws) = workspace::open_workspace_dialog() {
+        // Restore tabs from workspace state
+        let (restored_tabs, active_path) = workspace::restore_tabs(&ws.state);
+
+        // Close all existing tabs
+        tab_mgr.tabs.write().clear();
+        tab_mgr.active_tab_id.set(None);
+
+        // Load restored tabs
+        let active_id = if restored_tabs.is_empty() {
+            None
+        } else {
+            let id = active_path.as_ref().and_then(|ap| {
+                restored_tabs.iter().find(|t| {
+                    t.file_path.as_ref().map(|p| p.display().to_string()).as_deref() == Some(ap)
+                }).map(|t| t.id)
+            }).or_else(|| restored_tabs.first().map(|t| t.id));
+
+            let mut tabs_w = tab_mgr.tabs.write();
+            for tab in restored_tabs {
+                tabs_w.push(tab);
+            }
+            id
+        };
+
+        tab_mgr.active_tab_id.set(active_id);
+        tab_mgr.workspace.set(Some(ws));
     }
 }
 

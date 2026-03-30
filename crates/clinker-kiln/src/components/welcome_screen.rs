@@ -48,6 +48,14 @@ pub fn WelcomeScreen() -> Element {
                 button {
                     class: "kiln-welcome-btn",
                     onclick: move |_| {
+                        keyboard::open_workspace(&mut tab_mgr);
+                    },
+                    "Open Workspace"
+                }
+
+                button {
+                    class: "kiln-welcome-btn",
+                    onclick: move |_| {
                         let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
                         let new_id = new_tab.id;
                         tab_mgr.tabs.write().push(new_tab);
@@ -61,6 +69,7 @@ pub fn WelcomeScreen() -> Element {
             div {
                 class: "kiln-welcome-shortcuts",
                 div { span { class: "kiln-welcome-key", "Ctrl+O" } " open file" }
+                div { span { class: "kiln-welcome-key", "Ctrl+Shift+O" } " open workspace" }
                 div { span { class: "kiln-welcome-key", "Ctrl+N" } " new pipeline" }
             }
         }

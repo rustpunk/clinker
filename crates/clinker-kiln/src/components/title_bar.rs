@@ -85,6 +85,14 @@ pub fn TitleBar() -> Element {
                     },
                     "Open"
                 }
+                button {
+                    class: "kiln-file-btn",
+                    title: "Open workspace (Ctrl+Shift+O)",
+                    onclick: move |_| {
+                        keyboard::open_workspace(&mut tab_mgr);
+                    },
+                    "Workspace"
+                }
                 if has_active_tab {
                     button {
                         class: "kiln-file-btn",

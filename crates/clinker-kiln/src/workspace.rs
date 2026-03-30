@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum ancestor directory levels to walk when searching for kiln.toml.
 const MAX_ANCESTOR_DEPTH: usize = 10;
+const APP_DIR_NAME: &str = "clinker-kiln";
+const LAST_WORKSPACE_FILE: &str = "last-workspace.json";
 
 // ── Workspace manifest (kiln.toml) ──────────────────────────────────────
 
@@ -283,4 +285,118 @@ fn append_gitignore(dir: &Path) {
     let addition = "\n# Clinker Kiln IDE state (user-specific, not version-controlled)\n\
                     .kiln-state.json\n";
     let _ = fs::write(&gitignore_path, format!("{content}{addition}"));
+}
+
+// ── Last workspace tracking (OS app data dir) ───────────────────────────
+
+/// Path to the last-workspace tracker file.
+fn last_workspace_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(APP_DIR_NAME).join(LAST_WORKSPACE_FILE))
+}
+
+/// Remember which workspace was last used (so we can restore on next launch).
+pub fn save_last_workspace(root: &Path) {
+    let Some(path) = last_workspace_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let json = serde_json::json!({ "root": root.display().to_string() });
+    let _ = fs::write(&path, json.to_string());
+}
+
+/// Load the last-used workspace root path.
+pub fn load_last_workspace() -> Option<PathBuf> {
+    let path = last_workspace_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let root_str = parsed.get("root")?.as_str()?;
+    let root = PathBuf::from(root_str);
+    // Only return if the workspace still exists
+    if root.join("kiln.toml").exists() {
+        Some(root)
+    } else {
+        None
+    }
+}
+
+// ── Session save/restore helpers ────────────────────────────────────────
+
+use crate::file_ops;
+use crate::state::LayoutPreset;
+use crate::tab::TabEntry;
+
+/// Build a WorkspaceState from current app state for persistence.
+pub fn build_state_snapshot(
+    tabs: &[TabEntry],
+    active_file: Option<&str>,
+    layout: LayoutPreset,
+    run_log_expanded: bool,
+) -> WorkspaceState {
+    let open_paths: Vec<String> = tabs
+        .iter()
+        .filter_map(|t| t.file_path.as_ref())
+        .map(|p| p.display().to_string())
+        .collect();
+
+    WorkspaceState {
+        version: 1,
+        window: None, // TODO: save window geometry
+        layout: Some(LayoutState {
+            preset: layout.as_data_attr().to_string(),
+            inspector_width: None,
+            yaml_sidebar_width: None,
+            run_log_expanded: Some(run_log_expanded),
+        }),
+        tabs: Some(TabsState {
+            open: open_paths,
+            active: active_file.map(|s| s.to_string()),
+        }),
+        pipelines: HashMap::new(),
+        last_open_directory: None,
+    }
+}
+
+/// Restore tabs from a WorkspaceState. Returns the tabs and which should be active.
+pub fn restore_tabs(state: &WorkspaceState) -> (Vec<TabEntry>, Option<String>) {
+    let Some(ref tabs_state) = state.tabs else {
+        return (Vec::new(), None);
+    };
+
+    let mut tabs = Vec::new();
+    for path_str in &tabs_state.open {
+        let path = PathBuf::from(path_str);
+        if let Ok(yaml) = file_ops::read_pipeline_file(&path) {
+            tabs.push(TabEntry::from_file(path, yaml));
+        }
+    }
+
+    (tabs, tabs_state.active.clone())
+}
+
+/// Resolve a LayoutPreset from a string (for state restore).
+pub fn parse_layout_preset(s: &str) -> LayoutPreset {
+    match s {
+        "canvas-focus" => LayoutPreset::CanvasFocus,
+        "hybrid" => LayoutPreset::Hybrid,
+        "editor-focus" => LayoutPreset::EditorFocus,
+        "schematics" => LayoutPreset::Schematics,
+        _ => LayoutPreset::Hybrid,
+    }
+}
+
+/// Show a native directory picker and try to open it as a workspace.
+pub fn open_workspace_dialog() -> Option<Workspace> {
+    let dialog = rfd::FileDialog::new()
+        .set_title("Open Workspace");
+
+    let dir = dialog.pick_folder()?;
+
+    // Check if it has a kiln.toml
+    if dir.join("kiln.toml").exists() {
+        load_workspace(&dir)
+    } else {
+        // Try to find kiln.toml in the selected directory's children
+        // (user might have picked the parent)
+        None
+    }
 }
