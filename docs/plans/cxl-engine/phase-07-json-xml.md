@@ -676,5 +676,5 @@ Parallelizable: None — strict linear chain (each validates the pattern for the
 | # | Assumption | Basis | Risk if wrong |
 |---|-----------|-------|---------------|
 | 1 | `#[serde(flatten)]` with adjacently tagged enum works correctly with serde-saphyr | Tested with serde_json; saphyr uses serde Deserialize trait so should work | If not, fall back to separate `type` and `options` fields with manual dispatch |
-| 2 | `record_path` input files fit in memory as `serde_json::Value` (≤100MB → ≤600MB RSS) | Spec workload profile: ≤100MB per file, 2GB production budget | If exceeded, add diagnostic: "file too large for record_path; use NDJSON format" |
+| 2 | JSON reader uses streaming DeserializeSeed for all modes — O(1 record) memory | Implemented: IgnoredAny skips non-matching keys, visit_seq streams elements. ~10KB buffer + 1 record. | N/A — streaming is the default |
 | 3 | `quick-xml` 0.37 `QName::local_name()` API is stable | Spec pins 0.37, PLAN.md notes risk is low | Pin version, wrap in adapter if API breaks |

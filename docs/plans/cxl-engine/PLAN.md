@@ -35,7 +35,7 @@ with spill-to-disk under a configurable memory budget.
 | 17 | `build_eval_context` must freeze `pipeline_start_time` once at pipeline start (Phase 6 validation) | Pre-existing bug: current code recreates `pipeline_start_time` per record via `Local::now()`. Fix in Phase 6 Task 6.1.0 prep. |
 | 18 | `ctrlc::set_handler_with_signals` required for SIGTERM, not default `set_handler` (Phase 6 validation) | Default `set_handler()` only catches SIGINT. SIGTERM (kill, Docker stop, systemd) requires explicit opt-in. |
 | 19 | Adjacently tagged serde enum for format config (`InputFormat`/`OutputFormat`) replaces flat `InputOptions`/`OutputOptions` (Phase 7 decision) | Research: `deny_unknown_fields` broken with internally tagged enums (serde #2123). Adjacently tagged preserves YAML shape. Empirically validated with serde-saphyr. `FormatKind` enum removed. |
-| 20 | `serde_json::Value` + `pointer()` for JSON `record_path` navigation (Phase 7 decision) | No mature streaming path-navigation crate. Value tree costs 3-11x file size (400-600MB for 100MB). jq, Vector, Polars all buffer. NDJSON/array modes are streaming. |
+| 20 | Streaming `DeserializeSeed` + `IgnoredAny` for JSON path navigation — O(1 record) memory (Phase 7 decision, revised) | Original plan used `Value::pointer()` (3-11x overhead). Replaced with serde's `DeserializeSeed` + `IgnoredAny` which navigates the tree via `visit_map` without buffering. ~10KB + 1 record. |
 | 21 | Plain `quick_xml::Reader` with `QName::local_name()` for namespace stripping (Phase 7 decision) | `NsReader` resolves URIs (overkill). `local_name()` strips prefix. Config flag selects strip vs qualify. |
 
 ## Open Questions
