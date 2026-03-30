@@ -6,45 +6,48 @@ use crate::sync::EditSource;
 
 /// Notes drawer — editable stage-level note + field-level annotations.
 ///
-/// Edits mutate the PipelineConfig's `_notes` field and trigger the
-/// Inspector→YAML sync path (EditSource::Inspector → serialize → YAML).
+/// Both the stage note and field annotations are always editable (no
+/// display/edit toggle). Edits write back through the sync engine:
+/// mutate PipelineConfig._notes → EditSource::Inspector → serialize → YAML.
 ///
 /// Spec §A5A.2–A5A.4.
 #[component]
 pub fn DrawerNotes(stage_id: String) -> Element {
     let state = use_context::<AppState>();
-    let mut editing_stage_note = use_signal(|| false);
 
-    let pipeline_guard = (state.pipeline).read();
-    let Some(config) = pipeline_guard.as_ref() else {
-        return rsx! { DrawerNotesEmpty {} };
+    // Read current notes from the pipeline config
+    let (stage_note_text, annotations) = {
+        let pipeline_guard = (state.pipeline).read();
+        let Some(config) = pipeline_guard.as_ref() else {
+            return rsx! { DrawerNotesEmpty {} };
+        };
+
+        let notes_value = config
+            .inputs.iter().find(|i| i.name == stage_id).and_then(|i| i.notes.as_ref())
+            .or_else(|| config.transformations.iter().find(|t| t.name == stage_id).and_then(|t| t.notes.as_ref()))
+            .or_else(|| config.outputs.iter().find(|o| o.name == stage_id).and_then(|o| o.notes.as_ref()));
+
+        let notes = parse_notes(notes_value);
+        let annotations: Vec<(String, String)> = {
+            let mut v: Vec<_> = notes.field_annotations.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        (notes.stage_note.clone(), annotations)
     };
-
-    // Find the _notes value for this stage
-    let notes_value = config
-        .inputs.iter().find(|i| i.name == stage_id).and_then(|i| i.notes.as_ref())
-        .or_else(|| config.transformations.iter().find(|t| t.name == stage_id).and_then(|t| t.notes.as_ref()))
-        .or_else(|| config.outputs.iter().find(|o| o.name == stage_id).and_then(|o| o.notes.as_ref()));
-
-    let notes = parse_notes(notes_value);
-    let stage_note_text = notes.stage_note.clone();
-    let annotations: Vec<(String, String)> = notes.field_annotations.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    // Drop the borrow before creating closures that write to pipeline
-    drop(pipeline_guard);
+    // pipeline_guard dropped here — safe to write in closures below
 
     let stage_id_for_save = stage_id.clone();
 
-    // Helper: write updated notes back to the pipeline config
+    // Write updated notes back to the pipeline config
     let save_notes = move |updated: StageNotes| {
         let serialized = serialize_notes(&updated);
         let mut pipeline_sig = state.pipeline;
         let mut edit_src = state.edit_source;
 
         if let Some(ref mut config) = *pipeline_sig.write() {
-            // Find and update the _notes field on the matching stage
             let notes_field = config.inputs.iter_mut()
                 .find(|i| i.name == stage_id_for_save)
                 .map(|i| &mut i.notes)
@@ -66,60 +69,37 @@ pub fn DrawerNotes(stage_id: String) -> Element {
         div {
             class: "kiln-drawer-content kiln-drawer-content--notes",
 
-            // ── Stage note ────────────────────────────────────────────────
+            // ── Stage note (always editable textarea) ─────────────────────
             div {
                 class: "kiln-notes-section",
 
                 div {
                     class: "kiln-notes-section-header",
                     span { class: "kiln-notes-section-label", "STAGE NOTE" }
-                    button {
-                        class: "kiln-notes-edit-btn",
-                        onclick: move |_| {
-                            let current = *editing_stage_note.peek();
-                            editing_stage_note.set(!current);
-                        },
-                        if (editing_stage_note)() { "\u{270E} done" } else { "\u{270E} edit" }
-                    }
                 }
 
-                if (editing_stage_note)() {
-                    // Edit mode — textarea
-                    {
-                        let save = save_notes.clone();
-                        let current_annotations = annotations.clone();
-                        rsx! {
-                            textarea {
-                                class: "kiln-notes-textarea",
-                                value: "{stage_note_text}",
-                                oninput: move |e: FormEvent| {
-                                    let mut updated = StageNotes {
-                                        stage_note: e.value(),
-                                        field_annotations: current_annotations.iter()
-                                            .cloned().collect(),
-                                    };
-                                    save(updated);
-                                },
-                            }
-                        }
-                    }
-                } else {
-                    // Display mode
-                    if stage_note_text.is_empty() {
-                        div {
-                            class: "kiln-notes-empty",
-                            "No stage note \u{2014} click \u{270E} edit to add context"
-                        }
-                    } else {
-                        div {
-                            class: "kiln-notes-block",
-                            "{stage_note_text}"
+                {
+                    let save = save_notes.clone();
+                    let current_annotations = annotations.clone();
+                    rsx! {
+                        textarea {
+                            class: "kiln-notes-textarea",
+                            placeholder: "Add a note about this stage...",
+                            value: "{stage_note_text}",
+                            oninput: move |e: FormEvent| {
+                                let updated = StageNotes {
+                                    stage_note: e.value(),
+                                    field_annotations: current_annotations.iter()
+                                        .cloned().collect(),
+                                };
+                                save(updated);
+                            },
                         }
                     }
                 }
             }
 
-            // ── Field annotations ─────────────────────────────────────────
+            // ── Field annotations (always editable inputs) ────────────────
             div {
                 class: "kiln-notes-section",
 
@@ -154,7 +134,6 @@ pub fn DrawerNotes(stage_id: String) -> Element {
                                     "\u{270E} {key}"
                                 }
 
-                                // Editable inline input for the annotation text
                                 input {
                                     class: "kiln-notes-field-input",
                                     r#type: "text",
@@ -182,7 +161,6 @@ pub fn DrawerNotes(stage_id: String) -> Element {
     }
 }
 
-/// Empty state when no notes exist and pipeline isn't loaded.
 #[component]
 fn DrawerNotesEmpty() -> Element {
     rsx! {
