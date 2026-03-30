@@ -264,6 +264,75 @@ pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> S
     yaml
 }
 
+// ── Guide annotations (spec §S4.6) ──────────────────────────────────────
+
+/// Generate guide annotations for a template-instantiated pipeline.
+///
+/// If the template has `hints`, map them to line numbers in the stripped YAML.
+/// If no hints, auto-generate for common placeholder patterns.
+pub fn generate_guide_annotations(template: &Template, stripped_yaml: &str) -> Vec<GuideAnnotation> {
+    if !template.metadata.hints.is_empty() {
+        return generate_from_hints(&template.metadata.hints, stripped_yaml);
+    }
+
+    // Auto-generate: look for obvious placeholder values
+    auto_generate_annotations(stripped_yaml)
+}
+
+/// Generate annotations from explicit template hints.
+fn generate_from_hints(hints: &HashMap<String, String>, yaml: &str) -> Vec<GuideAnnotation> {
+    let mut annotations = Vec::new();
+
+    for (yaml_path, hint_text) in hints {
+        // Find the line that contains this path's leaf key
+        let leaf_key = yaml_path
+            .split('.')
+            .last()
+            .and_then(|s| s.split('[').next())
+            .unwrap_or(yaml_path);
+
+        for (idx, line) in yaml.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(&format!("{leaf_key}:")) || trimmed.starts_with(&format!("{leaf_key} ")) {
+                annotations.push(GuideAnnotation {
+                    line: idx + 1,
+                    hint: hint_text.clone(),
+                });
+                break; // First match only per hint
+            }
+        }
+    }
+
+    annotations.sort_by_key(|a| a.line);
+    annotations
+}
+
+/// Auto-generate annotations for common placeholder patterns.
+fn auto_generate_annotations(yaml: &str) -> Vec<GuideAnnotation> {
+    let mut annotations = Vec::new();
+    let placeholder_patterns = [
+        ("./data/input", "replace with your source path"),
+        ("./data/primary", "replace with your primary source path"),
+        ("./data/lookup", "replace with your lookup source path"),
+        ("./output/", "replace with your output path"),
+        ("\"\"", "provide a value"),
+    ];
+
+    for (idx, line) in yaml.lines().enumerate() {
+        for (pattern, hint) in &placeholder_patterns {
+            if line.contains(pattern) {
+                annotations.push(GuideAnnotation {
+                    line: idx + 1,
+                    hint: hint.to_string(),
+                });
+                break; // One annotation per line max
+            }
+        }
+    }
+
+    annotations
+}
+
 /// All available format categories for gallery filtering.
 pub const FORMAT_CATEGORIES: &[&str] = &["All", "CSV", "JSON", "XML", "Multi"];
 
@@ -374,5 +443,47 @@ fields:
         assert!(yaml.contains("emit email = email"));
         assert!(yaml.contains("emit status = status"));
         assert!(yaml.contains("has_header: true"));
+    }
+
+    #[test]
+    fn test_guide_annotations_from_hints() {
+        let yaml = include_str!("templates/csv_transform.yaml");
+        let template = parse_template(yaml, TemplateSource::Bundled).unwrap();
+        let stripped = strip_template_block(yaml);
+        let annotations = generate_guide_annotations(&template, &stripped);
+
+        // Should have annotations for the hints defined in csv_transform.yaml
+        assert!(!annotations.is_empty());
+        // Check that path hint was found
+        assert!(annotations.iter().any(|a| a.hint.contains("source path")));
+    }
+
+    #[test]
+    fn test_guide_annotations_auto_generate() {
+        let yaml = r#"_template:
+  name: "Bare"
+  description: "No hints"
+
+pipeline:
+  name: test
+
+inputs:
+  - name: source
+    type: csv
+    path: "./data/input.csv"
+
+outputs:
+  - name: dest
+    type: csv
+    path: "./output/result.csv"
+"#;
+        let template = parse_template(yaml, TemplateSource::Bundled).unwrap();
+        let stripped = strip_template_block(yaml);
+        let annotations = generate_guide_annotations(&template, &stripped);
+
+        // Auto-generated: should detect ./data/input and ./output/ placeholders
+        assert!(annotations.len() >= 2);
+        assert!(annotations.iter().any(|a| a.hint.contains("source path")));
+        assert!(annotations.iter().any(|a| a.hint.contains("output path")));
     }
 }

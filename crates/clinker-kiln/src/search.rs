@@ -63,7 +63,7 @@ pub struct StructuralTag {
 }
 
 /// A structural search match — a stage in a pipeline.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StructuralSearchMatch {
     /// Pipeline file path (relative to workspace).
     pub pipeline_path: String,

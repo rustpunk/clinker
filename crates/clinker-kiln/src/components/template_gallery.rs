@@ -103,18 +103,25 @@ pub fn TemplateGallery() -> Element {
                     TemplateCard {
                         key: "{tmpl.metadata.name}",
                         template: tmpl.clone(),
-                        on_use: move |yaml: String| {
+                        on_use: {
+                        let tmpl_clone = tmpl.clone();
+                        move |yaml: String| {
                             // Strip _template block and open as new tab
                             let clean_yaml = template::strip_template_block(&yaml);
-                            let new_tab = TabEntry::new_from_yaml(
+                            let annotations = template::generate_guide_annotations(
+                                &tmpl_clone, &clean_yaml,
+                            );
+                            let mut new_tab = TabEntry::new_from_yaml(
                                 &tab_mgr.tabs.read(),
                                 clean_yaml,
                             );
+                            new_tab.snapshot.guide_annotations = annotations;
                             let new_id = new_tab.id;
                             tab_mgr.tabs.write().push(new_tab);
                             tab_mgr.active_tab_id.set(Some(new_id));
                             tab_mgr.show_template_gallery.set(false);
-                        },
+                        }
+                    },
                     }
                 }
             }

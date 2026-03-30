@@ -49,6 +49,8 @@ pub struct TabSnapshot {
     pub parse_errors: Vec<String>,
     pub edit_source: EditSource,
     pub selected_stage: Option<String>,
+    /// Guide annotations from template instantiation (session-only, not persisted).
+    pub guide_annotations: Vec<crate::template::GuideAnnotation>,
 }
 
 /// One open pipeline tab with its file info and state snapshot.
@@ -89,6 +91,7 @@ impl TabEntry {
                 parse_errors: Vec::new(),
                 edit_source: EditSource::None,
                 selected_stage: None,
+                guide_annotations: Vec::new(),
             },
         }
     }
@@ -112,6 +115,7 @@ impl TabEntry {
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
+                guide_annotations: Vec::new(),
             },
         }
     }
@@ -148,6 +152,7 @@ impl TabEntry {
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
+                guide_annotations: Vec::new(),
             },
         }
     }
@@ -170,6 +175,7 @@ impl TabEntry {
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
+                guide_annotations: Vec::new(),
             },
         }
     }

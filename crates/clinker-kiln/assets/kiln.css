@@ -928,6 +928,128 @@ html, body {
   border-radius: 1px;
 }
 
+/* Structural search UI */
+.kiln-search-panel__structural {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-medium);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.kiln-structural-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-structural-tag {
+  display: inline-flex;
+  align-items: baseline;
+  padding: 3px 8px;
+  border-radius: 2px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  background: rgba(67, 179, 174, 0.12);
+  border: 1px solid rgba(67, 179, 174, 0.3);
+}
+
+.kiln-structural-tag__key {
+  color: var(--text-floor);
+}
+
+.kiln-structural-tag__sep {
+  color: var(--text-floor);
+  opacity: 0.5;
+}
+
+.kiln-structural-tag__value {
+  color: var(--bone);
+}
+
+.kiln-structural-hint {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  color: var(--text-floor);
+  opacity: 0.6;
+}
+
+.kiln-structural-hint__key {
+  color: var(--verdigris);
+  opacity: 0.8;
+}
+
+/* Structural search results */
+.kiln-structural-results {
+  padding: 0;
+}
+
+.kiln-structural-match {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-medium);
+  border-left: 2px solid var(--border-medium);
+  cursor: pointer;
+}
+
+.kiln-structural-match:hover {
+  background: rgba(67, 179, 174, 0.04);
+}
+
+.kiln-structural-match--input  { border-left-color: var(--verdigris); }
+.kiln-structural-match--transform { border-left-color: var(--ember); }
+.kiln-structural-match--output { border-left-color: var(--hazard); }
+
+.kiln-structural-match__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kiln-structural-match__led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.6;
+}
+
+.kiln-structural-match--input .kiln-structural-match__led { color: var(--verdigris); }
+.kiln-structural-match--transform .kiln-structural-match__led { color: var(--ember); }
+.kiln-structural-match--output .kiln-structural-match__led { color: var(--hazard); }
+
+.kiln-structural-match__name {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bone);
+}
+
+.kiln-structural-match__type {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  color: var(--text-floor);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.kiln-structural-match__path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  padding-left: 12px;
+  opacity: 0.7;
+}
+
+.kiln-structural-match__detail {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-floor);
+  padding-left: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── 6c2. Template gallery overlay ────────────────────────────────────────
    Centered 560px overlay for browsing and instantiating templates.
    ─────────────────────────────────────────────────────────────────────── */
