@@ -11,6 +11,7 @@ mod notes;
 mod pipeline_view;
 mod recent_files;
 mod commands;
+mod fs_watcher;
 mod search;
 mod state;
 mod sync;

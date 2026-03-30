@@ -21,3 +21,4 @@ toml.workspace = true
 tokio.workspace = true
 dioxus-nox-cmdk = "0.13"
 regex.workspace = true
+notify.workspace = true
