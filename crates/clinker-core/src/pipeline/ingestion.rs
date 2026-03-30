@@ -223,6 +223,7 @@ mod tests {
                     schema_overrides: None,
                     array_paths: None,
                     sort_order: None,
+                    notes: None,
                 })
                 .collect(),
             outputs: vec![OutputConfig {
@@ -235,6 +236,7 @@ mod tests {
                 sort_order: None,
                 preserve_nulls: None,
                 format: OutputFormat::Csv(None),
+                notes: None,
             }],
             transformations: transforms
                 .into_iter()
@@ -245,9 +247,11 @@ mod tests {
                     local_window,
                     log: None,
                     validations: None,
+                    notes: None,
                 }))
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
+            notes: None,
         }
     }
 

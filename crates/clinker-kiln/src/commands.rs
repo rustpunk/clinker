@@ -28,6 +28,7 @@ pub enum CommandGroup {
     File,
     Layout,
     Search,
+    Composition,
     Template,
     Git,
 }
@@ -38,6 +39,7 @@ impl CommandGroup {
             Self::File => "File",
             Self::Layout => "Layout",
             Self::Search => "Search",
+            Self::Composition => "Composition",
             Self::Template => "Template",
             Self::Git => "Git",
         }
@@ -144,6 +146,31 @@ pub fn all_commands() -> Vec<Command> {
             description: "Open the schema browser panel",
             shortcut: Some("Ctrl+Shift+E"),
             group: CommandGroup::Search,
+            requires_git: false,
+        },
+        // ── Composition ─────────────────────────────────────────
+        Command {
+            id: "composition.browse",
+            label: "Composition: Browse",
+            description: "Open the composition browser panel",
+            shortcut: Some("Ctrl+Shift+C"),
+            group: CommandGroup::Composition,
+            requires_git: false,
+        },
+        Command {
+            id: "composition.new",
+            label: "Composition: New",
+            description: "Create a new composition file",
+            shortcut: None,
+            group: CommandGroup::Composition,
+            requires_git: false,
+        },
+        Command {
+            id: "composition.extract",
+            label: "Composition: Extract from Pipeline",
+            description: "Extract selected transforms into a composition",
+            shortcut: None,
+            group: CommandGroup::Composition,
             requires_git: false,
         },
         // ── Template ────────────────────────────────────────────

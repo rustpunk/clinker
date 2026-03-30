@@ -13,6 +13,7 @@ clinker-git.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
+indexmap.workspace = true
 rfd.workspace = true
 blake3.workspace = true
 uuid.workspace = true

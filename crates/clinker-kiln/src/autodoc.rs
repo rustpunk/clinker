@@ -20,10 +20,8 @@ pub struct StageDoc {
 pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<StageDoc> {
     // Check inputs
     if let Some(input) = config.inputs.iter().find(|i| i.name == stage_name) {
-        let format = format!("{:?}", input.r#type).to_lowercase();
-        let has_header = input.options.as_ref()
-            .and_then(|o| o.has_header)
-            .unwrap_or(true);
+        let format = input.format.format_name().to_string();
+        let has_header = input.format.has_header().unwrap_or(true);
         let header_str = if has_header { "present" } else { "absent" };
 
         return Some(StageDoc {
@@ -75,7 +73,7 @@ pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<S
 
     // Check outputs
     if let Some(output) = config.outputs.iter().find(|o| o.name == stage_name) {
-        let format = format!("{:?}", output.r#type).to_lowercase();
+        let format = output.format.format_name().to_string();
 
         let mut metadata = vec![
             ("TYPE", "output".to_string()),

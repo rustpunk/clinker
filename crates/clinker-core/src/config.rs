@@ -89,6 +89,36 @@ pub enum InputFormat {
     FixedWidth(Option<FixedWidthInputOptions>),
 }
 
+impl InputFormat {
+    /// Short lowercase format name for display.
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            InputFormat::Csv(_) => "csv",
+            InputFormat::Json(_) => "json",
+            InputFormat::Xml(_) => "xml",
+        }
+    }
+
+    /// Whether this format has a header row concept (CSV only).
+    pub fn has_header(&self) -> Option<bool> {
+        match self {
+            InputFormat::Csv(Some(opts)) => opts.has_header,
+            _ => None,
+        }
+    }
+}
+
+impl OutputFormat {
+    /// Short lowercase format name for display.
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            OutputFormat::Csv(_) => "csv",
+            OutputFormat::Json(_) => "json",
+            OutputFormat::Xml(_) => "xml",
+        }
+    }
+}
+
 /// CSV-specific input options.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -396,6 +426,7 @@ impl<'de> Deserialize<'de> for SchemaSource {
 ///
 /// The `cxl` field contains the multi-line CXL source text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransformConfig {
     pub name: String,
     pub description: Option<String>,

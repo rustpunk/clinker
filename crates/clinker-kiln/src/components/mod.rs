@@ -1,5 +1,6 @@
 pub mod canvas;
 pub mod command_palette;
+pub mod composition_panel;
 pub mod confirm_dialog;
 pub mod inspector;
 pub mod run_log;

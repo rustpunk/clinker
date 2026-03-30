@@ -9,6 +9,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 use uuid::Uuid;
 
@@ -46,6 +47,12 @@ impl fmt::Display for TabId {
 pub struct TabSnapshot {
     pub yaml_text: String,
     pub pipeline: Option<PipelineConfig>,
+    /// Raw pipeline config preserving `_import` directives (for serialization).
+    pub raw_pipeline: Option<RawPipelineConfig>,
+    /// Resolved composition metadata (for canvas rendering).
+    pub compositions: Vec<ResolvedComposition>,
+    /// Contract validation warnings from composition imports.
+    pub contract_warnings: Vec<ContractWarning>,
     pub parse_errors: Vec<String>,
     pub edit_source: EditSource,
     pub selected_stage: Option<String>,
@@ -88,6 +95,9 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: SCAFFOLD_YAML.to_string(),
                 pipeline: parse_yaml(SCAFFOLD_YAML).ok(),
+                raw_pipeline: None,
+                compositions: Vec::new(),
+                contract_warnings: Vec::new(),
                 parse_errors: Vec::new(),
                 edit_source: EditSource::None,
                 selected_stage: None,
@@ -112,6 +122,9 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml,
                 pipeline: config,
+                raw_pipeline: None,
+                compositions: Vec::new(),
+                contract_warnings: Vec::new(),
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
@@ -149,6 +162,9 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml,
                 pipeline: config,
+                raw_pipeline: None,
+                compositions: Vec::new(),
+                contract_warnings: Vec::new(),
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
@@ -172,6 +188,9 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml.to_string(),
                 pipeline: config,
+                raw_pipeline: None,
+                compositions: Vec::new(),
+                contract_warnings: Vec::new(),
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,

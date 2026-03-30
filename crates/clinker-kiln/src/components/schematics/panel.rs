@@ -31,7 +31,9 @@ pub fn SchematicsPanel() -> Element {
         };
     };
 
-    let stages = derive_pipeline_view(config);
+    let compositions_read = (state.compositions).read();
+    let pipeline_view = derive_pipeline_view(config, &compositions_read);
+    let stages = pipeline_view.stages;
     let pipeline_name = config.pipeline.name.clone();
 
     // Pre-compute docs + notes for each stage

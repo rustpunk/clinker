@@ -67,6 +67,17 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
+        // Ctrl+Shift+C — Toggle composition panel
+        Key::Character(ref c) if c == "C" && event.modifiers().shift() => {
+            let current = (tab_mgr.left_panel)();
+            tab_mgr.left_panel.set(if current == LeftPanel::Compositions {
+                LeftPanel::None
+            } else {
+                LeftPanel::Compositions
+            });
+            true
+        }
+
         // Ctrl+Shift+N — Template gallery
         Key::Character(ref c) if c == "N" && event.modifiers().shift() => {
             let current = (tab_mgr.show_template_gallery)();

@@ -53,10 +53,16 @@ pub fn CanvasPanel() -> Element {
     let state = use_app_state();
 
     // Derive canvas stages from the pipeline model (if parsed successfully).
-    let stages = match &*(state.pipeline).read() {
-        Some(config) => derive_pipeline_view(config),
-        None => Vec::new(),
+    let compositions_read = (state.compositions).read();
+    let pipeline_view = match &*(state.pipeline).read() {
+        Some(config) => derive_pipeline_view(config, &compositions_read),
+        None => crate::pipeline_view::PipelineView {
+            stages: Vec::new(),
+            composition_groups: Vec::new(),
+        },
     };
+    let stages = pipeline_view.stages;
+    let _composition_groups = pipeline_view.composition_groups;
     let connections: Vec<_> = stages.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
 
     // ── Transform state (local — only the canvas needs these) ────────────────

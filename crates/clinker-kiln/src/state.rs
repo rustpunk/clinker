@@ -6,11 +6,13 @@
 ///
 /// `TabManagerState` is the global context for tab/file operations.
 
+use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 use clinker_git::RepoStatus;
 use clinker_schema::{SchemaIndex, SchemaWarning};
 use dioxus::prelude::*;
 
+use crate::composition_index::CompositionIndex;
 use crate::recent_files::RecentFileEntry;
 use crate::sync::EditSource;
 use crate::tab::{TabEntry, TabId};
@@ -18,14 +20,15 @@ use crate::workspace::Workspace;
 
 /// Which left-side panel is currently open (280px slide-in slot).
 ///
-/// Only one panel can be open at a time. Search and Schemas share the same
-/// slot. `None` means the slot is collapsed.
+/// Only one panel can be open at a time. Search, Schemas, and Compositions
+/// share the same slot. `None` means the slot is collapsed.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum LeftPanel {
     #[default]
     None,
     Search,
     Schemas,
+    Compositions,
 }
 
 /// Pipeline canvas layout preset.
@@ -62,7 +65,6 @@ impl LayoutPreset {
 
 /// Per-tab reactive state — consumed by canvas, inspector, YAML sidebar, etc.
 ///
-/// Shape is identical to the original single-pipeline `AppState`.
 /// Downstream components call `use_context::<AppState>()` and get the
 /// active tab's signals transparently.
 #[derive(Clone, Copy)]
@@ -76,6 +78,12 @@ pub struct AppState {
     pub yaml_text: Signal<String>,
     /// Parsed pipeline config (None if YAML is invalid).
     pub pipeline: Signal<Option<PipelineConfig>>,
+    /// Raw pipeline config preserving `_import` directives (for serialization).
+    pub raw_pipeline: Signal<Option<RawPipelineConfig>>,
+    /// Resolved composition metadata (for canvas rendering and override editing).
+    pub compositions: Signal<Vec<ResolvedComposition>>,
+    /// Contract validation warnings from composition imports.
+    pub contract_warnings: Signal<Vec<ContractWarning>>,
     /// Parse error messages (empty when YAML is valid).
     pub parse_errors: Signal<Vec<String>>,
     /// Which view last edited the model (sync loop prevention).
@@ -111,4 +119,6 @@ pub struct TabManagerState {
     pub git_state: Signal<Option<RepoStatus>>,
     /// Whether the command palette overlay is visible.
     pub show_command_palette: Signal<bool>,
+    /// Workspace composition index — populated on workspace load, refreshed on file changes.
+    pub composition_index: Signal<CompositionIndex>,
 }

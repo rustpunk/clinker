@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::model::{FieldType, SchemaIndex, SourceSchema};
-use clinker_core::config::{FormatKind, InputConfig, PipelineConfig, TransformConfig};
+use clinker_core::config::{InputConfig, InputFormat, PipelineConfig, TransformConfig};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -105,18 +105,17 @@ fn validate_input(
         return;
     };
 
-    // Check format mismatch
-    let format_matches = match input.r#type {
-        FormatKind::Csv => matches!(
+    // Check format mismatch (InputFormat is an adjacently tagged enum)
+    let format_matches = match &input.format {
+        InputFormat::Csv(_) => matches!(
             schema.metadata.format,
             crate::model::SourceFormat::Csv | crate::model::SourceFormat::Tsv
         ),
-        FormatKind::Json => matches!(
+        InputFormat::Json(_) => matches!(
             schema.metadata.format,
             crate::model::SourceFormat::Json | crate::model::SourceFormat::Jsonl
         ),
-        FormatKind::Xml => schema.metadata.format == crate::model::SourceFormat::Xml,
-        FormatKind::FixedWidth => false, // No schema format for fixed-width yet
+        InputFormat::Xml(_) => schema.metadata.format == crate::model::SourceFormat::Xml,
     };
 
     if !format_matches {
@@ -124,7 +123,7 @@ fn validate_input(
             stage_name: input.name.clone(),
             message: format!(
                 "Source format {:?} doesn't match schema format {:?}",
-                input.r#type, schema.metadata.format
+                input.format, schema.metadata.format
             ),
             suggestion: None,
             kind: WarningKind::FormatMismatch,
@@ -441,11 +440,12 @@ distinct by customer_id
             },
             inputs: vec![InputConfig {
                 name: "src".to_string(),
-                r#type: FormatKind::Csv,
                 path: "./data.csv".to_string(),
                 schema: None,
                 schema_overrides: None,
-                options: None,
+                array_paths: None,
+                sort_order: None,
+                format: InputFormat::Csv(None),
                 notes: None,
             }],
             outputs: vec![],

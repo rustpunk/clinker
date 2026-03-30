@@ -3,6 +3,8 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 mod app;
 mod autodoc;
 mod components;
+mod composition_index;
+mod composition_ops;
 mod cxl_bridge;
 mod demo;
 mod file_ops;

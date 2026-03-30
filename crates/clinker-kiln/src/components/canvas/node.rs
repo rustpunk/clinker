@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::pipeline_view::{StageView, NODE_HEIGHT, NODE_WIDTH};
+use crate::pipeline_view::{StageKind, StageView, NODE_HEIGHT, NODE_WIDTH};
 use crate::state::use_app_state;
 
 /// A single pipeline stage rendered as a rustpunk node card on the canvas.
@@ -12,23 +12,53 @@ pub fn CanvasNode(stage: StageView) -> Element {
     let stage_id = stage.id.clone();
 
     let is_selected = (state.selected_stage)().as_deref() == Some(stage_id.as_str());
-    let node_class = if is_selected {
-        "kiln-node kiln-node--selected"
+    let is_composition = matches!(&stage.kind, StageKind::Composition(_));
+    let is_from_composition = stage.from_composition.is_some();
+
+    let node_class = match (is_selected, is_composition) {
+        (true, true) => "kiln-node kiln-node--selected kiln-node--composition",
+        (false, true) => "kiln-node kiln-node--composition",
+        (true, false) => "kiln-node kiln-node--selected",
+        (false, false) => "kiln-node",
+    };
+
+    // Composition transforms from an import get a subtle indicator
+    let border_style = if is_from_composition {
+        format!(
+            "left: {x}px; top: {y}px; width: {w}px; border-top-color: {accent}; border-left: 2px dashed {accent};",
+            x = stage.canvas_x, y = stage.canvas_y, w = NODE_WIDTH
+        )
     } else {
-        "kiln-node"
+        format!(
+            "left: {x}px; top: {y}px; width: {w}px; border-top-color: {accent};",
+            x = stage.canvas_x, y = stage.canvas_y, w = NODE_WIDTH
+        )
     };
 
     const BORDER_TOP: f32 = 3.0;
     const PORT_HALF: f32 = 4.0;
     let port_y = NODE_HEIGHT / 2.0 - PORT_HALF - BORDER_TOP;
 
+    // Extra info for composition nodes
+    let comp_subtitle = if let StageKind::Composition(ref meta) = stage.kind {
+        let version_str = meta
+            .version
+            .as_deref()
+            .map(|v| format!(" v{v}"))
+            .unwrap_or_default();
+        Some(format!(
+            "◈ {}{} · {} transforms",
+            meta.name, version_str, meta.transform_count
+        ))
+    } else {
+        None
+    };
+
     rsx! {
         div {
             key: "{stage.id}",
             class: "{node_class}",
-            style: "left: {stage.canvas_x}px; top: {stage.canvas_y}px; \
-                    width: {NODE_WIDTH}px; \
-                    border-top-color: {accent};",
+            style: "{border_style}",
             onmousedown: move |e: MouseEvent| e.stop_propagation(),
             onclick: {
                 let stage_id = stage_id.clone();
@@ -52,7 +82,12 @@ pub fn CanvasNode(stage: StageView) -> Element {
 
             div { class: "kiln-node-label", "{stage.label}" }
             hr { class: "kiln-rust-line" }
-            div { class: "kiln-node-subtitle", "{stage.subtitle}" }
+
+            if let Some(ref sub) = comp_subtitle {
+                div { class: "kiln-node-subtitle", "{sub}" }
+            } else {
+                div { class: "kiln-node-subtitle", "{stage.subtitle}" }
+            }
 
             div {
                 class: "kiln-node-port kiln-node-port--in",

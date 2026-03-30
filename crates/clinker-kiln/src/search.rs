@@ -325,7 +325,7 @@ fn discover_yaml_files(root: &Path) -> Vec<PathBuf> {
         .collect();
 
     // Also scan common subdirectories
-    for subdir in &["pipelines", "schemas", "templates"] {
+    for subdir in &["pipelines", "schemas", "templates", "compositions"] {
         let sub = root.join(subdir);
         if sub.is_dir() {
             if let Ok(entries) = fs::read_dir(&sub) {
@@ -352,6 +352,7 @@ fn discover_yaml_files(root: &Path) -> Vec<PathBuf> {
 /// Valid structural search keys.
 pub const STRUCTURAL_KEYS: &[&str] = &[
     "input", "transform", "output", "field", "schema", "expr", "has", "pipeline",
+    "import", "composition", "override",
 ];
 
 /// Parse a raw DSL string into structural tags.
@@ -420,10 +421,59 @@ pub fn structural_search(
             }
         }
 
+        // Check composition-level tags (import:, composition:, override:)
+        // Parse as raw config to see _import directives
+        if tags.iter().any(|t| matches!(t.key.as_str(), "import" | "composition" | "override")) {
+            if let Ok(raw) = clinker_core::composition::parse_raw_config(&content) {
+                for entry in &raw.transformations {
+                    if let clinker_core::composition::RawTransformEntry::Import(directive) = entry {
+                        let path_lower = directive.path.to_lowercase();
+                        let override_names: Vec<String> = directive.overrides.keys().cloned().collect();
+
+                        for tag in tags {
+                            let val_lower = tag.value.to_lowercase();
+                            match tag.key.as_str() {
+                                "import" | "composition" => {
+                                    if path_lower.contains(&val_lower) {
+                                        results.push(StructuralSearchMatch {
+                                            pipeline_path: relative.clone(),
+                                            stage_name: directive.path.clone(),
+                                            stage_type: "import".to_string(),
+                                            matched_detail: format!(
+                                                "imports {} ({} override(s))",
+                                                directive.path,
+                                                directive.overrides.len()
+                                            ),
+                                        });
+                                    }
+                                }
+                                "override" => {
+                                    for ovr_name in &override_names {
+                                        if ovr_name.to_lowercase().contains(&val_lower) {
+                                            results.push(StructuralSearchMatch {
+                                                pipeline_path: relative.clone(),
+                                                stage_name: ovr_name.clone(),
+                                                stage_type: "override".to_string(),
+                                                matched_detail: format!(
+                                                    "overrides '{}' in {}",
+                                                    ovr_name, directive.path
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check inputs
         for input in &config.inputs {
             if stage_matches_tags(tags, "input", &input.name, &content_for_input(input)) {
-                let detail = format!("type: {:?}, path: {}", input.r#type, input.path);
+                let detail = format!("type: {}, path: {}", input.format.format_name(), input.path);
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
                     stage_name: input.name.clone(),
@@ -451,8 +501,8 @@ pub fn structural_search(
 
         // Check outputs
         for output in &config.outputs {
-            if stage_matches_tags(tags, "output", &output.name, &format!("{:?} {}", output.r#type, output.path)) {
-                let detail = format!("type: {:?}, path: {}", output.r#type, output.path);
+            if stage_matches_tags(tags, "output", &output.name, &format!("{} {}", output.format.format_name(), output.path)) {
+                let detail = format!("type: {}, path: {}", output.format.format_name(), output.path);
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
                     stage_name: output.name.clone(),
@@ -493,7 +543,7 @@ fn stage_matches_tags(tags: &[StructuralTag], stage_type: &str, name: &str, cont
 
 /// Build searchable content string for an input stage.
 fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
-    let mut content = format!("{} {:?} {}", input.name, input.r#type, input.path);
+    let mut content = format!("{} {} {}", input.name, input.format.format_name(), input.path);
     if let Some(ref schema) = input.schema {
         content.push_str(&format!(" schema:{schema}"));
     }

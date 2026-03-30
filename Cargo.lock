@@ -805,6 +805,7 @@ dependencies = [
  "dioxus",
  "dioxus-nox-cmdk",
  "dirs",
+ "indexmap",
  "notify",
  "regex",
  "rfd 0.15.4",
