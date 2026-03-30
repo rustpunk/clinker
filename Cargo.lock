@@ -458,8 +458,12 @@ dependencies = [
 name = "clinker-kiln"
 version = "0.1.0"
 dependencies = [
+ "clinker-core",
  "cxl",
  "dioxus",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,30 +1,21 @@
 use dioxus::prelude::*;
 
-use crate::demo::{demo_pipeline, DEMO_YAML};
 use crate::state::AppState;
+use crate::sync::EditSource;
 
-use super::tokenizer::tokenize;
-
-/// Full-height YAML sidebar with line-number gutter and syntax highlighting.
+/// Full-height YAML sidebar with editable textarea.
 ///
-/// Selection sync: when a stage is selected (via canvas click or inspector),
-/// the corresponding YAML lines receive a tinted background and accent left
-/// border. The line range comes from `DemoStage.yaml_line_start/end`.
+/// Phase 2b: replaces the static tokenized display with a live-editable
+/// `<textarea>`. On every keystroke, the YAML text signal is updated and
+/// the sync engine parses it to PipelineConfig.
 ///
 /// Doc: spec §6 — YAML Editor (Sidebar).
 #[component]
 pub fn YamlSidebar() -> Element {
     let state = use_context::<AppState>();
-    let lines = tokenize(DEMO_YAML);
-
-    // Compute the selected line range (1-indexed) from the selected stage.
-    let stages = demo_pipeline();
-    let selected_range = (state.selected_stage)().and_then(|id| {
-        stages
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.yaml_line_start..=s.yaml_line_end)
-    });
+    let text = (state.yaml_text)();
+    let errors = (state.parse_errors)();
+    let line_count = text.lines().count().max(1);
 
     rsx! {
         div {
@@ -36,58 +27,47 @@ pub fn YamlSidebar() -> Element {
                 span { class: "kiln-diamond", "\u{25C6}" }
                 span { class: "kiln-section-title", "PIPELINE YAML" }
                 span { class: "kiln-section-rule" }
-                span { class: "kiln-section-filename", "customer_etl.yaml" }
             }
 
-            // Scrollable code area
+            // Editable code area
             div {
                 class: "kiln-yaml-code-area",
 
-                // Gutter (line numbers)
+                // Line-number gutter
                 div {
                     class: "kiln-yaml-gutter",
-                    for (i, _) in lines.iter().enumerate() {
-                        {
-                            let line_num = i + 1; // 1-indexed
-                            let in_range = selected_range.as_ref()
-                                .is_some_and(|r| r.contains(&line_num));
-                            rsx! {
-                                div {
-                                    key: "gutter-{i}",
-                                    class: "kiln-yaml-line-num",
-                                    "data-selected": if in_range { "true" },
-                                    "{line_num}"
-                                }
-                            }
+                    for i in 0..line_count {
+                        div {
+                            key: "gutter-{i}",
+                            class: "kiln-yaml-line-num",
+                            "{i + 1}"
                         }
                     }
                 }
 
-                // Code column
+                // Editable textarea
+                textarea {
+                    class: "kiln-yaml-textarea",
+                    spellcheck: "false",
+                    value: "{text}",
+                    oninput: move |e: FormEvent| {
+                        let mut src = state.edit_source;
+                        src.set(EditSource::Yaml);
+                        let mut yaml = state.yaml_text;
+                        yaml.set(e.value());
+                    },
+                }
+            }
+
+            // Parse error bar
+            if !errors.is_empty() {
                 div {
-                    class: "kiln-yaml-code",
-                    for (i, line_tokens) in lines.iter().enumerate() {
-                        {
-                            let line_num = i + 1;
-                            let in_range = selected_range.as_ref()
-                                .is_some_and(|r| r.contains(&line_num));
-                            rsx! {
-                                div {
-                                    key: "line-{i}",
-                                    class: "kiln-yaml-line",
-                                    "data-selected": if in_range { "true" },
-                                    for (j, token) in line_tokens.iter().enumerate() {
-                                        span {
-                                            key: "tok-{i}-{j}",
-                                            "data-token": token.kind.as_data_attr(),
-                                            "{token.text}"
-                                        }
-                                    }
-                                    if line_tokens.iter().all(|t| t.text.is_empty()) {
-                                        "\u{00A0}"
-                                    }
-                                }
-                            }
+                    class: "kiln-yaml-errors",
+                    for (i, err) in errors.iter().enumerate() {
+                        div {
+                            key: "err-{i}",
+                            class: "kiln-yaml-error",
+                            "{err}"
                         }
                     }
                 }

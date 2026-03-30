@@ -4,7 +4,9 @@ mod app;
 mod components;
 mod cxl_bridge;
 mod demo;
+mod pipeline_view;
 mod state;
+mod sync;
 
 fn main() {
     dioxus::LaunchBuilder::new()

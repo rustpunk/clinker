@@ -533,7 +533,53 @@ html, body {
   color: var(--kiln-bone);
 }
 
-/* YAML syntax colours via data-token attribute — spec §6.2 */
+/* YAML editable textarea — monospace, full-height, dark background */
+.kiln-yaml-textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 20px;
+  color: var(--kiln-bone);
+  background: var(--kiln-char);
+  border: none;
+  outline: none;
+  resize: none;
+  white-space: pre;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+  tab-size: 2;
+}
+
+/* Parse error bar below the textarea */
+.kiln-yaml-errors {
+  flex-shrink: 0;
+  border-top: 1px solid var(--kiln-oxide-red);
+  background: rgba(183, 65, 14, 0.08);
+  padding: 6px 12px;
+  max-height: 80px;
+  overflow-y: auto;
+}
+
+.kiln-yaml-error {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  line-height: 16px;
+  color: var(--kiln-oxide-red);
+}
+
+/* Inspector value display (non-editable, like path) */
+.kiln-inspector-value {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-phosphor);
+  padding: 4px 0;
+  word-break: break-all;
+}
+
+/* YAML syntax colours via data-token attribute — spec §6.2 (kept for tokenizer) */
 [data-token="comment"] { color: var(--kiln-text-floor); }
 [data-token="key"]     { color: var(--kiln-verdigris); }
 [data-token="value"]   { color: var(--kiln-phosphor); }

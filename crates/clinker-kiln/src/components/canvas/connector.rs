@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::demo::DemoStage;
+use crate::pipeline_view::StageView;
 
 /// Three-layer SVG connector between two adjacent pipeline stages.
 ///
@@ -13,8 +13,8 @@ use crate::demo::DemoStage;
 /// Doc: spec §4.4 — Connectors.
 #[derive(Props, Clone, PartialEq)]
 pub struct ConnectorProps {
-    pub from: DemoStage,
-    pub to: DemoStage,
+    pub from: StageView,
+    pub to: StageView,
 }
 
 #[component]
@@ -39,7 +39,7 @@ pub fn Connector(props: ConnectorProps) -> Element {
         ty + 5.0,
     );
 
-    let accent = props.from.step_type.accent_color();
+    let accent = props.from.kind.accent_color();
 
     rsx! {
         g {

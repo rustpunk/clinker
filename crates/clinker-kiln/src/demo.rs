@@ -1,209 +1,36 @@
-/// Hardcoded demo pipeline for Phase 1. Replaced in Phase 2 by a real
-/// `Signal<Pipeline>` model parsed from YAML via serde-saphyr.
-
-/// Pass assignment for a pipeline stage.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Pass {
-    /// Pass 1 — scan phase (schema detection, index building).
-    Scan,
-    /// Pass 2 — transform phase (CXL expression evaluation, output).
-    Transform,
-}
-
-impl Pass {
-    pub fn label(self) -> &'static str {
-        match self {
-            Pass::Scan => "P1",
-            Pass::Transform => "P2",
-        }
-    }
-}
-
-/// Stage type, determining the accent colour and badge label.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum StepType {
-    Source,
-    Filter,
-    Map,
-    Sink,
-}
-
-impl StepType {
-    /// Rustpunk accent colour hex string for this stage type.
-    pub fn accent_color(self) -> &'static str {
-        match self {
-            StepType::Source => "#43B3AE",   // verdigris
-            StepType::Filter => "#E8A524",   // hazard
-            StepType::Map => "#C75B2A",      // ember
-            StepType::Sink => "#B7410E",     // oxide-red
-        }
-    }
-
-    /// Short badge label shown on the node card.
-    pub fn badge_label(self) -> &'static str {
-        match self {
-            StepType::Source => "SOURCE",
-            StepType::Filter => "FILTER",
-            StepType::Map => "MAP",
-            StepType::Sink => "SINK",
-        }
-    }
-}
-
-/// A named CXL expression field within a pipeline stage.
+/// Default pipeline YAML loaded when the app starts (no file selected).
 ///
-/// For example a filter stage has one expression (`expr`), while a map stage
-/// has one per output field (`full_name`, `email_lower`, etc.).
-#[derive(Clone, Debug, PartialEq)]
-pub struct DemoExprField {
-    /// Label shown in the inspector (e.g., "expr", "full_name").
-    pub label: &'static str,
-    /// Initial CXL expression text.
-    pub expr: &'static str,
-}
+/// This is a realistic `PipelineConfig`-compatible YAML that exercises the
+/// full config schema: inputs, transforms with CXL expressions, outputs,
+/// and error handling.
+pub const DEFAULT_YAML: &str = r#"pipeline:
+  name: customer_etl
 
-/// A single pipeline stage as rendered in the canvas and inspected in the
-/// side panel.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DemoStage {
-    /// Stable string ID used as the RSX iterator key. Never index-based.
-    pub id: &'static str,
-    /// Human-readable node label (Chakra Petch heading).
-    pub label: &'static str,
-    pub step_type: StepType,
-    pub pass: Pass,
-    /// Secondary subtitle line (JetBrains Mono, iron colour).
-    pub subtitle: &'static str,
-    /// Canvas world-space X position (top-left of the node card).
-    pub canvas_x: f32,
-    /// Canvas world-space Y position (top-left of the node card).
-    pub canvas_y: f32,
-    /// CXL expression fields for this stage (empty for Source/Sink).
-    pub expr_fields: Vec<DemoExprField>,
-    /// First line of this stage's block in DEMO_YAML (1-indexed, inclusive).
-    pub yaml_line_start: usize,
-    /// Last line of this stage's block in DEMO_YAML (1-indexed, inclusive).
-    pub yaml_line_end: usize,
-}
+inputs:
+  - name: customers
+    type: csv
+    path: ./data/customers.csv
+    options:
+      has_header: true
 
-/// Approximate rendered node height in px (used for port-centre calculations).
-pub const NODE_HEIGHT: f32 = 92.0;
-/// Fixed node card width in px, per spec §4.2.
-pub const NODE_WIDTH: f32 = 160.0;
+transformations:
+  - name: active_only
+    description: Filter to active customers
+    cxl: |
+      emit status_ok = status == "active"
 
-impl DemoStage {
-    /// Centre of the right-side output port — connector source point.
-    pub fn port_out(&self) -> (f32, f32) {
-        (self.canvas_x + NODE_WIDTH, self.canvas_y + NODE_HEIGHT / 2.0)
-    }
+  - name: enrich
+    description: Compute derived fields
+    cxl: |
+      emit full_name = first_name + " " + last_name
+      emit email_lower = lower(email)
 
-    /// Centre of the left-side input port — connector target point.
-    pub fn port_in(&self) -> (f32, f32) {
-        (self.canvas_x, self.canvas_y + NODE_HEIGHT / 2.0)
-    }
-}
+outputs:
+  - name: results
+    type: csv
+    path: ./output/customers.csv
+    include_unmapped: true
 
-/// Returns the four-stage demo pipeline.
-pub fn demo_pipeline() -> Vec<DemoStage> {
-    vec![
-        DemoStage {
-            id: "demo-source",
-            label: "csv_reader",
-            step_type: StepType::Source,
-            pass: Pass::Scan,
-            subtitle: "customers_*.csv",
-            canvas_x: 60.0,
-            canvas_y: 100.0,
-            expr_fields: vec![],
-            yaml_line_start: 5,
-            yaml_line_end: 11,
-        },
-        DemoStage {
-            id: "demo-filter",
-            label: "active_only",
-            step_type: StepType::Filter,
-            pass: Pass::Transform,
-            subtitle: "status == \"active\"",
-            canvas_x: 300.0,
-            canvas_y: 140.0,
-            expr_fields: vec![DemoExprField {
-                label: "expr",
-                expr: r#"status == "active""#,
-            }],
-            yaml_line_start: 14,
-            yaml_line_end: 16,
-        },
-        DemoStage {
-            id: "demo-map",
-            label: "enrich",
-            step_type: StepType::Map,
-            pass: Pass::Transform,
-            subtitle: "full_name, email_lower",
-            canvas_x: 540.0,
-            canvas_y: 80.0,
-            expr_fields: vec![
-                DemoExprField {
-                    label: "full_name",
-                    expr: r#"first_name + " " + last_name"#,
-                },
-                DemoExprField {
-                    label: "email_lower",
-                    expr: "lower(email)",
-                },
-                DemoExprField {
-                    label: "region_label",
-                    expr: r#"map("region_labels", region)"#,
-                },
-            ],
-            yaml_line_start: 18,
-            yaml_line_end: 27,
-        },
-        DemoStage {
-            id: "demo-sink",
-            label: "json_out",
-            step_type: StepType::Sink,
-            pass: Pass::Transform,
-            subtitle: "output/customers.json",
-            canvas_x: 780.0,
-            canvas_y: 120.0,
-            expr_fields: vec![],
-            yaml_line_start: 29,
-            yaml_line_end: 32,
-        },
-    ]
-}
-
-/// Demo pipeline YAML shown in the sidebar. Intentionally realistic to exercise
-/// the static syntax tokeniser.
-pub const DEMO_YAML: &str = r#"# Clinker Pipeline — Customer ETL
-name: customer_etl
-version: 2
-
-source:
-  csv_reader:
-    format: csv
-    path: ./data/customers_*.csv
-    csv:
-      header: true
-      null_value: ""
-
-stages:
-  active_only:
-    step: filter
-    expr: 'status == "active"'
-
-  enrich:
-    step: map
-    fields:
-      - name: full_name
-        expr: 'first_name + " " + last_name'
-      - name: email_lower
-        expr: lower(email)
-      - name: region_label
-        expr: map("region_labels", region)
-
-destination:
-  json_out:
-    format: json
-    path: ./output/customers.json
+error_handling:
+  strategy: fail_fast
 "#;

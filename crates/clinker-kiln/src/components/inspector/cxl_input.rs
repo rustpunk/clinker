@@ -16,9 +16,10 @@ use super::cxl_diagnostics::CxlDiagnostics;
 ///
 /// Doc: spec §5.2 — Inspector form field generation.
 #[component]
-pub fn CxlInput(label: &'static str, initial_value: &'static str) -> Element {
-    let mut text = use_signal(|| initial_value.to_string());
-    let mut validation = use_signal(|| validate_expr(initial_value));
+pub fn CxlInput(label: String, initial_value: String) -> Element {
+    let mut text = use_signal(move || initial_value.clone());
+    let initial_for_validate = text.peek().clone();
+    let mut validation = use_signal(move || validate_expr(&initial_for_validate));
 
     let on_input = move |e: FormEvent| {
         let new_text = e.value();

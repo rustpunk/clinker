@@ -1,4 +1,7 @@
+use clinker_core::config::PipelineConfig;
 use dioxus::prelude::*;
+
+use crate::sync::EditSource;
 
 /// Pipeline canvas layout preset.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -9,7 +12,6 @@ pub enum LayoutPreset {
 }
 
 impl LayoutPreset {
-    /// CSS `data-layout` attribute value for this preset.
     pub fn as_data_attr(self) -> &'static str {
         match self {
             LayoutPreset::CanvasFocus => "canvas-focus",
@@ -18,7 +20,6 @@ impl LayoutPreset {
         }
     }
 
-    /// Short label used in the title-bar layout switcher.
     pub fn label(self) -> &'static str {
         match self {
             LayoutPreset::CanvasFocus => "Canvas",
@@ -28,25 +29,20 @@ impl LayoutPreset {
     }
 }
 
-/// App-level reactive state — a struct of independent Signal handles, not a
-/// `Signal<AppState>`. Each field is a separate signal so that writing to
-/// `layout` does not trigger re-renders in components subscribed only to
-/// `run_log_expanded`, etc. (avoids the AP-4 monolithic-state anti-pattern.)
-///
-/// `Signal<T>` is `Copy`, so `AppState` is `Copy` and cheap to pass around.
-/// Provided at the app root via `use_context_provider` and consumed in
-/// descendant components via `use_context::<AppState>()`.
+/// App-level reactive state — struct of independent Signal handles (AP-4).
 #[derive(Clone, Copy)]
 pub struct AppState {
-    /// Current layout preset driving panel widths.
     pub layout: Signal<LayoutPreset>,
-    /// Whether the run-log drawer is expanded (220 px) or collapsed (28 px).
     pub run_log_expanded: Signal<bool>,
-    /// ID of the currently selected pipeline stage, or `None` if nothing is
-    /// selected. Drives canvas highlight, YAML sidebar line tinting, and
-    /// inspector panel visibility.
-    pub selected_stage: Signal<Option<&'static str>>,
-    /// Inspector panel width in pixels; range 260–520, default 340.
+    pub selected_stage: Signal<Option<String>>,
     #[allow(dead_code)]
     pub inspector_width: Signal<f32>,
+    /// Raw YAML text shown in the sidebar editor.
+    pub yaml_text: Signal<String>,
+    /// Parsed pipeline config (None if YAML is invalid).
+    pub pipeline: Signal<Option<PipelineConfig>>,
+    /// Parse error messages (empty when YAML is valid).
+    pub parse_errors: Signal<Vec<String>>,
+    /// Which view last edited the model (sync loop prevention).
+    pub edit_source: Signal<EditSource>,
 }
