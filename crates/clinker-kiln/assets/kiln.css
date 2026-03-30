@@ -889,7 +889,158 @@ html, body {
   background: var(--kiln-char);
 }
 
-/* ── 15. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+/* ── 15. Inspector config section (compressible) ───────────────────────────
+   When the drawer is open, config compresses to ~42%. When closed, fills.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-inspector-config {
+  flex: 1;
+  overflow-y: auto;
+  transition: flex 300ms ease;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+.kiln-inspector-config[data-compressed="true"] {
+  flex: 0.42;
+}
+
+/* ── 16. Drawer toggle bar ─────────────────────────────────────────────────
+   Three equal-width buttons: Run (phosphor) | Docs (verdigris) | Notes (iron).
+   Spec §A2.3: 32px height, char-raised background.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-drawer-bar {
+  display: flex;
+  align-items: stretch;
+  height: 32px;
+  flex-shrink: 0;
+  background: var(--kiln-char-raised);
+  border-top: 1px solid var(--kiln-border-subtle);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-drawer-divider {
+  width: 1px;
+  background: var(--kiln-border-medium);
+}
+
+.kiln-drawer-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  padding: 0 8px;
+  transition: background 200ms ease, color 200ms ease, border-color 200ms ease;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-drawer-btn:hover {
+  color: var(--kiln-bone);
+}
+
+.kiln-drawer-btn[data-active="true"] {
+  /* accent colour set via inline style */
+}
+
+.kiln-drawer-btn-icon {
+  font-size: 9px;
+}
+
+.kiln-drawer-btn-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.kiln-drawer-btn-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  padding: 0 4px;
+  line-height: 14px;
+}
+
+/* ── 17. Drawer region ─────────────────────────────────────────────────────
+   Expands/collapses below the toggle bar. Scrollable independently.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-drawer-region {
+  flex: 0;
+  overflow: hidden;
+  transition: flex 300ms ease;
+}
+
+.kiln-drawer-region[data-open="true"] {
+  flex: 0.58;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Drawer content containers */
+.kiln-drawer-content {
+  padding: 16px;
+  min-height: 100%;
+}
+
+/* Run drawer — phosphor tint */
+.kiln-drawer-content--run {
+  background: rgba(212, 160, 23, 0.04);
+}
+
+/* Docs drawer — Blueprint gridline overlay */
+.kiln-drawer-content--docs {
+  background:
+    linear-gradient(var(--kiln-verdigris) 1px, transparent 1px),
+    linear-gradient(90deg, var(--kiln-verdigris) 1px, transparent 1px);
+  background-size: 16px 16px;
+  background-color: var(--kiln-char);
+  /* Grid opacity via the alpha channel in the gradient colour */
+}
+
+.kiln-drawer-content--docs {
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(67, 179, 174, 0.04) 0px,
+      rgba(67, 179, 174, 0.04) 1px,
+      transparent 1px,
+      transparent 16px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(67, 179, 174, 0.04) 0px,
+      rgba(67, 179, 174, 0.04) 1px,
+      transparent 1px,
+      transparent 16px
+    );
+  background-color: var(--kiln-char);
+}
+
+/* Notes drawer — iron tint */
+.kiln-drawer-content--notes {
+  background: rgba(138, 126, 110, 0.04);
+}
+
+/* Placeholder text for stub drawers */
+.kiln-drawer-placeholder {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  text-align: center;
+  padding: 24px 0;
+  font-style: italic;
+}
+
+/* ── 18. Scrollbar theming (WebKit) ─────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
