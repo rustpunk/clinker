@@ -8,6 +8,7 @@ pub enum PipelineError {
     Eval(cxl::eval::EvalError),
     Compilation { transform_name: String, messages: Vec<String> },
     Io(std::io::Error),
+    ThreadPool(String),
 }
 
 impl fmt::Display for PipelineError {
@@ -24,6 +25,7 @@ impl fmt::Display for PipelineError {
                 Ok(())
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::ThreadPool(e) => write!(f, "thread pool error: {e}"),
         }
     }
 }

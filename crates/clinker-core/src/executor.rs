@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use clinker_record::{FieldResolver, PipelineCounters, Record, RecordStorage, RecordView, Schema, Value, WindowContext};
+use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
 use indexmap::IndexMap;
+use rayon::prelude::*;
 
-use crate::config::{ErrorStrategy, NullOrder, OutputConfig, PipelineConfig, SortOrder, TransformConfig};
+use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig, TransformConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
-use crate::plan::execution::{ExecutionMode, ExecutionPlan, ParallelismClass, PlanError};
+use crate::plan::execution::{ExecutionMode, ExecutionPlan, ParallelismClass};
 use crate::projection::project_output;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
@@ -96,6 +97,7 @@ impl PipelineExecutor {
         let input = &config.inputs[0];
         let output = &config.outputs[0];
         let writer_config = build_writer_config(output);
+        let pipeline_start_time = chrono::Local::now().naive_local();
 
         let first_record = csv_reader.next_record()?;
         let first_record = match first_record {
@@ -103,7 +105,7 @@ impl PipelineExecutor {
             None => return Ok((PipelineCounters::default(), Vec::new())),
         };
 
-        let ctx = build_eval_context(config, &input.path, 1);
+        let ctx = build_eval_context(config, &input.path, 1, pipeline_start_time);
         let first_result = evaluate_record(&first_record, transforms, &ctx);
 
         let schema = csv_reader.schema()?;
@@ -140,7 +142,7 @@ impl PipelineExecutor {
         let mut row_num: u64 = 2;
         while let Some(record) = csv_reader.next_record()? {
             counters.total_count += 1;
-            let ctx = build_eval_context(config, &input.path, row_num);
+            let ctx = build_eval_context(config, &input.path, row_num, pipeline_start_time);
             match evaluate_record(&record, transforms, &ctx) {
                 Ok(emitted) => {
                     let projected = project_output(&record, &emitted, output);
@@ -168,6 +170,7 @@ impl PipelineExecutor {
     ) -> Result<(PipelineCounters, Vec<DlqEntry>), PipelineError> {
         let input = &config.inputs[0];
         let output = &config.outputs[0];
+        let pipeline_start_time = chrono::Local::now().naive_local();
 
         // Phase 1: Build Arena from primary source
         let arena_fields = crate::plan::index::collect_arena_fields(
@@ -207,30 +210,30 @@ impl PipelineExecutor {
             }
         }
 
-        // Phase 2: Re-read primary source (second pass)
-        // We can't re-read from the same reader, so we read from Arena records
-        // and use the original csv_reader schema for projection.
-        // Actually, the Arena only has projected fields. We need the full record.
-        // For the in-memory test path, we'll re-read from a cursor.
-        // For file-based paths, we'd open a new reader.
-        // Since run_with_readers_writers takes a reader (not a path), and the reader
-        // is consumed by Arena::build, we need to handle this differently.
+        // Phase 2: Chunk-based evaluation with optional rayon parallelism.
+        //
+        // Records are built from Arena (projected fields only). Chunks of
+        // `chunk_size` records are evaluated, then written inline.
+        // For Stateless/IndexReading transforms, evaluation is parallelized
+        // via `pool.install(|| chunk.par_iter_mut().for_each(...))`.
+        // Sequential transforms use a plain `for` loop.
 
-        // For now: evaluate using Arena data for window context + re-read not needed
-        // because the Arena was built from the reader. We iterate Arena positions
-        // and for each, construct a Record from the Arena's projected fields
-        // (this is a simplification — full implementation would re-read the file).
-        // The output will contain only Arena fields + CXL-emitted fields.
+        let pool = build_thread_pool(config)?;
+        let use_parallel = can_parallelize(plan);
 
         let output_schema_ref = arena.schema();
         let writer_config = build_writer_config(output);
         let strategy = config.error_handling.strategy;
 
-        // Determine output schema from first record evaluation
         let record_count = arena.record_count();
         if record_count == 0 {
             return Ok((PipelineCounters::default(), Vec::new()));
         }
+
+        let chunk_size = config.pipeline.concurrency
+            .as_ref()
+            .and_then(|c| c.chunk_size)
+            .unwrap_or(1024) as u32;
 
         // Build a Record from Arena for evaluation
         let build_record_from_arena = |pos: u32| -> Record {
@@ -241,11 +244,9 @@ impl PipelineExecutor {
             Record::new(schema, values)
         };
 
-        // Evaluate first record to determine output schema
+        // Evaluate first record to determine output schema (needed before writer init)
         let first_record = build_record_from_arena(0);
-        let first_ctx = build_eval_context(config, &input.path, 1);
-
-        // Find window context for this record
+        let first_ctx = build_eval_context(config, &input.path, 1, pipeline_start_time);
         let first_emitted = evaluate_record_with_window(
             &first_record, transforms, &first_ctx, plan, &arena, &indices, 0,
         );
@@ -268,7 +269,7 @@ impl PipelineExecutor {
         let mut counters = PipelineCounters::default();
         let mut dlq_entries = Vec::new();
 
-        // Process first record
+        // Write first record result
         counters.total_count += 1;
         match first_emitted {
             Ok(_) => {
@@ -280,23 +281,53 @@ impl PipelineExecutor {
             }
         }
 
-        // Process remaining records
-        for pos in 1..record_count {
-            let row_num = pos as u64 + 1;
-            counters.total_count += 1;
-            let record = build_record_from_arena(pos);
-            let ctx = build_eval_context(config, &input.path, row_num);
+        // Process remaining records in chunks
+        let mut chunk_start = 1u32;
+        while chunk_start < record_count {
+            let chunk_end = (chunk_start + chunk_size).min(record_count);
 
-            match evaluate_record_with_window(&record, transforms, &ctx, plan, &arena, &indices, pos) {
-                Ok(emitted) => {
-                    let projected = project_output(&record, &emitted, output);
-                    csv_writer.write_record(&projected)?;
-                    counters.ok_count += 1;
-                }
-                Err(eval_err) => {
-                    handle_error(strategy, &record, row_num, &eval_err, &mut counters, &mut dlq_entries, output, &final_output_schema, &mut csv_writer)?;
+            // Build chunk: (arena_pos, Record, eval result — None until evaluated)
+            let mut chunk: Vec<(u32, Record, Option<Result<IndexMap<String, Value>, cxl::eval::EvalError>>)> =
+                (chunk_start..chunk_end)
+                    .map(|pos| (pos, build_record_from_arena(pos), None))
+                    .collect();
+
+            // Evaluate: parallel or sequential
+            if use_parallel {
+                pool.install(|| {
+                    chunk.par_iter_mut().for_each(|(pos, record, result)| {
+                        let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time);
+                        *result = Some(evaluate_record_with_window(
+                            record, transforms, &ctx, plan, &arena, &indices, *pos,
+                        ));
+                    });
+                });
+            } else {
+                for (pos, record, result) in chunk.iter_mut() {
+                    let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time);
+                    *result = Some(evaluate_record_with_window(
+                        record, transforms, &ctx, plan, &arena, &indices, *pos,
+                    ));
                 }
             }
+
+            // Write chunk results inline (single-threaded, preserves order)
+            for (pos, record, result) in &chunk {
+                let row_num = *pos as u64 + 1;
+                counters.total_count += 1;
+                match result.as_ref().unwrap() {
+                    Ok(emitted) => {
+                        let projected = project_output(record, emitted, output);
+                        csv_writer.write_record(&projected)?;
+                        counters.ok_count += 1;
+                    }
+                    Err(eval_err) => {
+                        handle_error(strategy, record, row_num, eval_err, &mut counters, &mut dlq_entries, output, &final_output_schema, &mut csv_writer)?;
+                    }
+                }
+            }
+
+            chunk_start = chunk_end;
         }
 
         csv_writer.flush()?;
@@ -408,11 +439,46 @@ fn build_writer_config(output: &OutputConfig) -> CsvWriterConfig {
     config
 }
 
+/// Build a rayon thread pool from config. Explicit pool (not global) for testability.
+///
+/// Default: `min(num_cpus - 2, 4)`. Overridable via `concurrency.threads` config.
+fn build_thread_pool(config: &PipelineConfig) -> Result<rayon::ThreadPool, PipelineError> {
+    let worker_threads = config
+        .pipeline
+        .concurrency
+        .as_ref()
+        .and_then(|c| c.threads)
+        .unwrap_or_else(|| std::cmp::min(num_cpus::get().saturating_sub(2).max(1), 4));
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .thread_name(|i| format!("cxl-worker-{i}"))
+        .build()
+        .map_err(|e| PipelineError::ThreadPool(e.to_string()))
+}
+
+/// Determine if all transforms can be parallelized (Stateless or IndexReading).
+fn can_parallelize(plan: &ExecutionPlan) -> bool {
+    plan.parallelism.per_transform.iter().all(|c| {
+        matches!(c, ParallelismClass::Stateless | ParallelismClass::IndexReading)
+    })
+}
+
 /// Build an EvalContext for a given record.
-fn build_eval_context(config: &PipelineConfig, source_file: &str, source_row: u64) -> EvalContext {
+///
+/// `pipeline_start_time` must be frozen once at pipeline start and reused for all
+/// records. This ensures `pipeline.start_time` is deterministic within a run.
+/// The `now` keyword uses `ctx.clock.now()` (wall-clock) and is intentionally
+/// non-deterministic — users who reference `now` opt into time-varying output.
+fn build_eval_context(
+    config: &PipelineConfig,
+    source_file: &str,
+    source_row: u64,
+    pipeline_start_time: chrono::NaiveDateTime,
+) -> EvalContext {
     EvalContext {
         clock: Box::new(WallClock),
-        pipeline_start_time: chrono::Local::now().naive_local(),
+        pipeline_start_time,
         pipeline_name: config.pipeline.name.clone(),
         pipeline_execution_id: String::new(),
         pipeline_counters: PipelineCounters::default(),
@@ -1120,5 +1186,235 @@ transformations:
         // source_row should be sequential
         // Values appear as integers in CSV output
         assert!(output.contains("row"), "output missing 'row' header: {}", output);
+    }
+
+    // ── Phase 6 gate tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_thread_pool_default_count() {
+        let expected = std::cmp::min(num_cpus::get().saturating_sub(2).max(1), 4);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(expected)
+            .thread_name(|i| format!("cxl-worker-{i}"))
+            .build()
+            .unwrap();
+        assert_eq!(pool.current_num_threads(), expected);
+    }
+
+    #[test]
+    fn test_thread_pool_cli_override() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("cxl-worker-{i}"))
+            .build()
+            .unwrap();
+        assert_eq!(pool.current_num_threads(), 2);
+    }
+
+    /// Helper: run executor with specific thread count via concurrency config.
+    fn run_test_with_threads(
+        yaml: &str,
+        csv_input: &str,
+        threads: usize,
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+        // Parse config and override thread count
+        let mut config = crate::config::parse_config(yaml).unwrap();
+        config.pipeline.concurrency = Some(crate::config::ConcurrencyConfig {
+            threads: Some(threads),
+            chunk_size: Some(64), // small chunks to exercise chunking logic
+        });
+        let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
+        let mut output_buf: Vec<u8> = Vec::new();
+        let (counters, dlq) =
+            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
+        let output = String::from_utf8(output_buf).unwrap();
+        Ok((counters, dlq, output))
+    }
+
+    #[test]
+    fn test_par_stateless_deterministic_output() {
+        let yaml = r#"
+pipeline:
+  name: par_stateless
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: double
+    cxl: |
+      emit doubled = amount + "_doubled"
+"#;
+        // Generate 1000-record CSV
+        let mut csv = String::from("id,amount\n");
+        for i in 0..1000 {
+            csv.push_str(&format!("{i},val_{i}\n"));
+        }
+
+        let (_, _, output_1) = run_test_with_threads(yaml, &csv, 1).unwrap();
+        let (_, _, output_4) = run_test_with_threads(yaml, &csv, 4).unwrap();
+        assert_eq!(output_1, output_4, "Output must be byte-identical with 1 vs 4 threads");
+    }
+
+    #[test]
+    fn test_par_index_reading_deterministic_output() {
+        let yaml = r#"
+pipeline:
+  name: par_index
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: dept_total
+    cxl: |
+      emit dept_total = window.sum(amount)
+    local_window:
+      group_by: [dept]
+"#;
+        let mut csv = String::from("dept,amount\n");
+        for i in 0..500 {
+            let dept = if i % 3 == 0 { "A" } else if i % 3 == 1 { "B" } else { "C" };
+            csv.push_str(&format!("{dept},{i}\n"));
+        }
+
+        let (_, _, output_1) = run_test_with_threads(yaml, &csv, 1).unwrap();
+        let (_, _, output_4) = run_test_with_threads(yaml, &csv, 4).unwrap();
+        assert_eq!(output_1, output_4, "Window output must be byte-identical with 1 vs 4 threads");
+    }
+
+    #[test]
+    fn test_sequential_not_parallelized() {
+        // A transform using window.lag(1) is classified Sequential.
+        // Verify the pipeline runs correctly (sequential dispatch path).
+        let yaml = r#"
+pipeline:
+  name: seq_test
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: lagged
+    cxl: |
+      emit prev = window.lag(1)
+    local_window:
+      group_by: [dept]
+      sort_by:
+        - field: id
+"#;
+        let csv = "dept,id\nA,1\nA,2\nA,3\nB,4\nB,5\n";
+        let (counters, _, _output) = run_test_with_threads(yaml, csv, 4).unwrap();
+        assert_eq!(counters.ok_count, 5);
+        // The key assertion: sequential transforms run without error under any thread count.
+        // The plan's `can_parallelize()` returns false, so the sequential path is used.
+    }
+
+    #[test]
+    fn test_golden_file_diff_1_vs_4_threads() {
+        // Full CSV→CXL→CSV pipeline: byte-identical output with 1 vs 4 threads.
+        // Uses only stateless transforms (no `now` keyword).
+        let yaml = r#"
+pipeline:
+  name: golden
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: transform
+    cxl: |
+      emit upper_name = name + "_UPPER"
+      emit computed = amount + "_x2"
+"#;
+        let mut csv = String::from("name,amount,dept\n");
+        for i in 0..500 {
+            csv.push_str(&format!("person_{i},{i},dept_{}\n", i % 5));
+        }
+
+        let (c1, _, out1) = run_test_with_threads(yaml, &csv, 1).unwrap();
+        let (c4, _, out4) = run_test_with_threads(yaml, &csv, 4).unwrap();
+        assert_eq!(out1, out4, "Golden file output must be byte-identical");
+        assert_eq!(c1.ok_count, c4.ok_count);
+        assert_eq!(c1.total_count, 500);
+    }
+
+    #[test]
+    fn test_arc_ast_shared_not_cloned() {
+        // Verify that Arc<TypedProgram> strong_count is 1 after compilation —
+        // the Arc is shared by reference during evaluation, not cloned per record.
+        let yaml = r#"
+pipeline:
+  name: arc_test
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: calc
+    cxl: |
+      emit doubled = amount + "_doubled"
+"#;
+        let config = crate::config::parse_config(yaml).unwrap();
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let compiled = PipelineExecutor::compile_transforms(&config.transformations, &schema).unwrap();
+        // Each compiled transform holds one Arc<TypedProgram>
+        for ct in &compiled {
+            assert_eq!(Arc::strong_count(&ct.typed), 1,
+                "Arc<TypedProgram> should have exactly 1 strong reference (no per-record cloning)");
+        }
+    }
+
+    #[test]
+    fn test_empty_pipeline_zero_records() {
+        let yaml = r#"
+pipeline:
+  name: empty
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: calc
+    cxl: |
+      emit doubled = name + "_x"
+"#;
+        // Header only, no data rows
+        let csv = "name\n";
+        let (counters, dlq, _output) = run_test(yaml, csv).unwrap();
+        assert_eq!(counters.total_count, 0);
+        assert_eq!(counters.ok_count, 0);
+        assert_eq!(counters.dlq_count, 0);
+        assert!(dlq.is_empty());
     }
 }

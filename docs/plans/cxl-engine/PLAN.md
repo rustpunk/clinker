@@ -25,6 +25,15 @@ with spill-to-disk under a configurable memory budget.
 | 7 | `RecordStorage` trait in `clinker-record` foundation crate (Phase 5 decision) | All crates depending on `clinker-record` gain access; `cxl::eval` becomes generic over `S` |
 | 8 | Unified `PipelineExecutor` replaces `StreamingExecutor` (Phase 5 decision) | Phase 6+ modifies one executor, not two. Streaming mode is an internal branch. |
 | 9 | `config::SortField` extended with optional `null_order` (Phase 5 decision) | Output sort ordering uses `null_order: None`; window sorting uses `Some(Last)` default |
+| 10 | Explicit `rayon::ThreadPool` via `build()` + `pool.install()`, not `build_global()` (Phase 6 decision) | Tests can configure per-test thread counts without global state races. Polars + Apollo Rover precedent. Zero perf difference. |
+| 11 | Inline `par_iter_mut` in executor loop, no ChunkProcessor struct (Phase 6 decision) | Ecosystem consensus: inline swap is the dominant pattern for row-oriented chunk parallelism. Tasks 6.3-6.5 bolt onto chunk boundary as loop-level checks. |
+| 12 | `IngestionOutput` struct carries Phase 1 arenas + indices, not a god-object ExecutionContext (Phase 6 decision) | DataFusion precedent: focused data-product struct. Plan and thread pool passed separately. |
+| 13 | Phase 6 spill scope is IO primitives only; spill triggers live in Phase 8 (Phase 6 decision) | Phase 2 streaming drops chunks after processing — nothing accumulates. Spec §9.1 spill is for blocking stages (sort, distinct) in Phase 8. |
+| 14 | Error threshold denominator: Arena total in TwoPass, running ratio in Streaming (Phase 6 decision) | Spec says "total record count is known from Phase 1." Streaming has no Phase 1, so running ratio is the only option. |
+| 15 | Exit codes: spec {0,1,2,3,4} + 130 for SIGINT/SIGTERM (Phase 6 decision) | Spec §10.2 is authoritative. 130 is Unix convention (128 + SIGINT=2). No collision. |
+| 16 | `now` keyword is wall-clock, non-deterministic by design (Phase 6 validation) | Users need wall-clock for timestamps and time-based filtering. Determinism guarantee applies to pipelines not using `now`. `pipeline.start_time` is frozen once (deterministic). |
+| 17 | `build_eval_context` must freeze `pipeline_start_time` once at pipeline start (Phase 6 validation) | Pre-existing bug: current code recreates `pipeline_start_time` per record via `Local::now()`. Fix in Phase 6 Task 6.1.0 prep. |
+| 18 | `ctrlc::set_handler_with_signals` required for SIGTERM, not default `set_handler` (Phase 6 validation) | Default `set_handler()` only catches SIGINT. SIGTERM (kill, Docker stop, systemd) requires explicit opt-in. |
 
 ## Open Questions
 
@@ -40,7 +49,7 @@ with spill-to-disk under a configurable memory budget.
 | 3 | CXL Resolver, Type Checker, Evaluator | ✅ Complete | 4 | 4 | — |
 | 4 | CSV + Minimal End-to-End Pipeline | ✅ Complete | 5 | 5 | — |
 | 5 | Two-Pass Pipeline — Arena, Indexing, Windows | 🔲 Ready (drilled + validated) | 5 | 0 | — |
-| 6 | Parallelism + Memory Management | 🔲 Not Started | 5 | 0 | Phase 5 |
+| 6 | Parallelism + Memory Management | 🔲 Ready (drilled + validated) | 5 | 0 | Phase 5 |
 | 7 | JSON + XML Readers/Writers | 🔲 Not Started | 4 | 0 | Phase 4 |
 | 8 | Sort, DLQ Polish, CLI Completion | 🔲 Not Started | 4 | 0 | Phase 6, 7 |
 | 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Not Started | 4 | 0 | Phase 7 |
@@ -74,7 +83,7 @@ Phase 1 (Foundation)
 ```
 
 Phase 5 requires the `ExecutionPlan` concept from Phase 4's executor.
-Phase 6 layers parallelism onto the sequential pipeline from Phase 5.
+Phase 6 layers parallelism onto the sequential pipeline from Phase 5. Spill IO primitives built in Phase 6; spill triggers in Phase 8.
 Phase 7 can start after Phase 4 (format readers are independent of windows).
 Phase 8 needs both Phase 6 (spill infrastructure) and Phase 7 (all formats).
 Phase 9 needs Phase 7 (schema applies to all formats).
@@ -91,3 +100,9 @@ Phase 10 needs Phase 9 (validations reference schemas and modules).
 | `quick-xml` 0.37 breaking changes | Low | Low — isolated to Phase 7 | Pin version. Wrap reader behind `FormatReader` trait. |
 | `WindowContext<'a, S>` generic propagation through eval | Low | Medium — 8 functions in `cxl::eval` need `S` param | Mechanical change. Monomorphized once for `Arena`. Sub-task 5.2.6 enumerates all sites. |
 | Phase 5 `RecordView` lifetime vs Phase 6 rayon closures | Low | Medium — if views need to cross task boundaries | `&Arena` is `Send` (Arena is Sync). Views don't escape closures. Upgrade to Arc is mechanical fallback. |
+| `ctrlc::set_handler` global state in tests | Low | Low — test flakiness | Phase 6 wraps in `Once`; tests manipulate `AtomicBool` directly, never install the real handler. |
+| RSS measurement is process-wide, not pipeline-scoped | Low | Low — premature spill triggers | 60% threshold provides headroom. Acceptable for v1. v2 could use custom allocator wrapper. |
+| Mixed parallelism classes force conservative sequential dispatch | Low | Medium — reduced parallelism | If any transform is Sequential, entire chunk is sequential. v2 could interleave parallel/sequential per-transform. |
+| CXL `now` keyword makes output non-reproducible | Low | Low — by design | Document that `now` is wall-clock. Golden file tests must not use `now`. `pipeline.start_time` is deterministic. |
+| Phase 8 Task 8.4 exit codes contradict spec §10.2 | Medium | Medium — Phase 8 plan needs correction | Phase 6 matches spec. Phase 8 exit code semantics for codes 2/3/4 must be corrected before Phase 8 implementation. |
+| Memory ceiling best-effort until Phase 8 spill triggers | Low | Medium — RSS can exceed 512MB during Phase 2 | Arena hard cap covers dominant consumer. Phase 6 adds `tracing::warn` on RSS ceiling breach. Full enforcement in Phase 8. |

@@ -183,7 +183,12 @@ tool with `check`, `eval`, and `fmt` subcommands. Define and implement all exit 
   - `cxl check <file.cxl>`: parse + typecheck, print errors or "OK"
   - `cxl eval <expr> --field name=value ...`: evaluate CXL expression with provided field values, print result
   - `cxl fmt <file.cxl>`: pretty-print CXL file to stdout (canonical formatting)
-- Exit codes: 0 = success, 1 = config/parse error, 2 = runtime error (data processing failure), 3 = partial success (some DLQ records, threshold not exceeded), 4 = threshold exceeded (too many DLQ records)
+- Exit codes: must match spec §10.2 and Phase 6 `exit_codes.rs` constants: 0 = success, 1 = config/CXL compile error, 2 = partial success (some DLQ rows), 3 = fatal data error (fail_fast / threshold exceeded / NaN in group_by), 4 = I/O or system error, 130 = interrupted by SIGINT/SIGTERM
+
+> 🔴 **[V-2-2] CORRECTED (Phase 6 validation):** Original exit codes 2/3/4 contradicted
+> spec §10.2 and Phase 6's `exit_codes.rs`. Updated to match spec: 2 = partial success
+> (DLQ), 3 = fatal data error, 4 = I/O error. Phase 6 owns the constants; Phase 8 owns
+> CLI flags and end-to-end integration tests.
 
 **Acceptance criteria:**
 - [ ] All 12 CLI flags parsed and applied correctly
@@ -191,11 +196,12 @@ tool with `check`, `eval`, and `fmt` subcommands. Define and implement all exit 
 - [ ] `cxl check` reports parse and type errors with source spans
 - [ ] `cxl eval` evaluates expression with field inputs and prints result
 - [ ] `cxl fmt` produces canonical pretty-printed CXL output
-- [ ] Exit code 0 for clean success
-- [ ] Exit code 1 for config/parse errors
-- [ ] Exit code 2 for runtime failures
-- [ ] Exit code 3 for partial success with DLQ records
-- [ ] Exit code 4 for error threshold exceeded
+- [ ] Exit code 0 for clean success (zero errors)
+- [ ] Exit code 1 for config/CXL compile error (no data processed)
+- [ ] Exit code 2 for partial success (some rows routed to DLQ)
+- [ ] Exit code 3 for fatal data error (fail_fast / threshold exceeded / NaN in group_by)
+- [ ] Exit code 4 for I/O or system error
+- [ ] Exit code 130 for SIGINT/SIGTERM interruption
 
 **Required unit tests (must pass before Phase 8 exit):**
 
@@ -216,9 +222,10 @@ tool with `check`, `eval`, and `fmt` subcommands. Define and implement all exit 
 | `test_cxl_eval_with_fields` | `cxl eval "Price * Qty" --field Price=10.5 --field Qty=3` → prints `31.5` | ⛔ Hard gate |
 | `test_cxl_fmt_canonical` | `cxl fmt` reformats whitespace to canonical form | ⛔ Hard gate |
 | `test_exit_code_0_success` | Clean pipeline run → exit 0 | ⛔ Hard gate |
-| `test_exit_code_1_parse_error` | Invalid YAML → exit 1 | ⛔ Hard gate |
-| `test_exit_code_2_runtime_error` | Missing input file → exit 2 | ⛔ Hard gate |
-| `test_exit_code_3_partial_dlq` | Some DLQ records, under threshold → exit 3 | ⛔ Hard gate |
-| `test_exit_code_4_threshold_exceeded` | DLQ count exceeds `--error-threshold` → exit 4 | ⛔ Hard gate |
+| `test_exit_code_1_compile_error` | Invalid YAML or CXL error → exit 1 | ⛔ Hard gate |
+| `test_exit_code_2_partial_dlq` | Some DLQ records, under threshold → exit 2 | ⛔ Hard gate |
+| `test_exit_code_3_fatal_data` | Error threshold exceeded → exit 3 | ⛔ Hard gate |
+| `test_exit_code_4_io_error` | Missing input file → exit 4 | ⛔ Hard gate |
+| `test_exit_code_130_interrupted` | SIGINT during pipeline → exit 130 | ⛔ Hard gate |
 
 > ⛔ **Hard gate:** Phase 8 exit criteria not met until all tests above pass.
