@@ -1,3 +1,4 @@
+use crate::resolver::FieldResolver;
 use crate::schema::Schema;
 use crate::value::Value;
 use indexmap::IndexMap;
@@ -104,6 +105,20 @@ impl Record {
     /// Total number of fields including overflow.
     pub fn total_field_count(&self) -> usize {
         self.schema.column_count() + self.overflow.as_ref().map_or(0, |m| m.len())
+    }
+}
+
+impl FieldResolver for Record {
+    fn resolve(&self, name: &str) -> Option<Value> {
+        self.get(name).cloned()
+    }
+
+    fn resolve_qualified(&self, _source: &str, field: &str) -> Option<Value> {
+        self.get(field).cloned()
+    }
+
+    fn available_fields(&self) -> Vec<&str> {
+        self.schema().columns().iter().map(|c| &**c).collect()
     }
 }
 
@@ -229,6 +244,30 @@ mod tests {
         record.set_overflow("extra2".into(), Value::Integer(2));
         assert_eq!(record.total_field_count(), 7);
         assert_eq!(record.field_count(), 5);
+    }
+
+    #[test]
+    fn test_record_implements_field_resolver() {
+        use crate::resolver::FieldResolver;
+
+        let schema = Arc::new(Schema::new(vec!["name".into(), "age".into()]));
+        let record = Record::new(
+            schema,
+            vec![Value::String("Ada".into()), Value::Integer(30)],
+        );
+        assert_eq!(record.resolve("name"), Some(Value::String("Ada".into())));
+        assert_eq!(record.resolve("age"), Some(Value::Integer(30)));
+        assert_eq!(record.resolve("unknown"), None);
+
+        // Qualified lookup delegates to unqualified
+        assert_eq!(
+            record.resolve_qualified("any_source", "name"),
+            Some(Value::String("Ada".into()))
+        );
+
+        let mut fields = record.available_fields();
+        fields.sort();
+        assert_eq!(fields, vec!["age", "name"]);
     }
 
     #[test]

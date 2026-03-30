@@ -3,6 +3,7 @@ pub mod counters;
 pub mod minimal;
 pub mod provenance;
 pub mod record;
+pub mod resolver;
 pub mod schema;
 pub mod value;
 
@@ -15,5 +16,6 @@ pub use counters::PipelineCounters;
 pub use minimal::MinimalRecord;
 pub use provenance::RecordProvenance;
 pub use record::Record;
+pub use resolver::{FieldResolver, WindowContext};
 pub use schema::Schema;
 pub use value::Value;
