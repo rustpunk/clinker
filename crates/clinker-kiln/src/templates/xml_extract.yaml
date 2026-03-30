@@ -1,0 +1,28 @@
+_template:
+  name: "XML Extract"
+  description: "Extract XML records to CSV"
+  category: "transform"
+  tags: ["xml", "csv", "extract"]
+  author: "clinker"
+  version: "1.0"
+
+pipeline:
+  name: xml-extract
+
+inputs:
+  - name: source
+    type: xml
+    path: "./data/input.xml"
+    options:
+      record_element: record
+
+transformations:
+  - name: select_fields
+    cxl: |
+      emit id = id
+      emit value = value
+
+outputs:
+  - name: result
+    type: csv
+    path: "./output/extracted.csv"

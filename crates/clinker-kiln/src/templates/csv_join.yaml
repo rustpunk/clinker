@@ -1,0 +1,37 @@
+_template:
+  name: "Multi-Source Join"
+  description: "Join two CSV sources on a shared key"
+  category: "join"
+  tags: ["csv", "join", "lookup"]
+  author: "clinker"
+  version: "1.0"
+  hints:
+    "inputs[0].path": "primary source path"
+    "inputs[1].path": "lookup source path"
+    "transformations[0].cxl": "join key and fields to pull"
+
+pipeline:
+  name: csv-join
+
+inputs:
+  - name: primary
+    type: csv
+    path: "./data/primary.csv"
+    options:
+      has_header: true
+  - name: lookup
+    type: csv
+    path: "./data/lookup.csv"
+    options:
+      has_header: true
+
+transformations:
+  - name: enrich
+    cxl: |
+      lookup_join lookup on key = id
+        pull region_name
+
+outputs:
+  - name: result
+    type: csv
+    path: "./output/joined.csv"
