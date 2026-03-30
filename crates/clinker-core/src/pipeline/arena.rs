@@ -20,6 +20,14 @@ pub struct Arena {
 }
 
 impl Arena {
+    /// Create an empty Arena with the given schema (for sources with no indices).
+    pub fn empty(schema: Arc<Schema>) -> Self {
+        Arena {
+            schema,
+            records: Vec::new(),
+        }
+    }
+
     /// Stream records from reader, storing only the named fields.
     ///
     /// `fields`: field names to project into the Arena (from `IndexSpec.arena_fields`).
@@ -47,8 +55,17 @@ impl Arena {
 
         let mut records = Vec::new();
         let mut bytes_used: usize = 0;
+        let mut records_since_check: u32 = 0;
 
         while let Some(record) = reader.next_record()? {
+            // Check shutdown flag every 4096 records to stay responsive to SIGINT
+            records_since_check += 1;
+            if records_since_check >= 4096 {
+                records_since_check = 0;
+                if super::shutdown::shutdown_requested() {
+                    return Err(ArenaError::ShutdownRequested);
+                }
+            }
             // Project: extract only the requested fields
             let projected_values: Vec<Value> = field_indices
                 .iter()
@@ -133,6 +150,8 @@ pub enum ArenaError {
     MemoryBudgetExceeded { used: usize, limit: usize },
     /// Error reading from the source format reader.
     ReadError(clinker_format::error::FormatError),
+    /// Shutdown was requested during Arena construction (SIGINT/SIGTERM).
+    ShutdownRequested,
 }
 
 impl std::fmt::Display for ArenaError {
@@ -148,6 +167,7 @@ impl std::fmt::Display for ArenaError {
                 )
             }
             ArenaError::ReadError(e) => write!(f, "arena read error: {}", e),
+            ArenaError::ShutdownRequested => write!(f, "arena construction interrupted by shutdown signal"),
         }
     }
 }
