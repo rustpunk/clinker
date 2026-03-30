@@ -15,9 +15,17 @@ pub struct Cli {
     /// Path to the pipeline YAML configuration file
     pub config: PathBuf,
 
+    /// Print execution plan and exit (no data read)
+    #[arg(long)]
+    pub explain: bool,
+
     /// Validate config and CXL without processing data
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Suppress stderr progress output
+    #[arg(long)]
+    pub quiet: bool,
 
     /// Log level: error, warn, info, debug, trace
     #[arg(long, default_value = "info")]
@@ -51,6 +59,13 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<u8, PipelineError> {
     // Load config
     let pipeline_config = config::load_config(&cli.config)?;
+
+    if cli.explain {
+        // Compile execution plan without reading any data
+        let plan_output = PipelineExecutor::explain(&pipeline_config)?;
+        println!("{}", plan_output);
+        return Ok(0);
+    }
 
     if cli.dry_run {
         tracing::info!("Dry run: config valid, {} inputs, {} outputs, {} transforms",

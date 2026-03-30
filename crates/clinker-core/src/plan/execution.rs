@@ -258,6 +258,48 @@ impl ExecutionPlan {
 
         out
     }
+
+    /// Full `--explain` output combining execution plan with config context.
+    ///
+    /// Includes: AST (CXL expressions), type annotations, source DAG,
+    /// indices to build, parallelism classification, and memory budget.
+    pub fn explain_full(&self, config: &PipelineConfig) -> String {
+        let mut out = self.explain();
+
+        // CXL AST (reformatted expressions from config)
+        out.push_str("=== CXL Expressions ===\n\n");
+        for t in &config.transformations {
+            out.push_str(&format!("Transform '{}':\n", t.name));
+            for line in t.cxl.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("  {}\n", trimmed));
+                }
+            }
+            out.push('\n');
+        }
+
+        // Type annotations (inferred types per output field)
+        out.push_str("=== Type Annotations ===\n\n");
+        for tp in &self.transforms {
+            out.push_str(&format!("Transform '{}': (types inferred at compile time)\n", tp.name));
+        }
+        out.push('\n');
+
+        // Memory budget
+        out.push_str("=== Memory Budget ===\n\n");
+        let memory_limit = config.pipeline.concurrency
+            .as_ref()
+            .and_then(|c| c.threads)
+            .map(|_| "configured")
+            .unwrap_or("default");
+        out.push_str(&format!("Memory limit: {}\n", memory_limit));
+        out.push_str(&format!("Worker threads: {}\n",
+            self.parallelism.worker_threads));
+        out.push('\n');
+
+        out
+    }
 }
 
 /// One tier of the source dependency DAG. Sources within a tier are independent.

@@ -6,6 +6,7 @@ pub mod exit_codes;
 mod integration_tests;
 pub mod pipeline;
 pub mod plan;
+pub mod progress;
 pub mod projection;
 
 #[allow(unused_imports)]

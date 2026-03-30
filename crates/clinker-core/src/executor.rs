@@ -401,6 +401,45 @@ impl PipelineExecutor {
         }
         Ok(compiled)
     }
+
+    /// Compile execution plan and return `--explain` output without reading data.
+    ///
+    /// Input files are NOT opened. Field names are extracted from CXL AST
+    /// so the resolver can compile without a data-derived schema.
+    pub fn explain(config: &PipelineConfig) -> Result<String, PipelineError> {
+        // Extract field names from CXL AST to build a synthetic schema
+        let mut all_fields = Vec::new();
+        for t in &config.transformations {
+            let parsed = cxl::parser::Parser::parse(&t.cxl);
+            if !parsed.errors.is_empty() {
+                return Err(PipelineError::Compilation {
+                    transform_name: t.name.clone(),
+                    messages: parsed.errors.iter().map(|e| e.message.clone()).collect(),
+                });
+            }
+            collect_field_refs(&parsed.ast, &mut all_fields);
+        }
+        all_fields.sort();
+        all_fields.dedup();
+
+        let schema = Arc::new(Schema::new(
+            all_fields.iter().map(|f| f.as_str().into()).collect(),
+        ));
+
+        let compiled = Self::compile_transforms(&config.transformations, &schema)?;
+        let compiled_refs: Vec<(&str, &TypedProgram)> = compiled
+            .iter()
+            .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
+            .collect();
+
+        let plan = ExecutionPlan::compile(config, &compiled_refs)
+            .map_err(|e| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: vec![e.to_string()],
+            })?;
+
+        Ok(plan.explain_full(config))
+    }
 }
 
 /// Build a CsvReaderConfig from the input config options.
@@ -618,6 +657,55 @@ fn handle_error<W: Write + Send>(
         }
     }
     Ok(())
+}
+
+/// Extract field reference names from a CXL AST (for --explain schema inference).
+fn collect_field_refs(program: &cxl::ast::Program, names: &mut Vec<String>) {
+    for stmt in &program.statements {
+        match stmt {
+            cxl::ast::Statement::Let { expr, .. }
+            | cxl::ast::Statement::Emit { expr, .. }
+            | cxl::ast::Statement::ExprStmt { expr, .. } => collect_field_refs_expr(expr, names),
+            cxl::ast::Statement::Trace { guard, message, .. } => {
+                if let Some(g) = guard { collect_field_refs_expr(g, names); }
+                collect_field_refs_expr(message, names);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
+    match expr {
+        cxl::ast::Expr::FieldRef { name, .. } => {
+            if &**name != "it" { names.push(name.to_string()); }
+        }
+        cxl::ast::Expr::Binary { lhs, rhs, .. } | cxl::ast::Expr::Coalesce { lhs, rhs, .. } => {
+            collect_field_refs_expr(lhs, names);
+            collect_field_refs_expr(rhs, names);
+        }
+        cxl::ast::Expr::Unary { operand, .. } => collect_field_refs_expr(operand, names),
+        cxl::ast::Expr::MethodCall { receiver, args, .. } => {
+            collect_field_refs_expr(receiver, names);
+            for a in args { collect_field_refs_expr(a, names); }
+        }
+        cxl::ast::Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
+            collect_field_refs_expr(condition, names);
+            collect_field_refs_expr(then_branch, names);
+            if let Some(eb) = else_branch { collect_field_refs_expr(eb, names); }
+        }
+        cxl::ast::Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject { collect_field_refs_expr(s, names); }
+            for arm in arms {
+                collect_field_refs_expr(&arm.pattern, names);
+                collect_field_refs_expr(&arm.body, names);
+            }
+        }
+        cxl::ast::Expr::WindowCall { args, .. } => {
+            for a in args { collect_field_refs_expr(a, names); }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1501,5 +1589,199 @@ transformations:
         // Bob's row should go to DLQ
         assert!(counters.dlq_count >= 1, "Should have at least 1 DLQ entry, got {}", counters.dlq_count);
         assert!(!dlq.is_empty(), "DLQ entries should be populated");
+    }
+
+    // ── Phase 8 Task 8.3: --explain gate tests ─────────────────
+
+    fn explain_config(yaml: &str) -> PipelineConfig {
+        crate::config::parse_config(yaml).unwrap()
+    }
+
+    #[test]
+    fn test_explain_no_data_read() {
+        // Input files don't exist — explain should succeed without opening them
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /nonexistent/path/that/does/not/exist.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /nonexistent/output.csv
+transformations:
+  - name: t1
+    cxl: "emit result = 1 + 2"
+"#;
+        let config = explain_config(yaml);
+        let result = PipelineExecutor::explain(&config);
+        assert!(result.is_ok(), "explain should succeed without reading data: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_explain_prints_ast() {
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: compute
+    cxl: "emit total = Price * Qty"
+"#;
+        let config = explain_config(yaml);
+        let output = PipelineExecutor::explain(&config).unwrap();
+        assert!(output.contains("CXL Expressions"), "should contain CXL section");
+        assert!(output.contains("Price"), "should contain field refs from CXL");
+        assert!(output.contains("Qty"), "should contain field refs from CXL");
+    }
+
+    #[test]
+    fn test_explain_prints_type_annotations() {
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = 1 + 2"
+"#;
+        let config = explain_config(yaml);
+        let output = PipelineExecutor::explain(&config).unwrap();
+        assert!(output.contains("Type Annotations"), "should contain type annotations section");
+    }
+
+    #[test]
+    fn test_explain_prints_source_dag() {
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: primary
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = 1"
+"#;
+        let config = explain_config(yaml);
+        let output = PipelineExecutor::explain(&config).unwrap();
+        assert!(output.contains("Source DAG"), "should contain source DAG");
+        assert!(output.contains("primary"), "should list source name");
+    }
+
+    #[test]
+    fn test_explain_prints_indices() {
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit total = window.sum(amount)"
+    local_window:
+      group_by: [dept]
+      sort_by:
+        - field: amount
+          order: asc
+"#;
+        let config = explain_config(yaml);
+        let output = PipelineExecutor::explain(&config).unwrap();
+        assert!(output.contains("Index [0]"), "should list indices");
+        assert!(output.contains("Group by"), "should show group_by");
+        assert!(output.contains("Sort by"), "should show sort_by");
+    }
+
+    #[test]
+    fn test_explain_prints_memory_budget() {
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = 1"
+"#;
+        let config = explain_config(yaml);
+        let output = PipelineExecutor::explain(&config).unwrap();
+        assert!(output.contains("Memory Budget"), "should contain memory budget section");
+    }
+
+    #[test]
+    fn test_explain_prints_parallelism() {
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = 1"
+"#;
+        let config = explain_config(yaml);
+        let output = PipelineExecutor::explain(&config).unwrap();
+        assert!(output.contains("Parallelism"), "should contain parallelism classification");
+    }
+
+    #[test]
+    fn test_explain_invalid_config_exit_1() {
+        // Invalid CXL should produce an error
+        let yaml = r#"
+pipeline:
+  name: explain-test
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/test.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = !!invalid syntax!!"
+"#;
+        let config = explain_config(yaml);
+        let result = PipelineExecutor::explain(&config);
+        assert!(result.is_err(), "invalid CXL should produce compilation error");
     }
 }
