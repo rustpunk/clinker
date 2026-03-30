@@ -49,6 +49,7 @@ pub fn AppShell() -> Element {
     let mut parse_errors = use_signal(Vec::new);
     let mut edit_source = use_signal(|| EditSource::None);
     let mut selected_stage = use_signal(|| None::<String>);
+    let mut schema_warnings = use_signal(Vec::new);
 
     // ── Session restore (single call on first mount per use_signal) ─────
     // restore_session() is called in the first use_signal closure. The result
@@ -162,6 +163,7 @@ pub fn AppShell() -> Element {
         pipeline,
         parse_errors,
         edit_source,
+        schema_warnings,
     };
 
     let mut app_state_signal = use_signal(|| current_app_state);
@@ -233,6 +235,22 @@ pub fn AppShell() -> Element {
                 let yaml = serialize_yaml(config);
                 yaml_text.set(yaml);
                 parse_errors.set(Vec::new());
+            }
+        });
+    }
+
+    // ── Schema validation: run when pipeline or schema index changes ──────
+    {
+        use_effect(move || {
+            let pl = (pipeline)();
+            let idx = (schema_index)();
+            let ws = (workspace)();
+
+            if let (Some(config), Some(ws)) = (pl.as_ref(), ws.as_ref()) {
+                let warnings = clinker_schema::validate_pipeline(config, &idx, &ws.root);
+                schema_warnings.set(warnings);
+            } else {
+                schema_warnings.set(Vec::new());
             }
         });
     }

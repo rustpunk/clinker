@@ -7,7 +7,7 @@
 /// `TabManagerState` is the global context for tab/file operations.
 
 use clinker_core::config::PipelineConfig;
-use clinker_schema::SchemaIndex;
+use clinker_schema::{SchemaIndex, SchemaWarning};
 use dioxus::prelude::*;
 
 use crate::recent_files::RecentFileEntry;
@@ -76,6 +76,8 @@ pub struct AppState {
     pub parse_errors: Signal<Vec<String>>,
     /// Which view last edited the model (sync loop prevention).
     pub edit_source: Signal<EditSource>,
+    /// Schema validation warnings for the current pipeline.
+    pub schema_warnings: Signal<Vec<SchemaWarning>>,
 }
 
 /// Read the current `AppState` from context.
