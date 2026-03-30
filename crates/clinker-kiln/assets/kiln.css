@@ -306,6 +306,16 @@ html, body {
   background-size: 200px 200px;
 }
 
+/* Transformed viewport div — receives pan/zoom CSS transform.
+   transform-origin: 0 0 so the translation is in screen-space (natural for pan). */
+.kiln-canvas-viewport {
+  position: relative;
+  transform-origin: 0 0;
+  /* will-change: transform tells the compositor to promote this layer for GPU
+     acceleration — keeps pan/zoom smooth at 60fps. */
+  will-change: transform;
+}
+
 /* SVG connector overlay — sits below nodes */
 .kiln-canvas-svg {
   position: absolute;
