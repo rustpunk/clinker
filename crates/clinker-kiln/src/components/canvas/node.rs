@@ -40,8 +40,10 @@ pub fn CanvasNode(stage: DemoStage) -> Element {
                     border-top-color: {accent};",
             // Prevent mousedown from triggering canvas pan.
             onmousedown: move |e: MouseEvent| e.stop_propagation(),
-            // Toggle selection on click.
-            onclick: move |_| {
+            // Toggle selection on click. Must stop propagation so the
+            // canvas panel's deselect-on-click handler doesn't fire.
+            onclick: move |e: MouseEvent| {
+                e.stop_propagation();
                 let mut sel = state.selected_stage;
                 let current = *sel.peek();
                 if current == Some(stage_id) {
