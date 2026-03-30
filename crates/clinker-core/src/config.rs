@@ -103,25 +103,45 @@ pub struct OutputOptions {
     pub root_element: Option<String>,
 }
 
-/// Sort field specification for output ordering.
+/// Sort field specification for output and window partition ordering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SortField {
     pub field: String,
-    #[serde(default = "default_sort_direction")]
-    pub direction: SortDirection,
+    #[serde(default = "default_sort_order")]
+    pub order: SortOrder,
+    /// Null handling during sort. None for output sorting; Some(Last) default for windows.
+    pub null_order: Option<NullOrder>,
 }
 
 /// Sort direction.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SortDirection {
+pub enum SortOrder {
     Asc,
     Desc,
 }
 
-fn default_sort_direction() -> SortDirection {
-    SortDirection::Asc
+fn default_sort_order() -> SortOrder {
+    SortOrder::Asc
+}
+
+/// Null handling in sort operations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NullOrder {
+    /// Nulls sort before all non-null values.
+    First,
+    /// Nulls sort after all non-null values (SQL convention default).
+    Last,
+    /// Remove records with null sort keys from the partition.
+    Drop,
+}
+
+impl Default for NullOrder {
+    fn default() -> Self {
+        NullOrder::Last
+    }
 }
 
 /// Supported format types.
@@ -531,7 +551,7 @@ outputs:
       - temp_field
     sort_order:
       - field: last_name
-        direction: asc
+        order: asc
       - field: first_name
     preserve_nulls: false
     options:
@@ -574,7 +594,7 @@ error_handling:
         assert_eq!(config.outputs[0].mapping.as_ref().unwrap().len(), 2);
         assert_eq!(config.outputs[0].exclude.as_ref().unwrap().len(), 2);
         assert_eq!(config.outputs[0].sort_order.as_ref().unwrap().len(), 2);
-        assert_eq!(config.outputs[0].sort_order.as_ref().unwrap()[0].direction, SortDirection::Asc);
+        assert_eq!(config.outputs[0].sort_order.as_ref().unwrap()[0].order, SortOrder::Asc);
         assert_eq!(config.outputs[0].preserve_nulls, Some(false));
 
         // Transforms

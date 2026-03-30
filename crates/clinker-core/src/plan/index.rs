@@ -139,7 +139,7 @@ fn sort_fields_equal(a: &[SortField], b: &[SortField]) -> bool {
     }
     a.iter()
         .zip(b.iter())
-        .all(|(x, y)| x.field == y.field && x.direction == y.direction)
+        .all(|(x, y)| x.field == y.field && x.order == y.order)
 }
 
 /// Errors from index planning.
