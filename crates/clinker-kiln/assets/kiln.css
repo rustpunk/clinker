@@ -819,13 +819,13 @@ html, body {
   flex-direction: column;
   border-top: 1px solid var(--kiln-border-subtle);
   min-height: 0;
+  /* Accent left border set inline from stage accent colour */
 }
 
-.kiln-inspector-yaml-code {
-  padding: 8px 16px;
-  overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--kiln-border-subtle) transparent;
+/* Scoped YAML code area reuses the sidebar's gutter + code layout */
+.kiln-inspector-yaml-area {
+  flex: 1;
+  min-height: 0;
 }
 
 /* ── 15. Scrollbar theming (WebKit) ─────────────────────────────────────── */
