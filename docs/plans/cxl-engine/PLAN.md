@@ -67,7 +67,7 @@ with spill-to-disk under a configurable memory budget.
 | 5 | Two-Pass Pipeline — Arena, Indexing, Windows | ✅ Complete | 5 | 5 | — |
 | 6 | Parallelism + Memory Management | ✅ Complete | 5 | 5 | Phase 5 |
 | 7 | JSON + XML Readers/Writers | ✅ Complete | 5 | 5 | Phase 4 |
-| 8 | Sort, DLQ Polish, CLI Completion | 🔲 Ready (drilled + validated) | 4 | 0 | Phase 6, 7 |
+| 8 | Sort, DLQ Polish, CLI Completion | ✅ Complete | 4 | 4 | Phase 6, 7 |
 | 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Not Started | 4 | 0 | Phase 7 |
 | 10 | Modules, Logging, Validations, Polish | 🔲 Not Started | 6 | 0 | Phase 9 |
 

@@ -217,11 +217,11 @@ mod tests {
 
 **Description:**
 Implement the CSV writer wrapping the `csv` crate `Writer`. Serializes `Record` fields in
-schema order, followed by overflow fields in deterministic order.
+schema order, followed by overflow fields in emit order (IndexMap insertion order).
 
 **Implementation notes:**
 - Wraps `csv::WriterBuilder`. Configurable via `CsvWriterConfig { delimiter: u8, include_header: bool }`.
-- `write_record()` iterates schema columns by index, calling `record.get(name)` for each. Then appends overflow fields sorted by key name (deterministic output).
+- `write_record()` iterates schema columns by index, calling `record.get(name)` for each. Then appends overflow fields in emit order (IndexMap insertion order). Output order matches input order when no sort steps are configured.
 - Value serialization table (spec-compliant, deterministic):
   - `Null` → `""` (empty string)
   - `Bool` → `"true"` / `"false"` (lowercase, canonical)
@@ -237,7 +237,7 @@ schema order, followed by overflow fields in deterministic order.
 
 **Acceptance criteria:**
 - [ ] Writes CSV matching schema column order
-- [ ] Overflow fields appended in sorted key order
+- [ ] Overflow fields appended in emit order (IndexMap insertion order)
 - [ ] Header row written on first record if configured
 - [ ] Null values serialize as empty string
 - [ ] Round-trip: CSV read → write → read produces identical Records
@@ -250,7 +250,7 @@ schema order, followed by overflow fields in deterministic order.
 | `test_csv_writer_with_header` | First line is header when `include_header: true` | ⛔ Hard gate |
 | `test_csv_writer_no_header` | No header line when `include_header: false` | ⛔ Hard gate |
 | `test_csv_writer_null_as_empty` | `Value::Null` produces empty field between delimiters | ⛔ Hard gate |
-| `test_csv_writer_overflow_fields_sorted` | Overflow fields appear in alphabetical key order after schema fields | ⛔ Hard gate |
+| `test_csv_writer_overflow_fields_emit_order` | Overflow fields appear in emit order (insertion order) after schema fields | ⛔ Hard gate |
 | `test_csv_writer_quoting_special_chars` | Fields containing delimiter/newline are quoted | ⛔ Hard gate |
 | `test_csv_roundtrip_lossless` | Read CSV → write CSV → read CSV → records equal | ⛔ Hard gate |
 
