@@ -11,6 +11,7 @@ clinker-format = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde-saphyr = { workspace = true }
+indexmap = { workspace = true }
 rayon = "1"
 crossbeam-channel = "0.5"
 chrono = { workspace = true }

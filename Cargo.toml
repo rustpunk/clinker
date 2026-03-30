@@ -27,8 +27,9 @@ miette = { version = "7", features = ["fancy"] }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 ahash = "0.8"
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
+static_assertions = "1"
 
 [workspace.metadata.release]
 shared-version = true

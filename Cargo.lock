@@ -277,6 +277,7 @@ dependencies = [
  "ctrlc",
  "cxl",
  "glob",
+ "indexmap",
  "lz4_flex",
  "miette",
  "rayon",
@@ -398,17 +399,22 @@ dependencies = [
  "ahash",
  "chrono",
  "clinker-record",
+ "indexmap",
  "miette",
  "regex",
+ "static_assertions",
+ "tracing",
 ]
 
 [[package]]
 name = "cxl-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "clinker-record",
  "cxl",
+ "indexmap",
  "miette",
  "serde_json",
 ]
@@ -1019,6 +1025,12 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strsim"
