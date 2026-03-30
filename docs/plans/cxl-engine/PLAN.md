@@ -50,7 +50,7 @@ with spill-to-disk under a configurable memory budget.
 | 4 | CSV + Minimal End-to-End Pipeline | ✅ Complete | 5 | 5 | — |
 | 5 | Two-Pass Pipeline — Arena, Indexing, Windows | 🔲 Ready (drilled + validated) | 5 | 0 | — |
 | 6 | Parallelism + Memory Management | ✅ Complete | 5 | 5 | Phase 5 |
-| 7 | JSON + XML Readers/Writers | 🔲 Not Started | 4 | 0 | Phase 4 |
+| 7 | JSON + XML Readers/Writers | 🔲 Ready (drilled + validated) | 5 | 0 | Phase 4 |
 | 8 | Sort, DLQ Polish, CLI Completion | 🔲 Not Started | 4 | 0 | Phase 6, 7 |
 | 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Not Started | 4 | 0 | Phase 7 |
 | 10 | Modules, Logging, Validations, Polish | 🔲 Not Started | 5 | 0 | Phase 9 |

@@ -42,7 +42,7 @@ fn main() -> ExitCode {
                 PipelineError::Config(_) | PipelineError::Compilation { .. } => ExitCode::from(1),
                 PipelineError::Io(_) => ExitCode::from(4),
                 PipelineError::Eval(_) => ExitCode::from(3),
-                PipelineError::Format(_) => ExitCode::from(4),
+                PipelineError::Format(_) | PipelineError::ThreadPool(_) => ExitCode::from(4),
             }
         }
     }
