@@ -60,6 +60,26 @@ html, body {
   user-select: none;
 }
 
+/* Force dark theme on all form elements — prevent white background leaks */
+input, textarea, select, button {
+  background: var(--kiln-char);
+  color: var(--kiln-bone);
+  border-color: var(--kiln-border-medium);
+  font-family: inherit;
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+/* Autofill override — WebKit injects light bg on autofill */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px var(--kiln-char) inset !important;
+  -webkit-text-fill-color: var(--kiln-bone) !important;
+}
+
 /* ── 4. App shell ──────────────────────────────────────────────────────────
    Full-viewport column flex: title bar → main → run log drawer.
    ─────────────────────────────────────────────────────────────────────── */
@@ -1663,9 +1683,11 @@ html, body {
   max-height: 360px;
 }
 
+/* Force all inputs inside palette to dark theme */
+.kiln-palette input,
 .kiln-palette [cmdk-input] {
   width: 100%;
-  background: transparent;
+  background: var(--kiln-char) !important;
   border: none;
   border-bottom: 1px solid var(--kiln-border-medium);
   padding: 12px 16px;
@@ -1675,6 +1697,7 @@ html, body {
   outline: none;
 }
 
+.kiln-palette input::placeholder,
 .kiln-palette [cmdk-input]::placeholder {
   color: var(--kiln-text-floor);
 }
@@ -2844,7 +2867,7 @@ html, body {
 
 .kiln-branch-switcher__search {
   width: 100%;
-  background: transparent;
+  background: var(--kiln-char) !important;
   border: none;
   border-bottom: 1px solid var(--kiln-border-medium);
   padding: 8px 12px;
