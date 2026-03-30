@@ -952,10 +952,37 @@ html, body {
 }
 
 .kiln-yaml-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   font-family: var(--kiln-font-code);
   font-size: 9px;
   line-height: 16px;
   color: var(--kiln-oxide-red);
+}
+
+.kiln-yaml-error-text {
+  flex: 1;
+  user-select: text;
+  cursor: text;
+}
+
+.kiln-yaml-error-copy {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid rgba(183, 65, 14, 0.3);
+  border-radius: 2px;
+  color: var(--kiln-oxide-red);
+  font-size: 11px;
+  padding: 1px 5px;
+  cursor: pointer;
+  transition: border-color 200ms, background 200ms;
+  line-height: 1;
+}
+
+.kiln-yaml-error-copy:hover {
+  border-color: var(--kiln-oxide-red);
+  background: rgba(183, 65, 14, 0.12);
 }
 
 /* Inspector value display (non-editable, like path) */

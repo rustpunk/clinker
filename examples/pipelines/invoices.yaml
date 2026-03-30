@@ -33,4 +33,4 @@ outputs:
     include_unmapped: false
 
 error_handling:
-  strategy: collect_all
+  strategy: continue

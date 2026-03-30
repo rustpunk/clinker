@@ -124,15 +124,37 @@ pub fn YamlSidebar() -> Element {
                 }
             }
 
-            // Parse error bar
+            // Parse error bar — selectable text + copy button
             if !errors.is_empty() {
                 div {
                     class: "kiln-yaml-errors",
                     for (i, err) in errors.iter().enumerate() {
-                        div {
-                            key: "err-{i}",
-                            class: "kiln-yaml-error",
-                            "{err}"
+                        {
+                            let err_text = err.clone();
+                            let err_display = err.clone();
+                            rsx! {
+                                div {
+                                    key: "err-{i}",
+                                    class: "kiln-yaml-error",
+                                    span {
+                                        class: "kiln-yaml-error-text",
+                                        "{err_display}"
+                                    }
+                                    button {
+                                        class: "kiln-yaml-error-copy",
+                                        title: "Copy error to clipboard",
+                                        onclick: move |_| {
+                                            let text = err_text.clone();
+                                            let js = format!(
+                                                "navigator.clipboard.writeText({})",
+                                                serde_json::to_string(&text).unwrap_or_default()
+                                            );
+                                            document::eval(&js);
+                                        },
+                                        "\u{2398}" // COPY icon (⎘)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
