@@ -1,4 +1,5 @@
 pub mod canvas;
+pub mod command_palette;
 pub mod confirm_dialog;
 pub mod inspector;
 pub mod run_log;
@@ -7,6 +8,7 @@ pub mod schematics;
 pub mod search_panel;
 pub mod status_bar;
 pub mod template_gallery;
+pub mod version_mode;
 pub mod tab_bar;
 pub mod title_bar;
 pub mod toast;

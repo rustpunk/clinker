@@ -1616,7 +1616,618 @@ html, body {
   cursor: not-allowed;
 }
 
-/* ── 6e. Status bar ──────────────────────────────────────────────────────
+/* ── 6e. Command palette ─────────────────────────────────────────────────
+   440px centered overlay with fuzzy search. Spec §G4.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 200;
+}
+
+.kiln-palette {
+  position: fixed;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 440px;
+  max-height: 360px;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-strong);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  z-index: 201;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+/* Override cmdk component styles to match rustpunk */
+.kiln-palette [cmdk-root] {
+  display: flex;
+  flex-direction: column;
+  max-height: 360px;
+}
+
+.kiln-palette [cmdk-input] {
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--kiln-border-medium);
+  padding: 12px 16px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-palette [cmdk-input]::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-palette [cmdk-list] {
+  overflow-y: auto;
+  max-height: 300px;
+  padding: 4px 0;
+}
+
+.kiln-palette [cmdk-empty] {
+  padding: 16px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-palette [cmdk-group-heading] {
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 8px 16px 4px;
+}
+
+.kiln-palette [cmdk-item] {
+  padding: 6px 16px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.kiln-palette [cmdk-item]:hover,
+.kiln-palette [cmdk-item][data-selected="true"] {
+  background: var(--kiln-border-strong);
+  border-left-color: var(--kiln-verdigris);
+}
+
+/* Palette item content */
+.kiln-palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.kiln-palette-item__label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+  white-space: nowrap;
+}
+
+.kiln-palette-item__desc {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kiln-palette-item__shortcut {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  color: var(--kiln-iron);
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+/* ── 6f. Version Mode ────────────────────────────────────────────────────
+   Full-viewport git layout. Branch bar, tab bar, file list + content.
+   Spec §G5. ok-green (#7ab648) accent for Version Mode.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-version-mode {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kiln-version-mode--no-repo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.kiln-version-mode__empty {
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  line-height: 1.8;
+}
+
+/* 2px ok-green mode indicator */
+.kiln-version-mode__indicator {
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(122,182,72,0.4), rgba(122,182,72,0.6), rgba(122,182,72,0.4), transparent);
+}
+
+/* Version Mode in layout switcher */
+.kiln-main[data-layout="version"] .kiln-canvas-panel { display: none; }
+.kiln-main[data-layout="version"] .kiln-yaml-sidebar { display: none; }
+.kiln-main[data-layout="version"] .kiln-inspector { display: none; }
+.kiln-main[data-layout="version"] .kiln-schematics { display: none; }
+
+/* Branch bar */
+.kiln-branch-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 16px;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-branch-bar__info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kiln-branch-bar__icon {
+  color: var(--kiln-verdigris);
+  font-size: 12px;
+}
+
+.kiln-branch-bar__name {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+}
+
+.kiln-branch-bar__ahead {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-ok-green);
+}
+
+.kiln-branch-bar__behind {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-hazard);
+}
+
+.kiln-branch-bar__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.kiln-branch-bar__btn {
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 4px 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  color: var(--kiln-iron);
+  cursor: pointer;
+}
+
+.kiln-branch-bar__btn:hover {
+  border-color: var(--kiln-iron);
+  color: var(--kiln-bone);
+}
+
+.kiln-branch-bar__btn--subtle {
+  color: var(--kiln-text-floor);
+}
+
+/* Version tabs */
+.kiln-version-tabs {
+  display: flex;
+  padding: 0 16px;
+  gap: 0;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-version-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 16px;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  transition: all 200ms ease;
+}
+
+.kiln-version-tab:hover {
+  color: var(--kiln-bone);
+}
+
+.kiln-version-tab--active {
+  color: var(--kiln-bone);
+  border-bottom-color: var(--kiln-ok-green);
+}
+
+/* Version content area */
+.kiln-version-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Changes tab */
+.kiln-changes-tab {
+  display: flex;
+  height: 100%;
+}
+
+.kiln-changes-sidebar {
+  flex: 0 0 220px;
+  border-right: 1px solid var(--kiln-border-medium);
+  overflow-y: auto;
+}
+
+.kiln-changes-sidebar__empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-sidebar__section {
+  padding: 8px 0;
+}
+
+.kiln-changes-sidebar__header {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-sidebar__count {
+  font-family: var(--kiln-font-code);
+}
+
+.kiln-changes-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+}
+
+.kiln-changes-file:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-changes-file__status {
+  font-weight: 600;
+  min-width: 12px;
+}
+
+.kiln-changes-file--modified .kiln-changes-file__status { color: var(--kiln-hazard); }
+.kiln-changes-file--added .kiln-changes-file__status { color: var(--kiln-ok-green); }
+.kiln-changes-file--deleted .kiln-changes-file__status { color: var(--kiln-oxide-red); }
+.kiln-changes-file--renamed .kiln-changes-file__status { color: var(--kiln-verdigris); }
+.kiln-changes-file--untracked .kiln-changes-file__status { color: var(--kiln-text-floor); }
+
+.kiln-changes-file__path {
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Commit area */
+.kiln-changes-commit {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.kiln-changes-commit__header {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-commit__input {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  min-height: 48px;
+  max-height: 120px;
+  resize: vertical;
+  outline: none;
+}
+
+.kiln-changes-commit__input:focus {
+  border-color: rgba(67, 179, 174, 0.6);
+}
+
+.kiln-changes-commit__input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-commit__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.kiln-changes-commit__btn {
+  padding: 6px 16px;
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.kiln-changes-commit__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.kiln-changes-commit__btn--commit {
+  background: rgba(67, 179, 174, 0.15);
+  border: 1px solid rgba(67, 179, 174, 0.4);
+  color: var(--kiln-verdigris);
+}
+
+.kiln-changes-commit__btn--commit:hover:not(:disabled) {
+  background: rgba(67, 179, 174, 0.25);
+}
+
+.kiln-changes-commit__btn--push {
+  background: rgba(122, 182, 72, 0.15);
+  border: 1px solid rgba(122, 182, 72, 0.4);
+  color: var(--kiln-ok-green);
+}
+
+.kiln-changes-commit__btn--push:hover:not(:disabled) {
+  background: rgba(122, 182, 72, 0.25);
+}
+
+/* Diff tab */
+.kiln-diff-tab {
+  display: flex;
+  height: 100%;
+}
+
+.kiln-diff-sidebar {
+  flex: 0 0 220px;
+  border-right: 1px solid var(--kiln-border-medium);
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.kiln-diff-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  border-left: 2px solid transparent;
+}
+
+.kiln-diff-file:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-diff-file--active {
+  background: var(--kiln-border-strong);
+  border-left-color: var(--kiln-verdigris);
+}
+
+.kiln-diff-file__status {
+  color: var(--kiln-hazard);
+  font-weight: 600;
+  min-width: 12px;
+}
+
+.kiln-diff-file__path {
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kiln-diff-content {
+  flex: 1;
+  overflow: auto;
+}
+
+.kiln-diff-content__empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-diff-content__unified {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.kiln-diff-line {
+  display: flex;
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.kiln-diff-line__num {
+  color: var(--kiln-text-floor);
+  min-width: 36px;
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+  font-size: 8px;
+}
+
+.kiln-diff-line__text {
+  flex: 1;
+}
+
+.kiln-diff-line--added {
+  background: rgba(122, 182, 72, 0.1);
+}
+
+.kiln-diff-line--added .kiln-diff-line__text {
+  color: var(--kiln-bone);
+}
+
+.kiln-diff-line--removed {
+  background: rgba(183, 65, 14, 0.1);
+}
+
+.kiln-diff-line--removed .kiln-diff-line__text {
+  color: var(--kiln-bone);
+}
+
+.kiln-diff-line--hunk {
+  background: var(--kiln-char-raised);
+}
+
+.kiln-diff-line--hunk .kiln-diff-line__text {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-diff-line--context .kiln-diff-line__text {
+  color: var(--kiln-iron);
+}
+
+/* Log tab */
+.kiln-log-tab {
+  overflow-y: auto;
+  padding: 8px 0;
+  height: 100%;
+}
+
+.kiln-log-tab__empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-log-entry {
+  display: flex;
+  padding: 4px 16px;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.kiln-log-entry:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.kiln-log-entry__graph {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 16px;
+  flex-shrink: 0;
+}
+
+.kiln-log-entry__dot {
+  color: var(--kiln-verdigris);
+  font-size: 8px;
+  line-height: 1;
+}
+
+.kiln-log-entry__line {
+  width: 1.5px;
+  flex: 1;
+  background: rgba(67, 179, 174, 0.4);
+  min-height: 12px;
+}
+
+.kiln-log-entry__info {
+  flex: 1;
+  min-width: 0;
+}
+
+.kiln-log-entry__header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.kiln-log-entry__hash {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  color: var(--kiln-verdigris);
+  flex-shrink: 0;
+}
+
+.kiln-log-entry__subject {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kiln-log-entry__meta {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+}
+
+.kiln-log-entry__author {
+  color: var(--kiln-iron);
+}
+
+.kiln-log-entry__time {
+  color: var(--kiln-text-floor);
+}
+
+/* ── 6g. Status bar ──────────────────────────────────────────────────────
    22px bottom bar with git branch, changes, cursor, encoding, language.
    Git segments hidden when no repo detected. Spec §G3.
    ─────────────────────────────────────────────────────────────────────── */

@@ -454,6 +454,7 @@ pub fn parse_layout_preset(s: &str) -> LayoutPreset {
         "hybrid" => LayoutPreset::Hybrid,
         "editor-focus" => LayoutPreset::EditorFocus,
         "schematics" => LayoutPreset::Schematics,
+        "version" => LayoutPreset::Version,
         _ => LayoutPreset::Hybrid,
     }
 }

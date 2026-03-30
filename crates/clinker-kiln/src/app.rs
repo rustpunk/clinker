@@ -17,11 +17,13 @@ use crate::components::{
     run_log::RunLogDrawer,
     schema_panel::SchemaPanel,
     schematics::SchematicsPanel,
+    command_palette::CommandPalette,
     search_panel::SearchPanel,
     status_bar::StatusBar,
     tab_bar::TabBar,
     template_gallery::TemplateGallery,
     title_bar::TitleBar,
+    version_mode::VersionMode,
     toast::ToastOverlay,
     welcome_screen::WelcomeScreen,
     yaml_sidebar::YamlSidebar,
@@ -82,6 +84,7 @@ pub fn AppShell() -> Element {
     let mut schema_index: Signal<SchemaIndex> = use_signal(SchemaIndex::default);
     let show_template_gallery: Signal<bool> = use_signal(|| false);
     let mut git_state: Signal<Option<clinker_git::RepoStatus>> = use_signal(|| None);
+    let show_command_palette: Signal<bool> = use_signal(|| false);
 
     // ── Git: detect repo and compute status on workspace change ──────────
     {
@@ -202,6 +205,7 @@ pub fn AppShell() -> Element {
         schema_index,
         show_template_gallery,
         git_state,
+        show_command_palette,
     });
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
@@ -216,6 +220,7 @@ pub fn AppShell() -> Element {
         schema_index,
         show_template_gallery,
         git_state,
+        show_command_palette,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
@@ -338,6 +343,11 @@ pub fn AppShell() -> Element {
                 TemplateGallery {}
             }
 
+            // ── Command palette overlay ─────────────────────────────────
+            if (show_command_palette)() {
+                CommandPalette {}
+            }
+
             if let Some(pending) = (pending_confirm)() {
                 ConfirmDialog {
                     pending: pending.clone(),
@@ -377,33 +387,39 @@ fn ActiveTabContent() -> Element {
     let mut tab_mgr = use_context::<TabManagerState>();
     let left_panel = (tab_mgr.left_panel)();
 
+    let is_version = *layout.read() == LayoutPreset::Version;
+
     rsx! {
         div {
             class: "kiln-main",
             "data-layout": layout.read().as_data_attr(),
 
-            // ── Left panel slot (280px, shared between Search and Schemas) ──
-            match left_panel {
-                LeftPanel::Search => rsx! {
-                    SearchPanel {}
-                },
-                LeftPanel::Schemas => rsx! {
-                    SchemaPanel {}
-                },
-                LeftPanel::None => rsx! {},
-            }
-
-            CanvasPanel {}
-
-            if let Some(ref stage_id) = (selected_stage)() {
-                InspectorPanel {
-                    key: "{stage_id}",
-                    stage_id: stage_id.clone(),
+            if is_version {
+                VersionMode {}
+            } else {
+                // ── Left panel slot (280px, shared between Search and Schemas) ──
+                match left_panel {
+                    LeftPanel::Search => rsx! {
+                        SearchPanel {}
+                    },
+                    LeftPanel::Schemas => rsx! {
+                        SchemaPanel {}
+                    },
+                    LeftPanel::None => rsx! {},
                 }
-            }
 
-            YamlSidebar {}
-            SchematicsPanel {}
+                CanvasPanel {}
+
+                if let Some(ref stage_id) = (selected_stage)() {
+                    InspectorPanel {
+                        key: "{stage_id}",
+                        stage_id: stage_id.clone(),
+                    }
+                }
+
+                YamlSidebar {}
+                SchematicsPanel {}
+            }
         }
     }
 }

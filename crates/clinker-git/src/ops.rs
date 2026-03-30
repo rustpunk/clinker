@@ -50,4 +50,30 @@ pub trait GitOps: Send + Sync {
 
     /// Get blame for a file.
     fn blame(&self, path: &Path) -> Result<Vec<BlameLine>, GitError>;
+
+    // ── Write operations ────────────────────────────────────────────
+
+    /// Stage files for commit.
+    fn stage(&self, paths: &[&Path]) -> Result<(), GitError>;
+
+    /// Unstage files.
+    fn unstage(&self, paths: &[&Path]) -> Result<(), GitError>;
+
+    /// Commit staged changes.
+    fn commit(&self, message: &str) -> Result<CommitInfo, GitError>;
+
+    /// Push to remote.
+    fn push(&self) -> Result<String, GitError>;
+
+    /// Pull from remote.
+    fn pull(&self) -> Result<String, GitError>;
+
+    /// Fetch from remote.
+    fn fetch(&self) -> Result<String, GitError>;
+
+    /// Get diff for a specific file.
+    fn diff_file(&self, path: &Path) -> Result<String, GitError>;
+
+    /// Stage all changed files.
+    fn stage_all(&self) -> Result<(), GitError>;
 }

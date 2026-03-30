@@ -35,6 +35,7 @@ pub enum LayoutPreset {
     Hybrid,
     EditorFocus,
     Schematics,
+    Version,
 }
 
 impl LayoutPreset {
@@ -44,6 +45,7 @@ impl LayoutPreset {
             LayoutPreset::Hybrid => "hybrid",
             LayoutPreset::EditorFocus => "editor-focus",
             LayoutPreset::Schematics => "schematics",
+            LayoutPreset::Version => "version",
         }
     }
 
@@ -53,6 +55,7 @@ impl LayoutPreset {
             LayoutPreset::Hybrid => "Hybrid",
             LayoutPreset::EditorFocus => "Editor",
             LayoutPreset::Schematics => "Schematic",
+            LayoutPreset::Version => "Version",
         }
     }
 }
@@ -106,4 +109,6 @@ pub struct TabManagerState {
     pub show_template_gallery: Signal<bool>,
     /// Git repository status — branch, ahead/behind, file changes.
     pub git_state: Signal<Option<RepoStatus>>,
+    /// Whether the command palette overlay is visible.
+    pub show_command_palette: Signal<bool>,
 }

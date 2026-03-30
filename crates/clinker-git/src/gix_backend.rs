@@ -168,6 +168,55 @@ impl GitOps for GitCliOps {
         Ok(commits)
     }
 
+    fn stage(&self, paths: &[&Path]) -> Result<(), GitError> {
+        let mut args = vec!["add", "--"];
+        let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        for p in &path_strs {
+            args.push(p);
+        }
+        self.git(&args)?;
+        Ok(())
+    }
+
+    fn unstage(&self, paths: &[&Path]) -> Result<(), GitError> {
+        let mut args = vec!["restore", "--staged", "--"];
+        let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        for p in &path_strs {
+            args.push(p);
+        }
+        self.git(&args)?;
+        Ok(())
+    }
+
+    fn commit(&self, message: &str) -> Result<CommitInfo, GitError> {
+        self.git(&["commit", "-m", message])?;
+        // Get the just-created commit info
+        let log = self.log(1)?;
+        log.into_iter().next().ok_or_else(|| GitError::Operation("commit created but log empty".to_string()))
+    }
+
+    fn push(&self) -> Result<String, GitError> {
+        self.git(&["push"])
+    }
+
+    fn pull(&self) -> Result<String, GitError> {
+        self.git(&["pull"])
+    }
+
+    fn fetch(&self) -> Result<String, GitError> {
+        self.git(&["fetch"])
+    }
+
+    fn diff_file(&self, path: &Path) -> Result<String, GitError> {
+        let path_str = path.to_string_lossy();
+        self.git(&["diff", "--", &path_str])
+    }
+
+    fn stage_all(&self) -> Result<(), GitError> {
+        self.git(&["add", "-A"])?;
+        Ok(())
+    }
+
     fn blame(&self, path: &Path) -> Result<Vec<BlameLine>, GitError> {
         let path_str = path.to_string_lossy();
         let output = self.git(&[

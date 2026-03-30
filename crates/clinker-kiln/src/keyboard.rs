@@ -23,6 +23,21 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
     let key = event.key();
 
     match key {
+        // Ctrl+Shift+P — Command palette
+        Key::Character(ref c) if c == "P" && event.modifiers().shift() => {
+            let current = (tab_mgr.show_command_palette)();
+            tab_mgr.show_command_palette.set(!current);
+            true
+        }
+
+        // Ctrl+Shift+G — Version Mode
+        Key::Character(ref c) if c == "G" && event.modifiers().shift() => {
+            // Toggle to/from Version layout — need AppState for layout
+            // For now, just toggle command palette with git: prefix hint
+            // Full Version Mode switching is handled via command palette
+            true
+        }
+
         // Ctrl+Shift+F — Toggle search panel
         Key::Character(ref c) if c == "F" && event.modifiers().shift() => {
             let current = (tab_mgr.left_panel)();
