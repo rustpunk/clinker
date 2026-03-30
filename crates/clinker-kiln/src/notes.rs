@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Parsed notes for a single stage.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StageNotes {
     /// Freeform markdown note about the stage.
     pub stage_note: String,

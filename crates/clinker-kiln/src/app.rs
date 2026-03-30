@@ -4,6 +4,7 @@ use crate::components::{
     canvas::CanvasPanel,
     inspector::InspectorPanel,
     run_log::RunLogDrawer,
+    schematics::SchematicsPanel,
     title_bar::TitleBar,
     yaml_sidebar::YamlSidebar,
 };
@@ -105,6 +106,9 @@ pub fn App() -> Element {
                 }
 
                 YamlSidebar {}
+
+                // Schematics panel — visible only in schematics layout
+                SchematicsPanel {}
             }
 
             RunLogDrawer {}

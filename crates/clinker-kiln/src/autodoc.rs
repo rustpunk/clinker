@@ -6,7 +6,7 @@
 use clinker_core::config::{PipelineConfig, TransformConfig};
 
 /// Structural documentation for a single pipeline stage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StageDoc {
     /// Auto-generated description of what this stage does.
     pub description: String,

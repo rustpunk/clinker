@@ -253,9 +253,18 @@ html, body {
   display: flex;
 }
 
-/* Hide inspector in canvas-focus and editor-focus layouts */
+/* Hide inspector in canvas-focus, editor-focus, and schematics layouts */
 .kiln-main[data-layout="canvas-focus"] .kiln-inspector { display: none; }
 .kiln-main[data-layout="editor-focus"] .kiln-inspector { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-inspector { display: none; }
+
+/* Schematics layout — hide canvas + yaml, show schematics panel */
+.kiln-main[data-layout="schematics"] .kiln-canvas-panel { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-yaml-sidebar { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-schematics { display: flex; flex: 1; }
+
+/* Default: schematics hidden */
+.kiln-schematics { display: none; }
 
 /* ── 7. Canvas panel ───────────────────────────────────────────────────────
    Infinite world-space viewport. Phase 3 adds CSS transform for pan/zoom.
@@ -1308,7 +1317,331 @@ html, body {
   color: var(--kiln-iron);
 }
 
-/* ── 20. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+/* ── 20. Schematics layout ─────────────────────────────────────────────────
+   Full-pipeline documentation view with Blueprint sub-aesthetic.
+   Spec §A7.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-schematics {
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--kiln-char);
+}
+
+.kiln-schematics-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  font-style: italic;
+}
+
+/* 2px verdigris mode indicator */
+.kiln-schematics-indicator {
+  height: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(67, 179, 174, 0.4) 20%,
+    rgba(67, 179, 174, 0.6) 50%,
+    rgba(67, 179, 174, 0.4) 80%,
+    transparent
+  );
+}
+
+/* ── Flow bar ── */
+.kiln-flow-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 40px;
+  flex-shrink: 0;
+  padding: 0 16px;
+  background: var(--kiln-char-surface);
+  border-bottom: 1px solid rgba(67, 179, 174, 0.15);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+.kiln-flow-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--kiln-border-subtle);
+  border-top-width: 2px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.kiln-flow-pill-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  letter-spacing: 0.02em;
+}
+
+.kiln-flow-pill-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 7px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.kiln-flow-connector {
+  flex-shrink: 0;
+  margin: 0 4px;
+}
+
+/* ── Scrollable content area with Blueprint gridlines ── */
+.kiln-schematics-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 32px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(67, 179, 174, 0.03) 0px,
+      rgba(67, 179, 174, 0.03) 1px,
+      transparent 1px,
+      transparent 16px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(67, 179, 174, 0.03) 0px,
+      rgba(67, 179, 174, 0.03) 1px,
+      transparent 1px,
+      transparent 16px
+    );
+  background-color: var(--kiln-char);
+}
+
+/* Summary section */
+.kiln-schematics-summary {
+  margin-bottom: 24px;
+}
+
+.kiln-schematics-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.kiln-schematics-diamond {
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+}
+
+.kiln-schematics-section-title {
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+}
+
+.kiln-schematics-section-rule {
+  flex: 1;
+  height: 1px;
+  background: rgba(67, 179, 174, 0.25);
+}
+
+.kiln-schematics-summary-text {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+
+/* ── Stage detail cards ── */
+.kiln-stage-card {
+  background: var(--kiln-char-surface);
+  border: 1px solid rgba(67, 179, 174, 0.15);
+  border-left: 3px solid var(--kiln-verdigris);
+  border-radius: 2px;
+  padding: 14px 16px;
+  margin-bottom: 0;
+}
+
+.kiln-stage-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.kiln-stage-card-index {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+}
+
+.kiln-stage-card-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-stage-card-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 7px;
+  border: 1px solid;
+  border-radius: 2px;
+}
+
+.kiln-stage-card-rule {
+  border: none;
+  height: 1px;
+  background: rgba(67, 179, 174, 0.3);
+  margin: 6px 0 10px;
+}
+
+.kiln-stage-card-description {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-iron);
+  margin-bottom: 8px;
+}
+
+/* User-authored note in stage card */
+.kiln-stage-card-note {
+  margin-bottom: 8px;
+}
+
+.kiln-stage-card-note-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 3px;
+}
+
+.kiln-stage-card-note-block {
+  background: var(--kiln-char-raised);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  padding: 6px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-bone);
+  white-space: pre-wrap;
+}
+
+/* Metadata grid */
+.kiln-stage-card-metadata {
+  margin-bottom: 8px;
+}
+
+.kiln-stage-card-meta-row {
+  display: flex;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-stage-card-meta-row:last-child {
+  border-bottom: none;
+}
+
+.kiln-stage-card-meta-key {
+  flex: 0 0 110px;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-stage-card-meta-value {
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+}
+
+/* Column change tags */
+.kiln-stage-card-columns {
+  margin-top: 6px;
+}
+
+.kiln-stage-card-columns-heading {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+  margin-bottom: 4px;
+}
+
+.kiln-stage-card-column-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-stage-card-column-tag {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.12);
+  border: 1px solid rgba(67, 179, 174, 0.25);
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+/* Flow arrows between stage cards */
+.kiln-schematics-arrow {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
+}
+
+/* Footer */
+.kiln-schematics-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 32px;
+  padding-bottom: 16px;
+}
+
+.kiln-schematics-footer-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(67, 179, 174, 0.3), transparent);
+}
+
+.kiln-schematics-footer-label {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--kiln-iron);
+  white-space: nowrap;
+}
+
+/* ── 21. Scrollbar theming (WebKit) ─────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {

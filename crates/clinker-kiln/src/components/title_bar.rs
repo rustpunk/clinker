@@ -54,7 +54,7 @@ pub fn TitleBar() -> Element {
                 // Prevent window drag from triggering on the switcher area.
                 onmousedown: move |e| e.stop_propagation(),
 
-                for preset in [LayoutPreset::CanvasFocus, LayoutPreset::Hybrid, LayoutPreset::EditorFocus] {
+                for preset in [LayoutPreset::CanvasFocus, LayoutPreset::Hybrid, LayoutPreset::EditorFocus, LayoutPreset::Schematics] {
                     button {
                         key: "{preset.label()}",
                         class: "kiln-layout-btn",

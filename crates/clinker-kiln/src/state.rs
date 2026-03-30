@@ -9,6 +9,7 @@ pub enum LayoutPreset {
     CanvasFocus,
     Hybrid,
     EditorFocus,
+    Schematics,
 }
 
 impl LayoutPreset {
@@ -17,6 +18,7 @@ impl LayoutPreset {
             LayoutPreset::CanvasFocus => "canvas-focus",
             LayoutPreset::Hybrid => "hybrid",
             LayoutPreset::EditorFocus => "editor-focus",
+            LayoutPreset::Schematics => "schematics",
         }
     }
 
@@ -25,6 +27,7 @@ impl LayoutPreset {
             LayoutPreset::CanvasFocus => "Canvas",
             LayoutPreset::Hybrid => "Hybrid",
             LayoutPreset::EditorFocus => "Editor",
+            LayoutPreset::Schematics => "Schematic",
         }
     }
 }
