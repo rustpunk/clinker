@@ -49,13 +49,6 @@ impl<W: Write> CsvWriter<W> {
 
 impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // Collect overflow field names sorted alphabetically
-        let mut overflow_keys: Vec<&str> = record
-            .overflow_fields()
-            .map(|iter| iter.map(|(k, _)| k).collect())
-            .unwrap_or_default();
-        overflow_keys.sort_unstable();
-
         // Write header on first record
         if self.config.include_header && !self.header_written {
             let mut header: Vec<&str> = self
@@ -64,12 +57,15 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
                 .iter()
                 .map(|c| c.as_ref())
                 .collect();
-            header.extend(overflow_keys.iter().copied());
+            // Overflow fields in emit order (IndexMap insertion order)
+            if let Some(overflow) = record.overflow_fields() {
+                header.extend(overflow.map(|(k, _)| k));
+            }
             self.inner.write_record(&header)?;
             self.header_written = true;
         }
 
-        // Write schema fields in order
+        // Schema fields in schema order
         let mut fields: Vec<String> = self
             .schema
             .columns()
@@ -82,13 +78,11 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             })
             .collect();
 
-        // Append overflow fields in sorted key order
-        for key in &overflow_keys {
-            let cell = record
-                .get(key)
-                .map(value_to_csv_cell)
-                .unwrap_or_default();
-            fields.push(cell);
+        // Overflow fields in emit order (IndexMap insertion order)
+        if let Some(overflow) = record.overflow_fields() {
+            for (_, value) in overflow {
+                fields.push(value_to_csv_cell(value));
+            }
         }
 
         self.inner.write_record(&fields)?;
@@ -190,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_csv_writer_overflow_fields_sorted() {
+    fn test_csv_writer_overflow_fields_emit_order() {
         let schema = make_schema(&["id"]);
         let mut record = make_record(&schema, vec![Value::Integer(1)]);
         record.set_overflow("zulu".into(), Value::String("z".into()));
@@ -198,8 +192,8 @@ mod tests {
         record.set_overflow("mike".into(), Value::String("m".into()));
 
         let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
-        // Schema field first, then overflow in alphabetical order
-        assert_eq!(output, "id,alpha,mike,zulu\n1,a,m,z\n");
+        // Schema field first, then overflow in emit order (insertion order)
+        assert_eq!(output, "id,zulu,alpha,mike\n1,z,a,m\n");
     }
 
     #[test]
