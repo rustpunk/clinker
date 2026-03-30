@@ -9,8 +9,11 @@ use crate::state::TabManagerState;
 
 use super::branch_bar::BranchBar;
 use super::changes_tab::ChangesTab;
+use super::conflicts_tab::ConflictsTab;
 use super::diff_tab::DiffTab;
 use super::log_tab::LogTab;
+use super::pr_pane::PrPane;
+use super::stash_tab::StashTab;
 
 /// Active sub-tab within Version Mode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -19,6 +22,8 @@ pub enum VersionTab {
     Changes,
     Diff,
     Log,
+    Stash,
+    Conflicts,
 }
 
 impl VersionTab {
@@ -27,18 +32,28 @@ impl VersionTab {
             Self::Changes => "Changes",
             Self::Diff => "Diff",
             Self::Log => "Log",
+            Self::Stash => "Stash",
+            Self::Conflicts => "Conflicts",
         }
     }
 }
 
-const VERSION_TABS: [VersionTab; 3] = [VersionTab::Changes, VersionTab::Diff, VersionTab::Log];
+const VERSION_TABS: [VersionTab; 5] = [
+    VersionTab::Changes,
+    VersionTab::Diff,
+    VersionTab::Log,
+    VersionTab::Stash,
+    VersionTab::Conflicts,
+];
 
 /// Version Mode root component.
 #[component]
 pub fn VersionMode() -> Element {
     let tab_mgr = use_context::<TabManagerState>();
     let mut active_tab = use_signal(|| VersionTab::Changes);
+    let mut show_pr = use_signal(|| false);
     let current_tab = (active_tab)();
+    let is_pr_open = (show_pr)();
 
     let git = (tab_mgr.git_state)();
 
@@ -60,29 +75,44 @@ pub fn VersionMode() -> Element {
             div { class: "kiln-version-mode__indicator" }
 
             // ── Branch bar ──────────────────────────────────────────
-            BranchBar {}
-
-            // ── Tab bar ─────────────────────────────────────────────
-            div { class: "kiln-version-tabs",
-                for tab in VERSION_TABS {
-                    button {
-                        class: if current_tab == tab {
-                            "kiln-version-tab kiln-version-tab--active"
-                        } else {
-                            "kiln-version-tab"
-                        },
-                        onclick: move |_| active_tab.set(tab),
-                        "{tab.label()}"
-                    }
+            div { class: "kiln-version-mode__branch-row",
+                BranchBar {}
+                button {
+                    class: "kiln-branch-bar__btn kiln-branch-bar__btn--pr",
+                    onclick: move |_| show_pr.set(true),
+                    "⊕ Create PR"
                 }
             }
 
-            // ── Content area ────────────────────────────────────────
-            div { class: "kiln-version-content",
-                match current_tab {
-                    VersionTab::Changes => rsx! { ChangesTab {} },
-                    VersionTab::Diff => rsx! { DiffTab {} },
-                    VersionTab::Log => rsx! { LogTab {} },
+            if is_pr_open {
+                PrPane {
+                    on_close: move |_| show_pr.set(false),
+                }
+            } else {
+                // ── Tab bar ─────────────────────────────────────────
+                div { class: "kiln-version-tabs",
+                    for tab in VERSION_TABS {
+                        button {
+                            class: if current_tab == tab {
+                                "kiln-version-tab kiln-version-tab--active"
+                            } else {
+                                "kiln-version-tab"
+                            },
+                            onclick: move |_| active_tab.set(tab),
+                            "{tab.label()}"
+                        }
+                    }
+                }
+
+                // ── Content area ────────────────────────────────────
+                div { class: "kiln-version-content",
+                    match current_tab {
+                        VersionTab::Changes => rsx! { ChangesTab {} },
+                        VersionTab::Diff => rsx! { DiffTab {} },
+                        VersionTab::Log => rsx! { LogTab {} },
+                        VersionTab::Stash => rsx! { StashTab {} },
+                        VersionTab::Conflicts => rsx! { ConflictsTab {} },
+                    }
                 }
             }
         }
