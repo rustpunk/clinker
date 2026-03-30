@@ -9,6 +9,7 @@ members = [
     "crates/clinker-channel",
     "crates/clinker",
     "crates/clinker-kiln",
+    "crates/clinker-schema",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ cxl = { path = "crates/cxl" }
 clinker-format = { path = "crates/clinker-format" }
 clinker-core = { path = "crates/clinker-core" }
 clinker-channel = { path = "crates/clinker-channel" }
+clinker-schema = { path = "crates/clinker-schema" }
 
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
