@@ -142,64 +142,64 @@
 
 | Task | Test | Status | Run | Commit |
 |------|------|--------|-----|--------|
-| 8.1 | `test_sort_single_field_asc` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_single_field_desc` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_compound_keys` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_nulls_first` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_nulls_last` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_stable_equal_keys` | ⛔ Not run | -- | -- |
-| 8.1 | `test_loser_tree_2way_merge` | ⛔ Not run | -- | -- |
-| 8.1 | `test_loser_tree_16way_merge` | ⛔ Not run | -- | -- |
-| 8.1 | `test_loser_tree_single_stream` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_spill_triggers_on_budget` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_cascade_merge` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_spill_cleanup` | ⛔ Not run | -- | -- |
-| 8.1 | `test_sort_in_memory_path` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_all_columns_present` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_uuid_v7_time_ordered` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_uuid_v7_unique` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_error_category_missing_required` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_error_category_type_coercion` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_error_category_nan` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_error_category_validation` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_error_category_aggregate` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_error_category_required_conversion` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_include_reason_false` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_include_source_row_false` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_source_fields_schema_order` | ⛔ Not run | -- | -- |
-| 8.2 | `test_dlq_timestamp_iso8601` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_no_data_read` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_prints_ast` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_prints_type_annotations` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_prints_source_dag` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_prints_indices` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_prints_memory_budget` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_prints_parallelism` | ⛔ Not run | -- | -- |
-| 8.3 | `test_explain_invalid_config_exit_1` | ⛔ Not run | -- | -- |
-| 8.3 | `test_progress_throttle_1sec` | ⛔ Not run | -- | -- |
-| 8.3 | `test_progress_format_with_total` | ⛔ Not run | -- | -- |
-| 8.3 | `test_progress_format_without_total` | ⛔ Not run | -- | -- |
-| 8.3 | `test_quiet_suppresses_progress` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_memory_limit_suffix_k` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_memory_limit_suffix_m` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_memory_limit_suffix_g` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_memory_limit_bare_bytes` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_default_memory_limit` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_error_threshold_zero` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_batch_id_default_uuid` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_quiet_flag` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cli_force_flag` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cxl_check_valid` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cxl_check_invalid` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cxl_eval_simple_expr` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cxl_eval_with_fields` | ⛔ Not run | -- | -- |
-| 8.4 | `test_cxl_fmt_canonical` | ⛔ Not run | -- | -- |
-| 8.4 | `test_exit_code_0_success` | ⛔ Not run | -- | -- |
-| 8.4 | `test_exit_code_1_compile_error` | ⛔ Not run | -- | -- |
-| 8.4 | `test_exit_code_2_partial_dlq` | ⛔ Not run | -- | -- |
-| 8.4 | `test_exit_code_3_fatal_data` | ⛔ Not run | -- | -- |
-| 8.4 | `test_exit_code_4_io_error` | ⛔ Not run | -- | -- |
-| 8.4 | `test_exit_code_130_interrupted` | ⛔ Not run | -- | -- |
+| 8.1 | `test_sort_single_field_asc` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_single_field_desc` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_compound_keys` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_nulls_first` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_nulls_last` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_stable_equal_keys` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_loser_tree_2way_merge` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_loser_tree_16way_merge` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_loser_tree_single_stream` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_spill_triggers_on_budget` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_cascade_merge` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_spill_cleanup` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.1 | `test_sort_in_memory_path` | ✅ Passed | 2026-03-30 | 96b2c3b |
+| 8.2 | `test_dlq_all_columns_present` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_uuid_v7_time_ordered` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_uuid_v7_unique` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_error_category_missing_required` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_error_category_type_coercion` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_error_category_nan` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_error_category_validation` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_error_category_aggregate` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_error_category_required_conversion` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_include_reason_false` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_include_source_row_false` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_source_fields_schema_order` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.2 | `test_dlq_timestamp_iso8601` | ✅ Passed | 2026-03-30 | 73dfdf7 |
+| 8.3 | `test_explain_no_data_read` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_prints_ast` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_prints_type_annotations` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_prints_source_dag` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_prints_indices` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_prints_memory_budget` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_prints_parallelism` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_explain_invalid_config_exit_1` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_progress_throttle_1sec` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_progress_format_with_total` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_progress_format_without_total` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.3 | `test_quiet_suppresses_progress` | ✅ Passed | 2026-03-30 | a95e61f |
+| 8.4 | `test_cli_memory_limit_suffix_k` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_memory_limit_suffix_m` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_memory_limit_suffix_g` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_memory_limit_bare_bytes` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_default_memory_limit` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_error_threshold_zero` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_batch_id_default_uuid` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_quiet_flag` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cli_force_flag` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cxl_check_valid` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cxl_check_invalid` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cxl_eval_simple_expr` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cxl_eval_with_fields` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_cxl_fmt_canonical` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_exit_code_0_success` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_exit_code_1_compile_error` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_exit_code_2_partial_dlq` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_exit_code_3_fatal_data` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_exit_code_4_io_error` | ✅ Passed | 2026-03-30 | bf08550 |
+| 8.4 | `test_exit_code_130_interrupted` | ✅ Passed | 2026-03-30 | bf08550 |
 
 ---
 
