@@ -48,12 +48,9 @@ pub fn AppShell() -> Element {
     let inspector_width = use_signal(|| 340.0_f32);
 
     // ── Tab management ───────────────────────────────────────────────────
-    let tabs = use_signal(|| {
-        vec![TabEntry::new_demo(DEFAULT_YAML)]
-    });
-    let active_tab_id = use_signal(|| {
-        Some(tabs.peek().first().map(|t| t.id).unwrap_or_else(TabId::new))
-    });
+    // Start with no tabs — the welcome screen provides Open/New buttons.
+    let tabs: Signal<Vec<TabEntry>> = use_signal(Vec::new);
+    let active_tab_id: Signal<Option<TabId>> = use_signal(|| None);
     let recent_files = use_signal(load_recent_files);
     let workspace = use_signal(|| None);
 

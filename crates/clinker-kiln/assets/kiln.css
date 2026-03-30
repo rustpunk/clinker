@@ -130,6 +130,35 @@ html, body {
   background: var(--kiln-border-medium);
 }
 
+/* File action buttons (New, Open, Save) in title bar */
+.kiln-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-file-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: color 200ms, border-color 200ms, background 200ms;
+}
+
+.kiln-file-btn:hover {
+  color: var(--kiln-bone);
+  border-color: var(--kiln-border-medium);
+  background: var(--kiln-char-surface);
+}
+
 /* Workspace name in title bar (§F5.1) */
 .kiln-title-workspace {
   font-family: var(--kiln-font-ui);
