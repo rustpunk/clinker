@@ -2,17 +2,25 @@
 //!
 //! Shows: branch + sync state, file change counts, cursor position,
 //! encoding, language, git engine. Git segments hidden when no repo.
+//! Branch segment is clickable → opens branch switcher dropdown.
+//! Changes segment clickable → switches to Version Mode.
 //! Spec: clinker-kiln-git-addendum.md §G3.
 
 use dioxus::prelude::*;
 
-use crate::state::TabManagerState;
+use clinker_git::GitOps;
+
+use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::state::{LayoutPreset, TabManagerState, use_app_state};
 
 /// Status bar component — anchored to viewport bottom.
 #[component]
 pub fn StatusBar() -> Element {
-    let tab_mgr = use_context::<TabManagerState>();
+    let mut tab_mgr = use_context::<TabManagerState>();
+    let state = use_app_state();
     let git = (tab_mgr.git_state)();
+    let mut show_branch_switcher = use_signal(|| false);
+    let is_switcher_open = (show_branch_switcher)();
 
     rsx! {
         div {
@@ -20,9 +28,10 @@ pub fn StatusBar() -> Element {
 
             // ── Git segments (hidden when no repo) ──────────────────────
             if let Some(ref status) = git {
-                // Branch segment
+                // Branch segment (clickable → branch switcher)
                 div {
-                    class: "kiln-status-segment kiln-status-segment--branch",
+                    class: "kiln-status-segment kiln-status-segment--branch kiln-status-segment--clickable",
+                    onclick: move |_| show_branch_switcher.set(!is_switcher_open),
                     span { class: "kiln-status__branch-icon", "⑂" }
                     span { class: "kiln-status__branch-name",
                         {
@@ -43,10 +52,14 @@ pub fn StatusBar() -> Element {
 
                 div { class: "kiln-status-divider" }
 
-                // Changes segment
+                // Changes segment (clickable → Version Mode)
                 if status.has_changes() {
                     div {
-                        class: "kiln-status-segment kiln-status-segment--changes",
+                        class: "kiln-status-segment kiln-status-segment--changes kiln-status-segment--clickable",
+                        onclick: move |_| {
+                            let mut layout = state.layout;
+                            layout.set(LayoutPreset::Version);
+                        },
                         if status.added > 0 {
                             span { class: "kiln-status__added", "+{status.added}" }
                         }
@@ -67,7 +80,7 @@ pub fn StatusBar() -> Element {
             // ── Cursor segment ──────────────────────────────────────────
             div {
                 class: "kiln-status-segment kiln-status-segment--cursor",
-                "Ln 1, Col 1"  // TODO: wire to YAML editor cursor
+                "Ln 1, Col 1"
             }
 
             div { class: "kiln-status-divider" }
@@ -96,6 +109,215 @@ pub fn StatusBar() -> Element {
                     "git"
                 }
             }
+        }
+
+        // ── Branch switcher dropdown ────────────────────────────────────
+        if is_switcher_open {
+            BranchSwitcher {
+                on_close: move |_| show_branch_switcher.set(false),
+            }
+        }
+    }
+}
+
+/// Branch switcher dropdown — opens above the status bar.
+/// Spec: clinker-kiln-git-addendum.md §G3.4.
+#[component]
+fn BranchSwitcher(on_close: EventHandler<()>) -> Element {
+    let mut tab_mgr = use_context::<TabManagerState>();
+    let mut search = use_signal(String::new);
+    let mut branches = use_signal(Vec::new);
+    let mut loaded = use_signal(|| false);
+    let mut new_branch_input = use_signal(|| false);
+    let mut new_branch_name = use_signal(String::new);
+
+    // Load branches on first render
+    if !(loaded)() {
+        let ws = (tab_mgr.workspace)();
+        if let Some(ws) = ws {
+            if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
+                if let Ok(b) = ops.branches() {
+                    branches.set(b);
+                }
+            }
+        }
+        loaded.set(true);
+    }
+
+    let branch_list = (branches)();
+    let query = (search)();
+    let show_new = (new_branch_input)();
+
+    let filtered: Vec<_> = branch_list
+        .iter()
+        .filter(|b| {
+            query.is_empty() || b.name.to_lowercase().contains(&query.to_lowercase())
+        })
+        .collect();
+
+    rsx! {
+        // Backdrop
+        div {
+            class: "kiln-branch-switcher-backdrop",
+            onclick: move |_| on_close.call(()),
+        }
+
+        // Dropdown
+        div {
+            class: "kiln-branch-switcher",
+            onclick: move |e: MouseEvent| e.stop_propagation(),
+
+            // Search input
+            input {
+                class: "kiln-branch-switcher__search",
+                r#type: "text",
+                placeholder: "Search branches...",
+                value: "{query}",
+                autofocus: true,
+                oninput: move |e: FormEvent| search.set(e.value()),
+            }
+
+            // Branch list
+            div { class: "kiln-branch-switcher__list",
+                for branch in filtered {
+                    {
+                        let name = branch.name.clone();
+                        let is_current = branch.is_current;
+                        let ahead = branch.ahead;
+                        let behind = branch.behind;
+
+                        rsx! {
+                            div {
+                                class: if is_current {
+                                    "kiln-branch-switcher__item kiln-branch-switcher__item--current"
+                                } else {
+                                    "kiln-branch-switcher__item"
+                                },
+                                onclick: {
+                                    let name = name.clone();
+                                    move |_| {
+                                        if !is_current {
+                                            switch_branch(&mut tab_mgr, &name);
+                                            on_close.call(());
+                                        }
+                                    }
+                                },
+
+                                if is_current {
+                                    span { class: "kiln-branch-switcher__dot", "●" }
+                                }
+                                span { class: "kiln-branch-switcher__name", "{name}" }
+                                if ahead > 0 {
+                                    span { class: "kiln-status__ahead", "↑{ahead}" }
+                                }
+                                if behind > 0 {
+                                    span { class: "kiln-status__behind", "↓{behind}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // New branch section
+            div { class: "kiln-branch-switcher__footer",
+                if show_new {
+                    div { class: "kiln-branch-switcher__new-row",
+                        input {
+                            class: "kiln-branch-switcher__new-input",
+                            r#type: "text",
+                            placeholder: "New branch name...",
+                            value: "{new_branch_name}",
+                            autofocus: true,
+                            oninput: move |e: FormEvent| new_branch_name.set(e.value()),
+                            onkeydown: move |e: KeyboardEvent| {
+                                if e.key() == Key::Enter {
+                                    let name = (new_branch_name)();
+                                    if !name.is_empty() {
+                                        create_and_switch(&mut tab_mgr, &name);
+                                        on_close.call(());
+                                    }
+                                }
+                            },
+                        }
+                    }
+                } else {
+                    button {
+                        class: "kiln-branch-switcher__new-btn",
+                        onclick: move |_| new_branch_input.set(true),
+                        "+ New Branch"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Switch to a different branch.
+fn switch_branch(tab_mgr: &mut TabManagerState, name: &str) {
+    let ws = (tab_mgr.workspace)();
+    let Some(ws) = ws else { return };
+
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let mut toast: Signal<Option<ToastState>> = use_context();
+
+    // Check for dirty state
+    let status = ops.status();
+    if let Ok(ref s) = status {
+        if s.has_changes() {
+            toast_error(&mut toast, format!("Stash or commit changes before switching branches"));
+            return;
+        }
+    }
+
+    let result = std::process::Command::new("git")
+        .args(["switch", name])
+        .current_dir(&ws.root)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            toast_success(&mut toast, &format!("Switched to {name}"));
+            if let Ok(new_status) = ops.status() {
+                tab_mgr.git_state.set(Some(new_status));
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            toast_error(&mut toast, format!("switch failed: {stderr}"));
+        }
+        Err(e) => {
+            toast_error(&mut toast, format!("switch failed: {e}"));
+        }
+    }
+}
+
+/// Create a new branch and switch to it.
+fn create_and_switch(tab_mgr: &mut TabManagerState, name: &str) {
+    let ws = (tab_mgr.workspace)();
+    let Some(ws) = ws else { return };
+
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let mut toast: Signal<Option<ToastState>> = use_context();
+
+    let result = std::process::Command::new("git")
+        .args(["switch", "-c", name])
+        .current_dir(&ws.root)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            toast_success(&mut toast, &format!("Created and switched to {name}"));
+            if let Ok(new_status) = ops.status() {
+                tab_mgr.git_state.set(Some(new_status));
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            toast_error(&mut toast, format!("create branch failed: {stderr}"));
+        }
+        Err(e) => {
+            toast_error(&mut toast, format!("create branch failed: {e}"));
         }
     }
 }

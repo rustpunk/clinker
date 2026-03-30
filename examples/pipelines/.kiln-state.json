@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "window": null,
+  "layout": {
+    "preset": "version",
+    "inspector_width": null,
+    "yaml_sidebar_width": null,
+    "run_log_expanded": true
+  },
+  "tabs": {
+    "open": [],
+    "active": null
+  },
+  "pipelines": {},
+  "last_open_directory": null,
+  "search": null
+}

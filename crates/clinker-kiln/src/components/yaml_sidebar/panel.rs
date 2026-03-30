@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-
 use dioxus::prelude::*;
 
+use clinker_git::{BlameLine, GitOps};
+
 use crate::pipeline_view::derive_pipeline_view;
-use crate::state::use_app_state;
+use crate::state::{use_app_state, TabManagerState};
 use crate::sync::EditSource;
 
 use super::tokenizer::tokenize;
@@ -15,17 +15,20 @@ use super::tokenizer::tokenize;
 /// textarea captures keystrokes; the pre shows the colours. Both scroll
 /// together via a shared container.
 ///
-/// Selection sync: when a stage is selected, its YAML lines receive a tinted
-/// background and accent left border (via `data-selected` attribute).
-///
-/// Doc: spec §6 — YAML Editor (Sidebar).
+/// Blame gutter: toggleable column showing per-line git blame (author, time, hash).
+/// Spec §G9.
 #[component]
 pub fn YamlSidebar() -> Element {
     let state = use_app_state();
+    let tab_mgr = use_context::<TabManagerState>();
     let text = (state.yaml_text)();
     let errors = (state.parse_errors)();
     let lines = tokenize(&text);
     let line_count = lines.len().max(1);
+    let mut blame_visible = use_signal(|| false);
+    let mut blame_data = use_signal(|| Vec::<BlameLine>::new());
+
+    let show_blame = (blame_visible)();
 
     // Compute selected stage's YAML line range for highlighting.
     let selected_range: Option<(usize, usize)> = {
@@ -40,21 +43,93 @@ pub fn YamlSidebar() -> Element {
         }
     };
 
+    // Schema warnings for YAML squiggles
+    let warnings = (state.schema_warnings)();
+
     rsx! {
         div {
             class: "kiln-yaml-sidebar",
 
-            // Section header
+            // Section header with blame toggle
             div {
                 class: "kiln-section-header",
                 span { class: "kiln-diamond", "\u{25C6}" }
                 span { class: "kiln-section-title", "PIPELINE YAML" }
                 span { class: "kiln-section-rule" }
+
+                // Blame toggle button (only when git repo detected)
+                if (tab_mgr.git_state)().is_some() {
+                    button {
+                        class: if show_blame {
+                            "kiln-blame-toggle kiln-blame-toggle--active"
+                        } else {
+                            "kiln-blame-toggle"
+                        },
+                        onclick: move |_| {
+                            let new_val = !show_blame;
+                            blame_visible.set(new_val);
+                            if new_val && (blame_data)().is_empty() {
+                                // Load blame data
+                                load_blame(&tab_mgr, &mut blame_data);
+                            }
+                        },
+                        "⑂ BLAME"
+                    }
+                }
             }
 
-            // Code area: gutter + editor container
+            // Code area: blame gutter + line numbers + editor
             div {
                 class: "kiln-yaml-code-area",
+
+                // Blame gutter (toggleable, 130px)
+                if show_blame {
+                    div {
+                        class: "kiln-blame-gutter",
+                        for i in 0..line_count {
+                            {
+                                let bl = (blame_data)();
+                                let blame = bl.iter().find(|b| b.line == i + 1).cloned();
+                                let prev_blame = if i > 0 {
+                                    bl.iter().find(|b| b.line == i).cloned()
+                                } else {
+                                    None
+                                };
+                                let is_group_start = blame.as_ref().map(|b| {
+                                    prev_blame.as_ref().map(|pb| pb.commit_id != b.commit_id).unwrap_or(true)
+                                }).unwrap_or(false);
+
+                                if let Some(ref b) = blame {
+                                    let author = if b.author.len() > 8 { b.author[..8].to_string() } else { b.author.clone() };
+                                    let time = relative_time_short(b.timestamp);
+                                    let hash = b.commit_id.clone();
+
+                                    rsx! {
+                                        div {
+                                            key: "blame-{i}",
+                                            class: "kiln-blame-line",
+                                            if is_group_start {
+                                                span { class: "kiln-blame-author", "{author}" }
+                                                span { class: "kiln-blame-time", "{time}" }
+                                                span { class: "kiln-blame-hash", "{hash}" }
+                                            } else {
+                                                span { class: "kiln-blame-continuation", "│" }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        div {
+                                            key: "blame-{i}",
+                                            class: "kiln-blame-line",
+                                            span { class: "kiln-blame-uncommitted", "uncommitted" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Line-number gutter
                 div {
@@ -64,6 +139,8 @@ pub fn YamlSidebar() -> Element {
                             let line_num = i + 1;
                             let in_range = selected_range
                                 .is_some_and(|(s, e)| line_num >= s && line_num <= e);
+                            // Check for schema warnings on this line
+                            let has_warning = !warnings.is_empty() && false; // TODO: map warnings to line numbers
                             rsx! {
                                 div {
                                     key: "gutter-{i}",
@@ -124,7 +201,7 @@ pub fn YamlSidebar() -> Element {
                 }
             }
 
-            // Parse error bar — selectable text + copy button
+            // Parse error bar
             if !errors.is_empty() {
                 div {
                     class: "kiln-yaml-errors",
@@ -151,7 +228,7 @@ pub fn YamlSidebar() -> Element {
                                             );
                                             document::eval(&js);
                                         },
-                                        "\u{2398}" // COPY icon (⎘)
+                                        "\u{2398}"
                                     }
                                 }
                             }
@@ -160,5 +237,51 @@ pub fn YamlSidebar() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Load blame data for the current file.
+fn load_blame(tab_mgr: &TabManagerState, blame_data: &mut Signal<Vec<BlameLine>>) {
+    let ws = (tab_mgr.workspace)();
+    let Some(ws) = ws else { return };
+
+    // Get the active tab's file path
+    let active_id = (tab_mgr.active_tab_id)();
+    let tabs = tab_mgr.tabs.read();
+    let active_tab = active_id.and_then(|id| tabs.iter().find(|t| t.id == id));
+    let Some(tab) = active_tab else { return };
+    let Some(ref file_path) = tab.file_path else { return };
+
+    // Make path relative to repo root
+    let relative = file_path
+        .strip_prefix(&ws.root)
+        .unwrap_or(file_path);
+
+    if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
+        if let Ok(lines) = ops.blame(relative) {
+            blame_data.set(lines);
+        }
+    }
+}
+
+/// Short relative time for blame gutter (2h, 3d, 1w, 2mo).
+fn relative_time_short(timestamp: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let diff = now - timestamp;
+
+    if diff < 3600 {
+        format!("{}m", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h", diff / 3600)
+    } else if diff < 604800 {
+        format!("{}d", diff / 86400)
+    } else if diff < 2592000 {
+        format!("{}w", diff / 604800)
+    } else {
+        format!("{}mo", diff / 2592000)
     }
 }

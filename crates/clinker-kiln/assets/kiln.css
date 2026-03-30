@@ -2813,6 +2813,196 @@ html, body {
   color: var(--kiln-text-floor);
 }
 
+/* Clickable status segments */
+.kiln-status-segment--clickable {
+  cursor: pointer;
+}
+
+/* ── Branch switcher dropdown ────────────────────────────────────────────
+   Opens above the status bar on branch click. Spec §G3.4.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-branch-switcher-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+}
+
+.kiln-branch-switcher {
+  position: fixed;
+  bottom: 24px;
+  left: 8px;
+  width: 280px;
+  max-height: 240px;
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  display: flex;
+  flex-direction: column;
+  z-index: 301;
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.kiln-branch-switcher__search {
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--kiln-border-medium);
+  padding: 8px 12px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-branch-switcher__search::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-branch-switcher__list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 4px 0;
+}
+
+.kiln-branch-switcher__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-bone);
+}
+
+.kiln-branch-switcher__item:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-branch-switcher__item--current {
+  cursor: default;
+}
+
+.kiln-branch-switcher__item--current:hover {
+  background: transparent;
+}
+
+.kiln-branch-switcher__dot {
+  color: var(--kiln-verdigris);
+  font-size: 8px;
+}
+
+.kiln-branch-switcher__name {
+  flex: 1;
+}
+
+.kiln-branch-switcher__footer {
+  border-top: 1px solid var(--kiln-border-medium);
+  padding: 6px 12px;
+}
+
+.kiln-branch-switcher__new-btn {
+  background: none;
+  border: none;
+  color: var(--kiln-verdigris);
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  cursor: pointer;
+}
+
+.kiln-branch-switcher__new-row {
+  display: flex;
+}
+
+.kiln-branch-switcher__new-input {
+  flex: 1;
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+/* ── Blame gutter ────────────────────────────────────────────────────────
+   Toggleable 130px column in YAML sidebar showing per-line blame.
+   Spec §G9.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-blame-toggle {
+  background: transparent;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 2px 6px;
+  font-family: var(--kiln-font-ui);
+  font-size: 7px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  transition: all 200ms ease;
+  margin-left: auto;
+}
+
+.kiln-blame-toggle:hover {
+  border-color: var(--kiln-verdigris);
+  color: var(--kiln-verdigris);
+}
+
+.kiln-blame-toggle--active {
+  background: rgba(67, 179, 174, 0.12);
+  border-color: rgba(67, 179, 174, 0.3);
+  color: var(--kiln-verdigris);
+}
+
+.kiln-blame-gutter {
+  flex: 0 0 130px;
+  overflow: hidden;
+  border-right: 1px solid var(--kiln-border-subtle);
+  padding-top: 0;
+}
+
+.kiln-blame-line {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  height: 1.55em;
+  padding: 0 6px;
+  font-family: var(--kiln-font-code);
+  font-size: 7px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.kiln-blame-author {
+  color: var(--kiln-verdigris);
+  min-width: 48px;
+}
+
+.kiln-blame-time {
+  color: var(--kiln-text-floor);
+  min-width: 22px;
+  text-align: right;
+}
+
+.kiln-blame-hash {
+  color: var(--kiln-text-floor);
+  min-width: 48px;
+  text-align: right;
+}
+
+.kiln-blame-continuation {
+  color: var(--kiln-border-subtle);
+  padding-left: 20px;
+}
+
+.kiln-blame-uncommitted {
+  color: var(--kiln-hazard);
+  opacity: 0.9;
+  font-style: italic;
+}
+
 /* ── 7. Canvas panel ───────────────────────────────────────────────────────
    Infinite world-space viewport. Phase 3 adds CSS transform for pan/zoom.
    Visual layers: dot grid → noise → scanlines → SVG connectors → nodes.
