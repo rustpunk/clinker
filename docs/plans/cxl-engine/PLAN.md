@@ -3,7 +3,7 @@
 **Spec:** `docs/cxl-engine-spec.md`
 **Status:** In Progress
 **Created:** 2026-03-28
-**Last Updated:** 2026-03-28
+**Last Updated:** 2026-03-30
 
 ## Summary
 
@@ -21,6 +21,10 @@ with spill-to-disk under a configurable memory budget.
 | 3 | `quick-xml` 0.37 API remains stable | Pin version; wrap in adapter trait |
 | 4 | Arena fits in memory for typical workloads (≤100MB files) | Arena spill-to-disk is a v2 optimization |
 | 5 | Single-level module imports (`use`) sufficient for v1 | Cross-module imports deferred to v2 |
+| 6 | `WindowContext<'a, S: RecordStorage>` lifetime-parameterized trait (Phase 5 decision) | If Phase 6 rayon needs to send views across task boundaries, upgrade to `Arc<Arena>` (mechanical) |
+| 7 | `RecordStorage` trait in `clinker-record` foundation crate (Phase 5 decision) | All crates depending on `clinker-record` gain access; `cxl::eval` becomes generic over `S` |
+| 8 | Unified `PipelineExecutor` replaces `StreamingExecutor` (Phase 5 decision) | Phase 6+ modifies one executor, not two. Streaming mode is an internal branch. |
+| 9 | `config::SortField` extended with optional `null_order` (Phase 5 decision) | Output sort ordering uses `null_order: None`; window sorting uses `Some(Last)` default |
 
 ## Open Questions
 
@@ -31,11 +35,11 @@ with spill-to-disk under a configurable memory budget.
 
 | Phase | Name | Status | Tasks | Passing | Blocked |
 |-------|------|--------|-------|---------|---------|
-| 1 | Foundation — Workspace + Data Model | 🔲 Not Started | 5 | 0 | — |
-| 2 | CXL Lexer + Parser | 🔲 Not Started | 4 | 0 | Phase 1 |
-| 3 | CXL Resolver, Type Checker, Evaluator | 🔲 Not Started | 4 | 0 | Phase 2 |
-| 4 | CSV + Minimal End-to-End Pipeline | 🔲 Not Started | 5 | 0 | Phase 3 |
-| 5 | Two-Pass Pipeline — Arena, Indexing, Windows | 🔲 Not Started | 5 | 0 | Phase 4 |
+| 1 | Foundation — Workspace + Data Model | ✅ Complete | 5 | 5 | — |
+| 2 | CXL Lexer + Parser | ✅ Complete | 4 | 4 | — |
+| 3 | CXL Resolver, Type Checker, Evaluator | ✅ Complete | 4 | 4 | — |
+| 4 | CSV + Minimal End-to-End Pipeline | ✅ Complete | 5 | 5 | — |
+| 5 | Two-Pass Pipeline — Arena, Indexing, Windows | 🔲 Ready (drilled + validated) | 5 | 0 | — |
 | 6 | Parallelism + Memory Management | 🔲 Not Started | 5 | 0 | Phase 5 |
 | 7 | JSON + XML Readers/Writers | 🔲 Not Started | 4 | 0 | Phase 4 |
 | 8 | Sort, DLQ Polish, CLI Completion | 🔲 Not Started | 4 | 0 | Phase 6, 7 |
@@ -85,3 +89,5 @@ Phase 10 needs Phase 9 (validations reference schemas and modules).
 | Deterministic output violated under parallelism | Medium | High — spec guarantee broken | Golden-file tests: run 1-thread vs 4-thread, diff output. Run 10x, verify identical. Add in Phase 6. |
 | Arena exceeds memory budget on large files | Low | Medium — OOM on production workloads | Phase 6 adds RSS tracking + spill. Arena spill is v2; Phase 6 halts with diagnostic if Arena overflows. |
 | `quick-xml` 0.37 breaking changes | Low | Low — isolated to Phase 7 | Pin version. Wrap reader behind `FormatReader` trait. |
+| `WindowContext<'a, S>` generic propagation through eval | Low | Medium — 8 functions in `cxl::eval` need `S` param | Mechanical change. Monomorphized once for `Arena`. Sub-task 5.2.6 enumerates all sites. |
+| Phase 5 `RecordView` lifetime vs Phase 6 rayon closures | Low | Medium — if views need to cross task boundaries | `&Arena` is `Send` (Arena is Sync). Views don't escape closures. Upgrade to Arc is mechanical fallback. |

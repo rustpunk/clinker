@@ -100,6 +100,7 @@ fn value_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::Record;
 
     fn make_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["name".into(), "value".into()]))
