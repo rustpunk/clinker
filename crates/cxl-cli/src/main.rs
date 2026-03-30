@@ -2,7 +2,16 @@ use std::collections::HashMap;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use clinker_record::Value;
+use clinker_record::{RecordStorage, Value};
+
+/// Dummy storage for no-window evaluation.
+struct NullStorage;
+impl RecordStorage for NullStorage {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
+    fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
+    fn record_count(&self) -> u32 { 0 }
+}
 use cxl::eval::{EvalContext, WallClock};
 use cxl::resolve::HashMapResolver;
 
@@ -179,7 +188,7 @@ fn cmd_eval(file: &str, record_json: &str) {
 
     let resolver = HashMapResolver::new(record_map);
 
-    match cxl::eval::eval_program(&typed, &ctx, &resolver, None) {
+    match cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None) {
         Ok(output) => {
             let json_out: serde_json::Map<String, serde_json::Value> = output
                 .into_iter()

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::Datelike;
-use clinker_record::Value;
+use clinker_record::{RecordStorage, Value};
 
 use crate::parser::Parser;
 use crate::resolve::pass::resolve_program;
@@ -9,6 +9,15 @@ use crate::resolve::HashMapResolver;
 use crate::typecheck::pass::type_check;
 use crate::typecheck::Type;
 use super::*;
+
+/// Dummy storage for no-window evaluation tests.
+struct NullStorage;
+impl RecordStorage for NullStorage {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
+    fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
+    fn record_count(&self) -> u32 { 0 }
+}
 
 fn eval_ok(src: &str, fields: &[&str], record: HashMap<String, Value>) -> indexmap::IndexMap<String, Value> {
     let parsed = Parser::parse(src);
@@ -20,7 +29,7 @@ fn eval_ok(src: &str, fields: &[&str], record: HashMap<String, Value>) -> indexm
         .unwrap_or_else(|d| panic!("Type errors: {:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>()));
     let ctx = EvalContext::test_default();
     let resolver = HashMapResolver::new(record);
-    eval_program(&typed, &ctx, &resolver, None)
+    eval_program::<NullStorage>(&typed, &ctx, &resolver, None)
         .unwrap_or_else(|e| panic!("Eval error: {}", e))
 }
 
@@ -203,7 +212,7 @@ fn test_eval_conversion_strict() {
     let typed = type_check(resolved, &HashMap::new()).unwrap();
     let ctx = EvalContext::test_default();
     let resolver = HashMapResolver::new(HashMap::new());
-    let result = eval_program(&typed, &ctx, &resolver, None);
+    let result = eval_program::<NullStorage>(&typed, &ctx, &resolver, None);
     assert!(result.is_err(), "Expected conversion error for \"abc\".to_int()");
 }
 
@@ -233,7 +242,7 @@ fn test_eval_regex_precompiled() {
     // And evaluation uses it
     let ctx = EvalContext::test_default();
     let resolver = HashMapResolver::new(HashMap::new());
-    let output = eval_program(&typed, &ctx, &resolver, None).unwrap();
+    let output = eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
     assert_eq!(output.get("val"), Some(&Value::Bool(true)));
 }
 

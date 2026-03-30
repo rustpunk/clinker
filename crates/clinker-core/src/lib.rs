@@ -3,6 +3,7 @@ pub mod dlq;
 pub mod error;
 pub mod executor;
 mod integration_tests;
+pub mod pipeline;
 pub mod plan;
 pub mod projection;
 

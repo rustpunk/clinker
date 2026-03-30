@@ -11,8 +11,19 @@ use crate::projection::project_output;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
 use clinker_format::traits::{FormatReader, FormatWriter};
+use clinker_record::RecordStorage;
 use cxl::eval::{EvalContext, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
+
+/// Dummy storage type for streaming (no-window) evaluation.
+/// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
+struct NullStorage;
+impl RecordStorage for NullStorage {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
+    fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
+    fn record_count(&self) -> u32 { 0 }
+}
 
 /// Compiled transform: CXL source compiled once, evaluated per record.
 struct CompiledTransform {
@@ -270,7 +281,7 @@ fn evaluate_record(
 ) -> Result<IndexMap<String, Value>, cxl::eval::EvalError> {
     let mut all_emitted = IndexMap::new();
     for t in transforms {
-        let emitted = cxl::eval::eval_program(&t.typed, ctx, record, None)?;
+        let emitted = cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, record, None)?;
         all_emitted.extend(emitted);
     }
     Ok(all_emitted)

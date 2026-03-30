@@ -65,9 +65,17 @@ mod tests {
     /// WindowContext must be object-safe for dynamic dispatch in the evaluator.
     #[test]
     fn test_window_context_object_safety() {
-        use super::super::traits::WindowContext;
-        // Compile-time check: dyn WindowContext is constructible as a trait object
-        fn _accepts_dyn(_: &dyn WindowContext) {}
+        use clinker_record::{RecordStorage, WindowContext};
+        // Dummy storage to provide a concrete S for the WindowContext trait
+        struct DummyStorage;
+        impl RecordStorage for DummyStorage {
+            fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
+            fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
+            fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
+            fn record_count(&self) -> u32 { 0 }
+        }
+        // Compile-time check: dyn WindowContext<'_, S> is constructible as a trait object
+        fn _accepts_dyn<'a>(_: &dyn WindowContext<'a, DummyStorage>) {}
     }
 
     /// Unqualified lookup returns stored value.

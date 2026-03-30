@@ -11,18 +11,18 @@ use clinker_record::Value;
 
 use crate::ast::{BinOp, Expr, LiteralValue, Statement, UnaryOp};
 use crate::lexer::Span;
-use crate::resolve::traits::{FieldResolver, WindowContext};
+use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
 pub use error::{EvalError, EvalErrorKind};
 pub use context::{Clock, WallClock, FixedClock, EvalContext};
 
 /// Evaluate a full CXL program against a record. Returns the output field map.
-pub fn eval_program(
+pub fn eval_program<'w, S: RecordStorage + 'w>(
     typed: &TypedProgram,
     ctx: &EvalContext,
     resolver: &dyn FieldResolver,
-    window: Option<&dyn WindowContext>,
+    window: Option<&dyn WindowContext<'w, S>>,
 ) -> Result<indexmap::IndexMap<String, Value>, EvalError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     let mut output = indexmap::IndexMap::new();
@@ -59,12 +59,12 @@ pub fn eval_program(
 }
 
 /// Evaluate a single expression.
-pub fn eval_expr(
+pub fn eval_expr<'w, S: RecordStorage + 'w>(
     expr: &Expr,
     typed: &TypedProgram,
     ctx: &EvalContext,
     resolver: &dyn FieldResolver,
-    window: Option<&dyn WindowContext>,
+    window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
     match expr {
@@ -227,21 +227,50 @@ pub fn eval_expr(
                     }
                 }
                 "first" => {
-                    Ok(w.first().and_then(|_r| {
-                        // Return the resolver as-is; CXL accesses fields via method chain
-                        // e.g., window.first().field_name
-                        Some(Value::Null) // Simplified: full impl needs field access chain
-                    }).unwrap_or(Value::Null))
+                    // Positional: returns RecordView. Field access via postfix chain
+                    // is handled by the MethodCall evaluator on the receiver.
+                    // For now, return Null — full field chain resolution in Task 5.4.
+                    Ok(w.first().map(|_r| Value::Null).unwrap_or(Value::Null))
                 }
-                "last" | "lag" | "lead" => Ok(Value::Null), // Simplified: full impl in Phase 5
-                "any" | "all" => Ok(Value::Null), // Simplified: full impl needs closure evaluation
+                "last" => Ok(w.last().map(|_r| Value::Null).unwrap_or(Value::Null)),
+                "lag" => {
+                    let offset = args.first()
+                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
+                        .transpose()?
+                        .and_then(|v| if let Value::Integer(n) = v { Some(n as usize) } else { None })
+                        .unwrap_or(1);
+                    Ok(w.lag(offset).map(|_r| Value::Null).unwrap_or(Value::Null))
+                }
+                "lead" => {
+                    let offset = args.first()
+                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
+                        .transpose()?
+                        .and_then(|v| if let Value::Integer(n) = v { Some(n as usize) } else { None })
+                        .unwrap_or(1);
+                    Ok(w.lead(offset).map(|_r| Value::Null).unwrap_or(Value::Null))
+                }
+                "collect" => {
+                    if let Some(Expr::FieldRef { name, .. }) = args.first() {
+                        Ok(w.collect(name))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "distinct" => {
+                    if let Some(Expr::FieldRef { name, .. }) = args.first() {
+                        Ok(w.distinct(name))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "any" | "all" => Ok(Value::Null), // Evaluator-driven: implemented in Task 5.4
                 _ => Ok(Value::Null),
             }
         }
     }
 }
 
-fn eval_binary(
+fn eval_binary<'w, S: RecordStorage + 'w>(
     op: BinOp,
     lhs: &Expr,
     rhs: &Expr,
@@ -249,7 +278,7 @@ fn eval_binary(
     typed: &TypedProgram,
     ctx: &EvalContext,
     resolver: &dyn FieldResolver,
-    window: Option<&dyn WindowContext>,
+    window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
     // Three-valued AND/OR: short-circuit before evaluating RHS
