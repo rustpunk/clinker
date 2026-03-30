@@ -1170,7 +1170,145 @@ html, body {
   border-color: var(--kiln-iron);
 }
 
-/* ── 19. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+/* ── 19. Docs drawer content (Blueprint sub-aesthetic) ─────────────────────
+   Auto-generated stage descriptions, metadata grid, column impact.
+   Spec §A5.2–A5.6, §A10.1.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* Auto-generated description block */
+.kiln-docs-description {
+  background: var(--kiln-char);
+  border: 1px solid rgba(67, 179, 174, 0.15);
+  border-left: 2px solid rgba(67, 179, 174, 0.3);
+  border-radius: 2px;
+  padding: 10px 12px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--kiln-bone);
+  margin-bottom: 12px;
+}
+
+/* User-authored note rendered below auto-description */
+.kiln-docs-note-section {
+  margin-bottom: 12px;
+}
+
+.kiln-docs-note-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 4px;
+}
+
+.kiln-docs-note-block {
+  background: var(--kiln-char-raised);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  padding: 8px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-bone);
+  white-space: pre-wrap;
+}
+
+/* Stage metadata key-value grid */
+.kiln-docs-metadata {
+  margin-bottom: 12px;
+  border: 1px solid rgba(67, 179, 174, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.kiln-docs-meta-row {
+  display: flex;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  padding: 4px 10px;
+}
+
+.kiln-docs-meta-row:last-child {
+  border-bottom: none;
+}
+
+.kiln-docs-meta-key {
+  flex: 0 0 100px;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-docs-meta-value {
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+}
+
+/* Column impact tags */
+.kiln-docs-columns {
+  margin-bottom: 12px;
+}
+
+.kiln-docs-columns-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+  margin-bottom: 4px;
+}
+
+.kiln-docs-column-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-docs-column-tag {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+.kiln-docs-column-tag--added {
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.12);
+  border: 1px solid rgba(67, 179, 174, 0.25);
+}
+
+/* Footer: ── AUTODOC ── */
+.kiln-docs-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.kiln-docs-footer-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(67, 179, 174, 0.3), transparent);
+}
+
+.kiln-docs-footer-label {
+  font-family: var(--kiln-font-code);
+  font-size: 8px;
+  letter-spacing: 0.15em;
+  color: var(--kiln-iron);
+}
+
+/* ── 20. Scrollbar theming (WebKit) ─────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {

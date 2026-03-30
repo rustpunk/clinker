@@ -1,6 +1,7 @@
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 
 mod app;
+mod autodoc;
 mod components;
 mod cxl_bridge;
 mod demo;

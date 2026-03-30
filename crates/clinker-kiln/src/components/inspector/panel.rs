@@ -115,7 +115,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
 
                 match (active_drawer)() {
                     ActiveDrawer::Run => rsx! { DrawerRun {} },
-                    ActiveDrawer::Docs => rsx! { DrawerDocs {} },
+                    ActiveDrawer::Docs => rsx! { DrawerDocs { stage_id: stage_id.clone() } },
                     ActiveDrawer::Notes => rsx! { DrawerNotes { stage_id: stage_id.clone() } },
                     ActiveDrawer::None => rsx! {},
                 }
