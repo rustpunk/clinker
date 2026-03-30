@@ -3,21 +3,21 @@
 **Phase file:** docs/plans/cxl-engine/phase-06-parallelism-memory.md
 **Started:** 2026-03-30
 **Last updated:** 2026-03-30
-**Status:** 🔄 In Progress
+**Status:** ✅ Complete
 
 ---
 
 ## Current state
 
-**Active task:** [6.1] Rayon Thread Pool + Chunk-Level Parallelism
-**Completed:** 0 of 5 tasks
-**Blocked:** none (Phase 5 entry criteria assumed met)
+**Active task:** none — Phase 6 complete
+**Completed:** 5 of 5 tasks
+**Blocked:** none
 
 ---
 
 ## Task list
 
-### 🔄 [6.1] Rayon Thread Pool + Chunk-Level Parallelism  ← ACTIVE
+### ✅ [6.1] Rayon Thread Pool + Chunk-Level Parallelism  ← COMPLETE
 **Sub-tasks:**
 - [ ] **6.1.0** (Prep) Fix `build_eval_context` bug: freeze `pipeline_start_time` once at pipeline start
 - [ ] **6.1.1** Build explicit `rayon::ThreadPool` from `ParallelismProfile::worker_threads`
@@ -38,11 +38,11 @@
 
 **Done when:** Explicit rayon pool built at startup, Phase 2 loop batched into chunks, par_iter_mut applied for Stateless/IndexReading, output byte-identical across thread counts
 **Commit:** `feat(phase-6): implement rayon thread pool and chunk-level parallelism`
-**Commit ID:** --
+**Commit ID:** 7657c09
 
 ---
 
-### ⛔ [6.2] Source-Level Parallelism (Phase 1)  ← BLOCKED on [6.1] gate tests
+### ✅ [6.2] Source-Level Parallelism (Phase 1)  ← COMPLETE
 **Sub-tasks:**
 - [ ] **6.2.1** Define `IngestionOutput` struct in `pipeline/ingestion.rs`
 - [ ] **6.2.2** Implement `thread::scope` dispatch over `SourceTier` DAG
@@ -60,11 +60,11 @@
 
 **Done when:** Independent sources ingested concurrently via `thread::scope`, DAG ordering respected, arenas collected into `IngestionOutput`
 **Commit:** `feat(phase-6): implement source-level parallelism with thread::scope`
-**Commit ID:** --
+**Commit ID:** d3f071d
 
 ---
 
-### ⛔ [6.3] Cross-Platform RSS Tracking  ← BLOCKED on [6.2] gate tests
+### ✅ [6.3] Cross-Platform RSS Tracking  ← COMPLETE
 **Sub-tasks:**
 - [ ] **6.3.0** (Prep) Add `libc` and `num_cpus` to clinker-core/Cargo.toml
 - [ ] **6.3.1** Implement `rss_bytes()` with `#[cfg(target_os)]` platform dispatch
@@ -81,11 +81,11 @@
 
 **Done when:** `rss_bytes()` returns `Some` on Linux/macOS/Windows, `MemoryBudget::should_spill()` triggers correctly, `--memory-limit` parsed
 **Commit:** `feat(phase-6): implement cross-platform RSS tracking and memory budget`
-**Commit ID:** --
+**Commit ID:** 74aada8
 
 ---
 
-### ⛔ [6.4] Spill-to-Disk Infrastructure  ← BLOCKED on [6.3] gate tests
+### ✅ [6.4] Spill-to-Disk Infrastructure  ← COMPLETE
 **Sub-tasks:**
 - [ ] **6.4.1** Implement `SpillWriter` (LZ4-compressed NDJSON with schema header)
 - [ ] **6.4.2** Implement `SpillReader` as `Iterator<Item=Result<Record, SpillError>>`
@@ -102,11 +102,11 @@
 
 **Done when:** SpillWriter/SpillReader round-trip all Value types with LZ4 compression, tempfile cleanup on drop, schema preserved
 **Commit:** `feat(phase-6): implement spill-to-disk NDJSON+LZ4 infrastructure`
-**Commit ID:** --
+**Commit ID:** 21f679e
 
 ---
 
-### ⛔ [6.5] Error Threshold + Signal Handling  ← BLOCKED on [6.4] gate tests
+### ✅ [6.5] Error Threshold + Signal Handling  ← COMPLETE
 **Sub-tasks:**
 - [ ] **6.5.1** Implement `ErrorThreshold` struct (TwoPass: Arena total denominator, Streaming: running ratio)
 - [ ] **6.5.2** Implement signal handling with `ctrlc::set_handler_with_signals` (SIGINT + SIGTERM)
@@ -124,7 +124,7 @@
 
 **Done when:** Error threshold checked at chunk boundaries with mode-aware denominator, SIGINT+SIGTERM handled gracefully, exit codes {0,1,2,3,4,130} defined and wired
 **Commit:** `feat(phase-6): implement error threshold, signal handling, and exit codes`
-**Commit ID:** --
+**Commit ID:** 856514c
 
 ---
 
@@ -132,42 +132,42 @@
 
 | Task | Test | Status | Run | Commit |
 |------|------|--------|-----|--------|
-| 6.1 | `test_thread_pool_default_count` | ⛔ Not run | -- | -- |
-| 6.1 | `test_thread_pool_cli_override` | ⛔ Not run | -- | -- |
-| 6.1 | `test_par_stateless_deterministic_output` | ⛔ Not run | -- | -- |
-| 6.1 | `test_par_index_reading_deterministic_output` | ⛔ Not run | -- | -- |
-| 6.1 | `test_sequential_not_parallelized` | ⛔ Not run | -- | -- |
-| 6.1 | `test_golden_file_diff_1_vs_4_threads` | ⛔ Not run | -- | -- |
-| 6.1 | `test_arc_ast_shared_not_cloned` | ⛔ Not run | -- | -- |
-| 6.1 | `test_empty_pipeline_zero_records` | ⛔ Not run | -- | -- |
-| 6.2 | `test_independent_sources_concurrent` | ⛔ Not run | -- | -- |
-| 6.2 | `test_dependent_sources_sequential` | ⛔ Not run | -- | -- |
-| 6.2 | `test_source_thread_owns_arena` | ⛔ Not run | -- | -- |
-| 6.2 | `test_arenas_moved_to_context` | ⛔ Not run | -- | -- |
-| 6.2 | `test_source_error_propagation` | ⛔ Not run | -- | -- |
-| 6.2 | `test_single_source_no_spawn` | ⛔ Not run | -- | -- |
-| 6.2 | `test_signal_during_phase1_ingestion` | ⛔ Not run | -- | -- |
-| 6.3 | `test_rss_bytes_returns_some` | ⛔ Not run | -- | -- |
-| 6.3 | `test_rss_bytes_increases_after_alloc` | ⛔ Not run | -- | -- |
-| 6.3 | `test_memory_budget_below_threshold` | ⛔ Not run | -- | -- |
-| 6.3 | `test_memory_budget_above_threshold` | ⛔ Not run | -- | -- |
-| 6.3 | `test_memory_budget_default_values` | ⛔ Not run | -- | -- |
-| 6.3 | `test_memory_limit_cli_parse_suffixes` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_roundtrip_all_value_types` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_schema_preserved` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_lz4_compression_ratio` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_tempfile_cleanup` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_empty_chunk` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_overflow_fields_preserved` | ⛔ Not run | -- | -- |
-| 6.4 | `test_spill_dir_override` | ⛔ Not run | -- | -- |
-| 6.5 | `test_error_threshold_below_limit` | ⛔ Not run | -- | -- |
-| 6.5 | `test_error_threshold_exceeded` | ⛔ Not run | -- | -- |
-| 6.5 | `test_error_threshold_zero_means_no_errors` | ⛔ Not run | -- | -- |
-| 6.5 | `test_error_threshold_one_means_unlimited` | ⛔ Not run | -- | -- |
-| 6.5 | `test_signal_flag_sets_atomic` | ⛔ Not run | -- | -- |
-| 6.5 | `test_graceful_shutdown_flushes_output` | ⛔ Not run | -- | -- |
-| 6.5 | `test_exit_codes_documented` | ⛔ Not run | -- | -- |
-| 6.5 | `test_shutdown_dlq_summary_to_stderr` | ⛔ Not run | -- | -- |
+| 6.1 | `test_thread_pool_default_count` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_thread_pool_cli_override` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_par_stateless_deterministic_output` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_par_index_reading_deterministic_output` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_sequential_not_parallelized` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_golden_file_diff_1_vs_4_threads` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_arc_ast_shared_not_cloned` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.1 | `test_empty_pipeline_zero_records` | ✅ Passed | 2026-03-30 | 7657c09 |
+| 6.2 | `test_independent_sources_concurrent` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.2 | `test_dependent_sources_sequential` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.2 | `test_source_thread_owns_arena` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.2 | `test_arenas_moved_to_context` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.2 | `test_source_error_propagation` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.2 | `test_single_source_no_spawn` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.2 | `test_signal_during_phase1_ingestion` | ✅ Passed | 2026-03-30 | d3f071d |
+| 6.3 | `test_rss_bytes_returns_some` | ✅ Passed | 2026-03-30 | 74aada8 |
+| 6.3 | `test_rss_bytes_increases_after_alloc` | ✅ Passed | 2026-03-30 | 74aada8 |
+| 6.3 | `test_memory_budget_below_threshold` | ✅ Passed | 2026-03-30 | 74aada8 |
+| 6.3 | `test_memory_budget_above_threshold` | ✅ Passed | 2026-03-30 | 74aada8 |
+| 6.3 | `test_memory_budget_default_values` | ✅ Passed | 2026-03-30 | 74aada8 |
+| 6.3 | `test_memory_limit_cli_parse_suffixes` | ✅ Passed | 2026-03-30 | 74aada8 |
+| 6.4 | `test_spill_roundtrip_all_value_types` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.4 | `test_spill_schema_preserved` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.4 | `test_spill_lz4_compression_ratio` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.4 | `test_spill_tempfile_cleanup` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.4 | `test_spill_empty_chunk` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.4 | `test_spill_overflow_fields_preserved` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.4 | `test_spill_dir_override` | ✅ Passed | 2026-03-30 | 21f679e |
+| 6.5 | `test_error_threshold_below_limit` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_error_threshold_exceeded` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_error_threshold_zero_means_no_errors` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_error_threshold_one_means_unlimited` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_signal_flag_sets_atomic` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_graceful_shutdown_flushes_output` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_exit_codes_documented` | ✅ Passed | 2026-03-30 | 856514c |
+| 6.5 | `test_shutdown_dlq_summary_to_stderr` | ✅ Passed | 2026-03-30 | 856514c |
 
 ---
 
@@ -175,7 +175,11 @@
 
 | Task | Name | Commit message | Commit ID | Completed |
 |------|------|---------------|-----------|-----------|
-| (none yet) | | | | |
+| 6.1 | Rayon Thread Pool + Chunk-Level Parallelism | feat(phase-6): implement rayon thread pool and chunk-level parallelism | 7657c09 | 2026-03-30 |
+| 6.2 | Source-Level Parallelism (Phase 1) | feat(phase-6): implement source-level parallelism with thread::scope | d3f071d | 2026-03-30 |
+| 6.3 | Cross-Platform RSS Tracking | feat(phase-6): implement cross-platform RSS tracking and memory budget | 74aada8 | 2026-03-30 |
+| 6.4 | Spill-to-Disk Infrastructure | feat(phase-6): implement spill-to-disk NDJSON+LZ4 infrastructure | 21f679e | 2026-03-30 |
+| 6.5 | Error Threshold + Signal Handling | feat(phase-6): implement error threshold, signal handling, and exit codes | 856514c | 2026-03-30 |
 
 ---
 
