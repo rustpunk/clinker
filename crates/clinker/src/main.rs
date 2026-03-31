@@ -6,10 +6,10 @@ use clap::{Parser, Subcommand};
 use clinker_channel::channel_override::{
     ChannelOverride, resolve_channel, resolve_channel_with_inheritance,
 };
-use clinker_channel::composition::{ProvenanceMap, resolve_compositions};
+use clinker_channel::composition::ProvenanceMap;
 use clinker_channel::manifest::ChannelManifest;
 use clinker_channel::workspace::WorkspaceRoot;
-use clinker_core::config::load_config_with_vars;
+use clinker_core::composition::CompositionError;
 use clinker_core::error::PipelineError;
 use clinker_core::executor::PipelineExecutor;
 use clinker_core::metrics::{self, ExecutionMetrics};
@@ -248,15 +248,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    // 4. Load + interpolate pipeline YAML (single pass, channel vars included)
-    let mut pipeline_config = load_config_with_vars(&args.config, &vars_ref)?;
+    // 4. Load + interpolate pipeline YAML as raw config (preserves _import overrides)
+    let raw_config = clinker_core::composition::load_raw_config_with_vars(&args.config, &vars_ref)?;
 
-    // 5. Resolve _import compositions → also get ProvenanceMap
-    let mut provenance = if let Some(ws) = &workspace {
-        resolve_compositions(&mut pipeline_config, ws, &vars_ref).map_err(channel_err)?
+    // 5. Resolve _import compositions (applies overrides from _import directives)
+    let (mut pipeline_config, _compositions) = if let Some(ws) = &workspace {
+        clinker_core::composition::resolve_imports(&raw_config, &ws.root)
+            .map_err(|errs| composition_errors_to_pipeline_error(&errs))?
     } else {
-        ProvenanceMap::new()
+        clinker_core::composition::raw_to_config_no_imports(&raw_config)
+            .map_err(|errs| composition_errors_to_pipeline_error(&errs))?
     };
+    let mut provenance = ProvenanceMap::new();
 
     // 6. Apply channel override (group inheritance + channel-specific)
     if let (Some(id), Some(ws)) = (&effective_channel, &workspace) {
@@ -532,6 +535,14 @@ fn check_warn_env_unset(
             derived.display()
         );
     }
+}
+
+/// Convert composition resolution errors to a PipelineError.
+fn composition_errors_to_pipeline_error(errs: &[CompositionError]) -> PipelineError {
+    let messages: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+    PipelineError::Config(clinker_core::config::ConfigError::Validation(
+        messages.join("; "),
+    ))
 }
 
 #[cfg(test)]

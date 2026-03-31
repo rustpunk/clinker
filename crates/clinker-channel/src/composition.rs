@@ -16,7 +16,7 @@ const MAX_IMPORT_DEPTH: usize = 10;
 /// A parsed `.comp.yaml` composition file.
 #[derive(Debug, Deserialize)]
 pub struct CompositionFile {
-    #[serde(rename = "_composition")]
+    #[serde(rename = "_compose")]
     pub header: CompositionHeader,
     #[serde(default)]
     pub transformations: Vec<TransformEntry>,
@@ -239,7 +239,7 @@ mod tests {
             tmp.path(),
             "compositions/clean.comp.yaml",
             r#"
-_composition:
+_compose:
   name: clean_customer
   description: "Standard normalization"
 
@@ -267,7 +267,7 @@ transformations:
             tmp.path(),
             "compositions/audit.comp.yaml",
             r#"
-_composition:
+_compose:
   name: audit
 
 transformations:
@@ -295,12 +295,12 @@ transformations:
         write_comp(
             tmp.path(),
             "compositions/a.comp.yaml",
-            "_composition:\n  name: a\ntransformations:\n  - name: from_a\n    cxl: \"emit a = 1\"\n",
+            "_compose:\n  name: a\ntransformations:\n  - name: from_a\n    cxl: \"emit a = 1\"\n",
         );
         write_comp(
             tmp.path(),
             "compositions/b.comp.yaml",
-            "_composition:\n  name: b\ntransformations:\n  - name: from_b\n    cxl: \"emit b = 2\"\n",
+            "_compose:\n  name: b\ntransformations:\n  - name: from_b\n    cxl: \"emit b = 2\"\n",
         );
 
         let mut config = base_config_with_transforms(vec![
@@ -319,7 +319,7 @@ transformations:
         write_comp(
             tmp.path(),
             "compositions/mid.comp.yaml",
-            "_composition:\n  name: mid\ntransformations:\n  - name: imported\n    cxl: \"emit x = 1\"\n",
+            "_compose:\n  name: mid\ntransformations:\n  - name: imported\n    cxl: \"emit x = 1\"\n",
         );
 
         let mut config = base_config_with_transforms(vec![
@@ -339,12 +339,12 @@ transformations:
         write_comp(
             tmp.path(),
             "compositions/inner.comp.yaml",
-            "_composition:\n  name: inner\ntransformations:\n  - name: deep\n    cxl: \"emit deep = true\"\n",
+            "_compose:\n  name: inner\ntransformations:\n  - name: deep\n    cxl: \"emit deep = true\"\n",
         );
         write_comp(
             tmp.path(),
             "compositions/outer.comp.yaml",
-            "_composition:\n  name: outer\ntransformations:\n  - name: shallow\n    cxl: \"emit shallow = true\"\n  - _import: compositions/inner.comp.yaml\n",
+            "_compose:\n  name: outer\ntransformations:\n  - name: shallow\n    cxl: \"emit shallow = true\"\n  - _import: compositions/inner.comp.yaml\n",
         );
 
         let mut config =
@@ -363,12 +363,12 @@ transformations:
         write_comp(
             tmp.path(),
             "compositions/a.comp.yaml",
-            "_composition:\n  name: a\ntransformations:\n  - _import: compositions/b.comp.yaml\n",
+            "_compose:\n  name: a\ntransformations:\n  - _import: compositions/b.comp.yaml\n",
         );
         write_comp(
             tmp.path(),
             "compositions/b.comp.yaml",
-            "_composition:\n  name: b\ntransformations:\n  - _import: compositions/a.comp.yaml\n",
+            "_compose:\n  name: b\ntransformations:\n  - _import: compositions/a.comp.yaml\n",
         );
 
         let mut config = base_config_with_transforms(vec![make_import("compositions/a.comp.yaml")]);
@@ -390,10 +390,7 @@ transformations:
             write_comp(
                 tmp.path(),
                 &format!("compositions/chain_{}.comp.yaml", i),
-                &format!(
-                    "_composition:\n  name: chain_{}\ntransformations:\n{}",
-                    i, next
-                ),
+                &format!("_compose:\n  name: chain_{}\ntransformations:\n{}", i, next),
             );
         }
 
@@ -413,7 +410,7 @@ transformations:
         write_comp(
             tmp.path(),
             "compositions/audit.comp.yaml",
-            "_composition:\n  name: audit\ntransformations:\n  - name: audit_ts\n    cxl: \"emit ts = now()\"\n  - name: audit_user\n    cxl: \"emit user = system\"\n",
+            "_compose:\n  name: audit\ntransformations:\n  - name: audit_ts\n    cxl: \"emit ts = now()\"\n  - name: audit_user\n    cxl: \"emit user = system\"\n",
         );
 
         let mut config = base_config_with_transforms(vec![
@@ -434,7 +431,7 @@ transformations:
         write_comp(
             tmp.path(),
             "compositions/audit.comp.yaml",
-            "_composition:\n  name: audit\ntransformations:\n  - name: imported\n    cxl: \"emit x = 1\"\n",
+            "_compose:\n  name: audit\ntransformations:\n  - name: imported\n    cxl: \"emit x = 1\"\n",
         );
 
         let mut config = base_config_with_transforms(vec![
@@ -453,7 +450,7 @@ transformations:
         write_comp(
             tmp.path(),
             "libs/audit.comp.yaml",
-            "_composition:\n  name: audit\ntransformations:\n  - name: from_var_path\n    cxl: \"emit x = 1\"\n",
+            "_compose:\n  name: audit\ntransformations:\n  - name: from_var_path\n    cxl: \"emit x = 1\"\n",
         );
 
         let mut config =
@@ -473,7 +470,7 @@ transformations:
         write_comp(
             tmp.path(),
             "shared/comps/audit.comp.yaml",
-            "_composition:\n  name: audit\ntransformations:\n  - name: ws_relative\n    cxl: \"emit x = 1\"\n",
+            "_compose:\n  name: audit\ntransformations:\n  - name: ws_relative\n    cxl: \"emit x = 1\"\n",
         );
 
         // Import path is workspace-root-relative, NOT relative to the importing file

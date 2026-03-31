@@ -203,7 +203,7 @@ transformations:
         ws,
         "compositions/audit.comp.yaml",
         r#"
-_composition:
+_compose:
   name: audit
 transformations:
   - name: audit_stamp
@@ -248,7 +248,7 @@ transformations:
         ws,
         "compositions/audit.comp.yaml",
         r#"
-_composition:
+_compose:
   name: audit
 transformations:
   - name: audit_stamp
@@ -312,7 +312,7 @@ fn test_e2e_add_composition_in_override() {
         ws,
         "compositions/extra.comp.yaml",
         r#"
-_composition:
+_compose:
   name: extra
 transformations:
   - name: extra_step
@@ -393,7 +393,7 @@ transformations:
         ws,
         "compositions/audit.comp.yaml",
         r#"
-_composition:
+_compose:
   name: audit
 transformations:
   - name: audit_stamp
@@ -845,7 +845,7 @@ transformations:
         ws,
         "compositions/audit.comp.yaml",
         r#"
-_composition:
+_compose:
   name: audit
 transformations:
   - name: audit_stamp

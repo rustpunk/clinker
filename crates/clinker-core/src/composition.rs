@@ -225,9 +225,72 @@ impl fmt::Display for CompositionError {
 ///
 /// Environment variable interpolation is applied before deserialization.
 pub fn parse_raw_config(yaml: &str) -> Result<RawPipelineConfig, ConfigError> {
-    let interpolated = crate::config::interpolate_env_vars(yaml, &[])?;
+    parse_raw_config_with_vars(yaml, &[])
+}
+
+/// Parse a raw pipeline config with extra variables for interpolation.
+///
+/// `extra_vars` are checked before system env vars during `${VAR}` expansion.
+pub fn parse_raw_config_with_vars(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
+) -> Result<RawPipelineConfig, ConfigError> {
+    let interpolated = crate::config::interpolate_env_vars(yaml, extra_vars)?;
     let config: RawPipelineConfig = serde_saphyr::from_str(&interpolated)?;
     Ok(config)
+}
+
+/// Load and parse a raw pipeline config from a YAML file with extra variables.
+pub fn load_raw_config_with_vars(
+    path: &Path,
+    extra_vars: &[(&str, &str)],
+) -> Result<RawPipelineConfig, ConfigError> {
+    let yaml = std::fs::read_to_string(path)?;
+    parse_raw_config_with_vars(&yaml, extra_vars)
+}
+
+/// Convert a `RawPipelineConfig` to a resolved `PipelineConfig` without
+/// resolving any imports (no workspace available).
+///
+/// Returns an error if any `_import` directives exist, since they cannot
+/// be resolved without a workspace root.
+pub fn raw_to_config_no_imports(
+    raw: &RawPipelineConfig,
+) -> Result<(PipelineConfig, Vec<ResolvedComposition>), Vec<CompositionError>> {
+    let mut resolved_transforms: Vec<TransformConfig> = Vec::new();
+    let mut errors: Vec<CompositionError> = Vec::new();
+
+    for entry in &raw.transformations {
+        match entry {
+            RawTransformEntry::Inline(transform) => {
+                resolved_transforms.push(transform.clone());
+            }
+            RawTransformEntry::Import(directive) => {
+                errors.push(CompositionError::IoError {
+                    path: directive.path.clone(),
+                    message: "_import requires a workspace (clinker.toml) for resolution".into(),
+                });
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let config = PipelineConfig {
+        pipeline: raw.pipeline.clone(),
+        inputs: raw.inputs.clone(),
+        outputs: raw.outputs.clone(),
+        transformations: resolved_transforms
+            .into_iter()
+            .map(TransformEntry::Transform)
+            .collect(),
+        error_handling: raw.error_handling.clone(),
+        notes: raw.notes.clone(),
+    };
+
+    Ok((config, Vec::new()))
 }
 
 /// Parse a `.comp.yaml` file from a YAML string.

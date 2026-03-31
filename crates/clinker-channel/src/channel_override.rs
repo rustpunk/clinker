@@ -838,7 +838,7 @@ mod tests {
         std::fs::write(
             comp_dir.join("audit.comp.yaml"),
             r#"
-_composition:
+_compose:
   name: audit_block
 
 transformations:
@@ -888,7 +888,7 @@ transformations:
         std::fs::create_dir_all(&comp_dir).unwrap();
         std::fs::write(
             comp_dir.join("audit.comp.yaml"),
-            "_composition:\n  name: audit\ntransformations:\n  - name: x\n    cxl: \"emit x = 1\"\n",
+            "_compose:\n  name: audit\ntransformations:\n  - name: x\n    cxl: \"emit x = 1\"\n",
         )
         .unwrap();
 
@@ -1013,7 +1013,7 @@ transformations:
         let comp_path = comp_dir.join("legacy.comp.yaml");
         std::fs::write(
             &comp_path,
-            "_composition:\n  name: legacy\ntransformations:\n  - name: legacy_a\n    cxl: \"emit a = 1\"\n",
+            "_compose:\n  name: legacy\ntransformations:\n  - name: legacy_a\n    cxl: \"emit a = 1\"\n",
         )
         .unwrap();
 
@@ -1084,7 +1084,7 @@ transformations:
         std::fs::create_dir_all(&comp_dir).unwrap();
         std::fs::write(
             comp_dir.join("unknown.comp.yaml"),
-            "_composition:\n  name: unknown\ntransformations: []\n",
+            "_compose:\n  name: unknown\ntransformations: []\n",
         )
         .unwrap();
 
@@ -1540,7 +1540,7 @@ transformations:
         let comp_path = comp_dir.join("legacy.comp.yaml");
         std::fs::write(
             &comp_path,
-            "_composition:\n  name: legacy\ntransformations:\n  - name: legacy_step\n    cxl: \"emit x = 1\"\n",
+            "_compose:\n  name: legacy\ntransformations:\n  - name: legacy_step\n    cxl: \"emit x = 1\"\n",
         )
         .unwrap();
         let canonical = std::fs::canonicalize(&comp_path).unwrap();
