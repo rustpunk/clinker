@@ -393,7 +393,45 @@ pub struct TransformConfig {
     pub cxl: String,
     pub local_window: Option<serde_json::Value>,
     pub log: Option<Vec<LogDirective>>,
-    pub validations: Option<serde_json::Value>,
+    pub validations: Option<Vec<ValidationEntry>>,
+}
+
+/// A declarative validation attached to a transform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationEntry {
+    pub name: Option<String>,
+    pub field: Option<String>,
+    pub check: String,
+    pub args: Option<IndexMap<String, serde_json::Value>>,
+    #[serde(default = "default_severity")]
+    pub severity: ValidationSeverity,
+    pub message: Option<String>,
+}
+
+fn default_severity() -> ValidationSeverity {
+    ValidationSeverity::Error
+}
+
+impl ValidationEntry {
+    /// Auto-derive name from field and check if not specified.
+    pub fn resolved_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            match &self.field {
+                Some(f) => format!("{}:{}", f, self.check),
+                None => self.check.clone(),
+            }
+        })
+    }
+}
+
+/// Validation severity: error routes to DLQ, warn logs and continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidationSeverity {
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "warn")]
+    Warn,
 }
 
 /// A logging directive attached to a transform.
@@ -1701,5 +1739,125 @@ transformations:
         let config = parse_config(&yaml).unwrap();
         let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
         assert_eq!(d.when, LogTiming::OnError);
+    }
+
+    // ── Validation config tests ───────────────────────────────────
+
+    fn yaml_with_validations(validations_block: &str) -> String {
+        format!(r#"
+pipeline:
+  name: test
+
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+    validations:
+{validations_block}
+"#)
+    }
+
+    #[test]
+    fn test_validation_config_basic() {
+        let yaml = yaml_with_validations(r#"
+      - check: "Amount > 0"
+        severity: error
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let t = config.transforms().next().unwrap();
+        let validations = t.validations.as_ref().unwrap();
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].check, "Amount > 0");
+        assert_eq!(validations[0].severity, ValidationSeverity::Error);
+    }
+
+    #[test]
+    fn test_validation_config_with_field() {
+        let yaml = yaml_with_validations(r#"
+      - field: Email
+        check: "validators.is_valid_email"
+        severity: error
+        message: "invalid email for {employee_id}"
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        assert_eq!(v.field.as_deref(), Some("Email"));
+        assert_eq!(v.message.as_deref(), Some("invalid email for {employee_id}"));
+    }
+
+    #[test]
+    fn test_validation_config_default_severity() {
+        let yaml = yaml_with_validations(r#"
+      - check: "Amount > 0"
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        assert_eq!(v.severity, ValidationSeverity::Error); // default
+    }
+
+    #[test]
+    fn test_validation_config_with_args() {
+        let yaml = yaml_with_validations(r#"
+      - field: salary
+        check: "validators.in_range"
+        args:
+          max: 500000
+          min: 0
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        let args = v.args.as_ref().unwrap();
+        assert_eq!(args["max"], serde_json::json!(500000));
+        assert_eq!(args["min"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_validation_order_before_emit() {
+        // Validations should be checked before emit — they appear in config
+        let yaml = yaml_with_validations(r#"
+      - check: "Amount > 0"
+        severity: error
+      - check: "Amount < 1000000"
+        severity: warn
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let vs = config.transforms().next().unwrap().validations.as_ref().unwrap();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0].check, "Amount > 0");
+        assert_eq!(vs[1].check, "Amount < 1000000");
+    }
+
+    #[test]
+    fn test_validation_module_fn_call() {
+        let yaml = yaml_with_validations(r#"
+      - field: salary
+        check: "validators.is_positive"
+        severity: error
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        assert_eq!(v.check, "validators.is_positive");
+    }
+
+    #[test]
+    fn test_validation_module_fn_with_args() {
+        let yaml = yaml_with_validations(r#"
+      - field: salary
+        check: "validators.in_range"
+        args:
+          max: 500000
+        severity: error
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        assert_eq!(v.check, "validators.in_range");
+        assert!(v.args.is_some());
     }
 }
