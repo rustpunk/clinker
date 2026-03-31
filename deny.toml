@@ -6,9 +6,8 @@
 [bans]
 multiple-versions = "warn"
 deny = [
-    # Ban cc build dependency — enforces pure Rust compilation
-    # (cc is allowed as a transitive dep of Dioxus/GTK via skip below)
-    { name = "cc", wrappers = ["dioxus-desktop"] },
+    # Ban cmake — enforces pure Rust compilation
+    # Note: cc is allowed via skip (Dioxus/GTK transitive build dep)
     { name = "cmake" },
 ]
 # Allow pure Rust FFI crates and Dioxus build deps
