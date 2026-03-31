@@ -290,4 +290,422 @@ transformations:
         // an appropriate error. The CLI maps this to exit code 130.)
         assert_eq!(crate::exit_codes::EXIT_INTERRUPTED, 130);
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // Phase 12: Filter + Distinct integration tests
+    // ══════════════════════════════════════════════════════════════
+
+    fn filter_yaml(cxl: &str) -> String {
+        let indented: String = cxl
+            .lines()
+            .map(|l| format!("      {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "pipeline:\n  name: filter_test\ninputs:\n  - name: src\n    type: csv\n    path: input.csv\noutputs:\n  - name: dest\n    type: csv\n    path: output.csv\ntransformations:\n  - name: t1\n    cxl: |\n{indented}\n"
+        )
+    }
+
+    // ── Filter tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_simple_predicate() {
+        let yaml = filter_yaml(
+            r#"filter status == "active"
+emit out_name = name"#,
+        );
+        let csv = "name,status\nAlice,active\nBob,inactive\nCharlie,active\n";
+        let (counters, dlq, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.total_count, 3);
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.filtered_count, 1);
+        assert_eq!(counters.dlq_count, 0);
+        assert!(dlq.is_empty());
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Charlie"));
+        assert!(!output.contains("Bob"));
+    }
+
+    #[test]
+    fn test_filter_compound_and_or() {
+        let yaml = filter_yaml(
+            r#"filter amount.to_int() > 100 or priority == "high"
+emit out_name = name
+emit out_amount = amount"#,
+        );
+        let csv = "name,amount,priority\nA,200,low\nB,50,high\nC,30,low\nD,150,medium\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 3); // A(200>100), B(high), D(150>100)
+        assert_eq!(counters.filtered_count, 1); // C(30,low)
+        assert!(!output.contains(",C,"));
+    }
+
+    #[test]
+    fn test_filter_with_let_binding() {
+        let yaml = filter_yaml(
+            r#"let derived = amount.to_int() * 2
+filter derived > 500
+emit out_name = name
+emit derived = derived"#,
+        );
+        let csv = "name,amount\nAlice,300\nBob,200\nCharlie,400\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 2); // Alice(600), Charlie(800)
+        assert_eq!(counters.filtered_count, 1); // Bob(400)
+        assert!(output.contains("Alice"));
+        assert!(!output.contains("Bob"));
+    }
+
+    #[test]
+    fn test_filter_null_field_skips() {
+        let yaml = filter_yaml(
+            r#"filter status == "active"
+emit out_name = name"#,
+        );
+        let csv = "name,status\nAlice,active\nBob,\nCharlie,active\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.filtered_count, 1); // Bob has empty status → null == "active" is false
+        assert!(!output.contains("Bob"));
+    }
+
+    #[test]
+    fn test_filter_all_rows_filtered() {
+        let yaml = filter_yaml(
+            r#"filter status == "active"
+emit out_name = name"#,
+        );
+        let csv = "name,status\nAlice,inactive\nBob,inactive\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.total_count, 2);
+        assert_eq!(counters.ok_count, 0);
+        assert_eq!(counters.filtered_count, 2);
+        // Output should be header-only or empty
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert!(lines.len() <= 1); // Just header or empty
+    }
+
+    #[test]
+    fn test_filter_multiple_filters_short_circuit() {
+        let yaml = filter_yaml(
+            r#"filter status == "active"
+filter amount.to_int() > 100
+emit out_name = name"#,
+        );
+        let csv = "name,status,amount\nAlice,active,200\nBob,inactive,300\nCharlie,active,50\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 1); // Only Alice passes both
+        assert_eq!(counters.filtered_count, 2); // Bob(first filter), Charlie(second filter)
+        assert!(output.contains("Alice"));
+        assert!(!output.contains("Bob"));
+        assert!(!output.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_filter_three_valued_or_with_null() {
+        let yaml = filter_yaml(
+            r#"filter optional == "yes" or required == "yes"
+emit out_name = name"#,
+        );
+        let csv = "name,optional,required\nA,,yes\nB,,no\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        // A: null or true → true (passes)
+        // B: null or false → null (filtered)
+        assert_eq!(counters.ok_count, 1);
+        assert_eq!(counters.filtered_count, 1);
+        assert!(output.contains("A"));
+    }
+
+    // ── Distinct tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_distinct_by_single_field() {
+        let yaml = filter_yaml(
+            r#"distinct by id
+emit out_id = id
+emit out_name = name"#,
+        );
+        let csv = "id,name\n1,Alice\n2,Bob\n1,Charlie\n3,Dave\n2,Eve\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 3); // 1,2,3
+        assert_eq!(counters.distinct_count, 2); // duplicate 1 and 2
+        assert!(output.contains("Alice")); // first occurrence of id=1
+        assert!(output.contains("Bob")); // first occurrence of id=2
+        assert!(!output.contains("Charlie")); // duplicate id=1
+        assert!(output.contains("Dave"));
+        assert!(!output.contains("Eve")); // duplicate id=2
+    }
+
+    #[test]
+    fn test_distinct_bare_all_fields() {
+        let yaml = filter_yaml(
+            r#"distinct
+emit out_name = name
+emit out_dept = dept"#,
+        );
+        let csv = "name,dept\nAlice,Eng\nBob,Sales\nAlice,Eng\nBob,HR\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 3); // Alice+Eng, Bob+Sales, Bob+HR are unique
+        assert_eq!(counters.distinct_count, 1); // Alice+Eng duplicate
+    }
+
+    #[test]
+    fn test_distinct_by_let_binding() {
+        let yaml = filter_yaml(
+            r#"let full = first + " " + last
+distinct by full
+emit full = full"#,
+        );
+        let csv = "first,last\nAlice,Smith\nBob,Jones\nAlice,Smith\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.distinct_count, 1);
+        assert!(output.contains("Alice Smith"));
+        assert!(output.contains("Bob Jones"));
+    }
+
+    #[test]
+    fn test_distinct_null_field_deduplicates() {
+        let yaml = filter_yaml(
+            r#"distinct by id
+emit out_id = id
+emit out_name = name"#,
+        );
+        let csv = "id,name\n1,Alice\n,Bob\n,Charlie\n2,Dave\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        // null id: Bob is first, Charlie is duplicate (NULL = NULL)
+        assert_eq!(counters.ok_count, 3); // 1, null(Bob), 2
+        assert_eq!(counters.distinct_count, 1); // null(Charlie)
+        assert!(output.contains("Bob"));
+        assert!(!output.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_distinct_preserves_first_fields() {
+        let yaml = filter_yaml(
+            r#"distinct by id
+emit out_id = id
+emit out_value = value"#,
+        );
+        let csv = "id,value\nA,100\nB,200\nA,999\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 2);
+        assert!(
+            output.contains("A,100") || output.contains("A,\"100\"") || output.contains(",100")
+        );
+        assert!(!output.contains("999")); // second A is dropped
+    }
+
+    #[test]
+    fn test_distinct_mixed_type_field() {
+        // String "1" vs numeric "1" — both are strings in CSV
+        let yaml = filter_yaml(
+            r#"distinct by code
+emit out_code = code"#,
+        );
+        let csv = "code\n1\n01\n1\n";
+        let (counters, _, _output) = run_pipeline(&yaml, csv).unwrap();
+        // "1" and "01" are different strings → both kept. Second "1" is duplicate.
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.distinct_count, 1);
+    }
+
+    // ── Combined filter + distinct ────────────────────────────────
+
+    #[test]
+    fn test_filter_then_distinct() {
+        let yaml = filter_yaml(
+            r#"filter status == "active"
+distinct by dept
+emit out_name = name
+emit out_dept = dept"#,
+        );
+        let csv = "name,status,dept\n\
+                   Alice,active,Eng\n\
+                   Bob,inactive,Eng\n\
+                   Charlie,active,Eng\n\
+                   Dave,active,Sales\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        // Bob filtered. Alice first active Eng. Charlie dup active Eng. Dave first active Sales.
+        assert_eq!(counters.ok_count, 2); // Alice, Dave
+        assert_eq!(counters.filtered_count, 1); // Bob
+        assert_eq!(counters.distinct_count, 1); // Charlie
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Dave"));
+        assert!(!output.contains("Bob"));
+        assert!(!output.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_distinct_then_filter() {
+        let yaml = filter_yaml(
+            r#"distinct by dept
+filter status == "active"
+emit out_name = name
+emit out_dept = dept"#,
+        );
+        let csv = "name,status,dept\n\
+                   Alice,inactive,Eng\n\
+                   Bob,active,Sales\n\
+                   Charlie,active,Eng\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        // Alice: first Eng (distinct passes), but inactive (filter rejects)
+        // Bob: first Sales (distinct passes), active (filter passes)
+        // Charlie: dup Eng (distinct rejects)
+        assert_eq!(counters.ok_count, 1); // Bob
+        assert_eq!(counters.filtered_count, 1); // Alice
+        assert_eq!(counters.distinct_count, 1); // Charlie
+        assert!(output.contains("Bob"));
+        assert!(!output.contains("Alice"));
+        assert!(!output.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_filter_distinct_combined_counters() {
+        let yaml = filter_yaml(
+            r#"filter status == "active"
+distinct by dept
+emit out_name = name"#,
+        );
+        let csv = "name,status,dept\n\
+                   A,active,Eng\n\
+                   B,inactive,Eng\n\
+                   C,active,Eng\n\
+                   D,active,Sales\n\
+                   E,inactive,Sales\n";
+        let (counters, _, _) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.total_count, 5);
+        assert_eq!(counters.ok_count, 2); // A, D
+        assert_eq!(counters.filtered_count, 2); // B, E
+        assert_eq!(counters.distinct_count, 1); // C
+        assert_eq!(counters.dlq_count, 0);
+        // Invariant: total = ok + filtered + distinct + dlq
+        assert_eq!(
+            counters.total_count,
+            counters.ok_count
+                + counters.filtered_count
+                + counters.distinct_count
+                + counters.dlq_count
+        );
+    }
+
+    // ── Stats + streaming tests ───────────────────────────────────
+
+    #[test]
+    fn test_streaming_filter_basic() {
+        // Streaming mode (no windows) — filter should work
+        let yaml = filter_yaml(
+            r#"filter amount.to_int() > 100
+emit out_name = name
+emit out_amount = amount"#,
+        );
+        let csv = "name,amount\nAlice,200\nBob,50\nCharlie,150\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.filtered_count, 1);
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Charlie"));
+        assert!(!output.contains("Bob"));
+    }
+
+    #[test]
+    fn test_streaming_distinct_global() {
+        // Streaming mode — global distinct (no windows)
+        let yaml = filter_yaml(
+            r#"distinct by category
+emit out_category = category
+emit out_first_item = name"#,
+        );
+        let csv = "name,category\nApple,Fruit\nBanana,Fruit\nCarrot,Veg\nDate,Fruit\nEgg,Protein\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        assert_eq!(counters.ok_count, 3); // Fruit, Veg, Protein
+        assert_eq!(counters.distinct_count, 2); // Banana, Date
+        assert!(output.contains("Apple")); // first Fruit
+        assert!(output.contains("Carrot"));
+        assert!(output.contains("Egg"));
+    }
+
+    #[test]
+    fn test_filter_distinct_order_matters_state() {
+        // A(active), A(inactive), B(active), B(active)
+        // distinct by name → filter active
+        let yaml = filter_yaml(
+            r#"distinct by name
+filter status == "active"
+emit out_name = name"#,
+        );
+        let csv = "name,status\nA,active\nA,inactive\nB,active\nB,active\n";
+        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        // A first: distinct passes, filter passes → emit
+        // A second: distinct rejects (dup)
+        // B first: distinct passes, filter passes → emit
+        // B second: distinct rejects (dup)
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.distinct_count, 2);
+        assert_eq!(counters.filtered_count, 0);
+        assert!(output.contains("A"));
+        assert!(output.contains("B"));
+    }
+
+    #[test]
+    fn test_filter_error_in_predicate_routes_to_dlq() {
+        let yaml = r#"
+pipeline:
+  name: filter_err
+error_handling:
+  strategy: continue
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: t1
+    cxl: |
+      filter amount.to_int() > 0
+      emit out_name = name
+"#;
+        let csv = "name,amount\nAlice,10\nBob,bad\nCharlie,5\n";
+        let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+        // Bob: "bad".to_int() → error → DLQ
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.dlq_count, 1);
+        assert_eq!(dlq.len(), 1);
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_distinct_high_cardinality() {
+        let yaml = filter_yaml(
+            r#"distinct by id
+emit out_id = id"#,
+        );
+        let mut csv = String::from("id\n");
+        for i in 0..1000 {
+            csv.push_str(&format!("{}\n", i % 100)); // 100 unique, 900 duplicates
+        }
+        let (counters, _, _) = run_pipeline(&yaml, &csv).unwrap();
+        assert_eq!(counters.ok_count, 100);
+        assert_eq!(counters.distinct_count, 900);
+        assert_eq!(counters.total_count, 1000);
+    }
+
+    #[test]
+    fn test_distinct_empty_string_vs_null() {
+        let yaml = filter_yaml(
+            r#"distinct by code
+emit out_code = code"#,
+        );
+        // Use quoted empty strings to be explicit
+        let csv = "code\n\"\"\nfoo\n\"\"\nbar\n";
+        let (counters, _, _output) = run_pipeline(&yaml, &csv).unwrap();
+        // Row 1: empty string "", Row 2: "foo", Row 3: empty string "" (dup), Row 4: "bar"
+        assert_eq!(counters.ok_count, 3); // "", "foo", "bar"
+        assert_eq!(counters.distinct_count, 1); // second ""
+    }
 }

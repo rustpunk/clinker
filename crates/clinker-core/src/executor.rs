@@ -19,7 +19,8 @@ use crate::projection::project_output;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
 use clinker_format::traits::{FormatReader, FormatWriter};
-use cxl::eval::{EvalContext, EvalResult, SkipReason, WallClock};
+use cxl::ast::Statement;
+use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
@@ -76,6 +77,25 @@ struct CompiledTransform {
     #[allow(dead_code)]
     name: String,
     typed: Arc<TypedProgram>,
+}
+
+impl CompiledTransform {
+    fn has_distinct(&self) -> bool {
+        self.typed
+            .program
+            .statements
+            .iter()
+            .any(|s| matches!(s, Statement::Distinct { .. }))
+    }
+
+}
+
+/// Build ProgramEvaluators for a set of compiled transforms.
+fn build_evaluators(transforms: &[CompiledTransform]) -> Vec<ProgramEvaluator> {
+    transforms
+        .iter()
+        .map(|t| ProgramEvaluator::new(Arc::clone(&t.typed), t.has_distinct()))
+        .collect()
 }
 
 /// Record that failed evaluation, queued for DLQ output.
@@ -171,6 +191,7 @@ impl PipelineExecutor {
         let mut counters = PipelineCounters::default();
         let mut dlq_entries = Vec::new();
         let strategy = config.error_handling.strategy;
+        let mut evaluators = build_evaluators(transforms);
 
         // Scan forward until a record emits, to derive the output schema.
         // Records that skip or error before the first emit are counted but
@@ -197,7 +218,7 @@ impl PipelineExecutor {
                 &params.batch_id,
                 &params.pipeline_vars,
             );
-            let result = evaluate_record(&record, transforms, &ctx);
+            let result = evaluate_record(&record, &mut evaluators, &ctx);
             match &result {
                 Ok(EvalResult::Emit(emitted)) => {
                     let projected = project_output(&record, emitted, output);
@@ -266,7 +287,7 @@ impl PipelineExecutor {
                 &params.batch_id,
                 &params.pipeline_vars,
             );
-            match evaluate_record(&record, transforms, &ctx) {
+            match evaluate_record(&record, &mut evaluators, &ctx) {
                 Ok(EvalResult::Emit(emitted)) => {
                     let projected = project_output(&record, &emitted, output);
                     csv_writer.write_record(&projected)?;
@@ -404,6 +425,7 @@ impl PipelineExecutor {
         let mut dlq_entries = Vec::new();
         let mut first_emit_pos: Option<u32> = None;
         let mut first_projected = None;
+        let mut evaluators = build_evaluators(transforms);
 
         for pos in 0..record_count {
             let record = build_record_from_arena(pos);
@@ -416,8 +438,15 @@ impl PipelineExecutor {
                 &params.batch_id,
                 &params.pipeline_vars,
             );
-            let result =
-                evaluate_record_with_window(&record, transforms, &ctx, plan, &arena, &indices, pos);
+            let result = evaluate_record_with_window(
+                &record,
+                &mut evaluators,
+                &ctx,
+                plan,
+                &arena,
+                &indices,
+                pos,
+            );
             counters.total_count += 1;
             match result {
                 Ok(EvalResult::Emit(emitted)) => {
@@ -481,6 +510,8 @@ impl PipelineExecutor {
 
             // Evaluate: parallel or sequential
             if use_parallel {
+                // Parallel: each thread gets fresh evaluators (stateless only —
+                // distinct forces Sequential so parallel never runs with distinct).
                 pool.install(|| {
                     chunk.par_iter_mut().for_each(|(pos, record, result)| {
                         let ctx = build_eval_context(
@@ -492,12 +523,20 @@ impl PipelineExecutor {
                             &params.batch_id,
                             &params.pipeline_vars,
                         );
+                        let mut local_evals = build_evaluators(transforms);
                         *result = Some(evaluate_record_with_window(
-                            record, transforms, &ctx, plan, &arena, &indices, *pos,
+                            record,
+                            &mut local_evals,
+                            &ctx,
+                            plan,
+                            &arena,
+                            &indices,
+                            *pos,
                         ));
                     });
                 });
             } else {
+                // Sequential: reuse shared evaluators (distinct state persists).
                 for (pos, record, result) in chunk.iter_mut() {
                     let ctx = build_eval_context(
                         config,
@@ -509,7 +548,13 @@ impl PipelineExecutor {
                         &params.pipeline_vars,
                     );
                     *result = Some(evaluate_record_with_window(
-                        record, transforms, &ctx, plan, &arena, &indices, *pos,
+                        record,
+                        &mut evaluators,
+                        &ctx,
+                        plan,
+                        &arena,
+                        &indices,
+                        *pos,
                     ));
                 }
             }
@@ -773,17 +818,21 @@ fn build_eval_context(
 /// so that later transforms can reference them as input fields.
 fn evaluate_record(
     record: &Record,
-    transforms: &[CompiledTransform],
+    evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
 ) -> Result<EvalResult, cxl::eval::EvalError> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
-    for t in transforms {
-        let emitted = cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, &record, None)?;
-        for (name, value) in &emitted {
-            record.set_overflow(name.clone().into_boxed_str(), value.clone());
+    for eval in evaluators.iter_mut() {
+        match eval.eval_record::<NullStorage>(ctx, &record, None)? {
+            EvalResult::Emit(emitted) => {
+                for (name, value) in &emitted {
+                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                }
+                all_emitted.extend(emitted);
+            }
+            skip @ EvalResult::Skip(_) => return Ok(skip),
         }
-        all_emitted.extend(emitted);
     }
     Ok(EvalResult::Emit(all_emitted))
 }
@@ -794,7 +843,7 @@ fn evaluate_record(
 /// so that later transforms can reference them as input fields.
 fn evaluate_record_with_window(
     record: &Record,
-    transforms: &[CompiledTransform],
+    evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
     plan: &ExecutionPlan,
     arena: &Arena,
@@ -804,10 +853,10 @@ fn evaluate_record_with_window(
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
 
-    for (i, t) in transforms.iter().enumerate() {
+    for (i, eval) in evaluators.iter_mut().enumerate() {
         let tp = &plan.transforms[i];
 
-        let emitted = if let Some(idx_num) = tp.window_index {
+        let result = if let Some(idx_num) = tp.window_index {
             // This transform uses windows — look up partition
             let spec = &plan.indices_to_build[idx_num];
             let index = &indices[idx_num];
@@ -830,24 +879,26 @@ fn evaluate_record_with_window(
                     let pos_in_partition =
                         partition.iter().position(|&p| p == record_pos).unwrap_or(0);
                     let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
-                    cxl::eval::eval_program(&t.typed, ctx, &record, Some(&wctx))?
+                    eval.eval_record(ctx, &record, Some(&wctx))?
                 } else {
-                    // Record not in any partition (null key) — eval without window
-                    cxl::eval::eval_program::<Arena>(&t.typed, ctx, &record, None)?
+                    eval.eval_record::<Arena>(ctx, &record, None)?
                 }
             } else {
-                // Null key — eval without window
-                cxl::eval::eval_program::<Arena>(&t.typed, ctx, &record, None)?
+                eval.eval_record::<Arena>(ctx, &record, None)?
             }
         } else {
-            // Stateless transform — no window
-            cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, &record, None)?
+            eval.eval_record::<NullStorage>(ctx, &record, None)?
         };
 
-        for (name, value) in &emitted {
-            record.set_overflow(name.clone().into_boxed_str(), value.clone());
+        match result {
+            EvalResult::Emit(emitted) => {
+                for (name, value) in &emitted {
+                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                }
+                all_emitted.extend(emitted);
+            }
+            skip @ EvalResult::Skip(_) => return Ok(skip),
         }
-        all_emitted.extend(emitted);
     }
 
     Ok(EvalResult::Emit(all_emitted))
