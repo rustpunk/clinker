@@ -21,6 +21,7 @@ use crate::components::{
     inspector::InspectorPanel,
     run_log::RunLogDrawer,
     composition_panel::CompositionPanel,
+    channel_mode::ChannelMode,
     placeholder_page::PlaceholderPage,
     schema_panel::SchemaPanel,
     schematics::SchematicsPanel,
@@ -43,7 +44,7 @@ use clinker_schema::SchemaIndex;
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
 use crate::state::{AppState, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState, use_app_state};
-use crate::sync::{serialize_yaml, try_parse_yaml, EditSource, ParseResult};
+use crate::sync::{serialize_raw_yaml, try_parse_yaml, EditSource, ParseResult};
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -66,6 +67,11 @@ pub fn AppShell() -> Element {
     let compositions = use_signal(Vec::new);
     let contract_warnings = use_signal(Vec::new);
     let mut partial_pipeline = use_signal(|| None);
+    let mut channel_pipeline: Signal<Option<crate::channel_resolve::ChannelResolution>> =
+        use_signal(|| None);
+    let channel_view_mode = use_signal(|| crate::state::ChannelViewMode::default());
+    let expanded_compositions = use_signal(std::collections::HashSet::new);
+    let composition_drill_stack = use_signal(Vec::new);
 
     // ── Session restore (single call on first mount per use_signal) ─────
     // restore_session() is called in the first use_signal closure. The result
@@ -107,6 +113,7 @@ pub fn AppShell() -> Element {
     let mut composition_index: Signal<crate::composition_index::CompositionIndex> =
         use_signal(crate::composition_index::CompositionIndex::default);
     let show_settings: Signal<bool> = use_signal(|| false);
+    let mut channel_state: Signal<Option<crate::state::ChannelState>> = use_signal(|| None);
 
     // ── Git: detect repo and compute status on workspace change ──────────
     {
@@ -153,6 +160,44 @@ pub fn AppShell() -> Element {
         });
     }
 
+    // ── Channel state: discover channels when workspace changes ────────
+    {
+        use_effect(move || {
+            let ws = (workspace)();
+            if let Some(ref ws) = ws {
+                let mut state = workspace::discover_channels(ws);
+                // Restore persisted channel selection
+                if let Some(ref mut cs) = state {
+                    if let Some(ref chan_persist) = ws.state.channels {
+                        cs.active_channel = chan_persist.active.clone();
+                        cs.recent_channels = chan_persist.recent.clone();
+                    } else if cs.default_channel.is_some() {
+                        // Use default_channel from clinker.toml on first load
+                        cs.active_channel = cs.default_channel.clone();
+                    }
+                }
+                channel_state.set(state);
+            } else {
+                channel_state.set(None);
+            }
+        });
+    }
+
+    // ── Workspace available: re-parse active tab to resolve compositions ──
+    // On startup, tabs may restore before the workspace signal is set.
+    // When workspace becomes available, trigger a re-parse so resolve_imports()
+    // can find .comp.yaml files relative to the workspace root.
+    {
+        use_effect(move || {
+            let ws = (workspace)();
+            let text = (yaml_text)();
+            let source = (edit_source)();
+            if ws.is_some() && !text.is_empty() && source == EditSource::None {
+                edit_source.set(EditSource::Yaml);
+            }
+        });
+    }
+
     // ── Filesystem watcher: auto-refresh git status + schema index ─────
     // Spawns a background watcher on the workspace root. Debounced 500ms.
     {
@@ -192,6 +237,7 @@ pub fn AppShell() -> Element {
         let pipeline_layout = pipeline_layout;
         let run_log_expanded = run_log_expanded;
         let activity_bar_visible = activity_bar_visible;
+        let channel_state = channel_state;
         move || {
             workspace::save_full_session(
                 &workspace.peek(),
@@ -201,6 +247,7 @@ pub fn AppShell() -> Element {
                 *pipeline_layout.peek(),
                 *run_log_expanded.peek(),
                 *activity_bar_visible.peek(),
+                &channel_state.peek(),
             );
         }
     });
@@ -216,6 +263,7 @@ pub fn AppShell() -> Element {
         let pipeline_layout = pipeline_layout;
         let run_log_expanded = run_log_expanded;
         let activity_bar_visible = activity_bar_visible;
+        let channel_state = channel_state;
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -227,6 +275,7 @@ pub fn AppShell() -> Element {
                     *pipeline_layout.peek(),
                     *run_log_expanded.peek(),
                     *activity_bar_visible.peek(),
+                    &channel_state.peek(),
                 );
             }
         }
@@ -262,8 +311,18 @@ pub fn AppShell() -> Element {
                 pipeline.set(new_tab.snapshot.pipeline.clone());
                 partial_pipeline.set(new_tab.snapshot.partial_pipeline.clone());
                 parse_errors.set(new_tab.snapshot.parse_errors.clone());
-                edit_source.set(new_tab.snapshot.edit_source);
                 selected_stage.set(new_tab.snapshot.selected_stage.clone());
+
+                // If tab was loaded from disk (edit_source == None) and has content,
+                // trigger a full re-parse to resolve _import compositions.
+                // parse_yaml_raw_path() used during tab creation skips resolve_imports().
+                if new_tab.snapshot.edit_source == EditSource::None
+                    && !new_tab.snapshot.yaml_text.is_empty()
+                {
+                    edit_source.set(EditSource::Yaml);
+                } else {
+                    edit_source.set(new_tab.snapshot.edit_source);
+                }
             }
         } else {
             // No active tab — clear signals
@@ -291,6 +350,7 @@ pub fn AppShell() -> Element {
                 (pipeline_layout)(),
                 (run_log_expanded)(),
                 (activity_bar_visible)(),
+                &(channel_state)(),
             );
             workspace::save_workspace_state(&ws.root, &state);
             workspace::save_last_workspace(&ws.root);
@@ -313,6 +373,10 @@ pub fn AppShell() -> Element {
         raw_pipeline,
         compositions,
         contract_warnings,
+        channel_pipeline,
+        channel_view_mode,
+        expanded_compositions,
+        composition_drill_stack,
     };
 
     let mut app_state_signal = use_signal(|| current_app_state);
@@ -334,6 +398,7 @@ pub fn AppShell() -> Element {
         show_settings,
         activity_bar_visible,
         nav_history,
+        channel_state,
     });
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
@@ -353,6 +418,7 @@ pub fn AppShell() -> Element {
         show_settings,
         activity_bar_visible,
         nav_history,
+        channel_state,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
@@ -403,16 +469,53 @@ pub fn AppShell() -> Element {
 
         use_effect(move || {
             let source = (edit_source)();
-            let pipeline_val = (pipeline)();
+            let raw_val = (raw_pipeline)();
 
             if source != EditSource::Inspector {
                 return;
             }
 
-            if let Some(ref config) = pipeline_val {
-                let yaml = serialize_yaml(config);
+            if let Some(ref config) = raw_val {
+                let yaml = serialize_raw_yaml(config);
                 yaml_text.set(yaml);
                 parse_errors.set(Vec::new());
+            }
+        });
+    }
+
+    // ── Channel resolution: resolve pipeline through channel overrides ────
+    {
+        use_effect(move || {
+            let pl = (pipeline)();
+            let cs = (channel_state)();
+
+            let active_id = cs.as_ref().and_then(|s| s.active_channel.clone());
+
+            match (pl.as_ref(), active_id, cs.as_ref()) {
+                (Some(config), Some(channel_id), Some(cs_ref)) => {
+                    // Derive pipeline path from active tab
+                    let pl_path = (active_tab_id)().and_then(|id| {
+                        tabs.read()
+                            .iter()
+                            .find(|t| t.id == id)
+                            .and_then(|t| t.file_path.clone())
+                    });
+
+                    match crate::channel_resolve::resolve_pipeline_for_channel(
+                        config,
+                        &channel_id,
+                        cs_ref,
+                        pl_path.as_deref(),
+                    ) {
+                        Ok(resolution) => channel_pipeline.set(Some(resolution)),
+                        Err(_e) => {
+                            channel_pipeline.set(None);
+                        }
+                    }
+                }
+                _ => {
+                    channel_pipeline.set(None);
+                }
             }
         });
     }
@@ -509,12 +612,7 @@ pub fn AppShell() -> Element {
                             },
                             NavigationContext::Git => rsx! { VersionMode {} },
                             NavigationContext::Docs => rsx! { SchematicsPanel {} },
-                            NavigationContext::Channels => rsx! {
-                                PlaceholderPage {
-                                    name: "Channels",
-                                    description: "Channel management, pipeline overrides, and health monitoring.",
-                                }
-                            },
+                            NavigationContext::Channels => rsx! { ChannelMode {} },
                             NavigationContext::Runs => rsx! {
                                 PlaceholderPage {
                                     name: "Run History",
@@ -603,14 +701,17 @@ fn ActiveTabContent() -> Element {
 
             CanvasPanel {}
 
-            if let Some(ref stage_id) = (selected_stage)() {
-                InspectorPanel {
-                    key: "{stage_id}",
-                    stage_id: stage_id.clone(),
+            // Hide inspector and YAML sidebar when drilled into a composition
+            if (state.composition_drill_stack)().is_empty() {
+                if let Some(ref stage_id) = (selected_stage)() {
+                    InspectorPanel {
+                        key: "{stage_id}",
+                        stage_id: stage_id.clone(),
+                    }
                 }
-            }
 
-            YamlSidebar {}
+                YamlSidebar {}
+            }
         }
     }
 }

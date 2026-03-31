@@ -18,7 +18,7 @@ use crate::components::confirm_dialog::PendingConfirm;
 use crate::components::toast::{toast_error, toast_success, ToastState};
 use crate::file_ops;
 use crate::state::{AppState, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState};
-use crate::sync::serialize_yaml;
+use crate::sync::serialize_raw_yaml;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -85,6 +85,26 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         }
     }
 
+    // ── Backspace/Escape — drill-in navigation (Pipeline context only) ───
+    if !ctrl && !alt && !shift && current_context == NavigationContext::Pipeline {
+        let mut drill_sig = app.composition_drill_stack;
+        let drill_stack = drill_sig.read();
+        if !drill_stack.is_empty() {
+            drop(drill_stack);
+            match key {
+                Key::Backspace => {
+                    drill_sig.write().pop();
+                    return true;
+                }
+                Key::Escape => {
+                    drill_sig.write().clear();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ── All remaining shortcuts require Ctrl ─────────────────────────────
     if !ctrl {
         return false;
@@ -126,6 +146,17 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         // Ctrl+Shift+R — Switch to Runs context
         Key::Character(ref c) if c == "R" && shift => {
             switch_context(&app, tab_mgr, NavigationContext::Runs);
+            true
+        }
+
+        // Ctrl+Shift+K — Channel switcher (toggle)
+        Key::Character(ref c) if c == "K" && shift => {
+            // Navigate to Channels context as a toggle
+            if current_context == NavigationContext::Channels {
+                switch_context(&app, tab_mgr, NavigationContext::Pipeline);
+            } else {
+                switch_context(&app, tab_mgr, NavigationContext::Channels);
+            }
             true
         }
 
@@ -365,8 +396,8 @@ fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: b
             return;
         };
 
-        let yaml = match tab.snapshot.pipeline {
-            Some(ref config) => serialize_yaml(config),
+        let yaml = match tab.snapshot.raw_pipeline {
+            Some(ref config) => serialize_raw_yaml(config),
             None => tab.snapshot.yaml_text.clone(),
         };
 

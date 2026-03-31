@@ -7,12 +7,17 @@ inputs:
     path: ./data/invoices.csv
     options:
       has_header: true
-
   - name: customers
     type: csv
     path: ./data/customers.csv
     options:
       has_header: true
+
+outputs:
+  - name: rollup
+    type: csv
+    path: ./output/invoice_rollup.csv
+    include_unmapped: false
 
 transformations:
   - name: recent_only
@@ -29,12 +34,6 @@ transformations:
     cxl: |
       emit total_amount = sum(amount)
       emit invoice_count = count(invoice_id)
-
-outputs:
-  - name: rollup
-    type: csv
-    path: ./output/invoice_rollup.csv
-    include_unmapped: false
 
 error_handling:
   strategy: continue
