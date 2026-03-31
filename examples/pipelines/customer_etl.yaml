@@ -20,9 +20,9 @@ outputs:
 
 transformations:
   - name: active_only
-    description: Filter to active customers
+    description: Flag active customers (filter statement added in Phase 12)
     cxl: |
-      emit _include = status == "active"
+      emit is_active = status == "active"
     _notes:
       fields:
         cxl: The status field uses lowercase string values.
@@ -36,12 +36,12 @@ transformations:
     overrides:
       check_email_format:
         cxl: |
-          emit email_valid = email_lower matches "^[^@]+@(acme|globex)\\.com$"
+          emit email_valid = email_lower.matches("^[^@]+@(acme|globex)\\.com$")
 
   - name: final_flag
     description: Flag high-value customers
     cxl: |
-      emit tier = if lifetime_value > 10000 then "gold" else "standard"
+      emit tier = if lifetime_value.to_int() > 10000 then "gold" else "standard"
 
 error_handling:
   strategy: fail_fast
