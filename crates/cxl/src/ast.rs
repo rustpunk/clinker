@@ -84,10 +84,11 @@ pub enum Expr {
         name: Box<str>,
         span: Span,
     },
+    /// Qualified field reference — N-part dotted path.
+    /// 2 parts: source.field (existing). 3 parts: source.record_type.field (multi-record).
     QualifiedFieldRef {
         node_id: NodeId,
-        source: Box<str>,
-        field: Box<str>,
+        parts: Box<[Box<str>]>,
         span: Span,
     },
     MethodCall {

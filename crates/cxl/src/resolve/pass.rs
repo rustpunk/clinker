@@ -130,12 +130,11 @@ impl<'a> Resolver<'a> {
             Expr::FieldRef { node_id, name, span } => {
                 self.resolve_field_ref(*node_id, name, *span);
             }
-            Expr::QualifiedFieldRef { node_id, source, field, span } => {
-                // For now, treat source.field as a qualified field lookup
-                // The runtime FieldResolver handles the actual lookup
+            Expr::QualifiedFieldRef { node_id, parts, span } => {
+                // Qualified field lookup — runtime FieldResolver handles resolution.
+                // 2-part: source.field, 3-part: source.record_type.field
                 self.bind(*node_id, ResolvedBinding::Field(0));
-                // Also try to resolve the source as a known identifier
-                let _ = (source, field, span);
+                let _ = (parts, span);
             }
             Expr::PipelineAccess { node_id, field, span } => {
                 if PIPELINE_MEMBERS.contains(&&**field) {

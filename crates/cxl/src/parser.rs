@@ -364,10 +364,28 @@ impl Parser {
                             span: Span::new(lhs_span.start as usize, end.end as usize),
                         };
                     } else {
-                        // Field access → QualifiedFieldRef
+                        // Field access → QualifiedFieldRef (supports chained dots)
                         let end = self.prev_span();
-                        let source_name = match &lhs {
-                            Expr::FieldRef { name, .. } => name.clone(),
+                        let new_span = Span::new(lhs_span.start as usize, end.end as usize);
+                        match lhs {
+                            Expr::FieldRef { name, .. } => {
+                                let nid = self.alloc_id();
+                                lhs = Expr::QualifiedFieldRef {
+                                    node_id: nid,
+                                    parts: vec![name, method_name.into()].into_boxed_slice(),
+                                    span: new_span,
+                                };
+                            }
+                            Expr::QualifiedFieldRef { parts, .. } => {
+                                let nid = self.alloc_id();
+                                let mut new_parts = parts.into_vec();
+                                new_parts.push(method_name.into());
+                                lhs = Expr::QualifiedFieldRef {
+                                    node_id: nid,
+                                    parts: new_parts.into_boxed_slice(),
+                                    span: new_span,
+                                };
+                            }
                             _ => {
                                 // For chained access like window.lag(1).field, keep as method
                                 let nid = self.alloc_id();
@@ -376,18 +394,11 @@ impl Parser {
                                     receiver: Box::new(lhs),
                                     method: method_name.into(),
                                     args: vec![],
-                                    span: Span::new(lhs_span.start as usize, end.end as usize),
+                                    span: new_span,
                                 };
                                 continue;
                             }
-                        };
-                        let nid = self.alloc_id();
-                        lhs = Expr::QualifiedFieldRef {
-                            node_id: nid,
-                            source: source_name,
-                            field: method_name.into(),
-                            span: Span::new(lhs_span.start as usize, end.end as usize),
-                        };
+                        }
                     }
                     continue;
                 }
@@ -940,9 +951,10 @@ mod tests {
         let r = parse_ok("let x = source.field");
         let expr = let_expr(&r);
         match expr {
-            Expr::QualifiedFieldRef { source, field, .. } => {
-                assert_eq!(&**source, "source");
-                assert_eq!(&**field, "field");
+            Expr::QualifiedFieldRef { parts, .. } => {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(&*parts[0], "source");
+                assert_eq!(&*parts[1], "field");
             }
             _ => panic!("expected QualifiedFieldRef"),
         }

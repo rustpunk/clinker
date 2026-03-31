@@ -28,6 +28,11 @@ impl Arena {
         }
     }
 
+    /// Create an Arena from pre-built parts (used by MultiRecordDispatcher).
+    pub fn from_parts(schema: Arc<Schema>, records: Vec<MinimalRecord>) -> Self {
+        Arena { schema, records }
+    }
+
     /// Stream records from reader, storing only the named fields.
     ///
     /// `fields`: field names to project into the Arena (from `IndexSpec.arena_fields`).

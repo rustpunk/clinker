@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod dispatch;
 pub mod index;
 pub mod ingestion;
 pub mod loser_tree;

@@ -399,7 +399,7 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
             cxl::ast::LiteralValue::Null => "null".into(),
         },
         cxl::ast::Expr::FieldRef { name, .. } => name.to_string(),
-        cxl::ast::Expr::QualifiedFieldRef { source, field, .. } => format!("{}.{}", source, field),
+        cxl::ast::Expr::QualifiedFieldRef { parts, .. } => parts.iter().map(|p| &**p).collect::<Vec<_>>().join("."),
         cxl::ast::Expr::Now { .. } => "now".into(),
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
         cxl::ast::Expr::PipelineAccess { field, .. } => format!("pipeline.{}", field),

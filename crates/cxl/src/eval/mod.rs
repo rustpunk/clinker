@@ -79,8 +79,17 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             Ok(resolver.resolve(name).unwrap_or(Value::Null))
         }
 
-        Expr::QualifiedFieldRef { source, field, .. } => {
-            Ok(resolver.resolve_qualified(source, field).unwrap_or(Value::Null))
+        Expr::QualifiedFieldRef { parts, .. } => {
+            match parts.len() {
+                2 => Ok(resolver.resolve_qualified(&parts[0], &parts[1]).unwrap_or(Value::Null)),
+                3 => {
+                    // Three-part path: source.record_type.field
+                    // Join first two parts as the compound source key
+                    let compound = format!("{}.{}", &parts[0], &parts[1]);
+                    Ok(resolver.resolve_qualified(&compound, &parts[2]).unwrap_or(Value::Null))
+                }
+                _ => Ok(Value::Null),
+            }
         }
 
         Expr::PipelineAccess { field, .. } => {
