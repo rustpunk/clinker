@@ -14,6 +14,7 @@ mod components;
 mod composition_index;
 mod composition_ops;
 mod cxl_bridge;
+mod debug_state;
 mod demo;
 mod file_ops;
 mod fs_watcher;
