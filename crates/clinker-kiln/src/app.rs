@@ -390,6 +390,38 @@ pub fn AppShell() -> Element {
         nav_history,
         channel_state,
     });
+    // ── Debug state context ────────────────────────────────────────────
+    {
+        use crate::debug_state::{DebugRunState, DebugState, DebugTab};
+        use std::collections::{HashMap, HashSet};
+
+        let debug_run_state = use_signal(|| DebugRunState::Idle);
+        let debug_breakpoints = use_signal(HashSet::new);
+        let debug_cond_breakpoints = use_signal(HashMap::new);
+        let debug_drawer_open = use_signal(|| false);
+        let debug_drawer_stage = use_signal(|| None::<String>);
+        let debug_drawer_tab = use_signal(DebugTab::default);
+        let debug_stage_cache = use_signal(HashMap::new);
+        let debug_watches = use_signal(Vec::new);
+        let debug_watch_collapsed = use_signal(|| false);
+        let debug_editing_bp_stage = use_signal(|| None::<String>);
+        let debug_downstream_dim_set = use_signal(HashSet::new);
+
+        use_context_provider(|| DebugState {
+            run_state: debug_run_state,
+            breakpoints: debug_breakpoints,
+            cond_breakpoints: debug_cond_breakpoints,
+            drawer_open: debug_drawer_open,
+            drawer_stage: debug_drawer_stage,
+            drawer_tab: debug_drawer_tab,
+            stage_cache: debug_stage_cache,
+            watches: debug_watches,
+            watch_collapsed: debug_watch_collapsed,
+            editing_bp_stage: debug_editing_bp_stage,
+            downstream_dim_set: debug_downstream_dim_set,
+        });
+    }
+
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
 

@@ -1,8 +1,10 @@
 #![allow(dead_code)] // Types consumed starting Phase 2+
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use clinker_record::Value;
+use dioxus::prelude::*;
 
 /// Drives title bar control visibility and canvas node styling.
 /// Transitions: Idle → Running → Paused → Running → Completed → Idle.
@@ -229,6 +231,30 @@ pub struct StageDebugData {
 pub struct WatchExpression {
     pub expr: String,
     pub values: Vec<Option<f64>>,
+}
+
+// ── Debug lifecycle context ───────────────────────────────
+
+/// Debug lifecycle state, provided at AppShell root.
+/// Copy-able — all fields are Signal<T> (cheap handles).
+#[derive(Clone, Copy)]
+pub struct DebugState {
+    pub run_state: Signal<DebugRunState>,
+    pub breakpoints: Signal<HashSet<String>>,
+    pub cond_breakpoints: Signal<HashMap<String, String>>,
+    pub drawer_open: Signal<bool>,
+    pub drawer_stage: Signal<Option<String>>,
+    pub drawer_tab: Signal<DebugTab>,
+    pub stage_cache: Signal<HashMap<String, StageDebugData>>,
+    pub watches: Signal<Vec<WatchExpression>>,
+    pub watch_collapsed: Signal<bool>,
+    pub editing_bp_stage: Signal<Option<String>>,
+    pub downstream_dim_set: Signal<HashSet<String>>,
+}
+
+/// Convenience accessor — same pattern as use_app_state() in state.rs.
+pub fn use_debug_state() -> DebugState {
+    use_context::<DebugState>()
 }
 
 #[cfg(test)]
