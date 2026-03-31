@@ -11,6 +11,7 @@ pub enum FormatError {
     Csv(csv::Error),
     Json(String),
     Xml(String),
+    FixedWidth(String),
     InvalidRecord { row: u64, message: String },
     SchemaInference(String),
 }
@@ -22,6 +23,7 @@ impl fmt::Display for FormatError {
             Self::Csv(e) => write!(f, "CSV error: {e}"),
             Self::Json(msg) => write!(f, "JSON error: {msg}"),
             Self::Xml(msg) => write!(f, "XML error: {msg}"),
+            Self::FixedWidth(msg) => write!(f, "fixed-width error: {msg}"),
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
             }

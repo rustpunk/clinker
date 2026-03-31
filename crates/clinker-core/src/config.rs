@@ -1,4 +1,4 @@
-use clinker_record::schema_def::{FieldDef, SchemaDefinition};
+use clinker_record::schema_def::{FieldDef, LineSeparator, SchemaDefinition};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::de::{self, MapAccess, Visitor};
@@ -80,6 +80,7 @@ pub enum InputFormat {
     Csv(Option<CsvInputOptions>),
     Json(Option<JsonInputOptions>),
     Xml(Option<XmlInputOptions>),
+    FixedWidth(Option<FixedWidthInputOptions>),
 }
 
 /// CSV-specific input options.
@@ -178,6 +179,7 @@ pub enum OutputFormat {
     Csv(Option<CsvOutputOptions>),
     Json(Option<JsonOutputOptions>),
     Xml(Option<XmlOutputOptions>),
+    FixedWidth(Option<FixedWidthOutputOptions>),
 }
 
 /// CSV-specific output options.
@@ -210,6 +212,20 @@ pub enum JsonOutputFormat {
 pub struct XmlOutputOptions {
     pub root_element: Option<String>,
     pub record_element: Option<String>,
+}
+
+/// Fixed-width input options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FixedWidthInputOptions {
+    pub line_separator: Option<LineSeparator>,
+}
+
+/// Fixed-width output options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FixedWidthOutputOptions {
+    pub line_separator: Option<LineSeparator>,
 }
 
 /// Sort field specification for output and window partition ordering.
