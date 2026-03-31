@@ -863,6 +863,13 @@ input:-webkit-autofill:focus {
    (the inspector component is conditionally mounted, so no CSS hide needed). */
 .kiln-main[data-layout="editor"] .kiln-inspector { display: none; }
 
+/* Schematics layout: pipeline autodoc takes full width, hide everything else */
+.kiln-main[data-layout="schematics"] .kiln-canvas-panel { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-yaml-sidebar { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-inspector { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-left-panel { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-schematics { flex: 1; }
+
 /* ── 6b. Left panel slot (search / schemas) ─────────────────────────────────
    280px slide-in from left. Only one open at a time. Pushes canvas narrower.
    ─────────────────────────────────────────────────────────────────────── */
@@ -4552,14 +4559,311 @@ input:-webkit-autofill:focus {
   color: var(--kiln-iron);
 }
 
+/* ── Docs drawer: section headings ──────────────────────────────────────── */
+.kiln-docs-section {
+  margin-bottom: 12px;
+}
+
+.kiln-docs-section-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 6px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+.kiln-docs-user-desc {
+  font-family: var(--kiln-font-blueprint);
+  font-size: 11px;
+  color: var(--kiln-bp-text);
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--kiln-bp-accent-30);
+}
+
+.kiln-docs-meta-value--badge {
+  font-weight: 600;
+  color: #D4A017;
+}
+
+.kiln-docs-meta-value--path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+/* ── Schema table ──────────────────────────────────────────────────────── */
+.kiln-docs-schema-table {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  width: 100%;
+}
+
+.kiln-docs-schema-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1.5fr;
+  gap: 4px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+.kiln-docs-schema-row--header {
+  font-family: var(--kiln-font-ui);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  border-bottom: 1px solid var(--kiln-bp-accent-30);
+}
+
+.kiln-docs-schema-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--kiln-bp-text);
+}
+
+.kiln-docs-schema-cell--name {
+  color: var(--kiln-bp-accent);
+  font-weight: 500;
+}
+
+/* ── Lineage table ─────────────────────────────────────────────────────── */
+.kiln-docs-lineage-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kiln-docs-lineage-row {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+.kiln-docs-lineage-field {
+  margin-bottom: 4px;
+}
+
+.kiln-docs-lineage-expr {
+  margin-bottom: 3px;
+}
+
+.kiln-docs-lineage-code {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 5%, transparent);
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+
+.kiln-docs-lineage-refs {
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+}
+
+.kiln-docs-lineage-refs-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kiln-docs-lineage-ref {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  margin-right: 6px;
+  color: var(--kiln-bp-text);
+}
+
+/* ── Contract section ──────────────────────────────────────────────────── */
+.kiln-docs-contract-group {
+  margin-bottom: 8px;
+}
+
+.kiln-docs-contract-heading {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 3px;
+}
+
+.kiln-docs-contract-field {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.kiln-docs-contract-name {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-accent);
+}
+
+.kiln-docs-contract-type {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+}
+
+/* ── Provenance diff ───────────────────────────────────────────────────── */
+.kiln-docs-diff {
+  margin-top: 6px;
+}
+
+.kiln-docs-diff-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 3px;
+}
+
+.kiln-docs-diff-block {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 8px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+  border-radius: 2px;
+}
+
+.kiln-docs-diff-block--original {
+  color: #B7410E;
+  background: color-mix(in srgb, #B7410E 6%, transparent);
+  border: 1px solid color-mix(in srgb, #B7410E 20%, transparent);
+}
+
+.kiln-docs-diff-block--current {
+  color: var(--kiln-bp-accent);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--kiln-bp-accent) 20%, transparent);
+}
+
+/* ── CXL statement badges ──────────────────────────────────────────────── */
+.kiln-docs-stmt-badge {
+  display: inline-block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  margin-right: 6px;
+  border: 1px solid;
+  border-radius: 0;
+}
+
+.kiln-docs-stmt-badge[data-kind="emit"] {
+  color: var(--kiln-bp-accent);
+  border-color: color-mix(in srgb, var(--kiln-bp-accent) 40%, transparent);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="filter"] {
+  color: #D4A017;
+  border-color: color-mix(in srgb, #D4A017 40%, transparent);
+  background: color-mix(in srgb, #D4A017 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="let"] {
+  color: #8A7E6E;
+  border-color: color-mix(in srgb, #8A7E6E 40%, transparent);
+  background: color-mix(in srgb, #8A7E6E 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="log"] {
+  color: #666;
+  border-color: color-mix(in srgb, #666 40%, transparent);
+  background: color-mix(in srgb, #666 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="expr"] {
+  color: var(--kiln-bp-text-dim);
+  border-color: var(--kiln-bp-border);
+}
+
+.kiln-docs-field-refs-summary {
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--kiln-bp-accent) 5%, transparent);
+  border-left: 2px solid var(--kiln-bp-accent-30);
+}
+
+/* Stage card: CXL summary line */
+.kiln-stage-card-cxl-summary {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+  letter-spacing: 0.04em;
+  margin: 4px 0;
+}
+
+.kiln-stage-card-field-refs {
+  margin: 4px 0;
+}
+
+/* ── Channel banner (schematics) ───────────────────────────────────────── */
+.kiln-schematics-channel-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, #D4A017 8%, transparent);
+  border: 1px solid color-mix(in srgb, #D4A017 25%, transparent);
+}
+
+.kiln-schematics-channel-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #D4A017;
+}
+
+.kiln-schematics-channel-name {
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: #D4A017;
+  font-weight: 600;
+}
+
+.kiln-schematics-channel-mode {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #D4A017 60%, transparent);
+  margin-left: auto;
+}
+
 /* ── 20. Schematics layout ─────────────────────────────────────────────────
    Full-pipeline documentation view with Blueprint sub-aesthetic.
    Spec §A7.
    ─────────────────────────────────────────────────────────────────────── */
 .kiln-schematics {
+  display: flex;
   flex-direction: column;
+  flex: 1;
   overflow: hidden;
-  background: var(--kiln-char);
+  min-height: 0;
+  background: var(--kiln-bp-bg);
   position: relative;
 }
 
@@ -4912,6 +5216,52 @@ input:-webkit-autofill:focus {
   border-radius: 2px;
 }
 
+/* Badges row (schema count, contract, channel) */
+.kiln-stage-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.kiln-stage-card-chip {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 0;
+  border: 1px solid;
+}
+
+.kiln-stage-card-chip--schema {
+  color: var(--kiln-bp-accent);
+  border-color: color-mix(in srgb, var(--kiln-bp-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 8%, transparent);
+}
+
+.kiln-stage-card-chip--contract {
+  color: #C75B2A;
+  border-color: color-mix(in srgb, #C75B2A 30%, transparent);
+  background: color-mix(in srgb, #C75B2A 8%, transparent);
+}
+
+.kiln-stage-card-chip--channel {
+  color: #D4A017;
+  border-color: color-mix(in srgb, #D4A017 30%, transparent);
+  background: color-mix(in srgb, #D4A017 8%, transparent);
+}
+
+/* Provenance line */
+.kiln-stage-card-provenance {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+  font-style: italic;
+  margin: 4px 0;
+}
+
 /* Flow arrows between stage cards */
 .kiln-schematics-arrow {
   display: flex;
@@ -4940,6 +5290,99 @@ input:-webkit-autofill:focus {
   letter-spacing: 0.2em;
   color: var(--kiln-iron);
   white-space: nowrap;
+}
+
+/* ── Dimension-line separators — addendum §Dimension Lines ─────────────── */
+
+/* Vertical dimension line between stage cards */
+.kiln-schematics-dimension {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 0;
+  opacity: 0.45;
+}
+.kiln-schematics-dimension-tick {
+  width: 8px;
+  height: 1px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.kiln-schematics-dimension-cap {
+  width: 1px;
+  height: 8px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  margin: 0 -1px;
+  flex-shrink: 0;
+}
+.kiln-schematics-dimension-line {
+  flex: 1;
+  height: 0;
+  border-top: 1px dashed var(--kiln-bp-accent-30);
+  max-width: 200px;
+}
+.kiln-schematics-dimension-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  color: var(--kiln-bp-accent);
+  opacity: 0.5;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+/* Horizontal dimension line in flow bar */
+.kiln-flow-dimension {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin: 0 2px;
+  opacity: 0.45;
+}
+.kiln-flow-dimension-tick {
+  width: 1px;
+  height: 8px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.kiln-flow-dimension-cap {
+  width: 8px;
+  height: 1px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  margin: 0 -1px;
+  flex-shrink: 0;
+}
+.kiln-flow-dimension-line {
+  width: 16px;
+  height: 0;
+  border-top: 1px dashed var(--kiln-bp-accent-30);
+  flex-shrink: 0;
+}
+
+/* ── Title block stamp — addendum §Title Block Stamps ─────────────────── */
+.kiln-stage-card-stamp {
+  position: absolute;
+  top: -8px;
+  left: 20px;
+  background: var(--kiln-bp-bg);
+  padding: 0 8px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--kiln-bp-accent);
+  opacity: 0.8;
+  font-weight: 600;
+  text-transform: lowercase;
+  z-index: 1;
+}
+
+/* ── Blueprint entry animation — addendum §Blueprint Motion ───────────── */
+@keyframes blueprintIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 /* ── 21. Scrollbar theming (WebKit) ─────────────────────────────────────── */
