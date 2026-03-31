@@ -1,0 +1,38 @@
+# cargo-deny configuration for clinker
+# Ensures zero C build dependencies (pure Rust only)
+#
+# Run: cargo deny check
+# CI: cargo deny check bans
+
+[bans]
+multiple-versions = "warn"
+deny = [
+    # Ban cc build dependency — enforces pure Rust compilation
+    { name = "cc" },
+    { name = "cmake" },
+]
+# Allow pure Rust FFI crates (no C compilation required)
+skip = [
+    { name = "libc" },
+    { name = "linux-raw-sys" },
+    { name = "mach2" },
+    { name = "windows-sys" },
+    { name = "windows-targets" },
+]
+
+[licenses]
+unlicensed = "warn"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"

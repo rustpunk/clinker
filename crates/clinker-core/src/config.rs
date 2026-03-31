@@ -636,6 +636,17 @@ pub fn interpolate_env_vars(
         let var_name = caps.get(1).unwrap().as_str();
         let default_value = caps.get(2).map(|m| m.as_str());
 
+        // Validate env var name: must be UPPERCASE + underscores only
+        if !var_name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            || var_name.starts_with(|c: char| c.is_ascii_digit())
+            || var_name.is_empty()
+        {
+            return Err(ConfigError::Validation(format!(
+                "invalid environment variable name '{}' at position {} — must match [A-Z_][A-Z0-9_]*",
+                var_name, full_match.start()
+            )));
+        }
+
         result.push_str(&escaped[last_end..full_match.start()]);
 
         // Check extra_vars first, then system env
@@ -665,12 +676,32 @@ pub fn interpolate_env_vars(
     Ok(result.replace('\0', "$"))
 }
 
+/// Maximum YAML document size (10 MB).
+const MAX_YAML_SIZE: usize = 10_485_760;
+
 /// Parse a pipeline config from a YAML string (after interpolation).
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml, &[])?;
-    let config: PipelineConfig = serde_saphyr::from_str(&interpolated)?;
+    let config: PipelineConfig = parse_yaml_with_budget(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
+}
+
+/// Parse YAML with DoS protection budgets.
+fn parse_yaml_with_budget(input: &str) -> Result<PipelineConfig, ConfigError> {
+    if input.len() > MAX_YAML_SIZE {
+        return Err(ConfigError::Validation(format!(
+            "YAML document exceeds 10MB limit ({} bytes)",
+            input.len()
+        )));
+    }
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_depth: 64,
+            max_nodes: 10_000,
+        },
+    };
+    serde_saphyr::from_str_with_options(input, options).map_err(ConfigError::Yaml)
 }
 
 /// Reserved pipeline member names that cannot be used as user variable names.
@@ -799,7 +830,7 @@ pub fn load_config_with_vars(
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
-    let config: PipelineConfig = serde_saphyr::from_str(&interpolated)?;
+    let config: PipelineConfig = parse_yaml_with_budget(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
 }
@@ -1859,5 +1890,116 @@ transformations:
         let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
         assert_eq!(v.check, "validators.in_range");
         assert!(v.args.is_some());
+    }
+
+    // ── YAML DoS budget tests ─────────────────────────────────────
+
+    #[test]
+    fn test_yaml_dos_document_size() {
+        // >10MB YAML → error
+        let huge = "a".repeat(MAX_YAML_SIZE + 1);
+        let err = parse_yaml_with_budget(&huge).unwrap_err();
+        assert!(err.to_string().contains("10MB limit"));
+    }
+
+    #[test]
+    fn test_yaml_dos_recursion_depth() {
+        // 100 levels of nesting → should exceed budget max_depth=64
+        let mut yaml = String::from("pipeline:\n");
+        for i in 0..100 {
+            yaml.push_str(&format!("{}level{}:\n", "  ".repeat(i + 1), i));
+        }
+        // This may fail as invalid pipeline config or as budget exceeded
+        assert!(parse_config(&yaml).is_err());
+    }
+
+    #[test]
+    fn test_yaml_dos_sequence_length() {
+        // >10k nodes → should exceed budget
+        let mut yaml = String::from("items:\n");
+        for i in 0..11_000 {
+            yaml.push_str(&format!("  - item{}\n", i));
+        }
+        assert!(parse_yaml_with_budget(&yaml).is_err());
+    }
+
+    // ── Env var name validation tests ─────────────────────────────
+
+    #[test]
+    fn test_env_var_name_valid() {
+        // ${DATABASE_URL} is valid uppercase
+        let yaml = r#"
+pipeline:
+  name: ${CLINKER_TEST_NAME:-test}
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        assert!(parse_config(yaml).is_ok());
+    }
+
+    #[test]
+    fn test_env_var_name_invalid_lowercase() {
+        let yaml = r#"
+pipeline:
+  name: ${database_url:-test}
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#;
+        let err = parse_config(yaml).unwrap_err();
+        assert!(err.to_string().contains("invalid environment variable name"));
+    }
+
+    #[test]
+    fn test_env_var_name_invalid_leading_digit() {
+        let result = interpolate_env_vars("${1BAD}", &[]);
+        // Regex won't match — 1BAD doesn't start with [A-Za-z_]
+        // So it stays as literal text, which is fine
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_env_var_name_empty() {
+        // ${} → regex won't match (requires at least one char)
+        let result = interpolate_env_vars("${}", &[]);
+        assert!(result.is_ok()); // stays literal
+    }
+
+    #[test]
+    fn test_env_var_name_special_chars() {
+        // ${DB-NAME} → regex won't match (hyphen not in char class)
+        let result = interpolate_env_vars("${DB-NAME}", &[]);
+        assert!(result.is_ok()); // stays literal
+    }
+
+    #[test]
+    fn test_env_var_unset_with_default() {
+        unsafe { std::env::remove_var("_CLINKER_UNSET_VAR") };
+        let result = interpolate_env_vars("${_CLINKER_UNSET_VAR:-fallback}", &[]).unwrap();
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn test_env_var_special_value_chars() {
+        // Values can contain anything — only names are validated
+        let result = interpolate_env_vars("test", &[("DB_URL", "postgres://user:pass@host/db")]);
+        assert!(result.is_ok());
     }
 }

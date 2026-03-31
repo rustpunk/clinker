@@ -14,6 +14,7 @@ pub mod plan;
 pub mod progress;
 pub mod projection;
 pub mod schema;
+pub mod security;
 pub mod validation;
 
 #[allow(unused_imports)]
