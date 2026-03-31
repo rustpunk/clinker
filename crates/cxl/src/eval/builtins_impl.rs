@@ -4,7 +4,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use clinker_record::Value;
 use regex::Regex;
 
-use super::context::MAX_STRING_OUTPUT;
+use super::context::{EvalContext, MAX_STRING_OUTPUT};
 use super::error::EvalError;
 use crate::lexer::Span;
 
@@ -16,6 +16,7 @@ pub fn dispatch_method(
     args: &[Value],
     regex: Option<&Regex>,
     span: Span,
+    ctx: &EvalContext,
 ) -> Result<Option<Value>, EvalError> {
     // Null propagation: nullable receiver → Null for most methods
     if receiver.is_null() && !matches!(method, "is_null" | "type_of" | "is_empty" | "catch") {
@@ -470,11 +471,20 @@ pub fn dispatch_method(
 
         // ── Debug ───────────────────────────────────────────────
         "debug" => {
-            // Pass-through: emit to tracing and return unchanged
+            // Level 3 passthrough: emit to tracing::trace! and return unchanged.
+            // Zero overhead when trace level disabled.
             if let Some(Value::String(prefix)) = args.first() {
-                tracing::debug!("{}: {:?}", prefix, receiver);
+                tracing::trace!(
+                    source_row = ctx.source_row,
+                    source_file = %ctx.source_file,
+                    "{}: {:?}", prefix, receiver
+                );
             } else {
-                tracing::debug!("{:?}", receiver);
+                tracing::trace!(
+                    source_row = ctx.source_row,
+                    source_file = %ctx.source_file,
+                    "{:?}", receiver
+                );
             }
             Ok(Some(receiver.clone()))
         }

@@ -37,7 +37,7 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
                 let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
                 output.insert(name.to_string(), val);
             }
-            Statement::Trace { guard, message, .. } => {
+            Statement::Trace { level, guard, message, .. } => {
                 let should_trace = if let Some(g) = guard {
                     matches!(eval_expr(g, typed, ctx, resolver, window, &env)?, Value::Bool(true))
                 } else {
@@ -45,7 +45,37 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
                 };
                 if should_trace {
                     let msg = eval_expr(message, typed, ctx, resolver, window, &env)?;
-                    tracing::debug!("trace: {:?}", msg);
+                    let msg_str = match &msg {
+                        Value::String(s) => s.to_string(),
+                        other => format!("{:?}", other),
+                    };
+                    match level.unwrap_or(crate::ast::TraceLevel::Trace) {
+                        crate::ast::TraceLevel::Trace => tracing::trace!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Debug => tracing::debug!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Info => tracing::info!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Warn => tracing::warn!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Error => tracing::error!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                    }
                 }
             }
             Statement::UseStmt { .. } => {} // Module imports handled at compile time
@@ -187,7 +217,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             // Get pre-compiled regex if available
             let regex = typed.regexes.get(node_id.0 as usize).and_then(|r| r.as_ref());
 
-            match builtins_impl::dispatch_method(&recv_val, method, &arg_vals, regex, *span)? {
+            match builtins_impl::dispatch_method(&recv_val, method, &arg_vals, regex, *span, ctx)? {
                 Some(val) => Ok(val),
                 None => Err(EvalError::new(
                     EvalErrorKind::TypeMismatch {

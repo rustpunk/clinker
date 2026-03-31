@@ -386,16 +386,55 @@ impl<'de> Deserialize<'de> for SchemaSource {
 /// Per-transform configuration block.
 ///
 /// The `cxl` field contains the multi-line CXL source text.
-/// `local_window`, `log`, and `validations` are structurally present
-/// but processed in later phases (Phase 5, 10).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformConfig {
     pub name: String,
     pub description: Option<String>,
     pub cxl: String,
     pub local_window: Option<serde_json::Value>,
-    pub log: Option<serde_json::Value>,
+    pub log: Option<Vec<LogDirective>>,
     pub validations: Option<serde_json::Value>,
+}
+
+/// A logging directive attached to a transform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogDirective {
+    pub level: LogLevel,
+    pub when: LogTiming,
+    pub condition: Option<String>,
+    pub message: String,
+    pub fields: Option<Vec<String>>,
+    pub every: Option<u64>,
+    pub log_rule: Option<String>,
+}
+
+/// When a log directive fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogTiming {
+    #[serde(rename = "before_transform")]
+    BeforeTransform,
+    #[serde(rename = "after_transform")]
+    AfterTransform,
+    #[serde(rename = "per_record")]
+    PerRecord,
+    #[serde(rename = "on_error")]
+    OnError,
+}
+
+/// Log level for directives (YAML config domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogLevel {
+    #[serde(rename = "trace")]
+    Trace,
+    #[serde(rename = "debug")]
+    Debug,
+    #[serde(rename = "info")]
+    Info,
+    #[serde(rename = "warn")]
+    Warn,
+    #[serde(rename = "error")]
+    Error,
 }
 
 /// A transformation list entry: either an inline transform or an `_import` directive.
@@ -621,6 +660,30 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     // Validate pipeline.vars
     if let Some(ref vars) = config.pipeline.vars {
         validate_pipeline_vars(vars)?;
+    }
+
+    // Validate log directives (iterate raw entries to avoid panic on unresolved imports)
+    for entry in &config.transformations {
+        if let TransformEntry::Transform(t) = entry {
+            if let Some(ref directives) = t.log {
+                for (i, d) in directives.iter().enumerate() {
+                    if let Some(every) = d.every {
+                        if every == 0 {
+                            return Err(ConfigError::Validation(format!(
+                                "transform '{}': log directive #{}: every must be >= 1",
+                                t.name, i + 1,
+                            )));
+                        }
+                        if d.when != LogTiming::PerRecord {
+                            return Err(ConfigError::Validation(format!(
+                                "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
+                                t.name, i + 1,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1531,5 +1594,112 @@ transformations:
         let converted = convert_pipeline_vars(&vars);
         assert!(matches!(&converted["version"], clinker_record::Value::String(s) if &**s == "1.0"));
         assert!(matches!(&converted["count"], clinker_record::Value::String(s) if &**s == "42"));
+    }
+
+    // ── Log directive config tests ────────────────────────────────
+
+    fn yaml_with_log(log_block: &str) -> String {
+        format!(r#"
+pipeline:
+  name: test
+
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+    log:
+{log_block}
+"#)
+    }
+
+    #[test]
+    fn test_log_level1_basic_emit() {
+        let yaml = yaml_with_log(r#"
+      - level: info
+        when: per_record
+        message: "processed {name}"
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let t = config.transforms().next().unwrap();
+        let directives = t.log.as_ref().unwrap();
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].level, LogLevel::Info);
+        assert_eq!(directives[0].when, LogTiming::PerRecord);
+        assert_eq!(directives[0].message, "processed {name}");
+    }
+
+    #[test]
+    fn test_log_level1_when_condition() {
+        let yaml = yaml_with_log(r#"
+      - level: warn
+        when: per_record
+        condition: "Amount > 1000"
+        message: "high value"
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
+        assert_eq!(d.condition.as_deref(), Some("Amount > 1000"));
+    }
+
+    #[test]
+    fn test_log_level1_fields_structured() {
+        let yaml = yaml_with_log(r#"
+      - level: info
+        when: per_record
+        message: "rec"
+        fields: [name, amount]
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
+        assert_eq!(d.fields.as_ref().unwrap(), &["name", "amount"]);
+    }
+
+    #[test]
+    fn test_log_level1_missing_message_error() {
+        // message is required — missing it should be a YAML parse error
+        let yaml = yaml_with_log(r#"
+      - level: info
+        when: per_record
+"#);
+        assert!(parse_config(&yaml).is_err());
+    }
+
+    #[test]
+    fn test_log_level1_invalid_level_error() {
+        let yaml = yaml_with_log(r#"
+      - level: critical
+        when: per_record
+        message: "msg"
+"#);
+        assert!(parse_config(&yaml).is_err());
+    }
+
+    #[test]
+    fn test_log_level1_invalid_when_error() {
+        let yaml = yaml_with_log(r#"
+      - level: info
+        when: always
+        message: "msg"
+"#);
+        assert!(parse_config(&yaml).is_err());
+    }
+
+    #[test]
+    fn test_log_level1_on_error_timing() {
+        let yaml = yaml_with_log(r#"
+      - level: error
+        when: on_error
+        message: "error: {_cxl_dlq_error_category}"
+"#);
+        let config = parse_config(&yaml).unwrap();
+        let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
+        assert_eq!(d.when, LogTiming::OnError);
     }
 }

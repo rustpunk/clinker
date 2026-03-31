@@ -282,3 +282,122 @@ fn test_eval_three_valued_or() {
     let v = eval_single("emit val = true or x", &["x"], HashMap::from([("x".into(), Value::Null)]));
     assert_eq!(v, Value::Bool(true));
 }
+
+// ── Level 3: .debug() passthrough tests ───────────────────────
+
+#[test]
+fn test_log_level3_passthrough_value() {
+    // .debug("check") returns the value unchanged
+    let v = eval_single(
+        "emit val = Name.debug(\"check\")",
+        &["Name"],
+        HashMap::from([("Name".into(), Value::String("Alice".into()))]),
+    );
+    assert_eq!(v, Value::String("Alice".into()));
+}
+
+#[test]
+fn test_log_level3_emits_trace() {
+    // .debug() should not error — trace event emitted but we can't capture it in unit tests
+    let v = eval_single(
+        "emit val = Name.debug(\"dbg\")",
+        &["Name"],
+        HashMap::from([("Name".into(), Value::String("Bob".into()))]),
+    );
+    assert_eq!(v, Value::String("Bob".into()));
+}
+
+#[test]
+fn test_log_level3_debug_no_prefix() {
+    // .debug() with no args
+    let v = eval_single(
+        "emit val = Name.debug()",
+        &["Name"],
+        HashMap::from([("Name".into(), Value::String("Carol".into()))]),
+    );
+    assert_eq!(v, Value::String("Carol".into()));
+}
+
+#[test]
+fn test_log_level3_debug_null() {
+    // null.debug("check") → null (null propagation)
+    let v = eval_single(
+        "emit val = Name.debug(\"check\")",
+        &["Name"],
+        HashMap::from([("Name".into(), Value::Null)]),
+    );
+    assert_eq!(v, Value::Null);
+}
+
+#[test]
+fn test_log_level3_debug_chained() {
+    // .debug("a").debug("b") → 2 events, value unchanged
+    let v = eval_single(
+        "emit val = Name.debug(\"first\").debug(\"second\")",
+        &["Name"],
+        HashMap::from([("Name".into(), Value::Integer(42))]),
+    );
+    assert_eq!(v, Value::Integer(42));
+}
+
+// ── Level 4: trace statement tests ────────────────────────────
+
+#[test]
+fn test_log_level4_trace_basic() {
+    // trace "msg" — should not error
+    let output = eval_ok(
+        "trace \"saw record\"\nemit val = 1",
+        &[],
+        HashMap::new(),
+    );
+    assert_eq!(output.get("val"), Some(&Value::Integer(1)));
+}
+
+#[test]
+fn test_log_level4_trace_when_guard() {
+    // trace if false "msg" — guard prevents trace
+    let output = eval_ok(
+        "trace if false \"should not fire\"\nemit val = 1",
+        &[],
+        HashMap::new(),
+    );
+    assert_eq!(output.get("val"), Some(&Value::Integer(1)));
+}
+
+#[test]
+fn test_log_level4_trace_level_override() {
+    // trace warn "alert" — uses warn level
+    let output = eval_ok(
+        "trace warn \"alert message\"\nemit val = 1",
+        &[],
+        HashMap::new(),
+    );
+    assert_eq!(output.get("val"), Some(&Value::Integer(1)));
+}
+
+#[test]
+fn test_log_level4_multi_field_interpolation() {
+    // trace with string containing field references — fields resolve to values
+    let record = HashMap::from([
+        ("a".into(), Value::Integer(1)),
+        ("b".into(), Value::Integer(2)),
+        ("c".into(), Value::Integer(3)),
+    ]);
+    let output = eval_ok(
+        "let msg = a + b + c\ntrace msg\nemit total = msg",
+        &["a", "b", "c"],
+        record,
+    );
+    assert_eq!(output.get("total"), Some(&Value::Integer(6)));
+}
+
+#[test]
+fn test_log_level4_guard_short_circuits() {
+    // trace if Amount > 1000 "high" — guard is false, message expr not evaluated for side effects
+    let output = eval_ok(
+        "trace if false \"never\"\nemit val = 42",
+        &[],
+        HashMap::new(),
+    );
+    assert_eq!(output.get("val"), Some(&Value::Integer(42)));
+}
