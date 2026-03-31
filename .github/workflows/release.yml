@@ -44,8 +44,17 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Install Dioxus CLI
+        run: cargo install dioxus-cli --locked
+
+      - name: Build CLI tools
+        run: cargo build --release --target ${{ matrix.target }} -p clinker -p cxl-cli
+
+      - name: Build Kiln (via dx)
+        shell: bash
+        run: |
+          cd crates/clinker-kiln
+          dx build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -56,7 +65,8 @@ jobs:
           staging="artifacts"
           mkdir -p "$staging"
 
-          for bin in clinker cxl-cli clinker-kiln; do
+          # CLI binaries from cargo build
+          for bin in clinker cxl-cli; do
             src="target/${target}/release/${bin}"
             if [ -f "$src" ]; then
               archive="${bin}-${tag}-${target}.tar.gz"
@@ -64,6 +74,14 @@ jobs:
               echo "Packaged ${archive}"
             fi
           done
+
+          # Kiln from dx build output
+          dx_out="crates/clinker-kiln/target/dx/clinker-kiln/release/bundle"
+          if [ -d "$dx_out" ]; then
+            archive="clinker-kiln-${tag}-${target}.tar.gz"
+            tar czf "${staging}/${archive}" -C "$dx_out" .
+            echo "Packaged ${archive}"
+          fi
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
@@ -73,13 +91,22 @@ jobs:
           $target = "${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 
-          foreach ($bin in @("clinker", "cxl-cli", "clinker-kiln")) {
+          # CLI binaries from cargo build
+          foreach ($bin in @("clinker", "cxl-cli")) {
             $src = "target\${target}\release\${bin}.exe"
             if (Test-Path $src) {
               $archive = "artifacts\${bin}-${tag}-${target}.zip"
               Compress-Archive -Path $src -DestinationPath $archive
               Write-Host "Packaged ${archive}"
             }
+          }
+
+          # Kiln from dx build output
+          $dxOut = "crates\clinker-kiln\target\dx\clinker-kiln\release\bundle"
+          if (Test-Path $dxOut) {
+            $archive = "artifacts\clinker-kiln-${tag}-${target}.zip"
+            Compress-Archive -Path "$dxOut\*" -DestinationPath $archive
+            Write-Host "Packaged ${archive}"
           }
 
       - name: Upload artifacts
