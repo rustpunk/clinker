@@ -67,6 +67,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Process only first N records per input (requires --dry-run)
+    #[arg(short = 'n', long)]
+    pub dry_run_n: Option<u64>,
+
+    /// Write dry-run output to file instead of stdout
+    #[arg(long)]
+    pub dry_run_output: Option<PathBuf>,
+
     /// Suppress stderr progress output
     #[arg(long)]
     pub quiet: bool,
@@ -287,7 +295,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         return Ok(0);
     }
 
-    if args.dry_run {
+    // Validate -n only valid with --dry-run
+    if args.dry_run_n.is_some() && !args.dry_run {
+        return Err(PipelineError::Config(
+            clinker_core::config::ConfigError::Validation(
+                "-n/--dry-run-n requires --dry-run flag".to_string(),
+            ),
+        ));
+    }
+
+    if args.dry_run && args.dry_run_n.is_none() {
+        // Config-validation-only mode (no -n)
         tracing::info!(
             "Dry run: config valid, {} inputs, {} outputs, {} transforms",
             pipeline_config.inputs.len(),
@@ -691,6 +709,56 @@ mod tests {
         let cli = Cli::try_parse_from(["clinker", "run", "--workspace", "/ws", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => assert_eq!(args.workspace, Some(PathBuf::from("/ws"))),
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    // ── Dry-run -n CLI tests ──────────────────────────────────────
+
+    #[test]
+    fn test_dry_run_n_flag() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "10", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.dry_run);
+                assert_eq!(args.dry_run_n, Some(10));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_dry_run_output_flag() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "5", "--dry-run-output", "out.csv", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.dry_run);
+                assert_eq!(args.dry_run_n, Some(5));
+                assert_eq!(args.dry_run_output, Some(PathBuf::from("out.csv")));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_dry_run_without_n_config_only() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.dry_run);
+                assert!(args.dry_run_n.is_none());
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_dry_run_default_stdout() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "3", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.dry_run_output.is_none()); // default to stdout
+            }
             _ => panic!("expected Run command"),
         }
     }

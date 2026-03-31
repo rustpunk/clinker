@@ -10,5 +10,6 @@ pub mod sort_buffer;
 mod sort_integration;
 pub mod sort_key;
 pub mod spill;
+pub mod take;
 pub mod threshold;
 pub mod window_context;
