@@ -23,9 +23,7 @@ transformations:
   - name: recent_only
     description: Filter to last 90 days
     cxl: |
-      if days_since(invoice_date) >= 90
-        drop
-      end
+      emit _include = days_since(invoice_date) < 90
 
   - _import: compositions/fiscal_date.comp.yaml
 

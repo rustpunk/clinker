@@ -22,9 +22,7 @@ transformations:
   - name: active_only
     description: Filter to active customers
     cxl: |
-      if status != "active"
-        drop
-      end
+      emit _include = status == "active"
     _notes:
       fields:
         cxl: The status field uses lowercase string values.
@@ -43,11 +41,7 @@ transformations:
   - name: final_flag
     description: Flag high-value customers
     cxl: |
-      if lifetime_value > 10000
-        emit tier = "gold"
-      else
-        emit tier = "standard"
-      end
+      emit tier = if lifetime_value > 10000 then "gold" else "standard"
 
 error_handling:
   strategy: fail_fast

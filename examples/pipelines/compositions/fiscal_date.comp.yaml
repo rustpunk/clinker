@@ -23,37 +23,15 @@ transformations:
     description: "Fiscal year starts April 1 — dates in Jan-Mar belong to prior FY"
     cxl: |
       let month = invoice_date.month()
-      if month < 4
-        emit fiscal_year = invoice_date.year()
-      else
-        emit fiscal_year = invoice_date.year() + 1
-      end
+      emit fiscal_year = if month < 4 then invoice_date.year() else invoice_date.year() + 1
   - name: compute_fiscal_quarter
     cxl: |
       let month = invoice_date.month()
-      if month >= 4 and month <= 6
-        emit fiscal_quarter = "Q1"
-        emit fiscal_month = month - 3
-      end
-      if month >= 7 and month <= 9
-        emit fiscal_quarter = "Q2"
-        emit fiscal_month = month - 3
-      end
-      if month >= 10 and month <= 12
-        emit fiscal_quarter = "Q3"
-        emit fiscal_month = month - 3
-      end
-      if month >= 1 and month <= 3
-        emit fiscal_quarter = "Q4"
-        emit fiscal_month = month + 9
-      end
+      emit fiscal_quarter = if month >= 4 and month <= 6 then "Q1" else if month >= 7 and month <= 9 then "Q2" else if month >= 10 and month <= 12 then "Q3" else "Q4"
+      emit fiscal_month = if month >= 4 then month - 3 else month + 9
   - name: compute_fiscal_period
     cxl: |
       emit fiscal_period = "FY" + fiscal_year.to_string() + "-" + fiscal_quarter
   - name: flag_current_fy
     cxl: |
       emit is_current_fy = fiscal_year == current_fiscal_year()
-  - name: drop_intermediate
-    description: "Clean up — keep only the derived fiscal fields"
-    cxl: |
-      drop month

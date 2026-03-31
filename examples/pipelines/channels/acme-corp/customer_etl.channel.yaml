@@ -1,0 +1,32 @@
+_channel:
+  pipeline: customer_etl
+  description: >
+    Acme Corp receives a broader customer feed that includes suspended
+    accounts. Loyalty discount tiers replace the standard gold/standard
+    flag. Output goes to the Acme-specific Looker dataset.
+
+inputs:
+  customers:
+    path: ./data/acme/customers_full.csv
+
+transformations:
+  active_only:
+    cxl: |
+      emit _include = status == "active" or status == "suspended"
+    description: Acme includes suspended accounts in their marketing feed
+
+  final_flag:
+    cxl: |
+      emit tier = if lifetime_value > 50000 then "platinum" else if lifetime_value > 10000 then "gold" else "standard"
+    description: Acme uses three tiers with a higher platinum threshold
+
+add_transformations:
+  - name: loyalty_discount
+    after: final_flag
+    description: Apply Acme loyalty programme discount percentage
+    cxl: |
+      emit loyalty_discount = if tier == "platinum" then 0.15 else if tier == "gold" then 0.10 else 0.0
+
+outputs:
+  results:
+    path: ./output/acme/customers_enriched.csv

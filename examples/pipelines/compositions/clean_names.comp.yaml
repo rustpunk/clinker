@@ -19,7 +19,3 @@ transformations:
     cxl: |
       emit full_name = first_name.trim() + " " + last_name.trim()
       emit name_key = lower(first_name.trim() + "_" + last_name.trim())
-  - name: drop_raw_names
-    cxl: |
-      drop first_name
-      drop last_name
