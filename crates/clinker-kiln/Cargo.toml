@@ -2,6 +2,7 @@
 name = "clinker-kiln"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Clinker Kiln — IDE for authoring Clinker YAML pipeline configurations"
 
 [dependencies]

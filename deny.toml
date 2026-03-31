@@ -1,23 +1,24 @@
 # cargo-deny configuration for clinker
-# Ensures zero C build dependencies (pure Rust only)
+# Ensures zero C build dependencies in clinker crates (pure Rust only)
 #
 # Run: cargo deny check
-# CI: cargo deny check bans
 
 [bans]
 multiple-versions = "warn"
 deny = [
     # Ban cc build dependency — enforces pure Rust compilation
-    { name = "cc" },
+    # (cc is allowed as a transitive dep of Dioxus/GTK via skip below)
+    { name = "cc", wrappers = ["dioxus-desktop"] },
     { name = "cmake" },
 ]
-# Allow pure Rust FFI crates (no C compilation required)
+# Allow pure Rust FFI crates and Dioxus build deps
 skip = [
     { name = "libc" },
     { name = "linux-raw-sys" },
     { name = "mach2" },
     { name = "windows-sys" },
     { name = "windows-targets" },
+    { name = "cc" },
 ]
 
 [licenses]
@@ -28,6 +29,8 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "MPL-2.0",
+    "CC0-1.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
@@ -35,4 +38,17 @@ allow = [
 
 [advisories]
 yanked = "warn"
-ignore = []
+# Dioxus desktop transitive deps: GTK3 bindings, instant, proc-macro-error
+ignore = [
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0384",
+    "RUSTSEC-2024-0411",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+    "RUSTSEC-2025-0057",
+]

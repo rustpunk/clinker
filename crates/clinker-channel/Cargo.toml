@@ -2,6 +2,7 @@
 name = "clinker-channel"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Channel overrides, composition resolution, and workspace discovery for Clinker"
 
 [dependencies]

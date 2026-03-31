@@ -2,6 +2,7 @@
 name = "clinker-schema"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Source schema parsing, indexing, and validation for Clinker pipelines"
 
 [dependencies]

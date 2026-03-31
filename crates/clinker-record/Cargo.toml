@@ -2,6 +2,7 @@
 name = "clinker-record"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Core data types (Value, Schema, Record) for the Clinker ETL engine"
 
 [dependencies]
