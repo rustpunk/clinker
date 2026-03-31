@@ -7,16 +7,27 @@ use clinker_record::{RecordStorage, Value};
 /// Dummy storage for no-window evaluation.
 struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
-    fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
-    fn record_count(&self) -> u32 { 0 }
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+        None
+    }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+        None
+    }
+    fn available_fields(&self, _: u32) -> Vec<&str> {
+        vec![]
+    }
+    fn record_count(&self) -> u32 {
+        0
+    }
 }
 use cxl::eval::{EvalContext, WallClock};
 use cxl::resolve::HashMapResolver;
 
 #[derive(Parser)]
-#[command(name = "cxl", about = "CXL language validator, evaluator, and formatter")]
+#[command(
+    name = "cxl",
+    about = "CXL language validator, evaluator, and formatter"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -56,7 +67,12 @@ fn main() {
 
     match cli.command {
         Command::Check { file } => cmd_check(&file),
-        Command::Eval { file, expr, record, fields } => cmd_eval(file.as_deref(), expr.as_deref(), record.as_deref(), &fields),
+        Command::Eval {
+            file,
+            expr,
+            record,
+            fields,
+        } => cmd_eval(file.as_deref(), expr.as_deref(), record.as_deref(), &fields),
         Command::Fmt { file } => cmd_fmt(&file),
     }
 }
@@ -73,7 +89,10 @@ fn cmd_check(file: &str) {
     let parsed = cxl::parser::Parser::parse(&source);
     if !parsed.errors.is_empty() {
         for err in &parsed.errors {
-            eprintln!("error[parse]: {} (at {}:{})", err.message, file, err.span.start);
+            eprintln!(
+                "error[parse]: {} (at {}:{})",
+                err.message, file, err.span.start
+            );
             if !err.how_to_fix.is_empty() {
                 eprintln!("  help: {}", err.how_to_fix);
             }
@@ -89,7 +108,10 @@ fn cmd_check(file: &str) {
         Ok(r) => r,
         Err(diags) => {
             for d in &diags {
-                eprintln!("error[resolve]: {} (at {}:{})", d.message, file, d.span.start);
+                eprintln!(
+                    "error[resolve]: {} (at {}:{})",
+                    d.message, file, d.span.start
+                );
                 if let Some(help) = &d.help {
                     eprintln!("  help: {}", help);
                 }
@@ -106,7 +128,10 @@ fn cmd_check(file: &str) {
         Err(diags) => {
             for d in &diags {
                 let level = if d.is_warning { "warning" } else { "error" };
-                eprintln!("{}[typecheck]: {} (at {}:{})", level, d.message, file, d.span.start);
+                eprintln!(
+                    "{}[typecheck]: {} (at {}:{})",
+                    level, d.message, file, d.span.start
+                );
                 if let Some(help) = &d.help {
                     eprintln!("  help: {}", help);
                 }
@@ -146,22 +171,26 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
             }
         };
         match json_value {
-            serde_json::Value::Object(map) => {
-                map.into_iter().map(|(k, v)| (k, json_to_value(v))).collect()
-            }
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .map(|(k, v)| (k, json_to_value(v)))
+                .collect(),
             _ => {
                 eprintln!("error: --record must be a JSON object");
                 process::exit(2);
             }
         }
     } else if !fields.is_empty() {
-        fields.iter().map(|f| {
-            let (name, value) = f.split_once('=').unwrap_or_else(|| {
-                eprintln!("error: --field must be name=value, got '{}'", f);
-                process::exit(2);
-            });
-            (name.to_string(), parse_field_value(value))
-        }).collect()
+        fields
+            .iter()
+            .map(|f| {
+                let (name, value) = f.split_once('=').unwrap_or_else(|| {
+                    eprintln!("error: --field must be name=value, got '{}'", f);
+                    process::exit(2);
+                });
+                (name.to_string(), parse_field_value(value))
+            })
+            .collect()
     } else {
         HashMap::new()
     };
@@ -293,7 +322,9 @@ fn collect_field_refs_stmt(stmt: &cxl::ast::Statement, names: &mut Vec<String>) 
         | cxl::ast::Statement::Emit { expr, .. }
         | cxl::ast::Statement::ExprStmt { expr, .. } => collect_field_refs_expr(expr, names),
         cxl::ast::Statement::Trace { guard, message, .. } => {
-            if let Some(g) = guard { collect_field_refs_expr(g, names); }
+            if let Some(g) = guard {
+                collect_field_refs_expr(g, names);
+            }
             collect_field_refs_expr(message, names);
         }
         _ => {}
@@ -303,7 +334,9 @@ fn collect_field_refs_stmt(stmt: &cxl::ast::Statement, names: &mut Vec<String>) 
 fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
     match expr {
         cxl::ast::Expr::FieldRef { name, .. } => {
-            if &**name != "it" { names.push(name.to_string()); }
+            if &**name != "it" {
+                names.push(name.to_string());
+            }
         }
         cxl::ast::Expr::Binary { lhs, rhs, .. } | cxl::ast::Expr::Coalesce { lhs, rhs, .. } => {
             collect_field_refs_expr(lhs, names);
@@ -312,22 +345,35 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
         cxl::ast::Expr::Unary { operand, .. } => collect_field_refs_expr(operand, names),
         cxl::ast::Expr::MethodCall { receiver, args, .. } => {
             collect_field_refs_expr(receiver, names);
-            for a in args { collect_field_refs_expr(a, names); }
+            for a in args {
+                collect_field_refs_expr(a, names);
+            }
         }
-        cxl::ast::Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
+        cxl::ast::Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_field_refs_expr(condition, names);
             collect_field_refs_expr(then_branch, names);
-            if let Some(eb) = else_branch { collect_field_refs_expr(eb, names); }
+            if let Some(eb) = else_branch {
+                collect_field_refs_expr(eb, names);
+            }
         }
         cxl::ast::Expr::Match { subject, arms, .. } => {
-            if let Some(s) = subject { collect_field_refs_expr(s, names); }
+            if let Some(s) = subject {
+                collect_field_refs_expr(s, names);
+            }
             for arm in arms {
                 collect_field_refs_expr(&arm.pattern, names);
                 collect_field_refs_expr(&arm.body, names);
             }
         }
         cxl::ast::Expr::WindowCall { args, .. } => {
-            for a in args { collect_field_refs_expr(a, names); }
+            for a in args {
+                collect_field_refs_expr(a, names);
+            }
         }
         _ => {}
     }
@@ -338,9 +384,13 @@ fn json_to_value(v: serde_json::Value) -> Value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(b),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { Value::Integer(i) }
-            else if let Some(f) = n.as_f64() { Value::Float(f) }
-            else { Value::Null }
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Null
+            }
         }
         serde_json::Value::String(s) => Value::String(s.into()),
         serde_json::Value::Array(arr) => Value::Array(arr.into_iter().map(json_to_value).collect()),
@@ -356,18 +406,27 @@ fn value_to_json(v: Value) -> serde_json::Value {
         Value::Float(f) => serde_json::json!(f),
         Value::String(s) => serde_json::Value::String(s.to_string()),
         Value::Date(d) => serde_json::Value::String(d.format("%Y-%m-%d").to_string()),
-        Value::DateTime(dt) => serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        Value::DateTime(dt) => {
+            serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        }
         Value::Array(arr) => serde_json::Value::Array(arr.into_iter().map(value_to_json).collect()),
     }
 }
 
 fn format_statement(stmt: &cxl::ast::Statement) -> String {
     match stmt {
-        cxl::ast::Statement::Let { name, expr, .. } =>
-            format!("let {} = {}", name, format_expr(expr)),
-        cxl::ast::Statement::Emit { name, expr, .. } =>
-            format!("emit {} = {}", name, format_expr(expr)),
-        cxl::ast::Statement::Trace { level, guard, message, .. } => {
+        cxl::ast::Statement::Let { name, expr, .. } => {
+            format!("let {} = {}", name, format_expr(expr))
+        }
+        cxl::ast::Statement::Emit { name, expr, .. } => {
+            format!("emit {} = {}", name, format_expr(expr))
+        }
+        cxl::ast::Statement::Trace {
+            level,
+            guard,
+            message,
+            ..
+        } => {
             let mut s = "trace".to_string();
             if let Some(l) = level {
                 s.push_str(&format!(" {:?}", l).to_lowercase());
@@ -379,7 +438,13 @@ fn format_statement(stmt: &cxl::ast::Statement) -> String {
             s
         }
         cxl::ast::Statement::UseStmt { path, alias, .. } => {
-            let mut s = format!("use {}", path.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("::"));
+            let mut s = format!(
+                "use {}",
+                path.iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::")
+            );
             if let Some(a) = alias {
                 s.push_str(&format!(" as {}", a));
             }
@@ -400,47 +465,84 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
             cxl::ast::LiteralValue::Null => "null".into(),
         },
         cxl::ast::Expr::FieldRef { name, .. } => name.to_string(),
-        cxl::ast::Expr::QualifiedFieldRef { parts, .. } => parts.iter().map(|p| &**p).collect::<Vec<_>>().join("."),
+        cxl::ast::Expr::QualifiedFieldRef { parts, .. } => {
+            parts.iter().map(|p| &**p).collect::<Vec<_>>().join(".")
+        }
         cxl::ast::Expr::Now { .. } => "now".into(),
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
         cxl::ast::Expr::PipelineAccess { field, .. } => format!("pipeline.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {
-                cxl::ast::BinOp::Add => "+", cxl::ast::BinOp::Sub => "-",
-                cxl::ast::BinOp::Mul => "*", cxl::ast::BinOp::Div => "/",
-                cxl::ast::BinOp::Mod => "%", cxl::ast::BinOp::Eq => "==",
-                cxl::ast::BinOp::Neq => "!=", cxl::ast::BinOp::Gt => ">",
-                cxl::ast::BinOp::Lt => "<", cxl::ast::BinOp::Gte => ">=",
-                cxl::ast::BinOp::Lte => "<=", cxl::ast::BinOp::And => "and",
+                cxl::ast::BinOp::Add => "+",
+                cxl::ast::BinOp::Sub => "-",
+                cxl::ast::BinOp::Mul => "*",
+                cxl::ast::BinOp::Div => "/",
+                cxl::ast::BinOp::Mod => "%",
+                cxl::ast::BinOp::Eq => "==",
+                cxl::ast::BinOp::Neq => "!=",
+                cxl::ast::BinOp::Gt => ">",
+                cxl::ast::BinOp::Lt => "<",
+                cxl::ast::BinOp::Gte => ">=",
+                cxl::ast::BinOp::Lte => "<=",
+                cxl::ast::BinOp::And => "and",
                 cxl::ast::BinOp::Or => "or",
             };
             format!("{} {} {}", format_expr(lhs), op_str, format_expr(rhs))
         }
         cxl::ast::Expr::Unary { op, operand, .. } => {
-            let op_str = match op { cxl::ast::UnaryOp::Neg => "-", cxl::ast::UnaryOp::Not => "not " };
+            let op_str = match op {
+                cxl::ast::UnaryOp::Neg => "-",
+                cxl::ast::UnaryOp::Not => "not ",
+            };
             format!("{}{}", op_str, format_expr(operand))
         }
-        cxl::ast::Expr::Coalesce { lhs, rhs, .. } => format!("{} ?? {}", format_expr(lhs), format_expr(rhs)),
-        cxl::ast::Expr::MethodCall { receiver, method, args, .. } => {
-            let args_str = args.iter().map(|a| format_expr(a)).collect::<Vec<_>>().join(", ");
+        cxl::ast::Expr::Coalesce { lhs, rhs, .. } => {
+            format!("{} ?? {}", format_expr(lhs), format_expr(rhs))
+        }
+        cxl::ast::Expr::MethodCall {
+            receiver,
+            method,
+            args,
+            ..
+        } => {
+            let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("{}.{}({})", format_expr(receiver), method, args_str)
         }
         cxl::ast::Expr::WindowCall { function, args, .. } => {
-            let args_str = args.iter().map(|a| format_expr(a)).collect::<Vec<_>>().join(", ");
+            let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("window.{}({})", function, args_str)
         }
-        cxl::ast::Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
-            let mut s = format!("if {} then {}", format_expr(condition), format_expr(then_branch));
-            if let Some(eb) = else_branch { s.push_str(&format!(" else {}", format_expr(eb))); }
+        cxl::ast::Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut s = format!(
+                "if {} then {}",
+                format_expr(condition),
+                format_expr(then_branch)
+            );
+            if let Some(eb) = else_branch {
+                s.push_str(&format!(" else {}", format_expr(eb)));
+            }
             s
         }
         cxl::ast::Expr::Match { subject, arms, .. } => {
             let mut s = "match ".to_string();
-            if let Some(sub) = subject { s.push_str(&format!("{} ", format_expr(sub))); }
+            if let Some(sub) = subject {
+                s.push_str(&format!("{} ", format_expr(sub)));
+            }
             s.push_str("{ ");
             for (i, arm) in arms.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
-                s.push_str(&format!("{} => {}", format_expr(&arm.pattern), format_expr(&arm.body)));
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format!(
+                    "{} => {}",
+                    format_expr(&arm.pattern),
+                    format_expr(&arm.body)
+                ));
             }
             s.push_str(" }");
             s
@@ -479,7 +581,10 @@ mod tests {
     #[test]
     fn test_parse_field_value_string() {
         assert_eq!(parse_field_value("hello"), Value::String("hello".into()));
-        assert_eq!(parse_field_value("hello world"), Value::String("hello world".into()));
+        assert_eq!(
+            parse_field_value("hello world"),
+            Value::String("hello world".into())
+        );
     }
 
     // Note: cmd_check/cmd_eval/cmd_fmt call process::exit() and cannot be tested
@@ -518,13 +623,15 @@ mod tests {
         let fields: HashMap<String, Value> = [
             ("Price".to_string(), Value::Float(10.5)),
             ("Qty".to_string(), Value::Integer(3)),
-        ].into();
+        ]
+        .into();
         let field_refs: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
 
         let parsed = cxl::parser::Parser::parse(source);
         assert!(parsed.errors.is_empty());
 
-        let resolved = cxl::resolve::resolve_program(parsed.ast, &field_refs, parsed.node_count).unwrap();
+        let resolved =
+            cxl::resolve::resolve_program(parsed.ast, &field_refs, parsed.node_count).unwrap();
         let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
 
         let ctx = EvalContext {

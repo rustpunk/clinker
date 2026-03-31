@@ -121,7 +121,9 @@ fn format_value(val: &Value, out: &mut String) {
         Value::Array(arr) => {
             out.push('[');
             for (i, v) in arr.iter().enumerate() {
-                if i > 0 { out.push_str(", "); }
+                if i > 0 {
+                    out.push_str(", ");
+                }
                 format_value(v, out);
             }
             out.push(']');
@@ -134,7 +136,8 @@ pub fn extract_fields(
     field_names: &[String],
     record: &IndexMap<String, Value>,
 ) -> Vec<(String, String)> {
-    field_names.iter()
+    field_names
+        .iter()
         .filter_map(|name| {
             record.get(name).map(|val| {
                 let mut s = String::new();

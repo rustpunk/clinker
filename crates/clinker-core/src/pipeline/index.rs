@@ -114,10 +114,10 @@ pub fn value_to_group_key(
         }
 
         Value::Integer(i) => {
-            if let Some(pin) = schema_pin {
-                if pin.field_type == Some(FieldType::Integer) {
-                    return Ok(Some(GroupByKey::Int(*i)));
-                }
+            if let Some(pin) = schema_pin
+                && pin.field_type == Some(FieldType::Integer)
+            {
+                return Ok(Some(GroupByKey::Int(*i)));
             }
             // Default: widen to Float
             Ok(Some(GroupByKey::Float((*i as f64).to_bits())))
@@ -149,10 +149,23 @@ impl std::fmt::Display for IndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IndexError::NanInGroupBy { field, row } => {
-                write!(f, "NaN in group_by field '{}' at row {} — pipeline must halt (exit code 3)", field, row)
+                write!(
+                    f,
+                    "NaN in group_by field '{}' at row {} — pipeline must halt (exit code 3)",
+                    field, row
+                )
             }
-            IndexError::TypeMismatch { field, expected, got, row } => {
-                write!(f, "type mismatch in group_by field '{}' at row {}: expected {}, got {}", field, row, expected, got)
+            IndexError::TypeMismatch {
+                field,
+                expected,
+                got,
+                row,
+            } => {
+                write!(
+                    f,
+                    "type mismatch in group_by field '{}' at row {}: expected {}, got {}",
+                    field, row, expected, got
+                )
             }
         }
     }
@@ -174,9 +187,7 @@ mod tests {
 
     impl TestStorage {
         fn new(columns: &[&str], rows: Vec<Vec<Value>>) -> Self {
-            let schema = Arc::new(Schema::new(
-                columns.iter().map(|c| (*c).into()).collect(),
-            ));
+            let schema = Arc::new(Schema::new(columns.iter().map(|c| (*c).into()).collect()));
             let records = rows
                 .into_iter()
                 .map(|fields| MinimalRecord::new(fields))
@@ -343,19 +354,13 @@ mod tests {
             ],
         );
 
-        let index = SecondaryIndex::build(
-            &storage,
-            &["dept".into(), "region".into()],
-            &HashMap::new(),
-        )
-        .unwrap();
+        let index =
+            SecondaryIndex::build(&storage, &["dept".into(), "region".into()], &HashMap::new())
+                .unwrap();
 
         assert_eq!(index.group_count(), 3); // (A,East), (A,West), (B,East)
 
-        let key_ae = vec![
-            GroupByKey::Str("A".into()),
-            GroupByKey::Str("East".into()),
-        ];
+        let key_ae = vec![GroupByKey::Str("A".into()), GroupByKey::Str("East".into())];
         assert_eq!(index.get(&key_ae).unwrap(), &[0, 3]);
     }
 
@@ -363,10 +368,7 @@ mod tests {
     fn test_secondary_index_nan_rejection() {
         let storage = TestStorage::new(
             &["amount"],
-            vec![
-                vec![Value::Float(1.0)],
-                vec![Value::Float(f64::NAN)],
-            ],
+            vec![vec![Value::Float(1.0)], vec![Value::Float(f64::NAN)]],
         );
 
         let result = SecondaryIndex::build(&storage, &["amount".into()], &HashMap::new());
@@ -411,11 +413,7 @@ mod tests {
     fn test_secondary_index_all_nulls() {
         let storage = TestStorage::new(
             &["dept"],
-            vec![
-                vec![Value::Null],
-                vec![Value::Null],
-                vec![Value::Null],
-            ],
+            vec![vec![Value::Null], vec![Value::Null], vec![Value::Null]],
         );
 
         let index = SecondaryIndex::build(&storage, &["dept".into()], &HashMap::new()).unwrap();

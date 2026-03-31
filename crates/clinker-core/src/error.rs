@@ -7,7 +7,10 @@ pub enum PipelineError {
     Schema(crate::schema::SchemaError),
     Format(clinker_format::FormatError),
     Eval(cxl::eval::EvalError),
-    Compilation { transform_name: String, messages: Vec<String> },
+    Compilation {
+        transform_name: String,
+        messages: Vec<String>,
+    },
     Io(std::io::Error),
     ThreadPool(String),
 }
@@ -19,8 +22,14 @@ impl fmt::Display for PipelineError {
             Self::Schema(e) => write!(f, "schema error: {e}"),
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Eval(e) => write!(f, "evaluation error: {e}"),
-            Self::Compilation { transform_name, messages } => {
-                write!(f, "CXL compilation failed for transform '{transform_name}': ")?;
+            Self::Compilation {
+                transform_name,
+                messages,
+            } => {
+                write!(
+                    f,
+                    "CXL compilation failed for transform '{transform_name}': "
+                )?;
                 for msg in messages {
                     write!(f, "\n  {msg}")?;
                 }

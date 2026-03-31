@@ -19,27 +19,45 @@ mod tests {
     }
 
     fn schema_3() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["dept".into(), "salary".into(), "seq".into()]))
+        Arc::new(Schema::new(vec![
+            "dept".into(),
+            "salary".into(),
+            "seq".into(),
+        ]))
     }
 
     fn rec2(schema: &Arc<Schema>, name: &str, value: i64) -> Record {
-        Record::new(schema.clone(), vec![Value::String(name.into()), Value::Integer(value)])
+        Record::new(
+            schema.clone(),
+            vec![Value::String(name.into()), Value::Integer(value)],
+        )
     }
 
     fn rec3(schema: &Arc<Schema>, dept: &str, salary: i64, seq: i64) -> Record {
-        Record::new(schema.clone(), vec![
-            Value::String(dept.into()),
-            Value::Integer(salary),
-            Value::Integer(seq),
-        ])
+        Record::new(
+            schema.clone(),
+            vec![
+                Value::String(dept.into()),
+                Value::Integer(salary),
+                Value::Integer(seq),
+            ],
+        )
     }
 
     fn sf(field: &str, order: SortOrder) -> SortField {
-        SortField { field: field.into(), order, null_order: None }
+        SortField {
+            field: field.into(),
+            order,
+            null_order: None,
+        }
     }
 
     fn sf_nulls(field: &str, order: SortOrder, nulls: NullOrder) -> SortField {
-        SortField { field: field.into(), order, null_order: Some(nulls) }
+        SortField {
+            field: field.into(),
+            order,
+            null_order: Some(nulls),
+        }
     }
 
     /// Merge sorted spill files via LoserTree, returning records in merge order.
@@ -47,11 +65,10 @@ mod tests {
         files: Vec<crate::pipeline::spill::SpillFile>,
         sort_by: &[SortField],
     ) -> Vec<Record> {
-        let mut readers: Vec<_> = files.iter()
-            .map(|f| f.reader().unwrap())
-            .collect();
+        let mut readers: Vec<_> = files.iter().map(|f| f.reader().unwrap()).collect();
 
-        let initial: Vec<Option<MergeEntry>> = readers.iter_mut()
+        let initial: Vec<Option<MergeEntry>> = readers
+            .iter_mut()
             .map(|r| {
                 r.next().map(|res| {
                     let record = res.unwrap();
@@ -109,7 +126,8 @@ mod tests {
         }
         match buf.finish().unwrap() {
             SortedOutput::InMemory(records) => {
-                let names: Vec<_> = records.iter()
+                let names: Vec<_> = records
+                    .iter()
                     .map(|r| match r.get("name").unwrap() {
                         Value::String(s) => s.to_string(),
                         _ => panic!("expected string"),
@@ -150,7 +168,10 @@ mod tests {
         let sort_by = vec![sf_nulls("value", SortOrder::Asc, NullOrder::First)];
         let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
         buf.push(rec2(&schema, "a", 30));
-        buf.push(Record::new(schema.clone(), vec![Value::String("b".into()), Value::Null]));
+        buf.push(Record::new(
+            schema.clone(),
+            vec![Value::String("b".into()), Value::Null],
+        ));
         buf.push(rec2(&schema, "c", 10));
         match buf.finish().unwrap() {
             SortedOutput::InMemory(records) => {
@@ -168,7 +189,10 @@ mod tests {
         let sort_by = vec![sf_nulls("value", SortOrder::Asc, NullOrder::Last)];
         let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
         buf.push(rec2(&schema, "a", 30));
-        buf.push(Record::new(schema.clone(), vec![Value::String("b".into()), Value::Null]));
+        buf.push(Record::new(
+            schema.clone(),
+            vec![Value::String("b".into()), Value::Null],
+        ));
         buf.push(rec2(&schema, "c", 10));
         match buf.finish().unwrap() {
             SortedOutput::InMemory(records) => {
@@ -253,7 +277,8 @@ mod tests {
             buf.sort_and_spill().unwrap();
         }
         // Files exist while SpillFiles are alive
-        let files_before: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let files_before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .collect();
         assert!(!files_before.is_empty(), "spill files should exist");
@@ -262,10 +287,14 @@ mod tests {
             SortedOutput::Spilled(files) => {
                 // Drop the spill files (RAII cleanup)
                 drop(files);
-                let files_after: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+                let files_after: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
                     .filter_map(|e| e.ok())
                     .collect();
-                assert!(files_after.is_empty(), "spill files should be cleaned up after drop");
+                assert!(
+                    files_after.is_empty(),
+                    "spill files should be cleaned up after drop"
+                );
             }
             _ => panic!("expected Spilled"),
         }
@@ -277,15 +306,24 @@ mod tests {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
         // Large budget — everything fits in memory
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, Some(dir.path().to_path_buf()), schema.clone());
+        let mut buf = SortBuffer::new(
+            sort_by,
+            10_000_000,
+            Some(dir.path().to_path_buf()),
+            schema.clone(),
+        );
         for i in (0..10).rev() {
             buf.push(rec2(&schema, &format!("r{i}"), i));
         }
         // Verify no spill files created
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(files.is_empty(), "no spill files should be created for in-memory path");
+        assert!(
+            files.is_empty(),
+            "no spill files should be created for in-memory path"
+        );
 
         match buf.finish().unwrap() {
             SortedOutput::InMemory(records) => {

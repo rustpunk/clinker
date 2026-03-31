@@ -12,7 +12,6 @@
 ///     expr: "Annotation on the expr field."
 ///     path: "Annotation on the path field."
 /// ```
-
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 

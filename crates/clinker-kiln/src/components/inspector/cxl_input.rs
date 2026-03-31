@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::cxl_bridge::{validate_expr, CxlValidation};
+use crate::cxl_bridge::{CxlValidation, validate_expr};
 
 use super::cxl_diagnostics::CxlDiagnostics;
 

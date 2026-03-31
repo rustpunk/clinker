@@ -61,7 +61,9 @@ impl Record {
             self.values[idx] = value;
             return;
         }
-        let map = self.overflow.get_or_insert_with(|| Box::new(IndexMap::new()));
+        let map = self
+            .overflow
+            .get_or_insert_with(|| Box::new(IndexMap::new()));
         map.insert(name, value);
     }
 
@@ -203,8 +205,7 @@ mod tests {
             Some(&Value::String("redirected".into()))
         );
         assert!(
-            record.overflow.is_none()
-                || !record.overflow.as_ref().unwrap().contains_key("name")
+            record.overflow.is_none() || !record.overflow.as_ref().unwrap().contains_key("name")
         );
     }
 

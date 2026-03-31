@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef};
-use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
+use clinker_record::{MinimalRecord, Schema, Value};
 
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
@@ -43,10 +43,7 @@ impl MultiRecordDispatcher {
 
     /// Dispatch fixed-width lines into per-type arenas.
     /// Each line is classified by the discriminator byte range.
-    pub fn dispatch_lines(
-        &self,
-        lines: &[Vec<u8>],
-    ) -> Result<DispatchResult, PipelineError> {
+    pub fn dispatch_lines(&self, lines: &[Vec<u8>]) -> Result<DispatchResult, PipelineError> {
         // Build tag → record type index map
         let tag_map: HashMap<&str, usize> = self
             .record_types
@@ -350,9 +347,9 @@ mod tests {
         ];
 
         let result = dispatcher.dispatch_lines(&lines).unwrap();
-        assert_eq!(result.arenas["HEADER"].record_count(), 1);
-        assert_eq!(result.arenas["DETAIL"].record_count(), 2);
-        assert_eq!(result.arenas["TRAILER"].record_count(), 1);
+        assert_eq!(result.arenas["HEADER"].len(), 1);
+        assert_eq!(result.arenas["DETAIL"].len(), 2);
+        assert_eq!(result.arenas["TRAILER"].len(), 1);
     }
 
     #[test]
@@ -383,24 +380,30 @@ mod tests {
         let dispatcher = MultiRecordDispatcher::new(discriminator, record_types, false);
 
         let records: Vec<(HashMap<String, Value>, Vec<u8>)> = vec![
-            ({
-                let mut m = HashMap::new();
-                m.insert("rec_type".into(), Value::String("header".into()));
-                m.insert("title".into(), Value::String("Report".into()));
-                m
-            }, vec![]),
-            ({
-                let mut m = HashMap::new();
-                m.insert("rec_type".into(), Value::String("detail".into()));
-                m.insert("id".into(), Value::String("1".into()));
-                m.insert("amount".into(), Value::String("100".into()));
-                m
-            }, vec![]),
+            (
+                {
+                    let mut m = HashMap::new();
+                    m.insert("rec_type".into(), Value::String("header".into()));
+                    m.insert("title".into(), Value::String("Report".into()));
+                    m
+                },
+                vec![],
+            ),
+            (
+                {
+                    let mut m = HashMap::new();
+                    m.insert("rec_type".into(), Value::String("detail".into()));
+                    m.insert("id".into(), Value::String("1".into()));
+                    m.insert("amount".into(), Value::String("100".into()));
+                    m
+                },
+                vec![],
+            ),
         ];
 
         let result = dispatcher.dispatch_records(&records).unwrap();
-        assert_eq!(result.arenas["HEADER"].record_count(), 1);
-        assert_eq!(result.arenas["DETAIL"].record_count(), 1);
+        assert_eq!(result.arenas["HEADER"].len(), 1);
+        assert_eq!(result.arenas["DETAIL"].len(), 1);
     }
 
     #[test]
@@ -417,26 +420,26 @@ mod tests {
         };
         let dispatcher = MultiRecordDispatcher::new(disc, make_record_types(), false);
         let result = dispatcher.dispatch_lines(&lines).unwrap();
-        assert_eq!(result.arenas["DETAIL"].record_count(), 1);
+        assert_eq!(result.arenas["DETAIL"].len(), 1);
     }
 
     #[test]
     fn test_dispatch_separate_arenas() {
         let dispatcher = MultiRecordDispatcher::new(fw_discriminator(), make_record_types(), false);
-        let lines: Vec<Vec<u8>> = vec![
-            b"HREPORT   ".to_vec(),
-            b"D00001 100".to_vec(),
-        ];
+        let lines: Vec<Vec<u8>> = vec![b"HREPORT   ".to_vec(), b"D00001 100".to_vec()];
         let result = dispatcher.dispatch_lines(&lines).unwrap();
 
         // Each record type has its own arena with its own schema
         let header = &result.arenas["HEADER"];
         let detail = &result.arenas["DETAIL"];
-        assert_eq!(header.record_count(), 1);
-        assert_eq!(detail.record_count(), 1);
+        assert_eq!(header.len(), 1);
+        assert_eq!(detail.len(), 1);
 
         // Schemas are different
-        assert_ne!(header.schema().columns().len(), detail.schema().columns().len());
+        assert_ne!(
+            header.schema().columns().len(),
+            detail.schema().columns().len()
+        );
     }
 
     #[test]
@@ -447,7 +450,7 @@ mod tests {
             b"X00002 200".to_vec(), // "X" doesn't match any tag
         ];
         let result = dispatcher.dispatch_lines(&lines).unwrap();
-        assert_eq!(result.arenas["DETAIL"].record_count(), 1);
+        assert_eq!(result.arenas["DETAIL"].len(), 1);
         assert_eq!(result.warnings.len(), 1);
         assert!(result.warnings[0].contains("X"));
     }
@@ -462,16 +465,19 @@ mod tests {
         let err = dispatcher.dispatch_lines(&lines);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("fail_fast"), "error should mention fail_fast: {msg}");
+        assert!(
+            msg.contains("fail_fast"),
+            "error should mention fail_fast: {msg}"
+        );
     }
 
     #[test]
     fn test_dispatch_cxl_three_part_path() {
         // Test that the CXL evaluator resolves three-part paths
         // benefits.EEID.employee_id → resolve_qualified("benefits.EEID", "employee_id")
+        use clinker_record::FieldResolver;
         use cxl::eval;
         use cxl::parser::Parser;
-        use clinker_record::FieldResolver;
 
         struct TestResolver;
         impl FieldResolver for TestResolver {
@@ -492,7 +498,11 @@ mod tests {
 
         let source = "emit x = benefits.EEID.employee_id";
         let parsed = Parser::parse(source);
-        assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
 
         let fields: &[&str] = &[];
         let resolved =
@@ -502,7 +512,9 @@ mod tests {
 
         let resolver = TestResolver;
         let ctx = eval::EvalContext::test_default();
-        let result = eval::eval_program::<crate::pipeline::arena::Arena>(&typed, &ctx, &resolver, None).unwrap();
+        let result =
+            eval::eval_program::<crate::pipeline::arena::Arena>(&typed, &ctx, &resolver, None)
+                .unwrap();
         assert_eq!(
             result.get("x"),
             Some(&Value::String("EMP001".into())),
@@ -541,9 +553,9 @@ mod tests {
         lines.push(b"T00090    ".to_vec());
 
         let result = dispatcher.dispatch_lines(&lines).unwrap();
-        assert_eq!(result.arenas["HEADER"].record_count(), 10);
-        assert_eq!(result.arenas["DETAIL"].record_count(), 90);
-        assert_eq!(result.arenas["TRAILER"].record_count(), 1);
+        assert_eq!(result.arenas["HEADER"].len(), 10);
+        assert_eq!(result.arenas["DETAIL"].len(), 90);
+        assert_eq!(result.arenas["TRAILER"].len(), 1);
     }
 
     #[test]
@@ -553,9 +565,9 @@ mod tests {
         let lines: Vec<Vec<u8>> = vec![b"D00001 100".to_vec()];
         let result = dispatcher.dispatch_lines(&lines).unwrap();
 
-        assert_eq!(result.arenas["HEADER"].record_count(), 0);
-        assert_eq!(result.arenas["DETAIL"].record_count(), 1);
-        assert_eq!(result.arenas["TRAILER"].record_count(), 0);
+        assert_eq!(result.arenas["HEADER"].len(), 0);
+        assert_eq!(result.arenas["DETAIL"].len(), 1);
+        assert_eq!(result.arenas["TRAILER"].len(), 0);
     }
 
     #[test]

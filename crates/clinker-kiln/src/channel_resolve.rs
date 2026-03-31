@@ -4,13 +4,10 @@
 //! engine. Produces a `ChannelResolution` containing the resolved config, provenance
 //! map, and tracking of which overrides were applied.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use clinker_channel::channel_override::{
-    resolve_channel, resolve_channel_with_inheritance, ChannelOverride,
-};
-use clinker_channel::composition::{resolve_compositions, ProvenanceMap};
+use clinker_channel::channel_override::{ChannelOverride, resolve_channel_with_inheritance};
+use clinker_channel::composition::{ProvenanceMap, resolve_compositions};
 use clinker_channel::error::ChannelError;
 use clinker_channel::manifest::ChannelManifest;
 use clinker_channel::workspace::{DefaultsConfig, WorkspaceConfig, WorkspaceRoot};
@@ -20,6 +17,7 @@ use crate::state::ChannelState;
 
 /// Result of resolving a pipeline through a channel's overrides.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ChannelResolution {
     /// The fully resolved pipeline config (base + compositions + overrides).
     pub resolved_config: PipelineConfig,
@@ -61,6 +59,7 @@ pub enum OverrideSource {
     /// From the channel's own .channel.yaml file.
     Channel,
     /// Inherited from a group.
+    #[allow(dead_code)]
     Group(String),
 }
 
@@ -119,14 +118,8 @@ pub fn resolve_pipeline_for_channel(
     let dummy_path = PathBuf::from("pipeline.yaml");
     let pl_path = pipeline_path.unwrap_or(&dummy_path);
 
-    config = resolve_channel_with_inheritance(
-        config,
-        channel_id,
-        pl_path,
-        &ws,
-        &vars,
-        &mut provenance,
-    )?;
+    config =
+        resolve_channel_with_inheritance(config, channel_id, pl_path, &ws, &vars, &mut provenance)?;
 
     // Step 3: Track what changed for UI indicators
     let mut overrides_applied = Vec::new();
@@ -175,24 +168,22 @@ pub fn resolve_pipeline_for_channel(
 
     // Detect modified transforms (CXL changed)
     for post_entry in &config.transformations {
-        if let TransformEntry::Transform(post_t) = post_entry {
-            if let Some(pre_entry) = pre_override_config.transformations.iter().find(|e| {
-                matches!(e, TransformEntry::Transform(t) if t.name == post_t.name)
-            }) {
-                if let TransformEntry::Transform(pre_t) = pre_entry {
-                    if pre_t.cxl != post_t.cxl
-                        || pre_t.description != post_t.description
-                        || pre_t.local_window != post_t.local_window
-                    {
-                        overrides_applied.push(AppliedOverride {
-                            target_name: post_t.name.clone(),
-                            kind: OverrideKind::Modified,
-                            source: OverrideSource::Channel,
-                            file: channel_override_path.clone(),
-                        });
-                    }
-                }
-            }
+        if let TransformEntry::Transform(post_t) = post_entry
+            && let Some(pre_entry) = pre_override_config
+                .transformations
+                .iter()
+                .find(|e| matches!(e, TransformEntry::Transform(t) if t.name == post_t.name))
+            && let TransformEntry::Transform(pre_t) = pre_entry
+            && (pre_t.cxl != post_t.cxl
+                || pre_t.description != post_t.description
+                || pre_t.local_window != post_t.local_window)
+        {
+            overrides_applied.push(AppliedOverride {
+                target_name: post_t.name.clone(),
+                kind: OverrideKind::Modified,
+                source: OverrideSource::Channel,
+                file: channel_override_path.clone(),
+            });
         }
     }
 

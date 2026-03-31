@@ -1,6 +1,7 @@
 /// Default pipeline YAML loaded when the app starts (no file selected).
 ///
 /// Includes `_notes` metadata to exercise the Notes drawer.
+#[allow(dead_code)]
 pub const DEFAULT_YAML: &str = r#"pipeline:
   name: customer_etl
 

@@ -6,8 +6,8 @@
 use dioxus::prelude::*;
 
 use crate::search::{
-    self, SearchMode, StructuralSearchMatch, StructuralTag, TextSearchFileResult,
-    TextSearchOptions, STRUCTURAL_KEYS,
+    self, STRUCTURAL_KEYS, SearchMode, StructuralSearchMatch, StructuralTag, TextSearchFileResult,
+    TextSearchOptions,
 };
 use crate::state::{LeftPanel, TabManagerState};
 
@@ -22,14 +22,14 @@ pub fn SearchPanel() -> Element {
     let mut use_regex = use_signal(|| false);
     let mut case_sensitive = use_signal(|| false);
     let mut whole_word = use_signal(|| false);
-    let mut results: Signal<Vec<TextSearchFileResult>> = use_signal(Vec::new);
+    let results: Signal<Vec<TextSearchFileResult>> = use_signal(Vec::new);
     let mut show_replace = use_signal(|| false);
     let mut replace_text = use_signal(String::new);
 
     // Structural search state
     let mut structural_query = use_signal(String::new);
-    let mut structural_results: Signal<Vec<StructuralSearchMatch>> = use_signal(Vec::new);
-    let mut structural_tags: Signal<Vec<StructuralTag>> = use_signal(Vec::new);
+    let structural_results: Signal<Vec<StructuralSearchMatch>> = use_signal(Vec::new);
+    let structural_tags: Signal<Vec<StructuralTag>> = use_signal(Vec::new);
 
     let current_mode = (mode)();
     let current_query = (query)();
@@ -60,7 +60,8 @@ pub fn SearchPanel() -> Element {
     };
 
     // Execute structural search
-    let run_structural = move |mut sr: Signal<Vec<StructuralSearchMatch>>, mut st: Signal<Vec<StructuralTag>>| {
+    let run_structural = move |mut sr: Signal<Vec<StructuralSearchMatch>>,
+                               mut st: Signal<Vec<StructuralTag>>| {
         let q = (structural_query)();
         let tags = search::parse_structural_query(&q);
         st.set(tags.clone());
@@ -200,7 +201,7 @@ pub fn SearchPanel() -> Element {
                         rsx! {
                             if !tags.is_empty() {
                                 div { class: "kiln-structural-tags",
-                                    for (i, tag) in tags.iter().enumerate() {
+                                    for (_i, tag) in tags.iter().enumerate() {
                                         {
                                             let key = tag.key.clone();
                                             let value = tag.value.clone();
@@ -296,7 +297,10 @@ pub fn SearchPanel() -> Element {
 #[component]
 fn StructuralResults(results: Vec<StructuralSearchMatch>) -> Element {
     let count = results.len();
-    let summary = format!("{count} stage {}", if count == 1 { "match" } else { "matches" });
+    let summary = format!(
+        "{count} stage {}",
+        if count == 1 { "match" } else { "matches" }
+    );
 
     rsx! {
         div { class: "kiln-structural-results",

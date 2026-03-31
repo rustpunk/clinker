@@ -51,12 +51,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         // Write header on first record
         if self.config.include_header && !self.header_written {
-            let mut header: Vec<&str> = self
-                .schema
-                .columns()
-                .iter()
-                .map(|c| c.as_ref())
-                .collect();
+            let mut header: Vec<&str> = self.schema.columns().iter().map(|c| c.as_ref()).collect();
             // Overflow fields in emit order (IndexMap insertion order)
             if let Some(overflow) = record.overflow_fields() {
                 header.extend(overflow.map(|(k, _)| k));
@@ -70,12 +65,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             .schema
             .columns()
             .iter()
-            .map(|col| {
-                record
-                    .get(col)
-                    .map(value_to_csv_cell)
-                    .unwrap_or_default()
-            })
+            .map(|col| record.get(col).map(value_to_csv_cell).unwrap_or_default())
             .collect();
 
         // Overflow fields in emit order (IndexMap insertion order)
@@ -123,7 +113,11 @@ mod tests {
         Record::new(Arc::clone(schema), values)
     }
 
-    fn write_to_string(schema: &Arc<Schema>, config: CsvWriterConfig, records: &[Record]) -> String {
+    fn write_to_string(
+        schema: &Arc<Schema>,
+        config: CsvWriterConfig,
+        records: &[Record],
+    ) -> String {
         let mut buf = Vec::new();
         {
             let mut writer = CsvWriter::new(&mut buf, Arc::clone(schema), config);
@@ -139,9 +133,18 @@ mod tests {
     fn test_csv_writer_basic_output() {
         let schema = make_schema(&["name", "age"]);
         let records = vec![
-            make_record(&schema, vec![Value::String("Alice".into()), Value::String("30".into())]),
-            make_record(&schema, vec![Value::String("Bob".into()), Value::String("25".into())]),
-            make_record(&schema, vec![Value::String("Charlie".into()), Value::String("35".into())]),
+            make_record(
+                &schema,
+                vec![Value::String("Alice".into()), Value::String("30".into())],
+            ),
+            make_record(
+                &schema,
+                vec![Value::String("Bob".into()), Value::String("25".into())],
+            ),
+            make_record(
+                &schema,
+                vec![Value::String("Charlie".into()), Value::String("35".into())],
+            ),
         ];
         let output = write_to_string(&schema, CsvWriterConfig::default(), &records);
         assert_eq!(output, "name,age\nAlice,30\nBob,25\nCharlie,35\n");
@@ -150,10 +153,16 @@ mod tests {
     #[test]
     fn test_csv_writer_with_header() {
         let schema = make_schema(&["x", "y"]);
-        let records = vec![make_record(&schema, vec![Value::Integer(1), Value::Integer(2)])];
+        let records = vec![make_record(
+            &schema,
+            vec![Value::Integer(1), Value::Integer(2)],
+        )];
         let output = write_to_string(
             &schema,
-            CsvWriterConfig { include_header: true, ..Default::default() },
+            CsvWriterConfig {
+                include_header: true,
+                ..Default::default()
+            },
             &records,
         );
         assert!(output.starts_with("x,y\n"));
@@ -162,10 +171,16 @@ mod tests {
     #[test]
     fn test_csv_writer_no_header() {
         let schema = make_schema(&["x", "y"]);
-        let records = vec![make_record(&schema, vec![Value::Integer(1), Value::Integer(2)])];
+        let records = vec![make_record(
+            &schema,
+            vec![Value::Integer(1), Value::Integer(2)],
+        )];
         let output = write_to_string(
             &schema,
-            CsvWriterConfig { include_header: false, ..Default::default() },
+            CsvWriterConfig {
+                include_header: false,
+                ..Default::default()
+            },
             &records,
         );
         assert_eq!(output, "1,2\n");
@@ -176,7 +191,11 @@ mod tests {
         let schema = make_schema(&["a", "b", "c"]);
         let records = vec![make_record(
             &schema,
-            vec![Value::String("x".into()), Value::Null, Value::String("z".into())],
+            vec![
+                Value::String("x".into()),
+                Value::Null,
+                Value::String("z".into()),
+            ],
         )];
         let output = write_to_string(&schema, CsvWriterConfig::default(), &records);
         // Null becomes empty string between delimiters

@@ -1,6 +1,5 @@
 /// Extract-as-composition logic: pull consecutive transforms from a pipeline
 /// into a reusable `.comp.yaml` file and replace them with an `_import` directive.
-
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -10,6 +9,7 @@ use clinker_core::composition::{
 };
 
 /// Result of extracting transforms into a composition.
+#[allow(dead_code)]
 pub struct ExtractionResult {
     pub composition_yaml: String,
     pub composition_path: PathBuf,
@@ -20,6 +20,7 @@ pub struct ExtractionResult {
 ///
 /// The selected transforms must be consecutive in the pipeline's transformations
 /// array. They are removed and replaced with a single `_import` directive.
+#[allow(dead_code)]
 pub fn extract_composition(
     raw: &RawPipelineConfig,
     selected_names: &[String],
@@ -32,9 +33,9 @@ pub fn extract_composition(
     let indices: Vec<usize> = selected_names
         .iter()
         .filter_map(|name| {
-            raw.transformations.iter().position(|entry| {
-                matches!(entry, RawTransformEntry::Inline(t) if t.name == *name)
-            })
+            raw.transformations
+                .iter()
+                .position(|entry| matches!(entry, RawTransformEntry::Inline(t) if t.name == *name))
         })
         .collect();
 
@@ -72,8 +73,8 @@ pub fn extract_composition(
             .collect(),
     };
 
-    let composition_yaml =
-        serde_saphyr::to_string(&comp).map_err(|e| format!("Failed to serialize composition: {e}"))?;
+    let composition_yaml = serde_saphyr::to_string(&comp)
+        .map_err(|e| format!("Failed to serialize composition: {e}"))?;
 
     // Build the import directive to replace the extracted transforms
     let slug = comp_name.to_lowercase().replace(' ', "_");

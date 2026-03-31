@@ -176,7 +176,6 @@ pub fn SchemaPanel() -> Element {
                                 }
                             }
                             SchemaCard {
-                                key: "{schema.path.display()}",
                                 schema: (*schema).clone(),
                             }
                         }

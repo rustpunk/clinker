@@ -23,6 +23,7 @@ impl Default for FixedWidthWriterConfig {
 struct WriteField {
     name: String,
     width: usize,
+    #[allow(dead_code)]
     field_type: Option<FieldType>,
     justify: Justify,
     pad_char: char,
@@ -47,12 +48,16 @@ impl<W: Write> FixedWidthWriter<W> {
         let resolved: Vec<WriteField> = fields
             .iter()
             .map(|f| {
-                let width = f.width.or_else(|| {
-                    f.end.and_then(|e| e.checked_sub(f.start.unwrap_or(0)))
-                }).ok_or_else(|| FormatError::InvalidRecord {
-                    row: 0,
-                    message: format!("field '{}': fixed-width field must have 'width' or 'end'", f.name),
-                })?;
+                let width = f
+                    .width
+                    .or_else(|| f.end.and_then(|e| e.checked_sub(f.start.unwrap_or(0))))
+                    .ok_or_else(|| FormatError::InvalidRecord {
+                        row: 0,
+                        message: format!(
+                            "field '{}': fixed-width field must have 'width' or 'end'",
+                            f.name
+                        ),
+                    })?;
 
                 let is_numeric = matches!(
                     f.field_type,
@@ -101,7 +106,7 @@ impl<W: Write> FixedWidthWriter<W> {
         &self.truncation_warnings
     }
 
-    fn format_value(&self, field: &WriteField, value: &Value) -> String {
+    fn format_value(&self, _field: &WriteField, value: &Value) -> String {
         match value {
             Value::Null => String::new(),
             Value::String(s) => s.to_string(),
@@ -143,10 +148,7 @@ impl<W: Write> FixedWidthWriter<W> {
 impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         for field in &self.fields {
-            let value = record
-                .get(&field.name)
-                .cloned()
-                .unwrap_or(Value::Null);
+            let value = record.get(&field.name).cloned().unwrap_or(Value::Null);
 
             let formatted = self.format_value(field, &value);
 
@@ -158,7 +160,10 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
                             row: 0,
                             message: format!(
                                 "field '{}': value '{}' ({} chars) exceeds width {} — truncation policy is 'error'",
-                                field.name, formatted, formatted.len(), field.width
+                                field.name,
+                                formatted,
+                                formatted.len(),
+                                field.width
                             ),
                         });
                     }
@@ -232,9 +237,7 @@ mod tests {
     }
 
     fn make_record(cols: &[&str], vals: Vec<Value>) -> Record {
-        let schema = Arc::new(Schema::new(
-            cols.iter().map(|c| (*c).into()).collect(),
-        ));
+        let schema = Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()));
         Record::new(schema, vals)
     }
 
@@ -385,7 +388,10 @@ mod tests {
         let err = writer.write_record(&rec);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("truncation"), "error should mention truncation: {msg}");
+        assert!(
+            msg.contains("truncation"),
+            "error should mention truncation: {msg}"
+        );
     }
 
     #[test]

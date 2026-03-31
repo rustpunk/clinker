@@ -5,7 +5,6 @@
 
 use dioxus::prelude::*;
 
-use crate::composition_index::CompositionIndex;
 use crate::state::{LeftPanel, TabManagerState};
 
 use super::composition_card::CompositionCard;

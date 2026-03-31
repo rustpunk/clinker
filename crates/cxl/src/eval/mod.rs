@@ -1,6 +1,6 @@
-pub mod error;
-pub mod context;
 pub mod builtins_impl;
+pub mod context;
+pub mod error;
 
 #[cfg(test)]
 mod tests;
@@ -14,8 +14,8 @@ use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
+pub use context::{Clock, EvalContext, FixedClock, WallClock};
 pub use error::{EvalError, EvalErrorKind};
-pub use context::{Clock, WallClock, FixedClock, EvalContext};
 
 /// Evaluate a full CXL program against a record. Returns the output field map.
 pub fn eval_program<'w, S: RecordStorage + 'w>(
@@ -37,9 +37,17 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
                 let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
                 output.insert(name.to_string(), val);
             }
-            Statement::Trace { level, guard, message, .. } => {
+            Statement::Trace {
+                level,
+                guard,
+                message,
+                ..
+            } => {
                 let should_trace = if let Some(g) = guard {
-                    matches!(eval_expr(g, typed, ctx, resolver, window, &env)?, Value::Bool(true))
+                    matches!(
+                        eval_expr(g, typed, ctx, resolver, window, &env)?,
+                        Value::Bool(true)
+                    )
                 } else {
                     true
                 };
@@ -111,12 +119,16 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
 
         Expr::QualifiedFieldRef { parts, .. } => {
             match parts.len() {
-                2 => Ok(resolver.resolve_qualified(&parts[0], &parts[1]).unwrap_or(Value::Null)),
+                2 => Ok(resolver
+                    .resolve_qualified(&parts[0], &parts[1])
+                    .unwrap_or(Value::Null)),
                 3 => {
                     // Three-part path: source.record_type.field
                     // Join first two parts as the compound source key
                     let compound = format!("{}.{}", &parts[0], &parts[1]);
-                    Ok(resolver.resolve_qualified(&compound, &parts[2]).unwrap_or(Value::Null))
+                    Ok(resolver
+                        .resolve_qualified(&compound, &parts[2])
+                        .unwrap_or(Value::Null))
                 }
                 _ => Ok(Value::Null),
             }
@@ -126,21 +138,22 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             Ok(ctx.resolve_pipeline(field).unwrap_or(Value::Null))
         }
 
-        Expr::Now { .. } => {
-            Ok(Value::DateTime(ctx.clock.now()))
-        }
+        Expr::Now { .. } => Ok(Value::DateTime(ctx.clock.now())),
 
         Expr::Wildcard { .. } => Ok(Value::Bool(true)), // Wildcard in match = always matches
 
-        Expr::Binary { op, lhs, rhs, span, .. } => {
-            eval_binary(*op, lhs, rhs, *span, typed, ctx, resolver, window, env)
-        }
+        Expr::Binary {
+            op, lhs, rhs, span, ..
+        } => eval_binary(*op, lhs, rhs, *span, typed, ctx, resolver, window, env),
 
-        Expr::Unary { op, operand, span, .. } => {
+        Expr::Unary {
+            op, operand, span, ..
+        } => {
             let val = eval_expr(operand, typed, ctx, resolver, window, env)?;
             match op {
                 UnaryOp::Neg => match val {
-                    Value::Integer(n) => n.checked_neg()
+                    Value::Integer(n) => n
+                        .checked_neg()
                         .map(Value::Integer)
                         .ok_or_else(|| EvalError::integer_overflow("negation", *span)),
                     Value::Float(f) => Ok(Value::Float(-f)),
@@ -164,7 +177,12 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             }
         }
 
-        Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             let cond = eval_expr(condition, typed, ctx, resolver, window, env)?;
             match cond {
                 Value::Bool(true) => eval_expr(then_branch, typed, ctx, resolver, window, env),
@@ -207,7 +225,13 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             }
         }
 
-        Expr::MethodCall { node_id, receiver, method, args, span } => {
+        Expr::MethodCall {
+            node_id,
+            receiver,
+            method,
+            args,
+            span,
+        } => {
             let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env)?;
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
@@ -215,7 +239,10 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             }
 
             // Get pre-compiled regex if available
-            let regex = typed.regexes.get(node_id.0 as usize).and_then(|r| r.as_ref());
+            let regex = typed
+                .regexes
+                .get(node_id.0 as usize)
+                .and_then(|r| r.as_ref());
 
             match builtins_impl::dispatch_method(&recv_val, method, &arg_vals, regex, *span, ctx)? {
                 Some(val) => Ok(val),
@@ -229,11 +256,21 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             }
         }
 
-        Expr::WindowCall { function, args, span, .. } => {
-            let w = window.ok_or_else(|| EvalError::new(
-                EvalErrorKind::TypeMismatch { expected: "window context", got: "none" },
-                *span,
-            ))?;
+        Expr::WindowCall {
+            function,
+            args,
+            span,
+            ..
+        } => {
+            let w = window.ok_or_else(|| {
+                EvalError::new(
+                    EvalErrorKind::TypeMismatch {
+                        expected: "window context",
+                        got: "none",
+                    },
+                    *span,
+                )
+            })?;
 
             match &**function {
                 "count" => Ok(Value::Integer(w.count())),
@@ -273,18 +310,32 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 }
                 "last" => Ok(w.last().map(|_r| Value::Null).unwrap_or(Value::Null)),
                 "lag" => {
-                    let offset = args.first()
+                    let offset = args
+                        .first()
                         .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
                         .transpose()?
-                        .and_then(|v| if let Value::Integer(n) = v { Some(n as usize) } else { None })
+                        .and_then(|v| {
+                            if let Value::Integer(n) = v {
+                                Some(n as usize)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(1);
                     Ok(w.lag(offset).map(|_r| Value::Null).unwrap_or(Value::Null))
                 }
                 "lead" => {
-                    let offset = args.first()
+                    let offset = args
+                        .first()
                         .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
                         .transpose()?
-                        .and_then(|v| if let Value::Integer(n) = v { Some(n as usize) } else { None })
+                        .and_then(|v| {
+                            if let Value::Integer(n) = v {
+                                Some(n as usize)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(1);
                     Ok(w.lead(offset).map(|_r| Value::Null).unwrap_or(Value::Null))
                 }
@@ -309,6 +360,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_binary<'w, S: RecordStorage + 'w>(
     op: BinOp,
     lhs: &Expr,
@@ -372,33 +424,70 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
 
     match op {
         BinOp::Add => eval_add(&left, &right, span),
-        BinOp::Sub => eval_arith(&left, &right, span, "subtraction", |a, b| a.checked_sub(b), |a, b| a - b),
-        BinOp::Mul => eval_arith(&left, &right, span, "multiplication", |a, b| a.checked_mul(b), |a, b| a * b),
+        BinOp::Sub => eval_arith(
+            &left,
+            &right,
+            span,
+            "subtraction",
+            |a, b| a.checked_sub(b),
+            |a, b| a - b,
+        ),
+        BinOp::Mul => eval_arith(
+            &left,
+            &right,
+            span,
+            "multiplication",
+            |a, b| a.checked_mul(b),
+            |a, b| a * b,
+        ),
         BinOp::Div => {
             // Check division by zero
             match (&left, &right) {
                 (_, Value::Integer(0)) => Err(EvalError::division_by_zero(span)),
                 (_, Value::Float(f)) if *f == 0.0 => Err(EvalError::division_by_zero(span)),
-                _ => eval_arith(&left, &right, span, "division", |a, b| a.checked_div(b), |a, b| a / b),
+                _ => eval_arith(
+                    &left,
+                    &right,
+                    span,
+                    "division",
+                    |a, b| a.checked_div(b),
+                    |a, b| a / b,
+                ),
             }
         }
-        BinOp::Mod => {
-            match (&left, &right) {
-                (_, Value::Integer(0)) => Err(EvalError::division_by_zero(span)),
-                _ => eval_arith(&left, &right, span, "modulo", |a, b| a.checked_rem(b), |a, b| a % b),
-            }
-        }
-        BinOp::Gt => Ok(Value::Bool(compare_values(&left, &right) == Some(std::cmp::Ordering::Greater))),
-        BinOp::Lt => Ok(Value::Bool(compare_values(&left, &right) == Some(std::cmp::Ordering::Less))),
-        BinOp::Gte => Ok(Value::Bool(matches!(compare_values(&left, &right), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))),
-        BinOp::Lte => Ok(Value::Bool(matches!(compare_values(&left, &right), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))),
+        BinOp::Mod => match (&left, &right) {
+            (_, Value::Integer(0)) => Err(EvalError::division_by_zero(span)),
+            _ => eval_arith(
+                &left,
+                &right,
+                span,
+                "modulo",
+                |a, b| a.checked_rem(b),
+                |a, b| a % b,
+            ),
+        },
+        BinOp::Gt => Ok(Value::Bool(
+            compare_values(&left, &right) == Some(std::cmp::Ordering::Greater),
+        )),
+        BinOp::Lt => Ok(Value::Bool(
+            compare_values(&left, &right) == Some(std::cmp::Ordering::Less),
+        )),
+        BinOp::Gte => Ok(Value::Bool(matches!(
+            compare_values(&left, &right),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ))),
+        BinOp::Lte => Ok(Value::Bool(matches!(
+            compare_values(&left, &right),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ))),
         BinOp::Eq | BinOp::Neq | BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
 }
 
 fn eval_add(left: &Value, right: &Value, span: Span) -> Result<Value, EvalError> {
     match (left, right) {
-        (Value::Integer(a), Value::Integer(b)) => a.checked_add(*b)
+        (Value::Integer(a), Value::Integer(b)) => a
+            .checked_add(*b)
             .map(Value::Integer)
             .ok_or_else(|| EvalError::integer_overflow("addition", span)),
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
@@ -410,7 +499,10 @@ fn eval_add(left: &Value, right: &Value, span: Span) -> Result<Value, EvalError>
 }
 
 fn eval_arith(
-    left: &Value, right: &Value, span: Span, op_name: &'static str,
+    left: &Value,
+    right: &Value,
+    span: Span,
+    op_name: &'static str,
     int_op: impl FnOnce(i64, i64) -> Option<i64>,
     float_op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<Value, EvalError> {

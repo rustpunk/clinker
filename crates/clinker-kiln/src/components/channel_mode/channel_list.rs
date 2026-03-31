@@ -5,7 +5,7 @@
 
 use dioxus::prelude::*;
 
-use crate::state::{ChannelSummary, GroupSummary, TabManagerState};
+use crate::state::{ChannelSummary, TabManagerState};
 use crate::workspace;
 
 /// Channel list sidebar component.
@@ -33,10 +33,8 @@ pub fn ChannelList() -> Element {
         .channels
         .iter()
         .filter(|c| {
-            if active_tier != "all" {
-                if c.tier.as_deref() != Some(active_tier.as_str()) {
-                    return false;
-                }
+            if active_tier != "all" && c.tier.as_deref() != Some(active_tier.as_str()) {
+                return false;
             }
             if query.is_empty() {
                 return true;
@@ -303,8 +301,7 @@ fn create_channel(workspace_root: &std::path::Path, channels_dir: &str, id: &str
 
     // Write template channel.yaml
     let display_name = id
-        .replace('-', " ")
-        .replace('_', " ")
+        .replace(['-', '_'], " ")
         .split_whitespace()
         .map(|w| {
             let mut c = w.chars();

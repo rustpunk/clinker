@@ -6,10 +6,12 @@
 //! Spec: clinker-kiln-search-schemas-templates-addendum.md §S3.5, §S3.6.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::model::{FieldType, SchemaIndex, SourceSchema};
-use clinker_core::config::{InputConfig, InputFormat, PipelineConfig, SchemaSource, TransformConfig};
+use crate::model::{SchemaIndex, SourceSchema};
+use clinker_core::config::{
+    InputConfig, InputFormat, PipelineConfig, SchemaSource, TransformConfig,
+};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -96,9 +98,10 @@ fn validate_input(
     let canonical = schema_path.canonicalize().unwrap_or(schema_path.clone());
 
     // Check if schema file exists in index
-    let schema = index.schemas.values().find(|s| {
-        s.path.canonicalize().unwrap_or_else(|_| s.path.clone()) == canonical
-    });
+    let schema = index
+        .schemas
+        .values()
+        .find(|s| s.path.canonicalize().unwrap_or_else(|_| s.path.clone()) == canonical);
 
     let Some(schema) = schema else {
         warnings.push(SchemaWarning {
@@ -178,9 +181,10 @@ fn resolve_input_schema<'a>(
     let schema_path = workspace_root.join(schema_file);
     let canonical = schema_path.canonicalize().unwrap_or(schema_path);
 
-    index.schemas.values().find(|s| {
-        s.path.canonicalize().unwrap_or_else(|_| s.path.clone()) == canonical
-    })
+    index
+        .schemas
+        .values()
+        .find(|s| s.path.canonicalize().unwrap_or_else(|_| s.path.clone()) == canonical)
 }
 
 // ── CXL field extraction (heuristic) ────────────────────────────────────
@@ -207,10 +211,10 @@ fn extract_referenced_fields(cxl: &str) -> Vec<String> {
         }
 
         // "emit <name> = <expr>" — extract from the RHS
-        if let Some(rest) = trimmed.strip_prefix("emit ") {
-            if let Some((_name, expr)) = rest.split_once('=') {
-                extract_identifiers(expr.trim(), &mut fields);
-            }
+        if let Some(rest) = trimmed.strip_prefix("emit ")
+            && let Some((_name, expr)) = rest.split_once('=')
+        {
+            extract_identifiers(expr.trim(), &mut fields);
         }
 
         // "distinct by <fields>" — extract field list
@@ -232,14 +236,13 @@ fn extract_referenced_fields(cxl: &str) -> Vec<String> {
         }
 
         // "lookup_join <source> on key = <field>"
-        if trimmed.starts_with("lookup_join") {
-            if let Some(key_part) = trimmed.split("key").nth(1) {
-                if let Some((_eq, field)) = key_part.split_once('=') {
-                    let f = field.trim();
-                    if is_identifier(f) {
-                        fields.insert(f.to_string());
-                    }
-                }
+        if trimmed.starts_with("lookup_join")
+            && let Some(key_part) = trimmed.split("key").nth(1)
+            && let Some((_eq, field)) = key_part.split_once('=')
+        {
+            let f = field.trim();
+            if is_identifier(f) {
+                fields.insert(f.to_string());
             }
         }
     }
@@ -252,12 +255,12 @@ fn extract_emit_fields(cxl: &str) -> Vec<String> {
     let mut fields = Vec::new();
     for line in cxl.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("emit ") {
-            if let Some((name, _expr)) = rest.split_once('=') {
-                let name = name.trim();
-                if is_identifier(name) {
-                    fields.push(name.to_string());
-                }
+        if let Some(rest) = trimmed.strip_prefix("emit ")
+            && let Some((name, _expr)) = rest.split_once('=')
+        {
+            let name = name.trim();
+            if is_identifier(name) {
+                fields.push(name.to_string());
             }
         }
     }
@@ -305,7 +308,9 @@ fn strip_quoted_strings(s: &str) -> String {
 /// Check if a string is a valid CXL identifier (field name).
 fn is_identifier(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -313,12 +318,46 @@ fn is_identifier(s: &str) -> bool {
 fn is_keyword_or_literal(s: &str) -> bool {
     matches!(
         s,
-        "true" | "false" | "null" | "nil" | "and" | "or" | "not"
-        | "filter" | "emit" | "distinct" | "sort" | "by" | "asc" | "desc"
-        | "lookup_join" | "on" | "key" | "pull" | "if" | "else" | "then"
-        | "contains" | "starts_with" | "ends_with" | "to_upper" | "to_lower"
-        | "len" | "trim" | "split" | "last" | "first" | "count" | "sum"
-        | "min" | "max" | "avg" | "abs" | "round" | "floor" | "ceil"
+        "true"
+            | "false"
+            | "null"
+            | "nil"
+            | "and"
+            | "or"
+            | "not"
+            | "filter"
+            | "emit"
+            | "distinct"
+            | "sort"
+            | "by"
+            | "asc"
+            | "desc"
+            | "lookup_join"
+            | "on"
+            | "key"
+            | "pull"
+            | "if"
+            | "else"
+            | "then"
+            | "contains"
+            | "starts_with"
+            | "ends_with"
+            | "to_upper"
+            | "to_lower"
+            | "len"
+            | "trim"
+            | "split"
+            | "last"
+            | "first"
+            | "count"
+            | "sum"
+            | "min"
+            | "max"
+            | "avg"
+            | "abs"
+            | "round"
+            | "floor"
+            | "ceil"
     )
 }
 
@@ -330,10 +369,8 @@ fn find_closest_field(target: &str, candidates: &[&str]) -> Option<String> {
 
     for &candidate in candidates {
         let dist = levenshtein(target, candidate);
-        if dist <= 2 {
-            if best.is_none() || dist < best.unwrap().1 {
-                best = Some((candidate, dist));
-            }
+        if dist <= 2 && (best.is_none() || dist < best.unwrap().1) {
+            best = Some((candidate, dist));
         }
     }
 
@@ -347,8 +384,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
     let n = a.len();
     let m = b.len();
 
-    if n == 0 { return m; }
-    if m == 0 { return n; }
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
 
     let mut prev: Vec<usize> = (0..=m).collect();
     let mut curr = vec![0; m + 1];
@@ -357,9 +398,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -445,8 +484,8 @@ distinct by customer_id
                 concurrency: None,
                 date_locale: None,
                 log_rules: None,
-                sort_output: None,
                 include_provenance: None,
+                metrics: None,
             },
             inputs: vec![InputConfig {
                 name: "src".to_string(),

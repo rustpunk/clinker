@@ -113,9 +113,18 @@ mod tests {
         };
 
         let result = project_output(&input, &emitted, &config);
-        assert_eq!(result.get("full_name"), Some(&Value::String("Alice Smith".into())));
-        assert_eq!(result.get("first_name"), Some(&Value::String("Alice".into())));
-        assert_eq!(result.get("secret"), Some(&Value::String("password123".into())));
+        assert_eq!(
+            result.get("full_name"),
+            Some(&Value::String("Alice Smith".into()))
+        );
+        assert_eq!(
+            result.get("first_name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            result.get("secret"),
+            Some(&Value::String("password123".into()))
+        );
     }
 
     #[test]
@@ -164,6 +173,9 @@ mod tests {
 
         let result = project_output(&input, &emitted, &config);
         assert!(result.get("first_name").is_none());
-        assert_eq!(result.get("given_name"), Some(&Value::String("Alice".into())));
+        assert_eq!(
+            result.get("given_name"),
+            Some(&Value::String("Alice".into()))
+        );
     }
 }

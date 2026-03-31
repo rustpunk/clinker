@@ -5,7 +5,6 @@
 ///
 /// Phase 2a: parser only (no resolver/typechecker — those need a real schema).
 /// Phase 2b will add `validate_with_schema()` using `resolve_program` + `type_check`.
-
 use cxl::parser::Parser;
 
 /// Result of validating a CXL expression, suitable for rendering.

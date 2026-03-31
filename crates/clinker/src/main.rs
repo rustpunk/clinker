@@ -3,8 +3,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use clinker_channel::channel_override::{resolve_channel, resolve_channel_with_inheritance, ChannelOverride};
-use clinker_channel::composition::{resolve_compositions, ProvenanceMap};
+use clinker_channel::channel_override::{
+    ChannelOverride, resolve_channel, resolve_channel_with_inheritance,
+};
+use clinker_channel::composition::{ProvenanceMap, resolve_compositions};
 use clinker_channel::manifest::ChannelManifest;
 use clinker_channel::workspace::WorkspaceRoot;
 use clinker_core::config::load_config_with_vars;
@@ -23,6 +25,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Run a pipeline from a YAML config file
     Run(RunArgs),
@@ -164,21 +167,25 @@ fn main() -> ExitCode {
 
     match &cli.command {
         Commands::Run(args) => {
-            let filter = args.log_level.parse::<tracing_subscriber::filter::LevelFilter>()
+            let filter = args
+                .log_level
+                .parse::<tracing_subscriber::filter::LevelFilter>()
                 .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
-            tracing_subscriber::fmt()
-                .with_max_level(filter)
-                .init();
+            tracing_subscriber::fmt().with_max_level(filter).init();
 
             match run(args) {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
                     tracing::error!("{e}");
                     match &e {
-                        PipelineError::Config(_) | PipelineError::Schema(_) | PipelineError::Compilation { .. } => ExitCode::from(1),
+                        PipelineError::Config(_)
+                        | PipelineError::Schema(_)
+                        | PipelineError::Compilation { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
                         PipelineError::Eval(_) => ExitCode::from(3),
-                        PipelineError::Format(_) | PipelineError::ThreadPool(_) => ExitCode::from(4),
+                        PipelineError::Format(_) | PipelineError::ThreadPool(_) => {
+                            ExitCode::from(4)
+                        }
                     }
                 }
             }
@@ -276,14 +283,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 ))
             })?;
             if co.when_passes() {
-                pipeline_config = resolve_channel(
-                    pipeline_config,
-                    &co,
-                    ws,
-                    &vars_ref,
-                    &mut provenance,
-                )
-                .map_err(channel_err)?;
+                pipeline_config =
+                    resolve_channel(pipeline_config, &co, ws, &vars_ref, &mut provenance)
+                        .map_err(channel_err)?;
             }
         }
     }
@@ -316,18 +318,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     // Resolve spool directory (CLI > env > YAML)
-    let yaml_spool = pipeline_config.pipeline.metrics.as_ref()
+    let yaml_spool = pipeline_config
+        .pipeline
+        .metrics
+        .as_ref()
         .and_then(|m| m.spool_dir.as_deref());
-    let spool_dir = metrics::resolve_spool_dir(
-        args.metrics_spool_dir.as_deref(),
-        yaml_spool,
-    );
+    let spool_dir = metrics::resolve_spool_dir(args.metrics_spool_dir.as_deref(), yaml_spool);
 
     // Build runtime parameters
     let execution_id = uuid::Uuid::now_v7().to_string();
     let batch_id = args.resolved_batch_id();
-    let pipeline_vars = pipeline_config.pipeline.vars.as_ref()
-        .map(|v| clinker_core::config::convert_pipeline_vars(v))
+    let pipeline_vars = pipeline_config
+        .pipeline
+        .vars
+        .as_ref()
+        .map(clinker_core::config::convert_pipeline_vars)
         .unwrap_or_default();
     let run_params = clinker_core::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
@@ -342,42 +347,44 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let reader = std::fs::File::open(input_path)?;
     let writer = std::fs::File::create(output_path)?;
 
-    let report = PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer, &run_params)?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer, &run_params)?;
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
 
     // Write DLQ if there are entries and DLQ path is configured
-    if !dlq_entries.is_empty() {
-        if let Some(ref dlq_config) = pipeline_config.error_handling.dlq {
-            if let Some(ref dlq_path) = dlq_config.path {
-                let input_schema = {
-                    let f = std::fs::File::open(input_path)?;
-                    let mut r = clinker_format::csv::reader::CsvReader::from_reader(
-                        f,
-                        clinker_format::csv::reader::CsvReaderConfig::default(),
-                    );
-                    r.schema().map_err(|e| PipelineError::Format(e))?
-                };
-                let dlq_writer = std::fs::File::create(dlq_path)?;
-                let include_reason = dlq_config.include_reason.unwrap_or(true);
-                let include_source_row = dlq_config.include_source_row.unwrap_or(true);
-                clinker_core::dlq::write_dlq(
-                    dlq_writer,
-                    dlq_entries,
-                    &input_schema,
-                    input_path,
-                    include_reason,
-                    include_source_row,
-                )
-                .map_err(PipelineError::Format)?;
-            }
-        }
+    if !dlq_entries.is_empty()
+        && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
+        && let Some(ref dlq_path) = dlq_config.path
+    {
+        let input_schema = {
+            let f = std::fs::File::open(input_path)?;
+            let mut r = clinker_format::csv::reader::CsvReader::from_reader(
+                f,
+                clinker_format::csv::reader::CsvReaderConfig::default(),
+            );
+            r.schema().map_err(PipelineError::Format)?
+        };
+        let dlq_writer = std::fs::File::create(dlq_path)?;
+        let include_reason = dlq_config.include_reason.unwrap_or(true);
+        let include_source_row = dlq_config.include_source_row.unwrap_or(true);
+        clinker_core::dlq::write_dlq(
+            dlq_writer,
+            dlq_entries,
+            &input_schema,
+            input_path,
+            include_reason,
+            include_source_row,
+        )
+        .map_err(PipelineError::Format)?;
     }
 
     tracing::info!(
         "Pipeline complete: {} total, {} ok, {} dlq",
-        counters.total_count, counters.ok_count, counters.dlq_count
+        counters.total_count,
+        counters.ok_count,
+        counters.dlq_count
     );
 
     // Exit codes per spec §10.2
@@ -386,7 +393,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Write execution metrics to spool directory (if configured)
     if let Some(ref dir) = spool_dir {
         let hostname = hostname_string();
-        let dlq_path = pipeline_config.error_handling.dlq.as_ref()
+        let dlq_path = pipeline_config
+            .error_handling
+            .dlq
+            .as_ref()
             .and_then(|d| d.path.clone());
 
         let duration_ms = (report.finished_at - report.started_at).num_milliseconds();
@@ -407,8 +417,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             execution_mode: format!("{:?}", report.execution_mode),
             peak_rss_bytes: report.peak_rss_bytes,
             thread_count: num_threads(args),
-            input_files: pipeline_config.inputs.iter().map(|i| i.path.clone()).collect(),
-            output_files: pipeline_config.outputs.iter().map(|o| o.path.clone()).collect(),
+            input_files: pipeline_config
+                .inputs
+                .iter()
+                .map(|i| i.path.clone())
+                .collect(),
+            output_files: pipeline_config
+                .outputs
+                .iter()
+                .map(|o| o.path.clone())
+                .collect(),
             dlq_path,
             error: None,
         };
@@ -439,9 +457,16 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
             let count = entries.len();
 
             if args.dry_run {
-                println!("Would collect {count} file(s) from {}", args.spool_dir.display());
+                println!(
+                    "Would collect {count} file(s) from {}",
+                    args.spool_dir.display()
+                );
                 for entry in &entries {
-                    println!("  {} ({})", entry.path.display(), entry.metrics.pipeline_name);
+                    println!(
+                        "  {} ({})",
+                        entry.path.display(),
+                        entry.metrics.pipeline_name
+                    );
                 }
                 return Ok(());
             }
@@ -449,19 +474,22 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
             let mut written = 0usize;
             for entry in entries {
                 metrics::append_ndjson(&entry.metrics, &args.output_file)?;
-                if args.delete_after_collect {
-                    if let Err(e) = std::fs::remove_file(&entry.path) {
-                        tracing::warn!(
-                            path = %entry.path.display(),
-                            error = %e,
-                            "metrics collect: failed to delete spool file after collection"
-                        );
-                    }
+                if args.delete_after_collect
+                    && let Err(e) = std::fs::remove_file(&entry.path)
+                {
+                    tracing::warn!(
+                        path = %entry.path.display(),
+                        error = %e,
+                        "metrics collect: failed to delete spool file after collection"
+                    );
                 }
                 written += 1;
             }
 
-            println!("Collected {written} file(s) → {}", args.output_file.display());
+            println!(
+                "Collected {written} file(s) → {}",
+                args.output_file.display()
+            );
             Ok(())
         }
     }
@@ -496,13 +524,13 @@ fn check_warn_env_unset(
 ) {
     let channel_dir = workspace.channel_dir(channel_id);
     let derived = ChannelOverride::path_for(pipeline_path, &channel_dir);
-    if let Ok(Some(co)) = ChannelOverride::load(&derived, channel_vars) {
-        if co.header.when.is_some() {
-            tracing::warn!(
-                "CLINKER_ENV is not set; when: condition in {} will not be evaluated — override file skipped",
-                derived.display()
-            );
-        }
+    if let Ok(Some(co)) = ChannelOverride::load(&derived, channel_vars)
+        && co.header.when.is_some()
+    {
+        tracing::warn!(
+            "CLINKER_ENV is not set; when: condition in {} will not be evaluated — override file skipped",
+            derived.display()
+        );
     }
 }
 
@@ -540,7 +568,8 @@ mod tests {
 
     #[test]
     fn test_cli_run_memory_limit_suffix_k() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--memory-limit", "512K", "p.yaml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--memory-limit", "512K", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 524288),
             _ => panic!("expected Run command"),
@@ -549,7 +578,8 @@ mod tests {
 
     #[test]
     fn test_cli_run_memory_limit_suffix_m() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--memory-limit", "256M", "p.yaml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--memory-limit", "256M", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 268435456),
             _ => panic!("expected Run command"),
@@ -558,7 +588,8 @@ mod tests {
 
     #[test]
     fn test_cli_run_memory_limit_suffix_g() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--memory-limit", "2G", "p.yaml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--memory-limit", "2G", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 2147483648),
             _ => panic!("expected Run command"),
@@ -567,7 +598,8 @@ mod tests {
 
     #[test]
     fn test_cli_run_memory_limit_bare_bytes() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--memory-limit", "1000000", "p.yaml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--memory-limit", "1000000", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 1000000),
             _ => panic!("expected Run command"),
@@ -626,11 +658,19 @@ mod tests {
     #[test]
     fn test_cli_run_metrics_spool_dir_flag() {
         let cli = Cli::try_parse_from([
-            "clinker", "run", "--metrics-spool-dir", "/var/spool/clinker", "p.yaml",
-        ]).unwrap();
+            "clinker",
+            "run",
+            "--metrics-spool-dir",
+            "/var/spool/clinker",
+            "p.yaml",
+        ])
+        .unwrap();
         match cli.command {
             Commands::Run(args) => {
-                assert_eq!(args.metrics_spool_dir, Some(PathBuf::from("/var/spool/clinker")));
+                assert_eq!(
+                    args.metrics_spool_dir,
+                    Some(PathBuf::from("/var/spool/clinker"))
+                );
             }
             _ => panic!("expected Run command"),
         }
@@ -639,13 +679,20 @@ mod tests {
     #[test]
     fn test_cli_metrics_collect_parses() {
         let cli = Cli::try_parse_from([
-            "clinker", "metrics", "collect",
-            "--spool-dir", "/var/spool/clinker",
-            "--output-file", "/data/metrics.ndjson",
+            "clinker",
+            "metrics",
+            "collect",
+            "--spool-dir",
+            "/var/spool/clinker",
+            "--output-file",
+            "/data/metrics.ndjson",
             "--delete-after-collect",
-        ]).unwrap();
+        ])
+        .unwrap();
         match cli.command {
-            Commands::Metrics { subcommand: MetricsCommands::Collect(args) } => {
+            Commands::Metrics {
+                subcommand: MetricsCommands::Collect(args),
+            } => {
                 assert_eq!(args.spool_dir, PathBuf::from("/var/spool/clinker"));
                 assert_eq!(args.output_file, PathBuf::from("/data/metrics.ndjson"));
                 assert!(args.delete_after_collect);
@@ -658,13 +705,20 @@ mod tests {
     #[test]
     fn test_cli_metrics_collect_dry_run() {
         let cli = Cli::try_parse_from([
-            "clinker", "metrics", "collect",
-            "--spool-dir", "/spool",
-            "--output-file", "/out.ndjson",
+            "clinker",
+            "metrics",
+            "collect",
+            "--spool-dir",
+            "/spool",
+            "--output-file",
+            "/out.ndjson",
             "--dry-run",
-        ]).unwrap();
+        ])
+        .unwrap();
         match cli.command {
-            Commands::Metrics { subcommand: MetricsCommands::Collect(args) } => {
+            Commands::Metrics {
+                subcommand: MetricsCommands::Collect(args),
+            } => {
                 assert!(args.dry_run);
             }
             _ => panic!("expected Metrics::Collect command"),
@@ -692,8 +746,15 @@ mod tests {
     #[test]
     fn test_cli_run_channel_path_multiple() {
         let cli = Cli::try_parse_from([
-            "clinker", "run", "--channel-path", "a.channel.yaml", "--channel-path", "b.channel.yaml", "p.yaml"
-        ]).unwrap();
+            "clinker",
+            "run",
+            "--channel-path",
+            "a.channel.yaml",
+            "--channel-path",
+            "b.channel.yaml",
+            "p.yaml",
+        ])
+        .unwrap();
         match cli.command {
             Commands::Run(args) => {
                 assert_eq!(args.channel_path.len(), 2);
@@ -717,7 +778,8 @@ mod tests {
 
     #[test]
     fn test_dry_run_n_flag() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "10", "p.yaml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "10", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => {
                 assert!(args.dry_run);
@@ -729,7 +791,17 @@ mod tests {
 
     #[test]
     fn test_dry_run_output_flag() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "5", "--dry-run-output", "out.csv", "p.yaml"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "clinker",
+            "run",
+            "--dry-run",
+            "-n",
+            "5",
+            "--dry-run-output",
+            "out.csv",
+            "p.yaml",
+        ])
+        .unwrap();
         match cli.command {
             Commands::Run(args) => {
                 assert!(args.dry_run);
@@ -754,7 +826,8 @@ mod tests {
 
     #[test]
     fn test_dry_run_default_stdout() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "3", "p.yaml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--dry-run", "-n", "3", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => {
                 assert!(args.dry_run_output.is_none()); // default to stdout

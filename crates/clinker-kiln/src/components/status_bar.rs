@@ -15,13 +15,13 @@ use dioxus::prelude::*;
 use clinker_git::GitOps;
 
 use crate::components::activity_bar::switch_context;
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::state::{NavigationContext, TabManagerState, use_app_state};
 
 /// Status bar component — anchored to viewport bottom.
 #[component]
 pub fn StatusBar() -> Element {
-    let mut tab_mgr = use_context::<TabManagerState>();
+    let tab_mgr = use_context::<TabManagerState>();
     let state = use_app_state();
     let current_ctx = (state.active_context)();
     let git = (tab_mgr.git_state)();
@@ -167,12 +167,11 @@ fn BranchSwitcher(on_close: EventHandler<()>) -> Element {
     // Load branches on first render
     if !(loaded)() {
         let ws = (tab_mgr.workspace)();
-        if let Some(ws) = ws {
-            if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
-                if let Ok(b) = ops.branches() {
-                    branches.set(b);
-                }
-            }
+        if let Some(ws) = ws
+            && let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root)
+            && let Ok(b) = ops.branches()
+        {
+            branches.set(b);
         }
         loaded.set(true);
     }
@@ -183,9 +182,7 @@ fn BranchSwitcher(on_close: EventHandler<()>) -> Element {
 
     let filtered: Vec<_> = branch_list
         .iter()
-        .filter(|b| {
-            query.is_empty() || b.name.to_lowercase().contains(&query.to_lowercase())
-        })
+        .filter(|b| query.is_empty() || b.name.to_lowercase().contains(&query.to_lowercase()))
         .collect();
 
     rsx! {
@@ -291,16 +288,21 @@ fn switch_branch(tab_mgr: &mut TabManagerState, name: &str) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
 
-    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else {
+        return;
+    };
     let mut toast: Signal<Option<ToastState>> = use_context();
 
     // Check for dirty state
     let status = ops.status();
-    if let Ok(ref s) = status {
-        if s.has_changes() {
-            toast_error(&mut toast, format!("Stash or commit changes before switching branches"));
-            return;
-        }
+    if let Ok(ref s) = status
+        && s.has_changes()
+    {
+        toast_error(
+            &mut toast,
+            "Stash or commit changes before switching branches".to_string(),
+        );
+        return;
     }
 
     let result = std::process::Command::new("git")
@@ -310,7 +312,7 @@ fn switch_branch(tab_mgr: &mut TabManagerState, name: &str) {
 
     match result {
         Ok(output) if output.status.success() => {
-            toast_success(&mut toast, &format!("Switched to {name}"));
+            toast_success(&mut toast, format!("Switched to {name}"));
             if let Ok(new_status) = ops.status() {
                 tab_mgr.git_state.set(Some(new_status));
             }
@@ -330,7 +332,9 @@ fn create_and_switch(tab_mgr: &mut TabManagerState, name: &str) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
 
-    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else {
+        return;
+    };
     let mut toast: Signal<Option<ToastState>> = use_context();
 
     let result = std::process::Command::new("git")
@@ -340,7 +344,7 @@ fn create_and_switch(tab_mgr: &mut TabManagerState, name: &str) {
 
     match result {
         Ok(output) if output.status.success() => {
-            toast_success(&mut toast, &format!("Created and switched to {name}"));
+            toast_success(&mut toast, format!("Created and switched to {name}"));
             if let Ok(new_status) = ops.status() {
                 tab_mgr.git_state.set(Some(new_status));
             }

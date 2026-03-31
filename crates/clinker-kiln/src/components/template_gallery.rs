@@ -32,7 +32,10 @@ pub fn TemplateGallery() -> Element {
             let q = current_search.to_lowercase();
             t.metadata.name.to_lowercase().contains(&q)
                 || t.metadata.description.to_lowercase().contains(&q)
-                || t.metadata.tags.iter().any(|tag| tag.to_lowercase().contains(&q))
+                || t.metadata
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(&q))
         })
         .collect();
 
@@ -131,10 +134,7 @@ pub fn TemplateGallery() -> Element {
 
 /// A single template card in the gallery grid.
 #[component]
-fn TemplateCard(
-    template: Template,
-    on_use: EventHandler<String>,
-) -> Element {
+fn TemplateCard(template: Template, on_use: EventHandler<String>) -> Element {
     let name = template.metadata.name.clone();
     let desc = template.metadata.description.clone();
     let tags = template.metadata.tags.clone();

@@ -17,10 +17,7 @@ pub enum ActiveDrawer {
 /// label, and badge. Active button gets accent-tinted background and
 /// 2px accent bottom border.
 #[component]
-pub fn DrawerToggleBar(
-    active: ActiveDrawer,
-    on_toggle: EventHandler<ActiveDrawer>,
-) -> Element {
+pub fn DrawerToggleBar(active: ActiveDrawer, on_toggle: EventHandler<ActiveDrawer>) -> Element {
     rsx! {
         div {
             class: "kiln-drawer-bar",

@@ -535,10 +535,7 @@ mod tests {
     #[test]
     fn test_lex_string_double_quoted() {
         let tokens = Lexer::tokenize(r#""hello \"world\"""#);
-        assert_eq!(
-            tokens[0].0,
-            Token::StringLit("hello \"world\"".into())
-        );
+        assert_eq!(tokens[0].0, Token::StringLit("hello \"world\"".into()));
     }
 
     #[test]

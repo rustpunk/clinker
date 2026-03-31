@@ -6,18 +6,18 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 mod app;
 mod autodoc;
 mod channel_resolve;
+mod commands;
 mod components;
 mod composition_index;
 mod composition_ops;
 mod cxl_bridge;
 mod demo;
 mod file_ops;
+mod fs_watcher;
 mod keyboard;
 mod notes;
 mod pipeline_view;
 mod recent_files;
-mod commands;
-mod fs_watcher;
 mod search;
 mod state;
 mod sync;
@@ -38,18 +38,18 @@ pub fn cli_workspace() -> Option<&'static PathBuf> {
 fn main() {
     // Parse --workspace <path> from CLI args
     let args: Vec<String> = std::env::args().collect();
-    if let Some(idx) = args.iter().position(|a| a == "--workspace") {
-        if let Some(path_str) = args.get(idx + 1) {
-            let path = PathBuf::from(path_str);
-            let resolved = if path.is_relative() {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&path))
-                    .unwrap_or(path)
-            } else {
-                path
-            };
-            let _ = CLI_WORKSPACE.set(resolved);
-        }
+    if let Some(idx) = args.iter().position(|a| a == "--workspace")
+        && let Some(path_str) = args.get(idx + 1)
+    {
+        let path = PathBuf::from(path_str);
+        let resolved = if path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path))
+                .unwrap_or(path)
+        } else {
+            path
+        };
+        let _ = CLI_WORKSPACE.set(resolved);
     }
 
     dioxus::LaunchBuilder::new()

@@ -32,18 +32,18 @@ impl std::error::Error for CoercionError {}
 
 /// Default date format chain — US-oriented.
 pub const DEFAULT_DATE_FORMATS: &[&str] = &[
-    "%Y-%m-%d",  // ISO 8601: 2024-01-15
-    "%m/%d/%Y",  // US slash: 01/15/2024
-    "%Y/%m/%d",  // Alt ISO: 2024/01/15
-    "%m-%d-%Y",  // US dash: 01-15-2024
+    "%Y-%m-%d", // ISO 8601: 2024-01-15
+    "%m/%d/%Y", // US slash: 01/15/2024
+    "%Y/%m/%d", // Alt ISO: 2024/01/15
+    "%m-%d-%Y", // US dash: 01-15-2024
 ];
 
 /// Default datetime format chain — US-oriented.
 pub const DEFAULT_DATETIME_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%S", // ISO 8601: 2024-01-15T10:30:00
-    "%Y-%m-%d %H:%M:%S",  // Space sep: 2024-01-15 10:30:00
-    "%m/%d/%Y %H:%M:%S",  // US: 01/15/2024 10:30:00
-    "%m/%d/%Y %H:%M",     // US no sec: 01/15/2024 10:30
+    "%Y-%m-%d %H:%M:%S", // Space sep: 2024-01-15 10:30:00
+    "%m/%d/%Y %H:%M:%S", // US: 01/15/2024 10:30:00
+    "%m/%d/%Y %H:%M",    // US no sec: 01/15/2024 10:30
 ];
 
 /// Strict coercion: returns Err on failure. Null propagates as Ok(Null).
@@ -53,12 +53,14 @@ pub fn coerce_to_int(value: &Value) -> Result<Value, CoercionError> {
         Value::Integer(_) => Ok(value.clone()),
         Value::Float(f) => Ok(Value::Integer(*f as i64)),
         Value::Bool(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-        Value::String(s) => s.parse::<i64>().map(Value::Integer).map_err(|_| {
-            CoercionError::ParseFailure {
-                input: s.to_string(),
-                target: "Integer",
-            }
-        }),
+        Value::String(s) => {
+            s.parse::<i64>()
+                .map(Value::Integer)
+                .map_err(|_| CoercionError::ParseFailure {
+                    input: s.to_string(),
+                    target: "Integer",
+                })
+        }
         other => Err(CoercionError::TypeMismatch {
             from: other.type_name(),
             to: "Integer",
@@ -78,12 +80,14 @@ pub fn coerce_to_float(value: &Value) -> Result<Value, CoercionError> {
         Value::Float(_) => Ok(value.clone()),
         Value::Integer(n) => Ok(Value::Float(*n as f64)),
         Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
-        Value::String(s) => s.parse::<f64>().map(Value::Float).map_err(|_| {
-            CoercionError::ParseFailure {
-                input: s.to_string(),
-                target: "Float",
-            }
-        }),
+        Value::String(s) => {
+            s.parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| CoercionError::ParseFailure {
+                    input: s.to_string(),
+                    target: "Float",
+                })
+        }
         other => Err(CoercionError::TypeMismatch {
             from: other.type_name(),
             to: "Float",

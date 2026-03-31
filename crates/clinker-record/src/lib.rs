@@ -12,8 +12,8 @@ pub mod value;
 
 // Re-export primary types at crate root for ergonomic imports
 pub use coercion::{
-    coerce_to_bool, coerce_to_date, coerce_to_datetime, coerce_to_float, coerce_to_int,
-    coerce_to_string, CoercionError, DEFAULT_DATETIME_FORMATS, DEFAULT_DATE_FORMATS,
+    CoercionError, DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, coerce_to_bool, coerce_to_date,
+    coerce_to_datetime, coerce_to_float, coerce_to_int, coerce_to_string,
 };
 pub use counters::PipelineCounters;
 pub use minimal::MinimalRecord;

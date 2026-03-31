@@ -11,5 +11,5 @@ pub mod validate;
 
 pub use discovery::build_workspace_schema_index;
 pub use model::*;
-pub use parse::{parse_schema, parse_schema_file, SchemaParseError};
-pub use validate::{validate_pipeline, SchemaWarning, WarningKind};
+pub use parse::{SchemaParseError, parse_schema, parse_schema_file};
+pub use validate::{SchemaWarning, WarningKind, validate_pipeline};

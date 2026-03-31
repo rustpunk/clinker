@@ -7,9 +7,9 @@
 use dioxus::prelude::*;
 use dioxus_nox_cmdk::*;
 
-use crate::commands::{all_commands, CommandGroup};
+use crate::commands::{CommandGroup, all_commands};
 use crate::components::activity_bar::switch_context;
-use crate::state::{use_app_state, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState};
+use crate::state::{LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState};
 
 /// Command palette overlay component.
 #[component]
@@ -48,7 +48,7 @@ pub fn CommandPalette() -> Element {
         }
     }
 
-    let mut open_signal = use_signal(|| true);
+    let _open_signal = use_signal(|| true);
 
     rsx! {
         // Backdrop
@@ -174,11 +174,13 @@ fn execute_command(id: &str, tab_mgr: &mut TabManagerState) {
         "composition.browse" => {
             switch_context(&app, tab_mgr, NavigationContext::Pipeline);
             let current = (tab_mgr.left_panel)();
-            tab_mgr.left_panel.set(if current == LeftPanel::Compositions {
-                LeftPanel::None
-            } else {
-                LeftPanel::Compositions
-            });
+            tab_mgr
+                .left_panel
+                .set(if current == LeftPanel::Compositions {
+                    LeftPanel::None
+                } else {
+                    LeftPanel::Compositions
+                });
         }
 
         // ── Template ───────────────────────────────────────────

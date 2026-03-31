@@ -12,7 +12,6 @@
 /// - Environment variables
 ///
 /// Spec: navigation addendum §N3.6.
-
 use dioxus::prelude::*;
 
 use crate::state::TabManagerState;

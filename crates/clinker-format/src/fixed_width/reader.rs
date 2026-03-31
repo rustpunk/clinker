@@ -48,11 +48,9 @@ struct ResolvedField {
 
 impl ResolvedField {
     fn from_field_def(f: &FieldDef) -> Result<Self, FormatError> {
-        let start = f.start.ok_or_else(|| {
-            FormatError::InvalidRecord {
-                row: 0,
-                message: format!("field '{}': fixed-width field must have 'start'", f.name),
-            }
+        let start = f.start.ok_or_else(|| FormatError::InvalidRecord {
+            row: 0,
+            message: format!("field '{}': fixed-width field must have 'start'", f.name),
         })?;
 
         let width = if let Some(w) = f.width {
@@ -240,19 +238,29 @@ impl<R: Read> FixedWidthReader<R> {
         self.parse_typed_value(field, value_str)
     }
 
-    fn parse_typed_value(&self, field: &ResolvedField, value_str: &str) -> Result<Value, FormatError> {
+    fn parse_typed_value(
+        &self,
+        field: &ResolvedField,
+        value_str: &str,
+    ) -> Result<Value, FormatError> {
         match &field.field_type {
             Some(FieldType::Integer) => {
                 let v: i64 = value_str.parse().map_err(|e| FormatError::InvalidRecord {
                     row: self.row_number,
-                    message: format!("field '{}': cannot parse '{}' as integer: {e}", field.name, value_str),
+                    message: format!(
+                        "field '{}': cannot parse '{}' as integer: {e}",
+                        field.name, value_str
+                    ),
                 })?;
                 Ok(Value::Integer(v))
             }
             Some(FieldType::Float) => {
                 let v: f64 = value_str.parse().map_err(|e| FormatError::InvalidRecord {
                     row: self.row_number,
-                    message: format!("field '{}': cannot parse '{}' as float: {e}", field.name, value_str),
+                    message: format!(
+                        "field '{}': cannot parse '{}' as float: {e}",
+                        field.name, value_str
+                    ),
                 })?;
                 Ok(Value::Float(v))
             }
@@ -280,7 +288,7 @@ impl<R: Read> FixedWidthReader<R> {
                                 "field '{}': cannot parse '{}' as boolean",
                                 field.name, value_str
                             ),
-                        })
+                        });
                     }
                 };
                 Ok(Value::Bool(b))
@@ -464,10 +472,7 @@ mod tests {
         let mut reader =
             FixedWidthReader::new(&data[..], fields, FixedWidthReaderConfig::default()).unwrap();
         let rec = reader.next_record().unwrap().unwrap();
-        assert_eq!(
-            rec.get("name"),
-            Some(&Value::String("Smith   ".into()))
-        );
+        assert_eq!(rec.get("name"), Some(&Value::String("Smith   ".into())));
     }
 
     #[test]

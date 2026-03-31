@@ -1,10 +1,8 @@
 use dioxus::prelude::*;
 
-use crate::autodoc::{
-    generate_stage_doc, ChannelDocContext, ConfigCategory, StageDoc,
-};
+use crate::autodoc::{ChannelDocContext, ConfigCategory, StageDoc, generate_stage_doc};
 use crate::notes::parse_notes;
-use crate::state::{use_app_state, ChannelViewMode};
+use crate::state::{ChannelViewMode, use_app_state};
 
 /// Docs drawer — full stage documentation with Blueprint sub-aesthetic.
 ///
@@ -57,7 +55,12 @@ pub fn DrawerDocs(stage_id: String) -> Element {
         _ => (base_config, None),
     };
 
-    let Some(doc) = generate_stage_doc(config, &compositions_read, channel_doc_ctx.as_ref(), &stage_id) else {
+    let Some(doc) = generate_stage_doc(
+        config,
+        &compositions_read,
+        channel_doc_ctx.as_ref(),
+        &stage_id,
+    ) else {
         return rsx! {
             div {
                 class: "kiln-drawer-content kiln-drawer-content--docs",
@@ -68,9 +71,23 @@ pub fn DrawerDocs(stage_id: String) -> Element {
 
     // Get the stage note from _notes (if any)
     let notes_value = config
-        .inputs.iter().find(|i| i.name == stage_id).and_then(|i| i.notes.as_ref())
-        .or_else(|| config.transforms().find(|t| t.name == stage_id).and_then(|t| t.notes.as_ref()))
-        .or_else(|| config.outputs.iter().find(|o| o.name == stage_id).and_then(|o| o.notes.as_ref()));
+        .inputs
+        .iter()
+        .find(|i| i.name == stage_id)
+        .and_then(|i| i.notes.as_ref())
+        .or_else(|| {
+            config
+                .transforms()
+                .find(|t| t.name == stage_id)
+                .and_then(|t| t.notes.as_ref())
+        })
+        .or_else(|| {
+            config
+                .outputs
+                .iter()
+                .find(|o| o.name == stage_id)
+                .and_then(|o| o.notes.as_ref())
+        });
     let notes = parse_notes(notes_value);
 
     // Group config entries by category

@@ -219,7 +219,11 @@ mod tests {
     fn make_arena(csv: &str, fields: &[&str]) -> Arena {
         let mut reader = CsvReader::from_reader(
             csv.as_bytes(),
-            CsvReaderConfig { delimiter: b',', quote_char: b'"', has_header: true },
+            CsvReaderConfig {
+                delimiter: b',',
+                quote_char: b'"',
+                has_header: true,
+            },
         );
         Arena::build(
             &mut reader,
@@ -231,7 +235,10 @@ mod tests {
 
     #[test]
     fn test_window_first_last() {
-        let arena = make_arena("name,amount\nAlice,100\nBob,200\nCarol,300\n", &["name", "amount"]);
+        let arena = make_arena(
+            "name,amount\nAlice,100\nBob,200\nCarol,300\n",
+            &["name", "amount"],
+        );
         let partition: Vec<u32> = vec![0, 1, 2];
         let ctx = PartitionWindowContext::new(&arena, &partition, 1);
 

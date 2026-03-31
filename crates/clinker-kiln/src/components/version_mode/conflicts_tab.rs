@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use clinker_git::GitOps;
 
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::state::TabManagerState;
 
 /// A parsed merge conflict.
@@ -31,10 +31,10 @@ pub fn ConflictsTab() -> Element {
     // Detect conflicts on first render
     if !(loaded)() {
         let ws = (tab_mgr.workspace)();
-        if let Some(ws) = ws {
-            if let Ok(entries) = detect_conflicts(&ws.root) {
-                conflicts.set(entries);
-            }
+        if let Some(ws) = ws
+            && let Ok(entries) = detect_conflicts(&ws.root)
+        {
+            conflicts.set(entries);
         }
         loaded.set(true);
     }
@@ -128,11 +128,10 @@ pub fn ConflictsTab() -> Element {
                             for (i, line) in content.lines().enumerate() {
                                 {
                                     let line_str = line.to_string();
-                                    let class = if line.starts_with("<<<<<<<") {
-                                        "kiln-conflict-line kiln-conflict-line--marker"
-                                    } else if line.starts_with("=======") {
-                                        "kiln-conflict-line kiln-conflict-line--marker"
-                                    } else if line.starts_with(">>>>>>>") {
+                                    let class = if line.starts_with("<<<<<<<")
+                                        || line.starts_with("=======")
+                                        || line.starts_with(">>>>>>>")
+                                    {
                                         "kiln-conflict-line kiln-conflict-line--marker"
                                     } else {
                                         "kiln-conflict-line"
@@ -155,7 +154,9 @@ pub fn ConflictsTab() -> Element {
 }
 
 /// Detect files with merge conflicts via `git diff --name-only --diff-filter=U`.
-fn detect_conflicts(repo_path: &std::path::Path) -> Result<Vec<ConflictEntry>, clinker_git::GitError> {
+fn detect_conflicts(
+    repo_path: &std::path::Path,
+) -> Result<Vec<ConflictEntry>, clinker_git::GitError> {
     let output = std::process::Command::new("git")
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(repo_path)
@@ -185,14 +186,13 @@ fn detect_conflicts(repo_path: &std::path::Path) -> Result<Vec<ConflictEntry>, c
 }
 
 /// Complete the merge — stage resolved files and prepare commit.
-fn complete_merge(
-    tab_mgr: &mut TabManagerState,
-    conflicts: &mut Signal<Vec<ConflictEntry>>,
-) {
+fn complete_merge(tab_mgr: &mut TabManagerState, conflicts: &mut Signal<Vec<ConflictEntry>>) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
 
-    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else {
+        return;
+    };
     let mut toast: Signal<Option<ToastState>> = use_context();
 
     // Stage all resolved conflict files
@@ -201,7 +201,10 @@ fn complete_merge(
         return;
     }
 
-    toast_success(&mut toast, "All conflicts resolved. Use commit to finalize the merge.");
+    toast_success(
+        &mut toast,
+        "All conflicts resolved. Use commit to finalize the merge.",
+    );
     conflicts.set(Vec::new());
 
     // Refresh git state

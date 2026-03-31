@@ -14,7 +14,10 @@ pub struct LogDispatcher {
 impl LogDispatcher {
     pub fn new(directives: Vec<LogDirective>) -> Self {
         let counters = vec![0u64; directives.len()];
-        Self { directives, counters }
+        Self {
+            directives,
+            counters,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -54,23 +57,23 @@ impl LogDispatcher {
 
             // Sampling: increment counter and check modulo
             self.counters[i] += 1;
-            if let Some(every) = d.every {
-                if self.counters[i] % every != 1 && every != 1 {
-                    // Skip unless it's the Nth record (1-indexed: fire on 1, 1+every, 1+2*every, ...)
-                    // For every=1, fire on every record
-                    if self.counters[i] != 1 && (self.counters[i] - 1) % every != 0 {
-                        continue;
-                    }
+            if let Some(every) = d.every
+                && self.counters[i] % every != 1
+                && every != 1
+            {
+                // Skip unless it's the Nth record (1-indexed: fire on 1, 1+every, 1+2*every, ...)
+                // For every=1, fire on every record
+                if self.counters[i] != 1 && !(self.counters[i] - 1).is_multiple_of(every) {
+                    continue;
                 }
             }
 
             // Condition check
-            if let Some(ref cond_expr) = d.condition {
-                if let Some(eval_fn) = condition_eval {
-                    if !eval_fn(cond_expr) {
-                        continue;
-                    }
-                }
+            if let Some(ref cond_expr) = d.condition
+                && let Some(eval_fn) = condition_eval
+                && !eval_fn(cond_expr)
+            {
+                continue;
             }
 
             emit_log(d, ctx, None);
@@ -78,11 +81,7 @@ impl LogDispatcher {
     }
 
     /// Fire all `on_error` directives for a DLQ-routed record.
-    pub fn fire_on_error(
-        &self,
-        ctx: &LogTemplateContext<'_>,
-        fields: Option<&[(String, String)]>,
-    ) {
+    pub fn fire_on_error(&self, ctx: &LogTemplateContext<'_>, fields: Option<&[(String, String)]>) {
         for d in &self.directives {
             if d.when == LogTiming::OnError {
                 emit_log(d, ctx, fields);
@@ -113,7 +112,11 @@ fn emit_log(
 
     let extra = if let Some(ef) = extra_fields {
         let pairs: Vec<String> = ef.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        if pairs.is_empty() { String::new() } else { format!(" {}", pairs.join(" ")) }
+        if pairs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", pairs.join(" "))
+        }
     } else {
         String::new()
     };
@@ -130,6 +133,7 @@ fn emit_log(
 }
 
 /// Create a LogTemplateContext from executor state.
+#[allow(clippy::too_many_arguments)]
 pub fn make_template_context<'a>(
     record_fields: &'a IndexMap<String, Value>,
     transform_name: &'a str,
@@ -183,8 +187,18 @@ mod tests {
 
     fn test_ctx(fields: &IndexMap<String, Value>) -> LogTemplateContext<'_> {
         make_template_context(
-            fields, "test", None, "input.csv", 1,
-            0, 0, 0, "pipeline", "exec-id", None, None,
+            fields,
+            "test",
+            None,
+            "input.csv",
+            1,
+            0,
+            0,
+            0,
+            "pipeline",
+            "exec-id",
+            None,
+            None,
         )
     }
 
@@ -203,7 +217,11 @@ mod tests {
 
     #[test]
     fn test_log_after_transform_fires_once() {
-        let d = make_directive(LogLevel::Info, LogTiming::AfterTransform, "done in {_transform_duration_ms}ms");
+        let d = make_directive(
+            LogLevel::Info,
+            LogTiming::AfterTransform,
+            "done in {_transform_duration_ms}ms",
+        );
         let dispatcher = LogDispatcher::new(vec![d]);
 
         let fields = empty_fields();
@@ -214,7 +232,11 @@ mod tests {
 
     #[test]
     fn test_log_on_error_fires_per_dlq() {
-        let d = make_directive(LogLevel::Error, LogTiming::OnError, "error: {_cxl_dlq_error_category}");
+        let d = make_directive(
+            LogLevel::Error,
+            LogTiming::OnError,
+            "error: {_cxl_dlq_error_category}",
+        );
         let dispatcher = LogDispatcher::new(vec![d]);
 
         let fields = empty_fields();

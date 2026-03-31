@@ -64,13 +64,17 @@ pub struct GuideAnnotation {
     /// 1-based line number in the YAML text.
     pub line: usize,
     /// Hint text to display.
+    #[allow(dead_code)]
     pub hint: String,
 }
 
 // ── Bundled templates (embedded at compile time) ────────────────────────
 
 const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
-    ("csv_transform", include_str!("templates/csv_transform.yaml")),
+    (
+        "csv_transform",
+        include_str!("templates/csv_transform.yaml"),
+    ),
     ("csv_join", include_str!("templates/csv_join.yaml")),
     ("csv_dedup", include_str!("templates/csv_dedup.yaml")),
     ("json_flatten", include_str!("templates/json_flatten.yaml")),
@@ -206,6 +210,7 @@ pub fn strip_template_block(yaml: &str) -> String {
 ///
 /// Creates a pipeline with: source (format + placeholder path + schema link),
 /// identity map stage with all fields, sink with same format.
+#[allow(dead_code)]
 pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> String {
     let name = &schema.metadata.name;
     let format = schema.metadata.format.label();
@@ -233,10 +238,10 @@ pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> S
     if clinker_format == "csv" {
         yaml.push_str("    options:\n      has_header: true\n");
     }
-    if clinker_format == "xml" {
-        if let Some(ref elem) = schema.metadata.record_element {
-            yaml.push_str(&format!("    options:\n      record_element: {elem}\n"));
-        }
+    if clinker_format == "xml"
+        && let Some(ref elem) = schema.metadata.record_element
+    {
+        yaml.push_str(&format!("    options:\n      record_element: {elem}\n"));
     }
 
     // Identity map transformation
@@ -244,11 +249,7 @@ pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> S
     yaml.push_str("  - name: select_fields\n");
     yaml.push_str("    cxl: |\n");
 
-    let top_level_fields: Vec<&str> = schema
-        .fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
+    let top_level_fields: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
 
     for field in &top_level_fields {
         let clean = field.trim_start_matches('@');
@@ -256,7 +257,7 @@ pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> S
     }
 
     // Output
-    yaml.push_str(&format!("\noutputs:\n"));
+    yaml.push_str("\noutputs:\n");
     yaml.push_str(&format!("  - name: {name}_output\n"));
     yaml.push_str(&format!("    type: {clinker_format}\n"));
     yaml.push_str(&format!("    path: \"./output/{name}_output.{format}\"\n"));
@@ -270,7 +271,10 @@ pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> S
 ///
 /// If the template has `hints`, map them to line numbers in the stripped YAML.
 /// If no hints, auto-generate for common placeholder patterns.
-pub fn generate_guide_annotations(template: &Template, stripped_yaml: &str) -> Vec<GuideAnnotation> {
+pub fn generate_guide_annotations(
+    template: &Template,
+    stripped_yaml: &str,
+) -> Vec<GuideAnnotation> {
     if !template.metadata.hints.is_empty() {
         return generate_from_hints(&template.metadata.hints, stripped_yaml);
     }
@@ -287,13 +291,15 @@ fn generate_from_hints(hints: &HashMap<String, String>, yaml: &str) -> Vec<Guide
         // Find the line that contains this path's leaf key
         let leaf_key = yaml_path
             .split('.')
-            .last()
+            .next_back()
             .and_then(|s| s.split('[').next())
             .unwrap_or(yaml_path);
 
         for (idx, line) in yaml.lines().enumerate() {
             let trimmed = line.trim();
-            if trimmed.starts_with(&format!("{leaf_key}:")) || trimmed.starts_with(&format!("{leaf_key} ")) {
+            if trimmed.starts_with(&format!("{leaf_key}:"))
+                || trimmed.starts_with(&format!("{leaf_key} "))
+            {
                 annotations.push(GuideAnnotation {
                     line: idx + 1,
                     hint: hint_text.clone(),
@@ -355,7 +361,11 @@ mod tests {
     #[test]
     fn test_parse_bundled_templates() {
         let templates = load_bundled_templates();
-        assert!(templates.len() >= 6, "expected at least 6 bundled templates, got {}", templates.len());
+        assert!(
+            templates.len() >= 6,
+            "expected at least 6 bundled templates, got {}",
+            templates.len()
+        );
 
         let names: Vec<&str> = templates.iter().map(|t| t.metadata.name.as_str()).collect();
         assert!(names.contains(&"CSV Transform"));

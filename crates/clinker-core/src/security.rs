@@ -129,7 +129,12 @@ mod tests {
     fn test_path_reject_absolute() {
         let result = validate_path(Path::new("/tmp/out.csv"), &base(), false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("absolute path not allowed"));
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("absolute path not allowed")
+        );
     }
 
     #[test]
@@ -143,28 +148,42 @@ mod tests {
     fn test_path_base_dir_resolution() {
         let result = validate_path(Path::new("data/input.csv"), &base(), false);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("/opt/pipelines/data/input.csv"));
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/opt/pipelines/data/input.csv")
+        );
     }
 
     #[test]
     fn test_path_base_dir_default() {
         let yaml_dir = PathBuf::from("/home/user/configs");
         let result = validate_path(Path::new("data/input.csv"), &yaml_dir, false);
-        assert_eq!(result.unwrap(), PathBuf::from("/home/user/configs/data/input.csv"));
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/home/user/configs/data/input.csv")
+        );
     }
 
     #[test]
     fn test_path_reject_encoded_dotdot() {
         let result = validate_path(Path::new("%2e%2e/etc/passwd"), &base(), false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("encoded directory traversal"));
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("encoded directory traversal")
+        );
     }
 
     #[test]
     fn test_path_dot_slash_prefix() {
         let result = validate_path(Path::new("./data/input.csv"), &base(), false);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("/opt/pipelines/./data/input.csv"));
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/opt/pipelines/./data/input.csv")
+        );
     }
 
     #[test]

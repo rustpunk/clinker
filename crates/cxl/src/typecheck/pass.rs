@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use regex::Regex;
 
-use crate::ast::{BinOp, Expr, NodeId, Program, Statement, UnaryOp, LiteralValue};
+use super::types::Type;
+use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement, UnaryOp};
 use crate::builtins::BuiltinRegistry;
 use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
-use super::types::Type;
 
 /// A diagnostic produced by the type checker.
 #[derive(Debug, Clone)]
@@ -55,7 +55,11 @@ pub fn type_check(
     let node_count = resolved.node_count;
 
     // Destructure resolved to avoid borrow conflicts
-    let ResolvedProgram { program, bindings, node_count: _ } = resolved;
+    let ResolvedProgram {
+        program,
+        bindings,
+        node_count: _,
+    } = resolved;
 
     let mut checker = TypeChecker {
         bindings: &bindings,
@@ -122,14 +126,20 @@ impl<'a> TypeChecker<'a> {
 
     fn get_type(&self, node_id: NodeId) -> Type {
         let idx = node_id.0 as usize;
-        self.types.get(idx).and_then(|t| t.clone()).unwrap_or(Type::Any)
+        self.types
+            .get(idx)
+            .and_then(|t| t.clone())
+            .unwrap_or(Type::Any)
     }
 
     fn add_constraint(&mut self, field: &str, ty: Type, span: Span) {
         self.field_constraints
             .entry(field.to_string())
             .or_default()
-            .push(FieldConstraint { inferred_type: ty, span });
+            .push(FieldConstraint {
+                inferred_type: ty,
+                span,
+            });
     }
 
     fn error(&mut self, span: Span, message: String, help: Option<String>) {
@@ -142,7 +152,14 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
-    fn error_with_related(&mut self, span: Span, message: String, help: Option<String>, related: Span) {
+    #[allow(dead_code)]
+    fn error_with_related(
+        &mut self,
+        span: Span,
+        message: String,
+        help: Option<String>,
+        related: Span,
+    ) {
         self.diagnostics.push(TypeDiagnostic {
             span,
             message,
@@ -202,8 +219,15 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::FieldRef { node_id, name, span } => {
-                let binding = self.bindings.get(node_id.0 as usize).and_then(|b| b.as_ref());
+            Expr::FieldRef {
+                node_id,
+                name,
+                span,
+            } => {
+                let binding = self
+                    .bindings
+                    .get(node_id.0 as usize)
+                    .and_then(|b| b.as_ref());
                 let ty = match binding {
                     Some(ResolvedBinding::Field(_)) => {
                         // Check schema for declared type
@@ -248,7 +272,13 @@ impl<'a> TypeChecker<'a> {
                 Type::Any
             }
 
-            Expr::Binary { node_id, op, lhs, rhs, span } => {
+            Expr::Binary {
+                node_id,
+                op,
+                lhs,
+                rhs,
+                span,
+            } => {
                 let lt = self.check_expr(lhs, in_predicate);
                 let rt = self.check_expr(rhs, in_predicate);
                 let ty = self.check_binary_op(*node_id, *op, &lt, &rt, *span);
@@ -256,7 +286,12 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::Unary { node_id, op, operand, .. } => {
+            Expr::Unary {
+                node_id,
+                op,
+                operand,
+                ..
+            } => {
                 let inner = self.check_expr(operand, in_predicate);
                 let ty = match op {
                     UnaryOp::Neg => {
@@ -278,7 +313,9 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::Coalesce { node_id, lhs, rhs, .. } => {
+            Expr::Coalesce {
+                node_id, lhs, rhs, ..
+            } => {
                 let lt = self.check_expr(lhs, in_predicate);
                 let rt = self.check_expr(rhs, in_predicate);
                 // Coalesce strips nullability from left operand
@@ -288,7 +325,13 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::IfThenElse { node_id, condition, then_branch, else_branch, .. } => {
+            Expr::IfThenElse {
+                node_id,
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 self.check_expr(condition, in_predicate);
                 let then_ty = self.check_expr(then_branch, in_predicate);
                 let ty = if let Some(eb) = else_branch {
@@ -302,16 +345,26 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::Match { node_id, subject, arms, span } => {
+            Expr::Match {
+                node_id,
+                subject,
+                arms,
+                span,
+            } => {
                 if let Some(s) = subject {
                     self.check_expr(s, in_predicate);
                 }
 
                 // Check for wildcard arm
-                let has_wildcard = arms.iter().any(|arm| matches!(arm.pattern, Expr::Wildcard { .. }));
+                let has_wildcard = arms
+                    .iter()
+                    .any(|arm| matches!(arm.pattern, Expr::Wildcard { .. }));
                 if !has_wildcard {
-                    self.error(*span, "match expression must have a '_' (wildcard) catch-all arm".into(),
-                        Some("Add '_ => <default_value>' as the last arm".into()));
+                    self.error(
+                        *span,
+                        "match expression must have a '_' (wildcard) catch-all arm".into(),
+                        Some("Add '_ => <default_value>' as the last arm".into()),
+                    );
                 }
 
                 let mut result_ty = Type::Any;
@@ -324,7 +377,13 @@ impl<'a> TypeChecker<'a> {
                 result_ty
             }
 
-            Expr::MethodCall { node_id, receiver, method, args, span } => {
+            Expr::MethodCall {
+                node_id,
+                receiver,
+                method,
+                args,
+                span,
+            } => {
                 let recv_ty = self.check_expr(receiver, in_predicate);
                 let mut arg_types = Vec::new();
                 for arg in args {
@@ -332,17 +391,20 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 // Try to pre-compile regex for .matches(), .find(), .capture()
-                if matches!(&**method, "matches" | "find" | "capture") {
-                    if let Some(first_arg) = args.first() {
-                        if let Expr::Literal { value: LiteralValue::String(pattern), span: arg_span, .. } = first_arg {
-                            match Regex::new(pattern) {
-                                Ok(re) => {
-                                    self.regexes[node_id.0 as usize] = Some(re);
-                                }
-                                Err(e) => {
-                                    self.error(*arg_span, format!("invalid regex pattern: {}", e), None);
-                                }
-                            }
+                if matches!(&**method, "matches" | "find" | "capture")
+                    && let Some(first_arg) = args.first()
+                    && let Expr::Literal {
+                        value: LiteralValue::String(pattern),
+                        span: arg_span,
+                        ..
+                    } = first_arg
+                {
+                    match Regex::new(pattern) {
+                        Ok(re) => {
+                            self.regexes[node_id.0 as usize] = Some(re);
+                        }
+                        Err(e) => {
+                            self.error(*arg_span, format!("invalid regex pattern: {}", e), None);
                         }
                     }
                 }
@@ -355,7 +417,9 @@ impl<'a> TypeChecker<'a> {
                 };
 
                 // Null propagation: nullable receiver → nullable result (except is_null, type_of)
-                let ty = if recv_ty.is_nullable() && !matches!(&**method, "is_null" | "type_of" | "catch" | "is_empty") {
+                let ty = if recv_ty.is_nullable()
+                    && !matches!(&**method, "is_null" | "type_of" | "catch" | "is_empty")
+                {
                     Type::nullable(ty)
                 } else {
                     ty
@@ -366,7 +430,12 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::WindowCall { node_id, function, args, span } => {
+            Expr::WindowCall {
+                node_id,
+                function,
+                args,
+                span,
+            } => {
                 let is_predicate_fn = &**function == "any" || &**function == "all";
 
                 // Check for nested window calls inside predicate_expr
@@ -387,9 +456,17 @@ impl<'a> TypeChecker<'a> {
                         let arg_ty = self.get_type(arg.node_id());
                         let inner = arg_ty.unwrap_nullable();
                         if !matches!(inner, Type::Int | Type::Float | Type::Numeric | Type::Any) {
-                            self.error(arg.span(),
-                                format!("window.{}() requires a Numeric argument, got {}", function, arg_ty),
-                                Some("Use a numeric field or convert with .to_int() / .to_float()".into()));
+                            self.error(
+                                arg.span(),
+                                format!(
+                                    "window.{}() requires a Numeric argument, got {}",
+                                    function, arg_ty
+                                ),
+                                Some(
+                                    "Use a numeric field or convert with .to_int() / .to_float()"
+                                        .into(),
+                                ),
+                            );
                         }
                     }
                 }
@@ -406,7 +483,14 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_binary_op(&mut self, node_id: NodeId, op: BinOp, lt: &Type, rt: &Type, _span: Span) -> Type {
+    fn check_binary_op(
+        &mut self,
+        node_id: NodeId,
+        op: BinOp,
+        lt: &Type,
+        rt: &Type,
+        _span: Span,
+    ) -> Type {
         let lt_inner = lt.unwrap_nullable();
         let rt_inner = rt.unwrap_nullable();
         let either_nullable = lt.is_nullable() || rt.is_nullable();
@@ -444,7 +528,14 @@ impl<'a> TypeChecker<'a> {
     /// Infer field types from binary operator usage.
     /// E.g., `status == "active"` → status is String.
     /// E.g., `amount + 1` → amount is Numeric.
-    fn infer_field_type_from_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, lt: &Type, rt: &Type) {
+    fn infer_field_type_from_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lt: &Type,
+        rt: &Type,
+    ) {
         // Only infer from operators that imply types
         let implied_type = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Some(Type::Numeric),
@@ -454,16 +545,19 @@ impl<'a> TypeChecker<'a> {
         };
 
         // For equality/comparison: infer from the other operand's known type
-        if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte) {
-            if let Expr::FieldRef { name, span, .. } = lhs {
-                if !matches!(rt, Type::Any) {
-                    self.add_constraint(name, rt.clone(), *span);
-                }
+        if matches!(
+            op,
+            BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte
+        ) {
+            if let Expr::FieldRef { name, span, .. } = lhs
+                && !matches!(rt, Type::Any)
+            {
+                self.add_constraint(name, rt.clone(), *span);
             }
-            if let Expr::FieldRef { name, span, .. } = rhs {
-                if !matches!(lt, Type::Any) {
-                    self.add_constraint(name, lt.clone(), *span);
-                }
+            if let Expr::FieldRef { name, span, .. } = rhs
+                && !matches!(lt, Type::Any)
+            {
+                self.add_constraint(name, lt.clone(), *span);
             }
         }
 
@@ -490,7 +584,10 @@ impl<'a> TypeChecker<'a> {
                                 "field '{}' is declared as {} in schema but used as {} here",
                                 field, declared, constraint.inferred_type
                             ),
-                            help: Some(format!("Change the usage to match the declared type {}", declared)),
+                            help: Some(format!(
+                                "Change the usage to match the declared type {}",
+                                declared
+                            )),
                             related_span: None,
                             is_warning: false,
                         });
@@ -510,7 +607,9 @@ impl<'a> TypeChecker<'a> {
                                 "field '{}' used as {} here but as {} elsewhere",
                                 field, other.inferred_type, first.inferred_type
                             ),
-                            help: Some("Ensure consistent type usage or add explicit conversion".into()),
+                            help: Some(
+                                "Ensure consistent type usage or add explicit conversion".into(),
+                            ),
                             related_span: Some(first.span),
                             is_warning: false,
                         });
@@ -522,7 +621,10 @@ impl<'a> TypeChecker<'a> {
 
     /// Check that the program has at least one emit statement.
     fn check_emit_count(&mut self, program: &Program) {
-        let has_emit = program.statements.iter().any(|s| matches!(s, Statement::Emit { .. }));
+        let has_emit = program
+            .statements
+            .iter()
+            .any(|s| matches!(s, Statement::Emit { .. }));
         if !has_emit {
             self.warning(
                 program.span,
@@ -571,15 +673,30 @@ mod tests {
 
     fn typecheck_ok(src: &str, fields: &[&str], schema: &HashMap<String, Type>) -> TypedProgram {
         let parsed = Parser::parse(src);
-        assert!(parsed.errors.is_empty(), "Parse errors: {:?}",
-            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>());
-        let resolved = resolve_program(parsed.ast, fields, parsed.node_count)
-            .unwrap_or_else(|d| panic!("Resolve errors: {:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>()));
-        type_check(resolved, schema)
-            .unwrap_or_else(|d| panic!("Type errors: {:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>()))
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap_or_else(|d| {
+            panic!(
+                "Resolve errors: {:?}",
+                d.iter().map(|e| &e.message).collect::<Vec<_>>()
+            )
+        });
+        type_check(resolved, schema).unwrap_or_else(|d| {
+            panic!(
+                "Type errors: {:?}",
+                d.iter().map(|e| &e.message).collect::<Vec<_>>()
+            )
+        })
     }
 
-    fn typecheck_err(src: &str, fields: &[&str], schema: &HashMap<String, Type>) -> Vec<TypeDiagnostic> {
+    fn typecheck_err(
+        src: &str,
+        fields: &[&str],
+        schema: &HashMap<String, Type>,
+    ) -> Vec<TypeDiagnostic> {
         let parsed = Parser::parse(src);
         assert!(parsed.errors.is_empty());
         let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
@@ -594,7 +711,9 @@ mod tests {
     fn first_emit_expr_type(typed: &TypedProgram) -> Type {
         for stmt in &typed.program.statements {
             if let Statement::Emit { expr, .. } = stmt {
-                return typed.types[expr.node_id().0 as usize].clone().unwrap_or(Type::Any);
+                return typed.types[expr.node_id().0 as usize]
+                    .clone()
+                    .unwrap_or(Type::Any);
             }
         }
         Type::Any
@@ -616,7 +735,11 @@ mod tests {
         // nullable_field + 1 → Nullable(Int) when field is declared Nullable(Int)
         let mut schema = HashMap::new();
         schema.insert("nullable_field".into(), Type::Nullable(Box::new(Type::Int)));
-        let typed = typecheck_ok("emit val = nullable_field + 1", &["nullable_field"], &schema);
+        let typed = typecheck_ok(
+            "emit val = nullable_field + 1",
+            &["nullable_field"],
+            &schema,
+        );
         let ty = first_emit_expr_type(&typed);
         assert_eq!(ty, Type::Nullable(Box::new(Type::Int)));
     }
@@ -625,7 +748,11 @@ mod tests {
     fn test_typecheck_coalesce_strips_nullable() {
         let mut schema = HashMap::new();
         schema.insert("nullable_field".into(), Type::Nullable(Box::new(Type::Int)));
-        let typed = typecheck_ok("emit val = nullable_field ?? 0", &["nullable_field"], &schema);
+        let typed = typecheck_ok(
+            "emit val = nullable_field ?? 0",
+            &["nullable_field"],
+            &schema,
+        );
         let ty = first_emit_expr_type(&typed);
         assert_eq!(ty, Type::Int);
     }
@@ -637,8 +764,13 @@ mod tests {
             &["status"],
             &HashMap::new(),
         );
-        assert!(diags.iter().any(|d| d.message.contains("wildcard") || d.message.contains("catch-all")),
-            "Expected wildcard diagnostic, got: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("wildcard") || d.message.contains("catch-all")),
+            "Expected wildcard diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -648,8 +780,13 @@ mod tests {
             &["amount"],
             &HashMap::new(),
         );
-        assert!(diags.iter().any(|d| d.message.contains("cannot be called inside")),
-            "Expected nested window diagnostic, got: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("cannot be called inside")),
+            "Expected nested window diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -657,13 +794,12 @@ mod tests {
         // window.sum() on a String field should produce an error
         let mut schema = HashMap::new();
         schema.insert("name".into(), Type::String);
-        let diags = typecheck_err(
-            "emit val = window.sum(name)",
-            &["name"],
-            &schema,
+        let diags = typecheck_err("emit val = window.sum(name)", &["name"], &schema);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Numeric")),
+            "Expected Numeric requirement diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        assert!(diags.iter().any(|d| d.message.contains("Numeric")),
-            "Expected Numeric requirement diagnostic, got: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
     #[test]
@@ -676,24 +812,30 @@ mod tests {
         );
         // Should have a diagnostic about conflicting types
         let conflict = diags.iter().find(|d| d.message.contains("used as"));
-        assert!(conflict.is_some(), "Expected type conflict diagnostic, got: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(
+            conflict.is_some(),
+            "Expected type conflict diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
         // Should cite both spans
-        assert!(conflict.unwrap().related_span.is_some(),
-            "Expected related_span to cite the other usage site");
+        assert!(
+            conflict.unwrap().related_span.is_some(),
+            "Expected related_span to cite the other usage site"
+        );
     }
 
     #[test]
     fn test_typecheck_schema_override_conflict() {
         let mut schema = HashMap::new();
         schema.insert("age".into(), Type::Int);
-        let diags = typecheck_err(
-            "emit val = age == \"old\"",
-            &["age"],
-            &schema,
+        let diags = typecheck_err("emit val = age == \"old\"", &["age"], &schema);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("declared as") && d.message.contains("schema")),
+            "Expected schema override conflict, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        assert!(diags.iter().any(|d| d.message.contains("declared as") && d.message.contains("schema")),
-            "Expected schema override conflict, got: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
     #[test]
@@ -712,10 +854,16 @@ mod tests {
             &HashMap::new(),
         );
         // amount should be inferred as Numeric, name as String
-        assert!(typed.field_types.contains_key("amount"),
-            "Expected amount in field_types, got: {:?}", typed.field_types);
-        assert!(typed.field_types.contains_key("name"),
-            "Expected name in field_types, got: {:?}", typed.field_types);
+        assert!(
+            typed.field_types.contains_key("amount"),
+            "Expected amount in field_types, got: {:?}",
+            typed.field_types
+        );
+        assert!(
+            typed.field_types.contains_key("name"),
+            "Expected name in field_types, got: {:?}",
+            typed.field_types
+        );
     }
 
     #[test]
@@ -728,7 +876,11 @@ mod tests {
     fn test_typecheck_if_missing_else_nullable() {
         let typed = typecheck_ok("emit val = if true then 1", &[], &HashMap::new());
         let ty = first_emit_expr_type(&typed);
-        assert!(ty.is_nullable(), "Expected Nullable type for if-then without else, got {}", ty);
+        assert!(
+            ty.is_nullable(),
+            "Expected Nullable type for if-then without else, got {}",
+            ty
+        );
     }
 
     #[test]
@@ -755,6 +907,9 @@ mod tests {
         );
         // The regex should be pre-compiled and stored
         let has_regex = typed.regexes.iter().any(|r| r.is_some());
-        assert!(has_regex, "Expected pre-compiled regex in TypedProgram.regexes");
+        assert!(
+            has_regex,
+            "Expected pre-compiled regex in TypedProgram.regexes"
+        );
     }
 }

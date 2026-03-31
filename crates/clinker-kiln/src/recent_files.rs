@@ -2,12 +2,12 @@
 ///
 /// Spec §F2.7: up to 20 entries, deduplicated by canonical path,
 /// most-recently-opened first.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 const MAX_RECENT: usize = 20;
 const APP_DIR_NAME: &str = "clinker-kiln";
 const RECENT_FILE_NAME: &str = "recent.json";
@@ -44,6 +44,7 @@ pub fn load_recent_files() -> Vec<RecentFileEntry> {
 }
 
 /// Save the recent files list to disk. Silently ignores errors.
+#[allow(dead_code)]
 pub fn save_recent_files(entries: &[RecentFileEntry]) {
     let Some(path) = recent_files_path() else {
         return;
@@ -60,9 +61,13 @@ pub fn save_recent_files(entries: &[RecentFileEntry]) {
 }
 
 /// Add a file to the recent list. Deduplicates by path and caps at 20 entries.
+#[allow(dead_code)]
 pub fn add_recent(entries: &mut Vec<RecentFileEntry>, entry: RecentFileEntry) {
     // Canonicalize for dedup (best-effort — keep original if canonicalize fails)
-    let canonical = entry.path.canonicalize().unwrap_or_else(|_| entry.path.clone());
+    let canonical = entry
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| entry.path.clone());
 
     // Remove existing entry for same path
     entries.retain(|e| {
@@ -78,6 +83,7 @@ pub fn add_recent(entries: &mut Vec<RecentFileEntry>, entry: RecentFileEntry) {
 }
 
 /// Check whether a file still exists on disk.
+#[allow(dead_code)]
 pub fn file_exists(path: &Path) -> bool {
     path.exists()
 }
@@ -85,6 +91,7 @@ pub fn file_exists(path: &Path) -> bool {
 /// Format a relative time string from an ISO 8601 timestamp.
 /// Returns a human-friendly string like "2 hours ago", "yesterday", "3 days ago".
 /// Falls back to the raw timestamp on parse failure.
+#[allow(dead_code)]
 pub fn relative_time(iso_timestamp: &str) -> String {
     // Simple implementation — good enough for recent files display
     // Full chrono parsing would be more robust but this covers the common cases

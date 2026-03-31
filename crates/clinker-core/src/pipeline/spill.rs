@@ -10,7 +10,7 @@
 //! Entire stream is LZ4 frame-compressed.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
@@ -52,7 +52,7 @@ impl From<serde_json::Error> for SpillError {
 
 impl From<lz4_flex::frame::Error> for SpillError {
     fn from(e: lz4_flex::frame::Error) -> Self {
-        SpillError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        SpillError::Io(std::io::Error::other(e.to_string()))
     }
 }
 
@@ -117,7 +117,9 @@ impl SpillWriter {
     /// Flush, finalize LZ4 frame, return handle to the completed spill file.
     pub fn finish(self) -> Result<SpillFile, SpillError> {
         let buf_writer = self.encoder.finish()?;
-        let temp_file = buf_writer.into_inner().map_err(|e| SpillError::Io(e.into_error()))?;
+        let temp_file = buf_writer
+            .into_inner()
+            .map_err(|e| SpillError::Io(e.into_error()))?;
         let path = temp_file.into_temp_path();
         Ok(SpillFile {
             path,
@@ -204,10 +206,7 @@ impl SpillReader {
         // Extract schema fields in order
         let mut values = Vec::with_capacity(self.schema.column_count());
         for col in self.schema.columns() {
-            let val = obj
-                .get(&**col)
-                .map(json_to_value)
-                .unwrap_or(Value::Null);
+            let val = obj.get(&**col).map(json_to_value).unwrap_or(Value::Null);
             values.push(val);
         }
 
@@ -284,7 +283,10 @@ mod tests {
                     Value::Integer(i as i64 * 100),
                     Value::Float(i as f64 * 1.5),
                     Value::String(format!("row_{i}").into()),
-                    Value::Date(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(i as i64)),
+                    Value::Date(
+                        chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+                            + chrono::Duration::days(i as i64),
+                    ),
                     Value::DateTime(
                         chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
                             .unwrap()
@@ -309,7 +311,10 @@ mod tests {
         assert_eq!(records[0].get("bool_col"), Some(&Value::Bool(true)));
         assert_eq!(records[0].get("int_col"), Some(&Value::Integer(0)));
         assert_eq!(records[0].get("float_col"), Some(&Value::Float(0.0)));
-        assert_eq!(records[0].get("str_col"), Some(&Value::String("row_0".into())));
+        assert_eq!(
+            records[0].get("str_col"),
+            Some(&Value::String("row_0".into()))
+        );
 
         // Check last record
         assert_eq!(records[99].get("int_col"), Some(&Value::Integer(9900)));
@@ -326,11 +331,10 @@ mod tests {
         ]));
 
         let mut writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
-        let record = Record::new(Arc::clone(&schema), vec![
-            Value::Integer(1),
-            Value::Integer(2),
-            Value::Integer(3),
-        ]);
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
         writer.write_record(&record).unwrap();
 
         let spill_file = writer.finish().unwrap();
@@ -340,7 +344,11 @@ mod tests {
         assert_eq!(records.len(), 1);
         let read_schema = records[0].schema();
         assert_eq!(
-            read_schema.columns().iter().map(|c| &**c).collect::<Vec<_>>(),
+            read_schema
+                .columns()
+                .iter()
+                .map(|c| &**c)
+                .collect::<Vec<_>>(),
             vec!["z_col", "a_col", "m_col"],
         );
     }
@@ -432,8 +440,7 @@ mod tests {
     fn test_spill_dir_override() {
         let custom_dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
-        let mut writer =
-            SpillWriter::new(Arc::clone(&schema), Some(custom_dir.path())).unwrap();
+        let mut writer = SpillWriter::new(Arc::clone(&schema), Some(custom_dir.path())).unwrap();
         writer
             .write_record(&make_record(&schema, "Alice", 100, true))
             .unwrap();

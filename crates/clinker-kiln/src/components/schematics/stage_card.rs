@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::autodoc::{ConfigCategory, CxlStatementKind, StageDoc};
+use crate::autodoc::{ConfigCategory, StageDoc};
 use crate::notes::StageNotes;
 
 /// A single stage detail card in the Schematics content area.
@@ -190,11 +190,11 @@ pub fn StageCard(
                     span { class: "kiln-card-section-label", "TRANSFORMS" }
                     for (si, sub) in doc.sub_stages.iter().enumerate() {
                         {
-                            let sub_name = sub.summary.split(':').next()
+                            let _sub_name = sub.summary.split(':').next()
                                 .or_else(|| sub.summary.split('.').next())
                                 .unwrap_or(&sub.summary);
                             // Find the actual stage name from config entries
-                            let sub_stage_name = sub.config.entries.iter()
+                            let _sub_stage_name = sub.config.entries.iter()
                                 .find(|e| e.key == "TYPE")
                                 .map(|_| {
                                     // Use provenance or fallback

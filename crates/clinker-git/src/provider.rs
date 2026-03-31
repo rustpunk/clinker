@@ -69,7 +69,7 @@ pub fn detect_provider(remote_url: &str) -> ProviderKind {
 pub fn parse_remote_url(url: &str) -> Option<(String, String)> {
     // SSH format: git@github.com:owner/repo.git
     if url.contains('@') && url.contains(':') {
-        let after_colon = url.split(':').last()?;
+        let after_colon = url.split(':').next_back()?;
         let path = after_colon.trim_end_matches(".git");
         let parts: Vec<&str> = path.splitn(2, '/').collect();
         if parts.len() == 2 {
@@ -100,7 +100,9 @@ pub fn get_remote_url(repo_path: &std::path::Path) -> Result<String, GitError> {
         .map_err(|e| GitError::Cli(e.to_string()))?;
 
     if !output.status.success() {
-        return Err(GitError::Operation("no remote 'origin' configured".to_string()));
+        return Err(GitError::Operation(
+            "no remote 'origin' configured".to_string(),
+        ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -183,11 +185,17 @@ fn create_github_pr(repo_path: &std::path::Path, params: &PrParams) -> Result<Pr
         .args(&arg_refs)
         .current_dir(repo_path)
         .output()
-        .map_err(|e| GitError::Cli(format!("gh not found: {e}. Install GitHub CLI to create PRs.")))?;
+        .map_err(|e| {
+            GitError::Cli(format!(
+                "gh not found: {e}. Install GitHub CLI to create PRs."
+            ))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(GitError::Operation(format!("gh pr create failed: {stderr}")));
+        return Err(GitError::Operation(format!(
+            "gh pr create failed: {stderr}"
+        )));
     }
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -195,7 +203,7 @@ fn create_github_pr(repo_path: &std::path::Path, params: &PrParams) -> Result<Pr
     // Extract PR number from URL
     let number = url
         .split('/')
-        .last()
+        .next_back()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
@@ -208,12 +216,30 @@ mod tests {
 
     #[test]
     fn test_detect_provider() {
-        assert_eq!(detect_provider("git@github.com:user/repo.git"), ProviderKind::GitHub);
-        assert_eq!(detect_provider("https://github.com/user/repo"), ProviderKind::GitHub);
-        assert_eq!(detect_provider("git@gitlab.com:user/repo.git"), ProviderKind::GitLab);
-        assert_eq!(detect_provider("https://gitlab.internal.co/user/repo"), ProviderKind::GitLab);
-        assert_eq!(detect_provider("git@bitbucket.org:user/repo.git"), ProviderKind::Bitbucket);
-        assert_eq!(detect_provider("https://some-random-host.com/repo"), ProviderKind::Unknown);
+        assert_eq!(
+            detect_provider("git@github.com:user/repo.git"),
+            ProviderKind::GitHub
+        );
+        assert_eq!(
+            detect_provider("https://github.com/user/repo"),
+            ProviderKind::GitHub
+        );
+        assert_eq!(
+            detect_provider("git@gitlab.com:user/repo.git"),
+            ProviderKind::GitLab
+        );
+        assert_eq!(
+            detect_provider("https://gitlab.internal.co/user/repo"),
+            ProviderKind::GitLab
+        );
+        assert_eq!(
+            detect_provider("git@bitbucket.org:user/repo.git"),
+            ProviderKind::Bitbucket
+        );
+        assert_eq!(
+            detect_provider("https://some-random-host.com/repo"),
+            ProviderKind::Unknown
+        );
     }
 
     #[test]

@@ -8,9 +8,10 @@
 /// Items that parse successfully become `PartialItem::Ok(T)`, failures become
 /// `PartialItem::Err` with the error message. The canvas can then render
 /// error nodes at the failure positions.
-
 use crate::composition::RawTransformEntry;
-use crate::config::{interpolate_env_vars, ErrorHandlingConfig, InputConfig, OutputConfig, PipelineMeta};
+use crate::config::{
+    ErrorHandlingConfig, InputConfig, OutputConfig, PipelineMeta, interpolate_env_vars,
+};
 
 /// An item that was either successfully parsed or failed with an error.
 #[derive(Debug, Clone)]
@@ -118,18 +119,26 @@ fn parse_array_section<T: serde::de::DeserializeOwned + Clone>(
     let Some(arr) = value.as_array() else {
         let msg = format!("{key}: expected array");
         errors.push(msg.clone());
-        return vec![PartialItem::Err { index: 0, message: msg }];
+        return vec![PartialItem::Err {
+            index: 0,
+            message: msg,
+        }];
     };
 
     arr.iter()
         .enumerate()
-        .map(|(i, item)| match serde_json::from_value::<T>(item.clone()) {
-            Ok(v) => PartialItem::Ok(v),
-            Err(e) => {
-                let msg = format!("{key}[{i}]: {e}");
-                errors.push(msg.clone());
-                PartialItem::Err { index: i, message: msg }
-            }
-        })
+        .map(
+            |(i, item)| match serde_json::from_value::<T>(item.clone()) {
+                Ok(v) => PartialItem::Ok(v),
+                Err(e) => {
+                    let msg = format!("{key}[{i}]: {e}");
+                    errors.push(msg.clone());
+                    PartialItem::Err {
+                        index: i,
+                        message: msg,
+                    }
+                }
+            },
+        )
         .collect()
 }

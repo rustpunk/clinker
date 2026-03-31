@@ -34,7 +34,10 @@ pub fn merge_with_rule(directive: &LogDirective, rule: &LogRule) -> LogDirective
     LogDirective {
         level: directive.level, // directive always has level (required field)
         when: directive.when,   // directive always has when (required field)
-        condition: directive.condition.clone().or_else(|| rule.condition.clone()),
+        condition: directive
+            .condition
+            .clone()
+            .or_else(|| rule.condition.clone()),
         message: directive.message.clone(), // directive always has message (required field)
         fields: directive.fields.clone().or_else(|| rule.fields.clone()),
         every: directive.every.or(rule.every),
@@ -49,19 +52,25 @@ pub fn resolve_log_rules(
     rules: &HashMap<String, LogRule>,
     transform_name: &str,
 ) -> Result<Vec<LogDirective>, ConfigError> {
-    directives.iter().enumerate().map(|(i, d)| {
-        if let Some(ref rule_name) = d.log_rule {
-            let rule = rules.get(rule_name).ok_or_else(|| {
-                ConfigError::Validation(format!(
-                    "transform '{}': log directive #{}: references nonexistent rule '{}'",
-                    transform_name, i + 1, rule_name,
-                ))
-            })?;
-            Ok(merge_with_rule(d, rule))
-        } else {
-            Ok(d.clone())
-        }
-    }).collect()
+    directives
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if let Some(ref rule_name) = d.log_rule {
+                let rule = rules.get(rule_name).ok_or_else(|| {
+                    ConfigError::Validation(format!(
+                        "transform '{}': log directive #{}: references nonexistent rule '{}'",
+                        transform_name,
+                        i + 1,
+                        rule_name,
+                    ))
+                })?;
+                Ok(merge_with_rule(d, rule))
+            } else {
+                Ok(d.clone())
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -95,7 +104,9 @@ mod tests {
     fn test_log_level2_external_rules_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rules.yaml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 rules:
   audit_trail:
     level: info
@@ -103,7 +114,9 @@ rules:
     condition: "Amount > 1000"
     message: "audit: {Name}"
     fields: [Name, Amount]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let loaded = load_log_rules(&path).unwrap();
         assert!(loaded.rules.contains_key("audit_trail"));
         let rule = &loaded.rules["audit_trail"];
@@ -148,7 +161,7 @@ rules:
             condition: Some("Status == \"FAIL\"".to_string()), // override rule condition
             message: "alert".to_string(),
             fields: Some(vec!["status".to_string()]), // override rule fields
-            every: Some(1), // override rule every
+            every: Some(1),                           // override rule every
             log_rule: Some("audit".to_string()),
         }];
 

@@ -113,9 +113,9 @@ fn get_fields_mut<'a>(
 ) -> Result<&'a mut Vec<FieldDef>, SchemaError> {
     match (schema, record_scope) {
         (ResolvedSchema::SingleRecord { fields }, None) => Ok(fields),
-        (ResolvedSchema::SingleRecord { .. }, Some(rec)) => Err(SchemaError::Validation(
-            format!("schema_overrides: record scope '{rec}' used but schema is single-record"),
-        )),
+        (ResolvedSchema::SingleRecord { .. }, Some(rec)) => Err(SchemaError::Validation(format!(
+            "schema_overrides: record scope '{rec}' used but schema is single-record"
+        ))),
         (ResolvedSchema::MultiRecord { record_types, .. }, Some(rec)) => {
             let rt = record_types
                 .iter_mut()
@@ -267,8 +267,14 @@ mod tests {
 
         let err = resolve_overrides(&mut schema, &[patch]).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("nonexistent"), "error should name field: {msg}");
-        assert!(msg.contains("not found"), "error should say not found: {msg}");
+        assert!(
+            msg.contains("nonexistent"),
+            "error should name field: {msg}"
+        );
+        assert!(
+            msg.contains("not found"),
+            "error should say not found: {msg}"
+        );
     }
 
     #[test]
@@ -322,12 +328,21 @@ mod tests {
 
         // Simulate alias application to emitted fields
         let mut emitted = indexmap::IndexMap::new();
-        emitted.insert("employee_id".to_string(), clinker_record::Value::Integer(42));
+        emitted.insert(
+            "employee_id".to_string(),
+            clinker_record::Value::Integer(42),
+        );
         crate::projection::apply_aliases(&mut emitted, &aliases);
 
         // Post-alias name is emp_id
-        assert!(emitted.contains_key("emp_id"), "post-alias name should be emp_id");
-        assert!(!emitted.contains_key("employee_id"), "pre-alias name should be gone");
+        assert!(
+            emitted.contains_key("emp_id"),
+            "post-alias name should be emp_id"
+        );
+        assert!(
+            !emitted.contains_key("employee_id"),
+            "pre-alias name should be gone"
+        );
 
         // Output mapping uses post-alias name
         let mut mapping = indexmap::IndexMap::new();

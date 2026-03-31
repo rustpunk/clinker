@@ -45,13 +45,11 @@ pub fn DiffTab() -> Element {
                                     selected_file.set(Some(p.clone()));
                                     // Load diff
                                     let ws = (tab_mgr.workspace)();
-                                    if let Some(ws) = ws {
-                                        if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
-                                            let path = std::path::Path::new(&p);
-                                            if let Ok(diff) = ops.diff_file(path) {
-                                                diff_content.set(diff);
-                                            }
-                                        }
+                                    if let Some(ws) = ws
+                                        && let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root)
+                                        && let Ok(diff) = ops.diff_file(std::path::Path::new(&p))
+                                    {
+                                        diff_content.set(diff);
                                     }
                                 },
                                 span { class: "kiln-diff-file__status", "{file.status.letter()}" }

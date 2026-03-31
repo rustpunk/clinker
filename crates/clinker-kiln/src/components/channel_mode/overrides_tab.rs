@@ -50,7 +50,7 @@ pub fn OverridesTab() -> Element {
     let current_view = (view_mode)();
 
     let cs = (tab_mgr.channel_state)();
-    let Some(ref channel_state) = cs else {
+    let Some(ref _channel_state) = cs else {
         return rsx! {};
     };
 
@@ -321,17 +321,18 @@ fn discover_override_files(dir: &std::path::Path) -> Vec<OverrideFile> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".channel.yaml") && name != "channel.yaml" {
-                    let stem = name
-                        .strip_suffix(".channel.yaml")
-                        .unwrap_or(name)
-                        .to_string();
-                    files.push(OverrideFile {
-                        pipeline_stem: stem,
-                        path,
-                    });
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".channel.yaml")
+                && name != "channel.yaml"
+            {
+                let stem = name
+                    .strip_suffix(".channel.yaml")
+                    .unwrap_or(name)
+                    .to_string();
+                files.push(OverrideFile {
+                    pipeline_stem: stem,
+                    path,
+                });
             }
         }
     }

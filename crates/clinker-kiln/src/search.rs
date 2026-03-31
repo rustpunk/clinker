@@ -142,6 +142,7 @@ pub fn text_search(
 ///
 /// Returns the new content with replacements applied, and the count of
 /// replacements made.
+#[allow(dead_code)]
 pub fn text_replace(
     content: &str,
     query: &str,
@@ -165,7 +166,10 @@ pub fn text_replace(
                 (new.into_owned(), if changed { 1 } else { 0 })
             }
         }
-        Matcher::Literal { pattern, case_sensitive } => {
+        Matcher::Literal {
+            pattern,
+            case_sensitive,
+        } => {
             let mut result = String::with_capacity(content.len());
             let mut count = 0;
             let mut remaining = content;
@@ -251,10 +255,7 @@ fn search_content(content: &str, matcher: &Matcher) -> Vec<TextSearchMatch> {
 
     for (line_idx, line) in content.lines().enumerate() {
         let line_matches: Vec<(usize, usize)> = match matcher {
-            Matcher::Regex(re) => re
-                .find_iter(line)
-                .map(|m| (m.start(), m.end()))
-                .collect(),
+            Matcher::Regex(re) => re.find_iter(line).map(|m| (m.start(), m.end())).collect(),
             Matcher::Literal {
                 pattern,
                 case_sensitive,
@@ -327,17 +328,17 @@ fn discover_yaml_files(root: &Path) -> Vec<PathBuf> {
     // Also scan common subdirectories
     for subdir in &["pipelines", "schemas", "templates", "compositions"] {
         let sub = root.join(subdir);
-        if sub.is_dir() {
-            if let Ok(entries) = fs::read_dir(&sub) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|ext| ext == "yaml" || ext == "yml")
-                    {
-                        files.push(path);
-                    }
+        if sub.is_dir()
+            && let Ok(entries) = fs::read_dir(&sub)
+        {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+                {
+                    files.push(path);
                 }
             }
         }
@@ -351,8 +352,17 @@ fn discover_yaml_files(root: &Path) -> Vec<PathBuf> {
 
 /// Valid structural search keys.
 pub const STRUCTURAL_KEYS: &[&str] = &[
-    "input", "transform", "output", "field", "schema", "expr", "has", "pipeline",
-    "import", "composition", "override",
+    "input",
+    "transform",
+    "output",
+    "field",
+    "schema",
+    "expr",
+    "has",
+    "pipeline",
+    "import",
+    "composition",
+    "override",
 ];
 
 /// Parse a raw DSL string into structural tags.
@@ -363,13 +373,14 @@ pub fn parse_structural_query(query: &str) -> Vec<StructuralTag> {
     let mut tags = Vec::new();
 
     for token in query.split_whitespace() {
-        if let Some((key, value)) = token.split_once(':') {
-            if !key.is_empty() && !value.is_empty() {
-                tags.push(StructuralTag {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                });
-            }
+        if let Some((key, value)) = token.split_once(':')
+            && !key.is_empty()
+            && !value.is_empty()
+        {
+            tags.push(StructuralTag {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
         }
     }
 
@@ -423,47 +434,49 @@ pub fn structural_search(
 
         // Check composition-level tags (import:, composition:, override:)
         // Parse as raw config to see _import directives
-        if tags.iter().any(|t| matches!(t.key.as_str(), "import" | "composition" | "override")) {
-            if let Ok(raw) = clinker_core::composition::parse_raw_config(&content) {
-                for entry in &raw.transformations {
-                    if let clinker_core::composition::RawTransformEntry::Import(directive) = entry {
-                        let path_lower = directive.path.to_lowercase();
-                        let override_names: Vec<String> = directive.overrides.keys().cloned().collect();
+        if tags
+            .iter()
+            .any(|t| matches!(t.key.as_str(), "import" | "composition" | "override"))
+            && let Ok(raw) = clinker_core::composition::parse_raw_config(&content)
+        {
+            for entry in &raw.transformations {
+                if let clinker_core::composition::RawTransformEntry::Import(directive) = entry {
+                    let path_lower = directive.path.to_lowercase();
+                    let override_names: Vec<String> = directive.overrides.keys().cloned().collect();
 
-                        for tag in tags {
-                            let val_lower = tag.value.to_lowercase();
-                            match tag.key.as_str() {
-                                "import" | "composition" => {
-                                    if path_lower.contains(&val_lower) {
+                    for tag in tags {
+                        let val_lower = tag.value.to_lowercase();
+                        match tag.key.as_str() {
+                            "import" | "composition" => {
+                                if path_lower.contains(&val_lower) {
+                                    results.push(StructuralSearchMatch {
+                                        pipeline_path: relative.clone(),
+                                        stage_name: directive.path.clone(),
+                                        stage_type: "import".to_string(),
+                                        matched_detail: format!(
+                                            "imports {} ({} override(s))",
+                                            directive.path,
+                                            directive.overrides.len()
+                                        ),
+                                    });
+                                }
+                            }
+                            "override" => {
+                                for ovr_name in &override_names {
+                                    if ovr_name.to_lowercase().contains(&val_lower) {
                                         results.push(StructuralSearchMatch {
                                             pipeline_path: relative.clone(),
-                                            stage_name: directive.path.clone(),
-                                            stage_type: "import".to_string(),
+                                            stage_name: ovr_name.clone(),
+                                            stage_type: "override".to_string(),
                                             matched_detail: format!(
-                                                "imports {} ({} override(s))",
-                                                directive.path,
-                                                directive.overrides.len()
+                                                "overrides '{}' in {}",
+                                                ovr_name, directive.path
                                             ),
                                         });
                                     }
                                 }
-                                "override" => {
-                                    for ovr_name in &override_names {
-                                        if ovr_name.to_lowercase().contains(&val_lower) {
-                                            results.push(StructuralSearchMatch {
-                                                pipeline_path: relative.clone(),
-                                                stage_name: ovr_name.clone(),
-                                                stage_type: "override".to_string(),
-                                                matched_detail: format!(
-                                                    "overrides '{}' in {}",
-                                                    ovr_name, directive.path
-                                                ),
-                                            });
-                                        }
-                                    }
-                                }
-                                _ => {}
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -501,8 +514,17 @@ pub fn structural_search(
 
         // Check outputs
         for output in &config.outputs {
-            if stage_matches_tags(tags, "output", &output.name, &format!("{} {}", output.format.format_name(), output.path)) {
-                let detail = format!("type: {}, path: {}", output.format.format_name(), output.path);
+            if stage_matches_tags(
+                tags,
+                "output",
+                &output.name,
+                &format!("{} {}", output.format.format_name(), output.path),
+            ) {
+                let detail = format!(
+                    "type: {}, path: {}",
+                    output.format.format_name(),
+                    output.path
+                );
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
                     stage_name: output.name.clone(),
@@ -543,7 +565,12 @@ fn stage_matches_tags(tags: &[StructuralTag], stage_type: &str, name: &str, cont
 
 /// Build searchable content string for an input stage.
 fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
-    let mut content = format!("{} {} {}", input.name, input.format.format_name(), input.path);
+    let mut content = format!(
+        "{} {} {}",
+        input.name,
+        input.format.format_name(),
+        input.path
+    );
     if let Some(ref schema) = input.schema {
         content.push_str(&format!(" schema:{schema:?}"));
     }
@@ -552,10 +579,11 @@ fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
 
 // ── Channel search ──────────────────────────────────────────────────────
 
-use crate::state::{ChannelState, ChannelSummary};
+use crate::state::ChannelState;
 
 /// A channel search match.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 pub struct ChannelSearchMatch {
     /// Channel or group ID that matched.
     pub id: String,
@@ -568,9 +596,18 @@ pub struct ChannelSearchMatch {
 }
 
 /// Channel-specific structural search keys.
-const CHANNEL_KEYS: &[&str] = &["channel", "override", "tier", "channel-tag", "group", "stale"];
+#[allow(dead_code)]
+const CHANNEL_KEYS: &[&str] = &[
+    "channel",
+    "override",
+    "tier",
+    "channel-tag",
+    "group",
+    "stale",
+];
 
 /// Check if a query contains channel-specific search keys.
+#[allow(dead_code)]
 pub fn has_channel_tags(tags: &[StructuralTag]) -> bool {
     tags.iter().any(|t| CHANNEL_KEYS.contains(&t.key.as_str()))
 }
@@ -584,10 +621,8 @@ pub fn has_channel_tags(tags: &[StructuralTag]) -> bool {
 /// - `group:id` — filter channels inheriting from a group
 /// - `override:name` — channels that have override files matching a pipeline stem
 /// - `stale:true` — channels with stale overrides (placeholder)
-pub fn channel_search(
-    state: &ChannelState,
-    tags: &[StructuralTag],
-) -> Vec<ChannelSearchMatch> {
+#[allow(dead_code)]
+pub fn channel_search(state: &ChannelState, tags: &[StructuralTag]) -> Vec<ChannelSearchMatch> {
     let mut results = Vec::new();
 
     for channel in &state.channels {
@@ -610,7 +645,8 @@ pub fn channel_search(
                     if channel.tier.as_deref().map(|t| t.to_lowercase()) != Some(val.clone()) {
                         matches = false;
                     } else {
-                        detail_parts.push(format!("tier: {}", channel.tier.as_deref().unwrap_or("")));
+                        detail_parts
+                            .push(format!("tier: {}", channel.tier.as_deref().unwrap_or("")));
                     }
                 }
                 "channel-tag" => {
@@ -621,7 +657,11 @@ pub fn channel_search(
                     }
                 }
                 "group" => {
-                    if !channel.inherits.iter().any(|g| g.to_lowercase().contains(&val)) {
+                    if !channel
+                        .inherits
+                        .iter()
+                        .any(|g| g.to_lowercase().contains(&val))
+                    {
                         matches = false;
                     } else {
                         detail_parts.push(format!("inherits: {}", tag.value));
@@ -761,8 +801,20 @@ mod tests {
     fn test_parse_structural_query() {
         let tags = parse_structural_query("input:employees field:email");
         assert_eq!(tags.len(), 2);
-        assert_eq!(tags[0], StructuralTag { key: "input".to_string(), value: "employees".to_string() });
-        assert_eq!(tags[1], StructuralTag { key: "field".to_string(), value: "email".to_string() });
+        assert_eq!(
+            tags[0],
+            StructuralTag {
+                key: "input".to_string(),
+                value: "employees".to_string()
+            }
+        );
+        assert_eq!(
+            tags[1],
+            StructuralTag {
+                key: "field".to_string(),
+                value: "email".to_string()
+            }
+        );
     }
 
     #[test]
@@ -774,17 +826,38 @@ mod tests {
     #[test]
     fn test_stage_matches_tags_and_logic() {
         let tags = vec![
-            StructuralTag { key: "transform".to_string(), value: "compute".to_string() },
-            StructuralTag { key: "expr".to_string(), value: "email".to_string() },
+            StructuralTag {
+                key: "transform".to_string(),
+                value: "compute".to_string(),
+            },
+            StructuralTag {
+                key: "expr".to_string(),
+                value: "email".to_string(),
+            },
         ];
 
         // Both match
-        assert!(stage_matches_tags(&tags, "transform", "compute_fields", "emit domain = email.split"));
+        assert!(stage_matches_tags(
+            &tags,
+            "transform",
+            "compute_fields",
+            "emit domain = email.split"
+        ));
 
         // Name doesn't match
-        assert!(!stage_matches_tags(&tags, "transform", "filter_step", "emit domain = email.split"));
+        assert!(!stage_matches_tags(
+            &tags,
+            "transform",
+            "filter_step",
+            "emit domain = email.split"
+        ));
 
         // Content doesn't match
-        assert!(!stage_matches_tags(&tags, "transform", "compute_fields", "emit x = y + z"));
+        assert!(!stage_matches_tags(
+            &tags,
+            "transform",
+            "compute_fields",
+            "emit x = y + z"
+        ));
     }
 }

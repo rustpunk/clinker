@@ -2,7 +2,6 @@
 ///
 /// Styled "Coming soon" card in the rustpunk aesthetic.
 /// Used for Channels and Runs contexts.
-
 use dioxus::prelude::*;
 
 #[component]

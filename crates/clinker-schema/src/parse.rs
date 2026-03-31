@@ -38,8 +38,7 @@ pub fn parse_schema(yaml: &str, path: &Path) -> Result<SourceSchema, SchemaParse
 
 /// Parse a `.schema.yaml` file from disk.
 pub fn parse_schema_file(path: &Path) -> Result<SourceSchema, SchemaParseError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| SchemaParseError::Io(e.to_string()))?;
+    let content = std::fs::read_to_string(path).map_err(|e| SchemaParseError::Io(e.to_string()))?;
     parse_schema(&content, path)
 }
 
@@ -207,10 +206,7 @@ fields:
 
         assert_eq!(schema.metadata.name, "orders");
         assert_eq!(schema.metadata.format, SourceFormat::Xml);
-        assert_eq!(
-            schema.metadata.record_element.as_deref(),
-            Some("order")
-        );
+        assert_eq!(schema.metadata.record_element.as_deref(), Some("order"));
         assert_eq!(schema.fields.len(), 4);
 
         // XML attributes

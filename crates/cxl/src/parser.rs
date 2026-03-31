@@ -61,8 +61,8 @@ fn infix_bp(tok: &Token) -> Option<(u8, u8)> {
 
 fn prefix_bp(tok: &Token) -> Option<u8> {
     match tok {
-        Token::Not => Some(10),     // between and(8) and comparisons(11)
-        Token::Minus => Some(18),   // between mul(16) and postfix(19)
+        Token::Not => Some(10),   // between and(8) and comparisons(11)
+        Token::Minus => Some(18), // between mul(16) and postfix(19)
         _ => None,
     }
 }
@@ -182,18 +182,26 @@ impl Parser {
                         }
                     }
                 }
-                Token::Let => {
-                    match parser.parse_let() {
-                        Ok(Statement::Let { node_id, name, expr, span }) => {
-                            constants.push(ModuleConst { node_id, name, expr, span });
-                        }
-                        Ok(_) => unreachable!(),
-                        Err(e) => {
-                            parser.errors.push(e);
-                            parser.recover_to_newline();
-                        }
+                Token::Let => match parser.parse_let() {
+                    Ok(Statement::Let {
+                        node_id,
+                        name,
+                        expr,
+                        span,
+                    }) => {
+                        constants.push(ModuleConst {
+                            node_id,
+                            name,
+                            expr,
+                            span,
+                        });
                     }
-                }
+                    Ok(_) => unreachable!(),
+                    Err(e) => {
+                        parser.errors.push(e);
+                        parser.recover_to_newline();
+                    }
+                },
                 Token::Emit => {
                     parser.errors.push(parser.error(
                         "emit is not allowed in module files",
@@ -274,7 +282,11 @@ impl Parser {
                 let nid = self.alloc_id();
                 let expr = self.parse_expr(0)?;
                 let span = expr.span();
-                Ok(Statement::ExprStmt { node_id: nid, expr, span })
+                Ok(Statement::ExprStmt {
+                    node_id: nid,
+                    expr,
+                    span,
+                })
             }
         }
     }
@@ -319,10 +331,22 @@ impl Parser {
         // Check for contextual level: info/warn/error/debug
         let level = if let Token::Ident(ref name) = self.peek().clone() {
             match name.as_ref() {
-                "info" => { self.advance(); Some(TraceLevel::Info) }
-                "warn" => { self.advance(); Some(TraceLevel::Warn) }
-                "error" => { self.advance(); Some(TraceLevel::Error) }
-                "debug" => { self.advance(); Some(TraceLevel::Debug) }
+                "info" => {
+                    self.advance();
+                    Some(TraceLevel::Info)
+                }
+                "warn" => {
+                    self.advance();
+                    Some(TraceLevel::Warn)
+                }
+                "error" => {
+                    self.advance();
+                    Some(TraceLevel::Error)
+                }
+                "debug" => {
+                    self.advance();
+                    Some(TraceLevel::Debug)
+                }
                 _ => None,
             }
         } else {
@@ -400,7 +424,11 @@ impl Parser {
         // Wrap FnDecl as an ExprStmt for now — Phase 3 resolver handles fn registration
         Ok(Statement::ExprStmt {
             node_id: nid,
-            expr: Expr::Literal { node_id: self.alloc_id(), value: LiteralValue::Null, span },
+            expr: Expr::Literal {
+                node_id: self.alloc_id(),
+                value: LiteralValue::Null,
+                span,
+            },
             span,
         })
     }
@@ -440,7 +468,11 @@ impl Parser {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
-            return Err(self.error("expression nesting too deep (max 256 levels)", "The parser has a maximum nesting depth to prevent stack overflow", "Simplify the expression or break it into let-bindings"));
+            return Err(self.error(
+                "expression nesting too deep (max 256 levels)",
+                "The parser has a maximum nesting depth to prevent stack overflow",
+                "Simplify the expression or break it into let-bindings",
+            ));
         }
 
         let mut lhs = self.parse_nud()?;
@@ -473,25 +505,19 @@ impl Parser {
                 }
 
                 // Non-associative comparison check
-                if is_comparison(&tok) {
-                    if let Expr::Binary { op, .. } = &lhs {
-                        if matches!(
-                            op,
-                            BinOp::Eq
-                                | BinOp::Neq
-                                | BinOp::Gt
-                                | BinOp::Lt
-                                | BinOp::Gte
-                                | BinOp::Lte
-                        ) {
-                            self.depth -= 1;
-                            return Err(self.error(
-                                "comparisons are not chainable",
-                                "CXL comparisons are non-associative — a == b == c is ambiguous",
-                                "use (a == b) and (b == c) instead",
-                            ));
-                        }
-                    }
+                if is_comparison(&tok)
+                    && let Expr::Binary { op, .. } = &lhs
+                    && matches!(
+                        op,
+                        BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte
+                    )
+                {
+                    self.depth -= 1;
+                    return Err(self.error(
+                        "comparisons are not chainable",
+                        "CXL comparisons are non-associative — a == b == c is ambiguous",
+                        "use (a == b) and (b == c) instead",
+                    ));
                 }
 
                 // Dot: postfix field access or method call
@@ -733,7 +759,10 @@ impl Parser {
             Token::Underscore => {
                 let nid = self.alloc_id();
                 self.advance();
-                Ok(Expr::Wildcard { node_id: nid, span: start })
+                Ok(Expr::Wildcard {
+                    node_id: nid,
+                    span: start,
+                })
             }
 
             // window.fn() or pipeline.field
@@ -923,7 +952,8 @@ impl Parser {
     }
 
     fn advance(&mut self) -> (Token, Span) {
-        let result = self.tokens
+        let result = self
+            .tokens
             .get(self.pos)
             .cloned()
             .unwrap_or((Token::Eof, Span::new(0, 0)));
@@ -1019,7 +1049,13 @@ mod tests {
         match first_stmt(&r) {
             Statement::Let { name, expr, .. } => {
                 assert_eq!(&**name, "x");
-                assert!(matches!(expr, Expr::Literal { value: LiteralValue::Int(42), .. }));
+                assert!(matches!(
+                    expr,
+                    Expr::Literal {
+                        value: LiteralValue::Int(42),
+                        ..
+                    }
+                ));
             }
             _ => panic!("expected Let"),
         }
@@ -1043,7 +1079,11 @@ mod tests {
         let expr = let_expr(&r);
         // Should be Add(1, Mul(2, 3)) due to precedence
         match expr {
-            Expr::Binary { op: BinOp::Add, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Add,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(**rhs, Expr::Binary { op: BinOp::Mul, .. }));
             }
             _ => panic!("expected Binary Add at top"),
@@ -1088,7 +1128,9 @@ mod tests {
         let r = parse_ok("let x = name.trim().upper()");
         let expr = let_expr(&r);
         match expr {
-            Expr::MethodCall { method, receiver, .. } => {
+            Expr::MethodCall {
+                method, receiver, ..
+            } => {
                 assert_eq!(&**method, "upper");
                 assert!(matches!(**receiver, Expr::MethodCall { .. }));
             }
@@ -1171,14 +1213,26 @@ mod tests {
     fn test_parse_unary_neg() {
         let r = parse_ok("let x = -42");
         let expr = let_expr(&r);
-        assert!(matches!(expr, Expr::Unary { op: UnaryOp::Neg, .. }));
+        assert!(matches!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_parse_unary_not() {
         let r = parse_ok("let x = not true");
         let expr = let_expr(&r);
-        assert!(matches!(expr, Expr::Unary { op: UnaryOp::Not, .. }));
+        assert!(matches!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Not,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1188,10 +1242,17 @@ mod tests {
         let r = parse_ok("let x = not a == b");
         let expr = let_expr(&r);
         match expr {
-            Expr::Unary { op: UnaryOp::Not, operand, .. } => {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                operand,
+                ..
+            } => {
                 assert!(matches!(**operand, Expr::Binary { op: BinOp::Eq, .. }));
             }
-            other => panic!("expected Unary Not wrapping Binary Eq, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected Unary Not wrapping Binary Eq, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -1199,22 +1260,43 @@ mod tests {
     fn test_parse_null_literal() {
         let r = parse_ok("let x = null");
         let expr = let_expr(&r);
-        assert!(matches!(expr, Expr::Literal { value: LiteralValue::Null, .. }));
+        assert!(matches!(
+            expr,
+            Expr::Literal {
+                value: LiteralValue::Null,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_parse_bool_literals() {
         let r = parse_ok("let x = true");
-        assert!(matches!(let_expr(&r), Expr::Literal { value: LiteralValue::Bool(true), .. }));
+        assert!(matches!(
+            let_expr(&r),
+            Expr::Literal {
+                value: LiteralValue::Bool(true),
+                ..
+            }
+        ));
         let r2 = parse_ok("let x = false");
-        assert!(matches!(let_expr(&r2), Expr::Literal { value: LiteralValue::Bool(false), .. }));
+        assert!(matches!(
+            let_expr(&r2),
+            Expr::Literal {
+                value: LiteralValue::Bool(false),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_parse_string_literals() {
         let r = parse_ok("let x = \"hello world\"");
         match let_expr(&r) {
-            Expr::Literal { value: LiteralValue::String(s), .. } => {
+            Expr::Literal {
+                value: LiteralValue::String(s),
+                ..
+            } => {
                 assert_eq!(&**s, "hello world");
             }
             _ => panic!("expected String literal"),
@@ -1314,7 +1396,11 @@ mod tests {
         let r = parse_ok("let x = (1 + 2) * 3");
         let expr = let_expr(&r);
         match expr {
-            Expr::Binary { op: BinOp::Mul, lhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Mul,
+                lhs,
+                ..
+            } => {
                 assert!(matches!(**lhs, Expr::Binary { op: BinOp::Add, .. }));
             }
             _ => panic!("expected Mul(Add(...), 3)"),
@@ -1374,7 +1460,11 @@ mod tests {
         assert!(r.node_count > 0);
         // The let statement, literal 1, literal 2, and binary add all get IDs
         // Plus the let statement itself
-        assert!(r.node_count >= 4, "Expected at least 4 nodes, got {}", r.node_count);
+        assert!(
+            r.node_count >= 4,
+            "Expected at least 4 nodes, got {}",
+            r.node_count
+        );
     }
 
     #[test]
@@ -1414,7 +1504,13 @@ mod tests {
         let r = parse_module_ok("let MAX = 100");
         assert_eq!(r.module.constants.len(), 1);
         assert_eq!(&*r.module.constants[0].name, "MAX");
-        assert!(matches!(r.module.constants[0].expr, Expr::Literal { value: LiteralValue::Int(100), .. }));
+        assert!(matches!(
+            r.module.constants[0].expr,
+            Expr::Literal {
+                value: LiteralValue::Int(100),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1435,7 +1531,11 @@ mod tests {
     fn test_module_reject_cross_import() {
         let result = Parser::parse_module("use other");
         assert!(!result.errors.is_empty());
-        assert!(result.errors[0].message.contains("modules cannot import other modules"));
+        assert!(
+            result.errors[0]
+                .message
+                .contains("modules cannot import other modules")
+        );
     }
 
     #[test]
@@ -1465,33 +1565,51 @@ mod tests {
     fn test_module_fn_no_params() {
         let r = parse_module_ok("fn pi() = 3.14159");
         assert_eq!(r.module.functions[0].params.len(), 0);
-        assert!(matches!(*r.module.functions[0].body, Expr::Literal { value: LiteralValue::Float(_), .. }));
+        assert!(matches!(
+            *r.module.functions[0].body,
+            Expr::Literal {
+                value: LiteralValue::Float(_),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_module_fn_method_chain_body() {
         let r = parse_module_ok("fn clean(val) = val.trim().upper()");
         assert_eq!(r.module.functions.len(), 1);
-        assert!(matches!(*r.module.functions[0].body, Expr::MethodCall { .. }));
+        assert!(matches!(
+            *r.module.functions[0].body,
+            Expr::MethodCall { .. }
+        ));
     }
 
     #[test]
     fn test_module_fn_conditional_body() {
-        let r = parse_module_ok("fn clamp(val, lo, hi) = if val < lo then lo else if val > hi then hi else val");
+        let r = parse_module_ok(
+            "fn clamp(val, lo, hi) = if val < lo then lo else if val > hi then hi else val",
+        );
         assert_eq!(r.module.functions.len(), 1);
-        assert!(matches!(*r.module.functions[0].body, Expr::IfThenElse { .. }));
+        assert!(matches!(
+            *r.module.functions[0].body,
+            Expr::IfThenElse { .. }
+        ));
     }
 
     #[test]
     fn test_module_fn_match_body() {
-        let r = parse_module_ok("fn tier(score) = match { score >= 90 => \"A\", score >= 80 => \"B\", _ => \"C\" }");
+        let r = parse_module_ok(
+            "fn tier(score) = match { score >= 90 => \"A\", score >= 80 => \"B\", _ => \"C\" }",
+        );
         assert_eq!(r.module.functions.len(), 1);
         assert!(matches!(*r.module.functions[0].body, Expr::Match { .. }));
     }
 
     #[test]
     fn test_module_with_comments() {
-        let r = parse_module_ok("# Utility functions\nfn add(a, b) = a + b\n# Constants\nlet MAX = 100");
+        let r = parse_module_ok(
+            "# Utility functions\nfn add(a, b) = a + b\n# Constants\nlet MAX = 100",
+        );
         assert_eq!(r.module.functions.len(), 1);
         assert_eq!(r.module.constants.len(), 1);
     }
@@ -1500,14 +1618,22 @@ mod tests {
     fn test_module_reject_wildcard_import() {
         let result = Parser::parse("use validators.*");
         assert!(!result.errors.is_empty());
-        assert!(result.errors[0].message.contains("wildcard imports not supported"));
+        assert!(
+            result.errors[0]
+                .message
+                .contains("wildcard imports not supported")
+        );
     }
 
     #[test]
     fn test_module_use_colons_rejected() {
         let result = Parser::parse("use validators::helpers");
         assert!(!result.errors.is_empty());
-        assert!(result.errors[0].message.contains("use paths use '.' separator, not '::'"));
+        assert!(
+            result.errors[0]
+                .message
+                .contains("use paths use '.' separator, not '::'")
+        );
     }
 
     #[test]
@@ -1582,6 +1708,10 @@ mod tests {
     fn test_module_use_after_let_error() {
         let result = Parser::parse("let x = 1\nuse validators");
         assert!(!result.errors.is_empty());
-        assert!(result.errors[0].message.contains("use must appear before let/emit/trace"));
+        assert!(
+            result.errors[0]
+                .message
+                .contains("use must appear before let/emit/trace")
+        );
     }
 }

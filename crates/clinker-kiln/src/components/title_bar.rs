@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 
 use crate::components::channel_mode::ChannelSwitcher;
 use crate::keyboard;
-use crate::state::{use_app_state, NavigationContext, PipelineLayoutMode, TabManagerState};
+use crate::state::{NavigationContext, PipelineLayoutMode, TabManagerState, use_app_state};
 use crate::tab::TabEntry;
 
 /// Custom frameless title bar with context-aware content.
@@ -29,14 +29,10 @@ pub fn TitleBar() -> Element {
     let active_id = (tab_mgr.active_tab_id)();
     let tabs = tab_mgr.tabs.read();
     let active_tab = active_id.and_then(|id| tabs.iter().find(|t| t.id == id));
-    let filename = active_tab
-        .map(|t| t.display_name())
-        .unwrap_or_default();
+    let filename = active_tab.map(|t| t.display_name()).unwrap_or_default();
     let is_dirty = active_tab.map(|t| t.is_dirty()).unwrap_or(false);
     let has_active_tab = active_tab.is_some();
-    let ws_name = (tab_mgr.workspace)()
-        .as_ref()
-        .map(|ws| ws.display_name());
+    let ws_name = (tab_mgr.workspace)().as_ref().map(|ws| ws.display_name());
 
     // Validation state (only relevant in Pipeline context)
     let has_errors = !(state.parse_errors)().is_empty();
@@ -61,10 +57,7 @@ pub fn TitleBar() -> Element {
 
     // Channel state for badge
     let channel_badge_info = (tab_mgr.channel_state)().as_ref().map(|cs| {
-        let label = cs
-            .active_channel
-            .as_deref()
-            .unwrap_or("NO CHANNEL");
+        let label = cs.active_channel.as_deref().unwrap_or("NO CHANNEL");
         let tier = cs.active_summary().and_then(|s| s.tier.clone());
         let has_channel = cs.active_channel.is_some();
         (label.to_uppercase(), tier, has_channel)

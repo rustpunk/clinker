@@ -5,7 +5,6 @@
 //! comparing file modification times.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use dioxus::prelude::*;
 
@@ -16,6 +15,7 @@ use crate::state::TabManagerState;
 enum IssueSeverity {
     Error,
     Warning,
+    #[allow(dead_code)]
     Info,
 }
 
@@ -42,6 +42,7 @@ impl IssueSeverity {
 struct HealthIssue {
     severity: IssueSeverity,
     message: String,
+    #[allow(dead_code)]
     file: PathBuf,
 }
 
@@ -49,6 +50,7 @@ struct HealthIssue {
 #[derive(Clone, Debug)]
 struct PipelineHealth {
     pipeline_stem: String,
+    #[allow(dead_code)]
     override_path: PathBuf,
     issues: Vec<HealthIssue>,
     is_stale: bool,
@@ -57,9 +59,16 @@ struct PipelineHealth {
 
 impl PipelineHealth {
     fn status_icon(&self) -> &'static str {
-        if self.issues.iter().any(|i| i.severity == IssueSeverity::Error) {
+        if self
+            .issues
+            .iter()
+            .any(|i| i.severity == IssueSeverity::Error)
+        {
             "\u{2717}" // ✗
-        } else if self.issues.iter().any(|i| i.severity == IssueSeverity::Warning)
+        } else if self
+            .issues
+            .iter()
+            .any(|i| i.severity == IssueSeverity::Warning)
             || self.is_stale
         {
             "\u{26a0}" // ⚠
@@ -69,9 +78,16 @@ impl PipelineHealth {
     }
 
     fn status_class(&self) -> &'static str {
-        if self.issues.iter().any(|i| i.severity == IssueSeverity::Error) {
+        if self
+            .issues
+            .iter()
+            .any(|i| i.severity == IssueSeverity::Error)
+        {
             "kiln-health-entry--error"
-        } else if self.issues.iter().any(|i| i.severity == IssueSeverity::Warning)
+        } else if self
+            .issues
+            .iter()
+            .any(|i| i.severity == IssueSeverity::Warning)
             || self.is_stale
         {
             "kiln-health-entry--warning"
@@ -233,9 +249,7 @@ fn run_health_checks(channel_dir: &Path, ws_root: &Path) -> Vec<PipelineHealth> 
         if base_path.is_none() {
             issues.push(HealthIssue {
                 severity: IssueSeverity::Error,
-                message: format!(
-                    "Base pipeline '{pipeline_stem}.yaml' not found in workspace"
-                ),
+                message: format!("Base pipeline '{pipeline_stem}.yaml' not found in workspace"),
                 file: path.clone(),
             });
         }
@@ -283,15 +297,11 @@ fn check_staleness(override_path: &Path, base_path: &Path) -> (bool, Option<Stri
     let override_mtime = std::fs::metadata(override_path)
         .and_then(|m| m.modified())
         .ok();
-    let base_mtime = std::fs::metadata(base_path)
-        .and_then(|m| m.modified())
-        .ok();
+    let base_mtime = std::fs::metadata(base_path).and_then(|m| m.modified()).ok();
 
     match (override_mtime, base_mtime) {
         (Some(ovr), Some(base)) if base > ovr => {
-            let elapsed = base
-                .duration_since(ovr)
-                .unwrap_or_default();
+            let elapsed = base.duration_since(ovr).unwrap_or_default();
             let days = elapsed.as_secs() / 86400;
             let info = if days > 30 {
                 format!("{} months", days / 30)

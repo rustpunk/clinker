@@ -57,8 +57,8 @@ pub fn toposort_constants(constants: &[ModuleConst]) -> Result<Vec<usize>, Modul
 
     // Kahn's algorithm
     let mut queue: Vec<usize> = Vec::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate().take(n) {
+        if deg == 0 {
             queue.push(i);
         }
     }
@@ -113,7 +113,12 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
             walk_expr(lhs, refs);
             walk_expr(rhs, refs);
         }
-        Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_expr(condition, refs);
             walk_expr(then_branch, refs);
             if let Some(eb) = else_branch {
@@ -190,12 +195,12 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
         // a self-call would be just `fn_name(args)` which parses as
         // FieldRef + method call, or as an unresolved FieldRef.
         // We check for FieldRef matching fn_name used in a call-like position.
-        Expr::MethodCall { receiver, method, args, .. } => {
+        Expr::MethodCall { receiver, args, .. } => {
             // Check: receiver is FieldRef matching fn_name (e.g., f.something)
-            if let Expr::FieldRef { name, .. } = &**receiver {
-                if &**name == fn_name {
-                    return true;
-                }
+            if let Expr::FieldRef { name, .. } = &**receiver
+                && &**name == fn_name
+            {
+                return true;
             }
             // Check: method name matching fn_name on any receiver won't happen
             // for self-recursion since it would need module prefix.
@@ -222,21 +227,28 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
         Expr::Coalesce { lhs, rhs, .. } => {
             contains_self_call(fn_name, lhs) || contains_self_call(fn_name, rhs)
         }
-        Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             contains_self_call(fn_name, condition)
                 || contains_self_call(fn_name, then_branch)
-                || else_branch.as_ref().map_or(false, |eb| contains_self_call(fn_name, eb))
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|eb| contains_self_call(fn_name, eb))
         }
         Expr::Match { subject, arms, .. } => {
-            subject.as_ref().map_or(false, |s| contains_self_call(fn_name, s))
+            subject
+                .as_ref()
+                .is_some_and(|s| contains_self_call(fn_name, s))
                 || arms.iter().any(|arm| {
                     contains_self_call(fn_name, &arm.pattern)
                         || contains_self_call(fn_name, &arm.body)
                 })
         }
-        Expr::WindowCall { args, .. } => {
-            args.iter().any(|a| contains_self_call(fn_name, a))
-        }
+        Expr::WindowCall { args, .. } => args.iter().any(|a| contains_self_call(fn_name, a)),
         Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::Literal { .. }
@@ -249,7 +261,7 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{LiteralValue, BinOp, NodeId};
+    use crate::ast::{BinOp, LiteralValue, NodeId};
     use crate::lexer::Span;
 
     fn make_const(name: &str, expr: Expr) -> ModuleConst {
@@ -262,11 +274,19 @@ mod tests {
     }
 
     fn lit_int(v: i64) -> Expr {
-        Expr::Literal { node_id: NodeId(0), value: LiteralValue::Int(v), span: Span::new(0, 1) }
+        Expr::Literal {
+            node_id: NodeId(0),
+            value: LiteralValue::Int(v),
+            span: Span::new(0, 1),
+        }
     }
 
     fn field_ref(name: &str) -> Expr {
-        Expr::FieldRef { node_id: NodeId(0), name: name.into(), span: Span::new(0, 1) }
+        Expr::FieldRef {
+            node_id: NodeId(0),
+            name: name.into(),
+            span: Span::new(0, 1),
+        }
     }
 
     fn add(lhs: Expr, rhs: Expr) -> Expr {
@@ -306,10 +326,7 @@ mod tests {
 
     #[test]
     fn test_module_const_duplicate_name() {
-        let constants = vec![
-            make_const("X", lit_int(1)),
-            make_const("X", lit_int(2)),
-        ];
+        let constants = vec![make_const("X", lit_int(1)), make_const("X", lit_int(2))];
         let err = toposort_constants(&constants).unwrap_err();
         assert!(err.message.contains("duplicate constant name 'X'"));
     }
@@ -317,11 +334,12 @@ mod tests {
     #[test]
     fn test_module_const_reject_field_reference() {
         // let BAD = Amount → "module constants cannot reference fields"
-        let constants = vec![
-            make_const("BAD", field_ref("Amount")),
-        ];
+        let constants = vec![make_const("BAD", field_ref("Amount"))];
         let err = toposort_constants(&constants).unwrap_err();
-        assert!(err.message.contains("module constants cannot reference fields"));
+        assert!(
+            err.message
+                .contains("module constants cannot reference fields")
+        );
         assert!(err.message.contains("Amount"));
     }
 
@@ -417,7 +435,11 @@ mod tests {
         // This simulates self-reference: receiver FieldRef("f") with method call
         let body = if_then_else(
             gt(field_ref("x"), lit_int(0)),
-            method_call(field_ref("f"), "call", vec![sub(field_ref("x"), lit_int(1))]),
+            method_call(
+                field_ref("f"),
+                "call",
+                vec![sub(field_ref("x"), lit_int(1))],
+            ),
             field_ref("x"),
         );
         let functions = vec![make_fn("f", &["x"], body)];

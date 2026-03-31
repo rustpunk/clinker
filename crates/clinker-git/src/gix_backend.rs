@@ -87,7 +87,7 @@ impl GitOps for GitCliOps {
     }
 
     fn branches(&self) -> Result<Vec<BranchInfo>, GitError> {
-        let current = self.current_branch().unwrap_or_default();
+        let _current = self.current_branch().unwrap_or_default();
 
         let output = self.git(&["branch", "--list", "--no-color"])?;
         let mut branches = Vec::new();
@@ -129,11 +129,7 @@ impl GitOps for GitCliOps {
 
     fn log(&self, max: usize) -> Result<Vec<CommitInfo>, GitError> {
         let max_str = format!("-{max}");
-        let output = self.git(&[
-            "log",
-            &max_str,
-            "--format=%H%n%an%n%ae%n%at%n%s%n---END---",
-        ])?;
+        let output = self.git(&["log", &max_str, "--format=%H%n%an%n%ae%n%at%n%s%n---END---"])?;
 
         let mut commits = Vec::new();
         let mut lines = output.lines().peekable();
@@ -170,7 +166,10 @@ impl GitOps for GitCliOps {
 
     fn stage(&self, paths: &[&Path]) -> Result<(), GitError> {
         let mut args = vec!["add", "--"];
-        let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let path_strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         for p in &path_strs {
             args.push(p);
         }
@@ -180,7 +179,10 @@ impl GitOps for GitCliOps {
 
     fn unstage(&self, paths: &[&Path]) -> Result<(), GitError> {
         let mut args = vec!["restore", "--staged", "--"];
-        let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let path_strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         for p in &path_strs {
             args.push(p);
         }
@@ -192,7 +194,9 @@ impl GitOps for GitCliOps {
         self.git(&["commit", "-m", message])?;
         // Get the just-created commit info
         let log = self.log(1)?;
-        log.into_iter().next().ok_or_else(|| GitError::Operation("commit created but log empty".to_string()))
+        log.into_iter()
+            .next()
+            .ok_or_else(|| GitError::Operation("commit created but log empty".to_string()))
     }
 
     fn push(&self) -> Result<String, GitError> {
@@ -219,11 +223,7 @@ impl GitOps for GitCliOps {
 
     fn blame(&self, path: &Path) -> Result<Vec<BlameLine>, GitError> {
         let path_str = path.to_string_lossy();
-        let output = self.git(&[
-            "blame",
-            "--porcelain",
-            &path_str,
-        ])?;
+        let output = self.git(&["blame", "--porcelain", &path_str])?;
 
         Ok(parse_blame_porcelain(&output))
     }

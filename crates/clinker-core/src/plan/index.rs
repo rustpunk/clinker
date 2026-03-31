@@ -31,11 +31,12 @@ pub fn parse_local_window(
     match &transform.local_window {
         None => Ok(None),
         Some(value) => {
-            let config: LocalWindowConfig =
-                serde_json::from_value(value.clone()).map_err(|e| PlanIndexError::InvalidLocalWindow {
+            let config: LocalWindowConfig = serde_json::from_value(value.clone()).map_err(|e| {
+                PlanIndexError::InvalidLocalWindow {
                     transform: transform.name.clone(),
                     message: e.to_string(),
-                })?;
+                }
+            })?;
             Ok(Some(config))
         }
     }
@@ -145,10 +146,7 @@ fn sort_fields_equal(a: &[SortField], b: &[SortField]) -> bool {
 /// Errors from index planning.
 #[derive(Debug)]
 pub enum PlanIndexError {
-    InvalidLocalWindow {
-        transform: String,
-        message: String,
-    },
+    InvalidLocalWindow { transform: String, message: String },
 }
 
 impl std::fmt::Display for PlanIndexError {

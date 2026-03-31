@@ -57,10 +57,18 @@ pub struct ExecutionReport {
 /// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
 struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
-    fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
-    fn record_count(&self) -> u32 { 0 }
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+        None
+    }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+        None
+    }
+    fn available_fields(&self, _: u32) -> Vec<&str> {
+        vec![]
+    }
+    fn record_count(&self) -> u32 {
+        0
+    }
 }
 
 /// Compiled transform: CXL source compiled once, evaluated per record.
@@ -112,11 +120,12 @@ impl PipelineExecutor {
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let plan = ExecutionPlan::compile(config, &compiled_refs)
-            .map_err(|e| PipelineError::Compilation {
+        let plan = ExecutionPlan::compile(config, &compiled_refs).map_err(|e| {
+            PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
-            })?;
+            }
+        })?;
 
         let execution_mode = plan.mode();
 
@@ -124,9 +133,14 @@ impl PipelineExecutor {
             ExecutionMode::Streaming => {
                 Self::execute_streaming(config, csv_reader, writer, &compiled_transforms, params)?
             }
-            ExecutionMode::TwoPass => {
-                Self::execute_two_pass(config, csv_reader, writer, &compiled_transforms, &plan, params)?
-            }
+            ExecutionMode::TwoPass => Self::execute_two_pass(
+                config,
+                csv_reader,
+                writer,
+                &compiled_transforms,
+                &plan,
+                params,
+            )?,
         };
 
         Ok(ExecutionReport {
@@ -160,7 +174,15 @@ impl PipelineExecutor {
             None => return Ok((PipelineCounters::default(), Vec::new(), rss_bytes())),
         };
 
-        let ctx = build_eval_context(config, &input.path, 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
+        let ctx = build_eval_context(
+            config,
+            &input.path,
+            1,
+            pipeline_start_time,
+            &params.execution_id,
+            &params.batch_id,
+            &params.pipeline_vars,
+        );
         let first_result = evaluate_record(&first_record, transforms, &ctx);
 
         let schema = csv_reader.schema()?;
@@ -190,14 +212,32 @@ impl PipelineExecutor {
                 counters.ok_count += 1;
             }
             Err(eval_err) => {
-                handle_error(strategy, &first_record, 1, &eval_err, &mut counters, &mut dlq_entries, output, &output_schema, &mut csv_writer)?;
+                handle_error(
+                    strategy,
+                    &first_record,
+                    1,
+                    &eval_err,
+                    &mut counters,
+                    &mut dlq_entries,
+                    output,
+                    &output_schema,
+                    &mut csv_writer,
+                )?;
             }
         }
 
         let mut row_num: u64 = 2;
         while let Some(record) = csv_reader.next_record()? {
             counters.total_count += 1;
-            let ctx = build_eval_context(config, &input.path, row_num, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
+            let ctx = build_eval_context(
+                config,
+                &input.path,
+                row_num,
+                pipeline_start_time,
+                &params.execution_id,
+                &params.batch_id,
+                &params.pipeline_vars,
+            );
             match evaluate_record(&record, transforms, &ctx) {
                 Ok(emitted) => {
                     let projected = project_output(&record, &emitted, output);
@@ -205,7 +245,17 @@ impl PipelineExecutor {
                     counters.ok_count += 1;
                 }
                 Err(eval_err) => {
-                    handle_error(strategy, &record, row_num, &eval_err, &mut counters, &mut dlq_entries, output, &output_schema, &mut csv_writer)?;
+                    handle_error(
+                        strategy,
+                        &record,
+                        row_num,
+                        &eval_err,
+                        &mut counters,
+                        &mut dlq_entries,
+                        output,
+                        &output_schema,
+                        &mut csv_writer,
+                    )?;
                 }
             }
             row_num += 1;
@@ -232,29 +282,36 @@ impl PipelineExecutor {
         let pipeline_start_time = chrono::Local::now().naive_local();
 
         // Phase 1: Build Arena from primary source
-        let arena_fields = crate::plan::index::collect_arena_fields(
-            &plan.indices_to_build, &input.name,
-        );
+        let arena_fields =
+            crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
         let memory_limit = parse_memory_limit(config);
-        let arena = Arena::build(&mut csv_reader, &arena_fields, memory_limit)
-            .map_err(|e| PipelineError::Compilation {
+        let arena = Arena::build(&mut csv_reader, &arena_fields, memory_limit).map_err(|e| {
+            PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
-            })?;
+            }
+        })?;
 
         // Phase 1: Build SecondaryIndices
         let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
-            .schema_overrides.as_ref()
-            .map(|overrides| overrides.iter().map(|o| (o.name.clone(), o.clone())).collect())
+            .schema_overrides
+            .as_ref()
+            .map(|overrides| {
+                overrides
+                    .iter()
+                    .map(|o| (o.name.clone(), o.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut indices: Vec<SecondaryIndex> = Vec::new();
         for spec in &plan.indices_to_build {
-            let idx = SecondaryIndex::build(&arena, &spec.group_by, &schema_pins)
-                .map_err(|e| PipelineError::Compilation {
+            let idx = SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
+                PipelineError::Compilation {
                     transform_name: String::new(),
                     messages: vec![e.to_string()],
-                })?;
+                }
+            })?;
             indices.push(idx);
         }
 
@@ -290,7 +347,9 @@ impl PipelineExecutor {
         }
 
         let mut rss_budget = MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
-        let chunk_size = config.pipeline.concurrency
+        let chunk_size = config
+            .pipeline
+            .concurrency
             .as_ref()
             .and_then(|c| c.chunk_size)
             .unwrap_or(1024) as u32;
@@ -298,7 +357,9 @@ impl PipelineExecutor {
         // Build a Record from Arena for evaluation
         let build_record_from_arena = |pos: u32| -> Record {
             let schema = Arc::clone(output_schema_ref);
-            let values: Vec<Value> = schema.columns().iter()
+            let values: Vec<Value> = schema
+                .columns()
+                .iter()
                 .map(|col| arena.resolve_field(pos, col).unwrap_or(Value::Null))
                 .collect();
             Record::new(schema, values)
@@ -306,9 +367,23 @@ impl PipelineExecutor {
 
         // Evaluate first record to determine output schema (needed before writer init)
         let first_record = build_record_from_arena(0);
-        let first_ctx = build_eval_context(config, &input.path, 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
+        let first_ctx = build_eval_context(
+            config,
+            &input.path,
+            1,
+            pipeline_start_time,
+            &params.execution_id,
+            &params.batch_id,
+            &params.pipeline_vars,
+        );
         let first_emitted = evaluate_record_with_window(
-            &first_record, transforms, &first_ctx, plan, &arena, &indices, 0,
+            &first_record,
+            transforms,
+            &first_ctx,
+            plan,
+            &arena,
+            &indices,
+            0,
         );
 
         let (final_output_schema, first_projected) = match &first_emitted {
@@ -325,7 +400,8 @@ impl PipelineExecutor {
             }
         };
 
-        let mut csv_writer = CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
+        let mut csv_writer =
+            CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
         let mut counters = PipelineCounters::default();
         let mut dlq_entries = Vec::new();
 
@@ -337,7 +413,17 @@ impl PipelineExecutor {
                 counters.ok_count += 1;
             }
             Err(eval_err) => {
-                handle_error(strategy, &first_record, 1, &eval_err, &mut counters, &mut dlq_entries, output, &final_output_schema, &mut csv_writer)?;
+                handle_error(
+                    strategy,
+                    &first_record,
+                    1,
+                    &eval_err,
+                    &mut counters,
+                    &mut dlq_entries,
+                    output,
+                    &final_output_schema,
+                    &mut csv_writer,
+                )?;
             }
         }
 
@@ -347,16 +433,28 @@ impl PipelineExecutor {
             let chunk_end = (chunk_start + chunk_size).min(record_count);
 
             // Build chunk: (arena_pos, Record, eval result — None until evaluated)
-            let mut chunk: Vec<(u32, Record, Option<Result<IndexMap<String, Value>, cxl::eval::EvalError>>)> =
-                (chunk_start..chunk_end)
-                    .map(|pos| (pos, build_record_from_arena(pos), None))
-                    .collect();
+            #[allow(clippy::type_complexity)]
+            let mut chunk: Vec<(
+                u32,
+                Record,
+                Option<Result<IndexMap<String, Value>, cxl::eval::EvalError>>,
+            )> = (chunk_start..chunk_end)
+                .map(|pos| (pos, build_record_from_arena(pos), None))
+                .collect();
 
             // Evaluate: parallel or sequential
             if use_parallel {
                 pool.install(|| {
                     chunk.par_iter_mut().for_each(|(pos, record, result)| {
-                        let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
+                        let ctx = build_eval_context(
+                            config,
+                            &input.path,
+                            *pos as u64 + 1,
+                            pipeline_start_time,
+                            &params.execution_id,
+                            &params.batch_id,
+                            &params.pipeline_vars,
+                        );
                         *result = Some(evaluate_record_with_window(
                             record, transforms, &ctx, plan, &arena, &indices, *pos,
                         ));
@@ -364,7 +462,15 @@ impl PipelineExecutor {
                 });
             } else {
                 for (pos, record, result) in chunk.iter_mut() {
-                    let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
+                    let ctx = build_eval_context(
+                        config,
+                        &input.path,
+                        *pos as u64 + 1,
+                        pipeline_start_time,
+                        &params.execution_id,
+                        &params.batch_id,
+                        &params.pipeline_vars,
+                    );
                     *result = Some(evaluate_record_with_window(
                         record, transforms, &ctx, plan, &arena, &indices, *pos,
                     ));
@@ -382,7 +488,17 @@ impl PipelineExecutor {
                         counters.ok_count += 1;
                     }
                     Err(eval_err) => {
-                        handle_error(strategy, record, row_num, eval_err, &mut counters, &mut dlq_entries, output, &final_output_schema, &mut csv_writer)?;
+                        handle_error(
+                            strategy,
+                            record,
+                            row_num,
+                            eval_err,
+                            &mut counters,
+                            &mut dlq_entries,
+                            output,
+                            &final_output_schema,
+                            &mut csv_writer,
+                        )?;
                     }
                 }
             }
@@ -404,10 +520,8 @@ impl PipelineExecutor {
         // CSV fields are all strings at the data level, but CXL allows
         // polymorphic usage (e.g. `+` for concat, `.to_int()` for coercion).
         // Declare as Any so the type checker doesn't reject valid CXL.
-        let type_schema: HashMap<String, Type> = fields
-            .iter()
-            .map(|f| (f.to_string(), Type::Any))
-            .collect();
+        let type_schema: HashMap<String, Type> =
+            fields.iter().map(|f| (f.to_string(), Type::Any)).collect();
 
         let mut compiled = Vec::with_capacity(transforms.len());
         for t in transforms {
@@ -424,15 +538,12 @@ impl PipelineExecutor {
                 });
             }
 
-            let resolved = cxl::resolve::resolve_program(
-                parse_result.ast,
-                &fields,
-                parse_result.node_count,
-            )
-            .map_err(|diags| PipelineError::Compilation {
-                transform_name: t.name.clone(),
-                messages: diags.into_iter().map(|d| d.message).collect(),
-            })?;
+            let resolved =
+                cxl::resolve::resolve_program(parse_result.ast, &fields, parse_result.node_count)
+                    .map_err(|diags| PipelineError::Compilation {
+                    transform_name: t.name.clone(),
+                    messages: diags.into_iter().map(|d| d.message).collect(),
+                })?;
 
             let typed = cxl::typecheck::type_check(resolved, &type_schema).map_err(|diags| {
                 // Filter to errors only (not warnings)
@@ -493,11 +604,12 @@ impl PipelineExecutor {
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let plan = ExecutionPlan::compile(config, &compiled_refs)
-            .map_err(|e| PipelineError::Compilation {
+        let plan = ExecutionPlan::compile(config, &compiled_refs).map_err(|e| {
+            PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
-            })?;
+            }
+        })?;
 
         Ok(plan.explain_full(config))
     }
@@ -507,15 +619,15 @@ impl PipelineExecutor {
 fn build_reader_config(input: &crate::config::InputConfig) -> CsvReaderConfig {
     let mut config = CsvReaderConfig::default();
     if let Some(opts) = input.csv_options() {
-        if let Some(ref d) = opts.delimiter {
-            if let Some(b) = d.as_bytes().first() {
-                config.delimiter = *b;
-            }
+        if let Some(ref d) = opts.delimiter
+            && let Some(b) = d.as_bytes().first()
+        {
+            config.delimiter = *b;
         }
-        if let Some(ref q) = opts.quote_char {
-            if let Some(b) = q.as_bytes().first() {
-                config.quote_char = *b;
-            }
+        if let Some(ref q) = opts.quote_char
+            && let Some(b) = q.as_bytes().first()
+        {
+            config.quote_char = *b;
         }
         if let Some(h) = opts.has_header {
             config.has_header = h;
@@ -530,12 +642,11 @@ fn build_writer_config(output: &OutputConfig) -> CsvWriterConfig {
     if let Some(h) = output.include_header {
         config.include_header = h;
     }
-    if let crate::config::OutputFormat::Csv(Some(ref opts)) = output.format {
-        if let Some(ref d) = opts.delimiter {
-            if let Some(b) = d.as_bytes().first() {
-                config.delimiter = *b;
-            }
-        }
+    if let crate::config::OutputFormat::Csv(Some(ref opts)) = output.format
+        && let Some(ref d) = opts.delimiter
+        && let Some(b) = d.as_bytes().first()
+    {
+        config.delimiter = *b;
     }
     config
 }
@@ -561,7 +672,10 @@ fn build_thread_pool(config: &PipelineConfig) -> Result<rayon::ThreadPool, Pipel
 /// Determine if all transforms can be parallelized (Stateless or IndexReading).
 fn can_parallelize(plan: &ExecutionPlan) -> bool {
     plan.parallelism.per_transform.iter().all(|c| {
-        matches!(c, ParallelismClass::Stateless | ParallelismClass::IndexReading)
+        matches!(
+            c,
+            ParallelismClass::Stateless | ParallelismClass::IndexReading
+        )
     })
 }
 
@@ -628,15 +742,22 @@ fn evaluate_record_with_window(
             let index = &indices[idx_num];
 
             // Compute group key from current record
-            let key: Option<Vec<GroupByKey>> = spec.group_by.iter().map(|field| {
-                let val = record.get(field).cloned().unwrap_or(Value::Null);
-                value_to_group_key(&val, field, None, record_pos).ok().flatten()
-            }).collect();
+            let key: Option<Vec<GroupByKey>> = spec
+                .group_by
+                .iter()
+                .map(|field| {
+                    let val = record.get(field).cloned().unwrap_or(Value::Null);
+                    value_to_group_key(&val, field, None, record_pos)
+                        .ok()
+                        .flatten()
+                })
+                .collect();
 
             if let Some(key) = key {
                 if let Some(partition) = index.get(&key) {
                     // Find current position within partition
-                    let pos_in_partition = partition.iter().position(|&p| p == record_pos).unwrap_or(0);
+                    let pos_in_partition =
+                        partition.iter().position(|&p| p == record_pos).unwrap_or(0);
                     let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
                     let emitted = cxl::eval::eval_program(&t.typed, ctx, record, Some(&wctx))?;
                     all_emitted.extend(emitted);
@@ -662,7 +783,10 @@ fn evaluate_record_with_window(
 
 /// Parse memory limit from config (default 512MB).
 fn parse_memory_limit(config: &PipelineConfig) -> usize {
-    config.pipeline.memory_limit.as_ref()
+    config
+        .pipeline
+        .memory_limit
+        .as_ref()
         .and_then(|s| {
             let s = s.trim();
             if let Some(num) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
@@ -732,7 +856,9 @@ fn collect_field_refs(program: &cxl::ast::Program, names: &mut Vec<String>) {
             | cxl::ast::Statement::Emit { expr, .. }
             | cxl::ast::Statement::ExprStmt { expr, .. } => collect_field_refs_expr(expr, names),
             cxl::ast::Statement::Trace { guard, message, .. } => {
-                if let Some(g) = guard { collect_field_refs_expr(g, names); }
+                if let Some(g) = guard {
+                    collect_field_refs_expr(g, names);
+                }
                 collect_field_refs_expr(message, names);
             }
             _ => {}
@@ -743,7 +869,9 @@ fn collect_field_refs(program: &cxl::ast::Program, names: &mut Vec<String>) {
 fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
     match expr {
         cxl::ast::Expr::FieldRef { name, .. } => {
-            if &**name != "it" { names.push(name.to_string()); }
+            if &**name != "it" {
+                names.push(name.to_string());
+            }
         }
         cxl::ast::Expr::Binary { lhs, rhs, .. } | cxl::ast::Expr::Coalesce { lhs, rhs, .. } => {
             collect_field_refs_expr(lhs, names);
@@ -752,22 +880,35 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
         cxl::ast::Expr::Unary { operand, .. } => collect_field_refs_expr(operand, names),
         cxl::ast::Expr::MethodCall { receiver, args, .. } => {
             collect_field_refs_expr(receiver, names);
-            for a in args { collect_field_refs_expr(a, names); }
+            for a in args {
+                collect_field_refs_expr(a, names);
+            }
         }
-        cxl::ast::Expr::IfThenElse { condition, then_branch, else_branch, .. } => {
+        cxl::ast::Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_field_refs_expr(condition, names);
             collect_field_refs_expr(then_branch, names);
-            if let Some(eb) = else_branch { collect_field_refs_expr(eb, names); }
+            if let Some(eb) = else_branch {
+                collect_field_refs_expr(eb, names);
+            }
         }
         cxl::ast::Expr::Match { subject, arms, .. } => {
-            if let Some(s) = subject { collect_field_refs_expr(s, names); }
+            if let Some(s) = subject {
+                collect_field_refs_expr(s, names);
+            }
             for arm in arms {
                 collect_field_refs_expr(&arm.pattern, names);
                 collect_field_refs_expr(&arm.body, names);
             }
         }
         cxl::ast::Expr::WindowCall { args, .. } => {
-            for a in args { collect_field_refs_expr(a, names); }
+            for a in args {
+                collect_field_refs_expr(a, names);
+            }
         }
         _ => {}
     }
@@ -786,7 +927,10 @@ mod tests {
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
 
-        let pipeline_vars = config.pipeline.vars.as_ref()
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
             .map(|v| crate::config::convert_pipeline_vars(v))
             .unwrap_or_default();
         let params = PipelineRunParams {
@@ -942,7 +1086,7 @@ transformations: []
         let csv = "name,age\nAlice,30\n";
         let (_, _, output) = run_test(yaml, csv).unwrap();
         assert!(output.contains("employee_name"));
-        assert!(!output.contains("\nname"));  // header should be renamed
+        assert!(!output.contains("\nname")); // header should be renamed
     }
 
     #[test]
@@ -1159,7 +1303,8 @@ error_handling:
     // === Task 5.5 Two-Pass Gate Tests ===
 
     fn two_pass_yaml(cxl: &str, local_window: &str) -> String {
-        format!(r#"
+        format!(
+            r#"
 pipeline:
   name: two_pass_test
 
@@ -1180,7 +1325,10 @@ transformations:
       {cxl}
     local_window:
       {local_window}
-"#, cxl = cxl, local_window = local_window)
+"#,
+            cxl = cxl,
+            local_window = local_window
+        )
     }
 
     #[test]
@@ -1208,8 +1356,16 @@ transformations:
         // count() returns partition size as integer
         assert!(output.contains("group_count"), "output: {}", output);
         // A has 3 records, B has 2
-        assert!(output.contains(",3") || output.contains("3,"), "expected 3 in output: {}", output);
-        assert!(output.contains(",2") || output.contains("2,"), "expected 2 in output: {}", output);
+        assert!(
+            output.contains(",3") || output.contains("3,"),
+            "expected 3 in output: {}",
+            output
+        );
+        assert!(
+            output.contains(",2") || output.contains("2,"),
+            "expected 2 in output: {}",
+            output
+        );
     }
 
     #[test]
@@ -1350,7 +1506,11 @@ transformations:
         assert_eq!(counters.ok_count, 3);
         // source_row should be sequential
         // Values appear as integers in CSV output
-        assert!(output.contains("row"), "output missing 'row' header: {}", output);
+        assert!(
+            output.contains("row"),
+            "output missing 'row' header: {}",
+            output
+        );
     }
 
     // ── Phase 6 gate tests ───────────────────────────────────────────
@@ -1390,7 +1550,10 @@ transformations:
         });
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
-        let pipeline_vars = config.pipeline.vars.as_ref()
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
             .map(|v| crate::config::convert_pipeline_vars(v))
             .unwrap_or_default();
         let params = PipelineRunParams {
@@ -1431,7 +1594,10 @@ transformations:
 
         let (_, _, output_1) = run_test_with_threads(yaml, &csv, 1).unwrap();
         let (_, _, output_4) = run_test_with_threads(yaml, &csv, 4).unwrap();
-        assert_eq!(output_1, output_4, "Output must be byte-identical with 1 vs 4 threads");
+        assert_eq!(
+            output_1, output_4,
+            "Output must be byte-identical with 1 vs 4 threads"
+        );
     }
 
     #[test]
@@ -1457,13 +1623,22 @@ transformations:
 "#;
         let mut csv = String::from("dept,amount\n");
         for i in 0..500 {
-            let dept = if i % 3 == 0 { "A" } else if i % 3 == 1 { "B" } else { "C" };
+            let dept = if i % 3 == 0 {
+                "A"
+            } else if i % 3 == 1 {
+                "B"
+            } else {
+                "C"
+            };
             csv.push_str(&format!("{dept},{i}\n"));
         }
 
         let (_, _, output_1) = run_test_with_threads(yaml, &csv, 1).unwrap();
         let (_, _, output_4) = run_test_with_threads(yaml, &csv, 4).unwrap();
-        assert_eq!(output_1, output_4, "Window output must be byte-identical with 1 vs 4 threads");
+        assert_eq!(
+            output_1, output_4,
+            "Window output must be byte-identical with 1 vs 4 threads"
+        );
     }
 
     #[test]
@@ -1559,8 +1734,11 @@ transformations:
         let compiled = PipelineExecutor::compile_transforms(&transforms, &schema).unwrap();
         // Each compiled transform holds one Arc<TypedProgram>
         for ct in &compiled {
-            assert_eq!(Arc::strong_count(&ct.typed), 1,
-                "Arc<TypedProgram> should have exactly 1 strong reference (no per-record cloning)");
+            assert_eq!(
+                Arc::strong_count(&ct.typed),
+                1,
+                "Arc<TypedProgram> should have exactly 1 strong reference (no per-record cloning)"
+            );
         }
     }
 
@@ -1630,8 +1808,10 @@ transformations:
         assert!(result.is_ok(), "Pipeline should not panic on shutdown");
         let (counters, _, output) = result.unwrap();
         // At minimum, the output should contain the header
-        assert!(output.contains("name") || output.contains("doubled"),
-            "Output should contain at least the header");
+        assert!(
+            output.contains("name") || output.contains("doubled"),
+            "Output should contain at least the header"
+        );
         // Counters should be consistent
         assert!(counters.ok_count + counters.dlq_count <= counters.total_count);
 
@@ -1670,7 +1850,11 @@ transformations:
         assert!(result.is_ok());
         let (counters, dlq, _output) = result.unwrap();
         // Bob's row should go to DLQ
-        assert!(counters.dlq_count >= 1, "Should have at least 1 DLQ entry, got {}", counters.dlq_count);
+        assert!(
+            counters.dlq_count >= 1,
+            "Should have at least 1 DLQ entry, got {}",
+            counters.dlq_count
+        );
         assert!(!dlq.is_empty(), "DLQ entries should be populated");
     }
 
@@ -1700,7 +1884,11 @@ transformations:
 "#;
         let config = explain_config(yaml);
         let result = PipelineExecutor::explain(&config);
-        assert!(result.is_ok(), "explain should succeed without reading data: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "explain should succeed without reading data: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1722,8 +1910,14 @@ transformations:
 "#;
         let config = explain_config(yaml);
         let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(output.contains("CXL Expressions"), "should contain CXL section");
-        assert!(output.contains("Price"), "should contain field refs from CXL");
+        assert!(
+            output.contains("CXL Expressions"),
+            "should contain CXL section"
+        );
+        assert!(
+            output.contains("Price"),
+            "should contain field refs from CXL"
+        );
         assert!(output.contains("Qty"), "should contain field refs from CXL");
     }
 
@@ -1746,7 +1940,10 @@ transformations:
 "#;
         let config = explain_config(yaml);
         let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(output.contains("Type Annotations"), "should contain type annotations section");
+        assert!(
+            output.contains("Type Annotations"),
+            "should contain type annotations section"
+        );
     }
 
     #[test]
@@ -1820,7 +2017,10 @@ transformations:
 "#;
         let config = explain_config(yaml);
         let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(output.contains("Memory Budget"), "should contain memory budget section");
+        assert!(
+            output.contains("Memory Budget"),
+            "should contain memory budget section"
+        );
     }
 
     #[test]
@@ -1842,7 +2042,10 @@ transformations:
 "#;
         let config = explain_config(yaml);
         let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(output.contains("Parallelism"), "should contain parallelism classification");
+        assert!(
+            output.contains("Parallelism"),
+            "should contain parallelism classification"
+        );
     }
 
     #[test]
@@ -1865,6 +2068,9 @@ transformations:
 "#;
         let config = explain_config(yaml);
         let result = PipelineExecutor::explain(&config);
-        assert!(result.is_err(), "invalid CXL should produce compilation error");
+        assert!(
+            result.is_err(),
+            "invalid CXL should produce compilation error"
+        );
     }
 }

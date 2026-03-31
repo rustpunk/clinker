@@ -22,8 +22,7 @@ impl HashMapResolver {
 
     /// Add a qualified field entry (`source.field` → value). Builder pattern.
     pub fn with_qualified(mut self, source: &str, field: &str, value: Value) -> Self {
-        self.qualified
-            .insert((source.into(), field.into()), value);
+        self.qualified.insert((source.into(), field.into()), value);
         self
     }
 }
@@ -56,10 +55,7 @@ mod tests {
             Value::String("Ada".into()),
         )]));
         let dyn_ref: &dyn FieldResolver = &resolver;
-        assert_eq!(
-            dyn_ref.resolve("name"),
-            Some(Value::String("Ada".into()))
-        );
+        assert_eq!(dyn_ref.resolve("name"), Some(Value::String("Ada".into())));
     }
 
     /// WindowContext must be object-safe for dynamic dispatch in the evaluator.
@@ -69,10 +65,18 @@ mod tests {
         // Dummy storage to provide a concrete S for the WindowContext trait
         struct DummyStorage;
         impl RecordStorage for DummyStorage {
-            fn resolve_field(&self, _: u32, _: &str) -> Option<Value> { None }
-            fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
-            fn available_fields(&self, _: u32) -> Vec<&str> { vec![] }
-            fn record_count(&self) -> u32 { 0 }
+            fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+                None
+            }
+            fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+                None
+            }
+            fn available_fields(&self, _: u32) -> Vec<&str> {
+                vec![]
+            }
+            fn record_count(&self) -> u32 {
+                0
+            }
         }
         // Compile-time check: dyn WindowContext<'_, S> is constructible as a trait object
         fn _accepts_dyn<'a>(_: &dyn WindowContext<'a, DummyStorage>) {}
@@ -81,8 +85,7 @@ mod tests {
     /// Unqualified lookup returns stored value.
     #[test]
     fn test_hashmap_resolver_unqualified() {
-        let resolver =
-            HashMapResolver::new(HashMap::from([("age".into(), Value::Integer(30))]));
+        let resolver = HashMapResolver::new(HashMap::from([("age".into(), Value::Integer(30))]));
         assert_eq!(resolver.resolve("age"), Some(Value::Integer(30)));
     }
 

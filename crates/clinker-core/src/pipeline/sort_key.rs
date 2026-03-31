@@ -58,7 +58,10 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&bytes);
         }
         Value::Float(f) => {
-            debug_assert!(!f.is_nan(), "NaN should be DLQ'd before reaching sort encoder");
+            debug_assert!(
+                !f.is_nan(),
+                "NaN should be DLQ'd before reaching sort encoder"
+            );
             let bits = f.to_bits();
             let encoded = if bits >> 63 == 1 {
                 bits ^ u64::MAX // negative: flip all bits
@@ -84,7 +87,7 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             bytes[0] ^= 0x80;
             buf.extend_from_slice(&bytes);
         }
-        Value::Null => {} // handled by caller
+        Value::Null => {}     // handled by caller
         Value::Array(_) => {} // not a valid sort key; defensive no-op
     }
 }

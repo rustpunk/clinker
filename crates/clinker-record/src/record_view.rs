@@ -1,8 +1,8 @@
 //! Zero-allocation view into arena-backed record storage.
 
+use crate::Value;
 use crate::resolver::FieldResolver;
 use crate::storage::RecordStorage;
-use crate::Value;
 
 /// Zero-allocation view into an arena-backed record.
 ///

@@ -7,7 +7,9 @@ use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef, SchemaD
 /// Resolved schema -- inherits merged, validated, ready for pipeline use.
 #[derive(Debug, Clone)]
 pub enum ResolvedSchema {
-    SingleRecord { fields: Vec<FieldDef> },
+    SingleRecord {
+        fields: Vec<FieldDef>,
+    },
     MultiRecord {
         discriminator: Discriminator,
         record_types: Vec<RecordTypeDef>,
@@ -71,9 +73,7 @@ pub fn resolve_schema(def: SchemaDefinition) -> Result<ResolvedSchema, SchemaErr
     if let Some(records) = def.records {
         // Multi-record path
         let discriminator = def.discriminator.ok_or_else(|| {
-            SchemaError::Validation(
-                "multi-record schema requires a 'discriminator' section".into(),
-            )
+            SchemaError::Validation("multi-record schema requires a 'discriminator' section".into())
         })?;
 
         // Resolve inherits within each record type's fields
@@ -422,21 +422,13 @@ fields:
 
         // .yaml extension
         let yaml_path = dir.path().join("test.yaml");
-        std::fs::write(
-            &yaml_path,
-            "fields:\n  - name: id\n    type: integer\n",
-        )
-        .unwrap();
+        std::fs::write(&yaml_path, "fields:\n  - name: id\n    type: integer\n").unwrap();
         let def = load_schema(&yaml_path).unwrap();
         assert_eq!(def.fields.as_ref().unwrap().len(), 1);
 
         // .yml extension
         let yml_path = dir.path().join("test.yml");
-        std::fs::write(
-            &yml_path,
-            "fields:\n  - name: name\n    type: string\n",
-        )
-        .unwrap();
+        std::fs::write(&yml_path, "fields:\n  - name: name\n    type: string\n").unwrap();
         let def = load_schema(&yml_path).unwrap();
         assert_eq!(def.fields.as_ref().unwrap().len(), 1);
     }
@@ -480,9 +472,6 @@ fields:
         let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
         let err = resolve_schema(def).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("drop"),
-            "error should mention drop: {msg}"
-        );
+        assert!(msg.contains("drop"), "error should mention drop: {msg}");
     }
 }

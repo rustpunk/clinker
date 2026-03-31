@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
-use serde::de;
 use serde::Deserialize;
+use serde::de;
 use std::path::Path;
 
 use crate::error::ChannelError;
@@ -40,17 +40,12 @@ fn default_active() -> bool {
 
 /// How a channel inherits group overrides.
 /// Deserializes from: absent → None, string → Single, list → Multiple.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ChannelInherits {
+    #[default]
     None,
     Single(String),
     Multiple(Vec<String>),
-}
-
-impl Default for ChannelInherits {
-    fn default() -> Self {
-        ChannelInherits::None
-    }
 }
 
 impl<'de> Deserialize<'de> for ChannelInherits {
@@ -166,12 +161,18 @@ variables:
         let manifest = ChannelManifest::load(&channel_dir).unwrap();
         assert_eq!(manifest.metadata.id, "acme-corp");
         assert_eq!(manifest.metadata.name, "Acme Corporation");
-        assert_eq!(manifest.metadata.description.as_deref(), Some("Enterprise tier"));
+        assert_eq!(
+            manifest.metadata.description.as_deref(),
+            Some("Enterprise tier")
+        );
         assert_eq!(manifest.metadata.contact.as_deref(), Some("jane@acme.com"));
         assert_eq!(manifest.metadata.tier.as_deref(), Some("enterprise"));
         assert_eq!(manifest.metadata.tags, vec!["enterprise", "us-west"]);
         assert!(manifest.metadata.active);
-        assert_eq!(manifest.variables.get("CHANNEL_DATA_DIR").unwrap(), "/data/acme");
+        assert_eq!(
+            manifest.variables.get("CHANNEL_DATA_DIR").unwrap(),
+            "/data/acme"
+        );
         assert_eq!(manifest.variables.get("BILLING_MODE").unwrap(), "custom");
     }
 
@@ -321,8 +322,7 @@ _channel:
     /// `$${VAR}` → literal `${VAR}` in output.
     #[test]
     fn test_interpolate_double_dollar_escape() {
-        let result =
-            clinker_core::config::interpolate_env_vars("expr: $${FOO}", &[]).unwrap();
+        let result = clinker_core::config::interpolate_env_vars("expr: $${FOO}", &[]).unwrap();
         assert_eq!(result, "expr: ${FOO}");
     }
 

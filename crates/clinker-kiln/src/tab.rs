@@ -5,7 +5,6 @@
 /// `TabEntry`, and the arriving `TabEntry`'s snapshot is loaded into the
 /// signals. This avoids Dioxus scope-ownership issues where signals created
 /// in child components get dropped when the component unmounts.
-
 use std::fmt;
 use std::path::PathBuf;
 
@@ -15,7 +14,7 @@ use clinker_core::partial::PartialPipelineConfig;
 use uuid::Uuid;
 
 use crate::file_ops::compute_hash;
-use crate::sync::{parse_yaml_raw_path, EditSource};
+use crate::sync::{EditSource, parse_yaml_raw_path};
 
 /// Scaffold YAML for new untitled pipelines.
 const SCAFFOLD_YAML: &str = r#"source:
@@ -51,8 +50,10 @@ pub struct TabSnapshot {
     /// Raw pipeline config preserving `_import` directives (for serialization).
     pub raw_pipeline: Option<RawPipelineConfig>,
     /// Resolved composition metadata (for canvas rendering).
+    #[allow(dead_code)]
     pub compositions: Vec<ResolvedComposition>,
     /// Contract validation warnings from composition imports.
+    #[allow(dead_code)]
     pub contract_warnings: Vec<ContractWarning>,
     /// Partial pipeline from graceful degradation (when full parse fails).
     pub partial_pipeline: Option<PartialPipelineConfig>,
@@ -180,6 +181,7 @@ impl TabEntry {
     }
 
     /// Create a tab pre-loaded with demo YAML.
+    #[allow(dead_code)]
     pub fn new_demo(yaml: &str) -> Self {
         let (config, errors) = match parse_yaml_raw_path(yaml) {
             Ok(c) => (Some(c), Vec::new()),
@@ -216,6 +218,7 @@ impl TabEntry {
     }
 
     /// Check dirty against live signal values (for the active tab).
+    #[allow(dead_code)]
     pub fn is_dirty_with_yaml(&self, current_yaml: &str) -> bool {
         let Some(saved_hash) = self.content_hash else {
             return true;

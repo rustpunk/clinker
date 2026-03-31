@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
 use clinker_format::traits::FormatReader;
+use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
 
 /// Columnar-projected record storage for Phase 1 indexing.
 /// Stores only the fields needed by window expressions.
@@ -46,17 +46,13 @@ impl Arena {
         let source_schema = reader.schema()?;
 
         // Build the projected schema (only the requested fields, in order)
-        let projected_columns: Vec<Box<str>> = fields
-            .iter()
-            .map(|f| f.clone().into_boxed_str())
-            .collect();
+        let projected_columns: Vec<Box<str>> =
+            fields.iter().map(|f| f.clone().into_boxed_str()).collect();
         let schema = Arc::new(Schema::new(projected_columns));
 
         // Map field names to their column indices in the source schema
-        let field_indices: Vec<Option<usize>> = fields
-            .iter()
-            .map(|f| source_schema.index(f))
-            .collect();
+        let field_indices: Vec<Option<usize>> =
+            fields.iter().map(|f| source_schema.index(f)).collect();
 
         let mut records = Vec::new();
         let mut bytes_used: usize = 0;
@@ -115,10 +111,7 @@ impl Arena {
 impl RecordStorage for Arena {
     fn resolve_field(&self, index: u32, name: &str) -> Option<Value> {
         let col = self.schema.index(name)?;
-        self.records
-            .get(index as usize)?
-            .get(col)
-            .cloned()
+        self.records.get(index as usize)?.get(col).cloned()
     }
 
     fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<Value> {
@@ -138,11 +131,9 @@ impl RecordStorage for Arena {
 fn estimated_size(record: &MinimalRecord) -> usize {
     let base = std::mem::size_of::<MinimalRecord>();
     let fields: usize = (0..record.len())
-        .map(|i| {
-            match record.get(i) {
-                Some(Value::String(s)) => std::mem::size_of::<Value>() + s.len(),
-                _ => std::mem::size_of::<Value>(),
-            }
+        .map(|i| match record.get(i) {
+            Some(Value::String(s)) => std::mem::size_of::<Value>() + s.len(),
+            _ => std::mem::size_of::<Value>(),
         })
         .sum();
     base + fields
@@ -172,7 +163,9 @@ impl std::fmt::Display for ArenaError {
                 )
             }
             ArenaError::ReadError(e) => write!(f, "arena read error: {}", e),
-            ArenaError::ShutdownRequested => write!(f, "arena construction interrupted by shutdown signal"),
+            ArenaError::ShutdownRequested => {
+                write!(f, "arena construction interrupted by shutdown signal")
+            }
         }
     }
 }
@@ -211,12 +204,8 @@ mod tests {
             big_csv.push_str(&format!("D{},{},Name{}\n", i % 3, i * 10, i));
         }
         let mut reader = make_csv_reader(&big_csv);
-        let arena = Arena::build(
-            &mut reader,
-            &["dept".into(), "amount".into()],
-            usize::MAX,
-        )
-        .unwrap();
+        let arena =
+            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
         assert_eq!(arena.record_count(), 100);
     }
 
@@ -224,12 +213,8 @@ mod tests {
     fn test_arena_field_projection() {
         let csv = "dept,amount,name,extra\nA,100,Alice,X\nB,200,Bob,Y\n";
         let mut reader = make_csv_reader(csv);
-        let arena = Arena::build(
-            &mut reader,
-            &["dept".into(), "amount".into()],
-            usize::MAX,
-        )
-        .unwrap();
+        let arena =
+            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
 
         // Schema has only projected fields
         assert_eq!(arena.schema().column_count(), 2);
@@ -251,7 +236,8 @@ mod tests {
     fn test_arena_record_view_resolve() {
         let csv = "dept,amount\nA,100\nB,200\nC,300\nD,400\nE,500\nF,600\n";
         let mut reader = make_csv_reader(csv);
-        let arena = Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena =
+            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
 
         let view = RecordView::new(&arena, 5);
         assert_eq!(view.resolve("dept"), Some(Value::String("F".into())));
@@ -262,7 +248,8 @@ mod tests {
     fn test_arena_record_view_missing_field() {
         let csv = "dept,amount\nA,100\n";
         let mut reader = make_csv_reader(csv);
-        let arena = Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena =
+            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
 
         let view = RecordView::new(&arena, 0);
         assert_eq!(view.resolve("nonexistent"), None);
@@ -287,7 +274,8 @@ mod tests {
     fn test_arena_empty_input() {
         let csv = "dept,amount\n";
         let mut reader = make_csv_reader(csv);
-        let arena = Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena =
+            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
         assert_eq!(arena.record_count(), 0);
         assert_eq!(arena.schema().column_count(), 2);
     }

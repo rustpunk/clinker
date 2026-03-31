@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 
-use crate::state::{use_app_state, DrillInEntry};
+use crate::state::{DrillInEntry, use_app_state};
 
 /// Breadcrumb bar shown above the canvas during drill-in.
 ///

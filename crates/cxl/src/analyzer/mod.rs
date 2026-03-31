@@ -106,7 +106,9 @@ fn classify_parallelism(calls: &[WindowCallInfo]) -> ParallelismHint {
 
     // If any call is positional (lag/lead/first/last), treat as Sequential
     // because positional access depends on partition ordering
-    let has_positional = calls.iter().any(|c| c.category == WindowFunction::Positional);
+    let has_positional = calls
+        .iter()
+        .any(|c| c.category == WindowFunction::Positional);
     if has_positional {
         return ParallelismHint::Sequential;
     }
@@ -117,11 +119,7 @@ fn classify_parallelism(calls: &[WindowCallInfo]) -> ParallelismHint {
 
 // --- AST walkers ---
 
-fn walk_statement(
-    stmt: &Statement,
-    calls: &mut Vec<WindowCallInfo>,
-    fields: &mut HashSet<String>,
-) {
+fn walk_statement(stmt: &Statement, calls: &mut Vec<WindowCallInfo>, fields: &mut HashSet<String>) {
     match stmt {
         Statement::Let { expr, .. } => walk_expr(expr, calls, fields, None),
         Statement::Emit { expr, .. } => walk_expr(expr, calls, fields, None),
@@ -209,9 +207,7 @@ fn walk_expr(
 
                 // Attach postfix fields to the last WindowCall we found
                 if let Some(last_call) = calls.last_mut() {
-                    last_call
-                        .postfix_fields
-                        .extend(postfix_fields.into_iter());
+                    last_call.postfix_fields.extend(postfix_fields);
                 }
             } else {
                 // Normal method call — walk receiver and args
@@ -272,11 +268,7 @@ fn walk_expr(
     }
 }
 
-fn walk_match_arm(
-    arm: &MatchArm,
-    calls: &mut Vec<WindowCallInfo>,
-    fields: &mut HashSet<String>,
-) {
+fn walk_match_arm(arm: &MatchArm, calls: &mut Vec<WindowCallInfo>, fields: &mut HashSet<String>) {
     walk_expr(&arm.pattern, calls, fields, None);
     walk_expr(&arm.body, calls, fields, None);
 }
@@ -337,7 +329,10 @@ mod tests {
         let typed = compile("emit prev = window.lag(1)");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
-        assert_eq!(analysis.window_calls[0].category, WindowFunction::Positional);
+        assert_eq!(
+            analysis.window_calls[0].category,
+            WindowFunction::Positional
+        );
         assert_eq!(analysis.parallelism_hint, ParallelismHint::Sequential);
     }
 
@@ -351,7 +346,8 @@ mod tests {
 
     #[test]
     fn test_analyzer_mixed_stateless_and_window() {
-        let typed = compile("let x = amount + 1\nemit total = window.sum(amount)\nemit doubled = x * 2");
+        let typed =
+            compile("let x = amount + 1\nemit total = window.sum(amount)\nemit doubled = x * 2");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         // Still IndexReading because there IS a window call

@@ -108,10 +108,22 @@ pub struct RepoStatus {
 impl RepoStatus {
     /// Build summary counts from file list.
     pub fn from_files(branch: String, ahead: usize, behind: usize, files: Vec<FileStatus>) -> Self {
-        let added = files.iter().filter(|f| f.status == StatusKind::Added).count();
-        let modified = files.iter().filter(|f| f.status == StatusKind::Modified).count();
-        let deleted = files.iter().filter(|f| f.status == StatusKind::Deleted).count();
-        let untracked = files.iter().filter(|f| f.status == StatusKind::Untracked).count();
+        let added = files
+            .iter()
+            .filter(|f| f.status == StatusKind::Added)
+            .count();
+        let modified = files
+            .iter()
+            .filter(|f| f.status == StatusKind::Modified)
+            .count();
+        let deleted = files
+            .iter()
+            .filter(|f| f.status == StatusKind::Deleted)
+            .count();
+        let untracked = files
+            .iter()
+            .filter(|f| f.status == StatusKind::Untracked)
+            .count();
 
         Self {
             branch,

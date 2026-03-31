@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, NaiveDateTime};
-use serde::ser::SerializeSeq;
 use serde::Serialize;
+use serde::ser::SerializeSeq;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -134,8 +134,8 @@ impl Value {
     }
 }
 
-use serde::de::{self, SeqAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{self, SeqAccess, Visitor};
 
 impl<'de> Deserialize<'de> for Value {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -321,14 +321,20 @@ mod tests {
         assert_eq!(Value::Float(3.14).heap_size(), 0);
         let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
         assert_eq!(Value::Date(d).heap_size(), 0);
-        assert_eq!(Value::DateTime(d.and_hms_opt(10, 30, 0).unwrap()).heap_size(), 0);
+        assert_eq!(
+            Value::DateTime(d.and_hms_opt(10, 30, 0).unwrap()).heap_size(),
+            0
+        );
     }
 
     #[test]
     fn test_value_heap_size_string() {
         assert_eq!(Value::String("hello".into()).heap_size(), 5);
         assert_eq!(Value::String("".into()).heap_size(), 0);
-        assert_eq!(Value::String("a longer string value".into()).heap_size(), 21);
+        assert_eq!(
+            Value::String("a longer string value".into()).heap_size(),
+            21
+        );
     }
 
     #[test]
@@ -336,7 +342,7 @@ mod tests {
         let arr = Value::Array(vec![Value::Integer(1), Value::String("ab".into())]);
         let expected = 2 * std::mem::size_of::<Value>() // Vec backing (capacity=2)
             + 0   // Integer heap = 0
-            + 2;  // String "ab" heap = 2
+            + 2; // String "ab" heap = 2
         assert_eq!(arr.heap_size(), expected);
     }
 

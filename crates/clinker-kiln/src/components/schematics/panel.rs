@@ -1,9 +1,9 @@
 use dioxus::prelude::*;
 
-use crate::autodoc::{generate_stage_doc, ChannelDocContext};
+use crate::autodoc::{ChannelDocContext, generate_stage_doc};
 use crate::notes::parse_notes;
-use crate::pipeline_view::{derive_pipeline_view, derive_partial_pipeline_view};
-use crate::state::{use_app_state, ChannelViewMode};
+use crate::pipeline_view::{derive_partial_pipeline_view, derive_pipeline_view};
+use crate::state::{ChannelViewMode, use_app_state};
 
 use super::flow_bar::FlowBar;
 use super::stage_card::StageCard;
@@ -70,7 +70,6 @@ pub fn SchematicsPanel() -> Element {
                                 }
                             }
                             StageCard {
-                                key: "card-{stage.id}",
                                 index: i,
                                 stage_id: stage.id.clone(),
                                 accent: stage.kind.accent_color(),
@@ -138,9 +137,24 @@ pub fn SchematicsPanel() -> Element {
             )
             .unwrap_or_default();
 
-            let notes_value = config.inputs.iter().find(|inp| inp.name == stage.id).and_then(|inp| inp.notes.as_ref())
-                .or_else(|| config.transforms().find(|t| t.name == stage.id).and_then(|t| t.notes.as_ref()))
-                .or_else(|| config.outputs.iter().find(|o| o.name == stage.id).and_then(|o| o.notes.as_ref()));
+            let notes_value = config
+                .inputs
+                .iter()
+                .find(|inp| inp.name == stage.id)
+                .and_then(|inp| inp.notes.as_ref())
+                .or_else(|| {
+                    config
+                        .transforms()
+                        .find(|t| t.name == stage.id)
+                        .and_then(|t| t.notes.as_ref())
+                })
+                .or_else(|| {
+                    config
+                        .outputs
+                        .iter()
+                        .find(|o| o.name == stage.id)
+                        .and_then(|o| o.notes.as_ref())
+                });
             let notes = parse_notes(notes_value);
 
             (i, stage.clone(), doc, notes)
@@ -217,7 +231,6 @@ pub fn SchematicsPanel() -> Element {
                     }
 
                     StageCard {
-                        key: "card-{stage.id}",
                         index: i,
                         stage_id: stage.id.clone(),
                         accent: stage.kind.accent_color(),

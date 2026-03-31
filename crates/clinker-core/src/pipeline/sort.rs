@@ -35,11 +35,7 @@ pub fn sort_partition<S: RecordStorage>(
 /// Check if a partition is already sorted (linear scan).
 ///
 /// Returns true if all consecutive pairs are in the correct order.
-pub fn is_sorted<S: RecordStorage>(
-    storage: &S,
-    positions: &[u32],
-    sort_by: &[SortField],
-) -> bool {
+pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u32], sort_by: &[SortField]) -> bool {
     positions
         .windows(2)
         .all(|pair| compare_records(storage, pair[0], pair[1], sort_by) != Ordering::Greater)
@@ -118,8 +114,12 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Integer(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Float(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Value::Integer(x), Value::Float(y)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::Integer(y)) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+        }
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
@@ -152,54 +152,83 @@ mod tests {
             let col = self.schema.index(name)?;
             self.records.get(index as usize)?.get(col).cloned()
         }
-        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> { None }
+        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+            None
+        }
         fn available_fields(&self, _: u32) -> Vec<&str> {
             self.schema.columns().iter().map(|s| &**s).collect()
         }
-        fn record_count(&self) -> u32 { self.records.len() as u32 }
+        fn record_count(&self) -> u32 {
+            self.records.len() as u32
+        }
     }
 
     fn sf(field: &str, order: SortOrder, null_order: Option<NullOrder>) -> SortField {
-        SortField { field: field.into(), order, null_order }
+        SortField {
+            field: field.into(),
+            order,
+            null_order,
+        }
     }
 
     #[test]
     fn test_sort_partition_ascending() {
-        let storage = TestStorage::new(&["amount"], vec![
-            vec![Value::Integer(30)],
-            vec![Value::Integer(10)],
-            vec![Value::Integer(50)],
-            vec![Value::Integer(20)],
-            vec![Value::Integer(40)],
-        ]);
+        let storage = TestStorage::new(
+            &["amount"],
+            vec![
+                vec![Value::Integer(30)],
+                vec![Value::Integer(10)],
+                vec![Value::Integer(50)],
+                vec![Value::Integer(20)],
+                vec![Value::Integer(40)],
+            ],
+        );
         let mut positions: Vec<u32> = vec![0, 1, 2, 3, 4];
-        sort_partition(&storage, &mut positions, &[sf("amount", SortOrder::Asc, None)]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[sf("amount", SortOrder::Asc, None)],
+        );
         assert_eq!(positions, vec![1, 3, 0, 4, 2]); // 10, 20, 30, 40, 50
     }
 
     #[test]
     fn test_sort_partition_descending() {
-        let storage = TestStorage::new(&["amount"], vec![
-            vec![Value::Integer(30)],
-            vec![Value::Integer(10)],
-            vec![Value::Integer(50)],
-            vec![Value::Integer(20)],
-            vec![Value::Integer(40)],
-        ]);
+        let storage = TestStorage::new(
+            &["amount"],
+            vec![
+                vec![Value::Integer(30)],
+                vec![Value::Integer(10)],
+                vec![Value::Integer(50)],
+                vec![Value::Integer(20)],
+                vec![Value::Integer(40)],
+            ],
+        );
         let mut positions: Vec<u32> = vec![0, 1, 2, 3, 4];
-        sort_partition(&storage, &mut positions, &[sf("amount", SortOrder::Desc, None)]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[sf("amount", SortOrder::Desc, None)],
+        );
         assert_eq!(positions, vec![2, 4, 0, 3, 1]); // 50, 40, 30, 20, 10
     }
 
     #[test]
     fn test_sort_null_first() {
-        let storage = TestStorage::new(&["amount"], vec![
-            vec![Value::Integer(30)],
-            vec![Value::Null],
-            vec![Value::Integer(10)],
-        ]);
+        let storage = TestStorage::new(
+            &["amount"],
+            vec![
+                vec![Value::Integer(30)],
+                vec![Value::Null],
+                vec![Value::Integer(10)],
+            ],
+        );
         let mut positions: Vec<u32> = vec![0, 1, 2];
-        sort_partition(&storage, &mut positions, &[sf("amount", SortOrder::Asc, Some(NullOrder::First))]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[sf("amount", SortOrder::Asc, Some(NullOrder::First))],
+        );
         assert_eq!(positions[0], 1); // null first
         assert_eq!(positions[1], 2); // 10
         assert_eq!(positions[2], 0); // 30
@@ -207,13 +236,20 @@ mod tests {
 
     #[test]
     fn test_sort_null_last() {
-        let storage = TestStorage::new(&["amount"], vec![
-            vec![Value::Integer(30)],
-            vec![Value::Null],
-            vec![Value::Integer(10)],
-        ]);
+        let storage = TestStorage::new(
+            &["amount"],
+            vec![
+                vec![Value::Integer(30)],
+                vec![Value::Null],
+                vec![Value::Integer(10)],
+            ],
+        );
         let mut positions: Vec<u32> = vec![0, 1, 2];
-        sort_partition(&storage, &mut positions, &[sf("amount", SortOrder::Asc, Some(NullOrder::Last))]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[sf("amount", SortOrder::Asc, Some(NullOrder::Last))],
+        );
         assert_eq!(positions[0], 2); // 10
         assert_eq!(positions[1], 0); // 30
         assert_eq!(positions[2], 1); // null last
@@ -221,41 +257,62 @@ mod tests {
 
     #[test]
     fn test_sort_null_drop() {
-        let storage = TestStorage::new(&["amount"], vec![
-            vec![Value::Integer(30)],
-            vec![Value::Null],
-            vec![Value::Integer(10)],
-        ]);
+        let storage = TestStorage::new(
+            &["amount"],
+            vec![
+                vec![Value::Integer(30)],
+                vec![Value::Null],
+                vec![Value::Integer(10)],
+            ],
+        );
         let mut positions: Vec<u32> = vec![0, 1, 2];
-        sort_partition(&storage, &mut positions, &[sf("amount", SortOrder::Asc, Some(NullOrder::Drop))]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[sf("amount", SortOrder::Asc, Some(NullOrder::Drop))],
+        );
         assert_eq!(positions.len(), 2);
         assert!(!positions.contains(&1)); // null dropped
     }
 
     #[test]
     fn test_sort_presorted_skip() {
-        let storage = TestStorage::new(&["amount"], vec![
-            vec![Value::Integer(10)],
-            vec![Value::Integer(20)],
-            vec![Value::Integer(30)],
-        ]);
+        let storage = TestStorage::new(
+            &["amount"],
+            vec![
+                vec![Value::Integer(10)],
+                vec![Value::Integer(20)],
+                vec![Value::Integer(30)],
+            ],
+        );
         let positions: Vec<u32> = vec![0, 1, 2];
-        assert!(is_sorted(&storage, &positions, &[sf("amount", SortOrder::Asc, None)]));
+        assert!(is_sorted(
+            &storage,
+            &positions,
+            &[sf("amount", SortOrder::Asc, None)]
+        ));
     }
 
     #[test]
     fn test_sort_partition_composite() {
-        let storage = TestStorage::new(&["dept", "amount"], vec![
-            vec![Value::String("B".into()), Value::Integer(200)],
-            vec![Value::String("A".into()), Value::Integer(300)],
-            vec![Value::String("A".into()), Value::Integer(100)],
-            vec![Value::String("B".into()), Value::Integer(100)],
-        ]);
+        let storage = TestStorage::new(
+            &["dept", "amount"],
+            vec![
+                vec![Value::String("B".into()), Value::Integer(200)],
+                vec![Value::String("A".into()), Value::Integer(300)],
+                vec![Value::String("A".into()), Value::Integer(100)],
+                vec![Value::String("B".into()), Value::Integer(100)],
+            ],
+        );
         let mut positions: Vec<u32> = vec![0, 1, 2, 3];
-        sort_partition(&storage, &mut positions, &[
-            sf("dept", SortOrder::Asc, None),
-            sf("amount", SortOrder::Desc, None),
-        ]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[
+                sf("dept", SortOrder::Asc, None),
+                sf("amount", SortOrder::Desc, None),
+            ],
+        );
         // A first (sorted by dept asc), then within A: 300, 100 (amount desc)
         assert_eq!(positions, vec![1, 2, 0, 3]); // A/300, A/100, B/200, B/100
     }

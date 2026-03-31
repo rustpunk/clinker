@@ -11,11 +11,7 @@ use crate::composition_index::CompositionEntry;
 #[component]
 pub fn CompositionCard(entry: CompositionEntry) -> Element {
     let name = &entry.meta.name;
-    let version = entry
-        .meta
-        .version
-        .as_deref()
-        .unwrap_or("—");
+    let version = entry.meta.version.as_deref().unwrap_or("—");
     let transform_count = entry.transform_count;
     let has_contract = entry.contract.is_some();
     let used_by_count = entry.used_by.len();

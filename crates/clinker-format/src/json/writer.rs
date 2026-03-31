@@ -10,16 +10,13 @@ use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
 /// JSON output format mode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum JsonOutputMode {
     /// `[{...},{...},...]` — valid JSON array.
+    #[default]
     Array,
     /// One JSON object per line, no wrapper.
     Ndjson,
-}
-
-impl Default for JsonOutputMode {
-    fn default() -> Self { Self::Array }
 }
 
 pub struct JsonWriterConfig {
@@ -30,7 +27,11 @@ pub struct JsonWriterConfig {
 
 impl Default for JsonWriterConfig {
     fn default() -> Self {
-        Self { format: JsonOutputMode::Array, pretty: false, preserve_nulls: false }
+        Self {
+            format: JsonOutputMode::Array,
+            pretty: false,
+            preserve_nulls: false,
+        }
     }
 }
 
@@ -43,7 +44,12 @@ pub struct JsonWriter<W: Write> {
 
 impl<W: Write> JsonWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: JsonWriterConfig) -> Self {
-        Self { writer, schema, config, records_written: 0 }
+        Self {
+            writer,
+            schema,
+            config,
+            records_written: 0,
+        }
     }
 
     /// Serialize a record to a JSON object.
@@ -56,7 +62,7 @@ impl<W: Write> JsonWriter<W> {
 
         // Schema fields in order
         for col in self.schema.columns() {
-            let val = record.get(&**col).unwrap_or(&Value::Null);
+            let val = record.get(col).unwrap_or(&Value::Null);
             if !self.config.preserve_nulls && val.is_null() {
                 continue;
             }
@@ -85,7 +91,8 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
             serde_json::to_string_pretty(&json_val)
         } else {
             serde_json::to_string(&json_val)
-        }.map_err(|e| FormatError::Json(e.to_string()))?;
+        }
+        .map_err(|e| FormatError::Json(e.to_string()))?;
 
         match self.config.format {
             JsonOutputMode::Array => {
@@ -94,13 +101,17 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
                 } else {
                     self.writer.write_all(b",\n").map_err(FormatError::Io)?;
                 }
-                self.writer.write_all(serialized.as_bytes()).map_err(FormatError::Io)?;
+                self.writer
+                    .write_all(serialized.as_bytes())
+                    .map_err(FormatError::Io)?;
             }
             JsonOutputMode::Ndjson => {
                 if self.records_written > 0 {
                     self.writer.write_all(b"\n").map_err(FormatError::Io)?;
                 }
-                self.writer.write_all(serialized.as_bytes()).map_err(FormatError::Io)?;
+                self.writer
+                    .write_all(serialized.as_bytes())
+                    .map_err(FormatError::Io)?;
             }
         }
 
@@ -144,21 +155,30 @@ mod tests {
     use crate::traits::FormatReader;
 
     fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec!["name".into(), "age".into(), "active".into()]))
+        Arc::new(Schema::new(vec![
+            "name".into(),
+            "age".into(),
+            "active".into(),
+        ]))
     }
 
     fn make_record(schema: &Arc<Schema>, name: &str, age: i64, active: bool) -> Record {
-        Record::new(Arc::clone(schema), vec![
-            Value::String(name.into()),
-            Value::Integer(age),
-            Value::Bool(active),
-        ])
+        Record::new(
+            Arc::clone(schema),
+            vec![
+                Value::String(name.into()),
+                Value::Integer(age),
+                Value::Bool(active),
+            ],
+        )
     }
 
     fn write_records(config: JsonWriterConfig, records: &[Record], schema: &Arc<Schema>) -> String {
         let mut buf = Vec::new();
         let mut w = JsonWriter::new(&mut buf, Arc::clone(schema), config);
-        for r in records { w.write_record(r).unwrap(); }
+        for r in records {
+            w.write_record(r).unwrap();
+        }
         w.flush().unwrap();
         String::from_utf8(buf).unwrap()
     }
@@ -189,7 +209,8 @@ mod tests {
             make_record(&schema, "Carol", 35, true),
         ];
         let config = JsonWriterConfig {
-            format: JsonOutputMode::Ndjson, ..Default::default()
+            format: JsonOutputMode::Ndjson,
+            ..Default::default()
         };
         let output = write_records(config, &records, &schema);
         let lines: Vec<&str> = output.trim().split('\n').collect();
@@ -205,36 +226,53 @@ mod tests {
     fn test_json_write_pretty() {
         let schema = test_schema();
         let records = vec![make_record(&schema, "Alice", 30, true)];
-        let config = JsonWriterConfig { pretty: true, ..Default::default() };
+        let config = JsonWriterConfig {
+            pretty: true,
+            ..Default::default()
+        };
         let output = write_records(config, &records, &schema);
         // Pretty output has indentation within objects
-        assert!(output.contains("  \"name\""), "Pretty output should be indented: {output}");
+        assert!(
+            output.contains("  \"name\""),
+            "Pretty output should be indented: {output}"
+        );
     }
 
     #[test]
     fn test_json_write_omit_nulls() {
         let schema = Arc::new(Schema::new(vec!["a".into(), "b".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![
-            Value::String("hello".into()),
-            Value::Null,
-        ]);
-        let config = JsonWriterConfig { preserve_nulls: false, ..Default::default() };
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::String("hello".into()), Value::Null],
+        );
+        let config = JsonWriterConfig {
+            preserve_nulls: false,
+            ..Default::default()
+        };
         let output = write_records(config, &[record], &schema);
-        assert!(!output.contains("\"b\""), "Null field 'b' should be omitted: {output}");
+        assert!(
+            !output.contains("\"b\""),
+            "Null field 'b' should be omitted: {output}"
+        );
         assert!(output.contains("\"a\""));
     }
 
     #[test]
     fn test_json_write_preserve_nulls() {
         let schema = Arc::new(Schema::new(vec!["a".into(), "b".into()]));
-        let record = Record::new(Arc::clone(&schema), vec![
-            Value::String("hello".into()),
-            Value::Null,
-        ]);
-        let config = JsonWriterConfig { preserve_nulls: true, ..Default::default() };
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::String("hello".into()), Value::Null],
+        );
+        let config = JsonWriterConfig {
+            preserve_nulls: true,
+            ..Default::default()
+        };
         let output = write_records(config, &[record], &schema);
-        assert!(output.contains("\"b\":null") || output.contains("\"b\": null"),
-            "Null field 'b' should be present: {output}");
+        assert!(
+            output.contains("\"b\":null") || output.contains("\"b\": null"),
+            "Null field 'b' should be present: {output}"
+        );
     }
 
     #[test]
@@ -243,20 +281,25 @@ mod tests {
         let mut record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
         record.set_overflow("extra".into(), Value::String("bonus".into()));
         let output = write_records(JsonWriterConfig::default(), &[record], &schema);
-        assert!(output.contains("\"extra\""), "Overflow field should appear: {output}");
+        assert!(
+            output.contains("\"extra\""),
+            "Overflow field should appear: {output}"
+        );
         assert!(output.contains("bonus"));
     }
 
     #[test]
     fn test_json_write_field_ordering() {
         let schema = Arc::new(Schema::new(vec!["z_field".into(), "a_field".into()]));
-        let mut record = Record::new(Arc::clone(&schema), vec![
-            Value::Integer(1), Value::Integer(2),
-        ]);
+        let mut record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(1), Value::Integer(2)],
+        );
         record.set_overflow("m_overflow".into(), Value::Integer(3));
 
         let config = JsonWriterConfig {
-            format: JsonOutputMode::Ndjson, ..Default::default()
+            format: JsonOutputMode::Ndjson,
+            ..Default::default()
         };
         let output = write_records(config, &[record], &schema);
         // z_field should appear before a_field (schema order), m_overflow after both
@@ -264,7 +307,10 @@ mod tests {
         let a_pos = output.find("a_field").unwrap();
         let m_pos = output.find("m_overflow").unwrap();
         assert!(z_pos < a_pos, "Schema field z should come before a");
-        assert!(a_pos < m_pos, "Overflow field should come after schema fields");
+        assert!(
+            a_pos < m_pos,
+            "Overflow field should come after schema fields"
+        );
     }
 
     #[test]
@@ -287,7 +333,8 @@ mod tests {
         let mut reader = JsonReader::from_reader(
             std::io::Cursor::new(written.as_bytes().to_vec()),
             JsonReaderConfig::default(),
-        ).unwrap();
+        )
+        .unwrap();
         let _s = reader.schema().unwrap();
         let r1 = reader.next_record().unwrap().unwrap();
         let r2 = reader.next_record().unwrap().unwrap();

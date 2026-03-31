@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::model::{SchemaIndex, SourceSchema};
-use crate::parse::{parse_schema, SchemaParseError};
+use crate::parse::{SchemaParseError, parse_schema};
 
 /// Default schema directory name relative to workspace root.
 pub const DEFAULT_SCHEMA_DIR: &str = "schemas";
@@ -19,7 +19,9 @@ pub const DEFAULT_SCHEMA_DIR: &str = "schemas";
 /// Returns parsed schemas with their `path` fields set. The caller is
 /// responsible for populating `referencing_pipelines` via
 /// [`resolve_schema_references`].
-pub fn discover_schemas(schema_dir: &Path) -> Vec<Result<SourceSchema, (PathBuf, SchemaParseError)>> {
+pub fn discover_schemas(
+    schema_dir: &Path,
+) -> Vec<Result<SourceSchema, (PathBuf, SchemaParseError)>> {
     let Ok(entries) = fs::read_dir(schema_dir) else {
         return Vec::new();
     };
@@ -135,26 +137,23 @@ fn glob_paths(pattern: &str) -> Result<Vec<PathBuf>, ()> {
     // For now, just check if the pattern is a simple directory/*.yaml
     // Full glob support can be added with the `glob` crate later.
     let path = Path::new(pattern);
-    if let Some(parent) = path.parent() {
-        if parent.is_dir() {
-            let ext_match = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("yaml");
-            let Ok(entries) = fs::read_dir(parent) else {
-                return Ok(Vec::new());
-            };
-            return Ok(entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext == ext_match)
-                })
-                .map(|e| e.path())
-                .collect());
-        }
+    if let Some(parent) = path.parent()
+        && parent.is_dir()
+    {
+        let ext_match = path.extension().and_then(|e| e.to_str()).unwrap_or("yaml");
+        let Ok(entries) = fs::read_dir(parent) else {
+            return Ok(Vec::new());
+        };
+        return Ok(entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == ext_match)
+            })
+            .map(|e| e.path())
+            .collect());
     }
     Ok(Vec::new())
 }
@@ -208,10 +207,10 @@ pub fn resolve_schema_references(
                     .path
                     .canonicalize()
                     .unwrap_or_else(|_| schema.path.clone());
-                if schema_canonical == canonical {
-                    if !schema.referencing_pipelines.contains(pipeline_path) {
-                        schema.referencing_pipelines.push(pipeline_path.clone());
-                    }
+                if schema_canonical == canonical
+                    && !schema.referencing_pipelines.contains(pipeline_path)
+                {
+                    schema.referencing_pipelines.push(pipeline_path.clone());
                 }
             }
         }

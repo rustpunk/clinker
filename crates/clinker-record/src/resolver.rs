@@ -1,6 +1,6 @@
+use crate::Value;
 use crate::record_view::RecordView;
 use crate::storage::RecordStorage;
-use crate::Value;
 
 /// Resolve a field name to a value from the current record.
 ///

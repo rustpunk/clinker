@@ -5,7 +5,6 @@
 //! `NullReporter` is a no-op for `--quiet` mode.
 
 use std::fmt::Write as FmtWrite;
-use std::io::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -46,6 +45,12 @@ pub trait ProgressReporter: Send + Sync {
 /// Writes progress to stderr, throttled to 1 update per second.
 pub struct StderrReporter {
     last_report: Mutex<Instant>,
+}
+
+impl Default for StderrReporter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StderrReporter {

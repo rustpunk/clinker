@@ -22,6 +22,7 @@ pub enum ValidationResult {
 ///
 /// `eval_check` is a closure that evaluates a CXL check expression and returns a bool.
 /// The caller is responsible for resolving module function references vs inline CXL.
+#[allow(clippy::type_complexity)]
 pub fn run_validations(
     validations: &[ValidationEntry],
     record_fields: &IndexMap<String, Value>,
@@ -38,9 +39,10 @@ pub fn run_validations(
             }
             Ok(false) => {
                 let name = v.resolved_name();
-                let msg = v.message.clone().unwrap_or_else(|| {
-                    format!("validation '{}' failed", name)
-                });
+                let msg = v
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| format!("validation '{}' failed", name));
 
                 match v.severity {
                     ValidationSeverity::Error => {
@@ -88,10 +90,7 @@ pub fn enforce_enum(
     // Null passes if field is not required
     if matches!(value, Value::Null) {
         if required {
-            return Err(format!(
-                "field '{}' is required but got null",
-                field_name
-            ));
+            return Err(format!("field '{}' is required but got null", field_name));
         }
         return Ok(());
     }
@@ -157,7 +156,10 @@ mod tests {
     use super::*;
 
     fn make_fields(pairs: &[(&str, Value)]) -> IndexMap<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     fn make_validation(check: &str, severity: ValidationSeverity) -> ValidationEntry {
@@ -172,12 +174,20 @@ mod tests {
     }
 
     // Always-true evaluator
-    fn eval_true(_check: &str, _field: Option<&str>, _record: &IndexMap<String, Value>) -> Result<bool, String> {
+    fn eval_true(
+        _check: &str,
+        _field: Option<&str>,
+        _record: &IndexMap<String, Value>,
+    ) -> Result<bool, String> {
         Ok(true)
     }
 
     // Evaluator that checks if a named field > 0
-    fn eval_positive(_check: &str, field: Option<&str>, record: &IndexMap<String, Value>) -> Result<bool, String> {
+    fn eval_positive(
+        _check: &str,
+        field: Option<&str>,
+        record: &IndexMap<String, Value>,
+    ) -> Result<bool, String> {
         if let Some(f) = field {
             match record.get(f) {
                 Some(Value::Integer(i)) => Ok(*i > 0),
@@ -232,7 +242,9 @@ mod tests {
 
         let result = run_validations(&validations, &fields, &eval_positive);
         match result {
-            ValidationResult::Failed { validation_name, .. } => {
+            ValidationResult::Failed {
+                validation_name, ..
+            } => {
                 assert!(validation_name.contains("check1"));
             }
             _ => panic!("expected Failed"),
@@ -305,7 +317,10 @@ mod tests {
         let mut v = make_validation("check", ValidationSeverity::Error);
         v.field = Some("Amount".to_string());
         v.message = Some("employee {employee_id} failed".to_string());
-        let fields = make_fields(&[("Amount", Value::Integer(-1)), ("employee_id", Value::String("E123".into()))]);
+        let fields = make_fields(&[
+            ("Amount", Value::Integer(-1)),
+            ("employee_id", Value::String("E123".into())),
+        ]);
         let result = run_validations(&[v], &fields, &eval_positive);
         match result {
             ValidationResult::Failed { message, .. } => {
@@ -332,7 +347,9 @@ mod tests {
         let result = run_validations(&validations, &fields, &eval_positive);
         // Error short-circuits after warn1 runs and err1 fails
         match result {
-            ValidationResult::Failed { validation_name, .. } => {
+            ValidationResult::Failed {
+                validation_name, ..
+            } => {
                 assert!(validation_name.contains("err1"));
             }
             _ => panic!("expected Failed from error severity"),
@@ -348,20 +365,33 @@ mod tests {
             ("field_name".to_string(), serde_json::json!("Amount")),
         ]));
         // The string "Amount" is a literal, not a field reference
-        assert_eq!(v.args.as_ref().unwrap()["field_name"], serde_json::json!("Amount"));
+        assert_eq!(
+            v.args.as_ref().unwrap()["field_name"],
+            serde_json::json!("Amount")
+        );
     }
 
     // ── Enum enforcement tests ────────────────────────────────────
 
     #[test]
     fn test_enum_enforcement_valid_value() {
-        let result = enforce_enum("status", &Value::String("B".into()), &["A".into(), "B".into(), "C".into()], false);
+        let result = enforce_enum(
+            "status",
+            &Value::String("B".into()),
+            &["A".into(), "B".into(), "C".into()],
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_enum_enforcement_invalid_value() {
-        let result = enforce_enum("status", &Value::String("D".into()), &["A".into(), "B".into(), "C".into()], false);
+        let result = enforce_enum(
+            "status",
+            &Value::String("D".into()),
+            &["A".into(), "B".into(), "C".into()],
+            false,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not in allowed values"));
     }
@@ -382,7 +412,12 @@ mod tests {
     #[test]
     fn test_enum_enforcement_after_coercion() {
         // Integer coerced to string representation matches enum
-        let result = enforce_enum("code", &Value::Integer(1), &["1".into(), "2".into(), "3".into()], false);
+        let result = enforce_enum(
+            "code",
+            &Value::Integer(1),
+            &["1".into(), "2".into(), "3".into()],
+            false,
+        );
         assert!(result.is_ok());
     }
 
@@ -390,7 +425,12 @@ mod tests {
 
     #[test]
     fn test_structure_ordering_valid() {
-        let record_types = vec!["header".into(), "detail".into(), "detail".into(), "footer".into()];
+        let record_types = vec![
+            "header".into(),
+            "detail".into(),
+            "detail".into(),
+            "footer".into(),
+        ];
         let constraints = vec![
             ("header".into(), "1".into()),
             ("detail".into(), "1+".into()),

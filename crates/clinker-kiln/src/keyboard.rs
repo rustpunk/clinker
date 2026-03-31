@@ -11,14 +11,13 @@
 /// Overlays: Ctrl+Shift+P (command palette), Ctrl+Shift+N (templates), Ctrl+, (settings).
 ///
 /// Attached at the AppShell level to capture shortcuts regardless of focus.
-
 use dioxus::prelude::*;
 
-use crate::components::activity_bar::{switch_context, navigate_back};
+use crate::components::activity_bar::{navigate_back, switch_context};
 use crate::components::confirm_dialog::PendingConfirm;
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::file_ops;
-use crate::state::{AppState, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState};
+use crate::state::{AppState, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState};
 use crate::sync::serialize_raw_yaml;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
@@ -43,47 +42,50 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
     }
 
     // ── Alt+Letter — Pipeline panel toggles (Pipeline context only) ──────
-    if alt && !ctrl && !shift && current_context == NavigationContext::Pipeline {
-        if let Key::Character(ref c) = key {
-            match c.as_str() {
-                "f" => {
-                    let current = (tab_mgr.left_panel)();
-                    tab_mgr.left_panel.set(if current == LeftPanel::Search {
-                        LeftPanel::None
-                    } else {
-                        LeftPanel::Search
-                    });
-                    return true;
-                }
-                "e" => {
-                    let current = (tab_mgr.left_panel)();
-                    tab_mgr.left_panel.set(if current == LeftPanel::Schemas {
-                        LeftPanel::None
-                    } else {
-                        LeftPanel::Schemas
-                    });
-                    return true;
-                }
-                "c" => {
-                    let current = (tab_mgr.left_panel)();
-                    tab_mgr.left_panel.set(if current == LeftPanel::Compositions {
+    if alt
+        && !ctrl
+        && !shift
+        && current_context == NavigationContext::Pipeline
+        && let Key::Character(ref c) = key
+    {
+        match c.as_str() {
+            "f" => {
+                let current = (tab_mgr.left_panel)();
+                tab_mgr.left_panel.set(if current == LeftPanel::Search {
+                    LeftPanel::None
+                } else {
+                    LeftPanel::Search
+                });
+                return true;
+            }
+            "e" => {
+                let current = (tab_mgr.left_panel)();
+                tab_mgr.left_panel.set(if current == LeftPanel::Schemas {
+                    LeftPanel::None
+                } else {
+                    LeftPanel::Schemas
+                });
+                return true;
+            }
+            "c" => {
+                let current = (tab_mgr.left_panel)();
+                tab_mgr
+                    .left_panel
+                    .set(if current == LeftPanel::Compositions {
                         LeftPanel::None
                     } else {
                         LeftPanel::Compositions
                     });
-                    return true;
-                }
-                _ => {}
+                return true;
             }
+            _ => {}
         }
     }
 
     // ── Ctrl+Alt+Left — Navigate back in context history ─────────────────
-    if ctrl && alt && !shift {
-        if matches!(key, Key::ArrowLeft) {
-            navigate_back(&app, tab_mgr);
-            return true;
-        }
+    if ctrl && alt && !shift && matches!(key, Key::ArrowLeft) {
+        navigate_back(&app, tab_mgr);
+        return true;
     }
 
     // ── Backspace/Escape — drill-in navigation (Pipeline context only) ───
@@ -283,15 +285,16 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
 
         // ── Ctrl+1-9 — Switch to tab N (Pipeline context only) ──────────
         Key::Character(ref c) if c.len() == 1 && !shift => {
-            if let Some(digit) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                if digit >= 1 && digit <= 9 && current_context == NavigationContext::Pipeline {
-                    let idx = (digit - 1) as usize;
-                    let tabs = tab_mgr.tabs.read();
-                    if let Some(tab) = tabs.get(idx) {
-                        tab_mgr.active_tab_id.set(Some(tab.id));
-                    }
-                    return true;
+            if let Some(digit) = c.chars().next().and_then(|ch| ch.to_digit(10))
+                && (1..=9).contains(&digit)
+                && current_context == NavigationContext::Pipeline
+            {
+                let idx = (digit - 1) as usize;
+                let tabs = tab_mgr.tabs.read();
+                if let Some(tab) = tabs.get(idx) {
+                    tab_mgr.active_tab_id.set(Some(tab.id));
                 }
+                return true;
             }
             false
         }
@@ -316,11 +319,21 @@ pub fn open_workspace(tab_mgr: &mut TabManagerState) {
         let active_id = if restored_tabs.is_empty() {
             None
         } else {
-            let id = active_path.as_ref().and_then(|ap| {
-                restored_tabs.iter().find(|t| {
-                    t.file_path.as_ref().map(|p| p.display().to_string()).as_deref() == Some(ap)
-                }).map(|t| t.id)
-            }).or_else(|| restored_tabs.first().map(|t| t.id));
+            let id = active_path
+                .as_ref()
+                .and_then(|ap| {
+                    restored_tabs
+                        .iter()
+                        .find(|t| {
+                            t.file_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .as_deref()
+                                == Some(ap)
+                        })
+                        .map(|t| t.id)
+                })
+                .or_else(|| restored_tabs.first().map(|t| t.id));
 
             let mut tabs_w = tab_mgr.tabs.write();
             for tab in restored_tabs {
@@ -341,11 +354,7 @@ pub fn open_workspace(tab_mgr: &mut TabManagerState) {
 /// Defaults the file explorer to the workspace root if a workspace is active,
 /// otherwise falls back to the OS default (usually ~/).
 pub fn open_file(tab_mgr: &mut TabManagerState) {
-    let starting_dir = tab_mgr
-        .workspace
-        .peek()
-        .as_ref()
-        .map(|ws| ws.root.clone());
+    let starting_dir = tab_mgr.workspace.peek().as_ref().map(|ws| ws.root.clone());
     if let Some(path) = file_ops::open_file_dialog(starting_dir.as_deref()) {
         match file_ops::read_pipeline_file(&path) {
             Ok(yaml) => {
@@ -362,14 +371,13 @@ pub fn open_file(tab_mgr: &mut TabManagerState) {
                     tab_mgr.active_tab_id.set(Some(existing_id));
                 } else {
                     // Detect workspace from file location
-                    if let Some(ws_root) = workspace::detect_workspace(&path) {
-                        if tab_mgr.workspace.peek().is_none() {
-                            if let Some(ws) = workspace::load_workspace(&ws_root) {
-                                // Immediately persist as last-used workspace
-                                workspace::save_last_workspace(&ws.root);
-                                tab_mgr.workspace.set(Some(ws));
-                            }
-                        }
+                    if let Some(ws_root) = workspace::detect_workspace(&path)
+                        && tab_mgr.workspace.peek().is_none()
+                        && let Some(ws) = workspace::load_workspace(&ws_root)
+                    {
+                        // Immediately persist as last-used workspace
+                        workspace::save_last_workspace(&ws.root);
+                        tab_mgr.workspace.set(Some(ws));
                     }
 
                     let new_tab = TabEntry::from_file(path, yaml);
@@ -444,13 +452,12 @@ fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: b
             }
 
             // Auto-create workspace if needed (§F4.3)
-            if let Some(parent) = path.parent() {
-                if workspace::detect_workspace(&path).is_none() {
-                    if workspace::auto_create_workspace(parent) {
-                        let mut toast: Signal<Option<ToastState>> = use_context();
-                        toast_success(&mut toast, "Workspace created \u{00B7} kiln.toml");
-                    }
-                }
+            if let Some(parent) = path.parent()
+                && workspace::detect_workspace(&path).is_none()
+                && workspace::auto_create_workspace(parent)
+            {
+                let mut toast: Signal<Option<ToastState>> = use_context();
+                toast_success(&mut toast, "Workspace created \u{00B7} kiln.toml");
             }
         }
         Err(e) => {
@@ -481,10 +488,7 @@ pub fn request_close_tab(tab_mgr: &mut TabManagerState, tab_id: TabId) {
             .unwrap_or_else(|| "untitled.yaml".to_string());
 
         let mut confirm: Signal<Option<PendingConfirm>> = use_context();
-        confirm.set(Some(PendingConfirm {
-            tab_id,
-            filename,
-        }));
+        confirm.set(Some(PendingConfirm { tab_id, filename }));
     } else {
         force_close_tab(tab_mgr, tab_id);
     }

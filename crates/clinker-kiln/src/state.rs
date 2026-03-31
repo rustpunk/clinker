@@ -9,7 +9,6 @@
 /// Navigation uses a two-level model:
 /// - `NavigationContext` — top-level activity (Pipeline, Channels, Git, Docs, Runs)
 /// - `PipelineLayoutMode` — view within Pipeline context only (Canvas, Hybrid, Editor)
-
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -165,7 +164,8 @@ impl PipelineLayoutMode {
     }
 
     /// All layout modes in display order.
-    pub const ALL: [PipelineLayoutMode; 4] = [Self::Canvas, Self::Hybrid, Self::Editor, Self::Schematics];
+    pub const ALL: [PipelineLayoutMode; 4] =
+        [Self::Canvas, Self::Hybrid, Self::Editor, Self::Schematics];
 }
 
 /// Per-tab reactive state — consumed by canvas, inspector, YAML sidebar, etc.
@@ -185,10 +185,12 @@ pub struct AppState {
     /// Parsed pipeline config (None if YAML is invalid).
     pub pipeline: Signal<Option<PipelineConfig>>,
     /// Raw pipeline config preserving `_import` directives (for serialization).
+    #[allow(dead_code)]
     pub raw_pipeline: Signal<Option<RawPipelineConfig>>,
     /// Resolved composition metadata (for canvas rendering and override editing).
     pub compositions: Signal<Vec<ResolvedComposition>>,
     /// Contract validation warnings from composition imports.
+    #[allow(dead_code)]
     pub contract_warnings: Signal<Vec<ContractWarning>>,
     /// Partial pipeline from graceful degradation (set when full parse fails but YAML syntax is valid).
     pub partial_pipeline: Signal<Option<PartialPipelineConfig>>,
@@ -232,6 +234,7 @@ pub fn use_app_state() -> AppState {
 pub struct TabManagerState {
     pub tabs: Signal<Vec<TabEntry>>,
     pub active_tab_id: Signal<Option<TabId>>,
+    #[allow(dead_code)]
     pub recent_files: Signal<Vec<RecentFileEntry>>,
     pub workspace: Signal<Option<Workspace>>,
     /// Which left panel is currently open (Search or Schemas).
@@ -290,14 +293,15 @@ pub struct ChannelState {
 impl ChannelState {
     /// Get the summary for the active channel, if any.
     pub fn active_summary(&self) -> Option<&ChannelSummary> {
-        self.active_channel.as_ref().and_then(|id| {
-            self.channels.iter().find(|c| c.id == *id)
-        })
+        self.active_channel
+            .as_ref()
+            .and_then(|id| self.channels.iter().find(|c| c.id == *id))
     }
 
     /// All unique tier names across discovered channels.
     pub fn tier_names(&self) -> Vec<String> {
-        let mut tiers: Vec<String> = self.channels
+        let mut tiers: Vec<String> = self
+            .channels
             .iter()
             .filter_map(|c| c.tier.clone())
             .collect();

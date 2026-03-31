@@ -11,40 +11,28 @@
 /// Navigation uses a two-level model:
 /// - `NavigationContext` selects the active page (Pipeline, Channels, Git, Docs, Runs)
 /// - `PipelineLayoutMode` selects the view within Pipeline (Canvas, Hybrid, Editor)
-
 use clinker_git::GitOps;
 use dioxus::prelude::*;
 
-use crate::components::{
-    activity_bar::ActivityBar,
-    canvas::CanvasPanel,
-    inspector::InspectorPanel,
-    run_log::RunLogDrawer,
-    composition_panel::CompositionPanel,
-    channel_mode::ChannelMode,
-    placeholder_page::PlaceholderPage,
-    schema_panel::SchemaPanel,
-    schematics::SchematicsPanel,
-    command_palette::CommandPalette,
-    search_panel::SearchPanel,
-    settings_overlay::SettingsOverlay,
-    status_bar::StatusBar,
-    tab_bar::TabBar,
-    template_gallery::TemplateGallery,
-    title_bar::TitleBar,
-    version_mode::VersionMode,
-    toast::ToastOverlay,
-    welcome_screen::WelcomeScreen,
-    yaml_sidebar::YamlSidebar,
-};
 use crate::components::confirm_dialog::{ConfirmAction, ConfirmDialog, PendingConfirm};
 use crate::components::toast::ToastState;
+use crate::components::{
+    activity_bar::ActivityBar, canvas::CanvasPanel, channel_mode::ChannelMode,
+    command_palette::CommandPalette, composition_panel::CompositionPanel,
+    inspector::InspectorPanel, placeholder_page::PlaceholderPage, run_log::RunLogDrawer,
+    schema_panel::SchemaPanel, schematics::SchematicsPanel, search_panel::SearchPanel,
+    status_bar::StatusBar, tab_bar::TabBar, template_gallery::TemplateGallery, title_bar::TitleBar,
+    toast::ToastOverlay, version_mode::VersionMode, welcome_screen::WelcomeScreen,
+    yaml_sidebar::YamlSidebar,
+};
 use clinker_schema::SchemaIndex;
 
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
-use crate::state::{AppState, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState, use_app_state};
-use crate::sync::{serialize_raw_yaml, try_parse_yaml, EditSource, ParseResult};
+use crate::state::{
+    AppState, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState, use_app_state,
+};
+use crate::sync::{EditSource, ParseResult, serialize_raw_yaml, try_parse_yaml};
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -69,7 +57,7 @@ pub fn AppShell() -> Element {
     let mut partial_pipeline = use_signal(|| None);
     let mut channel_pipeline: Signal<Option<crate::channel_resolve::ChannelResolution>> =
         use_signal(|| None);
-    let channel_view_mode = use_signal(|| crate::state::ChannelViewMode::default());
+    let channel_view_mode = use_signal(crate::state::ChannelViewMode::default);
     let expanded_compositions = use_signal(std::collections::HashSet::new);
     let composition_drill_stack = use_signal(Vec::new);
 
@@ -82,26 +70,38 @@ pub fn AppShell() -> Element {
 
     // ── Navigation signals ──────────────────────────────────────────────
     let active_context = use_signal(|| {
-        session_data.peek().as_ref().map(|s| s.context).unwrap_or_default()
+        session_data
+            .peek()
+            .as_ref()
+            .map(|s| s.context)
+            .unwrap_or_default()
     });
     let pipeline_layout = use_signal(|| {
-        session_data.peek().as_ref().map(|s| s.pipeline_layout).unwrap_or_default()
+        session_data
+            .peek()
+            .as_ref()
+            .map(|s| s.pipeline_layout)
+            .unwrap_or_default()
     });
     let activity_bar_visible = use_signal(|| true);
     let nav_history: Signal<Vec<NavigationContext>> = use_signal(Vec::new);
 
     let mut tabs: Signal<Vec<TabEntry>> = use_signal(|| {
-        session_data.write().as_mut()
+        session_data
+            .write()
+            .as_mut()
             .map(|s| std::mem::take(&mut s.tabs))
             .unwrap_or_default()
     });
-    let active_tab_id: Signal<Option<TabId>> = use_signal(|| {
-        session_data.peek().as_ref().and_then(|s| s.active_tab_id)
-    });
+    let active_tab_id: Signal<Option<TabId>> =
+        use_signal(|| session_data.peek().as_ref().and_then(|s| s.active_tab_id));
     let mut prev_tab_id: Signal<Option<TabId>> = use_signal(|| None);
     let recent_files = use_signal(load_recent_files);
     let workspace: Signal<Option<workspace::Workspace>> = use_signal(|| {
-        session_data.write().as_mut().and_then(|s| s.workspace.take())
+        session_data
+            .write()
+            .as_mut()
+            .and_then(|s| s.workspace.take())
     });
 
     // ── Left panel + schema index + template gallery ──────────────────────
@@ -212,7 +212,7 @@ pub fn AppShell() -> Element {
 
             // Spawn a polling loop that checks for debounced changes
             // and refreshes git/schema state.
-            let root2 = root.clone();
+            let _root2 = root.clone();
             std::thread::spawn(move || {
                 while let Ok(paths) = rx.recv() {
                     if crate::fs_watcher::has_git_relevant_changes(&paths) {
@@ -231,12 +231,6 @@ pub fn AppShell() -> Element {
     // use_drop fires when AppShell's scope drops (window close, app exit).
     use_drop({
         let tabs = tabs;
-        let workspace = workspace;
-        let active_tab_id = active_tab_id;
-        let active_context = active_context;
-        let pipeline_layout = pipeline_layout;
-        let run_log_expanded = run_log_expanded;
-        let activity_bar_visible = activity_bar_visible;
         let channel_state = channel_state;
         move || {
             workspace::save_full_session(
@@ -257,12 +251,6 @@ pub fn AppShell() -> Element {
     // Worst case on force-kill: lose last 5 seconds of layout/tab state.
     use_future(move || {
         let tabs = tabs;
-        let workspace = workspace;
-        let active_tab_id = active_tab_id;
-        let active_context = active_context;
-        let pipeline_layout = pipeline_layout;
-        let run_log_expanded = run_log_expanded;
-        let activity_bar_visible = activity_bar_visible;
         let channel_state = channel_state;
         async move {
             loop {
@@ -339,7 +327,9 @@ pub fn AppShell() -> Element {
         // Save workspace state on tab switch
         if let Some(ref ws) = *workspace.read() {
             let active_file = current_active.and_then(|id| {
-                tabs.read().iter().find(|t| t.id == id)
+                tabs.read()
+                    .iter()
+                    .find(|t| t.id == id)
                     .and_then(|t| t.file_path.as_ref())
                     .map(|p| p.display().to_string())
             });
@@ -437,10 +427,7 @@ pub fn AppShell() -> Element {
                 return;
             }
 
-            let ws_root = workspace
-                .read()
-                .as_ref()
-                .map(|ws| ws.root.clone());
+            let ws_root = workspace.read().as_ref().map(|ws| ws.root.clone());
 
             match try_parse_yaml(&text, ws_root.as_deref()) {
                 ParseResult::Complete(resolved) => {

@@ -48,14 +48,35 @@ pub struct BuiltinRegistry {
     window_fns: ahash::HashMap<&'static str, BuiltinDef>,
 }
 
+impl Default for BuiltinRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BuiltinRegistry {
     pub fn new() -> Self {
         let mut methods = ahash::HashMap::default();
         let mut window_fns = ahash::HashMap::default();
 
         // ── String (24) ──
-        let s = |name: &'static str, args: Vec<TypeTag>, min: usize, max: Option<usize>, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::String, args, min_args: min, max_args: max, return_type: ret, category: Category::String })
+        let s = |name: &'static str,
+                 args: Vec<TypeTag>,
+                 min: usize,
+                 max: Option<usize>,
+                 ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::String,
+                    args,
+                    min_args: min,
+                    max_args: max,
+                    return_type: ret,
+                    category: Category::String,
+                },
+            )
         };
         for (n, d) in [
             s("upper", vec![], 0, Some(0), TypeTag::String),
@@ -63,15 +84,51 @@ impl BuiltinRegistry {
             s("trim", vec![], 0, Some(0), TypeTag::String),
             s("trim_start", vec![], 0, Some(0), TypeTag::String),
             s("trim_end", vec![], 0, Some(0), TypeTag::String),
-            s("starts_with", vec![TypeTag::String], 1, Some(1), TypeTag::Bool),
-            s("ends_with", vec![TypeTag::String], 1, Some(1), TypeTag::Bool),
+            s(
+                "starts_with",
+                vec![TypeTag::String],
+                1,
+                Some(1),
+                TypeTag::Bool,
+            ),
+            s(
+                "ends_with",
+                vec![TypeTag::String],
+                1,
+                Some(1),
+                TypeTag::Bool,
+            ),
             s("contains", vec![TypeTag::String], 1, Some(1), TypeTag::Bool),
-            s("replace", vec![TypeTag::String, TypeTag::String], 2, Some(2), TypeTag::String),
-            s("substring", vec![TypeTag::Int, TypeTag::Int], 1, Some(2), TypeTag::String),
+            s(
+                "replace",
+                vec![TypeTag::String, TypeTag::String],
+                2,
+                Some(2),
+                TypeTag::String,
+            ),
+            s(
+                "substring",
+                vec![TypeTag::Int, TypeTag::Int],
+                1,
+                Some(2),
+                TypeTag::String,
+            ),
             s("left", vec![TypeTag::Int], 1, Some(1), TypeTag::String),
             s("right", vec![TypeTag::Int], 1, Some(1), TypeTag::String),
-            s("pad_left", vec![TypeTag::Int, TypeTag::String], 1, Some(2), TypeTag::String),
-            s("pad_right", vec![TypeTag::Int, TypeTag::String], 1, Some(2), TypeTag::String),
+            s(
+                "pad_left",
+                vec![TypeTag::Int, TypeTag::String],
+                1,
+                Some(2),
+                TypeTag::String,
+            ),
+            s(
+                "pad_right",
+                vec![TypeTag::Int, TypeTag::String],
+                1,
+                Some(2),
+                TypeTag::String,
+            ),
             s("repeat", vec![TypeTag::Int], 1, Some(1), TypeTag::String),
             s("reverse", vec![], 0, Some(0), TypeTag::String),
             s("length", vec![], 0, Some(0), TypeTag::Int),
@@ -81,16 +138,39 @@ impl BuiltinRegistry {
             s("format", vec![TypeTag::String], 1, Some(1), TypeTag::String),
             s("concat", vec![TypeTag::String], 1, None, TypeTag::String),
             s("find", vec![TypeTag::String], 1, Some(1), TypeTag::Bool),
-            s("capture", vec![TypeTag::String, TypeTag::Int], 1, Some(2), TypeTag::String),
+            s(
+                "capture",
+                vec![TypeTag::String, TypeTag::Int],
+                1,
+                Some(2),
+                TypeTag::String,
+            ),
         ] {
             methods.insert(n, d);
         }
 
         // ── Path (5) ──
         let p = |name: &'static str| {
-            (name, BuiltinDef { name, receiver: TypeTag::String, args: vec![], min_args: 0, max_args: Some(0), return_type: TypeTag::String, category: Category::Path })
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::String,
+                    args: vec![],
+                    min_args: 0,
+                    max_args: Some(0),
+                    return_type: TypeTag::String,
+                    category: Category::Path,
+                },
+            )
         };
-        for (n, d) in [p("file_name"), p("file_stem"), p("extension"), p("parent"), p("parent_name")] {
+        for (n, d) in [
+            p("file_name"),
+            p("file_stem"),
+            p("extension"),
+            p("parent"),
+            p("parent_name"),
+        ] {
             methods.insert(n, d);
         }
 
@@ -98,15 +178,38 @@ impl BuiltinRegistry {
         // Note: join/length overloaded with String — String entry wins in single-key map.
         // Array versions registered here would overwrite String. We keep String versions
         // and note that type checker disambiguates by receiver type.
-        methods.insert("join", BuiltinDef {
-            name: "join", receiver: TypeTag::String, args: vec![TypeTag::String],
-            min_args: 1, max_args: Some(1), return_type: TypeTag::String, category: Category::String,
-        });
+        methods.insert(
+            "join",
+            BuiltinDef {
+                name: "join",
+                receiver: TypeTag::String,
+                args: vec![TypeTag::String],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::String,
+                category: Category::String,
+            },
+        );
         // length already registered as String method above
 
         // ── Numeric (8) ──
-        let num = |name: &'static str, args: Vec<TypeTag>, min: usize, max: Option<usize>, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Numeric, args, min_args: min, max_args: max, return_type: ret, category: Category::Numeric })
+        let num = |name: &'static str,
+                   args: Vec<TypeTag>,
+                   min: usize,
+                   max: Option<usize>,
+                   ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Numeric,
+                    args,
+                    min_args: min,
+                    max_args: max,
+                    return_type: ret,
+                    category: Category::Numeric,
+                },
+            )
         };
         for (n, d) in [
             num("abs", vec![], 0, Some(0), TypeTag::Numeric),
@@ -114,7 +217,13 @@ impl BuiltinRegistry {
             num("floor", vec![], 0, Some(0), TypeTag::Int),
             num("round", vec![TypeTag::Int], 0, Some(1), TypeTag::Float),
             num("round_to", vec![TypeTag::Int], 1, Some(1), TypeTag::Float),
-            num("clamp", vec![TypeTag::Numeric, TypeTag::Numeric], 2, Some(2), TypeTag::Numeric),
+            num(
+                "clamp",
+                vec![TypeTag::Numeric, TypeTag::Numeric],
+                2,
+                Some(2),
+                TypeTag::Numeric,
+            ),
             num("min", vec![TypeTag::Numeric], 1, Some(1), TypeTag::Numeric),
             num("max", vec![TypeTag::Numeric], 1, Some(1), TypeTag::Numeric),
         ] {
@@ -122,8 +231,23 @@ impl BuiltinRegistry {
         }
 
         // ── Date (13) ──
-        let dt = |name: &'static str, args: Vec<TypeTag>, min: usize, max: Option<usize>, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Date, args, min_args: min, max_args: max, return_type: ret, category: Category::Date })
+        let dt = |name: &'static str,
+                  args: Vec<TypeTag>,
+                  min: usize,
+                  max: Option<usize>,
+                  ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Date,
+                    args,
+                    min_args: min,
+                    max_args: max,
+                    return_type: ret,
+                    category: Category::Date,
+                },
+            )
         };
         for (n, d) in [
             dt("year", vec![], 0, Some(0), TypeTag::Int),
@@ -138,14 +262,35 @@ impl BuiltinRegistry {
             dt("diff_days", vec![TypeTag::Date], 1, Some(1), TypeTag::Int),
             dt("diff_months", vec![TypeTag::Date], 1, Some(1), TypeTag::Int),
             dt("diff_years", vec![TypeTag::Date], 1, Some(1), TypeTag::Int),
-            dt("format_date", vec![TypeTag::String], 1, Some(1), TypeTag::String),
+            dt(
+                "format_date",
+                vec![TypeTag::String],
+                1,
+                Some(1),
+                TypeTag::String,
+            ),
         ] {
             methods.insert(n, d);
         }
 
         // ── Conversion strict (6) ──
-        let cs = |name: &'static str, args: Vec<TypeTag>, min: usize, max: Option<usize>, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Any, args, min_args: min, max_args: max, return_type: ret, category: Category::ConversionStrict })
+        let cs = |name: &'static str,
+                  args: Vec<TypeTag>,
+                  min: usize,
+                  max: Option<usize>,
+                  ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args,
+                    min_args: min,
+                    max_args: max,
+                    return_type: ret,
+                    category: Category::ConversionStrict,
+                },
+            )
         };
         for (n, d) in [
             cs("to_int", vec![], 0, Some(0), TypeTag::Int),
@@ -153,28 +298,70 @@ impl BuiltinRegistry {
             cs("to_string", vec![], 0, Some(0), TypeTag::String),
             cs("to_bool", vec![], 0, Some(0), TypeTag::Bool),
             cs("to_date", vec![TypeTag::String], 0, Some(1), TypeTag::Date),
-            cs("to_datetime", vec![TypeTag::String], 0, Some(1), TypeTag::DateTime),
+            cs(
+                "to_datetime",
+                vec![TypeTag::String],
+                0,
+                Some(1),
+                TypeTag::DateTime,
+            ),
         ] {
             methods.insert(n, d);
         }
 
         // ── Conversion lenient (5) ──
-        let cl = |name: &'static str, args: Vec<TypeTag>, min: usize, max: Option<usize>, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Any, args, min_args: min, max_args: max, return_type: ret, category: Category::ConversionLenient })
+        let cl = |name: &'static str,
+                  args: Vec<TypeTag>,
+                  min: usize,
+                  max: Option<usize>,
+                  ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args,
+                    min_args: min,
+                    max_args: max,
+                    return_type: ret,
+                    category: Category::ConversionLenient,
+                },
+            )
         };
         for (n, d) in [
             cl("try_int", vec![], 0, Some(0), TypeTag::Int),
             cl("try_float", vec![], 0, Some(0), TypeTag::Float),
             cl("try_bool", vec![], 0, Some(0), TypeTag::Bool),
             cl("try_date", vec![TypeTag::String], 0, Some(1), TypeTag::Date),
-            cl("try_datetime", vec![TypeTag::String], 0, Some(1), TypeTag::DateTime),
+            cl(
+                "try_datetime",
+                vec![TypeTag::String],
+                0,
+                Some(1),
+                TypeTag::DateTime,
+            ),
         ] {
             methods.insert(n, d);
         }
 
         // ── Introspection (4) ──
-        let intr = |name: &'static str, args: Vec<TypeTag>, min: usize, max: Option<usize>, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Any, args, min_args: min, max_args: max, return_type: ret, category: Category::Introspection })
+        let intr = |name: &'static str,
+                    args: Vec<TypeTag>,
+                    min: usize,
+                    max: Option<usize>,
+                    ret: TypeTag| {
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args,
+                    min_args: min,
+                    max_args: max,
+                    return_type: ret,
+                    category: Category::Introspection,
+                },
+            )
         };
         for (n, d) in [
             intr("type_of", vec![], 0, Some(0), TypeTag::String),
@@ -186,14 +373,33 @@ impl BuiltinRegistry {
         }
 
         // ── Debug (1) ──
-        methods.insert("debug", BuiltinDef {
-            name: "debug", receiver: TypeTag::Any, args: vec![TypeTag::String],
-            min_args: 1, max_args: Some(1), return_type: TypeTag::Any, category: Category::Debug,
-        });
+        methods.insert(
+            "debug",
+            BuiltinDef {
+                name: "debug",
+                receiver: TypeTag::Any,
+                args: vec![TypeTag::String],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::Any,
+                category: Category::Debug,
+            },
+        );
 
         // ── Window aggregate (5) ──
         let wa = |name: &'static str, args: Vec<TypeTag>, min: usize, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Any, args, min_args: min, max_args: Some(min), return_type: ret, category: Category::WindowAggregate })
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args,
+                    min_args: min,
+                    max_args: Some(min),
+                    return_type: ret,
+                    category: Category::WindowAggregate,
+                },
+            )
         };
         for (n, d) in [
             wa("sum", vec![TypeTag::Any], 1, TypeTag::Numeric),
@@ -207,7 +413,18 @@ impl BuiltinRegistry {
 
         // ── Window positional (4) ──
         let wp = |name: &'static str, args: Vec<TypeTag>, min: usize| {
-            (name, BuiltinDef { name, receiver: TypeTag::Any, args, min_args: min, max_args: Some(min), return_type: TypeTag::Any, category: Category::WindowPositional })
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args,
+                    min_args: min,
+                    max_args: Some(min),
+                    return_type: TypeTag::Any,
+                    category: Category::WindowPositional,
+                },
+            )
         };
         for (n, d) in [
             wp("first", vec![], 0),
@@ -220,7 +437,18 @@ impl BuiltinRegistry {
 
         // ── Window iterable (4) ──  — any/all take predicate exprs, collect/distinct take field exprs
         let wi = |name: &'static str, ret: TypeTag| {
-            (name, BuiltinDef { name, receiver: TypeTag::Any, args: vec![TypeTag::Any], min_args: 1, max_args: Some(1), return_type: ret, category: Category::WindowIterable })
+            (
+                name,
+                BuiltinDef {
+                    name,
+                    receiver: TypeTag::Any,
+                    args: vec![TypeTag::Any],
+                    min_args: 1,
+                    max_args: Some(1),
+                    return_type: ret,
+                    category: Category::WindowIterable,
+                },
+            )
         };
         for (n, d) in [
             wi("any", TypeTag::Bool),
@@ -231,7 +459,10 @@ impl BuiltinRegistry {
             window_fns.insert(n, d);
         }
 
-        Self { methods, window_fns }
+        Self {
+            methods,
+            window_fns,
+        }
     }
 
     pub fn lookup_method(&self, name: &str) -> Option<&BuiltinDef> {
@@ -261,17 +492,40 @@ mod tests {
     fn test_registry_all_string_methods() {
         let r = registry();
         let string_methods = [
-            "upper", "lower", "trim", "trim_start", "trim_end",
-            "starts_with", "ends_with", "contains", "replace", "substring",
-            "left", "right", "pad_left", "pad_right", "repeat", "reverse",
-            "length", "split", "join", "matches", "format", "concat",
-            "find", "capture",
+            "upper",
+            "lower",
+            "trim",
+            "trim_start",
+            "trim_end",
+            "starts_with",
+            "ends_with",
+            "contains",
+            "replace",
+            "substring",
+            "left",
+            "right",
+            "pad_left",
+            "pad_right",
+            "repeat",
+            "reverse",
+            "length",
+            "split",
+            "join",
+            "matches",
+            "format",
+            "concat",
+            "find",
+            "capture",
         ];
         for name in string_methods {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing string method: {}", name));
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing string method: {}", name));
             assert!(
                 def.category == Category::String || def.category == Category::Path,
-                "wrong category for {}: {:?}", name, def.category
+                "wrong category for {}: {:?}",
+                name,
+                def.category
             );
         }
         assert_eq!(string_methods.len(), 24);
@@ -280,8 +534,16 @@ mod tests {
     #[test]
     fn test_registry_all_path_methods() {
         let r = registry();
-        for name in ["file_name", "file_stem", "extension", "parent", "parent_name"] {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing path method: {}", name));
+        for name in [
+            "file_name",
+            "file_stem",
+            "extension",
+            "parent",
+            "parent_name",
+        ] {
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing path method: {}", name));
             assert_eq!(def.category, Category::Path);
         }
     }
@@ -298,9 +560,18 @@ mod tests {
     #[test]
     fn test_registry_all_numeric_methods() {
         let r = registry();
-        for name in ["abs", "ceil", "floor", "round", "round_to", "clamp", "min", "max"] {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing numeric method: {}", name));
-            assert_eq!(def.category, Category::Numeric, "wrong category for {}", name);
+        for name in [
+            "abs", "ceil", "floor", "round", "round_to", "clamp", "min", "max",
+        ] {
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing numeric method: {}", name));
+            assert_eq!(
+                def.category,
+                Category::Numeric,
+                "wrong category for {}",
+                name
+            );
         }
     }
 
@@ -308,12 +579,24 @@ mod tests {
     fn test_registry_all_date_methods() {
         let r = registry();
         let date_methods = [
-            "year", "month", "day", "hour", "minute", "second",
-            "add_days", "add_months", "add_years",
-            "diff_days", "diff_months", "diff_years", "format_date",
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "add_days",
+            "add_months",
+            "add_years",
+            "diff_days",
+            "diff_months",
+            "diff_years",
+            "format_date",
         ];
         for name in date_methods {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing date method: {}", name));
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing date method: {}", name));
             assert_eq!(def.category, Category::Date, "wrong category for {}", name);
         }
         assert_eq!(date_methods.len(), 13);
@@ -322,8 +605,17 @@ mod tests {
     #[test]
     fn test_registry_all_conversion_strict() {
         let r = registry();
-        for name in ["to_int", "to_float", "to_string", "to_bool", "to_date", "to_datetime"] {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing strict conv: {}", name));
+        for name in [
+            "to_int",
+            "to_float",
+            "to_string",
+            "to_bool",
+            "to_date",
+            "to_datetime",
+        ] {
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing strict conv: {}", name));
             assert_eq!(def.category, Category::ConversionStrict);
         }
     }
@@ -331,8 +623,16 @@ mod tests {
     #[test]
     fn test_registry_all_conversion_lenient() {
         let r = registry();
-        for name in ["try_int", "try_float", "try_bool", "try_date", "try_datetime"] {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing lenient conv: {}", name));
+        for name in [
+            "try_int",
+            "try_float",
+            "try_bool",
+            "try_date",
+            "try_datetime",
+        ] {
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing lenient conv: {}", name));
             assert_eq!(def.category, Category::ConversionLenient);
         }
     }
@@ -341,7 +641,9 @@ mod tests {
     fn test_registry_all_introspection() {
         let r = registry();
         for name in ["type_of", "is_null", "is_empty", "catch"] {
-            let def = r.lookup_method(name).unwrap_or_else(|| panic!("missing introspection: {}", name));
+            let def = r
+                .lookup_method(name)
+                .unwrap_or_else(|| panic!("missing introspection: {}", name));
             assert_eq!(def.category, Category::Introspection);
         }
     }
@@ -358,7 +660,9 @@ mod tests {
     fn test_registry_all_window_aggregate() {
         let r = registry();
         for name in ["sum", "avg", "min", "max", "count"] {
-            let def = r.lookup_window(name).unwrap_or_else(|| panic!("missing window agg: {}", name));
+            let def = r
+                .lookup_window(name)
+                .unwrap_or_else(|| panic!("missing window agg: {}", name));
             assert_eq!(def.category, Category::WindowAggregate);
         }
     }
@@ -367,7 +671,9 @@ mod tests {
     fn test_registry_all_window_positional() {
         let r = registry();
         for name in ["first", "last", "lag", "lead"] {
-            let def = r.lookup_window(name).unwrap_or_else(|| panic!("missing window pos: {}", name));
+            let def = r
+                .lookup_window(name)
+                .unwrap_or_else(|| panic!("missing window pos: {}", name));
             assert_eq!(def.category, Category::WindowPositional);
         }
     }
@@ -376,7 +682,9 @@ mod tests {
     fn test_registry_all_window_iterable() {
         let r = registry();
         for name in ["any", "all", "collect", "distinct"] {
-            let def = r.lookup_window(name).unwrap_or_else(|| panic!("missing window iter: {}", name));
+            let def = r
+                .lookup_window(name)
+                .unwrap_or_else(|| panic!("missing window iter: {}", name));
             assert_eq!(def.category, Category::WindowIterable);
         }
     }

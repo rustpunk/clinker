@@ -3,9 +3,9 @@
 
 use dioxus::prelude::*;
 
-use clinker_git::{GitOps, ProviderKind};
+use clinker_git::ProviderKind;
 
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::state::TabManagerState;
 
 /// PR creation pane component.
@@ -24,7 +24,8 @@ pub fn PrPane(on_close: EventHandler<()>) -> Element {
 
     // Detect provider from remote
     let ws = (tab_mgr.workspace)();
-    let provider = ws.as_ref()
+    let provider = ws
+        .as_ref()
         .and_then(|ws| clinker_git::get_remote_url(&ws.root).ok())
         .map(|url| clinker_git::detect_provider(&url))
         .unwrap_or(ProviderKind::Unknown);
@@ -37,7 +38,8 @@ pub fn PrPane(on_close: EventHandler<()>) -> Element {
 
     // Auto-detect target branch
     if let Some(ref ws) = ws {
-        let default = clinker_git::get_default_branch(&ws.root).unwrap_or_else(|_| "main".to_string());
+        let default =
+            clinker_git::get_default_branch(&ws.root).unwrap_or_else(|_| "main".to_string());
         if (target_branch)() == "main" && default != "main" {
             target_branch.set(default);
         }
@@ -160,7 +162,7 @@ pub fn PrPane(on_close: EventHandler<()>) -> Element {
                             match clinker_git::create_pr(root, &params, provider) {
                                 Ok(result) => {
                                     let mut toast: Signal<Option<ToastState>> = use_context();
-                                    toast_success(&mut toast, &format!("PR #{} created", result.number));
+                                    toast_success(&mut toast, format!("PR #{} created", result.number));
                                     created_url.set(Some(result.url));
                                 }
                                 Err(e) => {
@@ -194,9 +196,7 @@ fn humanize_branch(branch: &str) -> String {
         .unwrap_or(branch);
 
     // Replace separators with spaces, capitalize first letter
-    let words: String = name
-        .replace('-', " ")
-        .replace('_', " ");
+    let words: String = name.replace(['-', '_'], " ");
 
     let mut chars = words.chars();
     match chars.next() {

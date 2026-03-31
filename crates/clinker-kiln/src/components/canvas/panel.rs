@@ -4,7 +4,10 @@ use std::rc::Rc;
 use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
-use crate::pipeline_view::{derive_pipeline_view, derive_partial_pipeline_view, derive_composition_drill_view, NODE_WIDTH, NODE_HEIGHT};
+use crate::pipeline_view::{
+    NODE_HEIGHT, NODE_WIDTH, derive_composition_drill_view, derive_partial_pipeline_view,
+    derive_pipeline_view,
+};
 use crate::state::use_app_state;
 
 use super::breadcrumb::BreadcrumbBar;
@@ -64,7 +67,9 @@ pub fn CanvasPanel() -> Element {
         // Drill-in: render the top composition's transforms
         let drill_entry = drill_stack.last().unwrap();
         match &*(state.pipeline).read() {
-            Some(config) => derive_composition_drill_view(config, &compositions_read, &drill_entry.path),
+            Some(config) => {
+                derive_composition_drill_view(config, &compositions_read, &drill_entry.path)
+            }
             None => crate::pipeline_view::PipelineView {
                 stages: Vec::new(),
                 composition_groups: Vec::new(),
@@ -88,7 +93,12 @@ pub fn CanvasPanel() -> Element {
     let connections: Vec<_> = pipeline_view
         .connections
         .iter()
-        .map(|&(from, to)| (pipeline_view.stages[from].clone(), pipeline_view.stages[to].clone()))
+        .map(|&(from, to)| {
+            (
+                pipeline_view.stages[from].clone(),
+                pipeline_view.stages[to].clone(),
+            )
+        })
         .collect();
     let stages = pipeline_view.stages;
     let composition_groups = pipeline_view.composition_groups;
@@ -160,24 +170,40 @@ pub fn CanvasPanel() -> Element {
         let factor = match e.delta() {
             WheelDelta::Pixels(data) => {
                 let dy = data.y as f32;
-                if dy == 0.0 { return; }
+                if dy == 0.0 {
+                    return;
+                }
                 1.0 - dy * ZOOM_STEP_PIXEL
             }
             WheelDelta::Lines(data) => {
                 let dy = data.y as f32;
-                if dy == 0.0 { return; }
-                if dy < 0.0 { ZOOM_STEP_LINE } else { 1.0 / ZOOM_STEP_LINE }
+                if dy == 0.0 {
+                    return;
+                }
+                if dy < 0.0 {
+                    ZOOM_STEP_LINE
+                } else {
+                    1.0 / ZOOM_STEP_LINE
+                }
             }
             WheelDelta::Pages(data) => {
                 let dy = data.y as f32;
-                if dy == 0.0 { return; }
-                if dy < 0.0 { ZOOM_STEP_LINE * ZOOM_STEP_LINE } else { 1.0 / (ZOOM_STEP_LINE * ZOOM_STEP_LINE) }
+                if dy == 0.0 {
+                    return;
+                }
+                if dy < 0.0 {
+                    ZOOM_STEP_LINE * ZOOM_STEP_LINE
+                } else {
+                    1.0 / (ZOOM_STEP_LINE * ZOOM_STEP_LINE)
+                }
             }
         };
 
         let old_z = *zoom.peek();
         let new_z = (old_z * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        if (new_z - old_z).abs() < 0.0001 { return; }
+        if (new_z - old_z).abs() < 0.0001 {
+            return;
+        }
 
         // Anchor zoom to cursor position (cursor stays fixed in world space).
         let cursor = e.client_coordinates();
@@ -196,8 +222,14 @@ pub fn CanvasPanel() -> Element {
     let (svg_w, svg_h) = if stages.is_empty() {
         (1200.0_f32, 400.0_f32)
     } else {
-        let max_x = stages.iter().map(|s| s.canvas_x + NODE_WIDTH).fold(0.0_f32, f32::max);
-        let max_y = stages.iter().map(|s| s.canvas_y + NODE_HEIGHT).fold(0.0_f32, f32::max);
+        let max_x = stages
+            .iter()
+            .map(|s| s.canvas_x + NODE_WIDTH)
+            .fold(0.0_f32, f32::max);
+        let max_y = stages
+            .iter()
+            .map(|s| s.canvas_y + NODE_HEIGHT)
+            .fold(0.0_f32, f32::max);
         let min_y = stages.iter().map(|s| s.canvas_y).fold(f32::MAX, f32::min);
         // Ensure SVG covers negative-Y nodes (secondary inputs above the chain).
         let _ = min_y; // min_y handled by SVG viewBox if needed; overflow:visible covers it.

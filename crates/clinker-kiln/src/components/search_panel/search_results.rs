@@ -16,7 +16,11 @@ pub fn SearchResults(
     let file_count = results.len();
     let summary = format!(
         "{total_matches} {} in {file_count} {}",
-        if total_matches == 1 { "match" } else { "matches" },
+        if total_matches == 1 {
+            "match"
+        } else {
+            "matches"
+        },
         if file_count == 1 { "file" } else { "files" },
     );
 

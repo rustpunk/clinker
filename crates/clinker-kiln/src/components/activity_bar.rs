@@ -3,10 +3,9 @@
 /// Spec N2: 48px fixed-width, icon + label entries, active/inactive/hover states.
 /// Each entry maps to a `NavigationContext`. Settings button pinned to bottom.
 /// Badge indicators on Git (dirty file count).
-
 use dioxus::prelude::*;
 
-use crate::state::{use_app_state, NavigationContext, TabManagerState};
+use crate::state::{NavigationContext, TabManagerState, use_app_state};
 
 /// Maximum entries in the navigation history stack.
 const NAV_HISTORY_CAP: usize = 50;
@@ -20,12 +19,13 @@ pub fn ActivityBar() -> Element {
     let activity_bar_visible = (tab_mgr.activity_bar_visible)();
 
     // Git badge: count of dirty files
-    let git_badge = (tab_mgr.git_state)().as_ref().map(|gs| {
-        gs.files.len()
-    }).unwrap_or(0);
+    let git_badge = (tab_mgr.git_state)()
+        .as_ref()
+        .map(|gs| gs.files.len())
+        .unwrap_or(0);
 
     // Channel badge: count of discovered channels
-    let channel_badge = (tab_mgr.channel_state)()
+    let _channel_badge = (tab_mgr.channel_state)()
         .as_ref()
         .map(|cs| cs.channels.len())
         .unwrap_or(0);
@@ -142,7 +142,11 @@ fn SettingsEntry() -> Element {
 ///
 /// Used by the activity bar and keyboard handler. Extracted as a public helper
 /// so cross-context navigation actions can reuse it.
-pub fn switch_context(state: &crate::state::AppState, tab_mgr: &TabManagerState, target: NavigationContext) {
+pub fn switch_context(
+    state: &crate::state::AppState,
+    tab_mgr: &TabManagerState,
+    target: NavigationContext,
+) {
     let current = (state.active_context)();
     if current != target {
         let mut nav_history = tab_mgr.nav_history;

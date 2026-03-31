@@ -68,31 +68,72 @@ impl std::fmt::Display for ModuleLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
             ModuleLoadErrorKind::NotFound => {
-                write!(f, "module '{}' not found at {}", self.module_path, self.file_path.display())
+                write!(
+                    f,
+                    "module '{}' not found at {}",
+                    self.module_path,
+                    self.file_path.display()
+                )
             }
             ModuleLoadErrorKind::TooLarge(size) => {
-                write!(f, "module file {} is too large ({} bytes, max {})", self.file_path.display(), size, MAX_MODULE_FILE_SIZE)
+                write!(
+                    f,
+                    "module file {} is too large ({} bytes, max {})",
+                    self.file_path.display(),
+                    size,
+                    MAX_MODULE_FILE_SIZE
+                )
             }
             ModuleLoadErrorKind::ReadError(e) => {
-                write!(f, "failed to read module file {}: {}", self.file_path.display(), e)
+                write!(
+                    f,
+                    "failed to read module file {}: {}",
+                    self.file_path.display(),
+                    e
+                )
             }
             ModuleLoadErrorKind::NotUtf8 => {
-                write!(f, "module file {} is not valid UTF-8", self.file_path.display())
+                write!(
+                    f,
+                    "module file {} is not valid UTF-8",
+                    self.file_path.display()
+                )
             }
             ModuleLoadErrorKind::ParseErrors(errs) => {
-                write!(f, "parse errors in module '{}': {}", self.module_path, errs.join("; "))
+                write!(
+                    f,
+                    "parse errors in module '{}': {}",
+                    self.module_path,
+                    errs.join("; ")
+                )
             }
             ModuleLoadErrorKind::DuplicateFunction(name) => {
-                write!(f, "duplicate function '{}' in module '{}'", name, self.module_path)
+                write!(
+                    f,
+                    "duplicate function '{}' in module '{}'",
+                    name, self.module_path
+                )
             }
             ModuleLoadErrorKind::DuplicateConstant(name) => {
-                write!(f, "duplicate constant '{}' in module '{}'", name, self.module_path)
+                write!(
+                    f,
+                    "duplicate constant '{}' in module '{}'",
+                    name, self.module_path
+                )
             }
             ModuleLoadErrorKind::ConstantError(msg) => {
-                write!(f, "constant error in module '{}': {}", self.module_path, msg)
+                write!(
+                    f,
+                    "constant error in module '{}': {}",
+                    self.module_path, msg
+                )
             }
             ModuleLoadErrorKind::RecursiveCall(msg) => {
-                write!(f, "recursive call in module '{}': {}", self.module_path, msg)
+                write!(
+                    f,
+                    "recursive call in module '{}': {}",
+                    self.module_path, msg
+                )
             }
         }
     }
@@ -132,7 +173,9 @@ pub fn load_modules(
 
         match load_single_module(module_key, &file_path) {
             Ok(loaded) => {
-                registry.modules.insert(module_key.clone(), Arc::new(loaded));
+                registry
+                    .modules
+                    .insert(module_key.clone(), Arc::new(loaded));
             }
             Err(e) => {
                 errors.push(e);
@@ -147,7 +190,10 @@ pub fn load_modules(
     }
 }
 
-fn load_single_module(module_path: &str, file_path: &Path) -> Result<LoadedModule, ModuleLoadError> {
+fn load_single_module(
+    module_path: &str,
+    file_path: &Path,
+) -> Result<LoadedModule, ModuleLoadError> {
     // Check file exists
     let metadata = std::fs::metadata(file_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -196,7 +242,11 @@ fn load_single_module(module_path: &str, file_path: &Path) -> Result<LoadedModul
     })?;
 
     // Parse
-    let ModuleParseResult { module, errors, node_count } = Parser::parse_module(source);
+    let ModuleParseResult {
+        module,
+        errors,
+        node_count,
+    } = Parser::parse_module(source);
 
     if !errors.is_empty() {
         return Err(ModuleLoadError {
@@ -291,14 +341,16 @@ mod tests {
     #[test]
     fn test_module_missing_file_error() {
         let dir = temp_rules_dir();
-        let imports = vec![
-            ("nonexistent".to_string(), vec!["nonexistent".into()]),
-        ];
+        let imports = vec![("nonexistent".to_string(), vec!["nonexistent".into()])];
         let errors = load_modules(&imports, dir.path()).unwrap_err();
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0].kind, ModuleLoadErrorKind::NotFound));
         let msg = errors[0].to_string();
-        assert!(msg.contains("nonexistent.cxl"), "error should name expected path: {}", msg);
+        assert!(
+            msg.contains("nonexistent.cxl"),
+            "error should name expected path: {}",
+            msg
+        );
     }
 
     #[test]
@@ -308,9 +360,7 @@ mod tests {
         fs::create_dir_all(&custom_dir).unwrap();
         write_module(&custom_dir, "validators.cxl", "fn check(x) = x > 0");
 
-        let imports = vec![
-            ("validators".to_string(), vec!["validators".into()]),
-        ];
+        let imports = vec![("validators".to_string(), vec!["validators".into()])];
         let registry = load_modules(&imports, &custom_dir).unwrap();
         assert_eq!(registry.len(), 1);
     }
@@ -318,11 +368,16 @@ mod tests {
     #[test]
     fn test_module_use_nested_path_filesystem() {
         let dir = temp_rules_dir();
-        write_module(dir.path(), "reporting/fiscal.cxl", "fn quarter(m) = m / 3 + 1");
+        write_module(
+            dir.path(),
+            "reporting/fiscal.cxl",
+            "fn quarter(m) = m / 3 + 1",
+        );
 
-        let imports = vec![
-            ("reporting.fiscal".to_string(), vec!["reporting".into(), "fiscal".into()]),
-        ];
+        let imports = vec![(
+            "reporting.fiscal".to_string(),
+            vec!["reporting".into(), "fiscal".into()],
+        )];
         let registry = load_modules(&imports, dir.path()).unwrap();
         assert_eq!(registry.len(), 1);
         let m = registry.get("reporting.fiscal").unwrap();
@@ -332,11 +387,16 @@ mod tests {
     #[test]
     fn test_module_deep_nested_path_filesystem() {
         let dir = temp_rules_dir();
-        write_module(dir.path(), "shared/utils/string_helpers.cxl", "fn clean(v) = v.trim()");
+        write_module(
+            dir.path(),
+            "shared/utils/string_helpers.cxl",
+            "fn clean(v) = v.trim()",
+        );
 
-        let imports = vec![
-            ("shared.utils.string_helpers".to_string(), vec!["shared".into(), "utils".into(), "string_helpers".into()]),
-        ];
+        let imports = vec![(
+            "shared.utils.string_helpers".to_string(),
+            vec!["shared".into(), "utils".into(), "string_helpers".into()],
+        )];
         let registry = load_modules(&imports, dir.path()).unwrap();
         assert_eq!(registry.len(), 1);
     }
@@ -348,7 +408,9 @@ mod tests {
 
         let imports = vec![("bad".to_string(), vec!["bad".into()])];
         let errors = load_modules(&imports, dir.path()).unwrap_err();
-        assert!(matches!(errors[0].kind, ModuleLoadErrorKind::DuplicateFunction(ref n) if n == "f"));
+        assert!(
+            matches!(errors[0].kind, ModuleLoadErrorKind::DuplicateFunction(ref n) if n == "f")
+        );
     }
 
     #[test]
@@ -358,7 +420,9 @@ mod tests {
 
         let imports = vec![("bad".to_string(), vec!["bad".into()])];
         let errors = load_modules(&imports, dir.path()).unwrap_err();
-        assert!(matches!(errors[0].kind, ModuleLoadErrorKind::DuplicateConstant(ref n) if n == "X"));
+        assert!(
+            matches!(errors[0].kind, ModuleLoadErrorKind::DuplicateConstant(ref n) if n == "X")
+        );
     }
 
     #[test]
@@ -388,7 +452,11 @@ mod tests {
     #[test]
     fn test_module_functions_only_filesystem() {
         let dir = temp_rules_dir();
-        write_module(dir.path(), "fns.cxl", "fn add(a, b) = a + b\nfn neg(x) = -x");
+        write_module(
+            dir.path(),
+            "fns.cxl",
+            "fn add(a, b) = a + b\nfn neg(x) = -x",
+        );
 
         let imports = vec![("fns".to_string(), vec!["fns".into()])];
         let registry = load_modules(&imports, dir.path()).unwrap();

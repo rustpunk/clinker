@@ -50,17 +50,61 @@ struct LogLine {
 /// Returns the hardcoded demo log content for Phase 1.
 fn demo_log() -> Vec<LogLine> {
     vec![
-        LogLine { timestamp: "00:00.000", level: Level::Cmd,  message: "$ clinker run customer_etl.yaml --verbose" },
-        LogLine { timestamp: "00:00.012", level: Level::Info, message: "clinker v0.1.0 — loading pipeline config" },
-        LogLine { timestamp: "00:00.018", level: Level::Info, message: "schema: clinker-pipeline-schema-3.json loaded" },
-        LogLine { timestamp: "00:00.021", level: Level::Info, message: "source: csv_reader — pattern customers_*.csv" },
-        LogLine { timestamp: "00:00.025", level: Level::Stat, message: "source matched 3 files (customers_2023.csv, customers_2024.csv, …)" },
-        LogLine { timestamp: "00:00.030", level: Level::Info, message: "─── PASS 1: SCAN ───" },
-        LogLine { timestamp: "00:00.180", level: Level::Stat, message: "scan complete — 47,283 rows · 12 columns · 3 files" },
-        LogLine { timestamp: "00:00.182", level: Level::Info, message: "─── PASS 2: TRANSFORM ───" },
-        LogLine { timestamp: "00:00.215", level: Level::Stat, message: "filter active_only: 47,283 → 39,104 rows (Δ -8,179)" },
-        LogLine { timestamp: "00:00.302", level: Level::Stat, message: "map enrich: 39,104 → 39,104 rows (no change)" },
-        LogLine { timestamp: "00:00.418", level: Level::Ok,   message: "pipeline complete — 39,104 rows written in 418ms" },
+        LogLine {
+            timestamp: "00:00.000",
+            level: Level::Cmd,
+            message: "$ clinker run customer_etl.yaml --verbose",
+        },
+        LogLine {
+            timestamp: "00:00.012",
+            level: Level::Info,
+            message: "clinker v0.1.0 — loading pipeline config",
+        },
+        LogLine {
+            timestamp: "00:00.018",
+            level: Level::Info,
+            message: "schema: clinker-pipeline-schema-3.json loaded",
+        },
+        LogLine {
+            timestamp: "00:00.021",
+            level: Level::Info,
+            message: "source: csv_reader — pattern customers_*.csv",
+        },
+        LogLine {
+            timestamp: "00:00.025",
+            level: Level::Stat,
+            message: "source matched 3 files (customers_2023.csv, customers_2024.csv, …)",
+        },
+        LogLine {
+            timestamp: "00:00.030",
+            level: Level::Info,
+            message: "─── PASS 1: SCAN ───",
+        },
+        LogLine {
+            timestamp: "00:00.180",
+            level: Level::Stat,
+            message: "scan complete — 47,283 rows · 12 columns · 3 files",
+        },
+        LogLine {
+            timestamp: "00:00.182",
+            level: Level::Info,
+            message: "─── PASS 2: TRANSFORM ───",
+        },
+        LogLine {
+            timestamp: "00:00.215",
+            level: Level::Stat,
+            message: "filter active_only: 47,283 → 39,104 rows (Δ -8,179)",
+        },
+        LogLine {
+            timestamp: "00:00.302",
+            level: Level::Stat,
+            message: "map enrich: 39,104 → 39,104 rows (no change)",
+        },
+        LogLine {
+            timestamp: "00:00.418",
+            level: Level::Ok,
+            message: "pipeline complete — 39,104 rows written in 418ms",
+        },
     ]
 }
 

@@ -28,7 +28,9 @@ fn rss_bytes_impl() -> Option<u64> {
     use mach2::kern_return::KERN_SUCCESS;
     use mach2::message::mach_msg_type_number_t;
     use mach2::task::task_info;
-    use mach2::task_info::{mach_task_basic_info, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT};
+    use mach2::task_info::{
+        MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_task_basic_info,
+    };
     use mach2::traps::mach_task_self;
 
     // SAFETY: FFI call to mach kernel. `mach_task_self()` returns the current
@@ -129,9 +131,8 @@ impl MemoryBudget {
     /// Returns false if RSS cannot be measured (unsupported platform).
     pub fn should_spill(&mut self) -> bool {
         self.observe();
-        self.peak_rss.map_or(false, |rss| {
-            rss > (self.limit as f64 * self.spill_threshold_pct) as u64
-        })
+        self.peak_rss
+            .is_some_and(|rss| rss > (self.limit as f64 * self.spill_threshold_pct) as u64)
     }
 
     /// Spill threshold in absolute bytes.
@@ -215,7 +216,10 @@ mod tests {
             return; // Skip on unsupported platforms
         }
         budget.observe();
-        assert!(budget.peak_rss.is_some(), "peak_rss should be set after observe()");
+        assert!(
+            budget.peak_rss.is_some(),
+            "peak_rss should be set after observe()"
+        );
         let first_peak = budget.peak_rss.unwrap();
         budget.observe();
         // Peak must be non-decreasing

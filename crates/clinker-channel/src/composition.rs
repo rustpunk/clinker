@@ -194,6 +194,7 @@ mod tests {
                 array_paths: None,
                 sort_order: None,
                 format: InputFormat::Csv(None),
+                notes: None,
             }],
             outputs: vec![OutputConfig {
                 name: "results".into(),
@@ -205,9 +206,11 @@ mod tests {
                 sort_order: None,
                 preserve_nulls: None,
                 format: OutputFormat::Csv(None),
+                notes: None,
             }],
             transformations: transforms,
             error_handling: ErrorHandlingConfig::default(),
+            notes: None,
         }
     }
 
@@ -219,6 +222,7 @@ mod tests {
             local_window: None,
             log: None,
             validations: None,
+            notes: None,
         })
     }
 
@@ -247,8 +251,7 @@ transformations:
 "#,
         );
 
-        let comp =
-            CompositionFile::load(&tmp.path().join("compositions/clean.comp.yaml")).unwrap();
+        let comp = CompositionFile::load(&tmp.path().join("compositions/clean.comp.yaml")).unwrap();
         assert_eq!(comp.header.name, "clean_customer");
         assert_eq!(
             comp.header.description.as_deref(),
@@ -368,8 +371,7 @@ transformations:
             "_composition:\n  name: b\ntransformations:\n  - _import: compositions/a.comp.yaml\n",
         );
 
-        let mut config =
-            base_config_with_transforms(vec![make_import("compositions/a.comp.yaml")]);
+        let mut config = base_config_with_transforms(vec![make_import("compositions/a.comp.yaml")]);
 
         let result = resolve_compositions(&mut config, &ws, &[]);
         assert!(matches!(result, Err(ChannelError::CircularImport { .. })));
@@ -381,10 +383,7 @@ transformations:
         // Create a chain of 12 compositions (exceeds MAX_IMPORT_DEPTH=10)
         for i in 0..12 {
             let next = if i < 11 {
-                format!(
-                    "  - _import: compositions/chain_{}.comp.yaml\n",
-                    i + 1
-                )
+                format!("  - _import: compositions/chain_{}.comp.yaml\n", i + 1)
             } else {
                 "  - name: end\n    cxl: \"emit x = 1\"\n".to_string()
             };
@@ -457,7 +456,8 @@ transformations:
             "_composition:\n  name: audit\ntransformations:\n  - name: from_var_path\n    cxl: \"emit x = 1\"\n",
         );
 
-        let mut config = base_config_with_transforms(vec![make_import("${COMP_DIR}/audit.comp.yaml")]);
+        let mut config =
+            base_config_with_transforms(vec![make_import("${COMP_DIR}/audit.comp.yaml")]);
 
         let vars = [("COMP_DIR", "libs")];
         let provenance = resolve_compositions(&mut config, &ws, &vars).unwrap();
@@ -477,9 +477,8 @@ transformations:
         );
 
         // Import path is workspace-root-relative, NOT relative to the importing file
-        let mut config = base_config_with_transforms(vec![make_import(
-            "shared/comps/audit.comp.yaml",
-        )]);
+        let mut config =
+            base_config_with_transforms(vec![make_import("shared/comps/audit.comp.yaml")]);
 
         resolve_compositions(&mut config, &ws, &[]).unwrap();
         let names: Vec<_> = config.transforms().map(|t| t.name.as_str()).collect();
@@ -489,9 +488,8 @@ transformations:
     #[test]
     fn test_resolve_not_found() {
         let (_tmp, ws) = test_workspace();
-        let mut config = base_config_with_transforms(vec![make_import(
-            "compositions/nonexistent.comp.yaml",
-        )]);
+        let mut config =
+            base_config_with_transforms(vec![make_import("compositions/nonexistent.comp.yaml")]);
 
         let result = resolve_compositions(&mut config, &ws, &[]);
         assert!(matches!(

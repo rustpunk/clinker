@@ -74,10 +74,7 @@ impl WorkspaceRoot {
         // Check CLINKER_WORKSPACE_ROOT env var first — bypasses walk entirely
         if let Ok(ws_root) = std::env::var("CLINKER_WORKSPACE_ROOT") {
             let root = PathBuf::from(ws_root);
-            return match Self::at(&root) {
-                Ok(ws) => Some(ws),
-                Err(_) => None,
-            };
+            return Self::at(&root).ok();
         }
 
         // Walk from the pipeline file's parent directory upward
@@ -92,10 +89,7 @@ impl WorkspaceRoot {
         while let Some(dir) = walk_dir {
             let candidate = dir.join("clinker.toml");
             if candidate.exists() {
-                return match Self::load_at(dir) {
-                    Ok(ws) => Some(ws),
-                    Err(_) => None,
-                };
+                return Self::load_at(dir).ok();
             }
             walk_dir = dir.parent();
         }

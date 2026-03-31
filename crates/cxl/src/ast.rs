@@ -424,11 +424,7 @@ mod tests {
     #[test]
     fn test_ast_expr_size() {
         let size = std::mem::size_of::<Expr>();
-        assert!(
-            size <= 72,
-            "Expr is {} bytes, budget is 72",
-            size
-        );
+        assert!(size <= 72, "Expr is {} bytes, budget is 72", size);
     }
 
     #[test]
@@ -502,10 +498,7 @@ mod tests {
     #[test]
     fn test_ast_now_variant() {
         let span = Span::new(0, 3);
-        let expr = Expr::Now {
-            node_id: NID,
-            span,
-        };
+        let expr = Expr::Now { node_id: NID, span };
         assert_eq!(expr.span(), span);
         assert_eq!(expr.node_id(), NID);
     }

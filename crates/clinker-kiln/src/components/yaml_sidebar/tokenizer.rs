@@ -4,7 +4,6 @@
 /// line-by-line pass that covers the common patterns in the demo YAML.
 ///
 /// Replaced in Phase 2 with incremental parsing driven by serde-saphyr.
-
 /// A single coloured span within a YAML line.
 #[derive(Clone, Debug)]
 pub struct Token {
@@ -60,7 +59,10 @@ impl TokenKind {
 
 impl Token {
     fn new(kind: TokenKind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into() }
+        Self {
+            kind,
+            text: text.into(),
+        }
     }
 }
 
@@ -262,8 +264,12 @@ pub fn tokenize_cxl(cxl: &str) -> Vec<Token> {
         }
 
         // Punctuation
-        if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | '.' | ',' | ':' | '_')
-            && !(ch == '_' && i + 1 < len && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '_'))
+        if matches!(
+            ch,
+            '(' | ')' | '[' | ']' | '{' | '}' | '.' | ',' | ':' | '_'
+        ) && !(ch == '_'
+            && i + 1 < len
+            && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '_'))
         {
             tokens.push(Token::new(TokenKind::CxlPunct, &cxl[i..i + 1]));
             i += 1;

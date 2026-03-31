@@ -31,10 +31,7 @@ pub fn ChannelSwitcher(
         return rsx! {};
     };
 
-    let active_value = channel_state
-        .active_channel
-        .clone()
-        .unwrap_or_default();
+    let active_value = channel_state.active_channel.clone().unwrap_or_default();
 
     let channels = channel_state.channels.clone();
 

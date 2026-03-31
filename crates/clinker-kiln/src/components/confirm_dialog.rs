@@ -2,7 +2,6 @@
 ///
 /// Spec §F2.5: centered modal with backdrop blur, hazard accent,
 /// Save / Don't Save / Cancel buttons.
-
 use dioxus::prelude::*;
 
 /// What action the user chose in the confirmation dialog.
@@ -25,10 +24,7 @@ pub struct PendingConfirm {
 /// Rendered as a modal overlay. The parent provides a signal with the
 /// pending confirm state and handles the result.
 #[component]
-pub fn ConfirmDialog(
-    pending: PendingConfirm,
-    on_action: EventHandler<ConfirmAction>,
-) -> Element {
+pub fn ConfirmDialog(pending: PendingConfirm, on_action: EventHandler<ConfirmAction>) -> Element {
     rsx! {
         // Backdrop
         div {

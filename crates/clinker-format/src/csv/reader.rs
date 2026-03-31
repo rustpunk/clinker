@@ -58,11 +58,9 @@ impl<R: Read> CsvReader<R> {
         }
 
         let columns: Vec<Box<str>> = if self.config.has_header {
-            let headers = self.inner.headers().map_err(csv::Error::from)?;
+            let headers = self.inner.headers()?;
             if headers.is_empty() {
-                return Err(FormatError::SchemaInference(
-                    "header row is empty".into(),
-                ));
+                return Err(FormatError::SchemaInference("header row is empty".into()));
             }
             headers.iter().map(|h| h.into()).collect()
         } else {

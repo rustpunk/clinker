@@ -8,7 +8,7 @@
 
 use dioxus::prelude::*;
 
-use clinker_schema::{FieldDescriptor, FieldType};
+use clinker_schema::FieldDescriptor;
 
 /// Render a list of fields, with recursive nesting for object types.
 #[component]
@@ -45,20 +45,9 @@ fn FieldRow(field: FieldDescriptor, depth: u32) -> Element {
 
     let is_attr = field.is_xml_attribute();
     let has_enum = field.enum_values.as_ref().is_some_and(|v| !v.is_empty());
-    let enum_count = field
-        .enum_values
-        .as_ref()
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let has_children = field
-        .fields
-        .as_ref()
-        .is_some_and(|c| !c.is_empty());
-    let child_count = field
-        .fields
-        .as_ref()
-        .map(|c| c.len())
-        .unwrap_or(0);
+    let enum_count = field.enum_values.as_ref().map(|v| v.len()).unwrap_or(0);
+    let has_children = field.fields.as_ref().is_some_and(|c| !c.is_empty());
+    let child_count = field.fields.as_ref().map(|c| c.len()).unwrap_or(0);
 
     let desc_snippet = field
         .description
@@ -73,7 +62,7 @@ fn FieldRow(field: FieldDescriptor, depth: u32) -> Element {
         .unwrap_or_default();
 
     // Prefix for nested fields
-    let prefix = if depth > 0 { "│ " } else { "│ " };
+    let prefix = "│ ";
 
     rsx! {
         div {

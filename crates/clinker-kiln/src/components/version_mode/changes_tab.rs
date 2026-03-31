@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use clinker_git::{GitOps, StatusKind};
 
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::state::TabManagerState;
 
 /// Changes tab component.
@@ -110,7 +110,9 @@ fn do_commit(tab_mgr: &mut TabManagerState, message: &str, push: bool) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
 
-    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else {
+        return;
+    };
     let mut toast: Signal<Option<ToastState>> = use_context();
 
     // Stage all
@@ -123,13 +125,14 @@ fn do_commit(tab_mgr: &mut TabManagerState, message: &str, push: bool) {
     match ops.commit(message) {
         Ok(info) => {
             let short_hash = &info.id[..8.min(info.id.len())];
-            toast_success(&mut toast, &format!("Committed: {short_hash} {}", info.subject));
+            toast_success(
+                &mut toast,
+                format!("Committed: {short_hash} {}", info.subject),
+            );
 
             // Push if requested
-            if push {
-                if let Err(e) = ops.push() {
-                    toast_error(&mut toast, format!("push failed: {e}"));
-                }
+            if push && let Err(e) = ops.push() {
+                toast_error(&mut toast, format!("push failed: {e}"));
             }
         }
         Err(e) => {

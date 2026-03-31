@@ -1,7 +1,6 @@
 /// Tab bar: horizontal strip below the title bar showing open pipeline tabs.
 ///
 /// Spec §F3.1: 28px height, active/inactive styling, dirty dot, close button, [+] new tab.
-
 use dioxus::prelude::*;
 
 use crate::keyboard;

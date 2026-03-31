@@ -11,7 +11,6 @@
 ///
 /// Resolution happens at parse time: `_import` directives are expanded inline,
 /// overrides merged by transformation name, and circular imports rejected.
-
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -295,7 +294,10 @@ fn resolve_imports_inner(
         pipeline: raw.pipeline.clone(),
         inputs: raw.inputs.clone(),
         outputs: raw.outputs.clone(),
-        transformations: resolved_transforms.into_iter().map(TransformEntry::Transform).collect(),
+        transformations: resolved_transforms
+            .into_iter()
+            .map(TransformEntry::Transform)
+            .collect(),
         error_handling: raw.error_handling.clone(),
         notes: raw.notes.clone(),
     };
@@ -525,6 +527,13 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
+    fn as_transform(entry: &TransformEntry) -> &TransformConfig {
+        match entry {
+            TransformEntry::Transform(t) => t,
+            _ => panic!("expected Transform variant"),
+        }
+    }
+
     const COMP_YAML: &str = r#"
 _compose:
   name: "Clean Customer Data"
@@ -607,7 +616,9 @@ transformations:
         assert_eq!(raw.transformations.len(), 3);
 
         // First is inline
-        assert!(matches!(&raw.transformations[0], RawTransformEntry::Inline(t) if t.name == "pre_clean"));
+        assert!(
+            matches!(&raw.transformations[0], RawTransformEntry::Inline(t) if t.name == "pre_clean")
+        );
 
         // Second is import
         match &raw.transformations[1] {
@@ -622,7 +633,9 @@ transformations:
         }
 
         // Third is inline
-        assert!(matches!(&raw.transformations[2], RawTransformEntry::Inline(t) if t.name == "post_process"));
+        assert!(
+            matches!(&raw.transformations[2], RawTransformEntry::Inline(t) if t.name == "post_process")
+        );
     }
 
     #[test]
@@ -656,10 +669,19 @@ transformations:
 
         // 1 inline + 2 from composition + 1 inline = 4
         assert_eq!(resolved.transformations.len(), 4);
-        assert_eq!(resolved.transformations[0].name, "pre_clean");
-        assert_eq!(resolved.transformations[1].name, "normalize_names");
-        assert_eq!(resolved.transformations[2].name, "validate_emails");
-        assert_eq!(resolved.transformations[3].name, "post_process");
+        assert_eq!(as_transform(&resolved.transformations[0]).name, "pre_clean");
+        assert_eq!(
+            as_transform(&resolved.transformations[1]).name,
+            "normalize_names"
+        );
+        assert_eq!(
+            as_transform(&resolved.transformations[2]).name,
+            "validate_emails"
+        );
+        assert_eq!(
+            as_transform(&resolved.transformations[3]).name,
+            "post_process"
+        );
 
         // Composition metadata
         assert_eq!(compositions.len(), 1);
@@ -698,9 +720,17 @@ transformations:
 
         assert_eq!(resolved.transformations.len(), 2);
         // First transform unchanged
-        assert!(resolved.transformations[0].cxl.contains("emit full_name"));
+        assert!(
+            as_transform(&resolved.transformations[0])
+                .cxl
+                .contains("emit full_name")
+        );
         // Second transform overridden
-        assert!(resolved.transformations[1].cxl.contains("contains"));
+        assert!(
+            as_transform(&resolved.transformations[1])
+                .cxl
+                .contains("contains")
+        );
 
         // Override count tracked
         assert_eq!(compositions[0].override_count, 1);
@@ -708,7 +738,11 @@ transformations:
         // Original CXL preserved in origins
         let origin = &compositions[0].origins[1];
         assert_eq!(origin.transform_name, "validate_emails");
-        assert!(origin.original_cxl.contains("emit email_valid = email_lower"));
+        assert!(
+            origin
+                .original_cxl
+                .contains("emit email_valid = email_lower")
+        );
     }
 
     #[test]
@@ -800,7 +834,11 @@ transformations:
         assert!(result.is_err());
 
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| matches!(e, CompositionError::CircularImport { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, CompositionError::CircularImport { .. }))
+        );
     }
 
     #[test]
@@ -853,9 +891,15 @@ transformations:
 
         // outer_pre + inner_step + outer_post = 3
         assert_eq!(resolved.transformations.len(), 3);
-        assert_eq!(resolved.transformations[0].name, "outer_pre");
-        assert_eq!(resolved.transformations[1].name, "inner_step");
-        assert_eq!(resolved.transformations[2].name, "outer_post");
+        assert_eq!(as_transform(&resolved.transformations[0]).name, "outer_pre");
+        assert_eq!(
+            as_transform(&resolved.transformations[1]).name,
+            "inner_step"
+        );
+        assert_eq!(
+            as_transform(&resolved.transformations[2]).name,
+            "outer_post"
+        );
 
         // Two compositions resolved (outer and inner)
         assert_eq!(compositions.len(), 2);
@@ -867,10 +911,12 @@ transformations:
         let upstream = vec!["email".to_string()]; // missing first_name
 
         let warnings = validate_contract(&comp, "clean.comp.yaml", &upstream);
-        assert!(warnings
-            .iter()
-            .any(|w| w.kind == ContractWarningKind::MissingRequiredField
-                && w.message.contains("first_name")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.kind == ContractWarningKind::MissingRequiredField
+                    && w.message.contains("first_name"))
+        );
     }
 
     #[test]
@@ -880,9 +926,11 @@ transformations:
 
         let warnings = validate_contract(&comp, "clean.comp.yaml", &upstream);
         // No missing required fields (produces warnings may still fire for heuristic check)
-        assert!(!warnings
-            .iter()
-            .any(|w| w.kind == ContractWarningKind::MissingRequiredField));
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.kind == ContractWarningKind::MissingRequiredField)
+        );
     }
 
     #[test]
@@ -953,9 +1001,11 @@ transformations:
         let raw = parse_raw_config(yaml).unwrap();
         let result = resolve_imports(&raw, dir.path());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .iter()
-            .any(|e| matches!(e, CompositionError::IoError { .. })));
+        assert!(
+            result
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, CompositionError::IoError { .. }))
+        );
     }
 }

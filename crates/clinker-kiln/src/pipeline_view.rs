@@ -8,7 +8,6 @@
 /// - **Inline** (≤4 transforms): individual transform nodes with `from_composition` metadata
 ///   and a `CompositionGroup` boundary marker.
 /// - **Collapsed** (5+ transforms): a single `StageKind::Composition` node that can drill in.
-
 use clinker_core::composition::{CompositionOrigin, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 
@@ -118,7 +117,10 @@ pub struct StageView {
 impl StageView {
     /// Centre of the right-side output port — connector source point.
     pub fn port_out(&self) -> (f32, f32) {
-        (self.canvas_x + NODE_WIDTH, self.canvas_y + NODE_HEIGHT / 2.0)
+        (
+            self.canvas_x + NODE_WIDTH,
+            self.canvas_y + NODE_HEIGHT / 2.0,
+        )
     }
 
     /// Centre of the left-side input port — connector target point.
@@ -310,7 +312,10 @@ pub fn derive_pipeline_view(
             (target.canvas_x - NODE_WIDTH - NODE_GAP / 2.0, iy)
         } else {
             // No transforms — just place at LEFT_MARGIN.
-            (LEFT_MARGIN, BASE_Y + (input_idx as f32) * (NODE_HEIGHT + STACK_GAP))
+            (
+                LEFT_MARGIN,
+                BASE_Y + (input_idx as f32) * (NODE_HEIGHT + STACK_GAP),
+            )
         };
 
         input_stages.push(StageView {
@@ -475,21 +480,32 @@ pub fn derive_composition_drill_view(
 
     let comp = compositions.iter().find(|c| c.path == composition_path);
     let Some(comp) = comp else {
-        return PipelineView { stages: Vec::new(), composition_groups: Vec::new(), connections: Vec::new() };
+        return PipelineView {
+            stages: Vec::new(),
+            composition_groups: Vec::new(),
+            connections: Vec::new(),
+        };
     };
 
     let transforms: Vec<_> = config.transforms().collect();
 
     let start_idx = transforms.iter().position(|t| {
-        comp.transform_names.first().map(|n| n == &t.name).unwrap_or(false)
+        comp.transform_names
+            .first()
+            .map(|n| n == &t.name)
+            .unwrap_or(false)
     });
 
     if let Some(start) = start_idx {
         for (i, name) in comp.transform_names.iter().enumerate() {
             let t_idx = start + i;
-            if t_idx >= transforms.len() { break; }
+            if t_idx >= transforms.len() {
+                break;
+            }
             let t = transforms[t_idx];
-            if t.name != *name { break; }
+            if t.name != *name {
+                break;
+            }
 
             let y = BASE_Y + if i % 2 == 0 { 0.0 } else { STAGGER_Y };
             let subtitle = cxl_subtitle(&t.cxl);
@@ -516,7 +532,11 @@ pub fn derive_composition_drill_view(
         .map(|i| (i, i + 1))
         .collect();
 
-    PipelineView { stages, composition_groups: Vec::new(), connections }
+    PipelineView {
+        stages,
+        composition_groups: Vec::new(),
+        connections,
+    }
 }
 
 /// Find which composition (if any) a transform belongs to, and its index within that composition.
@@ -531,10 +551,10 @@ fn find_composition<'a>(
             .position(|n| n == &transform.name)
         {
             // Verify by checking the origin's transform name matches
-            if let Some(origin) = comp.origins.get(idx) {
-                if origin.transform_name == transform.name {
-                    return Some((comp, idx));
-                }
+            if let Some(origin) = comp.origins.get(idx)
+                && origin.transform_name == transform.name
+            {
+                return Some((comp, idx));
             }
         }
     }
@@ -563,7 +583,7 @@ pub fn derive_partial_pipeline_view(
     let output_count = partial.outputs.len();
 
     // Helper to compute staggered Y
-    let y_for = |i: usize| BASE_Y + if i % 2 == 0 { 0.0 } else { STAGGER_Y };
+    let y_for = |i: usize| BASE_Y + if i.is_multiple_of(2) { 0.0 } else { STAGGER_Y };
 
     // ── Transforms (horizontal spine) ───────────────────────────────────────
     let transform_x_start = if input_count == 0 {
@@ -644,7 +664,10 @@ pub fn derive_partial_pipeline_view(
                 - (stack_n as f32) * (NODE_HEIGHT + STACK_GAP);
             (target.canvas_x - NODE_WIDTH - NODE_GAP / 2.0, iy)
         } else {
-            (LEFT_MARGIN, BASE_Y + (input_idx as f32) * (NODE_HEIGHT + STACK_GAP))
+            (
+                LEFT_MARGIN,
+                BASE_Y + (input_idx as f32) * (NODE_HEIGHT + STACK_GAP),
+            )
         };
 
         match item {

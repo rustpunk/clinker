@@ -128,7 +128,13 @@ mod tests {
         Arc::new(Schema::new(vec!["name".into(), "value".into()]))
     }
 
-    fn make_dlq_entry(row: u64, category: DlqErrorCategory, error: &str, name: &str, value: &str) -> DlqEntry {
+    fn make_dlq_entry(
+        row: u64,
+        category: DlqErrorCategory,
+        error: &str,
+        name: &str,
+        value: &str,
+    ) -> DlqEntry {
         let schema = make_schema();
         let record = Record::new(
             schema,
@@ -144,7 +150,13 @@ mod tests {
 
     #[test]
     fn test_dlq_all_columns_present() {
-        let entries = vec![make_dlq_entry(2, DlqErrorCategory::TypeCoercionFailure, "eval error", "Alice", "bad")];
+        let entries = vec![make_dlq_entry(
+            2,
+            DlqErrorCategory::TypeCoercionFailure,
+            "eval error",
+            "Alice",
+            "bad",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -184,13 +196,23 @@ mod tests {
     #[test]
     fn test_dlq_uuid_v7_unique() {
         let entries: Vec<_> = (0..1000)
-            .map(|i| make_dlq_entry(i, DlqErrorCategory::TypeCoercionFailure, &format!("err{i}"), "n", "v"))
+            .map(|i| {
+                make_dlq_entry(
+                    i,
+                    DlqErrorCategory::TypeCoercionFailure,
+                    &format!("err{i}"),
+                    "n",
+                    "v",
+                )
+            })
             .collect();
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        let ids: Vec<&str> = output.lines().skip(1)
+        let ids: Vec<&str> = output
+            .lines()
+            .skip(1)
             .map(|l| l.split(',').next().unwrap())
             .collect();
         let mut unique = ids.clone();
@@ -201,7 +223,13 @@ mod tests {
 
     #[test]
     fn test_dlq_error_category_missing_required() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::MissingRequiredField, "field X is required", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::MissingRequiredField,
+            "field X is required",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -212,7 +240,13 @@ mod tests {
 
     #[test]
     fn test_dlq_error_category_type_coercion() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::TypeCoercionFailure, "cannot convert", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::TypeCoercionFailure,
+            "cannot convert",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -223,7 +257,13 @@ mod tests {
 
     #[test]
     fn test_dlq_error_category_nan() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::NanInOutputField, "NaN in field X", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::NanInOutputField,
+            "NaN in field X",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -234,7 +274,13 @@ mod tests {
 
     #[test]
     fn test_dlq_error_category_validation() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::ValidationFailure, "check failed", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::ValidationFailure,
+            "check failed",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -245,7 +291,13 @@ mod tests {
 
     #[test]
     fn test_dlq_error_category_aggregate() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::AggregateTypeError, "sum got non-numeric", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::AggregateTypeError,
+            "sum got non-numeric",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -256,7 +308,13 @@ mod tests {
 
     #[test]
     fn test_dlq_error_category_required_conversion() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::RequiredFieldConversionFailure, "required conversion failed", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::RequiredFieldConversionFailure,
+            "required conversion failed",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -267,7 +325,13 @@ mod tests {
 
     #[test]
     fn test_dlq_include_reason_false() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::TypeCoercionFailure, "error", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::TypeCoercionFailure,
+            "error",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", false, true).unwrap();
@@ -282,7 +346,13 @@ mod tests {
 
     #[test]
     fn test_dlq_include_source_row_false() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::TypeCoercionFailure, "error", "Alice", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::TypeCoercionFailure,
+            "error",
+            "Alice",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, false).unwrap();
@@ -299,10 +369,18 @@ mod tests {
 
     #[test]
     fn test_dlq_source_fields_schema_order() {
-        let schema = Arc::new(Schema::new(vec!["zulu".into(), "alpha".into(), "mike".into()]));
+        let schema = Arc::new(Schema::new(vec![
+            "zulu".into(),
+            "alpha".into(),
+            "mike".into(),
+        ]));
         let record = Record::new(
             schema.clone(),
-            vec![Value::String("Z".into()), Value::String("A".into()), Value::String("M".into())],
+            vec![
+                Value::String("Z".into()),
+                Value::String("A".into()),
+                Value::String("M".into()),
+            ],
         );
         let entries = vec![DlqEntry {
             source_row: 1,
@@ -324,7 +402,13 @@ mod tests {
 
     #[test]
     fn test_dlq_timestamp_iso8601() {
-        let entries = vec![make_dlq_entry(1, DlqErrorCategory::TypeCoercionFailure, "error", "a", "1")];
+        let entries = vec![make_dlq_entry(
+            1,
+            DlqErrorCategory::TypeCoercionFailure,
+            "error",
+            "a",
+            "1",
+        )];
         let schema = make_schema();
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -339,11 +423,29 @@ mod tests {
 
     #[test]
     fn test_dlq_category_as_str_all_variants() {
-        assert_eq!(DlqErrorCategory::MissingRequiredField.as_str(), "missing_required_field");
-        assert_eq!(DlqErrorCategory::TypeCoercionFailure.as_str(), "type_coercion_failure");
-        assert_eq!(DlqErrorCategory::RequiredFieldConversionFailure.as_str(), "required_field_conversion_failure");
-        assert_eq!(DlqErrorCategory::NanInOutputField.as_str(), "nan_in_output_field");
-        assert_eq!(DlqErrorCategory::AggregateTypeError.as_str(), "aggregate_type_error");
-        assert_eq!(DlqErrorCategory::ValidationFailure.as_str(), "validation_failure");
+        assert_eq!(
+            DlqErrorCategory::MissingRequiredField.as_str(),
+            "missing_required_field"
+        );
+        assert_eq!(
+            DlqErrorCategory::TypeCoercionFailure.as_str(),
+            "type_coercion_failure"
+        );
+        assert_eq!(
+            DlqErrorCategory::RequiredFieldConversionFailure.as_str(),
+            "required_field_conversion_failure"
+        );
+        assert_eq!(
+            DlqErrorCategory::NanInOutputField.as_str(),
+            "nan_in_output_field"
+        );
+        assert_eq!(
+            DlqErrorCategory::AggregateTypeError.as_str(),
+            "aggregate_type_error"
+        );
+        assert_eq!(
+            DlqErrorCategory::ValidationFailure.as_str(),
+            "validation_failure"
+        );
     }
 }

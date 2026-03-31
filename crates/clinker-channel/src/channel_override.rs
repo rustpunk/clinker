@@ -179,18 +179,15 @@ impl ChannelOverride {
 
     /// Load an override file. Returns `None` if the file does not exist
     /// (channel has no override for this pipeline). Errors on parse failure.
-    pub fn load(
-        path: &Path,
-        channel_vars: &[(&str, &str)],
-    ) -> Result<Option<Self>, ChannelError> {
+    pub fn load(path: &Path, channel_vars: &[(&str, &str)]) -> Result<Option<Self>, ChannelError> {
         let raw = match std::fs::read_to_string(path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(ChannelError::Io(e)),
         };
 
-        let interpolated = clinker_core::config::interpolate_env_vars(&raw, channel_vars)
-            .map_err(|e| {
+        let interpolated =
+            clinker_core::config::interpolate_env_vars(&raw, channel_vars).map_err(|e| {
                 ChannelError::Validation(format!(
                     "failed to interpolate variables in {}: {}",
                     path.display(),
@@ -298,15 +295,15 @@ pub fn resolve_channel(
     for add_comp in &override_file.add_compositions {
         let comp_path = workspace.resolve_comp_path(&add_comp.r#ref);
         if !comp_path.exists() {
-            return Err(ChannelError::CompositionNotFound {
-                path: comp_path,
-            });
+            return Err(ChannelError::CompositionNotFound { path: comp_path });
         }
 
         let anchor_pos = config
             .transformations
             .iter()
-            .position(|entry| matches!(entry, TransformEntry::Transform(t) if t.name == add_comp.after))
+            .position(
+                |entry| matches!(entry, TransformEntry::Transform(t) if t.name == add_comp.after),
+            )
             .ok_or_else(|| ChannelError::AddAfterNotFound {
                 name: format!("composition:{}", add_comp.r#ref),
                 after: add_comp.after.clone(),
@@ -315,8 +312,8 @@ pub fn resolve_channel(
 
         // Load composition and inline its transforms
         let comp = crate::composition::CompositionFile::load(&comp_path)?;
-        let canonical = std::fs::canonicalize(&comp_path)
-            .map_err(|_| ChannelError::CompositionNotFound {
+        let canonical =
+            std::fs::canonicalize(&comp_path).map_err(|_| ChannelError::CompositionNotFound {
                 path: comp_path.clone(),
             })?;
 
@@ -336,14 +333,18 @@ pub fn resolve_channel(
         // Insert after anchor (wrap each TransformConfig in TransformEntry)
         let insert_at = anchor_pos + 1;
         for (i, t) in resolved_transforms.into_iter().enumerate() {
-            config.transformations.insert(insert_at + i, TransformEntry::Transform(t));
+            config
+                .transformations
+                .insert(insert_at + i, TransformEntry::Transform(t));
         }
     }
 
     // 6. Remove transformations — by name (warning if not found)
     for name in &override_file.remove_transformations {
         let before_len = config.transformations.len();
-        config.transformations.retain(|entry| !matches!(entry, TransformEntry::Transform(t) if t.name == *name));
+        config
+            .transformations
+            .retain(|entry| !matches!(entry, TransformEntry::Transform(t) if t.name == *name));
         if config.transformations.len() == before_len {
             tracing::warn!("remove_transformations: '{}' not found — skipping", name);
         }
@@ -380,7 +381,9 @@ pub fn resolve_channel(
         }
 
         for name in &names_to_remove {
-            config.transformations.retain(|entry| !matches!(entry, TransformEntry::Transform(t) if t.name == *name));
+            config
+                .transformations
+                .retain(|entry| !matches!(entry, TransformEntry::Transform(t) if t.name == *name));
             provenance.remove(name);
         }
     }
@@ -422,16 +425,13 @@ pub fn resolve_channel_with_inheritance(
     channel_vars: &[(&str, &str)],
     provenance: &mut ProvenanceMap,
 ) -> Result<PipelineConfig, ChannelError> {
-    let manifest =
-        crate::manifest::ChannelManifest::load(&workspace.channel_dir(channel_id))?;
+    let manifest = crate::manifest::ChannelManifest::load(&workspace.channel_dir(channel_id))?;
 
     // Apply group overrides in order
     let group_ids = match &manifest.metadata.inherits {
         crate::manifest::ChannelInherits::None => vec![],
         crate::manifest::ChannelInherits::Single(id) => vec![id.as_str()],
-        crate::manifest::ChannelInherits::Multiple(ids) => {
-            ids.iter().map(|s| s.as_str()).collect()
-        }
+        crate::manifest::ChannelInherits::Multiple(ids) => ids.iter().map(|s| s.as_str()).collect(),
     };
 
     for group_id in &group_ids {
@@ -444,20 +444,20 @@ pub fn resolve_channel_with_inheritance(
 
         // Load group's .channel.yaml for this pipeline (may not exist → skip)
         let override_path = ChannelOverride::path_for(pipeline_path, &group_dir);
-        if let Some(co) = ChannelOverride::load(&override_path, channel_vars)? {
-            if co.when_passes() {
-                config = resolve_channel(config, &co, workspace, channel_vars, provenance)?;
-            }
+        if let Some(co) = ChannelOverride::load(&override_path, channel_vars)?
+            && co.when_passes()
+        {
+            config = resolve_channel(config, &co, workspace, channel_vars, provenance)?;
         }
     }
 
     // Apply channel-specific override (always wins over groups)
     let channel_dir = workspace.channel_dir(channel_id);
     let override_path = ChannelOverride::path_for(pipeline_path, &channel_dir);
-    if let Some(co) = ChannelOverride::load(&override_path, channel_vars)? {
-        if co.when_passes() {
-            config = resolve_channel(config, &co, workspace, channel_vars, provenance)?;
-        }
+    if let Some(co) = ChannelOverride::load(&override_path, channel_vars)?
+        && co.when_passes()
+    {
+        config = resolve_channel(config, &co, workspace, channel_vars, provenance)?;
     }
 
     Ok(config)
@@ -522,9 +522,7 @@ fn apply_output_delta(output: &mut OutputConfig, delta: &OutputOverrideDelta) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_core::config::{
-        ErrorStrategy, InputFormat, OutputFormat, PipelineMeta,
-    };
+    use clinker_core::config::{ErrorStrategy, InputFormat, OutputFormat, PipelineMeta};
 
     /// Unwrap a `TransformEntry::Transform` for test assertions.
     fn t(entry: &TransformEntry) -> &TransformConfig {
@@ -557,19 +555,19 @@ mod tests {
                 array_paths: None,
                 sort_order: None,
                 format: InputFormat::Csv(None),
+                notes: None,
             }],
             outputs: vec![OutputConfig {
                 name: "results".into(),
                 path: "/data/output.csv".into(),
                 include_unmapped: false,
                 include_header: None,
-                mapping: Some(IndexMap::from([
-                    ("name".into(), "name".into()),
-                ])),
+                mapping: Some(IndexMap::from([("name".into(), "name".into())])),
                 exclude: None,
                 sort_order: None,
                 preserve_nulls: None,
                 format: OutputFormat::Csv(None),
+                notes: None,
             }],
             transformations: vec![
                 TransformEntry::Transform(TransformConfig {
@@ -579,6 +577,7 @@ mod tests {
                     local_window: None,
                     log: None,
                     validations: None,
+                    notes: None,
                 }),
                 TransformEntry::Transform(TransformConfig {
                     name: "normalize_names".into(),
@@ -587,9 +586,11 @@ mod tests {
                     local_window: None,
                     log: None,
                     validations: None,
+                    notes: None,
                 }),
             ],
             error_handling: ErrorHandlingConfig::default(),
+            notes: None,
         }
     }
 
@@ -1020,22 +1021,28 @@ transformations:
 
         // Pre-populate: base config with transforms that came from this composition
         let mut config = base_config();
-        config.transformations.push(TransformEntry::Transform(TransformConfig {
-            name: "legacy_a".into(),
-            description: None,
-            cxl: "emit a = 1".into(),
-            local_window: None,
-            log: None,
-            validations: None,
-        }));
-        config.transformations.push(TransformEntry::Transform(TransformConfig {
-            name: "legacy_b".into(),
-            description: None,
-            cxl: "emit b = 2".into(),
-            local_window: None,
-            log: None,
-            validations: None,
-        }));
+        config
+            .transformations
+            .push(TransformEntry::Transform(TransformConfig {
+                name: "legacy_a".into(),
+                description: None,
+                cxl: "emit a = 1".into(),
+                local_window: None,
+                log: None,
+                validations: None,
+                notes: None,
+            }));
+        config
+            .transformations
+            .push(TransformEntry::Transform(TransformConfig {
+                name: "legacy_b".into(),
+                description: None,
+                cxl: "emit b = 2".into(),
+                local_window: None,
+                log: None,
+                validations: None,
+                notes: None,
+            }));
         provenance.insert("legacy_a".into(), canonical.clone());
         provenance.insert("legacy_b".into(), canonical.clone());
 
@@ -1060,7 +1067,9 @@ transformations:
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         // Both legacy transforms removed
         assert_eq!(result.transformations.len(), 2); // only original filter_active + normalize_names
-        assert!(!result.transformations.iter().any(|entry| matches!(entry, TransformEntry::Transform(t) if t.name.starts_with("legacy"))));
+        assert!(!result.transformations.iter().any(
+            |entry| matches!(entry, TransformEntry::Transform(t) if t.name.starts_with("legacy"))
+        ));
         assert!(!provenance.contains_key("legacy_a"));
         assert!(!provenance.contains_key("legacy_b"));
     }
@@ -1311,14 +1320,23 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 
         // Group changed filter_active
         assert!(t(&result.transformations[0]).cxl.contains("group_applied"));
         // Channel changed normalize_names
-        assert!(t(&result.transformations[1]).cxl.contains("channel_applied"));
+        assert!(
+            t(&result.transformations[1])
+                .cxl
+                .contains("channel_applied")
+        );
     }
 
     #[test]
@@ -1355,7 +1373,12 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 
@@ -1393,7 +1416,12 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 
@@ -1419,12 +1447,21 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 
         // Base config unchanged
-        assert!(t(&result.transformations[0]).cxl.contains("status != \"active\""));
+        assert!(
+            t(&result.transformations[0])
+                .cxl
+                .contains("status != \"active\"")
+        );
     }
 
     #[test]
@@ -1441,7 +1478,12 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         );
 
         assert!(matches!(result, Err(ChannelError::GroupNotFound { .. })));
@@ -1470,12 +1512,21 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 
         // Group override skipped — base unchanged
-        assert!(!t(&result.transformations[0]).cxl.contains("should_not_apply"));
+        assert!(
+            !t(&result.transformations[0])
+                .cxl
+                .contains("should_not_apply")
+        );
     }
 
     #[test]
@@ -1511,24 +1562,36 @@ transformations:
 
         // Pre-populate config and provenance with composition transforms
         let mut config = base_config();
-        config.transformations.push(TransformEntry::Transform(TransformConfig {
-            name: "legacy_step".into(),
-            description: None,
-            cxl: "emit x = 1".into(),
-            local_window: None,
-            log: None,
-            validations: None,
-        }));
+        config
+            .transformations
+            .push(TransformEntry::Transform(TransformConfig {
+                name: "legacy_step".into(),
+                description: None,
+                cxl: "emit x = 1".into(),
+                local_window: None,
+                log: None,
+                validations: None,
+                notes: None,
+            }));
         let mut provenance = ProvenanceMap::new();
         provenance.insert("legacy_step".into(), canonical);
 
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 
         // Group removed the composition's transforms — channel sees them gone
-        assert!(!result.transformations.iter().any(|entry| matches!(entry, TransformEntry::Transform(t) if t.name == "legacy_step")));
+        assert!(
+            !result.transformations.iter().any(
+                |entry| matches!(entry, TransformEntry::Transform(t) if t.name == "legacy_step")
+            )
+        );
         assert!(!provenance.contains_key("legacy_step"));
     }
 
@@ -1554,7 +1617,12 @@ transformations:
         let mut provenance = ProvenanceMap::new();
         let config = base_config();
         let result = resolve_channel_with_inheritance(
-            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+            config,
+            "acme",
+            &pipeline,
+            &workspace,
+            &[],
+            &mut provenance,
         )
         .unwrap();
 

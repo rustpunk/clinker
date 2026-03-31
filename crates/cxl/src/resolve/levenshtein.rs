@@ -35,11 +35,7 @@ pub fn levenshtein_bounded(a: &str, b: &str, threshold: usize) -> Option<usize> 
     }
 
     let dist = row[b_len];
-    if dist <= threshold {
-        Some(dist)
-    } else {
-        None
-    }
+    if dist <= threshold { Some(dist) } else { None }
 }
 
 /// Find the best fuzzy match for `target` among `candidates`.
@@ -47,10 +43,10 @@ pub fn levenshtein_bounded(a: &str, b: &str, threshold: usize) -> Option<usize> 
 pub fn best_match<'a>(target: &str, candidates: &[&'a str], threshold: usize) -> Option<&'a str> {
     let mut best: Option<(&str, usize)> = None;
     for &candidate in candidates {
-        if let Some(dist) = levenshtein_bounded(target, candidate, threshold) {
-            if best.is_none() || dist < best.unwrap().1 {
-                best = Some((candidate, dist));
-            }
+        if let Some(dist) = levenshtein_bounded(target, candidate, threshold)
+            && (best.is_none() || dist < best.unwrap().1)
+        {
+            best = Some((candidate, dist));
         }
     }
     best.map(|(name, _)| name)

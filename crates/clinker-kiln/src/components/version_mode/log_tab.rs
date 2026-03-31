@@ -17,12 +17,11 @@ pub fn LogTab() -> Element {
     // Load commits on first render
     if !(loaded)() {
         let ws = (tab_mgr.workspace)();
-        if let Some(ws) = ws {
-            if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
-                if let Ok(log) = ops.log(30) {
-                    commits.set(log);
-                }
-            }
+        if let Some(ws) = ws
+            && let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root)
+            && let Ok(log) = ops.log(30)
+        {
+            commits.set(log);
         }
         loaded.set(true);
     }
@@ -91,7 +90,11 @@ fn relative_time(timestamp: i64) -> String {
         format!("{hours}h ago")
     } else if diff < 604800 {
         let days = diff / 86400;
-        if days == 1 { "yesterday".to_string() } else { format!("{days} days ago") }
+        if days == 1 {
+            "yesterday".to_string()
+        } else {
+            format!("{days} days ago")
+        }
     } else {
         let weeks = diff / 604800;
         format!("{weeks}w ago")

@@ -77,12 +77,8 @@ impl Type {
             (Type::Int, Type::Float) | (Type::Float, Type::Int) => Some(Type::Float),
 
             // Nullable unification
-            (Type::Nullable(a), Type::Nullable(b)) => {
-                a.unify(b).map(Type::nullable)
-            }
-            (Type::Nullable(a), b) | (b, Type::Nullable(a)) => {
-                a.unify(b).map(Type::nullable)
-            }
+            (Type::Nullable(a), Type::Nullable(b)) => a.unify(b).map(Type::nullable),
+            (Type::Nullable(a), b) | (b, Type::Nullable(a)) => a.unify(b).map(Type::nullable),
 
             // Null unifies with anything as Nullable
             (Type::Null, b) => Some(Type::nullable(b.clone())),
@@ -170,7 +166,10 @@ mod tests {
 
     #[test]
     fn test_unify_null_wraps() {
-        assert_eq!(Type::Null.unify(&Type::Int), Some(Type::Nullable(Box::new(Type::Int))));
+        assert_eq!(
+            Type::Null.unify(&Type::Int),
+            Some(Type::Nullable(Box::new(Type::Int)))
+        );
     }
 
     #[test]

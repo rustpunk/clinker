@@ -61,7 +61,9 @@ where
                 .sources
                 .iter()
                 .map(|source_name| {
-                    s.spawn(|| ingest_one_source(source_name, plan, config, memory_limit, &open_reader))
+                    s.spawn(|| {
+                        ingest_one_source(source_name, plan, config, memory_limit, &open_reader)
+                    })
                 })
                 .collect();
 
@@ -170,7 +172,8 @@ where
         .map(|i| i.name.as_str())
         .unwrap_or("primary");
 
-    let (name, arena, idxs) = ingest_one_source(source_name, plan, config, memory_limit, open_reader)?;
+    let (name, arena, idxs) =
+        ingest_one_source(source_name, plan, config, memory_limit, open_reader)?;
 
     let mut arenas = HashMap::new();
     let mut indices = HashMap::new();
@@ -199,7 +202,10 @@ mod tests {
     }
 
     /// Helper: build a minimal pipeline config.
-    fn test_config(inputs: Vec<(&str, &str)>, transforms: Vec<(&str, &str, Option<serde_json::Value>)>) -> PipelineConfig {
+    fn test_config(
+        inputs: Vec<(&str, &str)>,
+        transforms: Vec<(&str, &str, Option<serde_json::Value>)>,
+    ) -> PipelineConfig {
         PipelineConfig {
             pipeline: PipelineMeta {
                 name: "test".into(),
@@ -240,15 +246,17 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| TransformEntry::Transform(TransformConfig {
-                    name: name.into(),
-                    description: None,
-                    cxl: cxl.into(),
-                    local_window,
-                    log: None,
-                    validations: None,
-                    notes: None,
-                }))
+                .map(|(name, cxl, local_window)| {
+                    TransformEntry::Transform(TransformConfig {
+                        name: name.into(),
+                        description: None,
+                        cxl: cxl.into(),
+                        local_window,
+                        log: None,
+                        validations: None,
+                        notes: None,
+                    })
+                })
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
@@ -258,9 +266,15 @@ mod tests {
     /// Helper: compile CXL source.
     fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProgram {
         let parsed = cxl::parser::Parser::parse(source);
-        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
-        let resolved = cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema: std::collections::HashMap<String, cxl::typecheck::types::Type> = std::collections::HashMap::new();
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved =
+            cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
+        let schema: std::collections::HashMap<String, cxl::typecheck::types::Type> =
+            std::collections::HashMap::new();
         cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
     }
 
@@ -274,7 +288,11 @@ mod tests {
     fn test_single_source_no_spawn() {
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("agg", "emit total = window.sum(amount)", Some(serde_json::json!({"group_by": ["dept"]})))],
+            vec![(
+                "agg",
+                "emit total = window.sum(amount)",
+                Some(serde_json::json!({"group_by": ["dept"]})),
+            )],
         );
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -314,14 +332,24 @@ mod tests {
         let ref_csv = "id,amount\nR1,50\nR2,75\n";
 
         let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            let data = if path == "ref.csv" { ref_csv } else { primary_csv };
+            let data = if path == "ref.csv" {
+                ref_csv
+            } else {
+                primary_csv
+            };
             Ok(csv_reader_from_str(data))
         });
 
         let output = result.unwrap();
-        assert_eq!(output.arenas.len(), 2, "Should have arenas for both sources");
-        assert!(output.arenas.contains_key("primary") || output.arenas.contains_key("reference"),
-            "Should contain reference source arena");
+        assert_eq!(
+            output.arenas.len(),
+            2,
+            "Should have arenas for both sources"
+        );
+        assert!(
+            output.arenas.contains_key("primary") || output.arenas.contains_key("reference"),
+            "Should contain reference source arena"
+        );
     }
 
     #[test]
@@ -345,9 +373,14 @@ mod tests {
         let ref_csv = "id,amount\nR1,50\nR2,75\n";
 
         let output = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            let data = if path == "ref.csv" { ref_csv } else { primary_csv };
+            let data = if path == "ref.csv" {
+                ref_csv
+            } else {
+                primary_csv
+            };
             Ok(csv_reader_from_str(data))
-        }).unwrap();
+        })
+        .unwrap();
 
         // Reference source arena should exist and have 2 records
         if let Some(ref_arena) = output.arenas.get("reference") {
@@ -380,17 +413,25 @@ mod tests {
         let output = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
             // Small artificial delay to demonstrate concurrency
             std::thread::sleep(std::time::Duration::from_millis(10));
-            let data = if path == "ref.csv" { ref_csv } else { primary_csv };
+            let data = if path == "ref.csv" {
+                ref_csv
+            } else {
+                primary_csv
+            };
             Ok(csv_reader_from_str(data))
-        }).unwrap();
+        })
+        .unwrap();
         let elapsed = start.elapsed();
 
         // Both sources should be populated
         assert!(output.arenas.len() >= 1);
         // With concurrency, two 10ms sleeps should take < 30ms (not 20ms+ serial)
         // Being generous with the threshold to avoid flakiness
-        assert!(elapsed < std::time::Duration::from_millis(100),
-            "Ingestion took {:?}, expected < 100ms for concurrent sources", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "Ingestion took {:?}, expected < 100ms for concurrent sources",
+            elapsed
+        );
     }
 
     #[test]
@@ -413,16 +454,25 @@ mod tests {
 
         // Verify DAG: reference should be in tier 0 (built first)
         assert!(plan.source_dag.len() >= 2, "Should have at least 2 tiers");
-        assert!(plan.source_dag[0].sources.contains(&"reference".to_string()),
-            "Reference should be in tier 0");
+        assert!(
+            plan.source_dag[0]
+                .sources
+                .contains(&"reference".to_string()),
+            "Reference should be in tier 0"
+        );
 
         let primary_csv = "id,ref_id,amount\n1,R1,100\n";
         let ref_csv = "id,amount\nR1,50\n";
 
         let output = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            let data = if path == "ref.csv" { ref_csv } else { primary_csv };
+            let data = if path == "ref.csv" {
+                ref_csv
+            } else {
+                primary_csv
+            };
             Ok(csv_reader_from_str(data))
-        }).unwrap();
+        })
+        .unwrap();
 
         // Both sources ingested successfully — tier ordering was respected
         assert!(output.arenas.contains_key("reference"));
@@ -432,7 +482,11 @@ mod tests {
     fn test_source_error_propagation() {
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("agg", "emit total = window.sum(amount)", Some(serde_json::json!({"group_by": ["dept"]})))],
+            vec![(
+                "agg",
+                "emit total = window.sum(amount)",
+                Some(serde_json::json!({"group_by": ["dept"]})),
+            )],
         );
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -455,7 +509,11 @@ mod tests {
         // Set shutdown flag, verify Arena::build respects it
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("agg", "emit total = window.sum(amount)", Some(serde_json::json!({"group_by": ["dept"]})))],
+            vec![(
+                "agg",
+                "emit total = window.sum(amount)",
+                Some(serde_json::json!({"group_by": ["dept"]})),
+            )],
         );
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);

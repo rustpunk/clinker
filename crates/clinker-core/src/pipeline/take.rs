@@ -14,7 +14,11 @@ pub struct TakeReader<R> {
 
 impl<R> TakeReader<R> {
     pub fn new(inner: R, limit: u64) -> Self {
-        Self { inner, limit, count: 0 }
+        Self {
+            inner,
+            limit,
+            count: 0,
+        }
     }
 
     /// Number of records yielded so far.
@@ -55,7 +59,11 @@ mod tests {
     impl MockReader {
         fn new(total: u64) -> Self {
             let schema = Arc::new(Schema::new(vec!["id".into()]));
-            Self { schema, total, yielded: 0 }
+            Self {
+                schema,
+                total,
+                yielded: 0,
+            }
         }
     }
 

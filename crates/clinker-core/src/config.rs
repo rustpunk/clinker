@@ -395,19 +395,15 @@ fn default_sort_order() -> SortOrder {
 /// Null handling in sort operations.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum NullOrder {
     /// Nulls sort before all non-null values.
     First,
     /// Nulls sort after all non-null values (SQL convention default).
+    #[default]
     Last,
     /// Remove records with null sort keys from the partition.
     Drop,
-}
-
-impl Default for NullOrder {
-    fn default() -> Self {
-        NullOrder::Last
-    }
 }
 
 /// Supported format types.
@@ -424,6 +420,7 @@ pub enum FormatKind {
 /// Schema source -- file path or inline definition.
 /// Custom Deserialize: YAML string -> FilePath, YAML map -> Inline(SchemaDefinition).
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum SchemaSource {
     FilePath(String),
     Inline(SchemaDefinition),
@@ -440,7 +437,8 @@ impl<'de> Deserialize<'de> for SchemaSource {
             type Value = SchemaSource;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a schema file path (string) or an inline schema definition (map)")
+                formatter
+                    .write_str("a schema file path (string) or an inline schema definition (map)")
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
@@ -454,7 +452,8 @@ impl<'de> Deserialize<'de> for SchemaSource {
             where
                 A: MapAccess<'de>,
             {
-                let def = SchemaDefinition::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                let def =
+                    SchemaDefinition::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 Ok(SchemaSource::Inline(def))
             }
         }
@@ -504,11 +503,9 @@ fn default_severity() -> ValidationSeverity {
 impl ValidationEntry {
     /// Auto-derive name from field and check if not specified.
     pub fn resolved_name(&self) -> String {
-        self.name.clone().unwrap_or_else(|| {
-            match &self.field {
-                Some(f) => format!("{}:{}", f, self.check),
-                None => self.check.clone(),
-            }
+        self.name.clone().unwrap_or_else(|| match &self.field {
+            Some(f) => format!("{}:{}", f, self.check),
+            None => self.check.clone(),
         })
     }
 }
@@ -568,6 +565,7 @@ pub enum LogLevel {
 /// Uses custom `Deserialize` (not `#[serde(untagged)]`) for clear error messages.
 /// Consistent with `SortFieldSpec` and `SchemaSource` (Phase 9 decision #40).
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum TransformEntry {
     Import { _import: String },
     Transform(TransformConfig),
@@ -668,7 +666,10 @@ impl std::fmt::Display for ConfigError {
             Self::Io(e) => write!(f, "config I/O error: {e}"),
             Self::Yaml(e) => write!(f, "YAML parse error: {e}"),
             Self::EnvVar { var_name, position } => {
-                write!(f, "undefined environment variable ${{{var_name}}} at position {position}")
+                write!(
+                    f,
+                    "undefined environment variable ${{{var_name}}} at position {position}"
+                )
             }
             Self::Validation(msg) => write!(f, "config validation error: {msg}"),
         }
@@ -690,9 +691,8 @@ impl From<serde_saphyr::Error> for ConfigError {
 }
 
 // Regex for ${VAR} and ${VAR:-default} interpolation
-static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}").unwrap()
-});
+static ENV_VAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}").unwrap());
 
 /// Pre-deserialize environment variable interpolation.
 ///
@@ -730,20 +730,27 @@ pub fn interpolate_env_vars(
         let default_value = caps.get(2).map(|m| m.as_str());
 
         // Validate env var name: must be UPPERCASE + underscores only
-        if !var_name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        if !var_name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
             || var_name.starts_with(|c: char| c.is_ascii_digit())
             || var_name.is_empty()
         {
             return Err(ConfigError::Validation(format!(
                 "invalid environment variable name '{}' at position {} — must match [A-Z_][A-Z0-9_]*",
-                var_name, full_match.start()
+                var_name,
+                full_match.start()
             )));
         }
 
         result.push_str(&escaped[last_end..full_match.start()]);
 
         // Check extra_vars first, then system env
-        if let Some(value) = extra_vars.iter().find(|(k, _)| *k == var_name).map(|(_, v)| *v) {
+        if let Some(value) = extra_vars
+            .iter()
+            .find(|(k, _)| *k == var_name)
+            .map(|(_, v)| *v)
+        {
             result.push_str(value);
         } else {
             match std::env::var(var_name) {
@@ -799,8 +806,15 @@ fn parse_yaml_with_budget(input: &str) -> Result<PipelineConfig, ConfigError> {
 
 /// Reserved pipeline member names that cannot be used as user variable names.
 const RESERVED_PIPELINE_NAMES: &[&str] = &[
-    "start_time", "name", "execution_id", "batch_id",
-    "total_count", "ok_count", "dlq_count", "source_file", "source_row",
+    "start_time",
+    "name",
+    "execution_id",
+    "batch_id",
+    "total_count",
+    "ok_count",
+    "dlq_count",
+    "source_file",
+    "source_row",
 ];
 
 /// Post-deserialization validation.
@@ -808,14 +822,14 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     for input in &config.inputs {
         // Fail-fast: inline schema + schema_overrides is a conflict.
         // Overrides only apply to externally referenced schemas.
-        if let Some(SchemaSource::Inline(_)) = &input.schema {
-            if input.schema_overrides.is_some() {
-                return Err(ConfigError::Validation(format!(
-                    "input '{}': cannot use both inline 'schema' and 'schema_overrides' — \
+        if let Some(SchemaSource::Inline(_)) = &input.schema
+            && input.schema_overrides.is_some()
+        {
+            return Err(ConfigError::Validation(format!(
+                "input '{}': cannot use both inline 'schema' and 'schema_overrides' — \
                      overrides only apply to externally referenced schemas",
-                    input.name
-                )));
-            }
+                input.name
+            )));
         }
     }
 
@@ -826,22 +840,24 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
 
     // Validate log directives (iterate raw entries to avoid panic on unresolved imports)
     for entry in &config.transformations {
-        if let TransformEntry::Transform(t) = entry {
-            if let Some(ref directives) = t.log {
-                for (i, d) in directives.iter().enumerate() {
-                    if let Some(every) = d.every {
-                        if every == 0 {
-                            return Err(ConfigError::Validation(format!(
-                                "transform '{}': log directive #{}: every must be >= 1",
-                                t.name, i + 1,
-                            )));
-                        }
-                        if d.when != LogTiming::PerRecord {
-                            return Err(ConfigError::Validation(format!(
-                                "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
-                                t.name, i + 1,
-                            )));
-                        }
+        if let TransformEntry::Transform(t) = entry
+            && let Some(ref directives) = t.log
+        {
+            for (i, d) in directives.iter().enumerate() {
+                if let Some(every) = d.every {
+                    if every == 0 {
+                        return Err(ConfigError::Validation(format!(
+                            "transform '{}': log directive #{}: every must be >= 1",
+                            t.name,
+                            i + 1,
+                        )));
+                    }
+                    if d.when != LogTiming::PerRecord {
+                        return Err(ConfigError::Validation(format!(
+                            "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
+                            t.name,
+                            i + 1,
+                        )));
                     }
                 }
             }
@@ -967,7 +983,14 @@ transformations:
         assert_eq!(config.inputs[0].path, "/tmp/input.csv");
         assert_eq!(config.outputs.len(), 1);
         assert_eq!(config.transformations.len(), 1);
-        assert!(config.transforms().next().unwrap().cxl.contains("emit full_name"));
+        assert!(
+            config
+                .transforms()
+                .next()
+                .unwrap()
+                .cxl
+                .contains("emit full_name")
+        );
         // Default error strategy
         assert_eq!(config.error_handling.strategy, ErrorStrategy::FailFast);
     }
@@ -1077,7 +1100,10 @@ transformations:
 "#;
         let err = parse_config(yaml).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("bogus_field") || msg.contains("unknown field"), "error should mention the unknown key: {msg}");
+        assert!(
+            msg.contains("bogus_field") || msg.contains("unknown field"),
+            "error should mention the unknown key: {msg}"
+        );
     }
 
     #[test]
@@ -1102,7 +1128,10 @@ transformations:
 "#;
         let err = parse_config(yaml).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("path") || msg.contains("missing"), "error should mention missing field: {msg}");
+        assert!(
+            msg.contains("path") || msg.contains("missing"),
+            "error should mention missing field: {msg}"
+        );
     }
 
     #[test]
@@ -1136,7 +1165,10 @@ error_handling:
 "#
             );
             let config = parse_config(&yaml).unwrap();
-            assert_eq!(config.error_handling.strategy, expected, "failed for {variant_str}");
+            assert_eq!(
+                config.error_handling.strategy, expected,
+                "failed for {variant_str}"
+            );
         }
     }
 
@@ -1211,13 +1243,19 @@ error_handling:
         assert_eq!(config.pipeline.name, "full-pipeline");
         assert_eq!(config.pipeline.memory_limit.as_deref(), Some("2GB"));
         assert_eq!(config.pipeline.date_formats.as_ref().unwrap().len(), 2);
-        assert_eq!(config.pipeline.concurrency.as_ref().unwrap().threads, Some(4));
+        assert_eq!(
+            config.pipeline.concurrency.as_ref().unwrap().threads,
+            Some(4)
+        );
         assert_eq!(config.pipeline.include_provenance, Some(true));
 
         // Input
         assert_eq!(config.inputs[0].name, "employees");
         assert_eq!(config.inputs[0].schema_overrides.as_ref().unwrap().len(), 1);
-        assert_eq!(config.inputs[0].csv_options().unwrap().has_header, Some(true));
+        assert_eq!(
+            config.inputs[0].csv_options().unwrap().has_header,
+            Some(true)
+        );
 
         // Output
         assert!(config.outputs[0].include_unmapped);
@@ -1225,7 +1263,9 @@ error_handling:
         assert_eq!(config.outputs[0].exclude.as_ref().unwrap().len(), 2);
         assert_eq!(config.outputs[0].sort_order.as_ref().unwrap().len(), 2);
         // SortFieldSpec resolves to SortField — verify via into_sort_field()
-        let sf = config.outputs[0].sort_order.as_ref().unwrap()[0].clone().into_sort_field();
+        let sf = config.outputs[0].sort_order.as_ref().unwrap()[0]
+            .clone()
+            .into_sort_field();
         assert_eq!(sf.order, SortOrder::Asc);
         assert_eq!(config.outputs[0].preserve_nulls, Some(false));
 
@@ -1365,7 +1405,10 @@ transformations:
             InputFormat::Xml(Some(opts)) => {
                 assert_eq!(opts.record_path.as_deref(), Some("Orders/Order"));
                 assert_eq!(opts.attribute_prefix.as_deref(), Some("_"));
-                assert!(matches!(opts.namespace_handling, Some(NamespaceHandling::Qualify)));
+                assert!(matches!(
+                    opts.namespace_handling,
+                    Some(NamespaceHandling::Qualify)
+                ));
             }
             other => panic!("Expected Xml with options, got {:?}", other),
         }
@@ -1392,7 +1435,10 @@ transformations:
     cxl: "emit x = a"
 "#;
         let result = parse_config(yaml);
-        assert!(result.is_err(), "CSV input with attribute_prefix should fail to parse");
+        assert!(
+            result.is_err(),
+            "CSV input with attribute_prefix should fail to parse"
+        );
     }
 
     #[test]
@@ -1612,13 +1658,17 @@ transformations:
     cxl: "emit x = a"
 "#;
         let result = parse_config(yaml);
-        assert!(result.is_err(), "sort_output at pipeline level should be rejected");
+        assert!(
+            result.is_err(),
+            "sort_output at pipeline level should be rejected"
+        );
     }
 
     // ── Pipeline vars tests ───────────────────────────────────────
 
     fn yaml_with_vars(vars_block: &str) -> String {
-        format!(r#"
+        format!(
+            r#"
 pipeline:
   name: test
   vars:
@@ -1635,7 +1685,8 @@ outputs:
 transformations:
   - name: t1
     cxl: "emit x = a"
-"#)
+"#
+        )
     }
 
     #[test]
@@ -1645,7 +1696,10 @@ transformations:
         let vars = config.pipeline.vars.unwrap();
         assert_eq!(vars["count"], serde_json::json!(42));
         let converted = convert_pipeline_vars(&vars);
-        assert!(matches!(converted["count"], clinker_record::Value::Integer(42)));
+        assert!(matches!(
+            converted["count"],
+            clinker_record::Value::Integer(42)
+        ));
     }
 
     #[test]
@@ -1654,7 +1708,9 @@ transformations:
         let config = parse_config(&yaml).unwrap();
         let vars = config.pipeline.vars.unwrap();
         let converted = convert_pipeline_vars(&vars);
-        assert!(matches!(converted["rate"], clinker_record::Value::Float(f) if (f - 0.05).abs() < f64::EPSILON));
+        assert!(
+            matches!(converted["rate"], clinker_record::Value::Float(f) if (f - 0.05).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
@@ -1663,7 +1719,10 @@ transformations:
         let config = parse_config(&yaml).unwrap();
         let vars = config.pipeline.vars.unwrap();
         let converted = convert_pipeline_vars(&vars);
-        assert!(matches!(converted["active"], clinker_record::Value::Bool(true)));
+        assert!(matches!(
+            converted["active"],
+            clinker_record::Value::Bool(true)
+        ));
     }
 
     #[test]
@@ -1744,8 +1803,14 @@ transformations:
         let config = parse_config(&yaml).unwrap();
         let vars = config.pipeline.vars.unwrap();
         let converted = convert_pipeline_vars(&vars);
-        assert!(matches!(converted["flag"], clinker_record::Value::Bool(true)));
-        assert!(matches!(converted["explicit_no"], clinker_record::Value::Bool(false)));
+        assert!(matches!(
+            converted["flag"],
+            clinker_record::Value::Bool(true)
+        ));
+        assert!(matches!(
+            converted["explicit_no"],
+            clinker_record::Value::Bool(false)
+        ));
     }
 
     #[test]
@@ -1761,7 +1826,8 @@ transformations:
     // ── Log directive config tests ────────────────────────────────
 
     fn yaml_with_log(log_block: &str) -> String {
-        format!(r#"
+        format!(
+            r#"
 pipeline:
   name: test
 
@@ -1778,16 +1844,19 @@ transformations:
     cxl: "emit x = a"
     log:
 {log_block}
-"#)
+"#
+        )
     }
 
     #[test]
     fn test_log_level1_basic_emit() {
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: info
         when: per_record
         message: "processed {name}"
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
         let t = config.transforms().next().unwrap();
         let directives = t.log.as_ref().unwrap();
@@ -1799,12 +1868,14 @@ transformations:
 
     #[test]
     fn test_log_level1_when_condition() {
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: warn
         when: per_record
         condition: "Amount > 1000"
         message: "high value"
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
         let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
         assert_eq!(d.condition.as_deref(), Some("Amount > 1000"));
@@ -1812,12 +1883,14 @@ transformations:
 
     #[test]
     fn test_log_level1_fields_structured() {
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: info
         when: per_record
         message: "rec"
         fields: [name, amount]
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
         let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
         assert_eq!(d.fields.as_ref().unwrap(), &["name", "amount"]);
@@ -1826,40 +1899,48 @@ transformations:
     #[test]
     fn test_log_level1_missing_message_error() {
         // message is required — missing it should be a YAML parse error
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: info
         when: per_record
-"#);
+"#,
+        );
         assert!(parse_config(&yaml).is_err());
     }
 
     #[test]
     fn test_log_level1_invalid_level_error() {
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: critical
         when: per_record
         message: "msg"
-"#);
+"#,
+        );
         assert!(parse_config(&yaml).is_err());
     }
 
     #[test]
     fn test_log_level1_invalid_when_error() {
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: info
         when: always
         message: "msg"
-"#);
+"#,
+        );
         assert!(parse_config(&yaml).is_err());
     }
 
     #[test]
     fn test_log_level1_on_error_timing() {
-        let yaml = yaml_with_log(r#"
+        let yaml = yaml_with_log(
+            r#"
       - level: error
         when: on_error
         message: "error: {_cxl_dlq_error_category}"
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
         let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
         assert_eq!(d.when, LogTiming::OnError);
@@ -1868,7 +1949,8 @@ transformations:
     // ── Validation config tests ───────────────────────────────────
 
     fn yaml_with_validations(validations_block: &str) -> String {
-        format!(r#"
+        format!(
+            r#"
 pipeline:
   name: test
 
@@ -1885,15 +1967,18 @@ transformations:
     cxl: "emit x = a"
     validations:
 {validations_block}
-"#)
+"#
+        )
     }
 
     #[test]
     fn test_validation_config_basic() {
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - check: "Amount > 0"
         severity: error
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
         let t = config.transforms().next().unwrap();
         let validations = t.validations.as_ref().unwrap();
@@ -1904,39 +1989,66 @@ transformations:
 
     #[test]
     fn test_validation_config_with_field() {
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - field: Email
         check: "validators.is_valid_email"
         severity: error
         message: "invalid email for {employee_id}"
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
-        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        let v = &config
+            .transforms()
+            .next()
+            .unwrap()
+            .validations
+            .as_ref()
+            .unwrap()[0];
         assert_eq!(v.field.as_deref(), Some("Email"));
-        assert_eq!(v.message.as_deref(), Some("invalid email for {employee_id}"));
+        assert_eq!(
+            v.message.as_deref(),
+            Some("invalid email for {employee_id}")
+        );
     }
 
     #[test]
     fn test_validation_config_default_severity() {
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - check: "Amount > 0"
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
-        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        let v = &config
+            .transforms()
+            .next()
+            .unwrap()
+            .validations
+            .as_ref()
+            .unwrap()[0];
         assert_eq!(v.severity, ValidationSeverity::Error); // default
     }
 
     #[test]
     fn test_validation_config_with_args() {
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - field: salary
         check: "validators.in_range"
         args:
           max: 500000
           min: 0
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
-        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        let v = &config
+            .transforms()
+            .next()
+            .unwrap()
+            .validations
+            .as_ref()
+            .unwrap()[0];
         let args = v.args.as_ref().unwrap();
         assert_eq!(args["max"], serde_json::json!(500000));
         assert_eq!(args["min"], serde_json::json!(0));
@@ -1945,14 +2057,22 @@ transformations:
     #[test]
     fn test_validation_order_before_emit() {
         // Validations should be checked before emit — they appear in config
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - check: "Amount > 0"
         severity: error
       - check: "Amount < 1000000"
         severity: warn
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
-        let vs = config.transforms().next().unwrap().validations.as_ref().unwrap();
+        let vs = config
+            .transforms()
+            .next()
+            .unwrap()
+            .validations
+            .as_ref()
+            .unwrap();
         assert_eq!(vs.len(), 2);
         assert_eq!(vs[0].check, "Amount > 0");
         assert_eq!(vs[1].check, "Amount < 1000000");
@@ -1960,27 +2080,43 @@ transformations:
 
     #[test]
     fn test_validation_module_fn_call() {
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - field: salary
         check: "validators.is_positive"
         severity: error
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
-        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        let v = &config
+            .transforms()
+            .next()
+            .unwrap()
+            .validations
+            .as_ref()
+            .unwrap()[0];
         assert_eq!(v.check, "validators.is_positive");
     }
 
     #[test]
     fn test_validation_module_fn_with_args() {
-        let yaml = yaml_with_validations(r#"
+        let yaml = yaml_with_validations(
+            r#"
       - field: salary
         check: "validators.in_range"
         args:
           max: 500000
         severity: error
-"#);
+"#,
+        );
         let config = parse_config(&yaml).unwrap();
-        let v = &config.transforms().next().unwrap().validations.as_ref().unwrap()[0];
+        let v = &config
+            .transforms()
+            .next()
+            .unwrap()
+            .validations
+            .as_ref()
+            .unwrap()[0];
         assert_eq!(v.check, "validators.in_range");
         assert!(v.args.is_some());
     }
@@ -2057,7 +2193,10 @@ transformations:
     cxl: "emit x = a"
 "#;
         let err = parse_config(yaml).unwrap_err();
-        assert!(err.to_string().contains("invalid environment variable name"));
+        assert!(
+            err.to_string()
+                .contains("invalid environment variable name")
+        );
     }
 
     #[test]

@@ -86,8 +86,7 @@ pub fn write_spool(metrics: &ExecutionMetrics, spool_dir: &Path) -> io::Result<(
 
     let file = File::create(&tmp_path)?;
     let mut writer = BufWriter::new(&file);
-    serde_json::to_writer(&mut writer, metrics)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    serde_json::to_writer(&mut writer, metrics).map_err(io::Error::other)?;
     writer.flush()?;
     file.sync_all()?;
     drop(writer);
@@ -169,8 +168,7 @@ pub fn append_ndjson(metrics: &ExecutionMetrics, output_path: &Path) -> io::Resu
         .append(true)
         .open(output_path)?;
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer(&mut writer, metrics)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    serde_json::to_writer(&mut writer, metrics).map_err(io::Error::other)?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
@@ -183,17 +181,14 @@ pub fn append_ndjson(metrics: &ExecutionMetrics, output_path: &Path) -> io::Resu
 /// 3. `yaml_spool_dir` — `pipeline.metrics.spool_dir` from the YAML config
 ///
 /// Returns `None` if none of the three sources is set (metrics disabled).
-pub fn resolve_spool_dir(
-    cli_flag: Option<&Path>,
-    yaml_spool_dir: Option<&str>,
-) -> Option<PathBuf> {
+pub fn resolve_spool_dir(cli_flag: Option<&Path>, yaml_spool_dir: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = cli_flag {
         return Some(p.to_path_buf());
     }
-    if let Ok(env) = std::env::var("CLINKER_METRICS_SPOOL_DIR") {
-        if !env.is_empty() {
-            return Some(PathBuf::from(env));
-        }
+    if let Ok(env) = std::env::var("CLINKER_METRICS_SPOOL_DIR")
+        && !env.is_empty()
+    {
+        return Some(PathBuf::from(env));
     }
     yaml_spool_dir.map(PathBuf::from)
 }
@@ -243,7 +238,10 @@ mod tests {
 
         // Temp file was cleaned up
         let tmp_path = dir.path().join(format!("{id}.json.tmp"));
-        assert!(!tmp_path.exists(), ".tmp file should be removed after rename");
+        assert!(
+            !tmp_path.exists(),
+            ".tmp file should be removed after rename"
+        );
     }
 
     #[test]
@@ -273,7 +271,10 @@ mod tests {
         let bad_dir = PathBuf::from("/nonexistent/spool/path");
         let metrics = sample_metrics("019571b2-0000-7000-0000-000000000003");
         let result = write_spool(&metrics, &bad_dir);
-        assert!(result.is_err(), "write_spool to non-existent dir should return Err");
+        assert!(
+            result.is_err(),
+            "write_spool to non-existent dir should return Err"
+        );
     }
 
     #[test]

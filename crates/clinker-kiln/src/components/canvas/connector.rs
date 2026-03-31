@@ -8,7 +8,8 @@ use crate::pipeline_view::StageView;
 /// 1. Glow layer   — wide stroke at 10% opacity for a soft halo effect.
 /// 2. Core cable   — dashed stroke at 70% opacity (8px dash, 4px gap).
 /// 3. Bright centre — hairline solid stroke at 90% opacity (hot-wire effect).
-/// Plus an open chevron arrowhead at the target port.
+///
+///    Plus an open chevron arrowhead at the target port.
 ///
 /// Doc: spec §4.4 — Connectors.
 #[derive(Props, Clone, PartialEq)]

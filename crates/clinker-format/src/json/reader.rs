@@ -18,20 +18,19 @@ use crate::traits::FormatReader;
 
 // ── Public config types ──────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct JsonReaderConfig {
     pub format: Option<JsonMode>,
     pub record_path: Option<String>,
     pub array_paths: Vec<ArrayPathSpec>,
 }
 
-impl Default for JsonReaderConfig {
-    fn default() -> Self {
-        Self { format: None, record_path: None, array_paths: vec![] }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
-pub enum JsonMode { Array, Ndjson, Object }
+pub enum JsonMode {
+    Array,
+    Ndjson,
+    Object,
+}
 
 #[derive(Debug, Clone)]
 pub struct ArrayPathSpec {
@@ -41,7 +40,10 @@ pub struct ArrayPathSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ArrayPathMode { Explode, Join }
+pub enum ArrayPathMode {
+    Explode,
+    Join,
+}
 
 // ── JsonReader ───────────────────────────────────────────────────────
 
@@ -54,11 +56,17 @@ pub struct JsonReader {
 
 enum InnerReader {
     /// NDJSON: line-by-line. O(1 record) memory.
-    Ndjson { reader: BufReader<Box<dyn Read + Send>>, line_buf: String },
+    Ndjson {
+        reader: BufReader<Box<dyn Read + Send>>,
+        line_buf: String,
+    },
     /// Array or record_path: records collected via streaming DeserializeSeed.
     /// Elements are deserialized one at a time and pushed to a Vec during the
     /// single-pass `deserialize` call, then yielded lazily via `pos`.
-    Collected { records: Vec<serde_json::Value>, pos: usize },
+    Collected {
+        records: Vec<serde_json::Value>,
+        pos: usize,
+    },
     /// Exhausted.
     Done,
 }
@@ -70,7 +78,12 @@ impl JsonReader {
     ) -> Result<Self, FormatError> {
         let mut buf = BufReader::new(Box::new(reader) as Box<dyn Read + Send>);
         let inner = Self::init(&mut buf, &config)?;
-        Ok(JsonReader { inner, schema: None, config, pending: Vec::new() })
+        Ok(JsonReader {
+            inner,
+            schema: None,
+            config,
+            pending: Vec::new(),
+        })
     }
 
     fn init(
@@ -93,11 +106,14 @@ impl JsonReader {
                 }
                 JsonMode::Ndjson => {
                     let owned = std::mem::replace(buf, BufReader::new(Box::new(std::io::empty())));
-                    Ok(InnerReader::Ndjson { reader: owned, line_buf: String::new() })
+                    Ok(InnerReader::Ndjson {
+                        reader: owned,
+                        line_buf: String::new(),
+                    })
                 }
-                JsonMode::Object => {
-                    Err(FormatError::Json("format: object requires record_path".into()))
-                }
+                JsonMode::Object => Err(FormatError::Json(
+                    "format: object requires record_path".into(),
+                )),
             };
         }
 
@@ -110,10 +126,14 @@ impl JsonReader {
             }
             Some(b'{') => {
                 let owned = std::mem::replace(buf, BufReader::new(Box::new(std::io::empty())));
-                Ok(InnerReader::Ndjson { reader: owned, line_buf: String::new() })
+                Ok(InnerReader::Ndjson {
+                    reader: owned,
+                    line_buf: String::new(),
+                })
             }
             Some(b) => Err(FormatError::Json(format!(
-                "cannot auto-detect: unexpected byte '{}' (0x{b:02x})", b as char
+                "cannot auto-detect: unexpected byte '{}' (0x{b:02x})",
+                b as char
             ))),
             None => Ok(InnerReader::Done),
         }
@@ -130,18 +150,20 @@ impl JsonReader {
                     Ok(None)
                 }
             }
-            InnerReader::Ndjson { reader, line_buf } => {
-                loop {
-                    line_buf.clear();
-                    let n = reader.read_line(line_buf).map_err(FormatError::Io)?;
-                    if n == 0 { return Ok(None); }
-                    let trimmed = line_buf.trim();
-                    if trimmed.is_empty() { continue; }
-                    let val: serde_json::Value = serde_json::from_str(trimmed)
-                        .map_err(|e| FormatError::Json(e.to_string()))?;
-                    return Ok(Some(val));
+            InnerReader::Ndjson { reader, line_buf } => loop {
+                line_buf.clear();
+                let n = reader.read_line(line_buf).map_err(FormatError::Io)?;
+                if n == 0 {
+                    return Ok(None);
                 }
-            }
+                let trimmed = line_buf.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let val: serde_json::Value =
+                    serde_json::from_str(trimmed).map_err(|e| FormatError::Json(e.to_string()))?;
+                return Ok(Some(val));
+            },
             InnerReader::Done => Ok(None),
         }
     }
@@ -154,17 +176,26 @@ impl JsonReader {
     ) {
         const MAX_DEPTH: usize = 64;
         if depth > MAX_DEPTH {
-            out.insert(prefix.to_string(), serde_json::Value::String("[max depth]".into()));
+            out.insert(
+                prefix.to_string(),
+                serde_json::Value::String("[max depth]".into()),
+            );
             return;
         }
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map {
-                    let name = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                    let name = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
                     Self::flatten_value(&name, val, out, depth + 1);
                 }
             }
-            other => { out.insert(prefix.to_string(), other.clone()); }
+            other => {
+                out.insert(prefix.to_string(), other.clone());
+            }
         }
     }
 
@@ -172,7 +203,9 @@ impl JsonReader {
         &self,
         flat: serde_json::Map<String, serde_json::Value>,
     ) -> Vec<serde_json::Map<String, serde_json::Value>> {
-        if self.config.array_paths.is_empty() { return vec![flat]; }
+        if self.config.array_paths.is_empty() {
+            return vec![flat];
+        }
 
         let mut result = vec![flat];
         for ap in &self.config.array_paths {
@@ -206,10 +239,14 @@ impl JsonReader {
                             }
                         }
                         ArrayPathMode::Join => {
-                            let joined: String = arr.iter().map(|v| match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                o => o.to_string(),
-                            }).collect::<Vec<_>>().join(&ap.separator);
+                            let joined: String = arr
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    o => o.to_string(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(&ap.separator);
                             let mut r = rec.clone();
                             r.insert(ap.path.clone(), serde_json::Value::String(joined));
                             next.push(r);
@@ -229,9 +266,11 @@ impl JsonReader {
         flat: &serde_json::Map<String, serde_json::Value>,
         schema: &Arc<Schema>,
     ) -> Record {
-        let values: Vec<Value> = schema.columns().iter().map(|col| {
-            flat.get(&**col).map(json_to_value).unwrap_or(Value::Null)
-        }).collect();
+        let values: Vec<Value> = schema
+            .columns()
+            .iter()
+            .map(|col| flat.get(&**col).map(json_to_value).unwrap_or(Value::Null))
+            .collect();
         let mut record = Record::new(Arc::clone(schema), values);
         for (key, val) in flat {
             if schema.index(key).is_none() {
@@ -244,7 +283,9 @@ impl JsonReader {
 
 impl FormatReader for JsonReader {
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        if let Some(ref s) = self.schema { return Ok(Arc::clone(s)); }
+        if let Some(ref s) = self.schema {
+            return Ok(Arc::clone(s));
+        }
 
         let first = self.next_raw()?;
         let first = match first {
@@ -263,7 +304,10 @@ impl FormatReader for JsonReader {
 
         let empty = serde_json::Map::new();
         let first_flat = expanded.first().unwrap_or(&empty);
-        let columns: Vec<Box<str>> = first_flat.keys().map(|k| k.clone().into_boxed_str()).collect();
+        let columns: Vec<Box<str>> = first_flat
+            .keys()
+            .map(|k| k.clone().into_boxed_str())
+            .collect();
         let schema = Arc::new(Schema::new(columns));
         self.schema = Some(Arc::clone(&schema));
         self.pending = expanded;
@@ -271,7 +315,9 @@ impl FormatReader for JsonReader {
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
-        if self.schema.is_none() { self.schema()?; }
+        if self.schema.is_none() {
+            self.schema()?;
+        }
         let schema = self.schema.as_ref().unwrap().clone();
 
         if !self.pending.is_empty() {
@@ -280,11 +326,16 @@ impl FormatReader for JsonReader {
         }
 
         loop {
-            let raw = match self.next_raw()? { Some(v) => v, None => return Ok(None) };
+            let raw = match self.next_raw()? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
             let mut flat = serde_json::Map::new();
             Self::flatten_value("", &raw, &mut flat, 0);
             let expanded = self.apply_array_paths(flat);
-            if expanded.is_empty() { continue; }
+            if expanded.is_empty() {
+                continue;
+            }
             let record = self.map_to_record(&expanded[0], &schema);
             self.pending = expanded.into_iter().skip(1).collect();
             return Ok(Some(record));
@@ -316,7 +367,9 @@ impl<'de, 'a> DeserializeSeed<'de> for PathNavigator<'a> {
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
         if self.path.is_empty() {
             // Arrived at target — stream the array
-            deserializer.deserialize_seq(ArrayCollector { results: self.results })
+            deserializer.deserialize_seq(ArrayCollector {
+                results: self.results,
+            })
         } else {
             // Navigate one level deeper
             deserializer.deserialize_map(ObjectNavigator {
@@ -350,7 +403,7 @@ impl<'de, 'a> Visitor<'de> for ObjectNavigator<'a> {
                     results: self.results,
                 })?;
                 // Skip remaining keys in this object
-                while let Some(_) = map.next_key::<IgnoredAny>()? {
+                while (map.next_key::<IgnoredAny>()?).is_some() {
                     map.next_value::<IgnoredAny>()?;
                 }
                 return Ok(());
@@ -359,7 +412,10 @@ impl<'de, 'a> Visitor<'de> for ObjectNavigator<'a> {
                 map.next_value::<IgnoredAny>()?;
             }
         }
-        Err(de::Error::custom(format!("key '{}' not found", self.target_key)))
+        Err(de::Error::custom(format!(
+            "key '{}' not found",
+            self.target_key
+        )))
     }
 }
 
@@ -391,9 +447,12 @@ fn stream_path_array(
 ) -> Result<Vec<serde_json::Value>, FormatError> {
     let mut results = Vec::new();
     let mut de = serde_json::Deserializer::from_reader(reader);
-    PathNavigator { path, results: &mut results }
-        .deserialize(&mut de)
-        .map_err(|e| FormatError::Json(e.to_string()))?;
+    PathNavigator {
+        path,
+        results: &mut results,
+    }
+    .deserialize(&mut de)
+    .map_err(|e| FormatError::Json(e.to_string()))?;
     Ok(results)
 }
 
@@ -403,8 +462,10 @@ fn stream_top_level_array(
 ) -> Result<Vec<serde_json::Value>, FormatError> {
     let mut results = Vec::new();
     let mut de = serde_json::Deserializer::from_reader(reader);
-    de.deserialize_seq(ArrayCollector { results: &mut results })
-        .map_err(|e| FormatError::Json(e.to_string()))?;
+    de.deserialize_seq(ArrayCollector {
+        results: &mut results,
+    })
+    .map_err(|e| FormatError::Json(e.to_string()))?;
     Ok(results)
 }
 
@@ -415,9 +476,13 @@ fn json_to_value(v: &serde_json::Value) -> Value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { Value::Integer(i) }
-            else if let Some(f) = n.as_f64() { Value::Float(f) }
-            else { Value::String(n.to_string().into()) }
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::String(n.to_string().into())
+            }
         }
         serde_json::Value::String(s) => Value::String(s.clone().into()),
         serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_value).collect()),
@@ -425,10 +490,14 @@ fn json_to_value(v: &serde_json::Value) -> Value {
     }
 }
 
-fn peek_first_byte(reader: &mut BufReader<Box<dyn Read + Send>>) -> Result<Option<u8>, FormatError> {
+fn peek_first_byte(
+    reader: &mut BufReader<Box<dyn Read + Send>>,
+) -> Result<Option<u8>, FormatError> {
     loop {
         let buf = reader.fill_buf().map_err(FormatError::Io)?;
-        if buf.is_empty() { return Ok(None); }
+        if buf.is_empty() {
+            return Ok(None);
+        }
         if let Some(pos) = buf.iter().position(|b| !b.is_ascii_whitespace()) {
             return Ok(Some(buf[pos]));
         }
@@ -447,7 +516,9 @@ mod tests {
         JsonReader::from_reader(std::io::Cursor::new(input.as_bytes().to_vec()), config).unwrap()
     }
 
-    fn default_config() -> JsonReaderConfig { JsonReaderConfig::default() }
+    fn default_config() -> JsonReaderConfig {
+        JsonReaderConfig::default()
+    }
 
     #[test]
     fn test_json_autodetect_array() {
@@ -455,8 +526,14 @@ mod tests {
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 1);
         assert_eq!(&*s.columns()[0], "a");
-        assert_eq!(r.next_record().unwrap().unwrap().get("a"), Some(&Value::Integer(1)));
-        assert_eq!(r.next_record().unwrap().unwrap().get("a"), Some(&Value::Integer(2)));
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(2))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 
@@ -465,8 +542,14 @@ mod tests {
         let mut r = reader_from_str("{\"a\":1}\n{\"a\":2}\n", default_config());
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 1);
-        assert_eq!(r.next_record().unwrap().unwrap().get("a"), Some(&Value::Integer(1)));
-        assert_eq!(r.next_record().unwrap().unwrap().get("a"), Some(&Value::Integer(2)));
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a"),
+            Some(&Value::Integer(2))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 
@@ -480,8 +563,14 @@ mod tests {
         let mut r = reader_from_str(input, config);
         let s = r.schema().unwrap();
         assert_eq!(&*s.columns()[0], "x");
-        assert_eq!(r.next_record().unwrap().unwrap().get("x"), Some(&Value::Integer(1)));
-        assert_eq!(r.next_record().unwrap().unwrap().get("x"), Some(&Value::Integer(2)));
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("x"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("x"),
+            Some(&Value::Integer(2))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 
@@ -490,17 +579,21 @@ mod tests {
         // The "big_blob" key has a large value that should be skipped via IgnoredAny
         // without buffering. We verify the reader navigates past it to "target".
         let big = "x".repeat(10_000);
-        let input = format!(
-            r#"{{"big_blob":"{big}","target":[{{"id":1}},{{"id":2}}]}}"#
-        );
+        let input = format!(r#"{{"big_blob":"{big}","target":[{{"id":1}},{{"id":2}}]}}"#);
         let config = JsonReaderConfig {
             record_path: Some("target".into()),
             ..default_config()
         };
         let mut r = reader_from_str(&input, config);
         let _s = r.schema().unwrap();
-        assert_eq!(r.next_record().unwrap().unwrap().get("id"), Some(&Value::Integer(1)));
-        assert_eq!(r.next_record().unwrap().unwrap().get("id"), Some(&Value::Integer(2)));
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("id"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("id"),
+            Some(&Value::Integer(2))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 
@@ -509,7 +602,9 @@ mod tests {
         let input = r#"[{"name":"Alice","orders":[{"id":1},{"id":2}]}]"#;
         let config = JsonReaderConfig {
             array_paths: vec![ArrayPathSpec {
-                path: "orders".into(), mode: ArrayPathMode::Explode, separator: ",".into(),
+                path: "orders".into(),
+                mode: ArrayPathMode::Explode,
+                separator: ",".into(),
             }],
             ..default_config()
         };
@@ -528,13 +623,18 @@ mod tests {
         let input = r#"[{"name":"Alice","tags":["a","b","c"]}]"#;
         let config = JsonReaderConfig {
             array_paths: vec![ArrayPathSpec {
-                path: "tags".into(), mode: ArrayPathMode::Join, separator: ",".into(),
+                path: "tags".into(),
+                mode: ArrayPathMode::Join,
+                separator: ",".into(),
             }],
             ..default_config()
         };
         let mut r = reader_from_str(input, config);
         let _s = r.schema().unwrap();
-        assert_eq!(r.next_record().unwrap().unwrap().get("tags"), Some(&Value::String("a,b,c".into())));
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("tags"),
+            Some(&Value::String("a,b,c".into()))
+        );
     }
 
     #[test]
@@ -555,7 +655,10 @@ mod tests {
         let mut r = reader_from_str(r#"[{"a":{"b":{"c":1}}}]"#, default_config());
         let s = r.schema().unwrap();
         assert_eq!(&*s.columns()[0], "a.b.c");
-        assert_eq!(r.next_record().unwrap().unwrap().get("a.b.c"), Some(&Value::Integer(1)));
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a.b.c"),
+            Some(&Value::Integer(1))
+        );
     }
 
     #[test]
@@ -580,8 +683,10 @@ mod tests {
     #[test]
     fn test_json_malformed_input() {
         let mut r = JsonReader::from_reader(
-            std::io::Cursor::new(b"{invalid}".to_vec()), default_config(),
-        ).unwrap();
+            std::io::Cursor::new(b"{invalid}".to_vec()),
+            default_config(),
+        )
+        .unwrap();
         assert!(r.schema().is_err());
     }
 
@@ -590,7 +695,9 @@ mod tests {
         let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
         let config = JsonReaderConfig {
             array_paths: vec![ArrayPathSpec {
-                path: "orders".into(), mode: ArrayPathMode::Explode, separator: ",".into(),
+                path: "orders".into(),
+                mode: ArrayPathMode::Explode,
+                separator: ",".into(),
             }],
             ..default_config()
         };

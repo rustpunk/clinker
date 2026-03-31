@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use clinker_channel::channel_override::{
-    resolve_channel, resolve_channel_with_inheritance, ChannelOverride,
+    ChannelOverride, resolve_channel, resolve_channel_with_inheritance,
 };
-use clinker_channel::composition::{resolve_compositions, ProvenanceMap};
+use clinker_channel::composition::{ProvenanceMap, resolve_compositions};
 use clinker_channel::error::ChannelError;
 use clinker_channel::workspace::WorkspaceRoot;
 use clinker_core::config::load_config_with_vars;
@@ -292,7 +292,10 @@ transformations:
     )
     .unwrap();
 
-    let audit = config.transforms().find(|t| t.name == "audit_stamp").unwrap();
+    let audit = config
+        .transforms()
+        .find(|t| t.name == "audit_stamp")
+        .unwrap();
     assert_eq!(audit.cxl, "emit ts = custom_now()");
 }
 
@@ -529,7 +532,9 @@ outputs:
     let channel_dir = workspace.channel_dir("acme");
     let override_path = ChannelOverride::path_for(&pipeline_path, &channel_dir);
     let channel_vars = [("CLINKER_ENV", "prod")];
-    let co = ChannelOverride::load(&override_path, &channel_vars).unwrap().unwrap();
+    let co = ChannelOverride::load(&override_path, &channel_vars)
+        .unwrap()
+        .unwrap();
 
     assert!(co.when_passes());
 
@@ -895,7 +900,10 @@ transformations:
     assert_eq!(names, vec!["before", "audit_stamp", "audit_user", "after"]);
     assert_eq!(config.outputs[0].path, "/data/acme/output.csv");
 
-    let audit = config.transforms().find(|t| t.name == "audit_stamp").unwrap();
+    let audit = config
+        .transforms()
+        .find(|t| t.name == "audit_stamp")
+        .unwrap();
     assert_eq!(audit.cxl, "emit ts = acme_now()");
 }
 

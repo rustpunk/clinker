@@ -5,7 +5,6 @@
 /// calling thread — Dioxus desktop runs on a single UI thread so async
 /// file dialogs block the event loop, which is acceptable for brief
 /// picker interactions.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 

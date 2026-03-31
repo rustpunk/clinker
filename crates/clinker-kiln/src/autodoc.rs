@@ -4,7 +4,6 @@
 /// never from run results. The doc model is section-based: each stage
 /// gets applicable sections (schema, lineage, contract, config, provenance,
 /// channel overrides) populated from config metadata.
-
 use clinker_core::composition::ResolvedComposition;
 use clinker_core::config::{
     ErrorStrategy, InputFormat, OutputFormat, PipelineConfig, SchemaSource,
@@ -270,15 +269,25 @@ pub fn generate_stage_doc(
 
     // Check outputs
     if let Some(output) = config.outputs.iter().find(|o| o.name == stage_name) {
-        return Some(generate_output_doc(config, output, channel_info, stage_name));
+        return Some(generate_output_doc(
+            config,
+            output,
+            channel_info,
+            stage_name,
+        ));
     }
 
     // Check collapsed composition nodes (IDs prefixed with _comp_)
-    if stage_name.starts_with("_comp_") {
-        let comp_path = &stage_name["_comp_".len()..];
-        if let Some(comp) = compositions.iter().find(|c| c.path == comp_path) {
-            return Some(generate_composition_doc(config, comp, compositions, channel_info, stage_name));
-        }
+    if let Some(comp_path) = stage_name.strip_prefix("_comp_")
+        && let Some(comp) = compositions.iter().find(|c| c.path == comp_path)
+    {
+        return Some(generate_composition_doc(
+            config,
+            comp,
+            compositions,
+            channel_info,
+            stage_name,
+        ));
     }
 
     None
@@ -412,7 +421,7 @@ fn generate_input_doc(
 
     // Sort order
     if let Some(ref sort) = input.sort_order {
-        for (i, spec) in sort.iter().enumerate() {
+        for spec in sort.iter() {
             let sf = spec.clone().into_sort_field();
             entries.push(ConfigEntry {
                 category: ConfigCategory::Sort,
@@ -441,7 +450,7 @@ fn generate_input_doc(
 }
 
 fn generate_transform_doc(
-    config: &PipelineConfig,
+    _config: &PipelineConfig,
     transform: &clinker_core::config::TransformConfig,
     compositions: &[ResolvedComposition],
     channel_info: Option<&ChannelDocContext>,
@@ -450,15 +459,20 @@ fn generate_transform_doc(
     // Analyze CXL statements
     let analysis = analyze_cxl(&transform.cxl);
 
-    let emit_stmts: Vec<_> = analysis.statements.iter()
+    let emit_stmts: Vec<_> = analysis
+        .statements
+        .iter()
         .filter(|s| s.kind == CxlStatementKind::Emit)
         .collect();
-    let filter_stmts: Vec<_> = analysis.statements.iter()
+    let filter_stmts: Vec<_> = analysis
+        .statements
+        .iter()
         .filter(|s| s.kind == CxlStatementKind::Filter)
         .collect();
     let emit_count = emit_stmts.len();
     let filter_count = filter_stmts.len();
-    let emit_names: Vec<_> = emit_stmts.iter()
+    let emit_names: Vec<_> = emit_stmts
+        .iter()
         .filter_map(|s| s.output_field.as_ref())
         .cloned()
         .collect();
@@ -467,7 +481,8 @@ fn generate_transform_doc(
     let summary = if let Some(ref desc) = transform.description {
         desc.clone()
     } else {
-        let filter_fields: Vec<_> = filter_stmts.iter()
+        let filter_fields: Vec<_> = filter_stmts
+            .iter()
             .flat_map(|s| s.field_refs.iter())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>()
@@ -478,7 +493,10 @@ fn generate_transform_doc(
             (true, true) => {
                 let emit_list = emit_names.join(", ");
                 let filter_list = filter_fields.join(", ");
-                format!("Derives {} field(s) ({}) and filters on {}.", emit_count, emit_list, filter_list)
+                format!(
+                    "Derives {} field(s) ({}) and filters on {}.",
+                    emit_count, emit_list, filter_list
+                )
             }
             (true, false) => {
                 let field_list = emit_names.join(", ");
@@ -510,13 +528,11 @@ fn generate_transform_doc(
 
     // Build config section
     let has_filters = filter_count > 0;
-    let mut entries = vec![
-        ConfigEntry {
-            category: ConfigCategory::Format,
-            key: "TYPE".to_string(),
-            value: "transform".to_string(),
-        },
-    ];
+    let mut entries = vec![ConfigEntry {
+        category: ConfigCategory::Format,
+        key: "TYPE".to_string(),
+        value: "transform".to_string(),
+    }];
     if emit_count > 0 {
         entries.push(ConfigEntry {
             category: ConfigCategory::Format,
@@ -568,7 +584,7 @@ fn generate_transform_doc(
 }
 
 fn generate_output_doc(
-    config: &PipelineConfig,
+    _config: &PipelineConfig,
     output: &clinker_core::config::OutputConfig,
     channel_info: Option<&ChannelDocContext>,
     stage_name: &str,
@@ -800,7 +816,10 @@ fn build_output_schema(output: &clinker_core::config::OutputConfig) -> Option<Sc
 fn field_def_to_doc(fd: &FieldDef) -> FieldDoc {
     FieldDoc {
         name: fd.name.clone(),
-        field_type: fd.field_type.as_ref().map(|t| format!("{:?}", t).to_lowercase()),
+        field_type: fd
+            .field_type
+            .as_ref()
+            .map(|t| format!("{:?}", t).to_lowercase()),
         required: fd.required.unwrap_or(false),
         format: fd.format.clone(),
         coerce: fd.coerce.unwrap_or(false),
@@ -924,14 +943,14 @@ fn push_error_handling_entries(entries: &mut Vec<ConfigEntry>, config: &Pipeline
         value: strategy_str.to_string(),
     });
 
-    if let Some(ref dlq) = eh.dlq {
-        if let Some(ref path) = dlq.path {
-            entries.push(ConfigEntry {
-                category: ConfigCategory::ErrorHandling,
-                key: "DLQ PATH".to_string(),
-                value: path.clone(),
-            });
-        }
+    if let Some(ref dlq) = eh.dlq
+        && let Some(ref path) = dlq.path
+    {
+        entries.push(ConfigEntry {
+            category: ConfigCategory::ErrorHandling,
+            key: "DLQ PATH".to_string(),
+            value: path.clone(),
+        });
     }
     if let Some(threshold) = eh.type_error_threshold {
         entries.push(ConfigEntry {
@@ -965,14 +984,22 @@ fn generate_composition_doc(
     let contract = comp.meta.contract.as_ref().map(|c| ContractSection {
         composition_name: comp.meta.name.clone(),
         version: comp.meta.version.clone(),
-        requires: c.requires.iter().map(|f| ContractFieldDoc {
-            name: f.name.clone(),
-            field_type: f.r#type.clone(),
-        }).collect(),
-        produces: c.produces.iter().map(|f| ContractFieldDoc {
-            name: f.name.clone(),
-            field_type: f.r#type.clone(),
-        }).collect(),
+        requires: c
+            .requires
+            .iter()
+            .map(|f| ContractFieldDoc {
+                name: f.name.clone(),
+                field_type: f.r#type.clone(),
+            })
+            .collect(),
+        produces: c
+            .produces
+            .iter()
+            .map(|f| ContractFieldDoc {
+                name: f.name.clone(),
+                field_type: f.r#type.clone(),
+            })
+            .collect(),
     });
 
     let mut entries = vec![
@@ -1039,15 +1066,63 @@ fn generate_composition_doc(
 
 /// CXL keywords and builtins to exclude from field reference extraction.
 const CXL_KEYWORDS: &[&str] = &[
-    "if", "then", "else", "end", "true", "false", "null", "nil",
-    "and", "or", "not", "in", "match", "when", "let", "emit",
-    "coalesce", "concat", "trim", "upper", "lower", "len", "abs",
-    "round", "floor", "ceil", "min", "max", "sum", "count", "avg",
-    "substr", "replace", "split", "join", "contains", "starts_with",
-    "ends_with", "to_int", "to_float", "to_string", "to_date",
-    "to_bool", "format_date", "parse_date", "now", "today",
-    "is_null", "is_empty", "is_numeric", "typeof", "default",
-    "guard", "log", "year", "month", "day",
+    "if",
+    "then",
+    "else",
+    "end",
+    "true",
+    "false",
+    "null",
+    "nil",
+    "and",
+    "or",
+    "not",
+    "in",
+    "match",
+    "when",
+    "let",
+    "emit",
+    "coalesce",
+    "concat",
+    "trim",
+    "upper",
+    "lower",
+    "len",
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "min",
+    "max",
+    "sum",
+    "count",
+    "avg",
+    "substr",
+    "replace",
+    "split",
+    "join",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "to_int",
+    "to_float",
+    "to_string",
+    "to_date",
+    "to_bool",
+    "format_date",
+    "parse_date",
+    "now",
+    "today",
+    "is_null",
+    "is_empty",
+    "is_numeric",
+    "typeof",
+    "default",
+    "guard",
+    "log",
+    "year",
+    "month",
+    "day",
 ];
 
 /// Analyze CXL source into classified statements with field references.
@@ -1086,8 +1161,8 @@ fn analyze_cxl(cxl: &str) -> CxlAnalysis {
 
 /// Classify a single CXL line by its statement kind.
 fn classify_cxl_line(line: &str) -> (CxlStatementKind, Option<String>, String) {
-    if line.starts_with("emit ") {
-        let rest = line[5..].trim_start();
+    if let Some(stripped) = line.strip_prefix("emit ") {
+        let rest = stripped.trim_start();
         if let Some(eq_pos) = rest.find('=') {
             let field_name = rest[..eq_pos].trim().to_string();
             let expr = rest[eq_pos + 1..].trim().to_string();
@@ -1095,8 +1170,8 @@ fn classify_cxl_line(line: &str) -> (CxlStatementKind, Option<String>, String) {
         }
         return (CxlStatementKind::Emit, None, rest.to_string());
     }
-    if line.starts_with("let ") {
-        let rest = line[4..].trim_start();
+    if let Some(stripped) = line.strip_prefix("let ") {
+        let rest = stripped.trim_start();
         if let Some(eq_pos) = rest.find('=') {
             let binding = rest[..eq_pos].trim().to_string();
             let expr = rest[eq_pos + 1..].trim().to_string();
@@ -1104,14 +1179,11 @@ fn classify_cxl_line(line: &str) -> (CxlStatementKind, Option<String>, String) {
         }
         return (CxlStatementKind::Let, None, rest.to_string());
     }
-    if line.starts_with("if ")
-        || line.starts_with("when ")
-        || line.starts_with("guard ")
-    {
+    if line.starts_with("if ") || line.starts_with("when ") || line.starts_with("guard ") {
         return (CxlStatementKind::Filter, None, line.to_string());
     }
-    if line.starts_with("log ") {
-        return (CxlStatementKind::Log, None, line[4..].to_string());
+    if let Some(stripped) = line.strip_prefix("log ") {
+        return (CxlStatementKind::Log, None, stripped.to_string());
     }
     (CxlStatementKind::Expression, None, line.to_string())
 }
@@ -1146,11 +1218,9 @@ fn extract_field_refs(expr: &str) -> Vec<String> {
 
         if ch.is_alphanumeric() || ch == '_' {
             token.push(ch);
-        } else {
-            if !token.is_empty() {
-                maybe_add_ref(&token, &mut refs);
-                token.clear();
-            }
+        } else if !token.is_empty() {
+            maybe_add_ref(&token, &mut refs);
+            token.clear();
         }
     }
     if !token.is_empty() {
@@ -1164,7 +1234,12 @@ fn extract_field_refs(expr: &str) -> Vec<String> {
 
 fn maybe_add_ref(token: &str, refs: &mut Vec<String>) {
     // Skip numeric literals
-    if token.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if token
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         return;
     }
     // Skip keywords
@@ -1188,7 +1263,9 @@ mod tests {
             emit age = year(today()) - birth_year
         "#;
         let analysis = analyze_cxl(cxl);
-        let emits: Vec<_> = analysis.statements.iter()
+        let emits: Vec<_> = analysis
+            .statements
+            .iter()
             .filter(|s| s.kind == CxlStatementKind::Emit)
             .collect();
         assert_eq!(emits.len(), 2);
@@ -1208,7 +1285,11 @@ mod tests {
         let analysis = analyze_cxl(cxl);
         assert_eq!(analysis.statements.len(), 1);
         assert_eq!(analysis.statements[0].kind, CxlStatementKind::Filter);
-        assert!(analysis.statements[0].field_refs.contains(&"status".to_string()));
+        assert!(
+            analysis.statements[0]
+                .field_refs
+                .contains(&"status".to_string())
+        );
         assert!(analysis.all_field_refs.contains(&"status".to_string()));
     }
 
@@ -1219,10 +1300,16 @@ mod tests {
             emit bonus = salary * 0.1
         "#;
         let analysis = analyze_cxl(cxl);
-        let filters: Vec<_> = analysis.statements.iter()
-            .filter(|s| s.kind == CxlStatementKind::Filter).collect();
-        let emits: Vec<_> = analysis.statements.iter()
-            .filter(|s| s.kind == CxlStatementKind::Emit).collect();
+        let filters: Vec<_> = analysis
+            .statements
+            .iter()
+            .filter(|s| s.kind == CxlStatementKind::Filter)
+            .collect();
+        let emits: Vec<_> = analysis
+            .statements
+            .iter()
+            .filter(|s| s.kind == CxlStatementKind::Emit)
+            .collect();
         assert_eq!(filters.len(), 1);
         assert_eq!(emits.len(), 1);
         assert!(filters[0].field_refs.contains(&"department".to_string()));
@@ -1236,9 +1323,20 @@ mod tests {
         let analysis = analyze_cxl(cxl);
         assert_eq!(analysis.statements.len(), 1);
         assert_eq!(analysis.statements[0].kind, CxlStatementKind::Let);
-        assert_eq!(analysis.statements[0].output_field.as_deref(), Some("total"));
-        assert!(analysis.statements[0].field_refs.contains(&"price".to_string()));
-        assert!(analysis.statements[0].field_refs.contains(&"tax".to_string()));
+        assert_eq!(
+            analysis.statements[0].output_field.as_deref(),
+            Some("total")
+        );
+        assert!(
+            analysis.statements[0]
+                .field_refs
+                .contains(&"price".to_string())
+        );
+        assert!(
+            analysis.statements[0]
+                .field_refs
+                .contains(&"tax".to_string())
+        );
     }
 
     #[test]

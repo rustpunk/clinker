@@ -6,8 +6,8 @@
 use std::io::BufRead;
 use std::sync::Arc;
 
-use quick_xml::events::Event;
 use quick_xml::Reader as XmlParser;
+use quick_xml::events::Event;
 
 use clinker_record::{Record, Schema, Value};
 
@@ -34,7 +34,10 @@ impl Default for XmlReaderConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum NamespaceMode { Strip, Qualify }
+pub enum NamespaceMode {
+    Strip,
+    Qualify,
+}
 
 #[derive(Debug, Clone)]
 pub struct XmlArrayPath {
@@ -44,7 +47,10 @@ pub struct XmlArrayPath {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum XmlArrayMode { Explode, Join }
+pub enum XmlArrayMode {
+    Explode,
+    Join,
+}
 
 /// Streaming XML reader.
 pub struct XmlReader<R: BufRead> {
@@ -97,7 +103,9 @@ impl<R: BufRead> XmlReader<R> {
 
         loop {
             self.buf.clear();
-            let event = self.parser.read_event_into(&mut self.buf)
+            let event = self
+                .parser
+                .read_event_into(&mut self.buf)
                 .map_err(|e| FormatError::Xml(e.to_string()))?;
 
             match event {
@@ -109,7 +117,8 @@ impl<R: BufRead> XmlReader<R> {
                         if name == self.path_segments[self.matched_depth] {
                             self.matched_depth += 1;
                             if self.matched_depth == self.path_segments.len() {
-                                let attrs = extract_attributes_static(&self.config.attribute_prefix, &e)?;
+                                let attrs =
+                                    extract_attributes_static(&self.config.attribute_prefix, e)?;
                                 let fields = self.extract_record_fields(attrs)?;
                                 return Ok(Some(fields));
                             }
@@ -117,7 +126,7 @@ impl<R: BufRead> XmlReader<R> {
                             self.skip_subtree()?;
                         }
                     } else {
-                        let attrs = extract_attributes_static(&self.config.attribute_prefix, &e)?;
+                        let attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                         let fields = self.extract_record_fields(attrs)?;
                         return Ok(Some(fields));
                     }
@@ -129,11 +138,12 @@ impl<R: BufRead> XmlReader<R> {
                         if name == self.path_segments[self.matched_depth]
                             && self.matched_depth == self.path_segments.len() - 1
                         {
-                            let fields = extract_attributes_static(&self.config.attribute_prefix, &e)?;
+                            let fields =
+                                extract_attributes_static(&self.config.attribute_prefix, e)?;
                             return Ok(Some(fields));
                         }
                     } else {
-                        let fields = extract_attributes_static(&self.config.attribute_prefix, &e)?;
+                        let fields = extract_attributes_static(&self.config.attribute_prefix, e)?;
                         return Ok(Some(fields));
                     }
                 }
@@ -147,8 +157,12 @@ impl<R: BufRead> XmlReader<R> {
                     self.done = true;
                     return Ok(None);
                 }
-                Event::Text(_) | Event::CData(_) | Event::Comment(_)
-                | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {
+                Event::Text(_)
+                | Event::CData(_)
+                | Event::Comment(_)
+                | Event::Decl(_)
+                | Event::PI(_)
+                | Event::DocType(_) => {
                     // Skip non-element events at navigation level
                 }
             }
@@ -168,7 +182,9 @@ impl<R: BufRead> XmlReader<R> {
 
         loop {
             buf2.clear();
-            let event = self.parser.read_event_into(&mut buf2)
+            let event = self
+                .parser
+                .read_event_into(&mut buf2)
                 .map_err(|e| FormatError::Xml(e.to_string()))?;
 
             match event {
@@ -203,7 +219,8 @@ impl<R: BufRead> XmlReader<R> {
                     }
                 }
                 Event::Text(ref t) => {
-                    let text = t.unescape()
+                    let text = t
+                        .unescape()
                         .map_err(|e| FormatError::Xml(e.to_string()))?
                         .into_owned();
                     if !text.is_empty() {
@@ -238,7 +255,9 @@ impl<R: BufRead> XmlReader<R> {
         let target_depth = self.xml_depth;
         loop {
             self.buf.clear();
-            let event = self.parser.read_event_into(&mut self.buf)
+            let event = self
+                .parser
+                .read_event_into(&mut self.buf)
                 .map_err(|e| FormatError::Xml(e.to_string()))?;
             match event {
                 Event::Start(_) => self.xml_depth += 1,
@@ -258,11 +277,7 @@ impl<R: BufRead> XmlReader<R> {
     }
 
     /// Convert raw field pairs to a Record, applying array_paths and type inference.
-    fn fields_to_record(
-        &self,
-        fields: Vec<(String, String)>,
-        schema: &Arc<Schema>,
-    ) -> Record {
+    fn fields_to_record(&self, fields: Vec<(String, String)>, schema: &Arc<Schema>) -> Record {
         let mut values = vec![Value::Null; schema.column_count()];
         let mut overflow: Vec<(String, Value)> = Vec::new();
 
@@ -302,9 +317,14 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
 
         // Infer schema from first record's field names (preserving order)
         let mut seen = std::collections::HashSet::new();
-        let columns: Vec<Box<str>> = first.iter()
+        let columns: Vec<Box<str>> = first
+            .iter()
             .filter_map(|(k, _)| {
-                if seen.insert(k.clone()) { Some(k.clone().into_boxed_str()) } else { None }
+                if seen.insert(k.clone()) {
+                    Some(k.clone().into_boxed_str())
+                } else {
+                    None
+                }
             })
             .collect();
         let schema = Arc::new(Schema::new(columns));
@@ -353,7 +373,8 @@ fn extract_attributes_static(
     for attr in elem.attributes() {
         let attr = attr.map_err(|e| FormatError::Xml(e.to_string()))?;
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        let val = attr.unescape_value()
+        let val = attr
+            .unescape_value()
             .map_err(|e| FormatError::Xml(e.to_string()))?
             .into_owned();
         attrs.push((format!("{prefix}{key}"), val));
@@ -369,10 +390,10 @@ fn infer_value(s: &str) -> Value {
     if let Ok(i) = s.parse::<i64>() {
         return Value::Integer(i);
     }
-    if let Ok(f) = s.parse::<f64>() {
-        if s.contains('.') || s.contains('e') || s.contains('E') {
-            return Value::Float(f);
-        }
+    if let Ok(f) = s.parse::<f64>()
+        && (s.contains('.') || s.contains('e') || s.contains('E'))
+    {
+        return Value::Float(f);
     }
     match s {
         "true" => Value::Bool(true),
@@ -386,7 +407,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn reader_from_str(xml: &str, config: XmlReaderConfig) -> XmlReader<std::io::BufReader<Cursor<Vec<u8>>>> {
+    fn reader_from_str(
+        xml: &str,
+        config: XmlReaderConfig,
+    ) -> XmlReader<std::io::BufReader<Cursor<Vec<u8>>>> {
         let cursor = Cursor::new(xml.as_bytes().to_vec());
         XmlReader::new(std::io::BufReader::new(cursor), config)
     }
@@ -511,7 +535,10 @@ mod tests {
         let mut r = reader_from_str(xml, default_config_with_path("Root/Row"));
         let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.get("content"), Some(&Value::String("some & content".into())));
+        assert_eq!(
+            r1.get("content"),
+            Some(&Value::String("some & content".into()))
+        );
     }
 
     #[test]

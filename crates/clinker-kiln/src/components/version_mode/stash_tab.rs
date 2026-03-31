@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use clinker_git::GitOps;
 
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::state::TabManagerState;
 
 /// A parsed stash entry.
@@ -25,10 +25,10 @@ pub fn StashTab() -> Element {
     // Load stashes on first render
     if !(loaded)() {
         let ws = (tab_mgr.workspace)();
-        if let Some(ws) = ws {
-            if let Ok(entries) = load_stashes(&ws.root) {
-                stashes.set(entries);
-            }
+        if let Some(ws) = ws
+            && let Ok(entries) = load_stashes(&ws.root)
+        {
+            stashes.set(entries);
         }
         loaded.set(true);
     }
@@ -101,15 +101,8 @@ fn load_stashes(repo_path: &std::path::Path) -> Result<Vec<StashEntry>, clinker_
         .lines()
         .enumerate()
         .map(|(i, line)| {
-            let message = line
-                .split(": ")
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(": ");
-            StashEntry {
-                index: i,
-                message,
-            }
+            let message = line.split(": ").skip(1).collect::<Vec<_>>().join(": ");
+            StashEntry { index: i, message }
         })
         .collect();
 
@@ -135,16 +128,16 @@ fn run_stash_action(
     let mut toast: Signal<Option<ToastState>> = use_context();
     match result {
         Ok(output) if output.status.success() => {
-            toast_success(&mut toast, &format!("Stash {action} succeeded"));
+            toast_success(&mut toast, format!("Stash {action} succeeded"));
             // Refresh stash list
             if let Ok(entries) = load_stashes(&ws.root) {
                 stashes.set(entries);
             }
             // Refresh git state
-            if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
-                if let Ok(status) = ops.status() {
-                    tab_mgr.git_state.set(Some(status));
-                }
+            if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root)
+                && let Ok(status) = ops.status()
+            {
+                tab_mgr.git_state.set(Some(status));
             }
         }
         Ok(output) => {

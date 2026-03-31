@@ -13,7 +13,10 @@ mod tests {
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
 
-        let pipeline_vars = config.pipeline.vars.as_ref()
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
             .map(|v| config::convert_pipeline_vars(v))
             .unwrap_or_default();
         let params = PipelineRunParams {
@@ -30,14 +33,26 @@ mod tests {
     }
 
     /// Determine exit code from pipeline result (mirrors main.rs logic).
-    fn exit_code(result: &Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError>) -> u8 {
+    fn exit_code(
+        result: &Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError>,
+    ) -> u8 {
         match result {
             Ok((counters, _, _)) => {
-                if counters.dlq_count > 0 { 2 } else { 0 }
+                if counters.dlq_count > 0 {
+                    2
+                } else {
+                    0
+                }
             }
-            Err(PipelineError::Config(_) | PipelineError::Schema(_) | PipelineError::Compilation { .. }) => 1,
+            Err(
+                PipelineError::Config(_)
+                | PipelineError::Schema(_)
+                | PipelineError::Compilation { .. },
+            ) => 1,
             Err(PipelineError::Eval(_)) => 3,
-            Err(PipelineError::Io(_) | PipelineError::Format(_) | PipelineError::ThreadPool(_)) => 4,
+            Err(PipelineError::Io(_) | PipelineError::Format(_) | PipelineError::ThreadPool(_)) => {
+                4
+            }
         }
     }
 
@@ -179,22 +194,45 @@ transformations:
         assert!(dlq.is_empty());
 
         // Verify output contains transformed fields
-        assert!(output.contains("employee_name"), "should have renamed full_name to employee_name");
-        assert!(output.contains("Alice Smith"), "should have concatenated names");
+        assert!(
+            output.contains("employee_name"),
+            "should have renamed full_name to employee_name"
+        );
+        assert!(
+            output.contains("Alice Smith"),
+            "should have concatenated names"
+        );
         assert!(output.contains("Bob Jones"));
-        assert!(output.contains("ENGINEERING"), "should have uppercased department");
+        assert!(
+            output.contains("ENGINEERING"),
+            "should have uppercased department"
+        );
         assert!(output.contains("MARKETING"));
 
         // Verify excluded field is gone
-        assert!(!output.contains("internal_id"), "should have excluded internal_id");
-        assert!(!output.contains("12345"), "should have excluded internal_id values");
+        assert!(
+            !output.contains("internal_id"),
+            "should have excluded internal_id"
+        );
+        assert!(
+            !output.contains("12345"),
+            "should have excluded internal_id values"
+        );
 
         // Verify unmapped fields are present
-        assert!(output.contains("first_name"), "include_unmapped should pass through");
+        assert!(
+            output.contains("first_name"),
+            "include_unmapped should pass through"
+        );
 
         // Parse output as CSV to verify structure
         let mut reader = csv::ReaderBuilder::new().from_reader(output.as_bytes());
-        let headers: Vec<String> = reader.headers().unwrap().iter().map(|s| s.to_string()).collect();
+        let headers: Vec<String> = reader
+            .headers()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(headers.contains(&"employee_name".to_string()));
         assert!(headers.contains(&"dept_upper".to_string()));
         assert!(!headers.contains(&"internal_id".to_string()));
@@ -224,9 +262,10 @@ transformations:
     cxl: "emit x = 1"
 "#;
         let config = config::parse_config(yaml).unwrap();
-        let result: Result<_, PipelineError> = Err(PipelineError::Io(
-            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found")
-        ));
+        let result: Result<_, PipelineError> = Err(PipelineError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        )));
         assert_eq!(exit_code(&result), 4);
     }
 

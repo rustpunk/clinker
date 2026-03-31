@@ -2,7 +2,6 @@
 ///
 /// Spec §F2.2: anchored bottom-right, 16px from edges, auto-dismiss after 5s.
 /// Verdigris accent for success, oxide-red for errors. Click to dismiss early.
-
 use dioxus::prelude::*;
 
 /// Toast state: message text + CSS accent color + auto-dismiss duration.

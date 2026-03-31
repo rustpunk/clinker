@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 
 use crate::channel_resolve::OverrideKind;
-use crate::pipeline_view::{StageKind, StageView, INLINE_THRESHOLD, NODE_HEIGHT, NODE_WIDTH};
-use crate::state::{use_app_state, DrillInEntry, TabManagerState};
+use crate::pipeline_view::{INLINE_THRESHOLD, NODE_HEIGHT, NODE_WIDTH, StageKind, StageView};
+use crate::state::{DrillInEntry, TabManagerState, use_app_state};
 
 /// A single pipeline stage rendered as a rustpunk node card on the canvas.
 #[component]
@@ -18,14 +18,14 @@ pub fn CanvasNode(stage: StageView) -> Element {
     let is_from_composition = stage.from_composition.is_some();
 
     // Channel override indicator
-    let tab_mgr = use_context::<TabManagerState>();
+    let _tab_mgr = use_context::<TabManagerState>();
     let channel_resolution = (state.channel_pipeline)();
     let override_info = channel_resolution.as_ref().and_then(|cr| {
         cr.overrides_applied
             .iter()
             .find(|o| o.target_name == stage.id)
     });
-    let has_channel_override = override_info.is_some();
+    let _has_channel_override = override_info.is_some();
     let is_added = override_info
         .map(|o| o.kind == OverrideKind::Added)
         .unwrap_or(false);
@@ -49,12 +49,16 @@ pub fn CanvasNode(stage: StageView) -> Element {
     let border_style = if is_from_composition {
         format!(
             "left: {x}px; top: {y}px; width: {w}px; border-top-color: {accent}; border-left: 2px dashed {accent};",
-            x = stage.canvas_x, y = stage.canvas_y, w = NODE_WIDTH
+            x = stage.canvas_x,
+            y = stage.canvas_y,
+            w = NODE_WIDTH
         )
     } else {
         format!(
             "left: {x}px; top: {y}px; width: {w}px; border-top-color: {accent};",
-            x = stage.canvas_x, y = stage.canvas_y, w = NODE_WIDTH
+            x = stage.canvas_x,
+            y = stage.canvas_y,
+            w = NODE_WIDTH
         )
     };
 

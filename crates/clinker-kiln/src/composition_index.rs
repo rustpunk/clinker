@@ -2,10 +2,9 @@
 ///
 /// Scans the `compositions/` directory, parses each file, and collects metadata
 /// for the composition browser panel.
-
 use std::path::PathBuf;
 
-use clinker_core::composition::{load_composition, CompositionMeta, Contract};
+use clinker_core::composition::{CompositionMeta, Contract, load_composition};
 
 use crate::workspace::Workspace;
 
@@ -52,22 +51,23 @@ pub fn build_composition_index(workspace: &Workspace) -> CompositionIndex {
                 && path
                     .file_stem()
                     .is_some_and(|s| s.to_string_lossy().ends_with(".comp"))
+                && let Ok(comp) = load_composition(&path)
             {
-                if let Ok(comp) = load_composition(&path) {
-                    let transform_count = comp.transformations.len();
-                    let contract = comp.compose.contract.clone();
-                    entries.push(CompositionEntry {
-                        path,
-                        meta: comp.compose,
-                        transform_count,
-                        contract,
-                        used_by: Vec::new(), // TODO: scan pipelines for _import refs
-                    });
-                }
+                let transform_count = comp.transformations.len();
+                let contract = comp.compose.contract.clone();
+                entries.push(CompositionEntry {
+                    path,
+                    meta: comp.compose,
+                    transform_count,
+                    contract,
+                    used_by: Vec::new(), // TODO: scan pipelines for _import refs
+                });
             }
         }
     }
 
     entries.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-    CompositionIndex { compositions: entries }
+    CompositionIndex {
+        compositions: entries,
+    }
 }

@@ -35,7 +35,11 @@ pub fn InspectorPanel(stage_id: String) -> Element {
     let (kind_label, accent, subtitle) = if input.is_some() {
         ("SOURCE", "#43B3AE", input.unwrap().path.clone())
     } else if let Some(t) = transform {
-        ("TRANSFORM", "#C75B2A", t.description.clone().unwrap_or_default())
+        (
+            "TRANSFORM",
+            "#C75B2A",
+            t.description.clone().unwrap_or_default(),
+        )
     } else if output.is_some() {
         ("OUTPUT", "#B7410E", output.unwrap().path.clone())
     } else {

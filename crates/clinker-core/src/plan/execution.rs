@@ -8,9 +8,7 @@ use std::collections::HashSet;
 use indexmap::IndexMap;
 
 use crate::config::{PipelineConfig, SortField};
-use crate::plan::index::{
-    self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest,
-};
+use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 
 use cxl::analyzer::{self, ParallelismHint};
 use cxl::typecheck::pass::TypedProgram;
@@ -136,7 +134,8 @@ impl ExecutionPlan {
                     ParallelismHint::IndexReading => {
                         // Check if cross-source
                         if let Some(wc) = wc {
-                            let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
+                            let source =
+                                wc.source.clone().unwrap_or_else(|| primary_source.clone());
                             if source != primary_source {
                                 ParallelismClass::CrossSource
                             } else {
@@ -217,7 +216,10 @@ impl ExecutionPlan {
         out.push_str("=== Execution Plan ===\n\n");
 
         out.push_str(&format!("Mode: {:?}\n", self.mode()));
-        out.push_str(&format!("Indices to build: {}\n", self.indices_to_build.len()));
+        out.push_str(&format!(
+            "Indices to build: {}\n",
+            self.indices_to_build.len()
+        ));
         out.push_str(&format!("Transforms: {}\n", self.transforms.len()));
         out.push_str(&format!(
             "Output projections: {}\n\n",
@@ -252,7 +254,10 @@ impl ExecutionPlan {
             out.push_str(&format!("Transform '{}':\n", tp.name));
             out.push_str(&format!("  Parallelism: {:?}\n", tp.parallelism_class));
             out.push_str(&format!("  Window index: {:?}\n", tp.window_index));
-            out.push_str(&format!("  Partition lookup: {:?}\n\n", tp.partition_lookup));
+            out.push_str(&format!(
+                "  Partition lookup: {:?}\n\n",
+                tp.partition_lookup
+            ));
         }
 
         out
@@ -281,20 +286,27 @@ impl ExecutionPlan {
         // Type annotations (inferred types per output field)
         out.push_str("=== Type Annotations ===\n\n");
         for tp in &self.transforms {
-            out.push_str(&format!("Transform '{}': (types inferred at compile time)\n", tp.name));
+            out.push_str(&format!(
+                "Transform '{}': (types inferred at compile time)\n",
+                tp.name
+            ));
         }
         out.push('\n');
 
         // Memory budget
         out.push_str("=== Memory Budget ===\n\n");
-        let memory_limit = config.pipeline.concurrency
+        let memory_limit = config
+            .pipeline
+            .concurrency
             .as_ref()
             .and_then(|c| c.threads)
             .map(|_| "configured")
             .unwrap_or("default");
         out.push_str(&format!("Memory limit: {}\n", memory_limit));
-        out.push_str(&format!("Worker threads: {}\n",
-            self.parallelism.worker_threads));
+        out.push_str(&format!(
+            "Worker threads: {}\n",
+            self.parallelism.worker_threads
+        ));
         out.push('\n');
 
         out
@@ -377,10 +389,10 @@ fn build_source_dag(
     // Collect which sources are dependencies (referenced by cross-source windows)
     let mut dependencies: HashSet<String> = HashSet::new();
     for wc in window_configs.iter().flatten() {
-        if let Some(source) = &wc.source {
-            if source != primary_source {
-                dependencies.insert(source.clone());
-            }
+        if let Some(source) = &wc.source
+            && source != primary_source
+        {
+            dependencies.insert(source.clone());
         }
     }
 
@@ -420,13 +432,8 @@ fn check_already_sorted(_config: &PipelineConfig, _source: &str, _sort_by: &[Sor
 #[derive(Debug)]
 pub enum PlanError {
     IndexPlanning(PlanIndexError),
-    MissingLocalWindow {
-        transform: String,
-    },
-    UnknownSource {
-        name: String,
-        transform: String,
-    },
+    MissingLocalWindow { transform: String },
+    UnknownSource { name: String, transform: String },
 }
 
 impl std::fmt::Display for PlanError {
@@ -515,15 +522,17 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| TransformEntry::Transform(TransformConfig {
-                    name: name.into(),
-                    description: None,
-                    cxl: cxl.into(),
-                    local_window,
-                    log: None,
-                    validations: None,
-                    notes: None,
-                }))
+                .map(|(name, cxl, local_window)| {
+                    TransformEntry::Transform(TransformConfig {
+                        name: name.into(),
+                        description: None,
+                        cxl: cxl.into(),
+                        local_window,
+                        log: None,
+                        validations: None,
+                        notes: None,
+                    })
+                })
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
@@ -533,7 +542,11 @@ mod tests {
     /// Compile CXL source to TypedProgram for a given set of field names.
     fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProgram {
         let parsed = Parser::parse(source);
-        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors
+        );
         let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
         let schema: HashMap<String, cxl::typecheck::types::Type> = HashMap::new();
         type_check(resolved, &schema).unwrap()
@@ -553,7 +566,10 @@ mod tests {
 
         assert!(plan.indices_to_build.is_empty());
         assert_eq!(plan.transforms.len(), 1);
-        assert_eq!(plan.transforms[0].parallelism_class, ParallelismClass::Stateless);
+        assert_eq!(
+            plan.transforms[0].parallelism_class,
+            ParallelismClass::Stateless
+        );
         assert_eq!(plan.mode(), ExecutionMode::Streaming);
     }
 
@@ -586,7 +602,11 @@ mod tests {
         let config = test_config(
             vec![("primary", "data.csv")],
             vec![
-                ("agg1", "emit total = window.sum(amount)", Some(window.clone())),
+                (
+                    "agg1",
+                    "emit total = window.sum(amount)",
+                    Some(window.clone()),
+                ),
                 ("agg2", "emit cnt = window.count()", Some(window)),
             ],
         );
@@ -609,8 +629,16 @@ mod tests {
         let config = test_config(
             vec![("primary", "data.csv")],
             vec![
-                ("agg_dept", "emit total = window.sum(amount)", Some(window_a)),
-                ("agg_region", "emit total = window.sum(amount)", Some(window_b)),
+                (
+                    "agg_dept",
+                    "emit total = window.sum(amount)",
+                    Some(window_a),
+                ),
+                (
+                    "agg_region",
+                    "emit total = window.sum(amount)",
+                    Some(window_b),
+                ),
             ],
         );
         let fields = &["dept", "region", "amount"];
@@ -635,7 +663,10 @@ mod tests {
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
-        assert_eq!(plan.transforms[0].parallelism_class, ParallelismClass::Stateless);
+        assert_eq!(
+            plan.transforms[0].parallelism_class,
+            ParallelismClass::Stateless
+        );
     }
 
     #[test]
@@ -651,7 +682,10 @@ mod tests {
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
-        assert_eq!(plan.transforms[0].parallelism_class, ParallelismClass::IndexReading);
+        assert_eq!(
+            plan.transforms[0].parallelism_class,
+            ParallelismClass::IndexReading
+        );
     }
 
     #[test]
@@ -670,7 +704,10 @@ mod tests {
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
-        assert_eq!(plan.transforms[0].parallelism_class, ParallelismClass::Sequential);
+        assert_eq!(
+            plan.transforms[0].parallelism_class,
+            ParallelismClass::Sequential
+        );
     }
 
     #[test]
@@ -716,7 +753,11 @@ mod tests {
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
         assert_eq!(plan.source_dag.len(), 2);
-        assert!(plan.source_dag[0].sources.contains(&"reference".to_string()));
+        assert!(
+            plan.source_dag[0]
+                .sources
+                .contains(&"reference".to_string())
+        );
         assert!(plan.source_dag[1].sources.contains(&"primary".to_string()));
     }
 

@@ -2,8 +2,7 @@ use dioxus::prelude::*;
 
 use clinker_git::{BlameLine, GitOps};
 
-use crate::pipeline_view::derive_pipeline_view;
-use crate::state::{use_app_state, ChannelViewMode, TabManagerState};
+use crate::state::{ChannelViewMode, TabManagerState, use_app_state};
 use crate::sync::EditSource;
 
 use super::tokenizer::tokenize;
@@ -26,7 +25,7 @@ pub fn YamlSidebar() -> Element {
     let raw_lines = tokenize(&raw_text);
     let raw_line_count = raw_lines.len().max(1);
     let mut blame_visible = use_signal(|| false);
-    let mut blame_data = use_signal(|| Vec::<BlameLine>::new());
+    let mut blame_data = use_signal(Vec::<BlameLine>::new);
 
     let show_blame = (blame_visible)();
 
@@ -44,7 +43,7 @@ pub fn YamlSidebar() -> Element {
     };
 
     // Schema warnings for YAML squiggles
-    let warnings = (state.schema_warnings)();
+    let _warnings = (state.schema_warnings)();
 
     // Channel view mode — Base / Resolved / Channel
     let channel_resolution = (state.channel_pipeline)();
@@ -53,7 +52,11 @@ pub fn YamlSidebar() -> Element {
             .as_ref()
             .and_then(|cs| cs.active_channel.as_ref())
             .is_some();
-    let view_mode = if has_channel { (state.channel_view_mode)() } else { ChannelViewMode::Base };
+    let view_mode = if has_channel {
+        (state.channel_view_mode)()
+    } else {
+        ChannelViewMode::Base
+    };
 
     // Load channel override text for Channel mode
     let channel_override_text = if view_mode == ChannelViewMode::Channel {
@@ -80,9 +83,7 @@ pub fn YamlSidebar() -> Element {
             let count = chan_lines.len().max(1);
             (chan_text, chan_lines, count, true)
         }
-        ChannelViewMode::Base => {
-            (raw_text.clone(), raw_lines, raw_line_count, true)
-        }
+        ChannelViewMode::Base => (raw_text.clone(), raw_lines, raw_line_count, true),
     };
 
     let section_title = match view_mode {
@@ -210,7 +211,7 @@ pub fn YamlSidebar() -> Element {
                             let in_range = selected_range
                                 .is_some_and(|(s, e)| line_num >= s && line_num <= e);
                             // Check for schema warnings on this line
-                            let has_warning = !warnings.is_empty() && false; // TODO: map warnings to line numbers
+                            let _has_warning = false; // TODO: map warnings to line numbers
                             rsx! {
                                 div {
                                     key: "gutter-{i}",
@@ -335,17 +336,17 @@ fn load_blame(tab_mgr: &TabManagerState, blame_data: &mut Signal<Vec<BlameLine>>
     let tabs = tab_mgr.tabs.read();
     let active_tab = active_id.and_then(|id| tabs.iter().find(|t| t.id == id));
     let Some(tab) = active_tab else { return };
-    let Some(ref file_path) = tab.file_path else { return };
+    let Some(ref file_path) = tab.file_path else {
+        return;
+    };
 
     // Make path relative to repo root
-    let relative = file_path
-        .strip_prefix(&ws.root)
-        .unwrap_or(file_path);
+    let relative = file_path.strip_prefix(&ws.root).unwrap_or(file_path);
 
-    if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) {
-        if let Ok(lines) = ops.blame(relative) {
-            blame_data.set(lines);
-        }
+    if let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root)
+        && let Ok(lines) = ops.blame(relative)
+    {
+        blame_data.set(lines);
     }
 }
 
@@ -354,7 +355,8 @@ fn channel_override_path(tab_mgr: &TabManagerState) -> Option<std::path::PathBuf
     let cs = (tab_mgr.channel_state)();
     let channel_state = cs.as_ref()?;
     let channel_id = channel_state.active_channel.as_ref()?;
-    let channel_dir = channel_state.workspace_root
+    let channel_dir = channel_state
+        .workspace_root
         .join(&channel_state.channels_dir)
         .join(channel_id);
 

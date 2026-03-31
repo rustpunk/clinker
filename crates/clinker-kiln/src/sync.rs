@@ -17,15 +17,14 @@
 /// An `EditSource` enum prevents infinite sync loops: when the YAML editor
 /// triggers a parse, we don't re-serialize; when the inspector triggers a
 /// serialize, we don't re-parse.
-
 use std::collections::HashMap;
 use std::path::Path;
 
 use clinker_core::composition::{
-    parse_raw_config, resolve_imports, CompositionError, CompositionOrigin, RawPipelineConfig,
-    RawTransformEntry, ResolvedComposition,
+    CompositionOrigin, RawPipelineConfig, RawTransformEntry, ResolvedComposition, parse_raw_config,
+    resolve_imports,
 };
-use clinker_core::config::{parse_config, PipelineConfig, TransformEntry};
+use clinker_core::config::{PipelineConfig, TransformEntry, parse_config};
 
 /// Tracks which view most recently edited the pipeline model.
 /// Used to break the YAML ↔ model sync loop.
@@ -50,6 +49,7 @@ pub enum EditSource {
 /// Returns `Ok(config)` on success, or `Err(messages)` with human-readable
 /// error descriptions on failure. Uses `clinker_core::config::parse_config()`
 /// which includes environment variable interpolation.
+#[allow(dead_code)]
 pub fn parse_yaml(yaml: &str) -> Result<PipelineConfig, Vec<String>> {
     match parse_config(yaml) {
         Ok(config) => Ok(config),
@@ -145,6 +145,7 @@ pub fn parse_yaml_raw_path(yaml: &str) -> Result<PipelineConfig, Vec<String>> {
 // ── Partial parsing (graceful degradation) ──────────────────────────────
 
 /// Result of attempting to parse a pipeline YAML with fallback.
+#[allow(clippy::large_enum_variant)]
 pub enum ParseResult {
     /// Fully successful parse — all items valid, imports resolved.
     Complete(ResolvedPipeline),
@@ -161,9 +162,8 @@ pub enum ParseResult {
 /// 3. If both fail: return `Failed`.
 pub fn try_parse_yaml(yaml: &str, workspace_root: Option<&Path>) -> ParseResult {
     // Fast path: try full parse
-    match parse_and_resolve_yaml(yaml, workspace_root) {
-        Ok(resolved) => return ParseResult::Complete(resolved),
-        Err(_) => {}
+    if let Ok(resolved) = parse_and_resolve_yaml(yaml, workspace_root) {
+        return ParseResult::Complete(resolved);
     }
 
     // Fallback: per-item partial parse
@@ -198,6 +198,7 @@ pub fn serialize_raw_yaml(config: &RawPipelineConfig) -> String {
 /// this function creates/updates/removes the override entry in the `_import` directive.
 ///
 /// Returns `true` if the raw config was modified.
+#[allow(dead_code)]
 pub fn apply_composition_override(
     raw: &mut RawPipelineConfig,
     origin: &CompositionOrigin,
@@ -205,29 +206,29 @@ pub fn apply_composition_override(
 ) -> bool {
     // Find the matching _import directive
     for entry in &mut raw.transformations {
-        if let RawTransformEntry::Import(directive) = entry {
-            if directive.path == origin.composition_path {
-                // Compare with original (whitespace-normalized)
-                if new_cxl.trim() == origin.original_cxl.trim() {
-                    // Reverted to base — remove override
-                    if directive.overrides.contains_key(&origin.transform_name) {
-                        directive.overrides.swap_remove(&origin.transform_name);
-                        return true;
-                    }
-                    return false;
-                } else {
-                    // Different from base — upsert override
-                    let ovr = directive
-                        .overrides
-                        .entry(origin.transform_name.clone())
-                        .or_insert_with(|| clinker_core::composition::TransformOverride {
-                            cxl: None,
-                            description: None,
-                            local_window: None,
-                        });
-                    ovr.cxl = Some(new_cxl.to_string());
+        if let RawTransformEntry::Import(directive) = entry
+            && directive.path == origin.composition_path
+        {
+            // Compare with original (whitespace-normalized)
+            if new_cxl.trim() == origin.original_cxl.trim() {
+                // Reverted to base — remove override
+                if directive.overrides.contains_key(&origin.transform_name) {
+                    directive.overrides.swap_remove(&origin.transform_name);
                     return true;
                 }
+                return false;
+            } else {
+                // Different from base — upsert override
+                let ovr = directive
+                    .overrides
+                    .entry(origin.transform_name.clone())
+                    .or_insert_with(|| clinker_core::composition::TransformOverride {
+                        cxl: None,
+                        description: None,
+                        local_window: None,
+                    });
+                ovr.cxl = Some(new_cxl.to_string());
+                return true;
             }
         }
     }
@@ -244,6 +245,7 @@ pub fn apply_composition_override(
 /// This bridges the gap between `clinker-schema` (knows field names) and
 /// `clinker-core::composition` (knows contracts). Called after both schema
 /// validation and import resolution complete.
+#[allow(dead_code)]
 pub fn validate_composition_contracts(
     resolved: &ResolvedPipeline,
     schema_fields: &[String],
@@ -286,12 +288,12 @@ pub fn validate_composition_contracts(
         // Add emitted fields from this transform to the available set
         for line in transform.cxl.lines() {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("emit ") {
-                if let Some(field_name) = rest.split('=').next() {
-                    let field = field_name.trim();
-                    if !field.is_empty() {
-                        available.push(field.to_string());
-                    }
+            if let Some(rest) = trimmed.strip_prefix("emit ")
+                && let Some(field_name) = rest.split('=').next()
+            {
+                let field = field_name.trim();
+                if !field.is_empty() {
+                    available.push(field.to_string());
                 }
             }
         }
@@ -310,10 +312,7 @@ pub fn validate_composition_contracts(
 ///
 /// This is a best-effort heuristic: it looks for `- name: <stage_name>` or
 /// `name: <stage_name>` patterns and groups subsequent indented lines.
-pub fn compute_yaml_ranges(
-    yaml: &str,
-    config: &PipelineConfig,
-) -> HashMap<String, (usize, usize)> {
+pub fn compute_yaml_ranges(yaml: &str, config: &PipelineConfig) -> HashMap<String, (usize, usize)> {
     let mut ranges = HashMap::new();
     let lines: Vec<&str> = yaml.lines().collect();
 
@@ -359,6 +358,7 @@ pub fn compute_yaml_ranges(
             // Walk forward to find the end of this block (next item at same indent level, or section end)
             let base_indent = lines[block_start].len() - lines[block_start].trim_start().len();
             let mut end_idx = start_idx;
+            #[allow(clippy::needless_range_loop)]
             for i in (start_idx + 1)..lines.len() {
                 let line = lines[i];
                 if line.trim().is_empty() {

@@ -3,7 +3,6 @@
 ///
 /// Spec §F4: kiln.toml is human-editable + version-controlled.
 /// .kiln-state.json is machine-managed + gitignored.
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -248,19 +247,16 @@ pub struct Workspace {
 impl Workspace {
     /// Display name: workspace.name from manifest, or directory name.
     pub fn display_name(&self) -> String {
-        self.manifest
-            .workspace
-            .name
-            .clone()
-            .unwrap_or_else(|| {
-                self.root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".to_string())
-            })
+        self.manifest.workspace.name.clone().unwrap_or_else(|| {
+            self.root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "workspace".to_string())
+        })
     }
 
     /// Make a path relative to the workspace root.
+    #[allow(dead_code)]
     pub fn relative_path(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
@@ -302,7 +298,10 @@ impl Workspace {
     /// any parse errors encountered.
     pub fn build_schema_index(
         &self,
-    ) -> (clinker_schema::SchemaIndex, Vec<(PathBuf, clinker_schema::SchemaParseError)>) {
+    ) -> (
+        clinker_schema::SchemaIndex,
+        Vec<(PathBuf, clinker_schema::SchemaParseError)>,
+    ) {
         clinker_schema::build_workspace_schema_index(
             &self.root,
             &self.schema_dir(),
@@ -344,8 +343,7 @@ pub fn detect_workspace(file_path: &Path) -> Option<PathBuf> {
 pub fn load_workspace(root: &Path) -> Option<Workspace> {
     let manifest_path = root.join("kiln.toml");
     let manifest_content = fs::read_to_string(&manifest_path).ok()?;
-    let manifest: WorkspaceManifest =
-        toml::from_str(&manifest_content).unwrap_or_default();
+    let manifest: WorkspaceManifest = toml::from_str(&manifest_content).unwrap_or_default();
 
     let state_path = root.join(".kiln-state.json");
     let state = if state_path.exists() {
@@ -507,29 +505,29 @@ pub fn discover_channels(ws: &Workspace) -> Option<ChannelState> {
         channels.sort_by(|a, b| a.id.cmp(&b.id));
 
         // Discover groups: scan groups dir for subdirectories with .channel.yaml files
-        if groups_abs.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&groups_abs) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let group_id = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let override_count = count_channel_yaml_files(&path);
-                    let inheritor_ids: Vec<String> = channels
-                        .iter()
-                        .filter(|c| c.inherits.contains(&group_id))
-                        .map(|c| c.id.clone())
-                        .collect();
-                    groups.push(GroupSummary {
-                        id: group_id,
-                        override_count,
-                        inheritor_ids,
-                    });
+        if groups_abs.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&groups_abs)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
                 }
+                let group_id = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let override_count = count_channel_yaml_files(&path);
+                let inheritor_ids: Vec<String> = channels
+                    .iter()
+                    .filter(|c| c.inherits.contains(&group_id))
+                    .map(|c| c.id.clone())
+                    .collect();
+                groups.push(GroupSummary {
+                    id: group_id,
+                    override_count,
+                    inheritor_ids,
+                });
             }
         }
         groups.sort_by(|a, b| a.id.cmp(&b.id));
@@ -579,11 +577,11 @@ pub fn save_last_workspace(root: &Path) {
         eprintln!("[kiln] cannot determine app data directory for last-workspace tracking");
         return;
     };
-    if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!("[kiln] failed to create app data dir: {e}");
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("[kiln] failed to create app data dir: {e}");
+        return;
     }
     let json = serde_json::json!({ "root": root.display().to_string() });
     if let Err(e) = fs::write(&path, json.to_string()) {
@@ -598,6 +596,7 @@ pub fn save_last_workspace(root: &Path) {
 /// - Periodic autosave (every 5s)
 /// - File save (Ctrl+S)
 /// - Workspace/file open
+#[allow(clippy::too_many_arguments)]
 pub fn save_full_session(
     workspace: &Option<Workspace>,
     tabs: &[TabEntry],
@@ -756,8 +755,7 @@ pub fn parse_navigation_state(state: &WorkspaceState) -> (NavigationContext, Pip
 
 /// Show a native directory picker and try to open it as a workspace.
 pub fn open_workspace_dialog() -> Option<Workspace> {
-    let dialog = rfd::FileDialog::new()
-        .set_title("Open Workspace");
+    let dialog = rfd::FileDialog::new().set_title("Open Workspace");
 
     let dir = dialog.pick_folder()?;
 
@@ -793,10 +791,10 @@ pub struct SessionInit {
 /// 4. Defaults (empty tabs, no workspace, Pipeline context, Hybrid layout)
 pub fn restore_session() -> SessionInit {
     // 1. Try CLI --workspace arg
-    if let Some(ws_path) = crate::cli_workspace() {
-        if let Some(init) = try_restore_from_workspace_root(ws_path) {
-            return init;
-        }
+    if let Some(ws_path) = crate::cli_workspace()
+        && let Some(init) = try_restore_from_workspace_root(ws_path)
+    {
+        return init;
     }
 
     // 2. Try last-used workspace
@@ -805,12 +803,11 @@ pub fn restore_session() -> SessionInit {
     }
 
     // 3. Try CWD workspace detection
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(ws_root) = detect_workspace(&cwd) {
-            if let Some(init) = try_restore_from_workspace_root(&ws_root) {
-                return init;
-            }
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(ws_root) = detect_workspace(&cwd)
+        && let Some(init) = try_restore_from_workspace_root(&ws_root)
+    {
+        return init;
     }
 
     // 4. Defaults
@@ -850,11 +847,16 @@ fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
     let active_tab_id = active_path
         .as_ref()
         .and_then(|ap| {
-            restored_tabs.iter().find(|t| {
-                t.file_path.as_ref()
-                    .map(|p| p.display().to_string())
-                    .as_deref() == Some(ap)
-            }).map(|t| t.id)
+            restored_tabs
+                .iter()
+                .find(|t| {
+                    t.file_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .as_deref()
+                        == Some(ap)
+                })
+                .map(|t| t.id)
         })
         .or_else(|| restored_tabs.first().map(|t| t.id));
 

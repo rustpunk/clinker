@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::components::yaml_sidebar::tokenizer::tokenize;
-use crate::state::{use_app_state, ChannelViewMode, TabManagerState};
+use crate::state::{ChannelViewMode, TabManagerState, use_app_state};
 use crate::sync::compute_yaml_ranges;
 
 /// Bottom section of the inspector showing the selected stage's YAML block
@@ -24,7 +24,11 @@ pub fn ScopedYaml(stage_id: String, accent: &'static str) -> Element {
             .as_ref()
             .and_then(|cs| cs.active_channel.as_ref())
             .is_some();
-    let view_mode = if has_channel { (state.channel_view_mode)() } else { ChannelViewMode::Base };
+    let view_mode = if has_channel {
+        (state.channel_view_mode)()
+    } else {
+        ChannelViewMode::Base
+    };
 
     // Determine which text/config to scope from
     let (text, scoped_config) = match view_mode {

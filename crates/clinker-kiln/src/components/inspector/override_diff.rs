@@ -6,7 +6,7 @@
 use dioxus::prelude::*;
 
 use crate::channel_resolve::{AppliedOverride, OverrideKind, OverrideSource};
-use crate::components::yaml_sidebar::tokenizer::{tokenize_cxl, Token, TokenKind};
+use crate::components::yaml_sidebar::tokenizer::{Token, TokenKind, tokenize_cxl};
 
 // ── Diff engine ────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ enum DiffLine {
     Added(Vec<Token>),
     /// Line changed: base tokens and override tokens, with per-token change marks.
     Changed {
-        base: Vec<(Token, bool)>,     // (token, is_changed)
+        base: Vec<(Token, bool)>,      // (token, is_changed)
         override_: Vec<(Token, bool)>, // (token, is_changed)
     },
 }
@@ -32,7 +32,14 @@ fn compute_diff(base: &str, override_: &str) -> Vec<DiffLine> {
 
     let lcs = lcs_table(&base_lines, &over_lines);
     let mut result = Vec::new();
-    backtrack_diff(&lcs, &base_lines, &over_lines, base_lines.len(), over_lines.len(), &mut result);
+    backtrack_diff(
+        &lcs,
+        &base_lines,
+        &over_lines,
+        base_lines.len(),
+        over_lines.len(),
+        &mut result,
+    );
     result
 }
 
@@ -92,8 +99,7 @@ fn merge_changed_pairs(lines: Vec<DiffLine>) -> Vec<DiffLine> {
                     let added = iter.next().unwrap();
                     if let DiffLine::Added(over_tokens) = added {
                         // Try to merge as a Changed pair with word-level diff
-                        let (base_marked, over_marked) =
-                            word_level_diff(base_tokens, &over_tokens);
+                        let (base_marked, over_marked) = word_level_diff(base_tokens, &over_tokens);
                         result.push(DiffLine::Changed {
                             base: base_marked,
                             override_: over_marked,
@@ -111,6 +117,7 @@ fn merge_changed_pairs(lines: Vec<DiffLine>) -> Vec<DiffLine> {
 }
 
 /// Compare two token sequences and mark which tokens differ.
+#[allow(clippy::type_complexity)]
 fn word_level_diff(
     base: &[Token],
     override_: &[Token],
@@ -346,7 +353,6 @@ fn render_diff_line(i: usize, dl: &DiffLine) -> Element {
                 }
             }
             div {
-                key: "chg-over-{i}",
                 class: "kiln-diff-line kiln-diff-line--added",
                 span { class: "kiln-diff-gutter", "+" }
                 span { class: "kiln-diff-content",

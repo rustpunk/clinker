@@ -5,7 +5,7 @@
 //! when .schema.yaml files change.
 //! Spec: clinker-kiln-git-addendum.md §G2.4.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -15,11 +15,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 ///
 /// Returns a receiver that emits debounced change events. The watcher
 /// runs on a background thread. Drop the watcher to stop it.
-pub fn start_watcher(
-    root: &PathBuf,
-) -> Option<(RecommendedWatcher, mpsc::Receiver<Vec<PathBuf>>)> {
+pub fn start_watcher(root: &Path) -> Option<(RecommendedWatcher, mpsc::Receiver<Vec<PathBuf>>)> {
     let (raw_tx, raw_rx) = mpsc::channel::<Vec<PathBuf>>();
-    let root = root.clone();
+    let root = root.to_path_buf();
 
     let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
@@ -64,12 +62,12 @@ pub fn has_git_relevant_changes(paths: &[PathBuf]) -> bool {
     paths.iter().any(|p| {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // Skip .git internal files (too noisy), IDE state files
-        !p.components().any(|c| c.as_os_str() == ".git")
-            && name != ".kiln-state.json"
+        !p.components().any(|c| c.as_os_str() == ".git") && name != ".kiln-state.json"
     })
 }
 
 /// Check if any of the changed paths are schema files.
+#[allow(dead_code)]
 pub fn has_schema_changes(paths: &[PathBuf]) -> bool {
     paths.iter().any(|p| {
         p.file_name()

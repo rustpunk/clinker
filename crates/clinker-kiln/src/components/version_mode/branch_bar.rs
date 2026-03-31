@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use clinker_git::GitOps;
 
-use crate::components::toast::{toast_error, toast_success, ToastState};
+use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::state::TabManagerState;
 
 /// Branch bar component for Version Mode.
@@ -74,7 +74,9 @@ fn run_git_action(tab_mgr: &mut TabManagerState, action: &str) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
 
-    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else { return };
+    let Ok(ops) = clinker_git::GitCliOps::discover(&ws.root) else {
+        return;
+    };
 
     let result = match action {
         "push" => ops.push(),
@@ -91,7 +93,7 @@ fn run_git_action(tab_mgr: &mut TabManagerState, action: &str) {
     // Show toast
     let mut toast: Signal<Option<ToastState>> = use_context();
     match result {
-        Ok(_) => toast_success(&mut toast, &format!("git {action} completed")),
+        Ok(_) => toast_success(&mut toast, format!("git {action} completed")),
         Err(e) => toast_error(&mut toast, format!("git {action} failed: {e}")),
     }
 }
