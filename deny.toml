@@ -34,5 +34,4 @@ allow = [
 ]
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# cargo-deny v2: advisories are denied by default; use `ignore` to skip specific ones
