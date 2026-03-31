@@ -120,8 +120,10 @@ pub fn StatusBar() -> Element {
                 }
             }
 
-            // ── Docs context: pipeline info ─────────────────────────────
-            if current_ctx == NavigationContext::Docs {
+            // ── Schematics layout: pipeline stage count ─────────────────
+            if current_ctx == NavigationContext::Pipeline
+                && (state.pipeline_layout)() == crate::state::PipelineLayoutMode::Schematics
+            {
                 if let Some(ref config) = (state.pipeline)() {
                     div {
                         class: "kiln-status-segment",

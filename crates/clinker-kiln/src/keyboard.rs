@@ -1,8 +1,9 @@
 /// Global keyboard shortcut handler.
 ///
-/// Context switching: Ctrl+Shift+E/C/G/D/R (Pipeline/Channels/Git/Docs/Runs).
+/// Context switching: Ctrl+Shift+E/C/G/R (Pipeline/Channels/Git/Runs).
 /// Pipeline panel toggles: Alt+F/E/C (Search/Schemas/Compositions).
-/// Layout modes (Pipeline only): Ctrl+Shift+1/2/3 (Canvas/Hybrid/Editor).
+/// Layout modes (Pipeline only): Ctrl+Shift+1/2/3/4 (Canvas/Hybrid/Editor/Schematics).
+/// Ctrl+Shift+D — Switch to Schematics layout mode (Pipeline autodoc).
 /// Focus mode: F11 (toggle activity bar).
 /// Navigation back: Ctrl+Alt+Left.
 /// File ops: Ctrl+N/O/S/W/Q, Ctrl+Shift+S/O.
@@ -137,9 +138,12 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
-        // Ctrl+Shift+D — Switch to Docs context
+        // Ctrl+Shift+D — Switch to Schematics layout (Pipeline context)
         Key::Character(ref c) if c == "D" && shift => {
-            switch_context(&app, tab_mgr, NavigationContext::Docs);
+            if current_context != NavigationContext::Pipeline {
+                switch_context(&app, tab_mgr, NavigationContext::Pipeline);
+            }
+            app.pipeline_layout.set(PipelineLayoutMode::Schematics);
             true
         }
 
@@ -187,6 +191,14 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         Key::Character(ref c) if c == "#" && shift => {
             if current_context == NavigationContext::Pipeline {
                 app.pipeline_layout.set(PipelineLayoutMode::Editor);
+            }
+            true
+        }
+
+        // Ctrl+Shift+4 — Schematics layout mode (Pipeline only)
+        Key::Character(ref c) if c == "$" && shift => {
+            if current_context == NavigationContext::Pipeline {
+                app.pipeline_layout.set(PipelineLayoutMode::Schematics);
             }
             true
         }

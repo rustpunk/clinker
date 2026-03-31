@@ -147,6 +147,10 @@ fn execute_command(id: &str, tab_mgr: &mut TabManagerState) {
             switch_context(&app, tab_mgr, NavigationContext::Pipeline);
             app.pipeline_layout.set(PipelineLayoutMode::Editor);
         }
+        "layout.schematics" => {
+            switch_context(&app, tab_mgr, NavigationContext::Pipeline);
+            app.pipeline_layout.set(PipelineLayoutMode::Schematics);
+        }
 
         // ── Search/panel commands (switch to Pipeline first) ───
         "search.text" => {

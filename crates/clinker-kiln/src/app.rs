@@ -611,7 +611,12 @@ pub fn AppShell() -> Element {
                                 }
                             },
                             NavigationContext::Git => rsx! { VersionMode {} },
-                            NavigationContext::Docs => rsx! { SchematicsPanel {} },
+                            NavigationContext::Docs => rsx! {
+                                PlaceholderPage {
+                                    name: "Technical Guide",
+                                    description: "Kiln user guide, CXL reference, and pipeline authoring documentation.",
+                                }
+                            },
                             NavigationContext::Channels => rsx! { ChannelMode {} },
                             NavigationContext::Runs => rsx! {
                                 PlaceholderPage {
@@ -679,6 +684,17 @@ fn ActiveTabContent() -> Element {
     let selected_stage = state.selected_stage;
     let tab_mgr = use_context::<TabManagerState>();
     let left_panel = (tab_mgr.left_panel)();
+
+    // Schematics layout mode: full-pipeline documentation view
+    if *pipeline_layout.read() == PipelineLayoutMode::Schematics {
+        return rsx! {
+            div {
+                class: "kiln-main",
+                "data-layout": "schematics",
+                SchematicsPanel {}
+            }
+        };
+    }
 
     rsx! {
         div {

@@ -53,7 +53,7 @@ pub enum NavigationContext {
     Channels,
     /// Version control — staged/unstaged files, diff view, commit form.
     Git,
-    /// Documentation — pipeline docs, transformation summaries, PDF export.
+    /// Documentation — Kiln user guide, CXL reference, pipeline authoring docs.
     Docs,
     /// Run history — chronological run list, filterable, expandable entries.
     Runs,
@@ -77,7 +77,7 @@ impl NavigationContext {
             Self::Pipeline => "Pipeline",
             Self::Channels => "Channels",
             Self::Git => "Version Control",
-            Self::Docs => "Documentation",
+            Self::Docs => "Technical Guide",
             Self::Runs => "Run History",
         }
     }
@@ -88,7 +88,7 @@ impl NavigationContext {
             Self::Pipeline => "Pipe",
             Self::Channels => "Chan",
             Self::Git => "Git",
-            Self::Docs => "Docs",
+            Self::Docs => "Guide",
             Self::Runs => "Runs",
         }
     }
@@ -110,7 +110,7 @@ impl NavigationContext {
             Self::Pipeline => "Ctrl+Shift+E",
             Self::Channels => "Ctrl+Shift+C",
             Self::Git => "Ctrl+Shift+G",
-            Self::Docs => "Ctrl+Shift+D",
+            Self::Docs => "",
             Self::Runs => "Ctrl+Shift+R",
         }
     }
@@ -139,6 +139,8 @@ pub enum PipelineLayoutMode {
     Hybrid,
     /// YAML editor takes full width, canvas and inspector hidden.
     Editor,
+    /// Pipeline autodoc — full scrollable documentation view (Blueprint aesthetic).
+    Schematics,
 }
 
 impl PipelineLayoutMode {
@@ -148,6 +150,7 @@ impl PipelineLayoutMode {
             Self::Canvas => "canvas",
             Self::Hybrid => "hybrid",
             Self::Editor => "editor",
+            Self::Schematics => "schematics",
         }
     }
 
@@ -157,11 +160,12 @@ impl PipelineLayoutMode {
             Self::Canvas => "Canvas",
             Self::Hybrid => "Hybrid",
             Self::Editor => "Editor",
+            Self::Schematics => "Schematics",
         }
     }
 
     /// All layout modes in display order.
-    pub const ALL: [PipelineLayoutMode; 3] = [Self::Canvas, Self::Hybrid, Self::Editor];
+    pub const ALL: [PipelineLayoutMode; 4] = [Self::Canvas, Self::Hybrid, Self::Editor, Self::Schematics];
 }
 
 /// Per-tab reactive state — consumed by canvas, inspector, YAML sidebar, etc.
