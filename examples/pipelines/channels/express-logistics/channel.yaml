@@ -1,0 +1,7 @@
+_channel:
+  id: express-logistics
+  name: "Express Logistics"
+  active: true
+
+variables:
+  EXPRESS_SURCHARGE: "8.99"

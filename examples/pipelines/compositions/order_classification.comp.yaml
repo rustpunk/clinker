@@ -1,0 +1,48 @@
+_compose:
+  name: "Order Classification"
+  description: "Classify orders by value tier, priority, risk, and fulfillment status"
+  version: "1.0"
+  contract:
+    requires:
+      - name: line_total
+        type: float
+      - name: shipping_method
+        type: string
+      - name: status
+        type: string
+      - name: order_date_parsed
+        type: date
+    produces:
+      - name: value_tier
+        type: string
+      - name: priority_level
+        type: string
+      - name: days_since_order
+        type: int
+      - name: fulfillment_risk
+        type: string
+      - name: order_score
+        type: float
+
+transformations:
+  - name: value_tier
+    description: Classify by order value
+    cxl: |
+      emit value_tier = if line_total >= 1000 then "premium" else if line_total >= 250 then "standard" else "economy"
+  - name: priority_level
+    description: Derive priority from method and value
+    cxl: |
+      emit priority_level = if shipping_method == "overnight" then "urgent" else if shipping_method == "express" and line_total >= 500 then "high" else if line_total >= 1000 then "high" else "normal"
+  - name: order_age
+    cxl: |
+      emit days_since_order = order_date_parsed.diff_days(pipeline.start_time)
+  - name: fulfillment_risk
+    description: Flag stale or high-value unshipped orders
+    cxl: |
+      emit fulfillment_risk = if status == "pending" and days_since_order > 7 then "overdue" else if status == "pending" and value_tier == "premium" then "watch" else "ok"
+  - name: order_score
+    description: Composite score for sorting/reporting
+    cxl: |
+      let tier_weight = if value_tier == "premium" then 3.0 else if value_tier == "standard" then 2.0 else 1.0
+      let urgency_weight = if priority_level == "urgent" then 3.0 else if priority_level == "high" then 2.0 else 1.0
+      emit order_score = tier_weight * urgency_weight * (1.0 + days_since_order.to_float() / 30.0)

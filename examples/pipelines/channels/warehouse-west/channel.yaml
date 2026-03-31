@@ -1,0 +1,7 @@
+_channel:
+  id: warehouse-west
+  name: "Warehouse West"
+  active: true
+
+variables:
+  REGION: "west"

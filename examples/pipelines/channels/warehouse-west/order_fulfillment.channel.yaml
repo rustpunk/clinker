@@ -1,0 +1,28 @@
+_channel:
+  pipeline: order_fulfillment
+  description: >
+    Warehouse West uses a regional product catalog and lower value
+    tier thresholds to account for west-coast pricing differences.
+
+inputs:
+  products:
+    path: ./data/west/products.csv
+
+transformations:
+  value_tier:
+    cxl: |
+      emit value_tier = if line_total >= 750 then "premium" else if line_total >= 150 then "standard" else "economy"
+    description: West coast uses lower tier thresholds
+
+add_transformations:
+  - name: region_tag
+    after: route_priority
+    description: Tag all records with west region
+    cxl: |
+      emit region = "west"
+
+outputs:
+  fulfilled_orders:
+    path: ./output/warehouse-west/fulfilled_orders.csv
+  priority_report:
+    path: ./output/warehouse-west/priority_report.json

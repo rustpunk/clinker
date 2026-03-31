@@ -14,16 +14,19 @@
   },
   "tabs": {
     "open": [
+      "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/order_fulfillment.yaml",
       "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/customer_etl.yaml"
     ],
-    "active": "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/customer_etl.yaml"
+    "active": "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/order_fulfillment.yaml"
   },
   "pipelines": {},
   "last_open_directory": null,
   "search": null,
   "channels": {
-    "active": "acme-corp",
+    "active": "express-logistics",
     "recent": [
+      "express-logistics",
+      "warehouse-west",
       "acme-corp"
     ]
   }

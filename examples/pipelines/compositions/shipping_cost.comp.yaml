@@ -1,0 +1,31 @@
+_compose:
+  name: "Shipping Cost"
+  description: "Calculate shipping cost from weight and shipping method"
+  version: "1.0"
+  contract:
+    requires:
+      - name: weight_kg
+        type: float
+      - name: shipping_method
+        type: string
+      - name: quantity
+        type: int
+    produces:
+      - name: shipping_weight
+        type: float
+      - name: base_shipping
+        type: float
+      - name: shipping_cost
+        type: float
+
+transformations:
+  - name: compute_weight
+    cxl: |
+      emit shipping_weight = weight_kg * quantity
+  - name: base_rate
+    description: Rate per kg by shipping method
+    cxl: |
+      emit base_shipping = if shipping_method == "express" then 2.50 else if shipping_method == "overnight" then 4.75 else 1.20
+  - name: total_shipping
+    cxl: |
+      emit shipping_cost = shipping_weight * base_shipping
