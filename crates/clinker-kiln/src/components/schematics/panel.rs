@@ -103,7 +103,8 @@ pub fn SchematicsPanel() -> Element {
     let config = config.unwrap();
 
     let compositions_read = (state.compositions).read();
-    let pipeline_view = derive_pipeline_view(config, &compositions_read);
+    let expanded = (state.expanded_compositions)();
+    let pipeline_view = derive_pipeline_view(config, &compositions_read, &expanded);
     let stages = pipeline_view.stages;
     let pipeline_name = config.pipeline.name.clone();
 

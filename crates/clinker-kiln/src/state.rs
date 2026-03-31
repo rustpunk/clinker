@@ -10,6 +10,9 @@
 /// - `NavigationContext` — top-level activity (Pipeline, Channels, Git, Docs, Runs)
 /// - `PipelineLayoutMode` — view within Pipeline context only (Canvas, Hybrid, Editor)
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 use clinker_core::partial::PartialPipelineConfig;
@@ -191,6 +194,23 @@ pub struct AppState {
     pub edit_source: Signal<EditSource>,
     /// Schema validation warnings for the current pipeline.
     pub schema_warnings: Signal<Vec<SchemaWarning>>,
+    /// Channel-resolved pipeline (None when no channel is active).
+    pub channel_pipeline: Signal<Option<crate::channel_resolve::ChannelResolution>>,
+    /// Current view mode when a channel is active (Base/Resolved/Diff).
+    pub channel_view_mode: Signal<ChannelViewMode>,
+    /// Composition paths that are currently inline-expanded on the canvas.
+    pub expanded_compositions: Signal<HashSet<String>>,
+    /// Drill-in stack for navigating into large compositions (5+ transforms).
+    pub composition_drill_stack: Signal<Vec<DrillInEntry>>,
+}
+
+/// An entry in the composition drill-in navigation stack.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrillInEntry {
+    /// Path to the `.comp.yaml` file.
+    pub path: String,
+    /// Display name of the composition.
+    pub name: String,
 }
 
 /// Read the current `AppState` from context.
@@ -228,6 +248,119 @@ pub struct TabManagerState {
     pub activity_bar_visible: Signal<bool>,
     /// Navigation history stack for back-navigation (capped at 50).
     pub nav_history: Signal<Vec<NavigationContext>>,
+    /// Channel state discovered from clinker.toml (None if no clinker.toml found).
+    pub channel_state: Signal<Option<ChannelState>>,
 }
 
 use clinker_schema::{SchemaIndex, SchemaWarning};
+
+// ── Channel state ──────────────────────────────────────────────────────
+
+/// Discovered channel workspace state. Extracted from `clinker-channel`
+/// types into Clone + PartialEq structs safe for Dioxus signals.
+///
+/// Populated when a workspace has a `clinker.toml` with a channels directory.
+/// None when no `clinker.toml` is found (channel features degrade gracefully).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelState {
+    /// Root directory containing clinker.toml.
+    pub workspace_root: PathBuf,
+    /// Channel directory name (from clinker.toml `[workspace] channels_dir`).
+    pub channels_dir: String,
+    /// Group directory name (from clinker.toml `[workspace] groups_dir`).
+    pub groups_dir: String,
+    /// Default channel ID (from clinker.toml `[workspace] default_channel`).
+    pub default_channel: Option<String>,
+    /// Whether the channels directory exists on disk.
+    pub dir_exists: bool,
+    /// Discovered channels with summary metadata.
+    pub channels: Vec<ChannelSummary>,
+    /// Discovered groups with summary metadata.
+    pub groups: Vec<GroupSummary>,
+    /// Currently selected channel ID (None = run base pipeline).
+    pub active_channel: Option<String>,
+    /// Recently selected channel IDs (most recent first, max 10).
+    pub recent_channels: Vec<String>,
+}
+
+impl ChannelState {
+    /// Get the summary for the active channel, if any.
+    pub fn active_summary(&self) -> Option<&ChannelSummary> {
+        self.active_channel.as_ref().and_then(|id| {
+            self.channels.iter().find(|c| c.id == *id)
+        })
+    }
+
+    /// All unique tier names across discovered channels.
+    pub fn tier_names(&self) -> Vec<String> {
+        let mut tiers: Vec<String> = self.channels
+            .iter()
+            .filter_map(|c| c.tier.clone())
+            .collect();
+        tiers.sort();
+        tiers.dedup();
+        tiers
+    }
+
+    /// Set active channel and push to recent list (max 10, deduped).
+    pub fn select_channel(&mut self, id: Option<String>) {
+        if let Some(ref channel_id) = id {
+            self.recent_channels.retain(|r| r != channel_id);
+            self.recent_channels.insert(0, channel_id.clone());
+            self.recent_channels.truncate(10);
+        }
+        self.active_channel = id;
+    }
+}
+
+/// Summary of a discovered channel (extracted from `ChannelManifest`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelSummary {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub contact: Option<String>,
+    pub tier: Option<String>,
+    pub tags: Vec<String>,
+    pub active: bool,
+    /// Group IDs this channel inherits from.
+    pub inherits: Vec<String>,
+    /// Number of `.channel.yaml` override files in this channel's directory.
+    pub override_count: usize,
+    /// Number of variables defined in `channel.yaml`.
+    pub variable_count: usize,
+}
+
+/// Summary of a discovered group (from `_groups/` directory).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupSummary {
+    pub id: String,
+    /// Number of `.channel.yaml` override files in this group's directory.
+    pub override_count: usize,
+    /// Channel IDs that inherit from this group.
+    pub inheritor_ids: Vec<String>,
+}
+
+/// Which view mode to show when a channel is active in Pipeline context.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ChannelViewMode {
+    /// Show the base pipeline (no overrides applied).
+    #[default]
+    Base,
+    /// Show the resolved pipeline (base + channel overrides merged).
+    Resolved,
+    /// Show/edit the channel override `.channel.yaml` file.
+    Channel,
+}
+
+impl ChannelViewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Base => "Base",
+            Self::Resolved => "Resolved",
+            Self::Channel => "Channel",
+        }
+    }
+
+    pub const ALL: [ChannelViewMode; 3] = [Self::Base, Self::Resolved, Self::Channel];
+}

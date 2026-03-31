@@ -136,8 +136,9 @@ const BASE_Y: f32 = 120.0;
 /// Y stagger amount (alternates +/- for adjacent nodes).
 const STAGGER_Y: f32 = 20.0;
 
-/// Maximum transforms in a composition before it collapses to a single node.
-const INLINE_THRESHOLD: usize = 4;
+/// Maximum transforms in a composition that can be inline-expanded.
+/// Compositions with more than this many transforms use drill-in instead.
+pub const INLINE_THRESHOLD: usize = 4;
 
 /// Result of deriving a pipeline view with composition awareness.
 pub struct PipelineView {
@@ -150,11 +151,12 @@ pub struct PipelineView {
 /// Layout: inputs first, then transforms in order, then outputs.
 /// Horizontal left-to-right, evenly spaced, with slight Y stagger.
 ///
-/// Compositions with ≤4 transforms are rendered inline with group boundaries.
-/// Compositions with 5+ transforms are collapsed to a single node.
+/// All compositions are collapsed by default. Compositions whose path is in
+/// `expanded` are rendered inline with a group boundary.
 pub fn derive_pipeline_view(
     config: &PipelineConfig,
     compositions: &[ResolvedComposition],
+    expanded: &std::collections::HashSet<String>,
 ) -> PipelineView {
     let mut stages = Vec::new();
     let mut groups = Vec::new();
@@ -187,8 +189,8 @@ pub fn derive_pipeline_view(
 
         // Check if this transform belongs to a composition
         if let Some((comp, origin_idx)) = find_composition(transform, compositions) {
-            if comp.transform_names.len() <= INLINE_THRESHOLD {
-                // Inline rendering: emit individual nodes with group boundary
+            if expanded.contains(&comp.path) {
+                // Inline-expanded: emit individual nodes inside a group boundary
                 let group_start_idx = stages.len();
                 let group_start_x = x;
 
@@ -196,7 +198,6 @@ pub fn derive_pipeline_view(
                     let t = &config.transformations[transform_idx + i];
                     let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
                     let subtitle = cxl_subtitle(&t.cxl);
-
                     let origin = comp.origins.get(origin_idx + i).cloned();
 
                     stages.push(StageView {
@@ -232,7 +233,7 @@ pub fn derive_pipeline_view(
 
                 transform_idx += comp.transform_names.len();
             } else {
-                // Collapsed rendering: single composition node
+                // Collapsed: single composition node
                 let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
                 stages.push(StageView {
                     id: format!("_comp_{}", comp.path),
@@ -309,6 +310,59 @@ pub fn derive_pipeline_view(
         stages,
         composition_groups: groups,
     }
+}
+
+/// Derive a drill-in view for a composition — renders its transforms as
+/// top-level stages for the canvas to display.
+pub fn derive_composition_drill_view(
+    config: &PipelineConfig,
+    compositions: &[ResolvedComposition],
+    composition_path: &str,
+) -> PipelineView {
+    let mut stages = Vec::new();
+    let mut x = LEFT_MARGIN;
+
+    // Find the composition and its transforms
+    let comp = compositions.iter().find(|c| c.path == composition_path);
+    let Some(comp) = comp else {
+        return PipelineView { stages: Vec::new(), composition_groups: Vec::new() };
+    };
+
+    let transforms: Vec<_> = config.transforms().collect();
+
+    // Find the first transform in this composition
+    let start_idx = transforms.iter().position(|t| {
+        comp.transform_names.first().map(|n| n == &t.name).unwrap_or(false)
+    });
+
+    if let Some(start) = start_idx {
+        for (i, name) in comp.transform_names.iter().enumerate() {
+            let t_idx = start + i;
+            if t_idx >= transforms.len() { break; }
+            let t = transforms[t_idx];
+            if t.name != *name { break; }
+
+            let y = BASE_Y + if i % 2 == 0 { 0.0 } else { STAGGER_Y };
+            let subtitle = cxl_subtitle(&t.cxl);
+            let origin = comp.origins.get(i).cloned();
+
+            stages.push(StageView {
+                id: t.name.clone(),
+                label: t.name.clone(),
+                kind: StageKind::Transform,
+                subtitle,
+                canvas_x: x,
+                canvas_y: y,
+                cxl_source: Some(t.cxl.clone()),
+                description: t.description.clone(),
+                from_composition: origin,
+                error_message: None,
+            });
+            x += NODE_WIDTH + NODE_GAP;
+        }
+    }
+
+    PipelineView { stages, composition_groups: Vec::new() }
 }
 
 /// Find which composition (if any) a transform belongs to, and its index within that composition.
