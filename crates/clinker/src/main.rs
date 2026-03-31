@@ -3,7 +3,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use clinker_core::config;
+use clinker_channel::channel_override::{resolve_channel, resolve_channel_with_inheritance, ChannelOverride};
+use clinker_channel::composition::{resolve_compositions, ProvenanceMap};
+use clinker_channel::manifest::ChannelManifest;
+use clinker_channel::workspace::WorkspaceRoot;
+use clinker_core::config::load_config_with_vars;
 use clinker_core::error::PipelineError;
 use clinker_core::executor::PipelineExecutor;
 use clinker_core::metrics::{self, ExecutionMetrics};
@@ -87,6 +91,23 @@ pub struct RunArgs {
     /// Overrides CLINKER_METRICS_SPOOL_DIR env var and pipeline.metrics.spool_dir in YAML.
     #[arg(long)]
     pub metrics_spool_dir: Option<PathBuf>,
+
+    /// Channel override to apply (e.g., "acme-corp")
+    #[arg(long)]
+    pub channel: Option<String>,
+
+    /// Explicit path(s) to .channel.yaml override file(s). Bypasses derived-name lookup.
+    /// May be specified multiple times; applied in declaration order (later wins on conflict).
+    #[arg(long)]
+    pub channel_path: Vec<PathBuf>,
+
+    /// Workspace root (overrides clinker.toml auto-discovery)
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+
+    /// Active environment name for when: conditions (sets CLINKER_ENV).
+    #[arg(long)]
+    pub env: Option<String>,
 }
 
 impl RunArgs {
@@ -170,9 +191,96 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
-    // Load config
-    let pipeline_config = config::load_config(&args.config)?;
+    // 1. Workspace discovery
+    let workspace = match &args.workspace {
+        Some(p) => Some(WorkspaceRoot::at(p).map_err(channel_err)?),
+        None => WorkspaceRoot::discover(args.config.as_path()),
+    };
 
+    // 1b. Resolve effective channel: --channel flag > default_channel from clinker.toml
+    let effective_channel: Option<String> = args.channel.clone().or_else(|| {
+        workspace.as_ref().and_then(|ws| {
+            ws.config.default_channel.as_ref().map(|ch| {
+                tracing::info!(
+                    "Using default channel \"{}\" from clinker.toml (override with --channel)",
+                    ch
+                );
+                ch.clone()
+            })
+        })
+    });
+
+    // 2. Resolve CLINKER_ENV from precedence chain
+    let clinker_env: Option<String> = args
+        .env
+        .clone()
+        .or_else(|| std::env::var("CLINKER_ENV").ok())
+        .or_else(|| workspace.as_ref().and_then(|ws| ws.defaults.env.clone()));
+
+    // 3. Load channel manifest → channel vars
+    let mut channel_vars: Vec<(String, String)> = Vec::new();
+    if let Some(ref env_name) = clinker_env {
+        channel_vars.push(("CLINKER_ENV".into(), env_name.clone()));
+    }
+    if let (Some(id), Some(ws)) = (&effective_channel, &workspace) {
+        let manifest = ChannelManifest::load(&ws.channel_dir(id)).map_err(channel_err)?;
+        for (k, v) in manifest.variables {
+            channel_vars.push((k, v));
+        }
+    }
+    let vars_ref: Vec<(&str, &str)> = channel_vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    // 4. Load + interpolate pipeline YAML (single pass, channel vars included)
+    let mut pipeline_config = load_config_with_vars(&args.config, &vars_ref)?;
+
+    // 5. Resolve _import compositions → also get ProvenanceMap
+    let mut provenance = if let Some(ws) = &workspace {
+        resolve_compositions(&mut pipeline_config, ws, &vars_ref).map_err(channel_err)?
+    } else {
+        ProvenanceMap::new()
+    };
+
+    // 6. Apply channel override (group inheritance + channel-specific)
+    if let (Some(id), Some(ws)) = (&effective_channel, &workspace) {
+        if clinker_env.is_none() && !args.quiet {
+            check_warn_env_unset(id, ws, &args.config, &vars_ref);
+        }
+        pipeline_config = resolve_channel_with_inheritance(
+            pipeline_config,
+            id,
+            &args.config,
+            ws,
+            &vars_ref,
+            &mut provenance,
+        )
+        .map_err(channel_err)?;
+    }
+
+    // 6b. Apply explicit --channel-path overrides (in declaration order; later wins on conflict)
+    for path in &args.channel_path {
+        if let Some(co) = ChannelOverride::load(path, &vars_ref).map_err(channel_err)? {
+            let ws = workspace.as_ref().ok_or_else(|| {
+                PipelineError::Config(clinker_core::config::ConfigError::Validation(
+                    "--channel-path requires a workspace (clinker.toml)".into(),
+                ))
+            })?;
+            if co.when_passes() {
+                pipeline_config = resolve_channel(
+                    pipeline_config,
+                    &co,
+                    ws,
+                    &vars_ref,
+                    &mut provenance,
+                )
+                .map_err(channel_err)?;
+            }
+        }
+    }
+
+    // 7. Existing logic: explain / dry_run / execute
     if args.explain {
         let plan_output = PipelineExecutor::explain(&pipeline_config)?;
         println!("{}", plan_output);
@@ -180,7 +288,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     if args.dry_run {
-        tracing::info!("Dry run: config valid, {} inputs, {} outputs, {} transforms",
+        tracing::info!(
+            "Dry run: config valid, {} inputs, {} outputs, {} transforms",
             pipeline_config.inputs.len(),
             pipeline_config.outputs.len(),
             pipeline_config.transformations.len(),
@@ -341,6 +450,30 @@ fn hostname_string() -> String {
             std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Map ChannelError to PipelineError for uniform error handling.
+fn channel_err(e: clinker_channel::error::ChannelError) -> PipelineError {
+    PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
+}
+
+/// Warn if CLINKER_ENV is not set but override files have when: conditions.
+fn check_warn_env_unset(
+    channel_id: &str,
+    workspace: &WorkspaceRoot,
+    pipeline_path: &std::path::Path,
+    channel_vars: &[(&str, &str)],
+) {
+    let channel_dir = workspace.channel_dir(channel_id);
+    let derived = ChannelOverride::path_for(pipeline_path, &channel_dir);
+    if let Ok(Some(co)) = ChannelOverride::load(&derived, channel_vars) {
+        if co.header.when.is_some() {
+            tracing::warn!(
+                "CLINKER_ENV is not set; when: condition in {} will not be evaluated — override file skipped",
+                derived.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +638,48 @@ mod tests {
                 assert!(args.dry_run);
             }
             _ => panic!("expected Metrics::Collect command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_run_channel_flag() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--channel", "acme", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => assert_eq!(args.channel, Some("acme".into())),
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_run_env_flag() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--env", "prod", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => assert_eq!(args.env, Some("prod".into())),
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_run_channel_path_multiple() {
+        let cli = Cli::try_parse_from([
+            "clinker", "run", "--channel-path", "a.channel.yaml", "--channel-path", "b.channel.yaml", "p.yaml"
+        ]).unwrap();
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.channel_path.len(), 2);
+                assert_eq!(args.channel_path[0], PathBuf::from("a.channel.yaml"));
+                assert_eq!(args.channel_path[1], PathBuf::from("b.channel.yaml"));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_run_workspace_flag() {
+        let cli = Cli::try_parse_from(["clinker", "run", "--workspace", "/ws", "p.yaml"]).unwrap();
+        match cli.command {
+            Commands::Run(args) => assert_eq!(args.workspace, Some(PathBuf::from("/ws"))),
+            _ => panic!("expected Run command"),
         }
     }
 }
