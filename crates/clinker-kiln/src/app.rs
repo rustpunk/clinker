@@ -30,7 +30,8 @@ use clinker_schema::SchemaIndex;
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
 use crate::state::{
-    AppState, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState, use_app_state,
+    AppState, KilnTheme, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState,
+    use_app_state,
 };
 use crate::sync::{EditSource, ParseResult, serialize_raw_yaml, try_parse_yaml};
 use crate::tab::{TabEntry, TabId};
@@ -114,6 +115,13 @@ pub fn AppShell() -> Element {
         use_signal(crate::composition_index::CompositionIndex::default);
     let show_settings: Signal<bool> = use_signal(|| false);
     let mut channel_state: Signal<Option<crate::state::ChannelState>> = use_signal(|| None);
+    let theme: Signal<KilnTheme> = use_signal(|| {
+        session_data
+            .peek()
+            .as_ref()
+            .and_then(|s| s.theme)
+            .unwrap_or_default()
+    });
 
     // ── Git: detect repo and compute status on workspace change ──────────
     {
@@ -242,6 +250,7 @@ pub fn AppShell() -> Element {
                 *run_log_expanded.peek(),
                 *activity_bar_visible.peek(),
                 &channel_state.peek(),
+                *theme.peek(),
             );
         }
     });
@@ -264,6 +273,7 @@ pub fn AppShell() -> Element {
                     *run_log_expanded.peek(),
                     *activity_bar_visible.peek(),
                     &channel_state.peek(),
+                    *theme.peek(),
                 );
             }
         }
@@ -341,6 +351,7 @@ pub fn AppShell() -> Element {
                 (run_log_expanded)(),
                 (activity_bar_visible)(),
                 &(channel_state)(),
+                (theme)(),
             );
             workspace::save_workspace_state(&ws.root, &state);
             workspace::save_last_workspace(&ws.root);
@@ -389,6 +400,7 @@ pub fn AppShell() -> Element {
         activity_bar_visible,
         nav_history,
         channel_state,
+        theme,
     });
     // ── Debug state context ────────────────────────────────────────────
     {
@@ -441,6 +453,7 @@ pub fn AppShell() -> Element {
         activity_bar_visible,
         nav_history,
         channel_state,
+        theme,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
@@ -590,6 +603,7 @@ pub fn AppShell() -> Element {
 
         div {
             class: "kiln-app",
+            "data-theme": (theme)().as_data_attr(),
             tabindex: "0",
             onkeydown: move |e: KeyboardEvent| {
                 if handle_keyboard(&e, &mut kb_tab_mgr) {
@@ -736,15 +750,18 @@ fn ActiveTabContent() -> Element {
 
             CanvasPanel {}
 
-            // Hide inspector and YAML sidebar when drilled into a composition
-            if (state.composition_drill_stack)().is_empty() {
-                if let Some(ref stage_id) = (selected_stage)() {
-                    InspectorPanel {
-                        key: "{stage_id}",
-                        stage_id: stage_id.clone(),
-                    }
+            // Inspector shows for any selected stage, even when drilled into a composition.
+            // Drilled transforms exist in state.pipeline (expanded during resolution).
+            if let Some(ref stage_id) = (selected_stage)() {
+                InspectorPanel {
+                    key: "{stage_id}",
+                    stage_id: stage_id.clone(),
                 }
+            }
 
+            // YAML sidebar hidden during drill-in (editing YAML while viewing a
+            // composition slice would be confusing).
+            if (state.composition_drill_stack)().is_empty() {
                 YamlSidebar {}
             }
         }

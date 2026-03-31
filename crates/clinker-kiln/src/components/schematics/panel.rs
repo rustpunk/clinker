@@ -72,7 +72,7 @@ pub fn SchematicsPanel() -> Element {
                             StageCard {
                                 index: i,
                                 stage_id: stage.id.clone(),
-                                accent: stage.kind.accent_color(),
+                                kind_attr: stage.kind.kind_attr(),
                                 badge: stage.kind.badge_label(),
                                 doc: crate::autodoc::StageDoc::default(),
                                 notes: crate::notes::StageNotes::default(),
@@ -233,7 +233,7 @@ pub fn SchematicsPanel() -> Element {
                     StageCard {
                         index: i,
                         stage_id: stage.id.clone(),
-                        accent: stage.kind.accent_color(),
+                        kind_attr: stage.kind.kind_attr(),
                         badge: stage.kind.badge_label(),
                         doc,
                         notes,

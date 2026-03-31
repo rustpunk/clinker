@@ -32,16 +32,16 @@ pub fn InspectorPanel(stage_id: String) -> Element {
     let transform = config.transforms().find(|t| t.name == stage_id);
     let output = config.outputs.iter().find(|o| o.name == stage_id);
 
-    let (kind_label, accent, subtitle) = if input.is_some() {
-        ("SOURCE", "#43B3AE", input.unwrap().path.clone())
+    let (kind_label, kind_attr, subtitle) = if input.is_some() {
+        ("SOURCE", "source", input.unwrap().path.clone())
     } else if let Some(t) = transform {
         (
             "TRANSFORM",
-            "#C75B2A",
+            "transform",
             t.description.clone().unwrap_or_default(),
         )
     } else if output.is_some() {
-        ("OUTPUT", "#B7410E", output.unwrap().path.clone())
+        ("OUTPUT", "output", output.unwrap().path.clone())
     } else {
         return rsx! {};
     };
@@ -81,7 +81,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
             StageHeader {
                 stage_id: stage_id.clone(),
                 kind_label,
-                accent,
+                kind_attr,
                 label: stage_id.clone(),
             }
 
@@ -133,7 +133,6 @@ pub fn InspectorPanel(stage_id: String) -> Element {
 
                 ScopedYaml {
                     stage_id: stage_id.clone(),
-                    accent,
                 }
             }
 

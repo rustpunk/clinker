@@ -7,7 +7,7 @@ use crate::state::use_app_state;
 pub fn StageHeader(
     stage_id: String,
     kind_label: &'static str,
-    accent: &'static str,
+    kind_attr: &'static str,
     label: String,
 ) -> Element {
     let state = use_app_state();
@@ -15,11 +15,12 @@ pub fn StageHeader(
     rsx! {
         div {
             class: "kiln-inspector-header",
-            style: "border-top: 3px solid {accent};",
+            "data-stage-kind": kind_attr,
+            style: "border-top: 3px solid var(--kiln-stage-accent);",
 
             span {
                 class: "kiln-inspector-badge",
-                style: "color: {accent}; border-color: {accent};",
+                style: "color: var(--kiln-stage-accent); border-color: var(--kiln-stage-accent);",
                 "{kind_label}"
             }
 

@@ -9,6 +9,7 @@
 /// File ops: Ctrl+N/O/S/W/Q, Ctrl+Shift+S/O.
 /// Tab switching: Ctrl+1-9 (Pipeline context only), Ctrl+Tab/Shift+Tab.
 /// Overlays: Ctrl+Shift+P (command palette), Ctrl+Shift+N (templates), Ctrl+, (settings).
+/// Theme: Ctrl+Shift+T (toggle Oxide/Enamel).
 ///
 /// Attached at the AppShell level to capture shortcuts regardless of focus.
 use dioxus::prelude::*;
@@ -170,6 +171,13 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         Key::Character(ref c) if c == "N" && shift => {
             let current = (tab_mgr.show_template_gallery)();
             tab_mgr.show_template_gallery.set(!current);
+            true
+        }
+
+        // Ctrl+Shift+T — Toggle theme (Oxide ↔ Enamel)
+        Key::Character(ref c) if c == "T" && shift => {
+            let current = (tab_mgr.theme)();
+            tab_mgr.theme.set(current.toggle());
             true
         }
 

@@ -7,7 +7,7 @@ use crate::sync::compute_yaml_ranges;
 /// Bottom section of the inspector showing the selected stage's YAML block
 /// with absolute line numbers from the full YAML.
 #[component]
-pub fn ScopedYaml(stage_id: String, accent: &'static str) -> Element {
+pub fn ScopedYaml(stage_id: String) -> Element {
     let state = use_app_state();
     let tab_mgr = use_context::<TabManagerState>();
     let raw_text = (state.yaml_text)();

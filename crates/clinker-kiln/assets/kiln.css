@@ -8,6 +8,7 @@
    JetBrains Mono: code, YAML editor, log timestamps (weight 400).
    ─────────────────────────────────────────────────────────────────────── */
 @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Share+Tech+Mono&display=swap');
 
 /* ── 2. CSS Custom Properties (Rustpunk colour palette) ────────────────────
    Token names follow the spec exactly. All UI colours reference these vars.
@@ -39,6 +40,277 @@
   /* Typography */
   --kiln-font-ui:   'Chakra Petch', 'Segoe UI', sans-serif;
   --kiln-font-code: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+
+  /* Extended palette — used by both themes, Enamel overrides below */
+  --kiln-canvas-bg:    #0D0A08;
+  --kiln-canvas-dot:   rgba(90, 80, 60, 0.3);
+  --kiln-panel-deep:   #0D0A08;
+  --kiln-panel-dark:   #14110C;
+  --kiln-plate-default:#14110C;
+  --kiln-plate-hover:  #1A1510;
+  --kiln-plate-field:  #0D0A08;
+  --kiln-text-bright:  #D4BC9A;
+  --kiln-text-dim:     #8A7560;
+  --kiln-accent-source:    #43B3AE;
+  --kiln-accent-transform: #C75B2A;
+  --kiln-accent-output:    #B7410E;
+  --kiln-accent-filter:    #7AAFC4;
+  --kiln-accent-derive:    #7AB87A;
+  --kiln-accent-compute:   #E8A524;
+  --kiln-accent-join:      #A0B8E8;
+  --kiln-scrollbar-track:  #14110C;
+  --kiln-scrollbar-thumb:  #3D3020;
+}
+
+/* ── 2b. Enamel Theme Overrides ────────────────────────────────────────────
+   Light industrial theme: porcelain-fused-to-steel data plates.
+   Activated via data-theme="enamel" on the root .kiln-app element.
+   ─────────────────────────────────────────────────────────────────────── */
+[data-theme="enamel"] {
+  /* Accent colours — oxide-red replaces verdigris as primary */
+  --kiln-verdigris:   #43B3AE;
+  --kiln-hazard:      #E8A524;
+  --kiln-ember:       #B7410E;
+  --kiln-phosphor:    #D4A017;
+  --kiln-oxide-red:   #B7410E;
+  --kiln-ok-green:    #2A7A40;
+
+  /* Neutral palette — cool grays replace warm bone tones */
+  --kiln-bone:        #E8EAEC;
+  --kiln-iron:        #8A9298;
+  --kiln-text-floor:  #6A7888;
+
+  /* Surface layers — Enamel dark panels (activity bar, status bar, headers) */
+  --kiln-char:        #1A2028;
+  --kiln-char-raised: #262C34;
+  --kiln-char-surface:#1E2630;
+
+  /* Border tiers — cool-gray borders */
+  --kiln-border-subtle: #363E48;
+  --kiln-border-medium: #4A5462;
+  --kiln-border-strong: #6A7480;
+
+  /* Typography — Enamel font families */
+  --kiln-font-ui:   'Rajdhani', 'Segoe UI', sans-serif;
+  --kiln-font-code: 'Share Tech Mono', 'Consolas', monospace;
+
+  /* Extended palette — Enamel overrides */
+  --kiln-canvas-bg:    #CDD1D6;
+  --kiln-canvas-dot:   rgba(90, 100, 112, 0.5);
+  --kiln-panel-deep:   #0E1318;
+  --kiln-panel-dark:   #1A2028;
+  --kiln-plate-default:#E6E9EC;
+  --kiln-plate-hover:  #EEF0F3;
+  --kiln-plate-field:  #D8DCE0;
+  --kiln-text-bright:  #E8EAEC;
+  --kiln-text-dim:     #6A7888;
+  --kiln-accent-source:    #7A8490;
+  --kiln-accent-transform: #B7410E;
+  --kiln-accent-output:    #7A8490;
+  --kiln-scrollbar-track:  #1A2028;
+  --kiln-scrollbar-thumb:  #363E48;
+}
+
+/* Enamel scrollbar overrides */
+[data-theme="enamel"] ::-webkit-scrollbar-track { background: var(--kiln-scrollbar-track); }
+[data-theme="enamel"] ::-webkit-scrollbar-thumb { background: var(--kiln-scrollbar-thumb); }
+[data-theme="enamel"] ::-webkit-scrollbar-thumb:hover { background: #4A5462; }
+
+/* Enamel canvas background — dot grid replaces Blueprint line grid */
+[data-theme="enamel"] .kiln-canvas-panel {
+  background-color: var(--kiln-canvas-bg);
+  background-image: radial-gradient(circle, var(--kiln-canvas-dot) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+/* Remove Oxide scanline + noise overlays in Enamel */
+[data-theme="enamel"] .kiln-canvas-panel::before,
+[data-theme="enamel"] .kiln-canvas-panel::after {
+  display: none;
+}
+
+/* Stage-kind accent CSS custom property — driven by data-stage-kind attribute.
+   Oxide defaults here, Enamel overrides below. */
+[data-stage-kind="source"]    { --kiln-stage-accent: var(--kiln-accent-source); }
+[data-stage-kind="transform"] { --kiln-stage-accent: var(--kiln-accent-transform); }
+[data-stage-kind="output"]    { --kiln-stage-accent: var(--kiln-accent-output); }
+[data-stage-kind="error"]     { --kiln-stage-accent: #CC3333; }
+
+/* Enamel node cards — light plate surface replaces dark char surface */
+[data-theme="enamel"] .kiln-node {
+  background: var(--kiln-plate-default);
+  border-color: #A0A8B0;
+  clip-path: none;
+}
+[data-theme="enamel"] .kiln-node:hover {
+  background: var(--kiln-plate-hover);
+  border-color: #8A9298;
+}
+[data-theme="enamel"] .kiln-node--selected {
+  border-color: var(--kiln-oxide-red) !important;
+  box-shadow: none;
+  outline: 2px solid var(--kiln-oxide-red);
+  outline-offset: 1px;
+}
+[data-theme="enamel"] .kiln-node-label {
+  color: #38424C;
+}
+[data-theme="enamel"] .kiln-node:hover .kiln-node-label {
+  color: #1C2830;
+}
+
+/* Enamel inspector — light plate fields inside dark panel shell */
+[data-theme="enamel"] .kiln-inspector-field,
+[data-theme="enamel"] .kiln-inspector-section-body {
+  background: var(--kiln-plate-field);
+  border-color: #B4BCC4;
+}
+[data-theme="enamel"] .kiln-inspector-field-key {
+  color: #48525C;
+}
+[data-theme="enamel"] .kiln-inspector-field-value {
+  color: #28323A;
+}
+
+/* Enamel horizontal ruling overlay for canvas (replaces scanlines) */
+[data-theme="enamel"] .kiln-canvas-panel .kiln-canvas-viewport::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 21px,
+    rgba(100, 110, 120, 0.04) 21px,
+    rgba(100, 110, 120, 0.04) 22px
+  );
+}
+
+/* Enamel animations */
+@keyframes enamel-plateIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.99); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes enamel-pulseAmber {
+  0%, 100% { opacity: 0.5; box-shadow: 0 0 4px #E8A52440; }
+  50%      { opacity: 1.0; box-shadow: 0 0 8px #E8A524A0; }
+}
+@keyframes enamel-flowEdge {
+  from { stroke-dashoffset: 24; }
+  to   { stroke-dashoffset: 0; }
+}
+@keyframes enamel-countUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── 2c. Enamel Material Details ──────────────────────────────────────────
+   Hazard stripes, crazing, chip marks, rivets — CSS-only, scoped to Enamel.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* Hazard stripe — app header top edge */
+[data-theme="enamel"] .kiln-title-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg, #B7410E, #B7410E 12px, transparent 12px, transparent 24px
+  );
+  opacity: 0.5;
+  z-index: 10;
+}
+
+/* Hazard stripe — node card header divider (below border-top) */
+[data-theme="enamel"] .kiln-node::after {
+  content: '';
+  position: absolute;
+  top: 22px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg, #B7410E 0, #B7410E 5px, #262C34 5px, #262C34 10px
+  );
+  opacity: 0.65;
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Source nodes get amber intake stripe */
+[data-theme="enamel"] .kiln-node[data-stage-kind="source"]::after {
+  background: repeating-linear-gradient(
+    90deg, #E8A524 0, #E8A524 5px, #1A2838 5px, #1A2838 10px
+  );
+}
+
+/* Crazing network — SVG data URI on node plate surfaces (4 variants) */
+[data-theme="enamel"] .kiln-node:nth-child(4n+1) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='148' height='84'%3E%3Cpath d='M0 34 L12 44 L22 38 M132 14 L121 26 L135 36' fill='none' stroke='%23707880' stroke-width='0.4' opacity='0.38'/%3E%3Cpath d='M8 0 L12 18 M126 18 L114 30 L130 44' fill='none' stroke='%23707880' stroke-width='0.2' opacity='0.25'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+[data-theme="enamel"] .kiln-node:nth-child(4n+2) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='148' height='84'%3E%3Cpath d='M14 0 L18 16 L8 26 L14 38 M130 46 L118 56' fill='none' stroke='%23707880' stroke-width='0.4' opacity='0.38'/%3E%3Cpath d='M120 30 L134 40' fill='none' stroke='%23707880' stroke-width='0.2' opacity='0.25'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+[data-theme="enamel"] .kiln-node:nth-child(4n+3) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='148' height='84'%3E%3Cpath d='M2 12 L14 22 L12 34 M128 0 L118 18 L132 28 L118 44' fill='none' stroke='%23707880' stroke-width='0.4' opacity='0.38'/%3E%3Cpath d='M0 52 L10 42 L22 48' fill='none' stroke='%23707880' stroke-width='0.2' opacity='0.25'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+[data-theme="enamel"] .kiln-node:nth-child(4n) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='148' height='84'%3E%3Cpath d='M0 28 L16 38 L24 28 M136 56 L122 40 L136 26' fill='none' stroke='%23707880' stroke-width='0.4' opacity='0.38'/%3E%3Cpath d='M128 20 L116 32 L130 40' fill='none' stroke='%23707880' stroke-width='0.2' opacity='0.25'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+
+/* Chip marks — corner erosion on node plates using clip-path.
+   Even-indexed: top-left + top-right chips.
+   Odd-indexed: top-right only. */
+[data-theme="enamel"] .kiln-node:nth-child(odd) {
+  clip-path: polygon(
+    11px 0, 100% 0, 100% 100%, 0 100%, 0 9px
+  );
+}
+[data-theme="enamel"] .kiln-node:nth-child(even) {
+  clip-path: polygon(
+    0 0, calc(100% - 11px) 0, 100% 9px, 100% 100%, 0 100%
+  );
+}
+/* Selected nodes: no clip-path (spec: eroded corners removed on selection) */
+[data-theme="enamel"] .kiln-node--selected {
+  clip-path: none !important;
+}
+
+/* Rivet marks — dark panel headers: inspector, YAML sidebar header */
+[data-theme="enamel"] .kiln-inspector-header::before,
+[data-theme="enamel"] .kiln-inspector-header::after {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #1A2028;
+  border: 1.5px solid #404850;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+  flex-shrink: 0;
+}
+
+/* Status bar hazard accent (left edge) */
+[data-theme="enamel"] .kiln-status-bar::before {
+  content: '';
+  width: 3px;
+  height: 14px;
+  background: repeating-linear-gradient(
+    180deg, #B7410E 0, #B7410E 2px, transparent 2px, transparent 4px
+  );
+  flex-shrink: 0;
+  margin-right: 6px;
+  align-self: center;
 }
 
 /* ── 3. Reset & base ───────────────────────────────────────────────────────
@@ -2071,6 +2343,38 @@ input:-webkit-autofill:focus {
   word-break: break-all;
 }
 
+.kiln-settings-theme-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+}
+.kiln-settings-theme-toggle {
+  display: flex;
+  gap: 4px;
+}
+.kiln-settings-theme-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  padding: 4px 12px;
+  border: 1px solid var(--kiln-border-medium);
+  background: transparent;
+  color: var(--kiln-iron);
+  cursor: pointer;
+  transition: all 150ms;
+}
+.kiln-settings-theme-btn:hover {
+  border-color: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+.kiln-settings-theme-btn--active {
+  background: var(--kiln-char-raised);
+  border-color: var(--kiln-oxide-red);
+  color: var(--kiln-bone);
+}
+
 .kiln-settings-empty {
   font-family: var(--kiln-font-code);
   font-size: 11px;
@@ -3149,6 +3453,23 @@ input:-webkit-autofill:focus {
 .kiln-status-segment--lang,
 .kiln-status-segment--engine {
   color: var(--kiln-text-floor);
+}
+
+.kiln-status-segment--theme {
+  color: var(--kiln-iron);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0 8px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  transition: color 150ms;
+}
+.kiln-status-segment--theme:hover {
+  color: var(--kiln-bone);
 }
 
 /* Clickable status segments */

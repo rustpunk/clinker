@@ -8,7 +8,7 @@ use crate::state::{DrillInEntry, TabManagerState, use_app_state};
 #[component]
 pub fn CanvasNode(stage: StageView) -> Element {
     let state = use_app_state();
-    let accent = stage.kind.accent_color();
+    let kind_attr = stage.kind.kind_attr();
     let badge = stage.kind.badge_label();
     let stage_id = stage.id.clone();
 
@@ -48,14 +48,14 @@ pub fn CanvasNode(stage: StageView) -> Element {
     // Composition transforms from an import get a subtle indicator
     let border_style = if is_from_composition {
         format!(
-            "left: {x}px; top: {y}px; width: {w}px; border-top-color: {accent}; border-left: 2px dashed {accent};",
+            "left: {x}px; top: {y}px; width: {w}px; border-top-color: var(--kiln-stage-accent); border-left: 2px dashed var(--kiln-stage-accent);",
             x = stage.canvas_x,
             y = stage.canvas_y,
             w = NODE_WIDTH
         )
     } else {
         format!(
-            "left: {x}px; top: {y}px; width: {w}px; border-top-color: {accent};",
+            "left: {x}px; top: {y}px; width: {w}px; border-top-color: var(--kiln-stage-accent);",
             x = stage.canvas_x,
             y = stage.canvas_y,
             w = NODE_WIDTH
@@ -98,6 +98,7 @@ pub fn CanvasNode(stage: StageView) -> Element {
         div {
             key: "{stage.id}",
             class: "{node_class}",
+            "data-stage-kind": kind_attr,
             style: "{border_style}",
             onmousedown: move |e: MouseEvent| e.stop_propagation(),
             onclick: {
@@ -137,7 +138,7 @@ pub fn CanvasNode(stage: StageView) -> Element {
 
             div {
                 class: "kiln-node-badge",
-                style: "color: {accent};",
+                style: "color: var(--kiln-stage-accent);",
                 span { class: "kiln-node-type-badge", "{badge}" }
                 // Channel override indicator
                 if is_modified {

@@ -40,44 +40,45 @@ pub fn Connector(props: ConnectorProps) -> Element {
         ty + 5.0,
     );
 
-    let accent = props.from.kind.accent_color();
+    let kind_attr = props.from.kind.kind_attr();
 
     rsx! {
         g {
+            "data-stage-kind": kind_attr,
             // Layer 1 — glow
             path {
                 d: "{path}",
                 fill: "none",
-                stroke: "{accent}",
                 stroke_width: "5",
                 stroke_opacity: "0.1",
+                style: "stroke: var(--kiln-stage-accent);",
             }
             // Layer 2 — dashed core cable
             path {
                 d: "{path}",
                 fill: "none",
-                stroke: "{accent}",
                 stroke_width: "2",
                 stroke_dasharray: "8 4",
                 stroke_opacity: "0.7",
+                style: "stroke: var(--kiln-stage-accent);",
             }
             // Layer 3 — bright centre hairline
             path {
                 d: "{path}",
                 fill: "none",
-                stroke: "{accent}",
                 stroke_width: "0.75",
                 stroke_opacity: "0.9",
+                style: "stroke: var(--kiln-stage-accent);",
             }
             // Open chevron arrowhead
             path {
                 d: "{arrow}",
                 fill: "none",
-                stroke: "{accent}",
                 stroke_width: "1.5",
                 stroke_opacity: "0.8",
                 stroke_linejoin: "round",
                 stroke_linecap: "round",
+                style: "stroke: var(--kiln-stage-accent);",
             }
         }
     }

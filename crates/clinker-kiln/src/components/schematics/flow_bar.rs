@@ -46,15 +46,16 @@ pub fn FlowBar(stages: Vec<StageView>) -> Element {
 
                 // Stage pill
                 {
-                    let accent = stage.kind.accent_color();
+                    let kind_attr = stage.kind.kind_attr();
                     let badge = stage.kind.badge_label();
                     rsx! {
                         div {
                             key: "flow-{stage.id}",
                             class: "kiln-flow-pill",
-                            style: "border-top-color: {accent}; \
-                                    background: color-mix(in srgb, {accent} 8%, var(--kiln-char-surface)); \
-                                    border-color: color-mix(in srgb, {accent} 20%, var(--kiln-border-subtle));",
+                            "data-stage-kind": kind_attr,
+                            style: "border-top-color: var(--kiln-stage-accent); \
+                                    background: color-mix(in srgb, var(--kiln-stage-accent) 8%, var(--kiln-char-surface)); \
+                                    border-color: color-mix(in srgb, var(--kiln-stage-accent) 20%, var(--kiln-border-subtle));",
 
                             span {
                                 class: "kiln-flow-pill-label",
@@ -62,7 +63,7 @@ pub fn FlowBar(stages: Vec<StageView>) -> Element {
                             }
                             span {
                                 class: "kiln-flow-pill-badge",
-                                style: "color: {accent};",
+                                style: "color: var(--kiln-stage-accent);",
                                 "{badge}"
                             }
                         }

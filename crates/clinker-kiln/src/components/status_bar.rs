@@ -16,12 +16,12 @@ use clinker_git::GitOps;
 
 use crate::components::activity_bar::switch_context;
 use crate::components::toast::{ToastState, toast_error, toast_success};
-use crate::state::{NavigationContext, TabManagerState, use_app_state};
+use crate::state::{KilnTheme, NavigationContext, TabManagerState, use_app_state};
 
 /// Status bar component — anchored to viewport bottom.
 #[component]
 pub fn StatusBar() -> Element {
-    let tab_mgr = use_context::<TabManagerState>();
+    let mut tab_mgr = use_context::<TabManagerState>();
     let state = use_app_state();
     let current_ctx = (state.active_context)();
     let git = (tab_mgr.git_state)();
@@ -134,6 +134,26 @@ pub fn StatusBar() -> Element {
 
             // ── Spacer ─────────────────────────────────────────────────
             div { class: "kiln-status-spacer" }
+
+            // ── Theme toggle ───────────────────────────────────────────
+            {
+                let current_theme = (tab_mgr.theme)();
+                let theme_label = match current_theme {
+                    KilnTheme::Oxide => "\u{25D1} OXIDE",  // ◑
+                    KilnTheme::Enamel => "\u{25D0} ENAMEL", // ◐
+                };
+                rsx! {
+                    button {
+                        class: "kiln-status-segment kiln-status-segment--theme kiln-status-segment--clickable",
+                        title: "Toggle theme (Ctrl+Shift+T)",
+                        onclick: move |_| {
+                            tab_mgr.theme.set(current_theme.toggle());
+                        },
+                        "{theme_label}"
+                    }
+                    div { class: "kiln-status-divider" }
+                }
+            }
 
             // ── Git engine indicator ────────────────────────────────────
             if git.is_some() {

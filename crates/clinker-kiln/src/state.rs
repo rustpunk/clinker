@@ -25,6 +25,53 @@ use crate::sync::EditSource;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace::Workspace;
 
+/// Visual theme — switches the entire UI between sub-aesthetics.
+///
+/// Oxide is the default dark Rustpunk theme (warm charred surfaces).
+/// Enamel is a light industrial theme (porcelain-fused-to-steel data plates).
+/// The active theme drives CSS custom property overrides via `data-theme` on the root element.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub enum KilnTheme {
+    #[default]
+    Oxide,
+    Enamel,
+}
+
+impl KilnTheme {
+    /// CSS `data-theme` attribute value.
+    pub fn as_data_attr(self) -> &'static str {
+        match self {
+            Self::Oxide => "oxide",
+            Self::Enamel => "enamel",
+        }
+    }
+
+    /// Human-readable display label.
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Oxide => "Oxide (Dark)",
+            Self::Enamel => "Enamel (Light)",
+        }
+    }
+
+    /// Toggle to the opposite theme.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Oxide => Self::Enamel,
+            Self::Enamel => Self::Oxide,
+        }
+    }
+
+    /// Parse from persisted string, defaulting to Oxide.
+    pub fn from_str_or_default(s: &str) -> Self {
+        match s {
+            "enamel" => Self::Enamel,
+            _ => Self::Oxide,
+        }
+    }
+}
+
 /// Which left-side panel is currently open (280px slide-in slot).
 ///
 /// Only one panel can be open at a time. Search, Schemas, and Compositions
@@ -257,6 +304,8 @@ pub struct TabManagerState {
     pub nav_history: Signal<Vec<NavigationContext>>,
     /// Channel state discovered from clinker.toml (None if no clinker.toml found).
     pub channel_state: Signal<Option<ChannelState>>,
+    /// Active visual theme (Oxide dark / Enamel light).
+    pub theme: Signal<KilnTheme>,
 }
 
 use clinker_schema::{SchemaIndex, SchemaWarning};

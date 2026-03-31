@@ -29,7 +29,22 @@ pub enum StageKind {
 }
 
 impl StageKind {
-    /// Rustpunk accent colour hex for this stage kind.
+    /// CSS `data-stage-kind` attribute value for theme-driven accent colors.
+    pub fn kind_attr(&self) -> &'static str {
+        match self {
+            StageKind::Source | StageKind::Composition(_) => "source",
+            StageKind::Transform => "transform",
+            StageKind::Output => "output",
+            StageKind::Error => "error",
+        }
+    }
+
+    /// Rustpunk accent colour hex for this stage kind (Oxide theme).
+    #[allow(dead_code)]
+    ///
+    /// Prefer using `kind_attr()` + CSS `var(--kiln-stage-accent)` for
+    /// DOM elements. This method is kept for SVG stroke attributes where
+    /// CSS custom properties may not be supported in all WebView engines.
     pub fn accent_color(&self) -> &'static str {
         match self {
             StageKind::Source => "#43B3AE",         // verdigris
