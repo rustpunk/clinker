@@ -804,6 +804,7 @@ dependencies = [
  "clinker-channel",
  "clinker-core",
  "clinker-git",
+ "clinker-record",
  "clinker-schema",
  "cxl",
  "dioxus",
