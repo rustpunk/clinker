@@ -3520,6 +3520,169 @@ input:-webkit-autofill:focus {
   right: -5px;
 }
 
+/* ── 8b. Composition nodes — dashed verdigris border ─────────────────────── */
+.kiln-node--composition {
+  border: 2px dashed rgba(67, 179, 174, 0.4);
+  border-top: 3px dashed rgba(67, 179, 174, 0.6);
+  clip-path: none;
+  border-radius: 0 4px 0 3px;
+}
+.kiln-node--composition:hover {
+  border-color: rgba(67, 179, 174, 0.7);
+}
+.kiln-node--composition.kiln-node--selected {
+  border-color: var(--kiln-verdigris) !important;
+  border-style: dashed;
+}
+
+/* Expand/drill indicator — bottom-right corner */
+.kiln-node-expand-indicator {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+}
+
+/* ── 8c. Composition group frame — inline-expanded boundary ──────────────── */
+.kiln-composition-group {
+  position: absolute;
+  z-index: 3;
+  border: 2px dashed rgba(67, 179, 174, 0.35);
+  border-top: 3px dashed rgba(67, 179, 174, 0.5);
+  border-radius: 0 4px 0 3px;
+  background: rgba(67, 179, 174, 0.04);
+}
+
+.kiln-composition-group__header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  height: 24px;
+}
+
+.kiln-composition-group__icon {
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-verdigris);
+}
+
+.kiln-composition-group__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-composition-group__meta {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-composition-group__spacer {
+  flex: 1;
+}
+
+.kiln-composition-group__collapse {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.kiln-composition-group__collapse:hover {
+  color: var(--kiln-verdigris);
+}
+
+/* ── 8d. Breadcrumb bar — drill-in navigation ────────────────────────────── */
+.kiln-breadcrumb-bar {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  gap: 0;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  z-index: 9;
+  position: relative;
+}
+
+.kiln-breadcrumb__segment {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.kiln-breadcrumb__segment--link {
+  color: var(--kiln-iron);
+  cursor: pointer;
+}
+.kiln-breadcrumb__segment--link:hover {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-breadcrumb__segment--active {
+  color: var(--kiln-bone);
+}
+
+.kiln-breadcrumb__sep {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  padding: 0 8px;
+}
+
+.kiln-breadcrumb__comp-icon {
+  color: var(--kiln-verdigris);
+  font-size: 10px;
+  margin-right: 4px;
+}
+
+.kiln-breadcrumb__spacer {
+  flex: 1;
+}
+
+.kiln-breadcrumb__hint {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* Scope indicator — verdigris gradient bar below breadcrumb */
+.kiln-scope-indicator {
+  height: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(90deg,
+    transparent,
+    rgba(67, 179, 174, 0.6) 20%,
+    rgba(67, 179, 174, 0.8) 50%,
+    rgba(67, 179, 174, 0.6) 80%,
+    transparent);
+}
+
+/* ── 8e. Channel override badges on nodes ────────────────────────────────── */
+.kiln-node-override-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  margin-left: auto;
+}
+.kiln-node-override-badge--modified {
+  color: var(--kiln-hazard);
+}
+.kiln-node-override-badge--added {
+  color: var(--kiln-verdigris);
+}
+.kiln-node-override-badge--removed {
+  color: var(--kiln-oxide-red);
+  text-decoration: line-through;
+}
+
 /* ── 9. YAML Sidebar ───────────────────────────────────────────────────────
    Spec §6: full-height column with section header + scrollable code area.
    ─────────────────────────────────────────────────────────────────────── */
@@ -4787,3 +4950,1031 @@ input:-webkit-autofill:focus {
   border-radius: 2px;
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--kiln-border-medium); }
+
+/* ── 22. Channel Mode ────────────────────────────────────────────────────── */
+
+.kiln-channel-mode {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.kiln-channel-mode__indicator {
+  height: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(90deg,
+    transparent,
+    rgba(67, 179, 174, 0.5) 20%,
+    rgba(67, 179, 174, 0.7) 50%,
+    rgba(67, 179, 174, 0.5) 80%,
+    transparent);
+}
+
+.kiln-channel-mode__layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kiln-channel-mode__main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Channel tabs ──────────────────────────────────────────────────────── */
+.kiln-channel-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  padding: 0 16px;
+  background: var(--kiln-char);
+}
+
+.kiln-channel-tab {
+  all: unset;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 8px 16px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms, border-color 200ms;
+}
+.kiln-channel-tab:hover {
+  color: var(--kiln-iron);
+}
+.kiln-channel-tab--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+/* ── Channel content area ──────────────────────────────────────────────── */
+.kiln-channel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.kiln-channel-content__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 12px;
+}
+.kiln-channel-content__empty-icon {
+  font-size: 32px;
+  color: var(--kiln-verdigris);
+  opacity: 0.3;
+}
+.kiln-channel-content__empty-text {
+  font-family: var(--kiln-font-ui);
+  font-size: 13px;
+  color: var(--kiln-text-floor);
+}
+
+/* ── Channel list sidebar (280px) ──────────────────────────────────────── */
+.kiln-channel-list {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char);
+  overflow: hidden;
+}
+
+.kiln-channel-list__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-channel-list__new-btn {
+  all: unset;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--kiln-font-code);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 150ms, border-color 150ms;
+}
+.kiln-channel-list__new-btn:hover {
+  color: var(--kiln-verdigris);
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-channel-list__new-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-surface);
+}
+
+.kiln-channel-list__new-input {
+  all: unset;
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-bone);
+  background: transparent;
+  border: 1px solid var(--kiln-verdigris);
+  border-radius: 3px;
+  padding: 4px 8px;
+}
+.kiln-channel-list__new-input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-channel-list__new-cancel {
+  all: unset;
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.kiln-channel-list__new-cancel:hover {
+  color: var(--kiln-iron);
+}
+
+.kiln-channel-list__search-input {
+  all: unset;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-bone);
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  padding: 6px 10px;
+  box-sizing: border-box;
+}
+.kiln-channel-list__search-input::placeholder {
+  color: var(--kiln-text-floor);
+}
+.kiln-channel-list__search-input:focus {
+  border-color: var(--kiln-verdigris);
+  outline: none;
+}
+
+/* ── Tier filter tabs ──────────────────────────────────────────────────── */
+.kiln-channel-list__tiers {
+  display: flex;
+  gap: 0;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.kiln-channel-tier {
+  all: unset;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  padding: 6px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms;
+}
+.kiln-channel-tier:hover {
+  color: var(--kiln-iron);
+}
+.kiln-channel-tier--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+/* ── Channel entries ───────────────────────────────────────────────────── */
+.kiln-channel-list__entries {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.kiln-channel-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background 150ms;
+}
+.kiln-channel-entry:hover {
+  background: var(--kiln-char-raised);
+}
+.kiln-channel-entry--active {
+  background: rgba(67, 179, 174, 0.08);
+  border-left: 2px solid var(--kiln-verdigris);
+  padding-left: 10px;
+}
+.kiln-channel-entry--inactive {
+  opacity: 0.5;
+}
+
+/* Tier pip — small colored dot */
+.kiln-channel-entry__pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--kiln-iron);
+  flex-shrink: 0;
+}
+.kiln-channel-entry__pip--group {
+  background: var(--kiln-hazard);
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+
+.kiln-channel-entry__info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.kiln-channel-entry__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-channel-entry__id {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-channel-entry__meta {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.kiln-channel-entry__badge {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+.kiln-channel-entry__badge--inactive {
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.1);
+}
+
+/* ── Groups section ────────────────────────────────────────────────────── */
+.kiln-channel-list__groups-header {
+  border-top: 1px solid var(--kiln-border-subtle);
+  padding: 0;
+}
+
+.kiln-channel-list__groups-toggle {
+  all: unset;
+  width: 100%;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 8px 12px;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+.kiln-channel-list__groups-toggle:hover {
+  color: var(--kiln-iron);
+}
+
+.kiln-channel-list__groups {
+  padding: 0 0 4px;
+}
+
+/* ── Empty state (no channels) ─────────────────────────────────────────── */
+.kiln-channel-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 16px;
+  padding: 40px;
+  text-align: center;
+}
+
+.kiln-channel-empty-state__icon {
+  font-size: 48px;
+  color: var(--kiln-verdigris);
+  opacity: 0.2;
+}
+
+.kiln-channel-empty-state__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  letter-spacing: 0.04em;
+}
+
+.kiln-channel-empty-state__desc {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-iron);
+  line-height: 1.5;
+  max-width: 380px;
+}
+
+.kiln-channel-empty-state__hint {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  margin-top: 8px;
+}
+
+.kiln-channel-empty-state__code {
+  color: var(--kiln-verdigris);
+  background: var(--kiln-char-raised);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+/* ── 22b. Identity tab ───────────────────────────────────────────────────── */
+
+.kiln-identity-tab {
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.kiln-identity-tab__empty {
+  color: var(--kiln-text-floor);
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.kiln-identity-card {
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 0 4px 0 3px;
+  padding: 20px;
+  max-width: 520px;
+}
+
+.kiln-identity-card__header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.kiln-identity-card__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-identity-card__id {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+
+.kiln-identity-card__inactive {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.1);
+  padding: 1px 6px;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kiln-identity-card__tier {
+  display: inline-block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.1);
+  border: 1px solid rgba(67, 179, 174, 0.3);
+  padding: 2px 10px;
+  border-radius: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+
+.kiln-identity-card__desc {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-iron);
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.kiln-identity-card__field {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-identity-card__label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  min-width: 80px;
+  flex-shrink: 0;
+}
+
+.kiln-identity-card__value {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+}
+
+.kiln-identity-card__tags {
+  padding: 10px 0;
+}
+
+.kiln-identity-card__tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.kiln-identity-card__tag {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+.kiln-identity-card__inherits {
+  padding: 10px 0;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-identity-card__inherit-chain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.kiln-identity-card__inherit-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.08);
+  border: 1px solid rgba(232, 165, 36, 0.2);
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+.kiln-identity-card__section {
+  padding: 10px 0;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-identity-card__section-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--kiln-text-floor);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.kiln-identity-card__section-note {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+
+/* ── 22c. Overrides tab ──────────────────────────────────────────────────── */
+
+.kiln-overrides-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.kiln-overrides-tab__views {
+  display: flex;
+  gap: 0;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  background: var(--kiln-char-surface);
+}
+
+.kiln-overrides-view {
+  all: unset;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms;
+}
+.kiln-overrides-view:hover { color: var(--kiln-iron); }
+.kiln-overrides-view--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+.kiln-overrides-tab__content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.kiln-overrides__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+  margin-bottom: 12px;
+}
+
+.kiln-overrides__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.kiln-overrides__empty {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  padding: 20px 0;
+}
+
+.kiln-override-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 150ms;
+}
+.kiln-override-entry:hover { background: var(--kiln-char-raised); }
+
+.kiln-override-entry__icon {
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+  flex-shrink: 0;
+}
+
+.kiln-override-entry__pipeline {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-bone);
+  font-weight: 500;
+}
+
+.kiln-override-entry__path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  margin-left: auto;
+}
+
+.kiln-override-pipeline {
+  margin-bottom: 16px;
+}
+
+.kiln-override-pipeline__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  margin-bottom: 6px;
+}
+
+.kiln-override-pipeline__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-override-pipeline__count {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-override-pipeline__channels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.kiln-override-pipeline__channel-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+/* Overrides matrix */
+.kiln-overrides-matrix__summary {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-iron);
+  margin-bottom: 12px;
+}
+
+.kiln-overrides-matrix__table {
+  display: grid;
+  gap: 1px;
+  background: var(--kiln-border-subtle);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.kiln-overrides-matrix__row {
+  display: contents;
+}
+
+.kiln-overrides-matrix__row--header .kiln-overrides-matrix__cell {
+  background: var(--kiln-char);
+  font-weight: 500;
+}
+
+.kiln-overrides-matrix__cell {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  padding: 6px 8px;
+  background: var(--kiln-char-surface);
+  color: var(--kiln-iron);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-overrides-matrix__cell--header {
+  color: var(--kiln-bone);
+  font-weight: 500;
+}
+
+.kiln-overrides-matrix__cell--override {
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.06);
+}
+
+.kiln-overrides-matrix__cell--empty {
+  color: var(--kiln-text-floor);
+  opacity: 0.4;
+}
+
+.kiln-overrides-matrix__cell--diagonal {
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-overrides-matrix__legend {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  margin-top: 8px;
+}
+
+/* ── 22d. Health tab ─────────────────────────────────────────────────────── */
+
+.kiln-health-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.kiln-health-tab__summary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-surface);
+  flex-shrink: 0;
+}
+
+.kiln-health-tab__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-health-tab__stats {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.kiln-health-stat {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kiln-health-stat--error {
+  color: #CC3333;
+  background: rgba(204, 51, 51, 0.1);
+}
+
+.kiln-health-stat--warning {
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.1);
+}
+
+.kiln-health-stat--stale {
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-health-stat--ok {
+  color: #7ab648;
+  background: rgba(122, 182, 72, 0.1);
+}
+
+.kiln-health-tab__results {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kiln-health-tab__empty {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  padding: 20px 0;
+  text-align: center;
+}
+
+.kiln-health-entry {
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 0 4px 0 3px;
+  border-left: 3px solid var(--kiln-border-subtle);
+  padding: 10px 12px;
+}
+
+.kiln-health-entry--error { border-left-color: #CC3333; }
+.kiln-health-entry--warning { border-left-color: var(--kiln-hazard); }
+.kiln-health-entry--ok { border-left-color: #7ab648; }
+
+.kiln-health-entry__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.kiln-health-entry__icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.kiln-health-entry__pipeline {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-health-entry__stale {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.08);
+  padding: 1px 6px;
+  border-radius: 2px;
+  margin-left: auto;
+}
+
+.kiln-health-entry__issues {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 20px;
+}
+
+.kiln-health-issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+}
+
+.kiln-health-issue--error { color: #CC3333; }
+.kiln-health-issue--warning { color: var(--kiln-hazard); }
+.kiln-health-issue--info { color: var(--kiln-verdigris); }
+
+.kiln-health-issue__icon {
+  flex-shrink: 0;
+  font-size: 10px;
+}
+
+.kiln-health-issue__msg {
+  color: var(--kiln-iron);
+}
+
+/* ── 22e. YAML sidebar toggle ────────────────────────────────────────────── */
+
+.kiln-yaml-channel-toggle {
+  display: flex;
+  gap: 0;
+  margin-left: 8px;
+}
+
+.kiln-yaml-toggle-btn {
+  all: unset;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 2px 8px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms;
+}
+.kiln-yaml-toggle-btn:hover { color: var(--kiln-iron); }
+.kiln-yaml-toggle-btn--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+/* Read-only textarea indicator */
+.kiln-yaml-textarea--readonly {
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* ── 22f. Channel switcher (nox-select) ──────────────────────────────────── */
+
+.kiln-channel-select {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Trigger (badge) — resets button styling from nox-select */
+.kiln-channel-select button[role="combobox"] {
+  all: unset;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+.kiln-channel-select button[role="combobox"]:hover {
+  color: var(--kiln-verdigris);
+}
+.kiln-channel-select button[role="combobox"][data-active="true"] {
+  color: var(--kiln-verdigris);
+}
+
+/* Dropdown content */
+.kiln-channel-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  min-width: 240px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  padding: 4px 0;
+  margin-top: 4px;
+}
+
+/* Hide dropdown when closed */
+.kiln-channel-select[data-select-state="closed"] .kiln-channel-dropdown {
+  display: none;
+}
+
+/* Individual items */
+.kiln-channel-dropdown [data-select-item] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+.kiln-channel-dropdown [data-select-item]:hover,
+.kiln-channel-dropdown [data-highlighted="true"] {
+  background: var(--kiln-char-raised);
+  color: var(--kiln-bone);
+}
+.kiln-channel-dropdown [data-state="checked"] {
+  color: var(--kiln-verdigris);
+}
+
+/* Item indicator (radio dot) */
+.kiln-channel-dropdown [data-select-item-indicator] {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.kiln-channel-dropdown [data-state="checked"] [data-select-item-indicator] {
+  color: var(--kiln-verdigris);
+}
+
+/* Item text */
+.kiln-channel-dropdown [data-select-item-text] {
+  flex: 1;
+}
+
+/* Tier badge */
+.kiln-channel-dropdown__tier {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-border-subtle);
+  padding: 1px 4px;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Override count */
+.kiln-channel-dropdown__count {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  margin-left: auto;
+}
+
+/* Description text (for "run base pipeline") */
+.kiln-channel-dropdown__desc {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}

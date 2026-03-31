@@ -550,6 +550,121 @@ fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
     content
 }
 
+// ── Channel search ──────────────────────────────────────────────────────
+
+use crate::state::{ChannelState, ChannelSummary};
+
+/// A channel search match.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelSearchMatch {
+    /// Channel or group ID that matched.
+    pub id: String,
+    /// Channel name.
+    pub name: String,
+    /// What matched (e.g., "tier: enterprise").
+    pub matched_detail: String,
+    /// Whether this is a group (vs. channel).
+    pub is_group: bool,
+}
+
+/// Channel-specific structural search keys.
+const CHANNEL_KEYS: &[&str] = &["channel", "override", "tier", "channel-tag", "group", "stale"];
+
+/// Check if a query contains channel-specific search keys.
+pub fn has_channel_tags(tags: &[StructuralTag]) -> bool {
+    tags.iter().any(|t| CHANNEL_KEYS.contains(&t.key.as_str()))
+}
+
+/// Search channels using structural tags.
+///
+/// Supported keys:
+/// - `channel:id` — filter by channel ID (substring match)
+/// - `tier:name` — filter by tier name
+/// - `channel-tag:value` — filter by tag
+/// - `group:id` — filter channels inheriting from a group
+/// - `override:name` — channels that have override files matching a pipeline stem
+/// - `stale:true` — channels with stale overrides (placeholder)
+pub fn channel_search(
+    state: &ChannelState,
+    tags: &[StructuralTag],
+) -> Vec<ChannelSearchMatch> {
+    let mut results = Vec::new();
+
+    for channel in &state.channels {
+        let mut matches = true;
+        let mut detail_parts = Vec::new();
+
+        for tag in tags {
+            let val = tag.value.to_lowercase();
+            match tag.key.as_str() {
+                "channel" => {
+                    if !channel.id.to_lowercase().contains(&val)
+                        && !channel.name.to_lowercase().contains(&val)
+                    {
+                        matches = false;
+                    } else {
+                        detail_parts.push(format!("id: {}", channel.id));
+                    }
+                }
+                "tier" => {
+                    if channel.tier.as_deref().map(|t| t.to_lowercase()) != Some(val.clone()) {
+                        matches = false;
+                    } else {
+                        detail_parts.push(format!("tier: {}", channel.tier.as_deref().unwrap_or("")));
+                    }
+                }
+                "channel-tag" => {
+                    if !channel.tags.iter().any(|t| t.to_lowercase().contains(&val)) {
+                        matches = false;
+                    } else {
+                        detail_parts.push(format!("tag: {}", tag.value));
+                    }
+                }
+                "group" => {
+                    if !channel.inherits.iter().any(|g| g.to_lowercase().contains(&val)) {
+                        matches = false;
+                    } else {
+                        detail_parts.push(format!("inherits: {}", tag.value));
+                    }
+                }
+                "override" => {
+                    // Check if channel has an override file matching the value
+                    let channel_dir = state
+                        .workspace_root
+                        .join(&state.channels_dir)
+                        .join(&channel.id);
+                    let override_path = channel_dir.join(format!("{}.channel.yaml", val));
+                    if !override_path.exists() {
+                        matches = false;
+                    } else {
+                        detail_parts.push(format!("overrides: {}.yaml", tag.value));
+                    }
+                }
+                "stale" => {
+                    // Placeholder: stale detection would require mtime comparison
+                    if val != "true" {
+                        matches = false;
+                    }
+                }
+                _ => {
+                    // Non-channel key — skip (might be a pipeline key)
+                }
+            }
+        }
+
+        if matches && !detail_parts.is_empty() {
+            results.push(ChannelSearchMatch {
+                id: channel.id.clone(),
+                name: channel.name.clone(),
+                matched_detail: detail_parts.join(", "),
+                is_group: false,
+            });
+        }
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,6 +7,7 @@ use super::drawer_bar::{ActiveDrawer, DrawerToggleBar};
 use super::drawer_docs::DrawerDocs;
 use super::drawer_notes::DrawerNotes;
 use super::drawer_run::DrawerRun;
+use super::override_diff::OverrideDiff;
 use super::scoped_yaml::ScopedYaml;
 use super::stage_header::StageHeader;
 
@@ -44,6 +45,29 @@ pub fn InspectorPanel(stage_id: String) -> Element {
     let cxl_source = transform.map(|t| t.cxl.clone());
     let drawer_open = (active_drawer)() != ActiveDrawer::None;
 
+    // Channel override info for this stage
+    let channel_resolution = (state.channel_pipeline)();
+    let override_info = channel_resolution.as_ref().and_then(|cr| {
+        cr.overrides_applied
+            .iter()
+            .find(|o| o.target_name == stage_id)
+            .cloned()
+    });
+
+    // Get base CXL for diff comparison
+    let base_cxl = cxl_source.clone().unwrap_or_default();
+
+    // Get resolved CXL from channel resolution
+    let resolved_cxl = channel_resolution
+        .as_ref()
+        .and_then(|cr| {
+            cr.resolved_config
+                .transforms()
+                .find(|t| t.name == stage_id)
+                .map(|t| t.cxl.clone())
+        })
+        .unwrap_or_default();
+
     rsx! {
         div {
             class: "kiln-inspector",
@@ -55,6 +79,15 @@ pub fn InspectorPanel(stage_id: String) -> Element {
                 kind_label,
                 accent,
                 label: stage_id.clone(),
+            }
+
+            // ── Override diff (when channel override applies to this stage) ──
+            if let Some(applied) = override_info {
+                OverrideDiff {
+                    applied: applied.clone(),
+                    base_cxl: base_cxl.clone(),
+                    resolved_cxl: resolved_cxl.clone(),
+                }
             }
 
             // ── Config section (upper, always visible) ────────────────────

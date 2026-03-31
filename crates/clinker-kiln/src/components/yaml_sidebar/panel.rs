@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use clinker_git::{BlameLine, GitOps};
 
 use crate::pipeline_view::derive_pipeline_view;
-use crate::state::{use_app_state, TabManagerState};
+use crate::state::{use_app_state, ChannelViewMode, TabManagerState};
 use crate::sync::EditSource;
 
 use super::tokenizer::tokenize;
@@ -21,10 +21,10 @@ use super::tokenizer::tokenize;
 pub fn YamlSidebar() -> Element {
     let state = use_app_state();
     let tab_mgr = use_context::<TabManagerState>();
-    let text = (state.yaml_text)();
+    let raw_text = (state.yaml_text)();
     let errors = (state.parse_errors)();
-    let lines = tokenize(&text);
-    let line_count = lines.len().max(1);
+    let raw_lines = tokenize(&raw_text);
+    let raw_line_count = raw_lines.len().max(1);
     let mut blame_visible = use_signal(|| false);
     let mut blame_data = use_signal(|| Vec::<BlameLine>::new());
 
@@ -36,7 +36,7 @@ pub fn YamlSidebar() -> Element {
         let pipeline_guard = (state.pipeline).read();
         match (selected.as_deref(), pipeline_guard.as_ref()) {
             (Some(stage_id), Some(config)) => {
-                let ranges = crate::sync::compute_yaml_ranges(&text, config);
+                let ranges = crate::sync::compute_yaml_ranges(&raw_text, config);
                 ranges.get(stage_id).copied()
             }
             _ => None,
@@ -46,6 +46,51 @@ pub fn YamlSidebar() -> Element {
     // Schema warnings for YAML squiggles
     let warnings = (state.schema_warnings)();
 
+    // Channel view mode — Base / Resolved / Channel
+    let channel_resolution = (state.channel_pipeline)();
+    let has_channel = channel_resolution.is_some()
+        && (tab_mgr.channel_state)()
+            .as_ref()
+            .and_then(|cs| cs.active_channel.as_ref())
+            .is_some();
+    let view_mode = if has_channel { (state.channel_view_mode)() } else { ChannelViewMode::Base };
+
+    // Load channel override text for Channel mode
+    let channel_override_text = if view_mode == ChannelViewMode::Channel {
+        load_channel_override_text(&tab_mgr)
+    } else {
+        None
+    };
+
+    // Determine displayed text and editability
+    let (text, lines, line_count, is_editable) = match view_mode {
+        ChannelViewMode::Resolved => {
+            let resolved_text = if let Some(ref cr) = channel_resolution {
+                crate::sync::serialize_yaml(&cr.resolved_config)
+            } else {
+                raw_text.clone()
+            };
+            let resolved_lines = tokenize(&resolved_text);
+            let count = resolved_lines.len().max(1);
+            (resolved_text, resolved_lines, count, false)
+        }
+        ChannelViewMode::Channel => {
+            let chan_text = channel_override_text.unwrap_or_default();
+            let chan_lines = tokenize(&chan_text);
+            let count = chan_lines.len().max(1);
+            (chan_text, chan_lines, count, true)
+        }
+        ChannelViewMode::Base => {
+            (raw_text.clone(), raw_lines, raw_line_count, true)
+        }
+    };
+
+    let section_title = match view_mode {
+        ChannelViewMode::Base => "PIPELINE YAML",
+        ChannelViewMode::Resolved => "RESOLVED YAML (read-only)",
+        ChannelViewMode::Channel => "CHANNEL OVERRIDE",
+    };
+
     rsx! {
         div {
             class: "kiln-yaml-sidebar",
@@ -54,8 +99,33 @@ pub fn YamlSidebar() -> Element {
             div {
                 class: "kiln-section-header",
                 span { class: "kiln-diamond", "\u{25C6}" }
-                span { class: "kiln-section-title", "PIPELINE YAML" }
+                span { class: "kiln-section-title", "{section_title}" }
                 span { class: "kiln-section-rule" }
+
+                // Channel view mode toggle (when channel is active)
+                if has_channel {
+                    div {
+                        class: "kiln-yaml-channel-toggle",
+                        for mode in ChannelViewMode::ALL {
+                            {
+                                let is_active = view_mode == mode;
+                                let mut view_sig = state.channel_view_mode;
+                                rsx! {
+                                    button {
+                                        key: "{mode.label()}",
+                                        class: if is_active {
+                                            "kiln-yaml-toggle-btn kiln-yaml-toggle-btn--active"
+                                        } else {
+                                            "kiln-yaml-toggle-btn"
+                                        },
+                                        onclick: move |_| view_sig.set(mode),
+                                        "{mode.label()}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Blame toggle button (only when git repo detected)
                 if (tab_mgr.git_state)().is_some() {
@@ -187,16 +257,31 @@ pub fn YamlSidebar() -> Element {
                     }
 
                     // Transparent textarea (captures input)
-                    textarea {
-                        class: "kiln-yaml-textarea",
-                        spellcheck: "false",
-                        value: "{text}",
-                        oninput: move |e: FormEvent| {
-                            let mut src = state.edit_source;
-                            src.set(EditSource::Yaml);
-                            let mut yaml = state.yaml_text;
-                            yaml.set(e.value());
-                        },
+                    if is_editable {
+                        textarea {
+                            class: "kiln-yaml-textarea",
+                            spellcheck: "false",
+                            value: "{text}",
+                            oninput: move |e: FormEvent| {
+                                if view_mode == ChannelViewMode::Channel {
+                                    // Channel override editing — save to file
+                                    save_channel_override_text(&tab_mgr, &e.value());
+                                } else {
+                                    // Base pipeline editing
+                                    let mut src = state.edit_source;
+                                    src.set(EditSource::Yaml);
+                                    let mut yaml = state.yaml_text;
+                                    yaml.set(e.value());
+                                }
+                            },
+                        }
+                    } else {
+                        textarea {
+                            class: "kiln-yaml-textarea kiln-yaml-textarea--readonly",
+                            spellcheck: "false",
+                            readonly: true,
+                            value: "{text}",
+                        }
                     }
                 }
             }
@@ -261,6 +346,45 @@ fn load_blame(tab_mgr: &TabManagerState, blame_data: &mut Signal<Vec<BlameLine>>
         if let Ok(lines) = ops.blame(relative) {
             blame_data.set(lines);
         }
+    }
+}
+
+/// Derive the channel override file path for the active tab + active channel.
+fn channel_override_path(tab_mgr: &TabManagerState) -> Option<std::path::PathBuf> {
+    let cs = (tab_mgr.channel_state)();
+    let channel_state = cs.as_ref()?;
+    let channel_id = channel_state.active_channel.as_ref()?;
+    let channel_dir = channel_state.workspace_root
+        .join(&channel_state.channels_dir)
+        .join(channel_id);
+
+    let active_id = (tab_mgr.active_tab_id)();
+    let tabs = tab_mgr.tabs.read();
+    let tab = active_id.and_then(|id| tabs.iter().find(|t| t.id == id))?;
+    let file_path = tab.file_path.as_ref()?;
+
+    Some(clinker_channel::channel_override::ChannelOverride::path_for(file_path, &channel_dir))
+}
+
+/// Load channel override YAML text from disk.
+fn load_channel_override_text(tab_mgr: &TabManagerState) -> Option<String> {
+    let path = channel_override_path(tab_mgr)?;
+    if path.exists() {
+        std::fs::read_to_string(&path).ok()
+    } else {
+        // Return template for new override file
+        Some("# Channel override for this pipeline\n# Add transform overrides here\n\n_override:\n  transforms: []\n".to_string())
+    }
+}
+
+/// Save channel override YAML text to disk.
+fn save_channel_override_text(tab_mgr: &TabManagerState, content: &str) {
+    if let Some(path) = channel_override_path(tab_mgr) {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, content);
     }
 }
 

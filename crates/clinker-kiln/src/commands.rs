@@ -33,6 +33,7 @@ pub enum CommandGroup {
     Template,
     Settings,
     Git,
+    Channel,
 }
 
 impl CommandGroup {
@@ -46,6 +47,7 @@ impl CommandGroup {
             Self::Template => "Template",
             Self::Settings => "Settings",
             Self::Git => "Git",
+            Self::Channel => "Channel",
         }
     }
 }
@@ -300,6 +302,55 @@ pub fn all_commands() -> Vec<Command> {
             shortcut: Some("Ctrl+D"),
             group: CommandGroup::Git,
             requires_git: true,
+        },
+        // ── Channel ───────────────────────────────────────────
+        Command {
+            id: "channel.switch",
+            label: "channel: switch",
+            description: "Open the channel switcher",
+            shortcut: Some("Ctrl+Shift+K"),
+            group: CommandGroup::Channel,
+            requires_git: false,
+        },
+        Command {
+            id: "channel.clear",
+            label: "channel: clear",
+            description: "Deselect the active channel (run base pipeline)",
+            shortcut: None,
+            group: CommandGroup::Channel,
+            requires_git: false,
+        },
+        Command {
+            id: "channel.health_check",
+            label: "channel: health check",
+            description: "Run health check for all channel overrides",
+            shortcut: None,
+            group: CommandGroup::Channel,
+            requires_git: false,
+        },
+        Command {
+            id: "channel.stale_report",
+            label: "channel: stale report",
+            description: "Show stale override report across workspace",
+            shortcut: None,
+            group: CommandGroup::Channel,
+            requires_git: false,
+        },
+        Command {
+            id: "channel.new_channel",
+            label: "channel: new channel",
+            description: "Create a new channel directory with template channel.yaml",
+            shortcut: None,
+            group: CommandGroup::Channel,
+            requires_git: false,
+        },
+        Command {
+            id: "channel.new_group",
+            label: "channel: new group",
+            description: "Create a new channel group directory",
+            shortcut: None,
+            group: CommandGroup::Channel,
+            requires_git: false,
         },
     ]
 }

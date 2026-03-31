@@ -5,6 +5,7 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 
 mod app;
 mod autodoc;
+mod channel_resolve;
 mod components;
 mod composition_index;
 mod composition_ops;
