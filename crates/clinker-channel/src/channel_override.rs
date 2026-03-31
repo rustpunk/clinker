@@ -406,6 +406,63 @@ pub fn resolve_channel(
 // Delta application helpers
 // ---------------------------------------------------------------------------
 
+/// Primary public entrypoint. Loads group overrides (in inherits order),
+/// then channel-specific override. Each step calls `resolve_channel()`.
+///
+/// `pipeline_path` is needed to derive `.channel.yaml` filenames via `path_for()`.
+pub fn resolve_channel_with_inheritance(
+    mut config: PipelineConfig,
+    channel_id: &str,
+    pipeline_path: &Path,
+    workspace: &WorkspaceRoot,
+    channel_vars: &[(&str, &str)],
+    provenance: &mut ProvenanceMap,
+) -> Result<PipelineConfig, ChannelError> {
+    let manifest =
+        crate::manifest::ChannelManifest::load(&workspace.channel_dir(channel_id))?;
+
+    // Apply group overrides in order
+    let group_ids = match &manifest.metadata.inherits {
+        crate::manifest::ChannelInherits::None => vec![],
+        crate::manifest::ChannelInherits::Single(id) => vec![id.as_str()],
+        crate::manifest::ChannelInherits::Multiple(ids) => {
+            ids.iter().map(|s| s.as_str()).collect()
+        }
+    };
+
+    for group_id in &group_ids {
+        let group_dir = workspace.group_dir(group_id);
+        if !group_dir.exists() {
+            return Err(ChannelError::GroupNotFound {
+                id: group_id.to_string(),
+            });
+        }
+
+        // Load group's .channel.yaml for this pipeline (may not exist → skip)
+        let override_path = ChannelOverride::path_for(pipeline_path, &group_dir);
+        if let Some(co) = ChannelOverride::load(&override_path, channel_vars)? {
+            if co.when_passes() {
+                config = resolve_channel(config, &co, workspace, channel_vars, provenance)?;
+            }
+        }
+    }
+
+    // Apply channel-specific override (always wins over groups)
+    let channel_dir = workspace.channel_dir(channel_id);
+    let override_path = ChannelOverride::path_for(pipeline_path, &channel_dir);
+    if let Some(co) = ChannelOverride::load(&override_path, channel_vars)? {
+        if co.when_passes() {
+            config = resolve_channel(config, &co, workspace, channel_vars, provenance)?;
+        }
+    }
+
+    Ok(config)
+}
+
+// ---------------------------------------------------------------------------
+// Delta application helpers
+// ---------------------------------------------------------------------------
+
 fn apply_input_delta(input: &mut InputConfig, delta: &InputOverrideDelta) {
     if let Some(ref path) = delta.path {
         input.path = path.clone();
@@ -1173,5 +1230,322 @@ transformations:
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         assert_eq!(result.inputs[0].path, "/data/acme/customers.csv");
+    }
+
+    // ---- Group inheritance tests ----
+
+    /// Helper: set up a workspace with channel + group directories and a base pipeline.
+    fn setup_inheritance_workspace() -> (tempfile::TempDir, WorkspaceRoot, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::write(ws.join("clinker.toml"), "[workspace]\n").unwrap();
+
+        // Create channel dir with channel.yaml
+        let channel_dir = ws.join("channels/acme");
+        std::fs::create_dir_all(&channel_dir).unwrap();
+
+        // Create groups dir
+        std::fs::create_dir_all(ws.join("_groups")).unwrap();
+
+        // Create a pipeline file
+        let pipeline = ws.join("pipelines/etl.yaml");
+        std::fs::create_dir_all(ws.join("pipelines")).unwrap();
+        std::fs::write(&pipeline, "").unwrap();
+
+        let workspace = WorkspaceRoot::at(ws).unwrap();
+        (tmp, workspace, pipeline)
+    }
+
+    #[test]
+    fn test_group_single_applies_before_channel() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        // Channel inherits from enterprise-base
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: enterprise-base\n",
+        )
+        .unwrap();
+
+        // Group override: changes filter_active CXL
+        let group_dir = ws.join("_groups/enterprise-base");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("etl.channel.yaml"),
+            r#"
+_channel:
+  pipeline: etl.yaml
+transformations:
+  filter_active:
+    cxl: "emit group_applied = true"
+"#,
+        )
+        .unwrap();
+
+        // Channel override: changes normalize_names CXL
+        std::fs::write(
+            ws.join("channels/acme/etl.channel.yaml"),
+            r#"
+_channel:
+  pipeline: etl.yaml
+transformations:
+  normalize_names:
+    cxl: "emit channel_applied = true"
+"#,
+        )
+        .unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        // Group changed filter_active
+        assert!(result.transformations[0].cxl.contains("group_applied"));
+        // Channel changed normalize_names
+        assert!(result.transformations[1].cxl.contains("channel_applied"));
+    }
+
+    #[test]
+    fn test_group_multiple_order() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        // Channel inherits from [group-a, group-b]
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: [group-a, group-b]\n",
+        )
+        .unwrap();
+
+        // Group A: changes filter_active
+        let group_a = ws.join("_groups/group-a");
+        std::fs::create_dir_all(&group_a).unwrap();
+        std::fs::write(
+            group_a.join("etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\ntransformations:\n  filter_active:\n    cxl: \"emit from_group_a = true\"\n",
+        )
+        .unwrap();
+
+        // Group B: also changes filter_active (should win over A)
+        let group_b = ws.join("_groups/group-b");
+        std::fs::create_dir_all(&group_b).unwrap();
+        std::fs::write(
+            group_b.join("etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\ntransformations:\n  filter_active:\n    cxl: \"emit from_group_b = true\"\n",
+        )
+        .unwrap();
+
+        // No channel-specific override
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        // Group B (later) wins over Group A on same transform
+        assert!(result.transformations[0].cxl.contains("from_group_b"));
+    }
+
+    #[test]
+    fn test_group_channel_wins() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: enterprise-base\n",
+        )
+        .unwrap();
+
+        // Group override: changes filter_active
+        let group_dir = ws.join("_groups/enterprise-base");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\ntransformations:\n  filter_active:\n    cxl: \"emit from_group = true\"\n",
+        )
+        .unwrap();
+
+        // Channel override: also changes filter_active (should win)
+        std::fs::write(
+            ws.join("channels/acme/etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\ntransformations:\n  filter_active:\n    cxl: \"emit from_channel = true\"\n",
+        )
+        .unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        // Channel wins over group
+        assert!(result.transformations[0].cxl.contains("from_channel"));
+    }
+
+    #[test]
+    fn test_group_no_override_for_pipeline() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: enterprise-base\n",
+        )
+        .unwrap();
+
+        // Group dir exists but has NO etl.channel.yaml → skip
+        let group_dir = ws.join("_groups/enterprise-base");
+        std::fs::create_dir_all(&group_dir).unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        // Base config unchanged
+        assert!(result.transformations[0].cxl.contains("status != \"active\""));
+    }
+
+    #[test]
+    fn test_group_not_found() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: nonexistent\n",
+        )
+        .unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        );
+
+        assert!(matches!(result, Err(ChannelError::GroupNotFound { .. })));
+    }
+
+    #[test]
+    fn test_group_when_condition_skips() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: enterprise-base\n",
+        )
+        .unwrap();
+
+        // Group override with when: condition that is false
+        let group_dir = ws.join("_groups/enterprise-base");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\n  when: \"dev == prod\"\ntransformations:\n  filter_active:\n    cxl: \"emit should_not_apply = true\"\n",
+        )
+        .unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        // Group override skipped — base unchanged
+        assert!(!result.transformations[0].cxl.contains("should_not_apply"));
+    }
+
+    #[test]
+    fn test_group_remove_composition_propagates() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        // Create composition file
+        let comp_dir = tmp.path().join("compositions");
+        std::fs::create_dir_all(&comp_dir).unwrap();
+        let comp_path = comp_dir.join("legacy.comp.yaml");
+        std::fs::write(
+            &comp_path,
+            "_composition:\n  name: legacy\ntransformations:\n  - name: legacy_step\n    cxl: \"emit x = 1\"\n",
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(&comp_path).unwrap();
+
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n  inherits: enterprise-base\n",
+        )
+        .unwrap();
+
+        // Group removes the composition
+        let group_dir = ws.join("_groups/enterprise-base");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join("etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\nremove_compositions:\n  - ref: compositions/legacy.comp.yaml\n",
+        )
+        .unwrap();
+
+        // Pre-populate config and provenance with composition transforms
+        let mut config = base_config();
+        config.transformations.push(TransformConfig {
+            name: "legacy_step".into(),
+            description: None,
+            cxl: "emit x = 1".into(),
+            local_window: None,
+            log: None,
+            validations: None,
+        });
+        let mut provenance = ProvenanceMap::new();
+        provenance.insert("legacy_step".into(), canonical);
+
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        // Group removed the composition's transforms — channel sees them gone
+        assert!(!result.transformations.iter().any(|t| t.name == "legacy_step"));
+        assert!(!provenance.contains_key("legacy_step"));
+    }
+
+    #[test]
+    fn test_no_inheritance() {
+        let (tmp, workspace, pipeline) = setup_inheritance_workspace();
+        let ws = tmp.path();
+
+        // Channel with no inherits
+        std::fs::write(
+            ws.join("channels/acme/channel.yaml"),
+            "_channel:\n  id: acme\n  name: Acme\n",
+        )
+        .unwrap();
+
+        // Channel-specific override
+        std::fs::write(
+            ws.join("channels/acme/etl.channel.yaml"),
+            "_channel:\n  pipeline: etl.yaml\ntransformations:\n  filter_active:\n    cxl: \"emit channel_only = true\"\n",
+        )
+        .unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let config = base_config();
+        let result = resolve_channel_with_inheritance(
+            config, "acme", &pipeline, &workspace, &[], &mut provenance,
+        )
+        .unwrap();
+
+        assert!(result.transformations[0].cxl.contains("channel_only"));
     }
 }
