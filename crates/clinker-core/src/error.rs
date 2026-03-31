@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum PipelineError {
     Config(crate::config::ConfigError),
+    Schema(crate::schema::SchemaError),
     Format(clinker_format::FormatError),
     Eval(cxl::eval::EvalError),
     Compilation { transform_name: String, messages: Vec<String> },
@@ -15,6 +16,7 @@ impl fmt::Display for PipelineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(e) => write!(f, "config error: {e}"),
+            Self::Schema(e) => write!(f, "schema error: {e}"),
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Eval(e) => write!(f, "evaluation error: {e}"),
             Self::Compilation { transform_name, messages } => {
@@ -47,6 +49,12 @@ impl From<clinker_format::FormatError> for PipelineError {
 impl From<cxl::eval::EvalError> for PipelineError {
     fn from(e: cxl::eval::EvalError) -> Self {
         Self::Eval(e)
+    }
+}
+
+impl From<crate::schema::SchemaError> for PipelineError {
+    fn from(e: crate::schema::SchemaError) -> Self {
+        Self::Schema(e)
     }
 }
 

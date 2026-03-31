@@ -1,6 +1,8 @@
+use clinker_record::schema_def::SchemaDefinition;
 use indexmap::IndexMap;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
@@ -61,7 +63,7 @@ pub struct ConcurrencyConfig {
 pub struct InputConfig {
     pub name: String,
     pub path: String,
-    pub schema: Option<String>,
+    pub schema: Option<SchemaSource>,
     pub schema_overrides: Option<Vec<SchemaOverride>>,
     pub array_paths: Option<Vec<ArrayPathConfig>>,
     pub sort_order: Option<Vec<SortFieldSpec>>,
@@ -243,13 +245,46 @@ pub enum SortOrder {
 /// Shorthand: `"field_name"` expands to `SortField { field: "field_name", order: Asc, null_order: None }`.
 /// Full: `{ field: "name", order: desc, null_order: first }` deserializes as SortField.
 ///
-/// This is a serde-only type. Resolve to `Vec<SortField>` via `into_sort_field()`
-/// at config load time. All downstream code uses `Vec<SortField>`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+/// Custom Deserialize: visit_str -> Short, visit_map -> Full.
+/// This gives specific error messages instead of serde(untagged)'s generic "no variant matched".
+#[derive(Debug, Clone, Serialize)]
 pub enum SortFieldSpec {
     Short(String),
     Full(SortField),
+}
+
+impl<'de> Deserialize<'de> for SortFieldSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SortFieldSpecVisitor;
+
+        impl<'de> Visitor<'de> for SortFieldSpecVisitor {
+            type Value = SortFieldSpec;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a field name (string) or a sort field object (map with 'field', 'order', 'null_order')")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SortFieldSpec::Short(v.to_owned()))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let sf = SortField::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(SortFieldSpec::Full(sf))
+            }
+        }
+
+        deserializer.deserialize_any(SortFieldSpecVisitor)
+    }
 }
 
 impl SortFieldSpec {
@@ -297,6 +332,48 @@ pub enum FormatKind {
     Xml,
     #[serde(rename = "fixed_width")]
     FixedWidth,
+}
+
+/// Schema source -- file path or inline definition.
+/// Custom Deserialize: YAML string -> FilePath, YAML map -> Inline(SchemaDefinition).
+#[derive(Debug, Clone, Serialize)]
+pub enum SchemaSource {
+    FilePath(String),
+    Inline(SchemaDefinition),
+}
+
+impl<'de> Deserialize<'de> for SchemaSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SchemaSourceVisitor;
+
+        impl<'de> Visitor<'de> for SchemaSourceVisitor {
+            type Value = SchemaSource;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a schema file path (string) or an inline schema definition (map)")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SchemaSource::FilePath(v.to_owned()))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let def = SchemaDefinition::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(SchemaSource::Inline(def))
+            }
+        }
+
+        deserializer.deserialize_any(SchemaSourceVisitor)
+    }
 }
 
 /// Per-transform configuration block.

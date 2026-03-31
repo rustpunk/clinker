@@ -26,7 +26,7 @@ mod tests {
             Ok((counters, _, _)) => {
                 if counters.dlq_count > 0 { 2 } else { 0 }
             }
-            Err(PipelineError::Config(_) | PipelineError::Compilation { .. }) => 1,
+            Err(PipelineError::Config(_) | PipelineError::Schema(_) | PipelineError::Compilation { .. }) => 1,
             Err(PipelineError::Eval(_)) => 3,
             Err(PipelineError::Io(_) | PipelineError::Format(_) | PipelineError::ThreadPool(_)) => 4,
         }

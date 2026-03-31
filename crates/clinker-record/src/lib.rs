@@ -6,6 +6,7 @@ pub mod record;
 pub mod record_view;
 pub mod resolver;
 pub mod schema;
+pub mod schema_def;
 pub mod storage;
 pub mod value;
 

@@ -146,7 +146,7 @@ fn main() -> ExitCode {
                 Err(e) => {
                     tracing::error!("{e}");
                     match &e {
-                        PipelineError::Config(_) | PipelineError::Compilation { .. } => ExitCode::from(1),
+                        PipelineError::Config(_) | PipelineError::Schema(_) | PipelineError::Compilation { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
                         PipelineError::Eval(_) => ExitCode::from(3),
                         PipelineError::Format(_) | PipelineError::ThreadPool(_) => ExitCode::from(4),
