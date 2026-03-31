@@ -112,6 +112,7 @@ impl InputFormat {
             InputFormat::Csv(_) => "csv",
             InputFormat::Json(_) => "json",
             InputFormat::Xml(_) => "xml",
+            InputFormat::FixedWidth(_) => "fixed_width",
         }
     }
 
@@ -131,6 +132,7 @@ impl OutputFormat {
             OutputFormat::Csv(_) => "csv",
             OutputFormat::Json(_) => "json",
             OutputFormat::Xml(_) => "xml",
+            OutputFormat::FixedWidth(_) => "fixed_width",
         }
     }
 }

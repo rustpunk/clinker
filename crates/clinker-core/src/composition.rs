@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     ConfigError, ErrorHandlingConfig, InputConfig, OutputConfig, PipelineConfig, PipelineMeta,
-    TransformConfig,
+    TransformConfig, TransformEntry,
 };
 
 // ── Composition file types (.comp.yaml) ─────────────────────────────────
@@ -226,14 +226,14 @@ impl fmt::Display for CompositionError {
 ///
 /// Environment variable interpolation is applied before deserialization.
 pub fn parse_raw_config(yaml: &str) -> Result<RawPipelineConfig, ConfigError> {
-    let interpolated = crate::config::interpolate_env_vars(yaml)?;
+    let interpolated = crate::config::interpolate_env_vars(yaml, &[])?;
     let config: RawPipelineConfig = serde_saphyr::from_str(&interpolated)?;
     Ok(config)
 }
 
 /// Parse a `.comp.yaml` file from a YAML string.
 pub fn parse_composition(yaml: &str) -> Result<CompositionConfig, ConfigError> {
-    let interpolated = crate::config::interpolate_env_vars(yaml)?;
+    let interpolated = crate::config::interpolate_env_vars(yaml, &[])?;
     let config: CompositionConfig = serde_saphyr::from_str(&interpolated)?;
     Ok(config)
 }
@@ -295,7 +295,7 @@ fn resolve_imports_inner(
         pipeline: raw.pipeline.clone(),
         inputs: raw.inputs.clone(),
         outputs: raw.outputs.clone(),
-        transformations: resolved_transforms,
+        transformations: resolved_transforms.into_iter().map(TransformEntry::Transform).collect(),
         error_handling: raw.error_handling.clone(),
         notes: raw.notes.clone(),
     };

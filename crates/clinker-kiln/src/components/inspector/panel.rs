@@ -29,7 +29,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
 
     // Determine stage kind and extract data
     let input = config.inputs.iter().find(|i| i.name == stage_id);
-    let transform = config.transformations.iter().find(|t| t.name == stage_id);
+    let transform = config.transforms().find(|t| t.name == stage_id);
     let output = config.outputs.iter().find(|o| o.name == stage_id);
 
     let (kind_label, accent, subtitle) = if input.is_some() {

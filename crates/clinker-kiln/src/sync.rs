@@ -25,7 +25,7 @@ use clinker_core::composition::{
     parse_raw_config, resolve_imports, CompositionError, CompositionOrigin, RawPipelineConfig,
     RawTransformEntry, ResolvedComposition,
 };
-use clinker_core::config::{parse_config, PipelineConfig};
+use clinker_core::config::{parse_config, PipelineConfig, TransformEntry};
 
 /// Tracks which view most recently edited the pipeline model.
 /// Used to break the YAML ↔ model sync loop.
@@ -113,11 +113,11 @@ pub struct ResolvedPipeline {
 ///
 /// Used when no workspace root is available. Import directives are skipped.
 fn raw_to_resolved_no_imports(raw: &RawPipelineConfig) -> Result<PipelineConfig, Vec<String>> {
-    let transforms = raw
+    let transforms: Vec<TransformEntry> = raw
         .transformations
         .iter()
         .filter_map(|entry| match entry {
-            RawTransformEntry::Inline(t) => Some(t.clone()),
+            RawTransformEntry::Inline(t) => Some(TransformEntry::Transform(t.clone())),
             RawTransformEntry::Import(_) => None,
         })
         .collect();
@@ -255,7 +255,7 @@ pub fn validate_composition_contracts(
 
     // Walk resolved transforms in order, validating contracts at composition boundaries
     let mut comp_idx = 0;
-    for transform in &resolved.resolved.transformations {
+    for transform in resolved.resolved.transforms() {
         // Check if this transform is the first in a composition
         if comp_idx < resolved.compositions.len() {
             let comp = &resolved.compositions[comp_idx];
@@ -322,7 +322,7 @@ pub fn compute_yaml_ranges(
     for input in &config.inputs {
         stage_names.push(input.name.clone());
     }
-    for transform in &config.transformations {
+    for transform in config.transforms() {
         stage_names.push(transform.name.clone());
     }
     for output in &config.outputs {

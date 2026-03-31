@@ -69,7 +69,7 @@ pub fn DrawerDocs(stage_id: String) -> Element {
     // Get the stage note from _notes (if any)
     let notes_value = config
         .inputs.iter().find(|i| i.name == stage_id).and_then(|i| i.notes.as_ref())
-        .or_else(|| config.transformations.iter().find(|t| t.name == stage_id).and_then(|t| t.notes.as_ref()))
+        .or_else(|| config.transforms().find(|t| t.name == stage_id).and_then(|t| t.notes.as_ref()))
         .or_else(|| config.outputs.iter().find(|o| o.name == stage_id).and_then(|o| o.notes.as_ref()));
     let notes = parse_notes(notes_value);
 

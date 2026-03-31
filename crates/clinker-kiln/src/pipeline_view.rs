@@ -180,8 +180,8 @@ pub fn derive_pipeline_view(
 
     let transforms: Vec<_> = config.transforms().collect();
     let mut transform_idx = 0;
-    while transform_idx < config.transformations.len() {
-        let transform = &config.transformations[transform_idx];
+    while transform_idx < transforms.len() {
+        let transform = transforms[transform_idx];
 
         if let Some((comp, origin_idx)) = find_composition(transform, compositions) {
             if expanded.contains(&comp.path) {
@@ -189,7 +189,7 @@ pub fn derive_pipeline_view(
                 let group_start_x = x;
 
                 for i in 0..comp.transform_names.len() {
-                    let t = &config.transformations[transform_idx + i];
+                    let t = transforms[transform_idx + i];
                     let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
                     let subtitle = cxl_subtitle(&t.cxl);
                     let origin = comp.origins.get(origin_idx + i).cloned();
@@ -271,6 +271,7 @@ pub fn derive_pipeline_view(
                 canvas_y: y,
                 cxl_source: Some(transform.cxl.clone()),
                 description: transform.description.clone(),
+
                 from_composition: None,
                 error_message: None,
             });

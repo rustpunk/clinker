@@ -484,7 +484,7 @@ pub fn structural_search(
         }
 
         // Check transformations
-        for transform in &config.transformations {
+        for transform in config.transforms() {
             if stage_matches_tags(tags, "transform", &transform.name, &transform.cxl) {
                 let detail = transform
                     .description
@@ -545,7 +545,7 @@ fn stage_matches_tags(tags: &[StructuralTag], stage_type: &str, name: &str, cont
 fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
     let mut content = format!("{} {} {}", input.name, input.format.format_name(), input.path);
     if let Some(ref schema) = input.schema {
-        content.push_str(&format!(" schema:{schema}"));
+        content.push_str(&format!(" schema:{schema:?}"));
     }
     content
 }

@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::model::{FieldType, SchemaIndex, SourceSchema};
-use clinker_core::config::{InputConfig, InputFormat, PipelineConfig, TransformConfig};
+use clinker_core::config::{InputConfig, InputFormat, PipelineConfig, SchemaSource, TransformConfig};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -65,7 +65,7 @@ pub fn validate_pipeline(
     }
 
     // Validate transformations against accumulated fields
-    for transform in &config.transformations {
+    for transform in config.transforms() {
         validate_transform(transform, &available_fields, &mut warnings);
         // Add emitted fields to available set
         for emitted in extract_emit_fields(&transform.cxl) {
@@ -83,11 +83,16 @@ fn validate_input(
     workspace_root: &Path,
     warnings: &mut Vec<SchemaWarning>,
 ) {
-    let Some(schema_ref) = &input.schema else {
+    let Some(schema_source) = &input.schema else {
         return; // No schema linked — no validation
     };
 
-    let schema_path = workspace_root.join(schema_ref);
+    let schema_file = match schema_source {
+        SchemaSource::FilePath(path) => path.as_str(),
+        SchemaSource::Inline(_) => return, // Inline schemas validated separately
+    };
+
+    let schema_path = workspace_root.join(schema_file);
     let canonical = schema_path.canonicalize().unwrap_or(schema_path.clone());
 
     // Check if schema file exists in index
@@ -98,7 +103,7 @@ fn validate_input(
     let Some(schema) = schema else {
         warnings.push(SchemaWarning {
             stage_name: input.name.clone(),
-            message: format!("Schema file not found: {schema_ref}"),
+            message: format!("Schema file not found: {schema_file}"),
             suggestion: None,
             kind: WarningKind::SchemaMissing,
         });
@@ -116,6 +121,7 @@ fn validate_input(
             crate::model::SourceFormat::Json | crate::model::SourceFormat::Jsonl
         ),
         InputFormat::Xml(_) => schema.metadata.format == crate::model::SourceFormat::Xml,
+        InputFormat::FixedWidth(_) => false, // No schema format match for fixed-width yet
     };
 
     if !format_matches {
@@ -164,8 +170,12 @@ fn resolve_input_schema<'a>(
     index: &'a SchemaIndex,
     workspace_root: &Path,
 ) -> Option<&'a SourceSchema> {
-    let schema_ref = input.schema.as_ref()?;
-    let schema_path = workspace_root.join(schema_ref);
+    let schema_source = input.schema.as_ref()?;
+    let schema_file = match schema_source {
+        SchemaSource::FilePath(path) => path.as_str(),
+        SchemaSource::Inline(_) => return None,
+    };
+    let schema_path = workspace_root.join(schema_file);
     let canonical = schema_path.canonicalize().unwrap_or(schema_path);
 
     index.schemas.values().find(|s| {

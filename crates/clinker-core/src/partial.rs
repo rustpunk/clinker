@@ -46,7 +46,7 @@ pub struct PartialPipelineConfig {
 /// fail to deserialize). Returns `Err` only when the YAML itself is broken
 /// (bad indentation, unclosed quotes, etc.).
 pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String> {
-    let interpolated = interpolate_env_vars(yaml).map_err(|e| e.to_string())?;
+    let interpolated = interpolate_env_vars(yaml, &[]).map_err(|e| e.to_string())?;
 
     let tree: serde_json::Value =
         serde_saphyr::from_str(&interpolated).map_err(|e| format!("YAML syntax error: {e}"))?;
