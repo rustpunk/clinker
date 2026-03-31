@@ -829,8 +829,17 @@ input:-webkit-autofill:focus {
   transition: flex 300ms ease-out;
 }
 
-/* ── Canvas panel widths per pipeline layout mode ── */
-.kiln-main[data-layout="hybrid"] .kiln-canvas-panel {
+/* ── Canvas column wrapper: breadcrumb + canvas stacked vertically ── */
+.kiln-canvas-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ── Canvas / sidebar widths per pipeline layout mode ── */
+.kiln-main[data-layout="hybrid"] .kiln-canvas-column {
   flex: 1;
   min-width: 0;
 }
@@ -840,7 +849,7 @@ input:-webkit-autofill:focus {
   display: flex;
 }
 
-.kiln-main[data-layout="canvas"] .kiln-canvas-panel {
+.kiln-main[data-layout="canvas"] .kiln-canvas-column {
   flex: 1;
   min-width: 0;
 }
@@ -849,7 +858,7 @@ input:-webkit-autofill:focus {
   display: none;
 }
 
-.kiln-main[data-layout="editor"] .kiln-canvas-panel {
+.kiln-main[data-layout="editor"] .kiln-canvas-column {
   display: none;
 }
 
@@ -864,7 +873,7 @@ input:-webkit-autofill:focus {
 .kiln-main[data-layout="editor"] .kiln-inspector { display: none; }
 
 /* Schematics layout: pipeline autodoc takes full width, hide everything else */
-.kiln-main[data-layout="schematics"] .kiln-canvas-panel { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-canvas-column { display: none; }
 .kiln-main[data-layout="schematics"] .kiln-yaml-sidebar { display: none; }
 .kiln-main[data-layout="schematics"] .kiln-inspector { display: none; }
 .kiln-main[data-layout="schematics"] .kiln-left-panel { display: none; }
@@ -3337,6 +3346,8 @@ input:-webkit-autofill:focus {
    Visual layers: dot grid → noise → scanlines → SVG connectors → nodes.
    ─────────────────────────────────────────────────────────────────────── */
 .kiln-canvas-panel {
+  flex: 1;
+  min-width: 0;
   position: relative;
   overflow: hidden;
   background-color: var(--kiln-char);
@@ -3873,6 +3884,14 @@ input:-webkit-autofill:focus {
 [data-token="value"]   { color: var(--kiln-phosphor); }
 [data-token="punct"]   { color: var(--kiln-iron); }
 [data-token="indent"]  { /* whitespace — no colour */ }
+
+/* CXL syntax colours — highlights CXL expressions within YAML */
+[data-token="cxl-keyword"] { color: var(--kiln-verdigris); font-weight: 600; }
+[data-token="cxl-op"]      { color: var(--kiln-iron); }
+[data-token="cxl-string"]  { color: var(--kiln-ember); }
+[data-token="cxl-ident"]   { color: var(--kiln-phosphor); }
+[data-token="cxl-literal"] { color: #B8956A; }
+[data-token="cxl-punct"]   { color: var(--kiln-iron); }
 
 /* ── 10. Run-log drawer ────────────────────────────────────────────────────
    Spec §7: bottom-anchored, pushes content up (not an overlay).
@@ -6631,4 +6650,140 @@ input:-webkit-autofill:focus {
 .kiln-channel-dropdown__desc {
   font-size: 10px;
   color: var(--kiln-text-floor);
+}
+
+/* ── Override Diff ────────────────────────────────────────────────────────
+   Inspector panel: shows base vs channel CXL when a stage has overrides.
+   ─────────────────────────────────────────────────────────────────────── */
+
+.kiln-override-diff {
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  margin: 8px 0;
+  background: var(--kiln-bg-recessed);
+  overflow: hidden;
+}
+
+.kiln-override-diff__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-bg-raised);
+}
+
+.kiln-override-diff__kind {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kiln-override-diff--modified .kiln-override-diff__kind {
+  color: var(--kiln-verdigris);
+}
+.kiln-override-diff--added .kiln-override-diff__kind {
+  color: var(--kiln-phosphor);
+}
+.kiln-override-diff--removed .kiln-override-diff__kind {
+  color: var(--kiln-ember);
+}
+
+.kiln-override-diff__source {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  letter-spacing: 0.04em;
+}
+
+/* Unified diff body */
+.kiln-override-diff__unified {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-x: auto;
+}
+
+/* Individual diff line: gutter + content */
+.kiln-diff-line {
+  display: flex;
+  min-height: 1.6em;
+}
+
+.kiln-diff-gutter {
+  flex: 0 0 20px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  user-select: none;
+  line-height: 1.6;
+}
+
+.kiln-diff-content {
+  flex: 1;
+  min-width: 0;
+  padding: 0 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Context lines — no decoration */
+.kiln-diff-line--context {
+  border-left: 3px solid transparent;
+}
+.kiln-diff-line--context .kiln-diff-gutter {
+  color: transparent;
+}
+
+/* Removed lines — ember left border */
+.kiln-diff-line--removed {
+  border-left: 3px solid var(--kiln-ember);
+  background: rgba(199, 91, 42, 0.08);
+}
+.kiln-diff-line--removed .kiln-diff-gutter {
+  color: var(--kiln-ember);
+}
+
+/* Added lines — ok-green left border */
+.kiln-diff-line--added {
+  border-left: 3px solid var(--kiln-ok-green);
+  background: rgba(122, 182, 72, 0.08);
+}
+.kiln-diff-line--added .kiln-diff-gutter {
+  color: var(--kiln-ok-green);
+}
+
+/* Word-level inline highlights for changed tokens */
+.kiln-diff-highlight--removed {
+  background: rgba(199, 91, 42, 0.25);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.kiln-diff-highlight--added {
+  background: rgba(122, 182, 72, 0.25);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.kiln-override-diff__file {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-override-diff__file-label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-override-diff__file-path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
 }

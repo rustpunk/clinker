@@ -92,6 +92,16 @@ pub fn CanvasPanel() -> Element {
     let mut pan_y = use_signal(|| 0.0_f32);
     let mut zoom = use_signal(|| 1.0_f32);
 
+    // Reset pan/zoom when entering or leaving drill-in so the content is centered.
+    let drill_depth = drill_stack.len();
+    let mut prev_drill_depth = use_signal(|| 0_usize);
+    if drill_depth != *prev_drill_depth.peek() {
+        prev_drill_depth.set(drill_depth);
+        pan_x.set(0.0);
+        pan_y.set(0.0);
+        zoom.set(1.0);
+    }
+
     // ── Non-reactive drag state — hot path, no re-renders during drag ─────────
     let drag = use_hook(|| Rc::new(RefCell::new(DragState::default())));
 
@@ -181,15 +191,18 @@ pub fn CanvasPanel() -> Element {
     let svg_h = 400.0_f32;
 
     rsx! {
-        // Breadcrumb bar + scope indicator (visible during drill-in)
-        if is_drilled {
-            BreadcrumbBar {
-                drill_stack: drill_stack.clone(),
-            }
-        }
-
         div {
-            class: "kiln-canvas-panel",
+            class: "kiln-canvas-column",
+
+            // Breadcrumb bar + scope indicator (visible during drill-in)
+            if is_drilled {
+                BreadcrumbBar {
+                    drill_stack: drill_stack.clone(),
+                }
+            }
+
+            div {
+                class: "kiln-canvas-panel",
             // Events on the outer panel — pointer capture would be added in Phase 3.
             onmousedown: drag_down,
             onmousemove: drag_move,
@@ -239,6 +252,7 @@ pub fn CanvasPanel() -> Element {
                     }
                 }
             }
+        }
         }
     }
 }
