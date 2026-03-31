@@ -27,3 +27,6 @@ dioxus-nox-cmdk = "0.13"
 dioxus-nox-select = "0.13"
 regex.workspace = true
 notify.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
