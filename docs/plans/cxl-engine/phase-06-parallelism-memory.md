@@ -455,7 +455,7 @@ Size) measurement and a `MemoryBudget` struct that governs spill decisions.
 <!-- 1-3 hours each. Split again if still too large. -->
 - [x] **6.3.0** (Prep) Add `libc` and `num_cpus` to `clinker-core/Cargo.toml` as direct dependencies.
 - [x] **6.3.1** Implement `fn rss_bytes() -> Option<u64>` with `#[cfg(target_os)]` platform dispatch. Linux uses `/proc/self/statm` + `libc::sysconf(libc::_SC_PAGESIZE)`. macOS uses `mach2::mach_task_basic_info`. Windows uses `windows-sys K32GetProcessMemoryInfo`. Unsupported returns `None`.
-- [x] **6.3.1a** (Errata 2026-03-31) macOS and Windows stubs replaced with real implementations. `mach2` 0.6 and `windows-sys` 0.61 added as platform-gated deps in `clinker-core/Cargo.toml`.
+- [x] **6.3.1a** (Errata 2026-03-31) macOS and Windows stubs replaced with real implementations. `mach2` 0.6 and `windows-sys` 0.61 added as platform-gated deps in `clinker-core/Cargo.toml`. Commit: `fda0640`.
 
 > 🟡 **[V-4-1] Accepted:** `libc` and `num_cpus` not yet in Cargo.toml. Added prep
 > sub-task 6.3.0.
