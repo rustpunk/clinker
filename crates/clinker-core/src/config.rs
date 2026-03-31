@@ -484,43 +484,70 @@ static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Pre-deserialize environment variable interpolation.
 ///
 /// Replaces `${VAR}` with `env::var("VAR")` and `${VAR:-default}` with
-/// the env value or the default. YAML-escapes substituted values by
-/// wrapping in single quotes if they contain YAML-special characters.
+/// the env value or the default. Bare text substitution — no YAML quoting
+/// applied (industry standard: dbt, Docker Compose, Helm, envsubst).
+///
+/// `extra_vars` are checked before `std::env::var` — highest priority among
+/// runtime vars. This allows channel variables to shadow system env vars.
+///
+/// `$${VAR}` produces literal `${VAR}` (escape, same as Docker Compose /
+/// Kubernetes convention). The `$$` is replaced with a NULL byte placeholder
+/// before the main regex, then restored after all substitution.
+///
 /// Missing var without default produces `ConfigError::EnvVar`.
-pub fn interpolate_env_vars(yaml: &str) -> Result<String, ConfigError> {
-    let mut result = String::with_capacity(yaml.len());
+pub fn interpolate_env_vars(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
+) -> Result<String, ConfigError> {
+    // Step 1: Replace $$ with NULL byte placeholder before main regex.
+    // NULL bytes do not appear in valid YAML config files.
+    debug_assert!(
+        !yaml.contains('\0'),
+        "input YAML contains NULL bytes — $$ escape placeholder collision"
+    );
+    let escaped = yaml.replace("$$", "\0");
+
+    // Step 2: Run regex substitution with extra_vars priority
+    let mut result = String::with_capacity(escaped.len());
     let mut last_end = 0;
 
-    for caps in ENV_VAR_RE.captures_iter(yaml) {
+    for caps in ENV_VAR_RE.captures_iter(&escaped) {
         let full_match = caps.get(0).unwrap();
         let var_name = caps.get(1).unwrap().as_str();
         let default_value = caps.get(2).map(|m| m.as_str());
 
-        result.push_str(&yaml[last_end..full_match.start()]);
+        result.push_str(&escaped[last_end..full_match.start()]);
 
-        match std::env::var(var_name) {
-            Ok(value) => result.push_str(&value),
-            Err(_) => match default_value {
-                Some(default) => result.push_str(default),
-                None => {
-                    return Err(ConfigError::EnvVar {
-                        var_name: var_name.to_string(),
-                        position: full_match.start(),
-                    });
-                }
-            },
+        // Check extra_vars first, then system env
+        if let Some(value) = extra_vars.iter().find(|(k, _)| *k == var_name).map(|(_, v)| *v) {
+            result.push_str(value);
+        } else {
+            match std::env::var(var_name) {
+                Ok(value) => result.push_str(&value),
+                Err(_) => match default_value {
+                    Some(default) => result.push_str(default),
+                    None => {
+                        return Err(ConfigError::EnvVar {
+                            var_name: var_name.to_string(),
+                            position: full_match.start(),
+                        });
+                    }
+                },
+            }
         }
 
         last_end = full_match.end();
     }
 
-    result.push_str(&yaml[last_end..]);
-    Ok(result)
+    result.push_str(&escaped[last_end..]);
+
+    // Step 3: Restore NULL byte placeholder → $
+    Ok(result.replace('\0', "$"))
 }
 
 /// Parse a pipeline config from a YAML string (after interpolation).
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
-    let interpolated = interpolate_env_vars(yaml)?;
+    let interpolated = interpolate_env_vars(yaml, &[])?;
     let config: PipelineConfig = serde_saphyr::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
@@ -544,10 +571,22 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Load and parse a pipeline config from a YAML file path with extra variables.
+/// `extra_vars` are checked before system env vars during interpolation.
+pub fn load_config_with_vars(
+    path: &std::path::Path,
+    extra_vars: &[(&str, &str)],
+) -> Result<PipelineConfig, ConfigError> {
+    let yaml = std::fs::read_to_string(path)?;
+    let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
+    let config: PipelineConfig = serde_saphyr::from_str(&interpolated)?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
 /// Load and parse a pipeline config from a YAML file path.
 pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError> {
-    let yaml = std::fs::read_to_string(path)?;
-    parse_config(&yaml)
+    load_config_with_vars(path, &[])
 }
 
 #[cfg(test)]
