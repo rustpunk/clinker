@@ -1,15 +1,74 @@
-# Phase 10: Modules, Logging, Validations, Polish
+# Phase 11: Modules, Logging, Validations, Polish
 
-**Status:** 🔲 Not Started
-**Depends on:** Phase 9 (schema system, all format readers complete)
-**Entry criteria:** Schema loading, overrides, fixed-width, and multi-record all passing Phase 9 tests; CXL evaluator supports function calls (Phase 3)
-**Exit criteria:** CXL modules loadable from `.cxl` files with qualified function calls; pipeline variables resolvable; 4-level logging system operational; declarative validations route failures to DLQ; security hardening passes; benchmark suite tracks records/sec + peak RSS; `cargo test --workspace` passes 80+ tests
+**Status:** 🔄 In Progress (Task 11.0 complete; Tasks 11.1–11.6 blocked on Phase 10)
+**Depends on:** Phase 10 (channel overrides + composition system)
+**Entry criteria:** Schema loading, overrides, fixed-width, and multi-record all passing Phase 9 tests; channel overrides and composition system passing Phase 10 tests; CXL evaluator supports function calls (Phase 3)
+**Exit criteria:** CXL modules loadable from `.cxl` files with qualified function calls; pipeline variables resolvable; 4-level logging system operational; declarative validations route failures to DLQ; security hardening passes; benchmark suite tracks records/sec + peak RSS; execution metrics spool operational; `cargo test --workspace` passes 80+ tests
 
 ---
 
 ## Tasks
 
-### Task 10.1: CXL Modules (.cxl Files)
+### Task 11.0: Execution Metrics Spool
+**Status:** ✅ Complete
+**Blocked by:** None (implemented ahead of Phase 10; no dependency on channel system)
+
+**Description:**
+Each pipeline execution atomically writes one JSON spool file to a configurable directory.
+A `clinker metrics collect` subcommand sweeps the spool and appends records to an NDJSON
+archive. Spool files are uniquely named by execution UUID v7, so 30–40 concurrent servers
+never contend on the same file.
+
+**Design:** Write-then-rename pattern (`<id>.json.tmp` → `<id>.json`). If the spool write
+fails (NFS unavailable, disk full), all metric fields are emitted via `tracing::warn!` so
+the scheduler's captured stderr preserves the data. No new crate dependencies.
+
+**Config precedence (highest → lowest):**
+1. `--metrics-spool-dir <path>` CLI flag
+2. `CLINKER_METRICS_SPOOL_DIR` environment variable
+3. `pipeline.metrics.spool_dir` in the YAML config
+4. Disabled (no spool file written)
+
+**YAML example:**
+```yaml
+pipeline:
+  name: daily_orders
+  metrics:
+    spool_dir: /var/spool/clinker
+```
+
+**Collect command:**
+```bash
+clinker metrics collect \
+  --spool-dir /var/spool/clinker \
+  --output-file /data/metrics/archive.ndjson \
+  --delete-after-collect
+```
+
+**Key files:**
+- `crates/clinker-core/src/metrics.rs` — `ExecutionMetrics`, `write_spool()`, `collect_spool()`, `append_ndjson()`, `resolve_spool_dir()`
+- `crates/clinker-core/src/executor.rs` — `ExecutionReport` struct (replaces `(PipelineCounters, Vec<DlqEntry>)` return tuple); captures timing + execution mode + peak RSS
+- `crates/clinker-core/src/pipeline/memory.rs` — `MemoryBudget::observe()` + `peak_rss` field
+- `crates/clinker-core/src/config.rs` — `MetricsConfig` struct + `pipeline.metrics` YAML key
+- `crates/clinker/src/main.rs` — `clinker run` / `clinker metrics collect` subcommand structure
+
+**Breaking change:** CLI restructured from `clinker pipeline.yaml` → `clinker run pipeline.yaml`.
+
+**Acceptance criteria:**
+- [x] Spool file written atomically (write-then-rename, no partial files visible to collector)
+- [x] `.tmp` files skipped by `collect_spool()`
+- [x] Config precedence: CLI > env var > YAML > disabled
+- [x] Spool write failure emits `tracing::warn!` with all metric fields inline (never silent loss)
+- [x] `clinker metrics collect` sweeps spool, appends NDJSON, optionally deletes spool files
+- [x] `--dry-run` on collect prints what would be collected without writing
+- [x] `peak_rss_bytes` tracked via `MemoryBudget::observe()` at chunk boundaries
+- [x] All 10 unit tests passing
+
+**Tests:** `cargo test metrics` — 10 tests in `clinker-core::metrics::tests` + 3 in `clinker::tests`
+
+---
+
+### Task 11.1: CXL Modules (.cxl Files)
 **Status:** 🔲 Not Started
 **Blocked by:** Phase 9 exit criteria
 
@@ -38,7 +97,7 @@ module-level `let` bindings (constants). Transforms reference modules via `use` 
 - [ ] Cross-file imports rejected with clear error
 - [ ] `--rules-path` CLI flag overrides `pipeline.rules_path`
 
-**Required unit tests (must pass before Task 10.2 unlocks):**
+**Required unit tests (must pass before Task 11.2 unlocks):**
 
 | Test name | What it verifies | Gate |
 |-----------|-----------------|------|
@@ -56,13 +115,13 @@ module-level `let` bindings (constants). Transforms reference modules via `use` 
 | `test_module_rules_path_cli_override` | `--rules-path /custom/` overrides default `./rules/` | ⛔ Hard gate |
 | `test_module_missing_file_error` | `use nonexistent;` produces error naming the expected file path | ⛔ Hard gate |
 
-> ⛔ **Hard gate:** Task 10.2 status remains `Blocked` until all tests above pass.
+> ⛔ **Hard gate:** Task 11.2 status remains `Blocked` until all tests above pass.
 
 ---
 
-### Task 10.2: Pipeline Variables + Metadata
-**Status:** ⛔ Blocked (waiting on Task 10.1)
-**Blocked by:** Task 10.1 — module registry must be working (variables share the Phase B resolver)
+### Task 11.2: Pipeline Variables + Metadata
+**Status:** ⛔ Blocked (waiting on Task 11.1)
+**Blocked by:** Task 11.1 — module registry must be working (variables share the Phase B resolver)
 
 **Description:**
 Implement `pipeline.vars` YAML section for user-defined typed constants and built-in
@@ -87,7 +146,7 @@ pipeline metadata fields accessible in CXL expressions.
 - [ ] `pipeline.name` and `pipeline.batch_id` accessible in CXL
 - [ ] Collision with built-in names produces config error
 
-**Required unit tests (must pass before Task 10.3 unlocks):**
+**Required unit tests (must pass before Task 11.3 unlocks):**
 
 | Test name | What it verifies | Gate |
 |-----------|-----------------|------|
@@ -103,13 +162,13 @@ pipeline metadata fields accessible in CXL expressions.
 | `test_pipeline_batch_id_default` | No `--batch-id` → `pipeline.batch_id` is generated UUID v7 | ⛔ Hard gate |
 | `test_vars_unknown_reference` | CXL `pipeline.nonexistent` → Phase B resolution error | ⛔ Hard gate |
 
-> ⛔ **Hard gate:** Task 10.3 status remains `Blocked` until all tests above pass.
+> ⛔ **Hard gate:** Task 11.3 status remains `Blocked` until all tests above pass.
 
 ---
 
-### Task 10.3: Logging System (4 Levels)
-**Status:** ⛔ Blocked (waiting on Task 10.2)
-**Blocked by:** Task 10.2 — pipeline variables must be working (log templates reference pipeline.* vars)
+### Task 11.3: Logging System (4 Levels)
+**Status:** ⛔ Blocked (waiting on Task 11.2)
+**Blocked by:** Task 11.2 — pipeline variables must be working (log templates reference pipeline.* vars)
 
 **Description:**
 Implement the 4-level logging system: YAML log directives, external log rules files,
@@ -119,7 +178,7 @@ env-filter in the CLI binary.
 **Implementation notes:**
 - **Level 1 — YAML log directives:** per-transform `log:` section with `level` (info/warn/error/debug/trace), `when` (CXL bool expression — optional, default always), `message` (template string with `{field_name}` interpolation), `condition` (alias for `when`), `fields` (list of field names to include as structured key-value pairs), `every` (sampling — log every Nth matching record).
 - **Level 2 — External log rules:** `pipeline.log_rules` config key referencing a YAML file. Each rule has same schema as Level 1. Transforms reference rules via `log_rule: rule_name`. Override merge: transform-level `log:` keys override matched rule keys.
-- **Level 3 — `.log(prefix)` passthrough:** `FieldName.log("debug_prefix")` in CXL returns the field value unchanged while emitting a `tracing::trace!` event with the prefix and value. Zero overhead when trace level disabled. NOT allowed inside `fn` bodies (validated at parse time, already covered by Task 10.1).
+- **Level 3 — `.log(prefix)` passthrough:** `FieldName.log("debug_prefix")` in CXL returns the field value unchanged while emitting a `tracing::trace!` event with the prefix and value. Zero overhead when trace level disabled. NOT allowed inside `fn` bodies (validated at parse time, already covered by Task 11.1).
 - **Level 4 — `trace` statement:** standalone statement in transform CXL: `trace "message {field}" when condition level warn`. `when` guard is optional (default: always). `level` override is optional (default: trace). `{field_name}` interpolation in message string. NOT allowed inside `fn` bodies.
 - Template variables available in log messages: provenance fields (`_source_file`, `_source_row`), pipeline counters (`_ok_count`, `_dlq_count`, `_total_count`), record fields, `_transform_name`, `_transform_duration_ms`.
 - `tracing-subscriber` setup: in `clinker/src/main.rs`, initialize with `EnvFilter` from `--log-level` flag. Format: compact, timestamps, target module.
@@ -134,7 +193,7 @@ env-filter in the CLI binary.
 - [ ] Template variables resolved in log messages
 - [ ] `tracing-subscriber` configured with env-filter from `--log-level`
 
-**Required unit tests (must pass before Task 10.4 unlocks):**
+**Required unit tests (must pass before Task 11.4 unlocks):**
 
 | Test name | What it verifies | Gate |
 |-----------|-----------------|------|
@@ -154,18 +213,24 @@ env-filter in the CLI binary.
 | `test_log_template_pipeline_counters` | `{_ok_count}` and `{_dlq_count}` resolve in log message template | ⛔ Hard gate |
 | `test_log_template_transform_meta` | `{_transform_name}` and `{_transform_duration_ms}` resolve in template | ⛔ Hard gate |
 
-> ⛔ **Hard gate:** Task 10.4 status remains `Blocked` until all tests above pass.
+> ⛔ **Hard gate:** Task 11.4 status remains `Blocked` until all tests above pass.
 
 ---
 
-### Task 10.4: Declarative Validations
-**Status:** ⛔ Blocked (waiting on Task 10.3)
-**Blocked by:** Task 10.3 — logging must be working (warn-severity validations log and continue)
+### Task 11.4: Declarative Validations + Schema Structure Validation
+**Status:** ⛔ Blocked (waiting on Task 11.3)
+**Blocked by:** Task 11.3 — logging must be working (warn-severity validations log and continue)
 
 **Description:**
 Implement the declarative `validations:` section on transforms. Each validation is a
 named check with a CXL bool expression or module function reference, arguments, and
 severity routing (error → DLQ, warn → log + continue).
+
+Also implement `structure:` ordering validation for multi-record schemas (deferred from
+Phase 9 drill decision #6). Phase 9 parses `structure:` into `Vec<StructureConstraint>`
+but does not validate ordering. This task validates that record types appear in the
+declared order with the declared cardinality. Violations are config-level warnings
+(not DLQ errors), per spec §4.1.
 
 **Implementation notes:**
 - `validations:` YAML section on each transform: list of validation entries.
@@ -187,7 +252,7 @@ severity routing (error → DLQ, warn → log + continue).
 - [ ] Phase C verifies function exists, arg count, return type Bool
 - [ ] Field references in args rejected at config parse time
 
-**Required unit tests (must pass before Task 10.5 unlocks):**
+**Required unit tests (must pass before Task 11.5 unlocks):**
 
 | Test name | What it verifies | Gate |
 |-----------|-----------------|------|
@@ -207,13 +272,13 @@ severity routing (error → DLQ, warn → log + continue).
 | `test_validation_phase_c_return_type` | Function returns String (not Bool) → compile error at Phase C | ⛔ Hard gate |
 | `test_validation_args_reject_field_ref` | `args: { val: Amount }` (field reference) → config error | ⛔ Hard gate |
 
-> ⛔ **Hard gate:** Task 10.5 status remains `Blocked` until all tests above pass.
+> ⛔ **Hard gate:** Task 11.5 status remains `Blocked` until all tests above pass.
 
 ---
 
-### Task 10.5: Security Hardening + Benchmarks
-**Status:** ⛔ Blocked (waiting on Task 10.4)
-**Blocked by:** Task 10.4 — validations must be working (benchmark suite exercises full pipeline including validations)
+### Task 11.5: Security Hardening + Benchmarks
+**Status:** ⛔ Blocked (waiting on Task 11.4)
+**Blocked by:** Task 11.4 — validations must be working (benchmark suite exercises full pipeline including validations)
 
 **Description:**
 Implement path security validation, output overwrite protection, YAML parser DoS budgets,
@@ -240,7 +305,7 @@ Verify zero C dependencies in the dependency tree.
 - [ ] Benchmark suite runs and reports records/sec + peak RSS
 - [ ] `cargo deny check` confirms zero C dependencies
 
-**Required unit tests (must pass before Phase 10 exit):**
+**Required unit tests (must pass before Phase 11 exit):**
 
 | Test name | What it verifies | Gate |
 |-----------|-----------------|------|
@@ -264,13 +329,13 @@ Verify zero C dependencies in the dependency tree.
 | `test_benchmark_json_10mb_runs` | 10MB JSON benchmark completes and reports records/sec | ⛔ Hard gate |
 | `test_benchmark_xml_50mb_runs` | 50MB XML benchmark completes and reports records/sec | ⛔ Hard gate |
 
-> ⛔ **Hard gate:** Task 10.6 status remains `Blocked` until all tests above pass.
+> ⛔ **Hard gate:** Task 11.6 status remains `Blocked` until all tests above pass.
 
 ---
 
-### Task 10.6: --dry-run -n Partial Processing
-**Status:** ⛔ Blocked (waiting on Task 10.5)
-**Blocked by:** Task 10.5 — security hardening must be in place before partial processing
+### Task 11.6: --dry-run -n Partial Processing
+**Status:** ⛔ Blocked (waiting on Task 11.5)
+**Blocked by:** Task 11.5 — security hardening must be in place before partial processing
 
 **Description:**
 Implement `clinker --dry-run -n <N> pipeline.yaml` which runs the full pipeline on the
@@ -293,7 +358,7 @@ to stdout (or a temp file with `--dry-run-output`). Deferred from Phase 8 (decis
 - [ ] `--dry-run-output <PATH>` redirects to file
 - [ ] Exit codes match normal pipeline run
 
-**Required unit tests (must pass before Phase 10 exit):**
+**Required unit tests (must pass before Phase 11 exit):**
 
 | Test name | What it verifies | Gate |
 |-----------|-----------------|------|
@@ -303,4 +368,4 @@ to stdout (or a temp file with `--dry-run-output`). Deferred from Phase 8 (decis
 | `test_dry_run_output_to_file` | `--dry-run-output out.csv` writes to file instead of stdout | ⛔ Hard gate |
 | `test_dry_run_n_exit_code_2_dlq` | Partial DLQ during dry-run produces exit code 2 | ⛔ Hard gate |
 
-> ⛔ **Hard gate:** Phase 10 exit criteria not met until all tests above pass.
+> ⛔ **Hard gate:** Phase 11 exit criteria not met until all tests above pass.

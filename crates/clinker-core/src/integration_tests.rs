@@ -13,11 +13,11 @@ mod tests {
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
 
-        let (counters, dlq) =
+        let report =
             PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
 
         let output = String::from_utf8(output_buf).unwrap();
-        Ok((counters, dlq, output))
+        Ok((report.counters, report.dlq_entries, output))
     }
 
     /// Determine exit code from pipeline result (mirrors main.rs logic).

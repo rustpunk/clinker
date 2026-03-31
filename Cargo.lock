@@ -258,12 +258,15 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "clinker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "clinker-core",
  "clinker-format",
  "miette",
+ "num_cpus",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -282,6 +285,7 @@ dependencies = [
  "indexmap",
  "libc",
  "lz4_flex",
+ "mach2",
  "miette",
  "num_cpus",
  "rayon",
@@ -292,6 +296,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -667,6 +672,12 @@ checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 dependencies = [
  "twox-hash",
 ]
+
+[[package]]
+name = "mach2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "matchers"

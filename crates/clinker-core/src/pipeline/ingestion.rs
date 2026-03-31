@@ -203,6 +203,7 @@ mod tests {
                 date_locale: None,
                 log_rules: None,
                 include_provenance: None,
+                metrics: None,
             },
             inputs: inputs
                 .into_iter()

@@ -432,11 +432,11 @@ Size) measurement and a `MemoryBudget` struct that governs spill decisions.
 - `--memory-limit` CLI flag sets `MemoryBudget::limit` in bytes (accepts `512M`, `2G` suffixes).
 
 **Acceptance criteria:**
-- [ ] `rss_bytes()` returns `Some(n)` on Linux, macOS, and Windows
-- [ ] `rss_bytes()` returns `None` on unsupported platforms
-- [ ] `MemoryBudget::should_spill` returns true when RSS exceeds threshold
-- [ ] `--memory-limit` CLI flag parsed and applied
-- [ ] RSS measurement cost is < 10us per call
+- [x] `rss_bytes()` returns `Some(n)` on Linux, macOS, and Windows
+- [x] `rss_bytes()` returns `None` on unsupported platforms
+- [x] `MemoryBudget::should_spill` returns true when RSS exceeds threshold
+- [x] `--memory-limit` CLI flag parsed and applied
+- [x] RSS measurement cost is < 10us per call
 
 **Required unit tests (must pass before Task 6.4 unlocks):**
 
@@ -453,8 +453,9 @@ Size) measurement and a `MemoryBudget` struct that governs spill decisions.
 
 #### Sub-tasks
 <!-- 1-3 hours each. Split again if still too large. -->
-- [ ] **6.3.0** (Prep) Add `libc` and `num_cpus` to `clinker-core/Cargo.toml` as direct dependencies.
-- [ ] **6.3.1** Implement `fn rss_bytes() -> Option<u64>` with `#[cfg(target_os)]` platform dispatch. Linux uses `/proc/self/statm` + `libc::sysconf(libc::_SC_PAGESIZE)`. macOS uses `mach2::mach_task_basic_info`. Windows uses `windows-sys K32GetProcessMemoryInfo`. Unsupported returns `None`.
+- [x] **6.3.0** (Prep) Add `libc` and `num_cpus` to `clinker-core/Cargo.toml` as direct dependencies.
+- [x] **6.3.1** Implement `fn rss_bytes() -> Option<u64>` with `#[cfg(target_os)]` platform dispatch. Linux uses `/proc/self/statm` + `libc::sysconf(libc::_SC_PAGESIZE)`. macOS uses `mach2::mach_task_basic_info`. Windows uses `windows-sys K32GetProcessMemoryInfo`. Unsupported returns `None`.
+- [x] **6.3.1a** (Errata 2026-03-31) macOS and Windows stubs replaced with real implementations. `mach2` 0.6 and `windows-sys` 0.61 added as platform-gated deps in `clinker-core/Cargo.toml`.
 
 > 🟡 **[V-4-1] Accepted:** `libc` and `num_cpus` not yet in Cargo.toml. Added prep
 > sub-task 6.3.0.

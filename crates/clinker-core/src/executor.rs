@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
 use indexmap::IndexMap;
 use rayon::prelude::*;
@@ -10,6 +11,7 @@ use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig, TransformConfig
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
+use crate::pipeline::memory::{MemoryBudget, rss_bytes};
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
 use crate::plan::execution::{ExecutionMode, ExecutionPlan, ParallelismClass};
@@ -19,6 +21,27 @@ use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
 use clinker_format::traits::{FormatReader, FormatWriter};
 use cxl::eval::{EvalContext, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
+
+/// Summary returned after a pipeline execution completes (success or partial).
+///
+/// Replaces the previous `(PipelineCounters, Vec<DlqEntry>)` tuple. Callers
+/// that previously destructured the tuple should access `report.counters` and
+/// `report.dlq_entries` instead.
+pub struct ExecutionReport {
+    /// Record counts: total, ok, dlq.
+    pub counters: PipelineCounters,
+    /// Records that were routed to the dead-letter queue.
+    pub dlq_entries: Vec<DlqEntry>,
+    /// Whether the pipeline ran in single-pass streaming or two-pass arena mode.
+    pub execution_mode: ExecutionMode,
+    /// Peak process RSS observed across chunk boundaries. `None` only on
+    /// platforms where RSS measurement is unavailable (e.g., FreeBSD).
+    pub peak_rss_bytes: Option<u64>,
+    /// Wall-clock time when `run_with_readers_writers` was entered.
+    pub started_at: DateTime<Utc>,
+    /// Wall-clock time immediately after the last write and flush completed.
+    pub finished_at: DateTime<Utc>,
+}
 
 /// Dummy storage type for streaming (no-window) evaluation.
 /// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
@@ -52,11 +75,16 @@ pub struct PipelineExecutor;
 
 impl PipelineExecutor {
     /// Run with explicit reader/writer sources.
+    ///
+    /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
+    /// execution mode, peak RSS, and wall-clock start/finish timestamps.
     pub fn run_with_readers_writers<R: Read + Send, W: Write + Send>(
         config: &PipelineConfig,
         reader: R,
         writer: W,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>), PipelineError> {
+    ) -> Result<ExecutionReport, PipelineError> {
+        let started_at = Utc::now();
+
         // Build CSV reader to get schema for CXL compilation
         let input = &config.inputs[0];
         let reader_config = build_reader_config(input);
@@ -78,23 +106,36 @@ impl PipelineExecutor {
                 messages: vec![e.to_string()],
             })?;
 
-        match plan.mode() {
+        let execution_mode = plan.mode();
+
+        let (counters, dlq_entries, peak_rss_bytes) = match execution_mode {
             ExecutionMode::Streaming => {
-                Self::execute_streaming(config, csv_reader, writer, &compiled_transforms)
+                Self::execute_streaming(config, csv_reader, writer, &compiled_transforms)?
             }
             ExecutionMode::TwoPass => {
-                Self::execute_two_pass(config, csv_reader, writer, &compiled_transforms, &plan)
+                Self::execute_two_pass(config, csv_reader, writer, &compiled_transforms, &plan)?
             }
-        }
+        };
+
+        Ok(ExecutionReport {
+            counters,
+            dlq_entries,
+            execution_mode,
+            peak_rss_bytes,
+            started_at,
+            finished_at: Utc::now(),
+        })
     }
 
-    /// Single-pass streaming execution (no windows). Former StreamingExecutor body.
+    /// Single-pass streaming execution (no windows).
+    ///
+    /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     fn execute_streaming<R: Read + Send, W: Write + Send>(
         config: &PipelineConfig,
         mut csv_reader: CsvReader<R>,
         writer: W,
         transforms: &[CompiledTransform],
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>), PipelineError> {
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
         let output = &config.outputs[0];
         let writer_config = build_writer_config(output);
@@ -103,7 +144,7 @@ impl PipelineExecutor {
         let first_record = csv_reader.next_record()?;
         let first_record = match first_record {
             Some(r) => r,
-            None => return Ok((PipelineCounters::default(), Vec::new())),
+            None => return Ok((PipelineCounters::default(), Vec::new(), rss_bytes())),
         };
 
         let ctx = build_eval_context(config, &input.path, 1, pipeline_start_time);
@@ -158,17 +199,20 @@ impl PipelineExecutor {
         }
 
         csv_writer.flush()?;
-        Ok((counters, dlq_entries))
+        Ok((counters, dlq_entries, rss_bytes()))
     }
 
     /// Two-pass execution: Phase 1 → 1.5 → Phase 2 → Phase 3.
+    ///
+    /// Returns `(counters, dlq_entries, peak_rss_bytes)`. Peak RSS is sampled
+    /// via [`MemoryBudget::observe`] at each chunk boundary.
     fn execute_two_pass<R: Read + Send, W: Write + Send>(
         config: &PipelineConfig,
         mut csv_reader: CsvReader<R>,
         writer: W,
         transforms: &[CompiledTransform],
         plan: &ExecutionPlan,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>), PipelineError> {
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
         let output = &config.outputs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
@@ -228,9 +272,10 @@ impl PipelineExecutor {
 
         let record_count = arena.record_count();
         if record_count == 0 {
-            return Ok((PipelineCounters::default(), Vec::new()));
+            return Ok((PipelineCounters::default(), Vec::new(), rss_bytes()));
         }
 
+        let mut rss_budget = MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
         let chunk_size = config.pipeline.concurrency
             .as_ref()
             .and_then(|c| c.chunk_size)
@@ -328,11 +373,12 @@ impl PipelineExecutor {
                 }
             }
 
+            rss_budget.observe();
             chunk_start = chunk_end;
         }
 
         csv_writer.flush()?;
-        Ok((counters, dlq_entries))
+        Ok((counters, dlq_entries, rss_budget.peak_rss))
     }
 
     /// Compile all CXL transform blocks against the input schema.
@@ -721,11 +767,11 @@ mod tests {
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
 
-        let (counters, dlq) =
+        let report =
             PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
 
         let output = String::from_utf8(output_buf).unwrap();
-        Ok((counters, dlq, output))
+        Ok((report.counters, report.dlq_entries, output))
     }
 
     #[test]
@@ -1316,10 +1362,10 @@ transformations:
         });
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
-        let (counters, dlq) =
+        let report =
             PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
         let output = String::from_utf8(output_buf).unwrap();
-        Ok((counters, dlq, output))
+        Ok((report.counters, report.dlq_entries, output))
     }
 
     #[test]

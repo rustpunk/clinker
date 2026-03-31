@@ -2,8 +2,8 @@
 //!
 //! `rss_bytes()` returns the current process RSS via platform-native APIs:
 //! - Linux: `/proc/self/statm` (resident pages × page size)
-//! - macOS: `mach_task_basic_info` via `mach2` (future — todo for non-Linux)
-//! - Windows: `K32GetProcessMemoryInfo` via `windows-sys` (future — todo for non-Linux)
+//! - macOS: `mach_task_basic_info` via `mach2` (pure Rust FFI)
+//! - Windows: `K32GetProcessMemoryInfo` via `windows-sys` (pure Rust FFI)
 //! - Unsupported: returns `None`
 //!
 //! `MemoryBudget` governs spill decisions: `should_spill()` returns true when
@@ -25,16 +25,60 @@ fn rss_bytes_impl() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn rss_bytes_impl() -> Option<u64> {
-    // mach2::mach_task_basic_info — deferred until macOS CI is available.
-    // For now, return None (falls back to allocation-counting heuristic).
-    None
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::message::mach_msg_type_number_t;
+    use mach2::task::task_info;
+    use mach2::task_info::{mach_task_basic_info, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT};
+    use mach2::traps::mach_task_self;
+
+    // SAFETY: FFI call to mach kernel. `mach_task_self()` returns the current
+    // task port (always valid). `task_info` reads process memory stats into
+    // the zeroed struct. No aliasing or lifetime concerns — all data is copied.
+    unsafe {
+        let mut info = mach_task_basic_info::default();
+        let mut count: mach_msg_type_number_t = MACH_TASK_BASIC_INFO_COUNT;
+        let ret = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info as *mut mach_task_basic_info as *mut _,
+            &mut count,
+        );
+        if ret == KERN_SUCCESS {
+            Some(info.resident_size)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn rss_bytes_impl() -> Option<u64> {
-    // windows_sys::Win32::System::ProcessStatus::K32GetProcessMemoryInfo
-    // Deferred until Windows CI is available.
-    None
+    use std::mem;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: FFI call to Win32 API. `GetCurrentProcess()` returns a
+    // pseudo-handle constant (-1) that is always valid and requires no
+    // `CloseHandle`. `K32GetProcessMemoryInfo` reads process memory stats
+    // into the zeroed struct. `cb` must be set to the struct size before the
+    // call for version compatibility.
+    unsafe {
+        let handle = GetCurrentProcess();
+        let mut pmc: PROCESS_MEMORY_COUNTERS = mem::zeroed();
+        pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = K32GetProcessMemoryInfo(
+            handle,
+            &mut pmc,
+            mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        );
+        if ok != 0 {
+            Some(pmc.WorkingSetSize as u64)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -52,6 +96,9 @@ pub struct MemoryBudget {
     pub limit: u64,
     /// Fraction of limit at which spill triggers. Default: 0.60.
     pub spill_threshold_pct: f64,
+    /// Peak RSS observed across all `observe()` / `should_spill()` calls.
+    /// `None` on platforms where RSS measurement is unavailable.
+    pub peak_rss: Option<u64>,
 }
 
 impl MemoryBudget {
@@ -59,6 +106,7 @@ impl MemoryBudget {
         Self {
             limit,
             spill_threshold_pct,
+            peak_rss: None,
         }
     }
 
@@ -68,10 +116,20 @@ impl MemoryBudget {
         Self::new(limit, 0.60)
     }
 
+    /// Poll current RSS and update `peak_rss` if it exceeds the recorded peak.
+    /// Called at chunk boundaries during Phase 2; also called by `should_spill()`.
+    pub fn observe(&mut self) {
+        if let Some(rss) = rss_bytes() {
+            self.peak_rss = Some(self.peak_rss.map_or(rss, |prev| prev.max(rss)));
+        }
+    }
+
     /// Returns true when current RSS exceeds the spill threshold.
+    /// Also updates `peak_rss` as a side-effect.
     /// Returns false if RSS cannot be measured (unsupported platform).
-    pub fn should_spill(&self) -> bool {
-        rss_bytes().map_or(false, |rss| {
+    pub fn should_spill(&mut self) -> bool {
+        self.observe();
+        self.peak_rss.map_or(false, |rss| {
             rss > (self.limit as f64 * self.spill_threshold_pct) as u64
         })
     }
@@ -134,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_memory_budget_below_threshold() {
-        let budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
         // Test process RSS should be well under 307MB (60% of 512MB)
         if rss_bytes().is_some() {
             assert!(!budget.should_spill());
@@ -144,10 +202,24 @@ mod tests {
     #[test]
     fn test_memory_budget_above_threshold() {
         // Budget of 1MB — any running process exceeds this
-        let budget = MemoryBudget::new(1024 * 1024, 0.60);
+        let mut budget = MemoryBudget::new(1024 * 1024, 0.60);
         if rss_bytes().is_some() {
             assert!(budget.should_spill());
         }
+    }
+
+    #[test]
+    fn test_memory_budget_peak_rss_tracked() {
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
+        if rss_bytes().is_none() {
+            return; // Skip on unsupported platforms
+        }
+        budget.observe();
+        assert!(budget.peak_rss.is_some(), "peak_rss should be set after observe()");
+        let first_peak = budget.peak_rss.unwrap();
+        budget.observe();
+        // Peak must be non-decreasing
+        assert!(budget.peak_rss.unwrap() >= first_peak);
     }
 
     #[test]

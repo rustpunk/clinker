@@ -29,6 +29,23 @@ pub struct PipelineMeta {
     pub date_locale: Option<String>,
     pub log_rules: Option<serde_json::Value>,
     pub include_provenance: Option<bool>,
+    /// Execution metrics spool configuration.
+    pub metrics: Option<MetricsConfig>,
+}
+
+/// Execution metrics reporting configuration.
+///
+/// Clinker writes one JSON file per pipeline run to `spool_dir` using an
+/// atomic write-then-rename strategy. A separate `clinker metrics collect`
+/// command sweeps the spool and appends records to an NDJSON archive.
+///
+/// Config precedence (highest → lowest):
+/// `--metrics-spool-dir` CLI flag > `CLINKER_METRICS_SPOOL_DIR` env var > this field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Directory where per-execution JSON files are spooled.
+    pub spool_dir: Option<String>,
 }
 
 /// Concurrency settings for parallel chunk processing.

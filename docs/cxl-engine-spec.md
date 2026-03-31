@@ -50,6 +50,7 @@ Every crate must be pure Rust (no transitive C dependencies).
 | Signal handling | `ctrlc` | Pure Rust. Graceful SIGINT/SIGTERM handling |
 | RSS (macOS) | `mach2` | Pure Rust FFI to Mach kernel API. `cfg(target_os = "macos")` only. |
 | RSS (Windows) | `windows-sys` | Pure Rust FFI to Win32 API. `cfg(target_os = "windows")` only. |
+| TOML config | `toml` | Pure Rust TOML parser for `clinker.toml` workspace config files |
 
 ### Crate-to-workspace mapping
 
@@ -59,6 +60,7 @@ Every crate must be pure Rust (no transitive C dependencies).
 | `regex` | `cxl` |
 | `csv`, `quick-xml` | `clinker-format` |
 | `serde-saphyr`, `rayon`, `crossbeam-channel`, `lz4_flex`, `tempfile`, `glob`, `uuid`, `ctrlc`, `mach2`, `windows-sys` | `clinker-core` |
+| `serde-saphyr`, `indexmap`, `toml` | `clinker-channel` |
 | `clap`, `tracing-subscriber` | `clinker`, `cxl-cli` |
 | `miette`, `tracing` | All crates |
 | `tokio`, `reqwest` | `clinker-core` (v2 only — API intercept) |
@@ -779,6 +781,69 @@ inputs:
 - **Provenance fields** (`_source_file`, etc.) are not part of the schema — they are injected by the pipeline independently.
 - **Fixed-width reader**: new module in `clinker-format`. Reads lines, applies the schema's field positions, produces `Record` objects with the schema's field names and parsed types.
 - **Multi-record dispatcher**: reads each line, matches the discriminator, routes to the appropriate record type's Arena during Phase 1 and record stream during Phase 2.
+
+---
+
+### 4.2 Channel Overrides + Composition System
+
+Clinker supports multi-tenant deployments where a single base pipeline YAML is customized per client/entity using **channel overrides** and **reusable compositions**. All features in this section work entirely from the CLI — Kiln (the IDE) is a DX convenience layer that helps authors create these files, not a runtime requirement.
+
+#### Workspace root discovery
+
+Clinker locates the workspace by walking up from the pipeline file's parent directory looking for a `clinker.toml` marker file. The walk is CWD-independent: the same workspace is found regardless of which directory `clinker` is invoked from. If no `clinker.toml` is found, Clinker runs in single-file mode (channels and compositions unavailable, warning emitted).
+
+```toml
+# clinker.toml
+[workspace]
+channels_dir = "channels"        # default
+groups_dir = "_groups"           # default
+pipeline_paths = ["pipelines/"]  # Kiln discovery hint only; CLI uses explicit file paths
+
+[defaults]
+env = "dev"                      # default CLINKER_ENV when --env absent and var unset
+```
+
+#### Channel manifests
+
+Each channel lives in `channels/<channel-id>/channel.yaml`. The `_channel:` metadata block declares the channel identity and optional `inherits:` group membership. The `variables:` block defines channel-scoped variables (e.g., `CHANNEL_DATA_DIR`) that are injected into the `${VAR}` interpolation chain before pipeline YAML deserialization.
+
+#### Variable interpolation
+
+All `${VAR}` substitution happens at text level before YAML deserialization (single pass). Priority: `--env` / `CLINKER_ENV` > channel variables > system environment variables. `$${VAR}` produces a literal `${VAR}` string (escape, same convention as Docker Compose and Kubernetes).
+
+**YAML injection safety:** Every substituted value is automatically wrapped in YAML single-quotes (`'value'`, with embedded `'` escaped to `''`). This prevents YAML structure corruption when channel variables contain `:`, `[`, `{`, `#`, or newlines (e.g., file paths, JDBC URLs). All interpolated positions produce YAML strings — typed YAML from variable substitution is a v2 concern.
+
+#### Override files (`.channel.yaml`)
+
+Override files live in the channel directory, named after the pipeline file stem: `channels/acme-corp/customer_etl.channel.yaml` for pipeline `customer_etl.yaml`. The `_channel:` header identifies the target pipeline and carries an optional `when:` condition. If the condition evaluates to false, the entire file is skipped. The `when:` parser supports `==`, `!=`, `in [...]`, and `not in [...]` on already-interpolated string values — no expression evaluator needed. Use `--channel-path <path>` (repeatable) to specify explicit override files; they are applied in declaration order after the derived-name file.
+
+Override operations (applied in order):
+1. Override `inputs:` — partial merge by input name (only specified keys change)
+2. Override `transformations:` — partial merge by transform name
+3. `add_transformations:` — insert inline transforms after a named anchor
+4. `add_compositions:` — inline a `.comp.yaml` block after a named anchor
+5. `remove_transformations:` — remove individual transforms by name (warn if not found)
+6. `remove_compositions:` — remove all transforms sourced from a `.comp.yaml` by path (uses `ProvenanceMap`)
+7. Override `outputs:` — partial merge by output name
+8. Override `error_handling:` — full replacement if present
+
+#### Compositions (`_import`)
+
+Reusable transform blocks live in `.comp.yaml` files. The `_import:` directive in a `transformations:` list (in base pipelines or in other composition files) is replaced inline by the composition's transforms at load time. All composition paths are workspace-root-relative. Circular imports are detected (`ChannelError::CircularImport`). Depth limit: 10 levels.
+
+`PipelineConfig.transformations` uses a `Vec<TransformEntry>` where `TransformEntry` is an untagged serde enum (`Import { _import: String }` | `Transform(TransformConfig)`). After `resolve_compositions()` the vec contains only `Transform` variants — the executor never sees `_import` entries.
+
+#### ProvenanceMap
+
+`resolve_compositions()` returns a `ProvenanceMap: HashMap<transform_name, comp_path>` mapping each inlined transform to its source composition file. This is threaded through the override merge steps, enabling `remove_compositions` to find and remove all transforms from a given composition regardless of where they were introduced (base pipeline or previous override step).
+
+#### Group inheritance
+
+Channels may declare `inherits: group-id` (single) or `inherits: [g1, g2]` (list). Group directories live at `channels/_groups/<group-id>/` and contain only `.channel.yaml` files. Groups are applied first (in order), then the channel-specific override. Channel always wins on conflict.
+
+#### `--env` precedence chain
+
+`CLINKER_ENV` is the active environment name, used in `when:` condition evaluation. Resolution order (highest to lowest): `--env` CLI flag → `CLINKER_ENV` system env var → `[defaults] env` in `clinker.toml` → `None`. When `None` and override files contain `when:` conditions, a warning is emitted to stderr (suppressed by `--quiet`). Run proceeds — this is informational, not an error.
 
 ---
 
@@ -1870,6 +1935,71 @@ Throttled to 1 update/second. Disabled with `--quiet`.
 
 ---
 
+### 10.6 Execution Metrics Spool
+
+Each pipeline execution optionally writes one JSON file to a configurable spool directory. The file contains timing, record counts, exit code, peak RSS, and metadata. A separate `clinker metrics collect` command sweeps the spool and appends records to an NDJSON archive.
+
+**Design:** write-then-rename. The file is written as `<execution_id>.json.tmp`, flushed, `fsync()`'d, then renamed to `<execution_id>.json`. The collector only processes files without the `.tmp` suffix — it never sees a partial write. Each execution writes a uniquely-named file (UUID v7), so 30–40 concurrent servers never contend.
+
+**Config precedence (highest → lowest):**
+1. `--metrics-spool-dir <path>` CLI flag
+2. `CLINKER_METRICS_SPOOL_DIR` environment variable
+3. `pipeline.metrics.spool_dir` in the YAML config
+4. Disabled (no spool write, no error)
+
+**YAML configuration:**
+```yaml
+pipeline:
+  name: daily_orders
+  metrics:
+    spool_dir: /var/spool/clinker
+```
+
+**Failure handling:** if the spool write fails (NFS unavailable, disk full), a `tracing::warn!` event is emitted with all metric fields as structured key-value pairs. The pipeline exit code is not affected — the spool write is a best-effort side effect.
+
+**Spool file schema (`schema_version: 1`):**
+
+```json
+{
+  "execution_id":    "019571b2-3f44-7c00-8d1e-...",
+  "schema_version":  1,
+  "pipeline_name":   "daily_orders",
+  "config_path":     "/etc/clinker/daily_orders.yaml",
+  "hostname":        "worker-07.internal",
+  "started_at":      "2026-03-31T14:22:01.345Z",
+  "finished_at":     "2026-03-31T14:23:44.812Z",
+  "duration_ms":     103467,
+  "exit_code":       2,
+  "records_total":   142850,
+  "records_ok":      142791,
+  "records_dlq":     59,
+  "execution_mode":  "TwoPass",
+  "peak_rss_bytes":  312524800,
+  "thread_count":    8,
+  "input_files":     ["orders_2026-03-31.csv"],
+  "output_files":    ["orders_clean_2026-03-31.csv"],
+  "dlq_path":        "orders_dlq_2026-03-31.csv",
+  "error":           null
+}
+```
+
+`execution_id` is the pipeline's UUID v7 batch ID (same as `pipeline.execution_id` / `_cxl_source_batch`). `peak_rss_bytes` is measured on Linux (`/proc/self/statm`), macOS (`mach_task_basic_info`), and Windows (`K32GetProcessMemoryInfo`); `null` only on unsupported platforms (e.g., FreeBSD).
+
+**Collect command:**
+```
+clinker metrics collect
+  --spool-dir <path>        # required
+  --output-file <path>      # required; append mode; NDJSON
+  --delete-after-collect    # remove spool file after appending
+  --dry-run                 # print what would be collected, don't write
+```
+
+Files that fail to parse (wrong schema version, malformed JSON) are skipped with a `tracing::warn!` — the collector never corrupts the output archive by writing a partial record.
+
+**CLI structure change:** The metrics subcommand required restructuring the CLI from `clinker pipeline.yaml` to `clinker run pipeline.yaml` to accommodate `clinker metrics collect`.
+
+---
+
 ## 11. Workspace Architecture
 
 The project is a Cargo workspace monorepo with six crates. The dependency graph is strictly one-directional — no cycles, no reverse dependencies. Every crate has a clear reason to exist: shared data model, language, language tooling, I/O, orchestration, CLI.
@@ -1953,6 +2083,16 @@ clinker/
 │   │           ├── dlq.rs              # Dead letter queue writer
 │   │           └── progress.rs         # Progress bar / reporting
 │   │
+│   ├── clinker-channel/                # Channel overrides + composition system (see §4.2)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                  # Public API: resolve_channel_with_inheritance(), resolve_compositions()
+│   │       ├── error.rs                # ChannelError enum
+│   │       ├── workspace.rs            # WorkspaceRoot discovery (clinker.toml walk-up), WorkspaceConfig
+│   │       ├── manifest.rs             # ChannelManifest, ChannelMetadata, ChannelInherits
+│   │       ├── override_file.rs        # OverrideFile, 9-op merge algorithm, when: condition parser
+│   │       └── composition.rs          # CompositionFile, _import resolution, ProvenanceMap
+│   │
 │   └── clinker/                        # CLI binary (thin wrapper)
 │       ├── Cargo.toml
 │       └── src/
@@ -1966,6 +2106,12 @@ clinker/
 │                                       #   --log-level <level>  (trace|debug|info|warn|error)
 │                                       #   --explain            (print execution plan, exit)
 │                                       #   --dry-run            (validate config + CXL, exit)
+│                                       #   --channel <id>       (apply channel override — see §4.2)
+│                                       #   --channel-path <path>(explicit .channel.yaml file; repeatable)
+│                                       #   --workspace <dir>    (override clinker.toml walk-up discovery)
+│                                       #   --env <name>         (set CLINKER_ENV for when: conditions)
+│                                       #   --force              (allow output file overwrite)
+│                                       #   --quiet              (suppress stderr progress output)
 │
 ├── tests/                              # Workspace-level integration tests
 │   ├── fixtures/                       # Sample CSV, XML, JSON, YAML pipeline configs
@@ -1978,19 +2124,21 @@ clinker/
 
 ```
 clinker (binary)
-  └── clinker-core (library)
-        ├── cxl (library)
-        │     └── clinker-record (library)
-        ├── clinker-format (library)
-        │     └── clinker-record (library)
-        └── clinker-record (library)
+  ├── clinker-channel (library)
+  │     └── clinker-core (library)
+  │           ├── cxl (library)
+  │           │     └── clinker-record (library)
+  │           ├── clinker-format (library)
+  │           │     └── clinker-record (library)
+  │           └── clinker-record (library)
+  └── clinker-core (library)  [shared — same instance]
 
 cxl-cli (binary)
   ├── cxl (library)
   └── clinker-record (library)
 ```
 
-Every arrow points down. No cycles. `clinker-record` is the foundation that everything builds on. `cxl` and `clinker-format` are peers that share the data model but know nothing about each other. `clinker-core` orchestrates them.
+Every arrow points down. No cycles. `clinker-record` is the foundation that everything builds on. `cxl` and `clinker-format` are peers that share the data model but know nothing about each other. `clinker-core` orchestrates them. `clinker-channel` sits above `clinker-core` — it consumes `PipelineConfig` and `interpolate_env_vars` but has no knowledge of the execution engine, enabling Kiln (the IDE) to use it independently without pulling in pipeline execution logic.
 
 ### 11.3 Crate Boundary Rules
 
@@ -2000,8 +2148,9 @@ Every arrow points down. No cycles. `clinker-record` is the foundation that ever
 | `cxl` | CXL parsing, AST, type checking, expression evaluation, built-in function signatures | Pipelines, file formats, config YAML, I/O, memory budgets |
 | `cxl-cli` | Interactive CXL script validation, REPL, `cxl check` / `cxl eval` / `cxl fmt` | Pipelines, file formats, config |
 | `clinker-format` | CSV/XML/JSON/fixed-width readers and writers, multi-record dispatcher, schema loading, format auto-detection, streaming I/O | CXL, pipelines, config YAML, memory budgets |
-| `clinker-core` | Config parsing, execution planning, pipeline orchestration, Arena, indexing, sorting, spilling, memory management, DLQ | CLI argument parsing, logging subscriber setup |
-| `clinker` | CLI entry point, argument parsing, logging subscriber setup, `main()` | Nothing — it's the top-level binary |
+| `clinker-core` | Config parsing, execution planning, pipeline orchestration, Arena, indexing, sorting, spilling, memory management, DLQ | CLI argument parsing, logging subscriber setup, channel/composition resolution |
+| `clinker-channel` | Workspace root discovery (`clinker.toml`), channel manifest parsing, variable interpolation (extends `clinker-core`'s `interpolate_env_vars`), override file parsing and 9-op merge, composition `_import` resolution, `ProvenanceMap`, group inheritance | Pipeline execution, file I/O, CXL evaluation, memory management |
+| `clinker` | CLI entry point, argument parsing, logging subscriber setup, `main()`, channel resolution orchestration (calls `clinker-channel` then passes resolved config to `clinker-core`) | Nothing — it's the top-level binary |
 
 ### 11.4 Trait Boundaries
 
@@ -2277,7 +2426,8 @@ With `strip` and `panic = "abort"`, target ≤10MB release binary for the `clink
 - `cxl-cli`: Standalone `cxl check` / `cxl eval` validator
 - `clinker-format`: CSV, XML, JSON, fixed-width readers/writers; multi-record dispatcher; schema loading + override resolution
 - `clinker-core`: Config parsing with `serde-saphyr`, two-pass pipeline (Skinny Pass → Pointer Sort → Fat Pass → Projection), source-level and chunk-level parallelism, memory budget with spill-to-disk, DLQ, external merge sort for per-source and per-output `sort_order`
-- `clinker`: CLI binary with `--explain`, `--dry-run`, progress reporting, signal handling (graceful shutdown), exit codes
+- `clinker-channel`: Channel override system — workspace root discovery (`clinker.toml`), channel manifests, `.channel.yaml` delta files with 9-op merge, `_channel:` header, `when:` conditional application, group inheritance, `_import` composition inlining, `ProvenanceMap` for `remove_compositions`
+- `clinker`: CLI binary with `--explain`, `--dry-run`, `--channel`, `--channel-path`, `--workspace`, `--env`, progress reporting, signal handling (graceful shutdown), exit codes
 
 ### v2 (Deferred)
 
@@ -2291,6 +2441,9 @@ With `strip` and `panic = "abort"`, target ≤10MB release binary for the `clink
 - `rust_decimal` for financial precision
 - CXL user-defined functions
 - CXL `match` / pattern matching expressions
+- `--all-channels` batch execution across all channels in a workspace
+- Parameterized compositions (templated `.comp.yaml` with input variables)
+- Multi-level group inheritance (groups inheriting from other groups)
 
 ---
 

@@ -8,6 +8,8 @@ description = "CLI for the Clinker ETL engine"
 clinker-core = { workspace = true }
 clinker-format = { workspace = true }
 clap = { workspace = true }
+chrono = { workspace = true }
+num_cpus = "1"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 uuid = { version = "1", features = ["v7"] }

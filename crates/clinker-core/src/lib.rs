@@ -4,6 +4,7 @@ pub mod error;
 pub mod executor;
 pub mod exit_codes;
 mod integration_tests;
+pub mod metrics;
 pub mod pipeline;
 pub mod plan;
 pub mod progress;

@@ -3,7 +3,7 @@
 **Spec:** `docs/cxl-engine-spec.md`
 **Status:** In Progress
 **Created:** 2026-03-28
-**Last Updated:** 2026-03-30
+**Last Updated:** 2026-03-31
 
 ## Summary
 
@@ -38,7 +38,7 @@ with spill-to-disk under a configurable memory budget.
 | 20 | Streaming `DeserializeSeed` + `IgnoredAny` for JSON path navigation — O(1 record) memory (Phase 7 decision, revised) | Original plan used `Value::pointer()` (3-11x overhead). Replaced with serde's `DeserializeSeed` + `IgnoredAny` which navigates the tree via `visit_map` without buffering. ~10KB + 1 record. |
 | 21 | Plain `quick_xml::Reader` with `QName::local_name()` for namespace stripping (Phase 7 decision) | `NsReader` resolves URIs (overkill). `local_name()` strips prefix. Config flag selects strip vs qualify. |
 | 22 | `SortBuffer` shared sort-and-spill engine for both source-sort and output-sort (Phase 8 decision) | One implementation of external merge sort + loser tree; executor calls SortBuffer at two intercept points; window sort unchanged in sort.rs |
-| 23 | `SortFieldSpec` untagged serde enum (`Short(String)` / `Full(SortField)`) for sort config (Phase 8 decision) | serde-saphyr supports untagged; YAML scalars vs mappings unambiguous; unified type for InputConfig and OutputConfig sort_order |
+| 23 | ~~`SortFieldSpec` untagged serde enum~~ → **Superseded by #40**: custom Deserialize impl for consistent error messages (Phase 9 decision) | Original: serde-saphyr supports untagged. Revised: untagged has bad error messages (serde#773); custom deser is ~20 lines with full control. |
 | 24 | `PipelineMeta.sort_output` removed; sort lives only on per-source `InputConfig.sort_order` and per-output `OutputConfig.sort_order` (Phase 8 decision) | Per-source and per-output sorts independently optional; global sort creates ambiguous precedence; stub was untyped serde_json::Value |
 | 25 | `InputConfig.sort_order` means "ensure this order" (active sort), not pre-sorted declaration (Phase 8 decision) | Subsumes pre-sorted optimization via is_sorted() fast path; one field, one semantic; no silent correctness bugs from false declarations |
 | 26 | Hybrid comparator: closure sort_by for in-memory, memcomparable byte encoding for loser tree merge (Phase 8 decision) | In-memory sorts don't need encoding overhead; loser tree needs Ord; Arrow-rs/DataFusion/Polars converge on this split |
@@ -50,6 +50,23 @@ with spill-to-disk under a configurable memory budget.
 | 32 | Callback-based ProgressReporter trait with phase-specific counters (Phase 8 decision) | Testable via VecReporter; NullReporter for --quiet; extensible for Kiln Tier 1 JSON Lines |
 | 33 | `cxl eval`: -e for inline, positional for file, --field + --record (Phase 8 decision) | Follows sed/perl -e convention; --field auto-type-inferred; no auto-detection (anti-pattern per clig.dev) |
 | 34 | `-n` partial processing deferred to Phase 10; --dry-run stays config-validation-only (Phase 8 decision) | Phase 8 scope is large enough; -n is closer to "sample mode" than dry run |
+| 35 | Override files use `.channel.yaml` extension + `_channel:` header (Phase 10 decision) | Ansible entity-name→filename pattern; "channel" is the domain concept; `_channel:` header consistent with `_composition:` convention |
+| 36 | `interpolate_env_vars` auto-wraps substituted values in YAML single-quotes (Phase 10 decision) | Ansible CVE-2021-3583, Docker Compose #8607, Vector #17343 all caused by bare pre-parse substitution; single-quote wrap is lossless for string values |
+| 37 | `--channel-path <path>` (repeatable) for explicit `.channel.yaml` override injection (Phase 10 decision) | Helm/Terraform pattern; enables hotfix injection without touching workspace channel dirs; applied after derived-name file |
+| 38 | Schema types in `clinker-record`, loading/resolution in `clinker-core` (Phase 9 decision) | Follows existing Schema/Arena split. No new dependency edges. FieldDef alongside Schema in foundation crate. |
+| 39 | `FieldDef` flat struct with typed `FieldType`/`Justify` enums, `serde_json::Value` for default (Phase 9 decision) | Research: every execution engine uses typed enums (Arrow, Polars, Spark, Beam). serde-saphyr has no Value type; serde_json::Value proven to work. |
+| 40 | `SchemaSource` + `SortFieldSpec` use custom `Deserialize` impl, not `#[serde(untagged)]` (Phase 9 decision) | Research: serde untagged has bad error messages (serde#773). Docker Compose uses normalize-then-deser. Custom deser is ~20 lines with full error control. |
+| 41 | `ResolvedSchema` enum (SingleRecord/MultiRecord) distinct from `SchemaDefinition` (Phase 9 decision) | Research: 5-to-2 for distinct resolved types (DataFusion, Protobuf, rustc, TS compiler, serde vs Polars, Spark). Eliminates variant ambiguity. |
+| 42 | Same `FieldDef` for definitions and overrides; `drop`/`record` fields validated as None in non-override contexts (Phase 9 decision) | Research: Docker Compose, Terraform use same type for base and override. Override semantics in loader, not type system. |
+| 43 | Alias creates identity boundary (SQL model); mapping keys reference post-alias names (Phase 9 decision) | Research: unanimous across SQL, dbt, Singer, Informatica, NiFi, Beam. Aliases resolved in executor; writers see final names. |
+| 44 | Byte-offset extraction for fixed-width; character mode is v2 toggle (Phase 9 decision) | Research: Informatica, Cobrix, Talend bytes mode. Spec says "byte position". go-fixedwidth toggleable pattern for v2. |
+| 45 | Type-aware truncation: numeric→Error, string→Warn, per-field override via TruncationPolicy (Phase 9 decision) | Research: Informatica rejects numeric overflow. Silent numeric truncation caused real payment routing failures. |
+| 46 | Constructor injection for FixedWidthReader schema; no FormatReader trait changes (Phase 9 decision) | Research: unanimous — DataFusion FileScanConfig, Spark ScanBuilder, Polars with_schema(). Schema at build time, read-only getter on trait. |
+| 47 | ~~`QualifiedFieldRef.parts: Vec<Box<str>>`~~ → **`Box<[Box<str>]>`** replaces source+field (Phase 9 validation decision) | Research: sqlparser-rs CompoundIdentifier pattern. Boxed slice per SWC/oxc AST node size conventions (saves 8 bytes inline, no wasted capacity). |
+| 48 | `MultiRecordDispatcher` in clinker-core between reader and arenas (Phase 9 decision) | Arena::build() consumes reader into one arena. Multi-record needs N arenas from one file read. Dispatcher routes by discriminator. |
+| 49 | `SchemaDefinition.format: Option<String>` not `Option<FormatKind>` (Phase 9 validation decision) | Research: 7/8 systems keep format external to schema (Arrow, Polars, Spark, Beam, Protobuf, Avro, JSON Schema). String avoids circular dep between clinker-record and clinker-core. |
+| 50 | `SchemaError` enum in `clinker-core/src/schema/mod.rs` with `PipelineError::Schema(SchemaError)` (Phase 9 validation decision) | DataFusion SchemaError pattern. Distinct from ConfigError (different lifecycle: schema resolution vs YAML parsing). |
+| 51 | Path validation deferred to Phase 11 central layer; Phase 9 load_schema() trusts paths (Phase 9 validation decision) | Research: 15+ CVEs from per-subsystem path validation (Ansible, Docker Compose, Terraform, Helm, dbt). Central validation is the correct architecture. |
 
 ## Open Questions
 
@@ -68,8 +85,9 @@ with spill-to-disk under a configurable memory budget.
 | 6 | Parallelism + Memory Management | ✅ Complete | 5 | 5 | Phase 5 |
 | 7 | JSON + XML Readers/Writers | ✅ Complete | 5 | 5 | Phase 4 |
 | 8 | Sort, DLQ Polish, CLI Completion | ✅ Complete | 4 | 4 | Phase 6, 7 |
-| 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Not Started | 4 | 0 | Phase 7 |
-| 10 | Modules, Logging, Validations, Polish | 🔲 Not Started | 6 | 0 | Phase 9 |
+| 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Validated (READY) | 4 | 0 | Phase 7 |
+| 10 | Channel Overrides + Composition System | 🔲 Not Started | 6 | 0 | Phase 9 |
+| 11 | Modules, Logging, Validations, Polish | 🔄 In Progress | 7 | 1 | Phase 10 |
 
 > Status key: 🔲 Not Started · 🔄 In Progress · ⛔ Blocked · ✅ Complete
 
@@ -92,7 +110,9 @@ Phase 1 (Foundation)
   │           │                 │                             │
   │           │                 └── Phase 9 (Schema + FW) ────┤
   │           │                       │                       │
-  │           │                       └── Phase 10 (Modules+) │
+  │           │                       └── Phase 10 (Channels) │
+  │           │                             │                 │
+  │           │                             └── Phase 11 (Modules+)
   │           │                                               │
   │           └───────────────── Phase 8 (Sort + CLI) ────────┘
   │                              (needs 6 + 7)
@@ -103,7 +123,8 @@ Phase 6 layers parallelism onto the sequential pipeline from Phase 5. Spill IO p
 Phase 7 can start after Phase 4 (format readers are independent of windows).
 Phase 8 needs both Phase 6 (spill infrastructure) and Phase 7 (all formats).
 Phase 9 needs Phase 7 (schema applies to all formats).
-Phase 10 needs Phase 9 (validations reference schemas and modules).
+Phase 10 needs Phase 9 (channel system needs all format readers + schema complete).
+Phase 11 needs Phase 10 (validations reference schemas and modules; logging references pipeline vars from channel system).
 
 ## Risk Register
 
