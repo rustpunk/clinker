@@ -1,0 +1,18 @@
+[package]
+name = "clinker-channel"
+version.workspace = true
+edition.workspace = true
+description = "Channel overrides, composition resolution, and workspace discovery for Clinker"
+
+[dependencies]
+clinker-core = { workspace = true }
+serde-saphyr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+indexmap = { workspace = true }
+tracing = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

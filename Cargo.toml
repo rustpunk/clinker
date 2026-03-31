@@ -6,6 +6,7 @@ members = [
     "crates/cxl-cli",
     "crates/clinker-format",
     "crates/clinker-core",
+    "crates/clinker-channel",
     "crates/clinker",
 ]
 
@@ -18,7 +19,9 @@ clinker-record = { path = "crates/clinker-record" }
 cxl = { path = "crates/cxl" }
 clinker-format = { path = "crates/clinker-format" }
 clinker-core = { path = "crates/clinker-core" }
+clinker-channel = { path = "crates/clinker-channel" }
 
+toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde-saphyr = "0.0.22"
