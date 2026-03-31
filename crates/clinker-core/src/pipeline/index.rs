@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use chrono::{NaiveDate, NaiveDateTime};
 use clinker_record::{RecordStorage, Value};
 
-use crate::config::SchemaOverride;
+use clinker_record::schema_def::{FieldDef, FieldType};
 
 /// Group-by key for SecondaryIndex. Supports Eq + Hash for HashMap keys.
 ///
@@ -42,7 +42,7 @@ impl SecondaryIndex {
     pub fn build<S: RecordStorage>(
         storage: &S,
         group_by: &[String],
-        schema_pins: &HashMap<String, SchemaOverride>,
+        schema_pins: &HashMap<String, FieldDef>,
     ) -> Result<Self, IndexError> {
         let mut groups: HashMap<Vec<GroupByKey>, Vec<u32>> = HashMap::new();
         let record_count = storage.record_count();
@@ -96,7 +96,7 @@ impl SecondaryIndex {
 pub fn value_to_group_key(
     val: &Value,
     field: &str,
-    schema_pin: Option<&SchemaOverride>,
+    schema_pin: Option<&FieldDef>,
     row: u32,
 ) -> Result<Option<GroupByKey>, IndexError> {
     match val {
@@ -115,7 +115,7 @@ pub fn value_to_group_key(
 
         Value::Integer(i) => {
             if let Some(pin) = schema_pin {
-                if pin.r#type == "integer" {
+                if pin.field_type == Some(FieldType::Integer) {
                     return Ok(Some(GroupByKey::Int(*i)));
                 }
             }
@@ -242,13 +242,36 @@ mod tests {
         assert_eq!(pos, neg);
     }
 
+    fn test_field(name: &str) -> FieldDef {
+        FieldDef {
+            name: name.into(),
+            field_type: None,
+            required: None,
+            format: None,
+            coerce: None,
+            default: None,
+            allowed_values: None,
+            alias: None,
+            inherits: None,
+            start: None,
+            width: None,
+            end: None,
+            justify: None,
+            pad: None,
+            trim: None,
+            truncation: None,
+            precision: None,
+            scale: None,
+            path: None,
+            drop: None,
+            record: None,
+        }
+    }
+
     #[test]
     fn test_group_by_key_integer_pin_rejects_float() {
-        let pin = SchemaOverride {
-            name: "x".into(),
-            r#type: "integer".into(),
-            format: None,
-        };
+        let mut pin = test_field("x");
+        pin.field_type = Some(FieldType::Integer);
         // Integer with pin → Int variant
         let key = value_to_group_key(&Value::Integer(42), "x", Some(&pin), 0)
             .unwrap()

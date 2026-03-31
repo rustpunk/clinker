@@ -229,7 +229,7 @@ impl PipelineExecutor {
             })?;
 
         // Phase 1: Build SecondaryIndices
-        let schema_pins: HashMap<String, crate::config::SchemaOverride> = input
+        let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
             .schema_overrides.as_ref()
             .map(|overrides| overrides.iter().map(|o| (o.name.clone(), o.clone())).collect())
             .unwrap_or_default();

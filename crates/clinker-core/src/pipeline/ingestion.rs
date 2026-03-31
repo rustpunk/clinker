@@ -127,7 +127,7 @@ where
     })?;
 
     // Build SecondaryIndices for this source
-    let schema_pins: HashMap<String, crate::config::SchemaOverride> = input
+    let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
         .schema_overrides
         .as_ref()
         .map(|overrides| {

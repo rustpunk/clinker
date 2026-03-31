@@ -1,9 +1,25 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
 use crate::config::OutputConfig;
+
+/// Apply schema aliases to emitted fields: rename keys from original to alias names.
+///
+/// Alias creates an identity boundary (SQL model): CXL uses original field names,
+/// but output-facing code (mapping, writers) sees the post-alias names.
+pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<String, String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let entries: Vec<(String, Value)> = emitted.drain(..).collect();
+    for (name, value) in entries {
+        let output_name = aliases.get(&name).cloned().unwrap_or(name);
+        emitted.insert(output_name, value);
+    }
+}
 
 /// Apply output projection: gather → exclude → mapping.
 ///

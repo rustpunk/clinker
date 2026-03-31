@@ -1,3 +1,5 @@
+pub mod resolve;
+
 use std::path::Path;
 
 use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef, SchemaDefinition};

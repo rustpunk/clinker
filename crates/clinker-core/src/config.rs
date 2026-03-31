@@ -1,4 +1,4 @@
-use clinker_record::schema_def::SchemaDefinition;
+use clinker_record::schema_def::{FieldDef, SchemaDefinition};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::de::{self, MapAccess, Visitor};
@@ -64,7 +64,7 @@ pub struct InputConfig {
     pub name: String,
     pub path: String,
     pub schema: Option<SchemaSource>,
-    pub schema_overrides: Option<Vec<SchemaOverride>>,
+    pub schema_overrides: Option<Vec<FieldDef>>,
     pub array_paths: Option<Vec<ArrayPathConfig>>,
     pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(flatten)]
@@ -153,15 +153,6 @@ impl InputConfig {
             _ => None,
         }
     }
-}
-
-/// Schema override for a named column.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchemaOverride {
-    pub name: String,
-    pub r#type: String,
-    pub format: Option<String>,
 }
 
 /// Output destination configuration.
@@ -515,7 +506,26 @@ pub fn interpolate_env_vars(yaml: &str) -> Result<String, ConfigError> {
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml)?;
     let config: PipelineConfig = serde_saphyr::from_str(&interpolated)?;
+    validate_config(&config)?;
     Ok(config)
+}
+
+/// Post-deserialization validation.
+fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
+    for input in &config.inputs {
+        // Fail-fast: inline schema + schema_overrides is a conflict.
+        // Overrides only apply to externally referenced schemas.
+        if let Some(SchemaSource::Inline(_)) = &input.schema {
+            if input.schema_overrides.is_some() {
+                return Err(ConfigError::Validation(format!(
+                    "input '{}': cannot use both inline 'schema' and 'schema_overrides' — \
+                     overrides only apply to externally referenced schemas",
+                    input.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load and parse a pipeline config from a YAML file path.
@@ -831,6 +841,43 @@ error_handling:
         let dlq = config.error_handling.dlq.as_ref().unwrap();
         assert_eq!(dlq.include_reason, Some(true));
         assert_eq!(config.error_handling.type_error_threshold, Some(0.05));
+    }
+
+    // ── Phase 9 Task 9.2 gate tests ─────────────────────────────────
+
+    #[test]
+    fn test_override_inline_schema_conflict() {
+        let yaml = r#"
+pipeline:
+  name: conflict-test
+
+inputs:
+  - name: source
+    type: csv
+    path: /tmp/input.csv
+    schema:
+      fields:
+        - name: id
+          type: integer
+    schema_overrides:
+      - name: id
+        type: float
+
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/output.csv
+
+transformations:
+  - name: t1
+    cxl: "emit x = id"
+"#;
+        let err = parse_config(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inline") || msg.contains("schema_overrides"),
+            "error should mention the conflict: {msg}"
+        );
     }
 
     // ── Phase 7 Task 7.0 gate tests ─────────────────────────────────
