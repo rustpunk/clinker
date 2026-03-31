@@ -1,12 +1,15 @@
+pub mod activity_bar;
 pub mod canvas;
 pub mod command_palette;
 pub mod composition_panel;
 pub mod confirm_dialog;
 pub mod inspector;
+pub mod placeholder_page;
 pub mod run_log;
 pub mod schema_panel;
 pub mod schematics;
 pub mod search_panel;
+pub mod settings_overlay;
 pub mod status_bar;
 pub mod template_gallery;
 pub mod version_mode;

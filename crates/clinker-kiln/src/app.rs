@@ -7,19 +7,26 @@
 ///
 /// This avoids Dioxus signal scope-ownership issues — all signals live in
 /// AppShell's scope, which outlives every child component.
+///
+/// Navigation uses a two-level model:
+/// - `NavigationContext` selects the active page (Pipeline, Channels, Git, Docs, Runs)
+/// - `PipelineLayoutMode` selects the view within Pipeline (Canvas, Hybrid, Editor)
 
 use clinker_git::GitOps;
 use dioxus::prelude::*;
 
 use crate::components::{
+    activity_bar::ActivityBar,
     canvas::CanvasPanel,
     inspector::InspectorPanel,
     run_log::RunLogDrawer,
     composition_panel::CompositionPanel,
+    placeholder_page::PlaceholderPage,
     schema_panel::SchemaPanel,
     schematics::SchematicsPanel,
     command_palette::CommandPalette,
     search_panel::SearchPanel,
+    settings_overlay::SettingsOverlay,
     status_bar::StatusBar,
     tab_bar::TabBar,
     template_gallery::TemplateGallery,
@@ -35,8 +42,8 @@ use clinker_schema::SchemaIndex;
 
 use crate::keyboard::handle_keyboard;
 use crate::recent_files::load_recent_files;
-use crate::state::{AppState, LayoutPreset, LeftPanel, TabManagerState, use_app_state};
-use crate::sync::{parse_yaml, serialize_yaml, EditSource};
+use crate::state::{AppState, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState, use_app_state};
+use crate::sync::{serialize_yaml, try_parse_yaml, EditSource, ParseResult};
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -58,6 +65,7 @@ pub fn AppShell() -> Element {
     let raw_pipeline = use_signal(|| None);
     let compositions = use_signal(Vec::new);
     let contract_warnings = use_signal(Vec::new);
+    let mut partial_pipeline = use_signal(|| None);
 
     // ── Session restore (single call on first mount per use_signal) ─────
     // restore_session() is called in the first use_signal closure. The result
@@ -66,9 +74,16 @@ pub fn AppShell() -> Element {
     let mut session_data: Signal<Option<workspace::SessionInit>> =
         use_signal(|| Some(workspace::restore_session()));
 
-    let layout = use_signal(|| {
-        session_data.peek().as_ref().map(|s| s.layout).unwrap_or(LayoutPreset::Hybrid)
+    // ── Navigation signals ──────────────────────────────────────────────
+    let active_context = use_signal(|| {
+        session_data.peek().as_ref().map(|s| s.context).unwrap_or_default()
     });
+    let pipeline_layout = use_signal(|| {
+        session_data.peek().as_ref().map(|s| s.pipeline_layout).unwrap_or_default()
+    });
+    let activity_bar_visible = use_signal(|| true);
+    let nav_history: Signal<Vec<NavigationContext>> = use_signal(Vec::new);
+
     let mut tabs: Signal<Vec<TabEntry>> = use_signal(|| {
         session_data.write().as_mut()
             .map(|s| std::mem::take(&mut s.tabs))
@@ -91,6 +106,7 @@ pub fn AppShell() -> Element {
     let show_command_palette: Signal<bool> = use_signal(|| false);
     let mut composition_index: Signal<crate::composition_index::CompositionIndex> =
         use_signal(crate::composition_index::CompositionIndex::default);
+    let show_settings: Signal<bool> = use_signal(|| false);
 
     // ── Git: detect repo and compute status on workspace change ──────────
     {
@@ -172,15 +188,19 @@ pub fn AppShell() -> Element {
         let tabs = tabs;
         let workspace = workspace;
         let active_tab_id = active_tab_id;
-        let layout = layout;
+        let active_context = active_context;
+        let pipeline_layout = pipeline_layout;
         let run_log_expanded = run_log_expanded;
+        let activity_bar_visible = activity_bar_visible;
         move || {
             workspace::save_full_session(
                 &workspace.peek(),
                 &tabs.peek(),
                 *active_tab_id.peek(),
-                *layout.peek(),
+                *active_context.peek(),
+                *pipeline_layout.peek(),
                 *run_log_expanded.peek(),
+                *activity_bar_visible.peek(),
             );
         }
     });
@@ -192,8 +212,10 @@ pub fn AppShell() -> Element {
         let tabs = tabs;
         let workspace = workspace;
         let active_tab_id = active_tab_id;
-        let layout = layout;
+        let active_context = active_context;
+        let pipeline_layout = pipeline_layout;
         let run_log_expanded = run_log_expanded;
+        let activity_bar_visible = activity_bar_visible;
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -201,8 +223,10 @@ pub fn AppShell() -> Element {
                     &workspace.peek(),
                     &tabs.peek(),
                     *active_tab_id.peek(),
-                    *layout.peek(),
+                    *active_context.peek(),
+                    *pipeline_layout.peek(),
                     *run_log_expanded.peek(),
+                    *activity_bar_visible.peek(),
                 );
             }
         }
@@ -223,6 +247,7 @@ pub fn AppShell() -> Element {
             if let Some(old_tab) = tabs_w.iter_mut().find(|t| t.id == old_id) {
                 old_tab.snapshot.yaml_text = (yaml_text)();
                 old_tab.snapshot.pipeline = (pipeline)();
+                old_tab.snapshot.partial_pipeline = (partial_pipeline)();
                 old_tab.snapshot.parse_errors = (parse_errors)();
                 old_tab.snapshot.edit_source = (edit_source)();
                 old_tab.snapshot.selected_stage = (selected_stage)();
@@ -235,6 +260,7 @@ pub fn AppShell() -> Element {
             if let Some(new_tab) = tabs_r.iter().find(|t| t.id == new_id) {
                 yaml_text.set(new_tab.snapshot.yaml_text.clone());
                 pipeline.set(new_tab.snapshot.pipeline.clone());
+                partial_pipeline.set(new_tab.snapshot.partial_pipeline.clone());
                 parse_errors.set(new_tab.snapshot.parse_errors.clone());
                 edit_source.set(new_tab.snapshot.edit_source);
                 selected_stage.set(new_tab.snapshot.selected_stage.clone());
@@ -243,6 +269,7 @@ pub fn AppShell() -> Element {
             // No active tab — clear signals
             yaml_text.set(String::new());
             pipeline.set(None);
+            partial_pipeline.set(None);
             parse_errors.set(Vec::new());
             edit_source.set(EditSource::None);
             selected_stage.set(None);
@@ -260,8 +287,10 @@ pub fn AppShell() -> Element {
             let state = workspace::build_state_snapshot(
                 &tabs.read(),
                 active_file.as_deref(),
-                (layout)(),
+                (active_context)(),
+                (pipeline_layout)(),
                 (run_log_expanded)(),
+                (activity_bar_visible)(),
             );
             workspace::save_workspace_state(&ws.root, &state);
             workspace::save_last_workspace(&ws.root);
@@ -270,12 +299,14 @@ pub fn AppShell() -> Element {
 
     // ── Build AppState ───────────────────────────────────────────────────
     let current_app_state = AppState {
-        layout,
+        active_context,
+        pipeline_layout,
         run_log_expanded,
         selected_stage,
         inspector_width,
         yaml_text,
         pipeline,
+        partial_pipeline,
         parse_errors,
         edit_source,
         schema_warnings,
@@ -300,6 +331,9 @@ pub fn AppShell() -> Element {
         git_state,
         show_command_palette,
         composition_index,
+        show_settings,
+        activity_bar_visible,
+        nav_history,
     });
     use_context_provider(move || toast_message);
     use_context_provider(move || pending_confirm);
@@ -316,11 +350,17 @@ pub fn AppShell() -> Element {
         git_state,
         show_command_palette,
         composition_index,
+        show_settings,
+        activity_bar_visible,
+        nav_history,
     };
 
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
     {
         let mut pipeline = pipeline;
+        let mut raw_pipeline = raw_pipeline;
+        let mut compositions = compositions;
+        let mut partial_pipeline = partial_pipeline;
         let mut parse_errors = parse_errors;
 
         use_effect(move || {
@@ -331,12 +371,26 @@ pub fn AppShell() -> Element {
                 return;
             }
 
-            match parse_yaml(&text) {
-                Ok(config) => {
-                    pipeline.set(Some(config));
+            let ws_root = workspace
+                .read()
+                .as_ref()
+                .map(|ws| ws.root.clone());
+
+            match try_parse_yaml(&text, ws_root.as_deref()) {
+                ParseResult::Complete(resolved) => {
+                    pipeline.set(Some(resolved.resolved));
+                    raw_pipeline.set(Some(resolved.raw));
+                    compositions.set(resolved.compositions);
+                    partial_pipeline.set(None);
                     parse_errors.set(Vec::new());
                 }
-                Err(errors) => {
+                ParseResult::Partial(partial) => {
+                    pipeline.set(None);
+                    partial_pipeline.set(Some(partial.clone()));
+                    parse_errors.set(partial.errors);
+                }
+                ParseResult::Failed(errors) => {
+                    partial_pipeline.set(None);
                     parse_errors.set(errors);
                 }
             }
@@ -386,6 +440,7 @@ pub fn AppShell() -> Element {
         use_effect(move || {
             let text = (yaml_text)();
             let pl = (pipeline)();
+            let pp = (partial_pipeline)();
             let errs = (parse_errors)();
             let src = (edit_source)();
             let sel = (selected_stage)();
@@ -395,6 +450,7 @@ pub fn AppShell() -> Element {
                 if let Some(tab) = tabs_w.iter_mut().find(|t| t.id == active_id) {
                     tab.snapshot.yaml_text = text;
                     tab.snapshot.pipeline = pl;
+                    tab.snapshot.partial_pipeline = pp;
                     tab.snapshot.parse_errors = errs;
                     tab.snapshot.edit_source = src;
                     tab.snapshot.selected_stage = sel;
@@ -404,6 +460,7 @@ pub fn AppShell() -> Element {
     }
 
     let has_active_tab = current_active.is_some();
+    let current_ctx = (active_context)();
 
     rsx! {
         document::Stylesheet { href: KILN_CSS }
@@ -419,14 +476,54 @@ pub fn AppShell() -> Element {
             },
 
             TitleBar {}
-            TabBar {}
 
-            if has_active_tab {
-                ActiveTabContent {
-                    key: "{current_active.map(|id| id.to_string()).unwrap_or_default()}",
+            // ── Body: activity bar + content area ──
+            div {
+                class: "kiln-body",
+
+                ActivityBar {}
+
+                div {
+                    class: "kiln-content-area",
+
+                    // Tab bar: Pipeline context only
+                    if current_ctx == NavigationContext::Pipeline {
+                        TabBar {}
+                    }
+
+                    // Context content dispatch with cross-fade
+                    div {
+                        class: "kiln-context-content",
+                        key: "{current_ctx.as_data_attr()}",
+                        "data-context": current_ctx.as_data_attr(),
+
+                        match current_ctx {
+                            NavigationContext::Pipeline => rsx! {
+                                if has_active_tab {
+                                    ActiveTabContent {
+                                        key: "{current_active.map(|id| id.to_string()).unwrap_or_default()}",
+                                    }
+                                } else {
+                                    WelcomeScreen {}
+                                }
+                            },
+                            NavigationContext::Git => rsx! { VersionMode {} },
+                            NavigationContext::Docs => rsx! { SchematicsPanel {} },
+                            NavigationContext::Channels => rsx! {
+                                PlaceholderPage {
+                                    name: "Channels",
+                                    description: "Channel management, pipeline overrides, and health monitoring.",
+                                }
+                            },
+                            NavigationContext::Runs => rsx! {
+                                PlaceholderPage {
+                                    name: "Run History",
+                                    description: "Pipeline execution history, filtering, and run detail breakdowns.",
+                                }
+                            },
+                        }
+                    }
                 }
-            } else {
-                WelcomeScreen {}
             }
 
             RunLogDrawer {}
@@ -473,51 +570,47 @@ pub fn AppShell() -> Element {
     }
 }
 
-/// Active tab's content area — keyed on tab ID for clean remount.
+/// Active tab's content area — Pipeline context only.
+///
+/// Renders canvas, inspector, YAML sidebar, and left panel slot.
+/// Keyed on tab ID for clean remount.
 #[component]
 fn ActiveTabContent() -> Element {
     let state = use_app_state();
-    let layout = state.layout;
+    let pipeline_layout = state.pipeline_layout;
     let selected_stage = state.selected_stage;
-    let mut tab_mgr = use_context::<TabManagerState>();
+    let tab_mgr = use_context::<TabManagerState>();
     let left_panel = (tab_mgr.left_panel)();
-
-    let is_version = *layout.read() == LayoutPreset::Version;
 
     rsx! {
         div {
             class: "kiln-main",
-            "data-layout": layout.read().as_data_attr(),
+            "data-layout": pipeline_layout.read().as_data_attr(),
 
-            if is_version {
-                VersionMode {}
-            } else {
-                // ── Left panel slot (280px, shared between Search and Schemas) ──
-                match left_panel {
-                    LeftPanel::Search => rsx! {
-                        SearchPanel {}
-                    },
-                    LeftPanel::Schemas => rsx! {
-                        SchemaPanel {}
-                    },
-                    LeftPanel::Compositions => rsx! {
-                        CompositionPanel {}
-                    },
-                    LeftPanel::None => rsx! {},
-                }
-
-                CanvasPanel {}
-
-                if let Some(ref stage_id) = (selected_stage)() {
-                    InspectorPanel {
-                        key: "{stage_id}",
-                        stage_id: stage_id.clone(),
-                    }
-                }
-
-                YamlSidebar {}
-                SchematicsPanel {}
+            // ── Left panel slot (280px, shared between Search, Schemas, Compositions) ──
+            match left_panel {
+                LeftPanel::Search => rsx! {
+                    SearchPanel {}
+                },
+                LeftPanel::Schemas => rsx! {
+                    SchemaPanel {}
+                },
+                LeftPanel::Compositions => rsx! {
+                    CompositionPanel {}
+                },
+                LeftPanel::None => rsx! {},
             }
+
+            CanvasPanel {}
+
+            if let Some(ref stage_id) = (selected_stage)() {
+                InspectorPanel {
+                    key: "{stage_id}",
+                    stage_id: stage_id.clone(),
+                }
+            }
+
+            YamlSidebar {}
         }
     }
 }

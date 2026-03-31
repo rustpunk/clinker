@@ -10,6 +10,7 @@ pub mod log_rules;
 pub mod log_template;
 pub mod metrics;
 pub mod modules;
+pub mod partial;
 pub mod pipeline;
 pub mod plan;
 pub mod progress;

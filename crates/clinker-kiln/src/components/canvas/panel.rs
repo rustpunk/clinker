@@ -4,7 +4,7 @@ use std::rc::Rc;
 use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
-use crate::pipeline_view::derive_pipeline_view;
+use crate::pipeline_view::{derive_pipeline_view, derive_partial_pipeline_view};
 use crate::state::use_app_state;
 
 use super::connector::Connector;
@@ -52,13 +52,16 @@ struct DragState {
 pub fn CanvasPanel() -> Element {
     let state = use_app_state();
 
-    // Derive canvas stages from the pipeline model (if parsed successfully).
+    // Derive canvas stages from the pipeline model, falling back to partial parse.
     let compositions_read = (state.compositions).read();
     let pipeline_view = match &*(state.pipeline).read() {
         Some(config) => derive_pipeline_view(config, &compositions_read),
-        None => crate::pipeline_view::PipelineView {
-            stages: Vec::new(),
-            composition_groups: Vec::new(),
+        None => match &*(state.partial_pipeline).read() {
+            Some(partial) => derive_partial_pipeline_view(partial),
+            None => crate::pipeline_view::PipelineView {
+                stages: Vec::new(),
+                composition_groups: Vec::new(),
+            },
         },
     };
     let stages = pipeline_view.stages;

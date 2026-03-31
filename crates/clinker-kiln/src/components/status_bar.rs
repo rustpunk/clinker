@@ -1,23 +1,29 @@
 //! Status bar — 22px persistent bottom bar.
 //!
-//! Shows: branch + sync state, file change counts, cursor position,
-//! encoding, language, git engine. Git segments hidden when no repo.
-//! Branch segment is clickable → opens branch switcher dropdown.
-//! Changes segment clickable → switches to Version Mode.
-//! Spec: clinker-kiln-git-addendum.md §G3.
+//! Context-aware information display. Adapts content per active context:
+//! - Pipeline: branch, file changes, cursor, encoding, language
+//! - Git: branch, sync state, change counts (prominent)
+//! - Docs: pipeline name, stage count
+//! - Channels/Runs: minimal (workspace label)
+//!
+//! Branch segment clickable → opens branch switcher dropdown.
+//! Changes segment clickable → switches to Git context.
+//! Spec: clinker-kiln-git-addendum.md §G3, navigation addendum §N5.
 
 use dioxus::prelude::*;
 
 use clinker_git::GitOps;
 
+use crate::components::activity_bar::switch_context;
 use crate::components::toast::{toast_error, toast_success, ToastState};
-use crate::state::{LayoutPreset, TabManagerState, use_app_state};
+use crate::state::{NavigationContext, TabManagerState, use_app_state};
 
 /// Status bar component — anchored to viewport bottom.
 #[component]
 pub fn StatusBar() -> Element {
     let mut tab_mgr = use_context::<TabManagerState>();
     let state = use_app_state();
+    let current_ctx = (state.active_context)();
     let git = (tab_mgr.git_state)();
     let mut show_branch_switcher = use_signal(|| false);
     let is_switcher_open = (show_branch_switcher)();
@@ -26,77 +32,102 @@ pub fn StatusBar() -> Element {
         div {
             class: "kiln-status-bar",
 
-            // ── Git segments (hidden when no repo) ──────────────────────
-            if let Some(ref status) = git {
-                // Branch segment (clickable → branch switcher)
-                div {
-                    class: "kiln-status-segment kiln-status-segment--branch kiln-status-segment--clickable",
-                    onclick: move |_| show_branch_switcher.set(!is_switcher_open),
-                    span { class: "kiln-status__branch-icon", "⑂" }
-                    span { class: "kiln-status__branch-name",
-                        {
-                            if status.branch.len() > 20 {
-                                format!("{}…", &status.branch[..19])
-                            } else {
-                                status.branch.clone()
+            // ── Context indicator ──────────────────────────────────────
+            div {
+                class: "kiln-status-segment kiln-status-segment--context",
+                "clinker ●"
+            }
+            div { class: "kiln-status-divider" }
+            div {
+                class: "kiln-status-segment",
+                match current_ctx {
+                    NavigationContext::Pipeline => {
+                        let mode = (state.pipeline_layout)();
+                        format!("Pipeline · {}", mode.label())
+                    },
+                    other => other.label().to_string(),
+                }
+            }
+            div { class: "kiln-status-divider" }
+
+            // ── Git segments (shown in Pipeline + Git contexts) ─────────
+            if matches!(current_ctx, NavigationContext::Pipeline | NavigationContext::Git) {
+                if let Some(ref status) = git {
+                    // Branch segment (clickable → branch switcher)
+                    div {
+                        class: "kiln-status-segment kiln-status-segment--branch kiln-status-segment--clickable",
+                        onclick: move |_| show_branch_switcher.set(!is_switcher_open),
+                        span { class: "kiln-status__branch-icon", "⑂" }
+                        span { class: "kiln-status__branch-name",
+                            {
+                                if status.branch.len() > 20 {
+                                    format!("{}…", &status.branch[..19])
+                                } else {
+                                    status.branch.clone()
+                                }
                             }
                         }
+                        if status.ahead > 0 {
+                            span { class: "kiln-status__ahead", "↑{status.ahead}" }
+                        }
+                        if status.behind > 0 {
+                            span { class: "kiln-status__behind", "↓{status.behind}" }
+                        }
                     }
-                    if status.ahead > 0 {
-                        span { class: "kiln-status__ahead", "↑{status.ahead}" }
-                    }
-                    if status.behind > 0 {
-                        span { class: "kiln-status__behind", "↓{status.behind}" }
-                    }
-                }
 
-                div { class: "kiln-status-divider" }
-
-                // Changes segment (clickable → Version Mode)
-                if status.has_changes() {
-                    div {
-                        class: "kiln-status-segment kiln-status-segment--changes kiln-status-segment--clickable",
-                        onclick: move |_| {
-                            let mut layout = state.layout;
-                            layout.set(LayoutPreset::Version);
-                        },
-                        if status.added > 0 {
-                            span { class: "kiln-status__added", "+{status.added}" }
-                        }
-                        if status.modified > 0 {
-                            span { class: "kiln-status__modified", "~{status.modified}" }
-                        }
-                        if status.deleted > 0 {
-                            span { class: "kiln-status__deleted", "−{status.deleted}" }
-                        }
-                        if status.untracked > 0 {
-                            span { class: "kiln-status__untracked", "?{status.untracked}" }
-                        }
-                    }
                     div { class: "kiln-status-divider" }
+
+                    // Changes segment (clickable → Git context)
+                    if status.has_changes() {
+                        div {
+                            class: "kiln-status-segment kiln-status-segment--changes kiln-status-segment--clickable",
+                            onclick: move |_| {
+                                switch_context(&state, &tab_mgr, NavigationContext::Git);
+                            },
+                            if status.added > 0 {
+                                span { class: "kiln-status__added", "+{status.added}" }
+                            }
+                            if status.modified > 0 {
+                                span { class: "kiln-status__modified", "~{status.modified}" }
+                            }
+                            if status.deleted > 0 {
+                                span { class: "kiln-status__deleted", "−{status.deleted}" }
+                            }
+                            if status.untracked > 0 {
+                                span { class: "kiln-status__untracked", "?{status.untracked}" }
+                            }
+                        }
+                        div { class: "kiln-status-divider" }
+                    }
                 }
             }
 
-            // ── Cursor segment ──────────────────────────────────────────
-            div {
-                class: "kiln-status-segment kiln-status-segment--cursor",
-                "Ln 1, Col 1"
+            // ── Pipeline context: cursor, encoding, language ────────────
+            if current_ctx == NavigationContext::Pipeline {
+                div {
+                    class: "kiln-status-segment kiln-status-segment--cursor",
+                    "Ln 1, Col 1"
+                }
+                div { class: "kiln-status-divider" }
+                div {
+                    class: "kiln-status-segment kiln-status-segment--encoding",
+                    "UTF-8"
+                }
+                div { class: "kiln-status-divider" }
+                div {
+                    class: "kiln-status-segment kiln-status-segment--lang",
+                    "YAML"
+                }
             }
 
-            div { class: "kiln-status-divider" }
-
-            // ── Encoding segment ────────────────────────────────────────
-            div {
-                class: "kiln-status-segment kiln-status-segment--encoding",
-                "UTF-8"
-            }
-
-            div { class: "kiln-status-divider" }
-
-            // ── Language segment ────────────────────────────────────────
-            div {
-                class: "kiln-status-segment kiln-status-segment--lang",
-                "YAML"
+            // ── Docs context: pipeline info ─────────────────────────────
+            if current_ctx == NavigationContext::Docs {
+                if let Some(ref config) = (state.pipeline)() {
+                    div {
+                        class: "kiln-status-segment",
+                        "{config.transformations.len()} stages"
+                    }
+                }
             }
 
             // ── Spacer ─────────────────────────────────────────────────

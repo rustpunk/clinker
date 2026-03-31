@@ -2,14 +2,20 @@
   "version": 1,
   "window": null,
   "layout": {
-    "preset": "version",
+    "preset": "hybrid",
     "inspector_width": null,
     "yaml_sidebar_width": null,
     "run_log_expanded": false
   },
+  "navigation": {
+    "active_context": "pipeline",
+    "pipeline_layout_mode": "hybrid",
+    "activity_bar_visible": true
+  },
   "tabs": {
     "open": [
-      "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/customer_etl.yaml"
+      "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/customer_etl.yaml",
+      "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/invoices.yaml"
     ],
     "active": "/home/glitch/code/rustpunk/clinker/.claude/worktrees/clinker-kiln-init/examples/pipelines/customer_etl.yaml"
   },

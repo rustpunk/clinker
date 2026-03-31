@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
+use clinker_core::partial::PartialPipelineConfig;
 use uuid::Uuid;
 
 use crate::file_ops::compute_hash;
-use crate::sync::{parse_yaml, EditSource};
+use crate::sync::{parse_yaml_raw_path, EditSource};
 
 /// Scaffold YAML for new untitled pipelines.
 const SCAFFOLD_YAML: &str = r#"source:
@@ -53,6 +54,8 @@ pub struct TabSnapshot {
     pub compositions: Vec<ResolvedComposition>,
     /// Contract validation warnings from composition imports.
     pub contract_warnings: Vec<ContractWarning>,
+    /// Partial pipeline from graceful degradation (when full parse fails).
+    pub partial_pipeline: Option<PartialPipelineConfig>,
     pub parse_errors: Vec<String>,
     pub edit_source: EditSource,
     pub selected_stage: Option<String>,
@@ -94,10 +97,11 @@ impl TabEntry {
             content_hash: None,
             snapshot: TabSnapshot {
                 yaml_text: SCAFFOLD_YAML.to_string(),
-                pipeline: parse_yaml(SCAFFOLD_YAML).ok(),
+                pipeline: parse_yaml_raw_path(SCAFFOLD_YAML).ok(),
                 raw_pipeline: None,
                 compositions: Vec::new(),
                 contract_warnings: Vec::new(),
+                partial_pipeline: None,
                 parse_errors: Vec::new(),
                 edit_source: EditSource::None,
                 selected_stage: None,
@@ -109,7 +113,7 @@ impl TabEntry {
     /// Create a tab from a file on disk.
     pub fn from_file(path: PathBuf, yaml: String) -> Self {
         let hash = compute_hash(&yaml);
-        let (config, errors) = match parse_yaml(&yaml) {
+        let (config, errors) = match parse_yaml_raw_path(&yaml) {
             Ok(c) => (Some(c), Vec::new()),
             Err(e) => (None, e),
         };
@@ -125,6 +129,7 @@ impl TabEntry {
                 raw_pipeline: None,
                 compositions: Vec::new(),
                 contract_warnings: Vec::new(),
+                partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
@@ -149,7 +154,7 @@ impl TabEntry {
             format!("untitled-{}.yaml", untitled_count + 1)
         };
 
-        let (config, errors) = match parse_yaml(&yaml) {
+        let (config, errors) = match parse_yaml_raw_path(&yaml) {
             Ok(c) => (Some(c), Vec::new()),
             Err(e) => (None, e),
         };
@@ -165,6 +170,7 @@ impl TabEntry {
                 raw_pipeline: None,
                 compositions: Vec::new(),
                 contract_warnings: Vec::new(),
+                partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
@@ -175,7 +181,7 @@ impl TabEntry {
 
     /// Create a tab pre-loaded with demo YAML.
     pub fn new_demo(yaml: &str) -> Self {
-        let (config, errors) = match parse_yaml(yaml) {
+        let (config, errors) = match parse_yaml_raw_path(yaml) {
             Ok(c) => (Some(c), Vec::new()),
             Err(e) => (None, e),
         };
@@ -191,6 +197,7 @@ impl TabEntry {
                 raw_pipeline: None,
                 compositions: Vec::new(),
                 contract_warnings: Vec::new(),
+                partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,

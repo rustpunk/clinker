@@ -13,13 +13,16 @@ pub fn CanvasNode(stage: StageView) -> Element {
 
     let is_selected = (state.selected_stage)().as_deref() == Some(stage_id.as_str());
     let is_composition = matches!(&stage.kind, StageKind::Composition(_));
+    let is_error = matches!(&stage.kind, StageKind::Error);
     let is_from_composition = stage.from_composition.is_some();
 
-    let node_class = match (is_selected, is_composition) {
-        (true, true) => "kiln-node kiln-node--selected kiln-node--composition",
-        (false, true) => "kiln-node kiln-node--composition",
-        (true, false) => "kiln-node kiln-node--selected",
-        (false, false) => "kiln-node",
+    let node_class = match (is_selected, is_composition, is_error) {
+        (true, true, _) => "kiln-node kiln-node--selected kiln-node--composition",
+        (false, true, _) => "kiln-node kiln-node--composition",
+        (_, _, true) if is_selected => "kiln-node kiln-node--selected kiln-node--error",
+        (_, _, true) => "kiln-node kiln-node--error",
+        (true, false, false) => "kiln-node kiln-node--selected",
+        (false, false, false) => "kiln-node",
     };
 
     // Composition transforms from an import get a subtle indicator

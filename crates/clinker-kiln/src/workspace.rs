@@ -97,6 +97,8 @@ pub struct WorkspaceState {
     #[serde(default)]
     pub layout: Option<LayoutState>,
     #[serde(default)]
+    pub navigation: Option<NavigationPersistence>,
+    #[serde(default)]
     pub tabs: Option<TabsState>,
     #[serde(default)]
     pub pipelines: HashMap<String, PipelineEditorState>,
@@ -105,6 +107,17 @@ pub struct WorkspaceState {
     /// Search history and saved queries (spec §S2.6).
     #[serde(default)]
     pub search: Option<SearchState>,
+}
+
+/// Persisted navigation state — active context, pipeline layout mode, focus mode.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NavigationPersistence {
+    /// Active context: "pipeline", "channels", "git", "docs", "runs".
+    pub active_context: String,
+    /// Pipeline layout mode: "canvas", "hybrid", "editor".
+    pub pipeline_layout_mode: String,
+    /// Whether the activity bar is visible (focus mode toggle).
+    pub activity_bar_visible: bool,
 }
 
 /// Persisted search state — recent and saved queries.
@@ -118,6 +131,15 @@ pub struct SearchState {
     pub saved: Vec<crate::search::SearchHistoryEntry>,
 }
 
+/// Legacy layout state — kept for backwards compatibility with old state files.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayoutState {
+    pub preset: String,
+    pub inspector_width: Option<f32>,
+    pub yaml_sidebar_width: Option<f32>,
+    pub run_log_expanded: Option<bool>,
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -129,14 +151,6 @@ pub struct WindowGeometry {
     pub width: u32,
     pub height: u32,
     pub maximized: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LayoutState {
-    pub preset: String,
-    pub inspector_width: Option<f32>,
-    pub yaml_sidebar_width: Option<f32>,
-    pub run_log_expanded: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -412,8 +426,10 @@ pub fn save_full_session(
     workspace: &Option<Workspace>,
     tabs: &[TabEntry],
     active_tab_id: Option<crate::tab::TabId>,
-    layout: LayoutPreset,
+    context: NavigationContext,
+    pipeline_layout: PipelineLayoutMode,
     run_log_expanded: bool,
+    activity_bar_visible: bool,
 ) {
     let Some(ws) = workspace else { return };
 
@@ -424,7 +440,14 @@ pub fn save_full_session(
             .map(|p| p.display().to_string())
     });
 
-    let state = build_state_snapshot(tabs, active_file.as_deref(), layout, run_log_expanded);
+    let state = build_state_snapshot(
+        tabs,
+        active_file.as_deref(),
+        context,
+        pipeline_layout,
+        run_log_expanded,
+        activity_bar_visible,
+    );
     save_workspace_state(&ws.root, &state);
     save_last_workspace(&ws.root);
 }
@@ -447,15 +470,17 @@ pub fn load_last_workspace() -> Option<PathBuf> {
 // ── Session save/restore helpers ────────────────────────────────────────
 
 use crate::file_ops;
-use crate::state::LayoutPreset;
+use crate::state::{NavigationContext, PipelineLayoutMode};
 use crate::tab::TabEntry;
 
 /// Build a WorkspaceState from current app state for persistence.
 pub fn build_state_snapshot(
     tabs: &[TabEntry],
     active_file: Option<&str>,
-    layout: LayoutPreset,
+    context: NavigationContext,
+    pipeline_layout: PipelineLayoutMode,
     run_log_expanded: bool,
+    activity_bar_visible: bool,
 ) -> WorkspaceState {
     let open_paths: Vec<String> = tabs
         .iter()
@@ -467,10 +492,15 @@ pub fn build_state_snapshot(
         version: 1,
         window: None, // TODO: save window geometry
         layout: Some(LayoutState {
-            preset: layout.as_data_attr().to_string(),
+            preset: pipeline_layout.as_data_attr().to_string(),
             inspector_width: None,
             yaml_sidebar_width: None,
             run_log_expanded: Some(run_log_expanded),
+        }),
+        navigation: Some(NavigationPersistence {
+            active_context: context.as_data_attr().to_string(),
+            pipeline_layout_mode: pipeline_layout.as_data_attr().to_string(),
+            activity_bar_visible,
         }),
         tabs: Some(TabsState {
             open: open_paths,
@@ -499,16 +529,44 @@ pub fn restore_tabs(state: &WorkspaceState) -> (Vec<TabEntry>, Option<String>) {
     (tabs, tabs_state.active.clone())
 }
 
-/// Resolve a LayoutPreset from a string (for state restore).
-pub fn parse_layout_preset(s: &str) -> LayoutPreset {
-    match s {
-        "canvas-focus" => LayoutPreset::CanvasFocus,
-        "hybrid" => LayoutPreset::Hybrid,
-        "editor-focus" => LayoutPreset::EditorFocus,
-        "schematics" => LayoutPreset::Schematics,
-        "version" => LayoutPreset::Version,
-        _ => LayoutPreset::Hybrid,
+/// Parse navigation state from persisted data.
+///
+/// Reads the `navigation` field first (new format). Falls back to the
+/// `layout.preset` field for backwards compatibility with old state files
+/// that used the flat `LayoutPreset` enum.
+pub fn parse_navigation_state(state: &WorkspaceState) -> (NavigationContext, PipelineLayoutMode) {
+    // New format: explicit navigation section
+    if let Some(ref nav) = state.navigation {
+        let context = match nav.active_context.as_str() {
+            "pipeline" => NavigationContext::Pipeline,
+            "channels" => NavigationContext::Channels,
+            "git" => NavigationContext::Git,
+            "docs" => NavigationContext::Docs,
+            "runs" => NavigationContext::Runs,
+            _ => NavigationContext::Pipeline,
+        };
+        let layout = match nav.pipeline_layout_mode.as_str() {
+            "canvas" => PipelineLayoutMode::Canvas,
+            "hybrid" => PipelineLayoutMode::Hybrid,
+            "editor" => PipelineLayoutMode::Editor,
+            _ => PipelineLayoutMode::Hybrid,
+        };
+        return (context, layout);
     }
+
+    // Legacy format: map old LayoutPreset strings to (context, layout) pairs
+    if let Some(ref layout_state) = state.layout {
+        return match layout_state.preset.as_str() {
+            "canvas-focus" | "canvas" => (NavigationContext::Pipeline, PipelineLayoutMode::Canvas),
+            "hybrid" => (NavigationContext::Pipeline, PipelineLayoutMode::Hybrid),
+            "editor-focus" | "editor" => (NavigationContext::Pipeline, PipelineLayoutMode::Editor),
+            "schematics" => (NavigationContext::Docs, PipelineLayoutMode::Hybrid),
+            "version" => (NavigationContext::Git, PipelineLayoutMode::Hybrid),
+            _ => (NavigationContext::Pipeline, PipelineLayoutMode::Hybrid),
+        };
+    }
+
+    (NavigationContext::Pipeline, PipelineLayoutMode::Hybrid)
 }
 
 /// Show a native directory picker and try to open it as a workspace.
@@ -537,7 +595,8 @@ pub struct SessionInit {
     pub tabs: Vec<TabEntry>,
     pub active_tab_id: Option<TabId>,
     pub workspace: Option<Workspace>,
-    pub layout: LayoutPreset,
+    pub context: NavigationContext,
+    pub pipeline_layout: PipelineLayoutMode,
 }
 
 /// Restore the previous session on app startup.
@@ -546,7 +605,7 @@ pub struct SessionInit {
 /// 1. `--workspace <path>` CLI argument (highest priority)
 /// 2. Last-used workspace (from `~/.local/share/clinker-kiln/last-workspace.json`)
 /// 3. Workspace detected from CWD (ancestor walk for `kiln.toml`)
-/// 4. Defaults (empty tabs, no workspace, Hybrid layout)
+/// 4. Defaults (empty tabs, no workspace, Pipeline context, Hybrid layout)
 pub fn restore_session() -> SessionInit {
     // 1. Try CLI --workspace arg
     if let Some(ws_path) = crate::cli_workspace() {
@@ -574,7 +633,8 @@ pub fn restore_session() -> SessionInit {
         tabs: Vec::new(),
         active_tab_id: None,
         workspace: None,
-        layout: LayoutPreset::Hybrid,
+        context: NavigationContext::Pipeline,
+        pipeline_layout: PipelineLayoutMode::Hybrid,
     }
 }
 
@@ -586,10 +646,8 @@ fn try_restore_from_last_workspace() -> Option<SessionInit> {
 fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
     let ws = load_workspace(ws_root)?;
 
-    // Extract layout before moving ws
-    let layout = ws.state.layout.as_ref()
-        .map(|ls| parse_layout_preset(&ls.preset))
-        .unwrap_or(LayoutPreset::Hybrid);
+    // Extract navigation state before moving ws
+    let (context, pipeline_layout) = parse_navigation_state(&ws.state);
 
     let (restored_tabs, active_path) = restore_tabs(&ws.state);
 
@@ -598,7 +656,8 @@ fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
             tabs: Vec::new(),
             active_tab_id: None,
             workspace: Some(ws),
-            layout,
+            context,
+            pipeline_layout,
         });
     }
 
@@ -618,6 +677,7 @@ fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
         tabs: restored_tabs,
         active_tab_id,
         workspace: Some(ws),
-        layout,
+        context,
+        pipeline_layout,
     })
 }

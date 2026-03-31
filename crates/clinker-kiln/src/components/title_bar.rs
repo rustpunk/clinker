@@ -2,21 +2,27 @@ use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 
 use crate::keyboard;
-use crate::state::{use_app_state, LayoutPreset, TabManagerState};
+use crate::state::{use_app_state, NavigationContext, PipelineLayoutMode, TabManagerState};
 use crate::tab::TabEntry;
 
-/// Custom frameless title bar with file action buttons.
+/// Custom frameless title bar with context-aware content.
 ///
-/// Elements (left -> right):
-///   [clinker][kiln]  |  [New][Open][Save]  |  workspace  |  filename
-///   ...  layout switcher  VALID
+/// Common elements (always visible):
+///   [clinker][kiln]  |  workspace-name  |  validation LED
 ///
-/// Doc: spec §8 — Title Bar, §F5 — Title Bar Integration.
+/// Pipeline context:
+///   [New][Open][Save]  |  filename  |  [Canvas|Hybrid|Editor]
+///
+/// Other contexts:
+///   Context label  |  context-specific actions
+///
+/// Doc: spec §8, §F5, addendum §N4.
 #[component]
 pub fn TitleBar() -> Element {
     let window = use_window();
     let state = use_app_state();
     let mut tab_mgr: TabManagerState = use_context();
+    let current_ctx = (state.active_context)();
 
     // Derive filename + dirty state from active tab
     let active_id = (tab_mgr.active_tab_id)();
@@ -31,7 +37,7 @@ pub fn TitleBar() -> Element {
         .as_ref()
         .map(|ws| ws.display_name());
 
-    // Validation state
+    // Validation state (only relevant in Pipeline context)
     let has_errors = !(state.parse_errors)().is_empty();
     let led_class = if has_errors || !has_active_tab {
         "kiln-led-dot kiln-led-dot--err"
@@ -46,12 +52,18 @@ pub fn TitleBar() -> Element {
         "VALID"
     };
 
+    // Mutable signal copy for layout mode switching
+    let mut pipeline_layout = state.pipeline_layout;
+
+    // Git state for Git context title bar
+    let git_branch = (tab_mgr.git_state)().as_ref().map(|gs| gs.branch.clone());
+
     rsx! {
         div {
             class: "kiln-title-bar",
             onmousedown: move |_| { window.drag(); },
 
-            // Brand badge
+            // Brand badge — always visible
             div {
                 class: "kiln-brand",
                 onmousedown: move |e| e.stop_propagation(),
@@ -61,51 +73,62 @@ pub fn TitleBar() -> Element {
 
             span { class: "kiln-title-divider" }
 
-            // ─── File action buttons ─────────────────────────────────
-            div {
-                class: "kiln-file-actions",
-                onmousedown: move |e| e.stop_propagation(),
+            // ── Pipeline context: file actions + filename ────────────────
+            if current_ctx == NavigationContext::Pipeline {
+                div {
+                    class: "kiln-file-actions",
+                    onmousedown: move |e| e.stop_propagation(),
 
-                button {
-                    class: "kiln-file-btn",
-                    title: "New pipeline (Ctrl+N)",
-                    onclick: move |_| {
-                        let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
-                        let new_id = new_tab.id;
-                        tab_mgr.tabs.write().push(new_tab);
-                        tab_mgr.active_tab_id.set(Some(new_id));
-                    },
-                    "New"
-                }
-                button {
-                    class: "kiln-file-btn",
-                    title: "Open file (Ctrl+O)",
-                    onclick: move |_| {
-                        keyboard::open_file(&mut tab_mgr);
-                    },
-                    "Open"
-                }
-                button {
-                    class: "kiln-file-btn",
-                    title: "Open workspace (Ctrl+Shift+O)",
-                    onclick: move |_| {
-                        keyboard::open_workspace(&mut tab_mgr);
-                    },
-                    "Workspace"
-                }
-                if has_active_tab {
                     button {
                         class: "kiln-file-btn",
-                        title: "Save (Ctrl+S)",
+                        title: "New pipeline (Ctrl+N)",
                         onclick: move |_| {
-                            keyboard::save_active_tab(&mut tab_mgr, false);
+                            let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
+                            let new_id = new_tab.id;
+                            tab_mgr.tabs.write().push(new_tab);
+                            tab_mgr.active_tab_id.set(Some(new_id));
                         },
-                        "Save"
+                        "New"
+                    }
+                    button {
+                        class: "kiln-file-btn",
+                        title: "Open file (Ctrl+O)",
+                        onclick: move |_| {
+                            keyboard::open_file(&mut tab_mgr);
+                        },
+                        "Open"
+                    }
+                    button {
+                        class: "kiln-file-btn",
+                        title: "Open workspace (Ctrl+Shift+O)",
+                        onclick: move |_| {
+                            keyboard::open_workspace(&mut tab_mgr);
+                        },
+                        "Workspace"
+                    }
+                    if has_active_tab {
+                        button {
+                            class: "kiln-file-btn",
+                            title: "Save (Ctrl+S)",
+                            onclick: move |_| {
+                                keyboard::save_active_tab(&mut tab_mgr, false);
+                            },
+                            "Save"
+                        }
                     }
                 }
+
+                span { class: "kiln-title-divider" }
             }
 
-            span { class: "kiln-title-divider" }
+            // ── Non-Pipeline contexts: context label ────────────────────
+            if current_ctx != NavigationContext::Pipeline {
+                span {
+                    class: "kiln-title-context-label",
+                    "{current_ctx.label()}"
+                }
+                span { class: "kiln-title-divider" }
+            }
 
             // Workspace name (if in workspace mode)
             if let Some(ref name) = ws_name {
@@ -116,49 +139,47 @@ pub fn TitleBar() -> Element {
                 span { class: "kiln-title-divider" }
             }
 
-            // Filename with dirty indicator
-            span {
-                class: "kiln-title-filename",
-                if is_dirty { "\u{25CF} " } else { "" }
-                "{filename}"
+            // Pipeline context: filename with dirty indicator
+            if current_ctx == NavigationContext::Pipeline {
+                span {
+                    class: "kiln-title-filename",
+                    if is_dirty { "\u{25CF} " } else { "" }
+                    "{filename}"
+                }
+            }
+
+            // Git context: branch name
+            if current_ctx == NavigationContext::Git {
+                if let Some(ref branch) = git_branch {
+                    span {
+                        class: "kiln-title-branch",
+                        "⑂ {branch}"
+                    }
+                }
             }
 
             // Flex spacer
             span { class: "kiln-title-spacer" }
 
-            // Layout preset switcher (only show when a tab is active)
-            if has_active_tab {
+            // ── Pipeline context: layout mode switcher ───────────────────
+            if current_ctx == NavigationContext::Pipeline && has_active_tab {
                 div {
                     class: "kiln-layout-switcher",
                     onmousedown: move |e| e.stop_propagation(),
 
-                    for preset in [LayoutPreset::CanvasFocus, LayoutPreset::Hybrid, LayoutPreset::EditorFocus, LayoutPreset::Schematics, LayoutPreset::Version] {
+                    for mode in PipelineLayoutMode::ALL {
                         {
-                            let is_active = (state.layout)() == preset;
-                            let is_version = preset == LayoutPreset::Version;
-                            let has_git = (tab_mgr.git_state)().is_some();
-
-                            // Version button: disabled when no git repo, ok-green accent when active
-                            let class = if is_version && is_active {
-                                "kiln-layout-btn kiln-layout-btn--version-active"
-                            } else if is_version && !has_git {
-                                "kiln-layout-btn kiln-layout-btn--disabled"
-                            } else {
-                                "kiln-layout-btn"
-                            };
+                            let is_active = (state.pipeline_layout)() == mode;
 
                             rsx! {
                                 button {
-                                    key: "{preset.label()}",
-                                    class: "{class}",
+                                    key: "{mode.label()}",
+                                    class: "kiln-layout-btn",
                                     "data-active": if is_active { "true" } else { "false" },
-                                    disabled: is_version && !has_git,
-                                    title: if is_version && !has_git { "No git repository detected" } else { "" },
                                     onclick: move |_| {
-                                        let mut layout = state.layout;
-                                        layout.set(preset);
+                                        pipeline_layout.set(mode);
                                     },
-                                    "{preset.label()}"
+                                    "{mode.label()}"
                                 }
                             }
                         }
@@ -166,8 +187,8 @@ pub fn TitleBar() -> Element {
                 }
             }
 
-            // Validation LED
-            if has_active_tab {
+            // Validation LED — always visible when Pipeline has active tab
+            if current_ctx == NavigationContext::Pipeline && has_active_tab {
                 div {
                     class: "kiln-validation-led",
                     onmousedown: move |e| e.stop_propagation(),

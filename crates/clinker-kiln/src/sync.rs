@@ -132,6 +132,47 @@ fn raw_to_resolved_no_imports(raw: &RawPipelineConfig) -> Result<PipelineConfig,
     })
 }
 
+/// Parse YAML into a PipelineConfig using the raw (composition-aware) path.
+///
+/// Skips import resolution (no workspace root). Used by tab constructors
+/// where workspace context isn't available yet — imports resolve on the
+/// first sync effect run after tab creation.
+pub fn parse_yaml_raw_path(yaml: &str) -> Result<PipelineConfig, Vec<String>> {
+    let raw = parse_raw_yaml(yaml)?;
+    raw_to_resolved_no_imports(&raw)
+}
+
+// ── Partial parsing (graceful degradation) ──────────────────────────────
+
+/// Result of attempting to parse a pipeline YAML with fallback.
+pub enum ParseResult {
+    /// Fully successful parse — all items valid, imports resolved.
+    Complete(ResolvedPipeline),
+    /// YAML is syntactically valid but some items failed to deserialize.
+    Partial(clinker_core::partial::PartialPipelineConfig),
+    /// Total failure — YAML syntax is broken, nothing recoverable.
+    Failed(Vec<String>),
+}
+
+/// Try to parse pipeline YAML with graceful fallback.
+///
+/// 1. Fast path: `parse_and_resolve_yaml` (all-or-nothing).
+/// 2. Fallback: `parse_partial_config` (per-item).
+/// 3. If both fail: return `Failed`.
+pub fn try_parse_yaml(yaml: &str, workspace_root: Option<&Path>) -> ParseResult {
+    // Fast path: try full parse
+    match parse_and_resolve_yaml(yaml, workspace_root) {
+        Ok(resolved) => return ParseResult::Complete(resolved),
+        Err(_) => {}
+    }
+
+    // Fallback: per-item partial parse
+    match clinker_core::partial::parse_partial_config(yaml) {
+        Ok(partial) => ParseResult::Partial(partial),
+        Err(e) => ParseResult::Failed(vec![e]),
+    }
+}
+
 // ── Serialization ───────────────────────────────────────────────────────
 
 /// Serialize a `PipelineConfig` back to YAML text (legacy path, no composition support).

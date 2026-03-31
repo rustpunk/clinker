@@ -25,6 +25,8 @@ pub enum StageKind {
     Output,
     /// A collapsed composition node (5+ transforms).
     Composition(CompositionNodeMeta),
+    /// A node that failed to parse — shown as a red error placeholder.
+    Error,
 }
 
 impl StageKind {
@@ -35,6 +37,7 @@ impl StageKind {
             StageKind::Transform => "#C75B2A",      // ember
             StageKind::Output => "#B7410E",         // oxide-red
             StageKind::Composition(_) => "#43B3AE", // verdigris (same as source)
+            StageKind::Error => "#CC3333",          // danger red
         }
     }
 
@@ -45,6 +48,7 @@ impl StageKind {
             StageKind::Transform => "TRANSFORM",
             StageKind::Output => "OUTPUT",
             StageKind::Composition(_) => "COMPOSITION",
+            StageKind::Error => "ERROR",
         }
     }
 }
@@ -107,6 +111,8 @@ pub struct StageView {
     pub description: Option<String>,
     /// If this transform came from a composition (for grouping, badges, and override editing).
     pub from_composition: Option<CompositionOrigin>,
+    /// Error message for `StageKind::Error` nodes (partial parse failures).
+    pub error_message: Option<String>,
 }
 
 impl StageView {
@@ -168,6 +174,7 @@ pub fn derive_pipeline_view(
             cxl_source: None,
             description: None,
             from_composition: None,
+            error_message: None,
         });
         x += NODE_WIDTH + NODE_GAP;
         idx += 1;
@@ -202,6 +209,7 @@ pub fn derive_pipeline_view(
                         cxl_source: Some(t.cxl.clone()),
                         description: t.description.clone(),
                         from_composition: origin,
+                        error_message: None,
                     });
                     x += NODE_WIDTH + NODE_GAP;
                     idx += 1;
@@ -250,6 +258,7 @@ pub fn derive_pipeline_view(
                     cxl_source: None,
                     description: comp.meta.description.clone(),
                     from_composition: None,
+                    error_message: None,
                 });
                 x += NODE_WIDTH + NODE_GAP;
                 idx += 1;
@@ -269,6 +278,7 @@ pub fn derive_pipeline_view(
                 cxl_source: Some(transform.cxl.clone()),
                 description: transform.description.clone(),
                 from_composition: None,
+                error_message: None,
             });
             x += NODE_WIDTH + NODE_GAP;
             idx += 1;
@@ -289,6 +299,7 @@ pub fn derive_pipeline_view(
             cxl_source: None,
             description: None,
             from_composition: None,
+            error_message: None,
         });
         x += NODE_WIDTH + NODE_GAP;
         idx += 1;
@@ -320,6 +331,167 @@ fn find_composition<'a>(
         }
     }
     None
+}
+
+/// Derive canvas nodes from a `PartialPipelineConfig` (graceful degradation).
+///
+/// Renders successfully-parsed items as normal nodes and failed items as
+/// `StageKind::Error` nodes. Composition grouping is skipped — import
+/// directives are rendered as plain transform nodes.
+pub fn derive_partial_pipeline_view(
+    partial: &clinker_core::partial::PartialPipelineConfig,
+) -> PipelineView {
+    use clinker_core::composition::RawTransformEntry;
+    use clinker_core::partial::PartialItem;
+
+    let mut stages = Vec::new();
+    let mut x = LEFT_MARGIN;
+    let mut idx = 0;
+
+    // Helper to compute staggered Y
+    let y_for = |i: usize| BASE_Y + if i % 2 == 0 { 0.0 } else { STAGGER_Y };
+
+    // Inputs
+    for item in &partial.inputs {
+        let y = y_for(idx);
+        match item {
+            PartialItem::Ok(input) => {
+                stages.push(StageView {
+                    id: input.name.clone(),
+                    label: input.name.clone(),
+                    kind: StageKind::Source,
+                    subtitle: input.path.clone(),
+                    canvas_x: x,
+                    canvas_y: y,
+                    cxl_source: None,
+                    description: None,
+                    from_composition: None,
+                    error_message: None,
+                });
+            }
+            PartialItem::Err { index, message } => {
+                stages.push(StageView {
+                    id: format!("_err_input_{index}"),
+                    label: format!("input #{}", index + 1),
+                    kind: StageKind::Error,
+                    subtitle: truncate_error(message),
+                    canvas_x: x,
+                    canvas_y: y,
+                    cxl_source: None,
+                    description: None,
+                    from_composition: None,
+                    error_message: Some(message.clone()),
+                });
+            }
+        }
+        x += NODE_WIDTH + NODE_GAP;
+        idx += 1;
+    }
+
+    // Transformations
+    for item in &partial.transformations {
+        let y = y_for(idx);
+        match item {
+            PartialItem::Ok(entry) => match entry {
+                RawTransformEntry::Inline(t) => {
+                    let subtitle = cxl_subtitle(&t.cxl);
+                    stages.push(StageView {
+                        id: t.name.clone(),
+                        label: t.name.clone(),
+                        kind: StageKind::Transform,
+                        subtitle,
+                        canvas_x: x,
+                        canvas_y: y,
+                        cxl_source: Some(t.cxl.clone()),
+                        description: t.description.clone(),
+                        from_composition: None,
+                        error_message: None,
+                    });
+                }
+                RawTransformEntry::Import(directive) => {
+                    stages.push(StageView {
+                        id: format!("_import_{}", directive.path),
+                        label: directive.path.clone(),
+                        kind: StageKind::Transform,
+                        subtitle: format!("_import: {}", directive.path),
+                        canvas_x: x,
+                        canvas_y: y,
+                        cxl_source: None,
+                        description: None,
+                        from_composition: None,
+                        error_message: None,
+                    });
+                }
+            },
+            PartialItem::Err { index, message } => {
+                stages.push(StageView {
+                    id: format!("_err_transform_{index}"),
+                    label: format!("transform #{}", index + 1),
+                    kind: StageKind::Error,
+                    subtitle: truncate_error(message),
+                    canvas_x: x,
+                    canvas_y: y,
+                    cxl_source: None,
+                    description: None,
+                    from_composition: None,
+                    error_message: Some(message.clone()),
+                });
+            }
+        }
+        x += NODE_WIDTH + NODE_GAP;
+        idx += 1;
+    }
+
+    // Outputs
+    for item in &partial.outputs {
+        let y = y_for(idx);
+        match item {
+            PartialItem::Ok(output) => {
+                stages.push(StageView {
+                    id: output.name.clone(),
+                    label: output.name.clone(),
+                    kind: StageKind::Output,
+                    subtitle: output.path.clone(),
+                    canvas_x: x,
+                    canvas_y: y,
+                    cxl_source: None,
+                    description: None,
+                    from_composition: None,
+                    error_message: None,
+                });
+            }
+            PartialItem::Err { index, message } => {
+                stages.push(StageView {
+                    id: format!("_err_output_{index}"),
+                    label: format!("output #{}", index + 1),
+                    kind: StageKind::Error,
+                    subtitle: truncate_error(message),
+                    canvas_x: x,
+                    canvas_y: y,
+                    cxl_source: None,
+                    description: None,
+                    from_composition: None,
+                    error_message: Some(message.clone()),
+                });
+            }
+        }
+        x += NODE_WIDTH + NODE_GAP;
+        idx += 1;
+    }
+
+    PipelineView {
+        stages,
+        composition_groups: Vec::new(),
+    }
+}
+
+/// Truncate an error message for display as a node subtitle.
+fn truncate_error(msg: &str) -> String {
+    if msg.len() <= 40 {
+        msg.to_string()
+    } else {
+        format!("{}...", &msg[..37])
+    }
 }
 
 /// Extract first non-empty line of CXL, truncated to 30 chars.

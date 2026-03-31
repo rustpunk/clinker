@@ -5,12 +5,17 @@
 /// know about tabs.
 ///
 /// `TabManagerState` is the global context for tab/file operations.
+///
+/// Navigation uses a two-level model:
+/// - `NavigationContext` — top-level activity (Pipeline, Channels, Git, Docs, Runs)
+/// - `PipelineLayoutMode` — view within Pipeline context only (Canvas, Hybrid, Editor)
 
 use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
+use clinker_core::partial::PartialPipelineConfig;
 use clinker_git::RepoStatus;
-use clinker_schema::{SchemaIndex, SchemaWarning};
 use dioxus::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::composition_index::CompositionIndex;
 use crate::recent_files::RecentFileEntry;
@@ -31,36 +36,129 @@ pub enum LeftPanel {
     Compositions,
 }
 
-/// Pipeline canvas layout preset.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum LayoutPreset {
-    CanvasFocus,
-    Hybrid,
-    EditorFocus,
-    Schematics,
-    Version,
+/// Top-level navigation context — the activity the user is performing.
+///
+/// Each context is a distinct page with its own layout, content, and purpose.
+/// Switching contexts changes *what you're doing*. State is preserved per
+/// context when switching away.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub enum NavigationContext {
+    /// Pipeline editing — canvas, YAML editor, inspector, compositions.
+    #[default]
+    Pipeline,
+    /// Channel management — identity card, pipeline override grid, health.
+    Channels,
+    /// Version control — staged/unstaged files, diff view, commit form.
+    Git,
+    /// Documentation — pipeline docs, transformation summaries, PDF export.
+    Docs,
+    /// Run history — chronological run list, filterable, expandable entries.
+    Runs,
 }
 
-impl LayoutPreset {
+impl NavigationContext {
+    /// CSS data attribute value for the content area.
     pub fn as_data_attr(self) -> &'static str {
         match self {
-            LayoutPreset::CanvasFocus => "canvas-focus",
-            LayoutPreset::Hybrid => "hybrid",
-            LayoutPreset::EditorFocus => "editor-focus",
-            LayoutPreset::Schematics => "schematics",
-            LayoutPreset::Version => "version",
+            Self::Pipeline => "pipeline",
+            Self::Channels => "channels",
+            Self::Git => "git",
+            Self::Docs => "docs",
+            Self::Runs => "runs",
         }
     }
 
+    /// Full display label.
     pub fn label(self) -> &'static str {
         match self {
-            LayoutPreset::CanvasFocus => "Canvas",
-            LayoutPreset::Hybrid => "Hybrid",
-            LayoutPreset::EditorFocus => "Editor",
-            LayoutPreset::Schematics => "Schematic",
-            LayoutPreset::Version => "Version",
+            Self::Pipeline => "Pipeline",
+            Self::Channels => "Channels",
+            Self::Git => "Version Control",
+            Self::Docs => "Documentation",
+            Self::Runs => "Run History",
         }
     }
+
+    /// Short label for the activity bar (max 4 chars).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Pipeline => "Pipe",
+            Self::Channels => "Chan",
+            Self::Git => "Git",
+            Self::Docs => "Docs",
+            Self::Runs => "Runs",
+        }
+    }
+
+    /// Unicode icon character for the activity bar.
+    pub fn icon_char(self) -> &'static str {
+        match self {
+            Self::Pipeline => "◇",
+            Self::Channels => "◈",
+            Self::Git => "⟠",
+            Self::Docs => "◆",
+            Self::Runs => "◎",
+        }
+    }
+
+    /// Keyboard shortcut hint for display.
+    pub fn keyboard_hint(self) -> &'static str {
+        match self {
+            Self::Pipeline => "Ctrl+Shift+E",
+            Self::Channels => "Ctrl+Shift+C",
+            Self::Git => "Ctrl+Shift+G",
+            Self::Docs => "Ctrl+Shift+D",
+            Self::Runs => "Ctrl+Shift+R",
+        }
+    }
+
+    /// All contexts in display order.
+    pub const ALL: [NavigationContext; 5] = [
+        Self::Pipeline,
+        Self::Channels,
+        Self::Git,
+        Self::Docs,
+        Self::Runs,
+    ];
+}
+
+/// Pipeline view mode — how you see the pipeline content.
+///
+/// Only applies within the Pipeline context. Switching layout modes changes
+/// *how you see* the pipeline, not what you're doing. All three modes share
+/// the same state (selected transformation, cursor position, inspector).
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub enum PipelineLayoutMode {
+    /// Canvas takes full width, YAML sidebar hidden.
+    Canvas,
+    /// Canvas ~62% + YAML sidebar ~38% (360px). Primary authoring mode.
+    #[default]
+    Hybrid,
+    /// YAML editor takes full width, canvas and inspector hidden.
+    Editor,
+}
+
+impl PipelineLayoutMode {
+    /// CSS data attribute value for layout switching.
+    pub fn as_data_attr(self) -> &'static str {
+        match self {
+            Self::Canvas => "canvas",
+            Self::Hybrid => "hybrid",
+            Self::Editor => "editor",
+        }
+    }
+
+    /// Display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Canvas => "Canvas",
+            Self::Hybrid => "Hybrid",
+            Self::Editor => "Editor",
+        }
+    }
+
+    /// All layout modes in display order.
+    pub const ALL: [PipelineLayoutMode; 3] = [Self::Canvas, Self::Hybrid, Self::Editor];
 }
 
 /// Per-tab reactive state — consumed by canvas, inspector, YAML sidebar, etc.
@@ -69,7 +167,8 @@ impl LayoutPreset {
 /// active tab's signals transparently.
 #[derive(Clone, Copy)]
 pub struct AppState {
-    pub layout: Signal<LayoutPreset>,
+    pub active_context: Signal<NavigationContext>,
+    pub pipeline_layout: Signal<PipelineLayoutMode>,
     pub run_log_expanded: Signal<bool>,
     pub selected_stage: Signal<Option<String>>,
     #[allow(dead_code)]
@@ -84,6 +183,8 @@ pub struct AppState {
     pub compositions: Signal<Vec<ResolvedComposition>>,
     /// Contract validation warnings from composition imports.
     pub contract_warnings: Signal<Vec<ContractWarning>>,
+    /// Partial pipeline from graceful degradation (set when full parse fails but YAML syntax is valid).
+    pub partial_pipeline: Signal<Option<PartialPipelineConfig>>,
     /// Parse error messages (empty when YAML is valid).
     pub parse_errors: Signal<Vec<String>>,
     /// Which view last edited the model (sync loop prevention).
@@ -121,4 +222,12 @@ pub struct TabManagerState {
     pub show_command_palette: Signal<bool>,
     /// Workspace composition index — populated on workspace load, refreshed on file changes.
     pub composition_index: Signal<CompositionIndex>,
+    /// Whether the settings overlay is visible.
+    pub show_settings: Signal<bool>,
+    /// Whether the activity bar is visible (focus mode toggle).
+    pub activity_bar_visible: Signal<bool>,
+    /// Navigation history stack for back-navigation (capped at 50).
+    pub nav_history: Signal<Vec<NavigationContext>>,
 }
+
+use clinker_schema::{SchemaIndex, SchemaWarning};

@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use crate::autodoc::generate_stage_doc;
 use crate::notes::parse_notes;
-use crate::pipeline_view::derive_pipeline_view;
+use crate::pipeline_view::{derive_pipeline_view, derive_partial_pipeline_view};
 use crate::state::use_app_state;
 
 use super::flow_bar::FlowBar;
@@ -19,7 +19,76 @@ pub fn SchematicsPanel() -> Element {
     let state = use_app_state();
 
     let pipeline_guard = (state.pipeline).read();
-    let Some(config) = pipeline_guard.as_ref() else {
+    let config = pipeline_guard.as_ref();
+
+    // If no full pipeline, try partial pipeline for degraded view
+    if config.is_none() {
+        let partial_guard = (state.partial_pipeline).read();
+        if let Some(partial) = partial_guard.as_ref() {
+            let pipeline_view = derive_partial_pipeline_view(partial);
+            let stages = pipeline_view.stages;
+            return rsx! {
+                div {
+                    class: "kiln-schematics",
+                    div { class: "kiln-schematics-indicator" }
+                    FlowBar { stages: stages.clone() }
+                    div {
+                        class: "kiln-schematics-content",
+                        div {
+                            class: "kiln-schematics-summary",
+                            div {
+                                class: "kiln-schematics-section-header",
+                                span { class: "kiln-schematics-diamond", "\u{25C7}" }
+                                span { class: "kiln-schematics-section-title", "PARTIAL PIPELINE (errors present)" }
+                                span { class: "kiln-schematics-section-rule" }
+                            }
+                        }
+                        for (i, stage) in stages.iter().enumerate() {
+                            if i > 0 {
+                                div {
+                                    class: "kiln-schematics-arrow",
+                                    svg {
+                                        width: "20",
+                                        height: "24",
+                                        view_box: "0 0 20 24",
+                                        line {
+                                            x1: "10", y1: "0", x2: "10", y2: "18",
+                                            stroke: "var(--kiln-verdigris)",
+                                            stroke_width: "1.5",
+                                            stroke_dasharray: "4 3",
+                                            stroke_opacity: "0.5",
+                                        }
+                                        polyline {
+                                            points: "5,16 10,22 15,16",
+                                            fill: "none",
+                                            stroke: "var(--kiln-verdigris)",
+                                            stroke_width: "1.5",
+                                            stroke_opacity: "0.7",
+                                            stroke_linejoin: "round",
+                                            stroke_linecap: "round",
+                                        }
+                                    }
+                                }
+                            }
+                            StageCard {
+                                key: "card-{stage.id}",
+                                index: i,
+                                stage_id: stage.id.clone(),
+                                accent: stage.kind.accent_color(),
+                                badge: stage.kind.badge_label(),
+                                doc: crate::autodoc::StageDoc {
+                                    description: stage.error_message.clone().unwrap_or_else(|| stage.subtitle.clone()),
+                                    metadata: vec![],
+                                    columns_added: vec![],
+                                },
+                                notes: crate::notes::StageNotes::default(),
+                            }
+                        }
+                    }
+                }
+            };
+        }
+
         return rsx! {
             div {
                 class: "kiln-schematics",
@@ -29,7 +98,9 @@ pub fn SchematicsPanel() -> Element {
                 }
             }
         };
-    };
+    }
+
+    let config = config.unwrap();
 
     let compositions_read = (state.compositions).read();
     let pipeline_view = derive_pipeline_view(config, &compositions_read);

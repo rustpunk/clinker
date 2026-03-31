@@ -3,18 +3,18 @@
 //! Every action available in Kiln is registered as a `Command` with an id,
 //! label, description, optional keyboard shortcut, and group.
 //! The command palette fuzzy-searches against label + description.
-//! Spec: clinker-kiln-git-addendum.md §G4.4.
+//! Spec: clinker-kiln-git-addendum.md §G4.4, navigation addendum §N8.
 
 /// A registered command.
 #[derive(Clone, Debug)]
 pub struct Command {
-    /// Unique identifier (e.g., "git.commit", "file.save").
+    /// Unique identifier (e.g., "git.commit", "nav.pipeline").
     pub id: &'static str,
-    /// Display label (e.g., "git: commit").
+    /// Display label (e.g., "nav: pipeline").
     pub label: &'static str,
     /// Short description.
     pub description: &'static str,
-    /// Keyboard shortcut display string (e.g., "Ctrl+K").
+    /// Keyboard shortcut display string (e.g., "Ctrl+Shift+E").
     pub shortcut: Option<&'static str>,
     /// Group for categorization.
     pub group: CommandGroup,
@@ -25,22 +25,26 @@ pub struct Command {
 /// Command groups for palette sections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandGroup {
+    Navigation,
     File,
     Layout,
     Search,
     Composition,
     Template,
+    Settings,
     Git,
 }
 
 impl CommandGroup {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Navigation => "Navigation",
             Self::File => "File",
             Self::Layout => "Layout",
             Self::Search => "Search",
             Self::Composition => "Composition",
             Self::Template => "Template",
+            Self::Settings => "Settings",
             Self::Git => "Git",
         }
     }
@@ -49,6 +53,47 @@ impl CommandGroup {
 /// All registered commands.
 pub fn all_commands() -> Vec<Command> {
     vec![
+        // ── Navigation ─────────────────────────────────────────
+        Command {
+            id: "nav.pipeline",
+            label: "nav: Pipeline",
+            description: "Switch to Pipeline context",
+            shortcut: Some("Ctrl+Shift+E"),
+            group: CommandGroup::Navigation,
+            requires_git: false,
+        },
+        Command {
+            id: "nav.channels",
+            label: "nav: Channels",
+            description: "Switch to Channels context",
+            shortcut: Some("Ctrl+Shift+C"),
+            group: CommandGroup::Navigation,
+            requires_git: false,
+        },
+        Command {
+            id: "nav.git",
+            label: "nav: Git",
+            description: "Switch to Version Control context",
+            shortcut: Some("Ctrl+Shift+G"),
+            group: CommandGroup::Navigation,
+            requires_git: false,
+        },
+        Command {
+            id: "nav.docs",
+            label: "nav: Docs",
+            description: "Switch to Documentation context",
+            shortcut: Some("Ctrl+Shift+D"),
+            group: CommandGroup::Navigation,
+            requires_git: false,
+        },
+        Command {
+            id: "nav.runs",
+            label: "nav: Runs",
+            description: "Switch to Run History context",
+            shortcut: Some("Ctrl+Shift+R"),
+            group: CommandGroup::Navigation,
+            requires_git: false,
+        },
         // ── File ────────────────────────────────────────────────
         Command {
             id: "file.new",
@@ -90,53 +135,37 @@ pub fn all_commands() -> Vec<Command> {
             group: CommandGroup::File,
             requires_git: false,
         },
-        // ── Layout ──────────────────────────────────────────────
+        // ── Layout (Pipeline context) ──────────────────────────
         Command {
             id: "layout.canvas",
-            label: "Layout: Canvas Focus",
-            description: "Switch to canvas-only layout",
-            shortcut: None,
+            label: "layout: Canvas",
+            description: "Switch to canvas-only layout mode",
+            shortcut: Some("Ctrl+Shift+1"),
             group: CommandGroup::Layout,
             requires_git: false,
         },
         Command {
             id: "layout.hybrid",
-            label: "Layout: Hybrid",
-            description: "Switch to canvas + YAML sidebar layout",
-            shortcut: None,
+            label: "layout: Hybrid",
+            description: "Switch to canvas + YAML sidebar layout mode",
+            shortcut: Some("Ctrl+Shift+2"),
             group: CommandGroup::Layout,
             requires_git: false,
         },
         Command {
             id: "layout.editor",
-            label: "Layout: Editor Focus",
-            description: "Switch to YAML editor-only layout",
-            shortcut: None,
+            label: "layout: Editor",
+            description: "Switch to YAML editor-only layout mode",
+            shortcut: Some("Ctrl+Shift+3"),
             group: CommandGroup::Layout,
             requires_git: false,
-        },
-        Command {
-            id: "layout.schematics",
-            label: "Layout: Schematics",
-            description: "Switch to documentation/schematics view",
-            shortcut: None,
-            group: CommandGroup::Layout,
-            requires_git: false,
-        },
-        Command {
-            id: "layout.version",
-            label: "Layout: Version",
-            description: "Switch to git version control mode",
-            shortcut: Some("Ctrl+Shift+G"),
-            group: CommandGroup::Layout,
-            requires_git: true,
         },
         // ── Search ──────────────────────────────────────────────
         Command {
             id: "search.text",
             label: "Search: Text",
             description: "Search across pipeline files",
-            shortcut: Some("Ctrl+Shift+F"),
+            shortcut: Some("Alt+F"),
             group: CommandGroup::Search,
             requires_git: false,
         },
@@ -144,7 +173,7 @@ pub fn all_commands() -> Vec<Command> {
             id: "search.schemas",
             label: "Search: Browse Schemas",
             description: "Open the schema browser panel",
-            shortcut: Some("Ctrl+Shift+E"),
+            shortcut: Some("Alt+E"),
             group: CommandGroup::Search,
             requires_git: false,
         },
@@ -153,7 +182,7 @@ pub fn all_commands() -> Vec<Command> {
             id: "composition.browse",
             label: "Composition: Browse",
             description: "Open the composition browser panel",
-            shortcut: Some("Ctrl+Shift+C"),
+            shortcut: Some("Alt+C"),
             group: CommandGroup::Composition,
             requires_git: false,
         },
@@ -180,6 +209,15 @@ pub fn all_commands() -> Vec<Command> {
             description: "Create a pipeline from a template",
             shortcut: Some("Ctrl+Shift+N"),
             group: CommandGroup::Template,
+            requires_git: false,
+        },
+        // ── Settings ────────────────────────────────────────────
+        Command {
+            id: "settings.open",
+            label: "settings: Open",
+            description: "Open workspace settings",
+            shortcut: Some("Ctrl+,"),
+            group: CommandGroup::Settings,
             requires_git: false,
         },
         // ── Git ─────────────────────────────────────────────────
@@ -260,14 +298,6 @@ pub fn all_commands() -> Vec<Command> {
             label: "git: view diff",
             description: "Show diff for current file",
             shortcut: Some("Ctrl+D"),
-            group: CommandGroup::Git,
-            requires_git: true,
-        },
-        Command {
-            id: "git.version_mode",
-            label: "git: open version mode",
-            description: "Switch to Version layout",
-            shortcut: Some("Ctrl+Shift+G"),
             group: CommandGroup::Git,
             requires_git: true,
         },

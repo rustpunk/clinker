@@ -1,98 +1,184 @@
 /// Global keyboard shortcut handler.
 ///
-/// Spec §F6: Ctrl+N/O/S/Shift+S/W/Q/Tab/Shift+Tab/1-9.
-/// Spec §S5.3: Ctrl+Shift+F (search), Ctrl+Shift+E (schemas), Ctrl+Shift+N (templates).
+/// Context switching: Ctrl+Shift+E/C/G/D/R (Pipeline/Channels/Git/Docs/Runs).
+/// Pipeline panel toggles: Alt+F/E/C (Search/Schemas/Compositions).
+/// Layout modes (Pipeline only): Ctrl+Shift+1/2/3 (Canvas/Hybrid/Editor).
+/// Focus mode: F11 (toggle activity bar).
+/// Navigation back: Ctrl+Alt+Left.
+/// File ops: Ctrl+N/O/S/W/Q, Ctrl+Shift+S/O.
+/// Tab switching: Ctrl+1-9 (Pipeline context only), Ctrl+Tab/Shift+Tab.
+/// Overlays: Ctrl+Shift+P (command palette), Ctrl+Shift+N (templates), Ctrl+, (settings).
+///
 /// Attached at the AppShell level to capture shortcuts regardless of focus.
 
 use dioxus::prelude::*;
 
+use crate::components::activity_bar::{switch_context, navigate_back};
 use crate::components::confirm_dialog::PendingConfirm;
 use crate::components::toast::{toast_error, toast_success, ToastState};
 use crate::file_ops;
-use crate::state::{LeftPanel, TabManagerState};
+use crate::state::{AppState, NavigationContext, PipelineLayoutMode, LeftPanel, TabManagerState};
 use crate::sync::serialize_yaml;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
 /// Handle a global keyboard event. Returns `true` if the event was consumed.
 pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> bool {
-    if !event.modifiers().ctrl() {
+    let key = event.key();
+    let ctrl = event.modifiers().ctrl();
+    let shift = event.modifiers().shift();
+    let alt = event.modifiers().alt();
+
+    // Get app state for context-aware shortcuts
+    let app_state_sig = use_context::<Signal<AppState>>();
+    let mut app = *app_state_sig.read();
+    let current_context = (app.active_context)();
+
+    // ── F11 — Toggle focus mode (no modifiers required) ──────────────────
+    if matches!(key, Key::F11) && !ctrl && !alt {
+        let visible = (tab_mgr.activity_bar_visible)();
+        tab_mgr.activity_bar_visible.set(!visible);
+        return true;
+    }
+
+    // ── Alt+Letter — Pipeline panel toggles (Pipeline context only) ──────
+    if alt && !ctrl && !shift && current_context == NavigationContext::Pipeline {
+        if let Key::Character(ref c) = key {
+            match c.as_str() {
+                "f" => {
+                    let current = (tab_mgr.left_panel)();
+                    tab_mgr.left_panel.set(if current == LeftPanel::Search {
+                        LeftPanel::None
+                    } else {
+                        LeftPanel::Search
+                    });
+                    return true;
+                }
+                "e" => {
+                    let current = (tab_mgr.left_panel)();
+                    tab_mgr.left_panel.set(if current == LeftPanel::Schemas {
+                        LeftPanel::None
+                    } else {
+                        LeftPanel::Schemas
+                    });
+                    return true;
+                }
+                "c" => {
+                    let current = (tab_mgr.left_panel)();
+                    tab_mgr.left_panel.set(if current == LeftPanel::Compositions {
+                        LeftPanel::None
+                    } else {
+                        LeftPanel::Compositions
+                    });
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── Ctrl+Alt+Left — Navigate back in context history ─────────────────
+    if ctrl && alt && !shift {
+        if matches!(key, Key::ArrowLeft) {
+            navigate_back(&app, tab_mgr);
+            return true;
+        }
+    }
+
+    // ── All remaining shortcuts require Ctrl ─────────────────────────────
+    if !ctrl {
         return false;
     }
 
-    let key = event.key();
-
     match key {
-        // Ctrl+Shift+P — Command palette
-        Key::Character(ref c) if c == "P" && event.modifiers().shift() => {
+        // ── Ctrl+Shift — Context switching + overlays ────────────────────
+        // Ctrl+Shift+P — Command palette (unchanged, highest priority)
+        Key::Character(ref c) if c == "P" && shift => {
             let current = (tab_mgr.show_command_palette)();
             tab_mgr.show_command_palette.set(!current);
             true
         }
 
-        // Ctrl+Shift+G — Toggle Version Mode layout
-        Key::Character(ref c) if c == "G" && event.modifiers().shift() => {
-            if (tab_mgr.git_state)().is_some() {
-                let app_state_sig = use_context::<Signal<crate::state::AppState>>();
-                let app = *app_state_sig.read();
-                let mut layout = app.layout;
-                if (layout)() == crate::state::LayoutPreset::Version {
-                    layout.set(crate::state::LayoutPreset::Hybrid);
-                } else {
-                    layout.set(crate::state::LayoutPreset::Version);
-                }
-            }
+        // Ctrl+Shift+E — Switch to Pipeline context
+        Key::Character(ref c) if c == "E" && shift => {
+            switch_context(&app, tab_mgr, NavigationContext::Pipeline);
             true
         }
 
-        // Ctrl+Shift+F — Toggle search panel
-        Key::Character(ref c) if c == "F" && event.modifiers().shift() => {
-            let current = (tab_mgr.left_panel)();
-            tab_mgr.left_panel.set(if current == LeftPanel::Search {
-                LeftPanel::None
-            } else {
-                LeftPanel::Search
-            });
+        // Ctrl+Shift+C — Switch to Channels context
+        Key::Character(ref c) if c == "C" && shift => {
+            switch_context(&app, tab_mgr, NavigationContext::Channels);
             true
         }
 
-        // Ctrl+Shift+E — Toggle schema panel
-        Key::Character(ref c) if c == "E" && event.modifiers().shift() => {
-            let current = (tab_mgr.left_panel)();
-            tab_mgr.left_panel.set(if current == LeftPanel::Schemas {
-                LeftPanel::None
-            } else {
-                LeftPanel::Schemas
-            });
+        // Ctrl+Shift+G — Switch to Git context
+        Key::Character(ref c) if c == "G" && shift => {
+            switch_context(&app, tab_mgr, NavigationContext::Git);
             true
         }
 
-        // Ctrl+Shift+C — Toggle composition panel
-        Key::Character(ref c) if c == "C" && event.modifiers().shift() => {
-            let current = (tab_mgr.left_panel)();
-            tab_mgr.left_panel.set(if current == LeftPanel::Compositions {
-                LeftPanel::None
-            } else {
-                LeftPanel::Compositions
-            });
+        // Ctrl+Shift+D — Switch to Docs context
+        Key::Character(ref c) if c == "D" && shift => {
+            switch_context(&app, tab_mgr, NavigationContext::Docs);
+            true
+        }
+
+        // Ctrl+Shift+R — Switch to Runs context
+        Key::Character(ref c) if c == "R" && shift => {
+            switch_context(&app, tab_mgr, NavigationContext::Runs);
             true
         }
 
         // Ctrl+Shift+N — Template gallery
-        Key::Character(ref c) if c == "N" && event.modifiers().shift() => {
+        Key::Character(ref c) if c == "N" && shift => {
             let current = (tab_mgr.show_template_gallery)();
             tab_mgr.show_template_gallery.set(!current);
             true
         }
 
-        // Ctrl+Q — Graceful quit (triggers use_drop → session save)
-        Key::Character(ref c) if c == "q" && !event.modifiers().shift() => {
+        // Ctrl+Shift+1 — Canvas layout mode (Pipeline only)
+        Key::Character(ref c) if c == "!" && shift => {
+            if current_context == NavigationContext::Pipeline {
+                app.pipeline_layout.set(PipelineLayoutMode::Canvas);
+            }
+            true
+        }
+
+        // Ctrl+Shift+2 — Hybrid layout mode (Pipeline only)
+        Key::Character(ref c) if c == "@" && shift => {
+            if current_context == NavigationContext::Pipeline {
+                app.pipeline_layout.set(PipelineLayoutMode::Hybrid);
+            }
+            true
+        }
+
+        // Ctrl+Shift+3 — Editor layout mode (Pipeline only)
+        Key::Character(ref c) if c == "#" && shift => {
+            if current_context == NavigationContext::Pipeline {
+                app.pipeline_layout.set(PipelineLayoutMode::Editor);
+            }
+            true
+        }
+
+        // ── Ctrl+, — Settings overlay ────────────────────────────────────
+        Key::Character(ref c) if c == "," && !shift => {
+            let current = (tab_mgr.show_settings)();
+            tab_mgr.show_settings.set(!current);
+            true
+        }
+
+        // ── Ctrl+Q — Graceful quit ──────────────────────────────────────
+        Key::Character(ref c) if c == "q" && !shift => {
             dioxus::desktop::window().close();
             true
         }
 
-        // Ctrl+N — New untitled tab
-        Key::Character(ref c) if c == "n" && !event.modifiers().shift() => {
+        // ── Ctrl+N — New untitled tab ───────────────────────────────────
+        Key::Character(ref c) if c == "n" && !shift => {
+            // Switch to Pipeline context if not already there
+            if current_context != NavigationContext::Pipeline {
+                switch_context(&app, tab_mgr, NavigationContext::Pipeline);
+            }
             let new_tab = TabEntry::new_untitled(&tab_mgr.tabs.read());
             let new_id = new_tab.id;
             tab_mgr.tabs.write().push(new_tab);
@@ -100,54 +186,62 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
             true
         }
 
-        // Ctrl+O — Open file
-        Key::Character(ref c) if c == "o" && !event.modifiers().shift() => {
+        // ── Ctrl+O — Open file ──────────────────────────────────────────
+        Key::Character(ref c) if c == "o" && !shift => {
             open_file(tab_mgr);
+            // Switch to Pipeline context after opening
+            if current_context != NavigationContext::Pipeline {
+                switch_context(&app, tab_mgr, NavigationContext::Pipeline);
+            }
             true
         }
 
-        // Ctrl+Shift+O — Open workspace
-        Key::Character(ref c) if c == "O" && event.modifiers().shift() => {
+        // ── Ctrl+Shift+O — Open workspace ───────────────────────────────
+        Key::Character(ref c) if c == "O" && shift => {
             open_workspace(tab_mgr);
             true
         }
 
-        // Ctrl+S — Save active tab
-        Key::Character(ref c) if c == "s" && !event.modifiers().shift() => {
+        // ── Ctrl+S — Save active tab ────────────────────────────────────
+        Key::Character(ref c) if c == "s" && !shift => {
             save_active_tab(tab_mgr, false);
             true
         }
 
-        // Ctrl+Shift+S — Save As
-        Key::Character(ref c) if c == "S" && event.modifiers().shift() => {
+        // ── Ctrl+Shift+S — Save As ─────────────────────────────────────
+        Key::Character(ref c) if c == "S" && shift => {
             save_active_tab(tab_mgr, true);
             true
         }
 
-        // Ctrl+W — Close active tab (with dirty confirmation)
-        Key::Character(ref c) if c == "w" && !event.modifiers().shift() => {
+        // ── Ctrl+W — Close active tab ───────────────────────────────────
+        Key::Character(ref c) if c == "w" && !shift => {
             if let Some(active_id) = (tab_mgr.active_tab_id)() {
                 request_close_tab(tab_mgr, active_id);
             }
             true
         }
 
-        // Ctrl+Tab — Next tab
-        Key::Tab if !event.modifiers().shift() => {
-            cycle_tab(tab_mgr, 1);
+        // ── Ctrl+Tab — Next tab (Pipeline context only) ─────────────────
+        Key::Tab if !shift => {
+            if current_context == NavigationContext::Pipeline {
+                cycle_tab(tab_mgr, 1);
+            }
             true
         }
 
-        // Ctrl+Shift+Tab — Previous tab
-        Key::Tab if event.modifiers().shift() => {
-            cycle_tab(tab_mgr, -1);
+        // ── Ctrl+Shift+Tab — Previous tab (Pipeline context only) ───────
+        Key::Tab if shift => {
+            if current_context == NavigationContext::Pipeline {
+                cycle_tab(tab_mgr, -1);
+            }
             true
         }
 
-        // Ctrl+1-9 — Switch to tab N
-        Key::Character(ref c) if c.len() == 1 => {
+        // ── Ctrl+1-9 — Switch to tab N (Pipeline context only) ──────────
+        Key::Character(ref c) if c.len() == 1 && !shift => {
             if let Some(digit) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                if digit >= 1 && digit <= 9 {
+                if digit >= 1 && digit <= 9 && current_context == NavigationContext::Pipeline {
                     let idx = (digit - 1) as usize;
                     let tabs = tab_mgr.tabs.read();
                     if let Some(tab) = tabs.get(idx) {
