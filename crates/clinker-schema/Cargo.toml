@@ -1,0 +1,15 @@
+[package]
+name = "clinker-schema"
+version.workspace = true
+edition.workspace = true
+description = "Source schema parsing, indexing, and validation for Clinker pipelines"
+
+[dependencies]
+clinker-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+ahash.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

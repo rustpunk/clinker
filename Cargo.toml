@@ -8,6 +8,9 @@ members = [
     "crates/clinker-core",
     "crates/clinker-channel",
     "crates/clinker",
+    "crates/clinker-kiln",
+    "crates/clinker-schema",
+    "crates/clinker-git",
 ]
 
 [workspace.package]
@@ -20,6 +23,8 @@ cxl = { path = "crates/cxl" }
 clinker-format = { path = "crates/clinker-format" }
 clinker-core = { path = "crates/clinker-core" }
 clinker-channel = { path = "crates/clinker-channel" }
+clinker-schema = { path = "crates/clinker-schema" }
+clinker-git = { path = "crates/clinker-git" }
 
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +38,13 @@ ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 static_assertions = "1"
+dioxus = { version = "=0.7.4", features = ["desktop"] }
+rfd = "0.15"
+blake3 = "1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+tokio = { version = "1", features = ["time", "rt"] }
+notify = "7"
 
 [workspace.metadata.release]
 shared-version = true

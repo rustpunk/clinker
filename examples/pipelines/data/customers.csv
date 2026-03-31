@@ -1,0 +1,6 @@
+customer_id,first_name,last_name,email,status,lifetime_value,zip_code
+1001,Alice,Chen,alice.chen@acme.com,active,15200,94103
+1002,Bob,Martinez,bob.m@globex.com,active,8400,10001
+1003,Carol,Johnson,carol.j@example.com,inactive,3200,60601
+1004,Dave,Williams,dave.w@acme.com,active,22100,98101
+1005,Eve,Brown,eve.brown@globex.com,active,6700,30301

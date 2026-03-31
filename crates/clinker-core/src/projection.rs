@@ -109,6 +109,7 @@ mod tests {
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
+            notes: None,
         };
 
         let result = project_output(&input, &emitted, &config);
@@ -132,6 +133,7 @@ mod tests {
             exclude: Some(vec!["secret".into()]),
             sort_order: None,
             preserve_nulls: None,
+            notes: None,
         };
 
         let result = project_output(&input, &emitted, &config);
@@ -157,6 +159,7 @@ mod tests {
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
+            notes: None,
         };
 
         let result = project_output(&input, &emitted, &config);

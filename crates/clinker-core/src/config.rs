@@ -15,6 +15,9 @@ pub struct PipelineConfig {
     pub transformations: Vec<TransformEntry>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
+    /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
+    #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// Pipeline-level metadata and global settings.
@@ -22,16 +25,25 @@ pub struct PipelineConfig {
 #[serde(deny_unknown_fields)]
 pub struct PipelineMeta {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vars: Option<IndexMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub date_formats: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rules_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<ConcurrencyConfig>,
     // Spec stubs — processed in later phases
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub date_locale: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_rules: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_provenance: Option<bool>,
     /// Execution metrics spool configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MetricsConfig>,
 }
 
@@ -47,6 +59,7 @@ pub struct PipelineMeta {
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Directory where per-execution JSON files are spooled.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_dir: Option<String>,
 }
 
@@ -54,7 +67,9 @@ pub struct MetricsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<usize>,
 }
 
@@ -63,12 +78,19 @@ pub struct ConcurrencyConfig {
 pub struct InputConfig {
     pub name: String,
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_overrides: Option<Vec<FieldDef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub array_paths: Option<Vec<ArrayPathConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(flatten)]
     pub format: InputFormat,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// Adjacently tagged format enum for inputs.
@@ -83,13 +105,49 @@ pub enum InputFormat {
     FixedWidth(Option<FixedWidthInputOptions>),
 }
 
+impl InputFormat {
+    /// Short lowercase format name for display.
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            InputFormat::Csv(_) => "csv",
+            InputFormat::Json(_) => "json",
+            InputFormat::Xml(_) => "xml",
+            InputFormat::FixedWidth(_) => "fixed_width",
+        }
+    }
+
+    /// Whether this format has a header row concept (CSV only).
+    pub fn has_header(&self) -> Option<bool> {
+        match self {
+            InputFormat::Csv(Some(opts)) => opts.has_header,
+            _ => None,
+        }
+    }
+}
+
+impl OutputFormat {
+    /// Short lowercase format name for display.
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            OutputFormat::Csv(_) => "csv",
+            OutputFormat::Json(_) => "json",
+            OutputFormat::Xml(_) => "xml",
+            OutputFormat::FixedWidth(_) => "fixed_width",
+        }
+    }
+}
+
 /// CSV-specific input options.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CsvInputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_char: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub has_header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
 }
 
@@ -97,7 +155,9 @@ pub struct CsvInputOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct JsonInputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<JsonFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
 }
 
@@ -105,8 +165,11 @@ pub struct JsonInputOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct XmlInputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attribute_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace_handling: Option<NamespaceHandling>,
 }
 
@@ -134,6 +197,7 @@ pub struct ArrayPathConfig {
     pub path: String,
     #[serde(default)]
     pub mode: ArrayMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub separator: Option<String>,
 }
 
@@ -163,13 +227,21 @@ pub struct OutputConfig {
     pub path: String,
     #[serde(default)]
     pub include_unmapped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<IndexMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<Vec<SortFieldSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub preserve_nulls: Option<bool>,
     #[serde(flatten)]
     pub format: OutputFormat,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// Adjacently tagged format enum for outputs.
@@ -186,6 +258,7 @@ pub enum OutputFormat {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CsvOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
 }
 
@@ -193,7 +266,9 @@ pub struct CsvOutputOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct JsonOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<JsonOutputFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pretty: Option<bool>,
 }
 
@@ -210,7 +285,9 @@ pub enum JsonOutputFormat {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct XmlOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_element: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record_element: Option<String>,
 }
 
@@ -218,6 +295,7 @@ pub struct XmlOutputOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FixedWidthInputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub line_separator: Option<LineSeparator>,
 }
 
@@ -225,6 +303,7 @@ pub struct FixedWidthInputOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FixedWidthOutputOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub line_separator: Option<LineSeparator>,
 }
 
@@ -236,6 +315,7 @@ pub struct SortField {
     #[serde(default = "default_sort_order")]
     pub order: SortOrder,
     /// Null handling during sort. None for output sorting; Some(Last) default for windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub null_order: Option<NullOrder>,
 }
 
@@ -387,13 +467,21 @@ impl<'de> Deserialize<'de> for SchemaSource {
 ///
 /// The `cxl` field contains the multi-line CXL source text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransformConfig {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub cxl: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub local_window: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<Vec<LogDirective>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub validations: Option<Vec<ValidationEntry>>,
+    /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
+    #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
+    pub notes: Option<serde_json::Value>,
 }
 
 /// A declarative validation attached to a transform.
@@ -524,7 +612,9 @@ impl PipelineConfig {
 pub struct ErrorHandlingConfig {
     #[serde(default = "default_strategy")]
     pub strategy: ErrorStrategy,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dlq: Option<DlqConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
 }
 
@@ -555,8 +645,11 @@ fn default_strategy() -> ErrorStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DlqConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_reason: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_source_row: Option<bool>,
 }
 

@@ -1,0 +1,8 @@
+[package]
+name = "clinker-git"
+version.workspace = true
+edition.workspace = true
+description = "Git backend abstraction for Clinker Kiln — CLI-based with future gix upgrade path"
+
+[dependencies]
+tokio = { workspace = true, features = ["process"] }

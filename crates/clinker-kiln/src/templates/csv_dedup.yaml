@@ -1,0 +1,27 @@
+_template:
+  name: "CSV Dedup"
+  description: "Deduplicate CSV records by key fields"
+  category: "transform"
+  tags: ["csv", "distinct", "dedup"]
+  author: "clinker"
+  version: "1.0"
+
+pipeline:
+  name: csv-dedup
+
+inputs:
+  - name: source
+    type: csv
+    path: "./data/input.csv"
+    options:
+      has_header: true
+
+transformations:
+  - name: deduplicate
+    cxl: |
+      distinct by id
+
+outputs:
+  - name: result
+    type: csv
+    path: "./output/deduped.csv"

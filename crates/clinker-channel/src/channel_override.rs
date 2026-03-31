@@ -289,6 +289,7 @@ pub fn resolve_channel(
             local_window: add.local_window.clone(),
             log: None,
             validations: None,
+            notes: None,
         });
         config.transformations.insert(anchor_pos + 1, new_transform);
     }

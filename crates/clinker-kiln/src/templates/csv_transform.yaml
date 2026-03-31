@@ -1,0 +1,35 @@
+_template:
+  name: "CSV Transform"
+  description: "Read CSV, apply filters and maps, write CSV"
+  category: "transform"
+  tags: ["csv", "filter", "map"]
+  author: "clinker"
+  version: "1.0"
+  hints:
+    "inputs[0].path": "replace with your source path"
+    "outputs[0].path": "replace with your output path"
+    "transformations[0].cxl": "your filter expression"
+    "transformations[1].cxl": "your map expressions"
+
+pipeline:
+  name: csv-transform
+
+inputs:
+  - name: source
+    type: csv
+    path: "./data/input.csv"
+    options:
+      has_header: true
+
+transformations:
+  - name: filter_active
+    cxl: |
+      filter status == "active"
+  - name: compute_fields
+    cxl: |
+      emit full_name = first_name + " " + last_name
+
+outputs:
+  - name: result
+    type: csv
+    path: "./output/result.csv"

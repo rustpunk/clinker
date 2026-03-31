@@ -1,0 +1,37 @@
+pipeline:
+  name: invoice_rollup
+
+inputs:
+  - name: invoices
+    type: csv
+    path: ./data/invoices.csv
+    options:
+      has_header: true
+  - name: customers
+    type: csv
+    path: ./data/customers.csv
+    options:
+      has_header: true
+
+outputs:
+  - name: rollup
+    type: csv
+    path: ./output/invoice_rollup.csv
+    include_unmapped: false
+
+transformations:
+  - name: recent_only
+    description: Filter to last 90 days
+    cxl: |
+      emit _include = days_since(invoice_date) < 90
+
+  - _import: compositions/fiscal_date.comp.yaml
+
+  - name: totals
+    description: Sum by customer
+    cxl: |
+      emit total_amount = sum(amount)
+      emit invoice_count = count(invoice_id)
+
+error_handling:
+  strategy: continue

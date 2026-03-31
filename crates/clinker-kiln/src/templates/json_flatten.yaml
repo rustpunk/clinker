@@ -1,0 +1,27 @@
+_template:
+  name: "JSON Flatten"
+  description: "Flatten nested JSON to CSV with field extraction"
+  category: "transform"
+  tags: ["json", "csv", "flatten"]
+  author: "clinker"
+  version: "1.0"
+
+pipeline:
+  name: json-flatten
+
+inputs:
+  - name: source
+    type: json
+    path: "./data/input.json"
+
+transformations:
+  - name: extract_fields
+    cxl: |
+      emit id = id
+      emit name = name
+      emit email = email
+
+outputs:
+  - name: result
+    type: csv
+    path: "./output/flattened.csv"

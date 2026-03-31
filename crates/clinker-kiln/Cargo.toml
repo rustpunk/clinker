@@ -1,0 +1,28 @@
+[package]
+name = "clinker-kiln"
+version.workspace = true
+edition.workspace = true
+description = "Clinker Kiln — IDE for authoring Clinker YAML pipeline configurations"
+
+[dependencies]
+dioxus.workspace = true
+cxl.workspace = true
+clinker-core.workspace = true
+clinker-record.workspace = true
+clinker-schema.workspace = true
+clinker-git.workspace = true
+clinker-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+indexmap.workspace = true
+rfd.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+toml.workspace = true
+tokio.workspace = true
+dioxus-nox-cmdk = "0.13"
+dioxus-nox-select = "0.13"
+regex.workspace = true
+notify.workspace = true

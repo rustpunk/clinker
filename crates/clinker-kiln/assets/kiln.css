@@ -1,0 +1,6789 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   CLINKER KILN — Rustpunk Theme (Oxide sub-aesthetic)
+   Spec: clinker-kiln-spec.md §4.3, §5, §6, §7
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 1. Google Fonts ───────────────────────────────────────────────────────
+   Chakra Petch: UI labels, section headers, brand badge (weight 600).
+   JetBrains Mono: code, YAML editor, log timestamps (weight 400).
+   ─────────────────────────────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+
+/* ── 2. CSS Custom Properties (Rustpunk colour palette) ────────────────────
+   Token names follow the spec exactly. All UI colours reference these vars.
+   ─────────────────────────────────────────────────────────────────────── */
+:root {
+  /* Accent colours */
+  --kiln-verdigris:   #43B3AE;
+  --kiln-hazard:      #E8A524;
+  --kiln-ember:       #C75B2A;
+  --kiln-phosphor:    #D4A017;
+  --kiln-oxide-red:   #B7410E;
+  --kiln-ok-green:    #7ab648;
+
+  /* Neutral palette */
+  --kiln-bone:        #D4BC9A;
+  --kiln-iron:        #A89A88;
+  --kiln-text-floor:  #8A7560;
+
+  /* Surface layers (darkest → lightest) — aligned to RUSTPUNK_AESTHETICS.md */
+  --kiln-char:        #0D0A08;
+  --kiln-char-raised: #14110C;
+  --kiln-char-surface:#0A0804;
+
+  /* Border tiers — aligned to RUSTPUNK_AESTHETICS.md */
+  --kiln-border-subtle: #2A211A;
+  --kiln-border-medium: #3D3020;
+  --kiln-border-strong: #5A4530;
+
+  /* Typography */
+  --kiln-font-ui:   'Chakra Petch', 'Segoe UI', sans-serif;
+  --kiln-font-code: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+}
+
+/* ── 3. Reset & base ───────────────────────────────────────────────────────
+   ─────────────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: var(--kiln-char);
+  color: var(--kiln-bone);
+  font-family: var(--kiln-font-ui);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Force dark theme on all form elements — prevent white background leaks */
+input, textarea, select, button {
+  background: var(--kiln-char);
+  color: var(--kiln-bone);
+  border-color: var(--kiln-border-medium);
+  font-family: inherit;
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+/* Autofill override — WebKit injects light bg on autofill */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px var(--kiln-char) inset !important;
+  -webkit-text-fill-color: var(--kiln-bone) !important;
+}
+
+/* ── 4. App shell ──────────────────────────────────────────────────────────
+   Full-viewport column flex: title bar → main → run log drawer.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-app {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  background: var(--kiln-char);
+  overflow: hidden;
+}
+
+/* ── 4b. Body wrapper (activity bar + content area) ─────────────────────── */
+.kiln-body {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── 4c. Activity bar ────────────────────────────────────────────────────
+   48px vertical strip, far left edge. Spans between title bar and status bar.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-activity-bar {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 48px;
+  width: 48px;
+  background: var(--kiln-char);
+  border-right: 1px solid var(--kiln-border-subtle);
+  padding: 4px 0;
+  overflow: hidden;
+  transition: width 200ms ease, flex-basis 200ms ease;
+}
+
+.kiln-activity-bar--hidden {
+  flex: 0 0 0px;
+  width: 0;
+  border-right: none;
+}
+
+.kiln-activity-bar__spacer {
+  flex: 1;
+}
+
+.kiln-activity-bar__entry {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 0 6px 0;
+  border: none;
+  border-left: 3px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: background 150ms, border-color 150ms, color 150ms;
+  position: relative;
+}
+
+.kiln-activity-bar__entry:hover {
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-activity-bar__entry--active {
+  border-left-color: var(--kiln-verdigris);
+  background: rgba(96, 211, 194, 0.08);
+}
+
+.kiln-activity-bar__entry--active .kiln-activity-bar__icon,
+.kiln-activity-bar__entry--active .kiln-activity-bar__label {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-activity-bar__icon {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--kiln-text-floor);
+  transition: color 150ms;
+}
+
+.kiln-activity-bar__label {
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--kiln-text-floor);
+  transition: color 150ms;
+  white-space: nowrap;
+}
+
+.kiln-activity-bar__badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: 12px;
+  height: 12px;
+  border-radius: 6px;
+  background: var(--kiln-hazard);
+  color: var(--kiln-char);
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 12px;
+  text-align: center;
+  padding: 0 2px;
+}
+
+/* ── 4d. Content area (tab bar + context content) ───────────────────────── */
+.kiln-content-area {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── 4e. Context content — cross-fade on context switch ────────────────── */
+.kiln-context-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  animation: context-fade-in 150ms ease-out;
+}
+
+@keyframes context-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ── 4f. Placeholder page (Coming soon) ────────────────────────────────── */
+.kiln-placeholder-page {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  background: var(--kiln-char);
+}
+
+.kiln-placeholder-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 48px 64px;
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 8px;
+  background: var(--kiln-char-raised);
+}
+
+.kiln-placeholder-icon {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 32px;
+  color: var(--kiln-border-medium);
+  opacity: 0.6;
+}
+
+.kiln-placeholder-title {
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  margin: 0;
+}
+
+.kiln-placeholder-desc {
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  margin: 0;
+  text-align: center;
+  max-width: 280px;
+}
+
+.kiln-placeholder-status {
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--kiln-verdigris);
+  padding: 4px 12px;
+  border: 1px solid rgba(96, 211, 194, 0.3);
+  border-radius: 4px;
+  background: rgba(96, 211, 194, 0.06);
+}
+
+/* ── 5. Title bar ──────────────────────────────────────────────────────────
+   Fixed height, no native decorations. Draggable via window.drag() in Rust.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-title-bar {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  min-height: 36px;
+  padding: 0 12px;
+  background: var(--kiln-char-raised);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  gap: 8px;
+  flex-shrink: 0;
+  /* Draggable region — interactive children override with no-drag. */
+  -webkit-app-region: drag;
+}
+
+/* Brand badge: [clinker][kiln] */
+.kiln-brand {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-brand-label {
+  padding: 0 7px;
+  background: var(--kiln-border-medium);
+  color: var(--kiln-bone);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+}
+
+.kiln-brand-value {
+  padding: 0 7px;
+  background: var(--kiln-border-strong);
+  color: var(--kiln-oxide-red);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+}
+
+.kiln-title-divider {
+  display: inline-block;
+  width: 1px;
+  height: 14px;
+  background: var(--kiln-border-medium);
+}
+
+/* File action buttons (New, Open, Save) in title bar */
+.kiln-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-file-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: color 200ms, border-color 200ms, background 200ms;
+}
+
+.kiln-file-btn:hover {
+  color: var(--kiln-bone);
+  border-color: var(--kiln-border-medium);
+  background: var(--kiln-char-surface);
+}
+
+/* Workspace name in title bar (§F5.1) */
+.kiln-title-workspace {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  color: var(--kiln-verdigris);
+  -webkit-app-region: no-drag;
+}
+
+.kiln-title-filename {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-title-context-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--kiln-verdigris);
+  text-transform: uppercase;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-title-branch {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-ok-green);
+  -webkit-app-region: no-drag;
+}
+
+.kiln-title-spacer {
+  flex: 1;
+}
+
+/* Layout mode switcher — three-segment toggle group */
+.kiln-layout-switcher {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-layout-btn {
+  padding: 0 10px;
+  height: 22px;
+  background: var(--kiln-char-raised);
+  color: var(--kiln-text-floor);
+  border: none;
+  border-right: 1px solid var(--kiln-border-medium);
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 150ms, color 150ms;
+}
+
+.kiln-layout-btn:last-child {
+  border-right: none;
+}
+
+.kiln-layout-btn:hover {
+  background: var(--kiln-char-surface);
+  color: var(--kiln-bone);
+}
+
+.kiln-layout-btn[data-active="true"] {
+  background: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+/* Version button: ok-green accent when active */
+.kiln-layout-btn--version-active {
+  background: rgba(122, 182, 72, 0.15) !important;
+  color: var(--kiln-ok-green) !important;
+  border-bottom: 2px solid var(--kiln-ok-green) !important;
+}
+
+/* Disabled layout button (Version when no git repo) */
+.kiln-layout-btn--disabled {
+  opacity: 0.35;
+  cursor: not-allowed !important;
+}
+
+/* Validation LED */
+.kiln-validation-led {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-led-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+
+.kiln-led-dot--ok {
+  background: var(--kiln-ok-green);
+  box-shadow: 0 0 4px 1px rgba(122, 182, 72, 0.6);
+}
+
+.kiln-led-dot--err {
+  background: var(--kiln-oxide-red);
+  box-shadow: 0 0 4px 1px rgba(183, 65, 14, 0.6);
+}
+
+.kiln-led-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--kiln-ok-green);
+  text-transform: uppercase;
+}
+
+/* ── 5b. Tab bar ──────────────────────────────────────────────────────────
+   Spec §F3.1: 28px height, below title bar, full viewport width.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-tab-bar {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  min-height: 28px;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-tab-bar::-webkit-scrollbar { display: none; }
+
+.kiln-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 10px;
+  max-width: 160px;
+  border-right: 1px solid var(--kiln-border-subtle);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-raised);
+  cursor: pointer;
+  transition: background 150ms ease, color 150ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-tab:hover {
+  background: var(--kiln-char-surface);
+}
+
+.kiln-tab--active {
+  background: var(--kiln-border-strong);
+  border-bottom-color: transparent;
+  border-top: 2px solid var(--kiln-verdigris);
+}
+
+.kiln-tab--active .kiln-tab-name {
+  color: var(--kiln-bone);
+}
+
+.kiln-tab-dirty {
+  color: var(--kiln-bone);
+  font-size: 10px;
+}
+
+.kiln-tab-name {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--kiln-text-floor);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-tab-close {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  margin-left: auto;
+}
+
+.kiln-tab:hover .kiln-tab-close,
+.kiln-tab--active .kiln-tab-close {
+  display: block;
+}
+
+.kiln-tab-close:hover {
+  color: var(--kiln-oxide-red);
+}
+
+/* Git status indicators on tabs */
+.kiln-tab-git {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 4px;
+  padding: 0 3px;
+  border-radius: 2px;
+  line-height: 1.4;
+}
+
+.kiln-tab-git--modified { color: var(--kiln-hazard); background: rgba(232, 165, 36, 0.12); }
+.kiln-tab-git--added    { color: var(--kiln-ok-green); background: rgba(122, 182, 72, 0.12); }
+.kiln-tab-git--deleted  { color: var(--kiln-oxide-red); background: rgba(183, 65, 14, 0.12); }
+.kiln-tab-git--renamed  { color: var(--kiln-verdigris); background: rgba(67, 179, 174, 0.12); }
+.kiln-tab-git--untracked { color: var(--kiln-text-floor); background: rgba(255, 255, 255, 0.04); }
+
+.kiln-tab-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  min-width: 28px;
+  height: 100%;
+  background: none;
+  border: none;
+  border-right: 1px solid var(--kiln-border-subtle);
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  transition: color 150ms;
+  -webkit-app-region: no-drag;
+}
+
+.kiln-tab-new:hover {
+  color: var(--kiln-bone);
+  background: var(--kiln-char-raised);
+}
+
+/* ── 5c. Welcome screen ───────────────────────────────────────────────────
+   Spec §F7: shown when no tabs are open.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-welcome {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--kiln-char-surface);
+}
+
+.kiln-welcome-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+.kiln-welcome-brand-top {
+  font-family: var(--kiln-font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--kiln-bone);
+  background: var(--kiln-border-medium);
+  padding: 4px 14px;
+  border-top-left-radius: 2px;
+  border-top-right-radius: 2px;
+}
+
+.kiln-welcome-brand-bottom {
+  font-family: var(--kiln-font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--kiln-bone);
+  background: var(--kiln-oxide-red);
+  padding: 4px 14px;
+  border-bottom-left-radius: 2px;
+  border-bottom-right-radius: 2px;
+}
+
+.kiln-welcome-subtitle {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-welcome .kiln-rust-line {
+  width: 200px;
+}
+
+.kiln-welcome-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.kiln-welcome-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  color: var(--kiln-bone);
+  padding: 6px 16px;
+  cursor: pointer;
+  transition: border-color 300ms ease, background 300ms ease;
+}
+
+.kiln-welcome-btn:hover {
+  border-color: var(--kiln-border-strong);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-welcome-shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-welcome-key {
+  font-family: var(--kiln-font-code);
+  color: var(--kiln-iron);
+  margin-right: 6px;
+}
+
+/* ── 5d. Toast notifications ──────────────────────────────────────────────
+   Spec §F2.2: anchored bottom-right, 16px from edges, auto-dismiss.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-toast {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 100;
+  background: var(--kiln-char-raised);
+  border: 1px solid rgba(67, 179, 174, 0.4);
+  border-left: 3px solid var(--kiln-verdigris);
+  border-radius: 2px;
+  padding: 8px 14px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  cursor: pointer;
+  animation: toast-in 300ms ease;
+  max-width: 360px;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── 5e. Confirmation dialog ───────────────────────────────────────────────
+   Spec §F2.5: modal for unsaved changes. Backdrop blur, hazard accent.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.kiln-confirm-dialog {
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 20px 28px;
+  min-width: 320px;
+  max-width: 420px;
+}
+
+.kiln-confirm-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-bone);
+  margin-bottom: 10px;
+}
+
+.kiln-confirm-diamond {
+  color: var(--kiln-hazard);
+  margin-right: 4px;
+}
+
+.kiln-confirm-body {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.kiln-confirm-filename {
+  color: var(--kiln-bone);
+}
+
+.kiln-confirm-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.kiln-confirm-btn {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: border-color 300ms ease, background 300ms ease;
+}
+
+.kiln-confirm-btn--cancel {
+  color: var(--kiln-iron);
+}
+
+.kiln-confirm-btn--cancel:hover {
+  border-color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-confirm-btn--discard {
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-confirm-btn--discard:hover {
+  border-color: var(--kiln-oxide-red);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-confirm-btn--save {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-confirm-btn--save:hover {
+  border-color: var(--kiln-verdigris);
+  background: var(--kiln-border-subtle);
+}
+
+/* ── 6. Main panel area ────────────────────────────────────────────────────
+   Horizontal row: canvas | inspector | yaml sidebar.
+   Layout presets are driven by `data-layout` attribute.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  transition: flex 300ms ease-out;
+}
+
+/* ── Canvas column wrapper: breadcrumb + canvas stacked vertically ── */
+.kiln-canvas-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ── Canvas / sidebar widths per pipeline layout mode ── */
+.kiln-main[data-layout="hybrid"] .kiln-canvas-column {
+  flex: 1;
+  min-width: 0;
+}
+
+.kiln-main[data-layout="hybrid"] .kiln-yaml-sidebar {
+  flex: 0 0 360px;
+  display: flex;
+}
+
+.kiln-main[data-layout="canvas"] .kiln-canvas-column {
+  flex: 1;
+  min-width: 0;
+}
+
+.kiln-main[data-layout="canvas"] .kiln-yaml-sidebar {
+  display: none;
+}
+
+.kiln-main[data-layout="editor"] .kiln-canvas-column {
+  display: none;
+}
+
+.kiln-main[data-layout="editor"] .kiln-yaml-sidebar {
+  flex: 1;
+  display: flex;
+}
+
+/* Hide inspector in editor layout mode.
+   Canvas and Hybrid both show inspector when a node is selected
+   (the inspector component is conditionally mounted, so no CSS hide needed). */
+.kiln-main[data-layout="editor"] .kiln-inspector { display: none; }
+
+/* Schematics layout: pipeline autodoc takes full width, hide everything else */
+.kiln-main[data-layout="schematics"] .kiln-canvas-column { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-yaml-sidebar { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-inspector { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-left-panel { display: none; }
+.kiln-main[data-layout="schematics"] .kiln-schematics { flex: 1; }
+
+/* ── 6b. Left panel slot (search / schemas) ─────────────────────────────────
+   280px slide-in from left. Only one open at a time. Pushes canvas narrower.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-left-panel {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--kiln-char);
+  border-right: 2px solid var(--kiln-border-strong);
+  overflow: hidden;
+}
+
+.kiln-left-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-left-panel__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--kiln-text-floor);
+  text-transform: uppercase;
+}
+
+.kiln-left-panel__close {
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-left-panel__close:hover {
+  background: var(--kiln-border-medium);
+  color: var(--kiln-bone);
+}
+
+.kiln-left-panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+/* ── 6c. Search panel ────────────────────────────────────────────────────
+   Workspace-wide text/structural search with results list.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-search-panel {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--kiln-char);
+  border-right: 2px solid var(--kiln-border-strong);
+  overflow: hidden;
+}
+
+.kiln-search-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-search-panel__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--kiln-text-floor);
+  text-transform: uppercase;
+}
+
+.kiln-search-panel__close {
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-search-panel__close:hover {
+  background: var(--kiln-border-medium);
+  color: var(--kiln-bone);
+}
+
+/* Mode tabs */
+.kiln-search-panel__tabs {
+  display: flex;
+  padding: 6px 12px;
+  gap: 4px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-search-mode-tab {
+  background: none;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 3px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+}
+
+.kiln-search-mode-tab:hover {
+  border-color: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+.kiln-search-mode-tab--active {
+  border-color: var(--kiln-verdigris);
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+/* Input row */
+.kiln-search-panel__input-row {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  gap: 4px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-search-panel__input {
+  flex: 1;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 5px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-bone);
+  outline: none;
+  min-width: 0;
+}
+
+.kiln-search-panel__input:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-search-panel__input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+/* Search option toggles */
+.kiln-search-toggle {
+  background: none;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 3px 5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.kiln-search-toggle:hover {
+  border-color: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+.kiln-search-toggle--active {
+  border-color: var(--kiln-verdigris);
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+.kiln-search-toggle--expand {
+  padding: 3px 4px;
+  font-size: 10px;
+}
+
+/* Replace row */
+.kiln-search-panel__replace-row {
+  display: flex;
+  padding: 4px 12px 8px;
+  padding-left: 30px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-search-panel__input--replace {
+  width: 100%;
+}
+
+/* Structural placeholder */
+.kiln-search-panel__structural-placeholder {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* Results area */
+.kiln-search-panel__results {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.kiln-search-panel__empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* Search results */
+.kiln-search-results__summary {
+  padding: 6px 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-search-file-group {
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-search-file-group__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.kiln-search-file-group__path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-bone);
+  font-weight: 600;
+}
+
+.kiln-search-file-group__count {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-border-medium);
+  padding: 1px 5px;
+  border-radius: 8px;
+}
+
+.kiln-search-match {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 12px 2px 20px;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+
+.kiln-search-match:hover {
+  background: rgba(67, 179, 174, 0.06);
+}
+
+.kiln-search-match__line {
+  color: var(--kiln-text-floor);
+  font-size: 11px;
+  min-width: 24px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.kiln-search-match__content {
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.kiln-search-match__highlight {
+  background: rgba(67, 179, 174, 0.2);
+  color: var(--kiln-verdigris);
+  border-radius: 1px;
+}
+
+/* Structural search UI */
+.kiln-search-panel__structural {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.kiln-structural-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-structural-tag {
+  display: inline-flex;
+  align-items: baseline;
+  padding: 3px 8px;
+  border-radius: 2px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  background: rgba(67, 179, 174, 0.12);
+  border: 1px solid rgba(67, 179, 174, 0.3);
+}
+
+.kiln-structural-tag__key {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-structural-tag__sep {
+  color: var(--kiln-text-floor);
+  opacity: 0.5;
+}
+
+.kiln-structural-tag__value {
+  color: var(--kiln-bone);
+}
+
+.kiln-structural-hint {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  opacity: 0.6;
+}
+
+.kiln-structural-hint__key {
+  color: var(--kiln-verdigris);
+  opacity: 0.8;
+}
+
+/* Structural search results */
+.kiln-structural-results {
+  padding: 0;
+}
+
+.kiln-structural-match {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-border-medium);
+  cursor: pointer;
+}
+
+.kiln-structural-match:hover {
+  background: rgba(67, 179, 174, 0.04);
+}
+
+.kiln-structural-match--input  { border-left-color: var(--kiln-verdigris); }
+.kiln-structural-match--transform { border-left-color: var(--kiln-ember); }
+.kiln-structural-match--output { border-left-color: var(--kiln-hazard); }
+
+.kiln-structural-match__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kiln-structural-match__led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.6;
+}
+
+.kiln-structural-match--input .kiln-structural-match__led { color: var(--kiln-verdigris); }
+.kiln-structural-match--transform .kiln-structural-match__led { color: var(--kiln-ember); }
+.kiln-structural-match--output .kiln-structural-match__led { color: var(--kiln-hazard); }
+
+.kiln-structural-match__name {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-structural-match__type {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.kiln-structural-match__path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  padding-left: 12px;
+  opacity: 0.7;
+}
+
+.kiln-structural-match__detail {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  padding-left: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 6c2. Template gallery overlay ────────────────────────────────────────
+   Centered 560px overlay for browsing and instantiating templates.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-gallery-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 100;
+}
+
+.kiln-gallery {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 560px;
+  max-height: 80vh;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-strong);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  z-index: 101;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.7);
+}
+
+.kiln-gallery__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-gallery__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--kiln-bone);
+  text-transform: uppercase;
+}
+
+.kiln-gallery__close {
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-gallery__close:hover {
+  background: var(--kiln-border-medium);
+  color: var(--kiln-bone);
+}
+
+.kiln-gallery__search {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-gallery__search-input {
+  width: 100%;
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-strong);
+  border-radius: 2px;
+  padding: 7px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-gallery__search-input:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-gallery__search-input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-gallery__tabs {
+  display: flex;
+  padding: 8px 16px;
+  gap: 6px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-gallery-tab {
+  background: none;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 4px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+}
+
+.kiln-gallery-tab:hover {
+  border-color: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+.kiln-gallery-tab--active {
+  border-color: var(--kiln-verdigris);
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+.kiln-gallery__grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  align-content: start;
+}
+
+.kiln-gallery__empty {
+  grid-column: 1 / -1;
+  padding: 24px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* Template card */
+.kiln-gallery-card {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-strong);
+  border-radius: 3px;
+  border-top: 2px solid var(--kiln-border-medium);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 150ms;
+}
+
+.kiln-gallery-card:hover {
+  border-color: var(--kiln-border-strong);
+}
+
+.kiln-gallery-card--csv  { border-top-color: var(--kiln-verdigris); }
+.kiln-gallery-card--json { border-top-color: var(--kiln-hazard); }
+.kiln-gallery-card--xml  { border-top-color: var(--kiln-ember); }
+.kiln-gallery-card--other { border-top-color: var(--kiln-text-floor); }
+
+.kiln-gallery-card__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.kiln-gallery-card__name {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-gallery-card__source {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-gallery-card__desc {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  line-height: 1.4;
+}
+
+.kiln-gallery-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-gallery-card__tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+
+.kiln-gallery-card__use-btn {
+  background: none;
+  border: 1px solid var(--kiln-verdigris);
+  border-radius: 2px;
+  padding: 5px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-verdigris);
+  cursor: pointer;
+  text-align: center;
+  margin-top: 4px;
+}
+
+.kiln-gallery-card__use-btn:hover {
+  background: rgba(67, 179, 174, 0.1);
+}
+
+/* ── 6d. Schema panel ────────────────────────────────────────────────────
+   Format-grouped cards with expandable field lists.
+   Format accents: CSV verdigris, JSON hazard, XML ember, Parquet phosphor.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-schema-panel {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--kiln-char);
+  border-right: 2px solid var(--kiln-border-strong);
+  overflow: hidden;
+}
+
+.kiln-schema-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-schema-panel__title {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--kiln-text-floor);
+  text-transform: uppercase;
+}
+
+.kiln-schema-panel__close {
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.kiln-schema-panel__close:hover {
+  background: var(--kiln-border-medium);
+  color: var(--kiln-bone);
+}
+
+/* Search input */
+.kiln-schema-panel__search {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-schema-panel__search-input {
+  width: 100%;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 5px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-schema-panel__search-input:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-schema-panel__search-input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+/* Format filter tabs */
+.kiln-schema-panel__tabs {
+  display: flex;
+  padding: 6px 12px;
+  gap: 4px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-schema-tab {
+  background: none;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 3px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+}
+
+.kiln-schema-tab:hover {
+  border-color: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+.kiln-schema-tab--active {
+  border-color: var(--kiln-verdigris);
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+/* Schema list */
+.kiln-schema-panel__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.kiln-schema-panel__empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  line-height: 1.6;
+}
+
+.kiln-schema-panel__section-header {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--kiln-text-floor);
+  text-transform: uppercase;
+  padding: 8px 12px 4px;
+  border-top: 1px solid var(--kiln-border-medium);
+  margin-top: 4px;
+}
+
+.kiln-schema-panel__section-header:first-child {
+  border-top: none;
+  margin-top: 0;
+}
+
+/* Schema card */
+.kiln-schema-card {
+  margin: 2px 8px;
+  padding: 8px;
+  border-radius: 2px;
+  border-left: 2px solid var(--kiln-border-medium);
+  transition: background 150ms;
+}
+
+.kiln-schema-card:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Format accent borders */
+.kiln-schema-card--csv  { border-left-color: var(--kiln-verdigris); }
+.kiln-schema-card--tsv  { border-left-color: var(--kiln-verdigris); }
+.kiln-schema-card--json { border-left-color: var(--kiln-hazard); }
+.kiln-schema-card--jsonl { border-left-color: var(--kiln-hazard); }
+.kiln-schema-card--xml  { border-left-color: var(--kiln-ember); }
+
+.kiln-schema-card__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.kiln-schema-card__diamond {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-schema-card--csv .kiln-schema-card__diamond,
+.kiln-schema-card--tsv .kiln-schema-card__diamond { color: var(--kiln-verdigris); }
+.kiln-schema-card--json .kiln-schema-card__diamond,
+.kiln-schema-card--jsonl .kiln-schema-card__diamond { color: var(--kiln-hazard); }
+.kiln-schema-card--xml .kiln-schema-card__diamond { color: var(--kiln-ember); }
+
+.kiln-schema-card__name {
+  font-family: 'Chakra Petch', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  flex: 1;
+}
+
+.kiln-schema-card__count {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-schema-card__meta {
+  padding-left: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  line-height: 1.5;
+}
+
+.kiln-schema-card__path {
+  opacity: 0.7;
+}
+
+.kiln-schema-card__format {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-schema-card__sep {
+  color: var(--kiln-border-medium);
+}
+
+.kiln-schema-card__usage {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-schema-card__desc {
+  padding: 4px 14px 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  font-style: italic;
+  opacity: 0.8;
+}
+
+/* Field list */
+.kiln-field-list {
+  padding: 4px 0 2px;
+}
+
+.kiln-field-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.kiln-field__prefix {
+  color: var(--kiln-border-medium);
+  user-select: none;
+}
+
+.kiln-field__name {
+  color: var(--kiln-bone);
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+.kiln-field__type {
+  padding: 0 3px;
+  border-radius: 1px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.kiln-field__type--str   { color: var(--kiln-bone); background: rgba(255,255,255,0.06); }
+.kiln-field__type--int   { color: var(--kiln-verdigris); background: rgba(67,179,174,0.1); }
+.kiln-field__type--float { color: var(--kiln-verdigris); background: rgba(67,179,174,0.1); }
+.kiln-field__type--bool  { color: var(--kiln-hazard); background: rgba(230,126,34,0.1); }
+.kiln-field__type--date  { color: var(--kiln-phosphor); background: rgba(57,255,20,0.08); }
+.kiln-field__type--dt    { color: var(--kiln-phosphor); background: rgba(57,255,20,0.08); }
+.kiln-field__type--obj   { color: var(--kiln-text-floor); background: rgba(255,255,255,0.04); }
+.kiln-field__type--arr   { color: var(--kiln-text-floor); background: rgba(255,255,255,0.04); }
+
+.kiln-field__nullable {
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.kiln-field__nullable--no  { color: var(--kiln-oxide-red); }
+.kiln-field__nullable--yes { color: var(--kiln-text-floor); }
+
+.kiln-field__tag {
+  padding: 0 3px;
+  border-radius: 1px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.kiln-field__tag--attr {
+  color: var(--kiln-ember);
+  background: rgba(183, 65, 14, 0.1);
+}
+
+.kiln-field__tag--enum {
+  color: var(--kiln-hazard);
+  background: rgba(230, 126, 34, 0.1);
+}
+
+.kiln-field__tag--children {
+  color: var(--kiln-text-floor);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.kiln-field__desc {
+  color: var(--kiln-text-floor);
+  font-style: italic;
+  opacity: 0.7;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Bottom actions */
+.kiln-schema-panel__actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-schema-panel__action-btn {
+  flex: 1;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 5px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  text-align: center;
+}
+
+.kiln-schema-panel__action-btn:hover:not(:disabled) {
+  border-color: var(--kiln-border-strong);
+  color: var(--kiln-bone);
+}
+
+.kiln-schema-panel__action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── 6e. Command palette ─────────────────────────────────────────────────
+   440px centered overlay with fuzzy search. Spec §G4.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 200;
+}
+
+.kiln-palette {
+  position: fixed;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 440px;
+  max-height: 360px;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-strong);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  z-index: 201;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+/* Override cmdk component styles to match rustpunk */
+.kiln-palette [cmdk-root] {
+  display: flex;
+  flex-direction: column;
+  max-height: 360px;
+}
+
+/* Force all inputs inside palette to dark theme */
+.kiln-palette input,
+.kiln-palette [cmdk-input] {
+  width: 100%;
+  background: var(--kiln-char) !important;
+  border: none;
+  border-bottom: 1px solid var(--kiln-border-medium);
+  padding: 12px 16px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-palette input::placeholder,
+.kiln-palette [cmdk-input]::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-palette [cmdk-list] {
+  overflow-y: auto;
+  max-height: 300px;
+  padding: 4px 0;
+}
+
+.kiln-palette [cmdk-empty] {
+  padding: 16px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-palette [cmdk-group-heading] {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 8px 16px 4px;
+}
+
+.kiln-palette [cmdk-item] {
+  padding: 6px 16px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.kiln-palette [cmdk-item]:hover,
+.kiln-palette [cmdk-item][data-selected="true"] {
+  background: var(--kiln-border-strong);
+  border-left-color: var(--kiln-verdigris);
+}
+
+/* Palette item content */
+.kiln-palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.kiln-palette-item__label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+  white-space: nowrap;
+}
+
+.kiln-palette-item__desc {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kiln-palette-item__shortcut {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+/* ── 6e2. Settings overlay ────────────────────────────────────────────────
+   Centered modal for workspace configuration. Not a context.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 200;
+}
+
+.kiln-settings-overlay {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 520px;
+  max-height: 80vh;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-strong);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  z-index: 201;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.kiln-settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-settings-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  margin: 0;
+}
+
+.kiln-settings-close {
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.kiln-settings-close:hover {
+  color: var(--kiln-bone);
+}
+
+.kiln-settings-content {
+  overflow-y: auto;
+  padding: 16px 20px;
+  flex: 1;
+}
+
+.kiln-settings-section {
+  margin-bottom: 20px;
+}
+
+.kiln-settings-section__label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+  margin: 0 0 8px 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-settings-field {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.kiln-settings-field__label {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  flex: 0 0 120px;
+  text-align: right;
+}
+
+.kiln-settings-field__value {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  flex: 1;
+  word-break: break-all;
+}
+
+.kiln-settings-empty {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  text-align: center;
+  padding: 32px;
+}
+
+.kiln-settings-footer {
+  padding: 8px 20px;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-settings-hint {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  font-style: italic;
+}
+
+/* ── 6f. Version Mode ────────────────────────────────────────────────────
+   Full-viewport git layout. Branch bar, tab bar, file list + content.
+   Spec §G5. ok-green (#7ab648) accent for Version Mode.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-version-mode {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kiln-version-mode--no-repo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.kiln-version-mode__empty {
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  line-height: 1.8;
+}
+
+/* 2px ok-green mode indicator */
+.kiln-version-mode__indicator {
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(122,182,72,0.4), rgba(122,182,72,0.6), rgba(122,182,72,0.4), transparent);
+}
+
+/* Version Mode — now rendered as Git context, not a layout preset.
+   VersionMode component fills the context content area directly. */
+
+/* Branch bar */
+.kiln-branch-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 16px;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-branch-bar__info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kiln-branch-bar__icon {
+  color: var(--kiln-verdigris);
+  font-size: 12px;
+}
+
+.kiln-branch-bar__name {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+}
+
+.kiln-branch-bar__ahead {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-ok-green);
+}
+
+.kiln-branch-bar__behind {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-hazard);
+}
+
+.kiln-branch-bar__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.kiln-branch-bar__btn {
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 4px 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  cursor: pointer;
+}
+
+.kiln-branch-bar__btn:hover {
+  border-color: var(--kiln-iron);
+  color: var(--kiln-bone);
+}
+
+.kiln-branch-bar__btn--subtle {
+  color: var(--kiln-text-floor);
+}
+
+/* Version tabs */
+.kiln-version-tabs {
+  display: flex;
+  padding: 0 16px;
+  gap: 0;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-version-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 16px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  transition: all 200ms ease;
+}
+
+.kiln-version-tab:hover {
+  color: var(--kiln-bone);
+}
+
+.kiln-version-tab--active {
+  color: var(--kiln-bone);
+  border-bottom-color: var(--kiln-ok-green);
+}
+
+/* Version content area */
+.kiln-version-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Changes tab */
+.kiln-changes-tab {
+  display: flex;
+  height: 100%;
+}
+
+.kiln-changes-sidebar {
+  flex: 0 0 220px;
+  border-right: 1px solid var(--kiln-border-medium);
+  overflow-y: auto;
+}
+
+.kiln-changes-sidebar__empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-sidebar__section {
+  padding: 8px 0;
+}
+
+.kiln-changes-sidebar__header {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-sidebar__count {
+  font-family: var(--kiln-font-code);
+}
+
+.kiln-changes-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+}
+
+.kiln-changes-file:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-changes-file__status {
+  font-weight: 600;
+  min-width: 12px;
+}
+
+.kiln-changes-file--modified .kiln-changes-file__status { color: var(--kiln-hazard); }
+.kiln-changes-file--added .kiln-changes-file__status { color: var(--kiln-ok-green); }
+.kiln-changes-file--deleted .kiln-changes-file__status { color: var(--kiln-oxide-red); }
+.kiln-changes-file--renamed .kiln-changes-file__status { color: var(--kiln-verdigris); }
+.kiln-changes-file--untracked .kiln-changes-file__status { color: var(--kiln-text-floor); }
+
+.kiln-changes-file__path {
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Commit area */
+.kiln-changes-commit {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.kiln-changes-commit__header {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-commit__input {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  min-height: 48px;
+  max-height: 120px;
+  resize: vertical;
+  outline: none;
+}
+
+.kiln-changes-commit__input:focus {
+  border-color: rgba(67, 179, 174, 0.6);
+}
+
+.kiln-changes-commit__input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-changes-commit__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.kiln-changes-commit__btn {
+  padding: 6px 16px;
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.kiln-changes-commit__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.kiln-changes-commit__btn--commit {
+  background: rgba(67, 179, 174, 0.15);
+  border: 1px solid rgba(67, 179, 174, 0.4);
+  color: var(--kiln-verdigris);
+}
+
+.kiln-changes-commit__btn--commit:hover:not(:disabled) {
+  background: rgba(67, 179, 174, 0.25);
+}
+
+.kiln-changes-commit__btn--push {
+  background: rgba(122, 182, 72, 0.15);
+  border: 1px solid rgba(122, 182, 72, 0.4);
+  color: var(--kiln-ok-green);
+}
+
+.kiln-changes-commit__btn--push:hover:not(:disabled) {
+  background: rgba(122, 182, 72, 0.25);
+}
+
+/* Diff tab */
+.kiln-diff-tab {
+  display: flex;
+  height: 100%;
+}
+
+.kiln-diff-sidebar {
+  flex: 0 0 220px;
+  border-right: 1px solid var(--kiln-border-medium);
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.kiln-diff-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  border-left: 2px solid transparent;
+}
+
+.kiln-diff-file:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-diff-file--active {
+  background: var(--kiln-border-strong);
+  border-left-color: var(--kiln-verdigris);
+}
+
+.kiln-diff-file__status {
+  color: var(--kiln-hazard);
+  font-weight: 600;
+  min-width: 12px;
+}
+
+.kiln-diff-file__path {
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kiln-diff-content {
+  flex: 1;
+  overflow: auto;
+}
+
+.kiln-diff-content__empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-diff-content__unified {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.kiln-diff-line {
+  display: flex;
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.kiln-diff-line__num {
+  color: var(--kiln-text-floor);
+  min-width: 36px;
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+  font-size: 10px;
+}
+
+.kiln-diff-line__text {
+  flex: 1;
+}
+
+.kiln-diff-line--added {
+  background: rgba(122, 182, 72, 0.1);
+}
+
+.kiln-diff-line--added .kiln-diff-line__text {
+  color: var(--kiln-bone);
+}
+
+.kiln-diff-line--removed {
+  background: rgba(183, 65, 14, 0.1);
+}
+
+.kiln-diff-line--removed .kiln-diff-line__text {
+  color: var(--kiln-bone);
+}
+
+.kiln-diff-line--hunk {
+  background: var(--kiln-char-raised);
+}
+
+.kiln-diff-line--hunk .kiln-diff-line__text {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-diff-line--context .kiln-diff-line__text {
+  color: var(--kiln-iron);
+}
+
+/* Log tab */
+.kiln-log-tab {
+  overflow-y: auto;
+  padding: 8px 0;
+  height: 100%;
+}
+
+.kiln-log-tab__empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-log-entry {
+  display: flex;
+  padding: 4px 16px;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.kiln-log-entry:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.kiln-log-entry__graph {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 16px;
+  flex-shrink: 0;
+}
+
+.kiln-log-entry__dot {
+  color: var(--kiln-verdigris);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.kiln-log-entry__line {
+  width: 1.5px;
+  flex: 1;
+  background: rgba(67, 179, 174, 0.4);
+  min-height: 12px;
+}
+
+.kiln-log-entry__info {
+  flex: 1;
+  min-width: 0;
+}
+
+.kiln-log-entry__header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.kiln-log-entry__hash {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+  flex-shrink: 0;
+}
+
+.kiln-log-entry__subject {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kiln-log-entry__meta {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+.kiln-log-entry__author {
+  color: var(--kiln-iron);
+}
+
+.kiln-log-entry__time {
+  color: var(--kiln-text-floor);
+}
+
+/* Version Mode branch row + PR button */
+.kiln-version-mode__branch-row {
+  display: flex;
+  align-items: center;
+}
+
+.kiln-version-mode__branch-row .kiln-branch-bar {
+  flex: 1;
+}
+
+.kiln-branch-bar__btn--pr {
+  color: var(--kiln-ok-green) !important;
+  border-color: rgba(122, 182, 72, 0.4) !important;
+  margin-right: 16px;
+}
+
+.kiln-branch-bar__btn--pr:hover {
+  background: rgba(122, 182, 72, 0.1) !important;
+}
+
+/* Stash tab */
+.kiln-stash-tab {
+  padding: 12px 16px;
+  overflow-y: auto;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kiln-stash-tab__empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  line-height: 1.8;
+}
+
+.kiln-stash-card {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  padding: 10px 12px;
+}
+
+.kiln-stash-card__header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.kiln-stash-card__title {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  font-weight: 600;
+}
+
+.kiln-stash-card__msg {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-stash-card__actions {
+  display: flex;
+  gap: 6px;
+}
+
+.kiln-stash-card__btn {
+  padding: 3px 10px;
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.kiln-stash-card__btn--apply {
+  color: var(--kiln-verdigris);
+  border: 1px solid rgba(67, 179, 174, 0.4);
+  background: rgba(67, 179, 174, 0.08);
+}
+
+.kiln-stash-card__btn--pop {
+  color: var(--kiln-iron);
+  border: 1px solid var(--kiln-border-medium);
+  background: none;
+}
+
+.kiln-stash-card__btn--drop {
+  color: var(--kiln-oxide-red);
+  border: 1px solid rgba(183, 65, 14, 0.4);
+  background: rgba(183, 65, 14, 0.08);
+}
+
+/* Conflicts tab */
+.kiln-conflicts-tab {
+  display: flex;
+  height: 100%;
+}
+
+.kiln-conflicts-tab__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-conflicts-tab__led--ok {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--kiln-ok-green);
+}
+
+.kiln-conflicts-sidebar {
+  flex: 0 0 200px;
+  border-right: 1px solid var(--kiln-border-medium);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.kiln-conflicts-sidebar__header {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  border-bottom: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-conflicts-sidebar__count {
+  font-family: var(--kiln-font-code);
+}
+
+.kiln-conflicts-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  border-left: 2px solid transparent;
+}
+
+.kiln-conflicts-file:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-conflicts-file--active {
+  background: var(--kiln-border-strong);
+  border-left-color: var(--kiln-oxide-red);
+}
+
+.kiln-conflicts-file__led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.kiln-conflicts-file__led--unresolved { background: var(--kiln-oxide-red); }
+.kiln-conflicts-file__led--resolved { background: var(--kiln-ok-green); }
+
+.kiln-conflicts-file__path {
+  color: var(--kiln-bone);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-conflicts-file__count {
+  color: var(--kiln-oxide-red);
+  font-size: 10px;
+}
+
+.kiln-conflicts-sidebar__merge-btn {
+  margin: 8px 12px;
+  padding: 6px 12px;
+  background: rgba(122, 182, 72, 0.15);
+  border: 1px solid rgba(122, 182, 72, 0.4);
+  color: var(--kiln-ok-green);
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.kiln-conflicts-content {
+  flex: 1;
+  overflow: auto;
+}
+
+.kiln-conflicts-content__empty {
+  padding: 24px;
+  text-align: center;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-conflicts-content__text {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.kiln-conflict-line {
+  display: flex;
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.kiln-conflict-line--marker {
+  background: rgba(183, 65, 14, 0.12);
+}
+
+.kiln-conflict-line--marker .kiln-conflict-line__text {
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-conflict-line__num {
+  color: var(--kiln-text-floor);
+  min-width: 36px;
+  text-align: right;
+  padding-right: 8px;
+  font-size: 10px;
+  user-select: none;
+}
+
+.kiln-conflict-line__text {
+  color: var(--kiln-bone);
+}
+
+/* PR creation pane */
+.kiln-pr-pane {
+  flex: 1;
+  padding: 16px 24px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.kiln-pr-pane__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.kiln-pr-pane__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bone);
+}
+
+.kiln-pr-pane__close {
+  background: none;
+  border: none;
+  color: var(--kiln-text-floor);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.kiln-pr-pane__provider {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-pr-pane__branches {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.kiln-pr-pane__branch {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kiln-pr-pane__branch-icon {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-pr-pane__branch-name {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+}
+
+.kiln-pr-pane__branch-input {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  outline: none;
+  width: 160px;
+}
+
+.kiln-pr-pane__arrow {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-pr-pane__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.kiln-pr-pane__label {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-pr-pane__input {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 7px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-pr-pane__input:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-pr-pane__textarea {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  outline: none;
+  min-height: 120px;
+  resize: vertical;
+}
+
+.kiln-pr-pane__textarea:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-pr-pane__options {
+  display: flex;
+  gap: 16px;
+}
+
+.kiln-pr-pane__checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.kiln-pr-pane__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.kiln-pr-pane__create-btn {
+  padding: 8px 20px;
+  background: rgba(122, 182, 72, 0.15);
+  border: 1px solid rgba(122, 182, 72, 0.4);
+  color: var(--kiln-ok-green);
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.kiln-pr-pane__create-btn:hover:not(:disabled) {
+  background: rgba(122, 182, 72, 0.25);
+}
+
+.kiln-pr-pane__create-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.kiln-pr-pane__cancel-btn {
+  padding: 8px 20px;
+  background: none;
+  border: 1px solid var(--kiln-border-medium);
+  color: var(--kiln-iron);
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+/* PR success screen */
+.kiln-pr-success {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.kiln-pr-success__icon {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: rgba(122, 182, 72, 0.15);
+  border: 2px solid rgba(122, 182, 72, 0.3);
+  color: var(--kiln-ok-green);
+  font-size: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.kiln-pr-success__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--kiln-ok-green);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.kiln-pr-success__meta {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-pr-success__url {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+  background: var(--kiln-char);
+  border: 1px solid rgba(67, 179, 174, 0.25);
+  border-radius: 2px;
+  padding: 4px 10px;
+  text-decoration: none;
+}
+
+.kiln-pr-success__close {
+  margin-top: 8px;
+  padding: 6px 16px;
+  background: none;
+  border: 1px solid var(--kiln-border-medium);
+  color: var(--kiln-iron);
+  border-radius: 2px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+/* ── 6g. Status bar ──────────────────────────────────────────────────────
+   22px bottom bar with git branch, changes, cursor, encoding, language.
+   Git segments hidden when no repo detected. Spec §G3.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-status-bar {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  min-height: 22px;
+  background: var(--kiln-char);
+  border-top: 1px solid var(--kiln-border-subtle);
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  padding: 0 8px;
+  gap: 0;
+  user-select: none;
+}
+
+.kiln-status-segment {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  height: 100%;
+  white-space: nowrap;
+}
+
+.kiln-status-segment:hover {
+  background: var(--kiln-border-strong);
+  transition: background 150ms;
+}
+
+.kiln-status-divider {
+  width: 1px;
+  height: 10px;
+  background: var(--kiln-border-medium);
+  flex-shrink: 0;
+}
+
+.kiln-status-spacer {
+  flex: 1;
+}
+
+/* Branch segment */
+.kiln-status__branch-icon {
+  color: var(--kiln-verdigris);
+  font-size: 10px;
+}
+
+.kiln-status__branch-name {
+  color: var(--kiln-bone);
+}
+
+.kiln-status__ahead {
+  color: var(--kiln-ok-green);
+}
+
+.kiln-status__behind {
+  color: var(--kiln-hazard);
+}
+
+/* Changes segment */
+.kiln-status__added {
+  color: var(--kiln-ok-green);
+}
+
+.kiln-status__modified {
+  color: var(--kiln-hazard);
+}
+
+.kiln-status__deleted {
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-status__untracked {
+  color: var(--kiln-text-floor);
+}
+
+/* Static segments */
+.kiln-status-segment--cursor {
+  color: var(--kiln-iron);
+}
+
+.kiln-status-segment--encoding,
+.kiln-status-segment--lang,
+.kiln-status-segment--engine {
+  color: var(--kiln-text-floor);
+}
+
+/* Clickable status segments */
+.kiln-status-segment--clickable {
+  cursor: pointer;
+}
+
+/* ── Branch switcher dropdown ────────────────────────────────────────────
+   Opens above the status bar on branch click. Spec §G3.4.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-branch-switcher-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+}
+
+.kiln-branch-switcher {
+  position: fixed;
+  bottom: 24px;
+  left: 8px;
+  width: 280px;
+  max-height: 240px;
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  display: flex;
+  flex-direction: column;
+  z-index: 301;
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.kiln-branch-switcher__search {
+  width: 100%;
+  background: var(--kiln-char) !important;
+  border: none;
+  border-bottom: 1px solid var(--kiln-border-medium);
+  padding: 8px 12px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+.kiln-branch-switcher__search::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-branch-switcher__list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 4px 0;
+}
+
+.kiln-branch-switcher__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+}
+
+.kiln-branch-switcher__item:hover {
+  background: var(--kiln-border-strong);
+}
+
+.kiln-branch-switcher__item--current {
+  cursor: default;
+}
+
+.kiln-branch-switcher__item--current:hover {
+  background: transparent;
+}
+
+.kiln-branch-switcher__dot {
+  color: var(--kiln-verdigris);
+  font-size: 10px;
+}
+
+.kiln-branch-switcher__name {
+  flex: 1;
+}
+
+.kiln-branch-switcher__footer {
+  border-top: 1px solid var(--kiln-border-medium);
+  padding: 6px 12px;
+}
+
+.kiln-branch-switcher__new-btn {
+  background: none;
+  border: none;
+  color: var(--kiln-verdigris);
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.kiln-branch-switcher__new-row {
+  display: flex;
+}
+
+.kiln-branch-switcher__new-input {
+  flex: 1;
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+  outline: none;
+}
+
+/* ── Blame gutter ────────────────────────────────────────────────────────
+   Toggleable 130px column in YAML sidebar showing per-line blame.
+   Spec §G9.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-blame-toggle {
+  background: transparent;
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 2px;
+  padding: 2px 6px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  transition: all 200ms ease;
+  margin-left: auto;
+}
+
+.kiln-blame-toggle:hover {
+  border-color: var(--kiln-verdigris);
+  color: var(--kiln-verdigris);
+}
+
+.kiln-blame-toggle--active {
+  background: rgba(67, 179, 174, 0.12);
+  border-color: rgba(67, 179, 174, 0.3);
+  color: var(--kiln-verdigris);
+}
+
+.kiln-blame-gutter {
+  flex: 0 0 130px;
+  overflow: hidden;
+  border-right: 1px solid var(--kiln-border-subtle);
+  padding-top: 0;
+}
+
+.kiln-blame-line {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  height: 1.55em;
+  padding: 0 6px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.kiln-blame-author {
+  color: var(--kiln-verdigris);
+  min-width: 48px;
+}
+
+.kiln-blame-time {
+  color: var(--kiln-text-floor);
+  min-width: 22px;
+  text-align: right;
+}
+
+.kiln-blame-hash {
+  color: var(--kiln-text-floor);
+  min-width: 48px;
+  text-align: right;
+}
+
+.kiln-blame-continuation {
+  color: var(--kiln-border-subtle);
+  padding-left: 20px;
+}
+
+.kiln-blame-uncommitted {
+  color: var(--kiln-hazard);
+  opacity: 0.9;
+  font-style: italic;
+}
+
+/* ── 7. Canvas panel ───────────────────────────────────────────────────────
+   Infinite world-space viewport. Phase 3 adds CSS transform for pan/zoom.
+   Visual layers: dot grid → noise → scanlines → SVG connectors → nodes.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-canvas-panel {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+  background-color: var(--kiln-char);
+
+  /* Two-tier Blueprint line grid: 20px minor + 100px major
+     RUSTPUNK_AESTHETICS.md §Grid Paper */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cdefs%3E%3Cpattern id='minor' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Cpath d='M 20 0 L 0 0 0 20' fill='none' stroke='%2343B3AE' stroke-width='0.3' opacity='0.08'/%3E%3C/pattern%3E%3Cpattern id='major' width='100' height='100' patternUnits='userSpaceOnUse'%3E%3Crect width='100' height='100' fill='url(%23minor)'/%3E%3Cpath d='M 100 0 L 0 0 0 100' fill='none' stroke='%2343B3AE' stroke-width='0.8' opacity='0.08'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='100' height='100' fill='url(%23major)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 100px 100px;
+}
+
+/* Scanline overlay — ::before
+   RUSTPUNK_AESTHETICS.md §Scanlines: 2px transparent + 2px rgba(0,0,0,0.06) */
+.kiln-canvas-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.06) 2px,
+    rgba(0, 0, 0, 0.06) 4px
+  );
+}
+
+/* Noise / grain overlay — ::after
+   RUSTPUNK_AESTHETICS.md §Noise Overlay: 256x256 warm-weighted grain,
+   blend overlay, opacity 0.6. feColorMatrix warm-weights: R×1.0, G×0.7, B×0.4 */
+.kiln-canvas-panel::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 11;
+  opacity: 0.6;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='1 0 0 0 0 0 0.7 0 0 0 0 0 0.4 0 0 0 0 0 0.16 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+/* Transformed viewport div — receives pan/zoom CSS transform.
+   transform-origin: 0 0 so the translation is in screen-space (natural for pan). */
+.kiln-canvas-viewport {
+  position: relative;
+  transform-origin: 0 0;
+  /* will-change: transform tells the compositor to promote this layer for GPU
+     acceleration — keeps pan/zoom smooth at 60fps. */
+  will-change: transform;
+}
+
+/* SVG connector overlay — sits below nodes */
+.kiln-canvas-svg {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* ── 8. Node cards ─────────────────────────────────────────────────────────
+   Spec §4.2: 160 px wide, accent border-top, eroded asymmetric corners.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-node {
+  position: absolute;
+  z-index: 5;
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-top-width: 3px;
+  /* Eroded corners: top-right 16 px, bottom-left 14 px — spec §4.2 */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 16px) 0,
+    100% 16px,
+    100% 100%,
+    14px 100%,
+    0 calc(100% - 14px)
+  );
+  padding: 10px 12px 10px 12px;
+  cursor: default;
+  transition: border-color 300ms ease, box-shadow 300ms ease;
+}
+
+.kiln-node:hover {
+  border-color: var(--kiln-border-medium);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+/* Selected node — accent border glow, eroded corners removed (spec §4.5) */
+.kiln-node--selected {
+  border-color: var(--kiln-verdigris) !important;
+  box-shadow: 0 0 12px 2px rgba(67, 179, 174, 0.3),
+              0 2px 16px rgba(0, 0, 0, 0.5);
+  clip-path: none;
+}
+
+/* Error node — red accent for parse-failure placeholders */
+.kiln-node--error {
+  border-top-color: #CC3333;
+  background: rgba(204, 51, 51, 0.08);
+}
+.kiln-node--error .kiln-node-badge {
+  color: #CC3333;
+}
+
+/* Badge row: pass pill + type label */
+.kiln-node-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 7px;
+}
+
+.kiln-node-pass-pill {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--kiln-border-medium);
+  color: var(--kiln-iron);
+  letter-spacing: 0.05em;
+}
+
+.kiln-node-type-badge {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  /* Colour is driven by inline `color:` from accent. */
+}
+
+/* Primary node label */
+.kiln-node-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  letter-spacing: 0.02em;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Rust-line separator — oxidation spread gradient, RUSTPUNK_AESTHETICS.md §Surface Treatment */
+.kiln-rust-line {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg,
+    transparent 0%, #5C3A1E 8%, #B7410E 20%, #C75B2A 35%,
+    #8B4513 50%, #B7410E 65%, #5C3A1E 85%, transparent 100%);
+  opacity: 0.6;
+  margin: 4px 0 6px;
+}
+
+/* Subtitle / secondary info line */
+.kiln-node-subtitle {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Port squares — left (in) and right (out) */
+.kiln-node-port {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--kiln-char-raised);
+  border: 1px solid var(--kiln-border-medium);
+}
+
+.kiln-node-port--in {
+  left: -5px;
+}
+
+.kiln-node-port--out {
+  right: -5px;
+}
+
+/* ── 8b. Composition nodes — dashed verdigris border ─────────────────────── */
+.kiln-node--composition {
+  border: 2px dashed rgba(67, 179, 174, 0.4);
+  border-top: 3px dashed rgba(67, 179, 174, 0.6);
+  clip-path: none;
+  border-radius: 0 4px 0 3px;
+}
+.kiln-node--composition:hover {
+  border-color: rgba(67, 179, 174, 0.7);
+}
+.kiln-node--composition.kiln-node--selected {
+  border-color: var(--kiln-verdigris) !important;
+  border-style: dashed;
+}
+
+/* Expand/drill indicator — bottom-right corner */
+.kiln-node-expand-indicator {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+}
+
+/* ── 8c. Composition group frame — inline-expanded boundary ──────────────── */
+.kiln-composition-group {
+  position: absolute;
+  z-index: 3;
+  border: 2px dashed rgba(67, 179, 174, 0.35);
+  border-top: 3px dashed rgba(67, 179, 174, 0.5);
+  border-radius: 0 4px 0 3px;
+  background: rgba(67, 179, 174, 0.04);
+}
+
+.kiln-composition-group__header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  height: 24px;
+}
+
+.kiln-composition-group__icon {
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-verdigris);
+}
+
+.kiln-composition-group__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-composition-group__meta {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-composition-group__spacer {
+  flex: 1;
+}
+
+.kiln-composition-group__collapse {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.kiln-composition-group__collapse:hover {
+  color: var(--kiln-verdigris);
+}
+
+/* ── 8d. Breadcrumb bar — drill-in navigation ────────────────────────────── */
+.kiln-breadcrumb-bar {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  gap: 0;
+  background: var(--kiln-char);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  z-index: 9;
+  position: relative;
+}
+
+.kiln-breadcrumb__segment {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.kiln-breadcrumb__segment--link {
+  color: var(--kiln-iron);
+  cursor: pointer;
+}
+.kiln-breadcrumb__segment--link:hover {
+  color: var(--kiln-verdigris);
+}
+
+.kiln-breadcrumb__segment--active {
+  color: var(--kiln-bone);
+}
+
+.kiln-breadcrumb__sep {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  padding: 0 8px;
+}
+
+.kiln-breadcrumb__comp-icon {
+  color: var(--kiln-verdigris);
+  font-size: 10px;
+  margin-right: 4px;
+}
+
+.kiln-breadcrumb__spacer {
+  flex: 1;
+}
+
+.kiln-breadcrumb__hint {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* Scope indicator — verdigris gradient bar below breadcrumb */
+.kiln-scope-indicator {
+  height: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(90deg,
+    transparent,
+    rgba(67, 179, 174, 0.6) 20%,
+    rgba(67, 179, 174, 0.8) 50%,
+    rgba(67, 179, 174, 0.6) 80%,
+    transparent);
+}
+
+/* ── 8e. Channel override badges on nodes ────────────────────────────────── */
+.kiln-node-override-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  margin-left: auto;
+}
+.kiln-node-override-badge--modified {
+  color: var(--kiln-hazard);
+}
+.kiln-node-override-badge--added {
+  color: var(--kiln-verdigris);
+}
+.kiln-node-override-badge--removed {
+  color: var(--kiln-oxide-red);
+  text-decoration: line-through;
+}
+
+/* ── 9. YAML Sidebar ───────────────────────────────────────────────────────
+   Spec §6: full-height column with section header + scrollable code area.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-yaml-sidebar {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char);
+  overflow: hidden;
+}
+
+/* Section header row */
+.kiln-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+}
+
+.kiln-diamond {
+  color: var(--kiln-border-medium);
+  font-size: 10px;
+}
+
+.kiln-section-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-section-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-section-filename {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+/* Scrollable code area — horizontal row of gutter + code */
+.kiln-yaml-code-area {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kiln-yaml-gutter {
+  flex: 0 0 36px;
+  background: var(--kiln-char);
+  border-right: 1px solid var(--kiln-border-subtle);
+  padding: 8px 0;
+  overflow: hidden;
+}
+
+.kiln-yaml-line-num {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 20px;
+  color: var(--kiln-text-floor);
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+}
+
+.kiln-yaml-code {
+  flex: 1;
+  padding: 8px 12px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+.kiln-yaml-line {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 20px;
+  white-space: pre;
+  color: var(--kiln-bone);
+}
+
+/* Editor container: stacks syntax overlay + textarea */
+.kiln-yaml-editor {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Syntax-highlighted overlay — visible, pointer-events none */
+.kiln-yaml-highlight {
+  padding: 8px 12px;
+  pointer-events: none;
+  white-space: pre;
+}
+
+/* Transparent textarea — captures input, sits on top */
+.kiln-yaml-textarea {
+  position: absolute;
+  inset: 0;
+  padding: 8px 12px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 20px;
+  color: transparent;
+  caret-color: var(--kiln-bone);
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  white-space: pre;
+  overflow: hidden;
+  tab-size: 2;
+}
+
+/* Parse error bar below the textarea */
+.kiln-yaml-errors {
+  flex-shrink: 0;
+  border-top: 1px solid var(--kiln-oxide-red);
+  background: rgba(183, 65, 14, 0.08);
+  padding: 6px 12px;
+  max-height: 80px;
+  overflow-y: auto;
+}
+
+.kiln-yaml-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--kiln-oxide-red);
+}
+
+.kiln-yaml-error-text {
+  flex: 1;
+  user-select: text;
+  cursor: text;
+}
+
+.kiln-yaml-error-copy {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid rgba(183, 65, 14, 0.3);
+  border-radius: 2px;
+  color: var(--kiln-oxide-red);
+  font-size: 11px;
+  padding: 1px 5px;
+  cursor: pointer;
+  transition: border-color 200ms, background 200ms;
+  line-height: 1;
+}
+
+.kiln-yaml-error-copy:hover {
+  border-color: var(--kiln-oxide-red);
+  background: rgba(183, 65, 14, 0.12);
+}
+
+/* Inspector value display (non-editable, like path) */
+.kiln-inspector-value {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-phosphor);
+  padding: 4px 0;
+  word-break: break-all;
+}
+
+/* YAML syntax colours via data-token attribute — spec §6.2 (kept for tokenizer) */
+[data-token="comment"] { color: var(--kiln-text-floor); }
+[data-token="key"]     { color: var(--kiln-verdigris); }
+[data-token="value"]   { color: var(--kiln-phosphor); }
+[data-token="punct"]   { color: var(--kiln-iron); }
+[data-token="indent"]  { /* whitespace — no colour */ }
+
+/* CXL syntax colours — highlights CXL expressions within YAML */
+[data-token="cxl-keyword"] { color: var(--kiln-verdigris); font-weight: 600; }
+[data-token="cxl-op"]      { color: var(--kiln-iron); }
+[data-token="cxl-string"]  { color: var(--kiln-ember); }
+[data-token="cxl-ident"]   { color: var(--kiln-phosphor); }
+[data-token="cxl-literal"] { color: #B8956A; }
+[data-token="cxl-punct"]   { color: var(--kiln-iron); }
+
+/* ── 10. Run-log drawer ────────────────────────────────────────────────────
+   Spec §7: bottom-anchored, pushes content up (not an overlay).
+   Collapsed: 28 px tab bar. Expanded: 220 px.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-run-log {
+  flex-shrink: 0;
+  border-top: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-raised);
+  height: 28px;
+  overflow: hidden;
+  transition: height 300ms ease-out;
+}
+
+.kiln-run-log[data-expanded="true"] {
+  height: 220px;
+}
+
+/* Tab bar (always visible) */
+.kiln-run-log-tab {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 12px;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.kiln-run-log-tab:hover .kiln-run-log-label {
+  color: var(--kiln-bone);
+}
+
+.kiln-run-log-led {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--kiln-ok-green);
+  box-shadow: 0 0 4px 1px rgba(122, 182, 72, 0.5);
+}
+
+.kiln-run-log-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  transition: color 150ms;
+}
+
+.kiln-run-log-chevron {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* Scrollable log content (visible when expanded) */
+.kiln-run-log-content {
+  height: calc(220px - 28px);
+  overflow-y: auto;
+  padding: 4px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Individual log line */
+.kiln-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  padding: 0 12px;
+  line-height: 18px;
+}
+
+.kiln-log-ts {
+  flex: 0 0 72px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-log-tag {
+  flex: 0 0 32px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.kiln-log-msg {
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Level colours — spec §7.3 */
+.kiln-log-line[data-level="cmd"]  .kiln-log-tag,
+.kiln-log-line[data-level="cmd"]  .kiln-log-msg  { color: var(--kiln-bone); font-weight: 600; }
+
+.kiln-log-line[data-level="info"] .kiln-log-tag,
+.kiln-log-line[data-level="info"] .kiln-log-msg  { color: var(--kiln-iron); }
+
+.kiln-log-line[data-level="stat"] .kiln-log-tag,
+.kiln-log-line[data-level="stat"] .kiln-log-msg  { color: var(--kiln-verdigris); }
+
+.kiln-log-line[data-level="ok"]   .kiln-log-tag,
+.kiln-log-line[data-level="ok"]   .kiln-log-msg  { color: var(--kiln-ok-green); font-weight: 600; }
+
+.kiln-log-line[data-level="warn"] {
+  background: rgba(232, 165, 36, 0.08);
+}
+.kiln-log-line[data-level="warn"] .kiln-log-tag,
+.kiln-log-line[data-level="warn"] .kiln-log-msg  { color: var(--kiln-hazard); }
+
+.kiln-log-line[data-level="err"]  {
+  background: rgba(183, 65, 14, 0.08);
+}
+.kiln-log-line[data-level="err"]  .kiln-log-tag,
+.kiln-log-line[data-level="err"]  .kiln-log-msg  { color: var(--kiln-oxide-red); }
+
+/* ── 11. YAML selection sync ────────────────────────────────────────────────
+   When a stage is selected, its YAML lines get a tinted background and
+   accent left border. Line numbers shift to verdigris colour.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-yaml-line[data-selected="true"] {
+  background: rgba(67, 179, 174, 0.08);
+  border-left: 2px solid var(--kiln-verdigris);
+  padding-left: 10px;
+}
+
+.kiln-yaml-line-num[data-selected="true"] {
+  color: var(--kiln-verdigris);
+}
+
+/* ── 12. Inspector panel ───────────────────────────────────────────────────
+   Spec §5: slide-in panel between canvas and YAML sidebar.
+   340 px default width, vertical flex with scrollable content.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-inspector {
+  flex: 0 0 340px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--kiln-border-subtle);
+  border-right: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-raised);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Inspector header — accent border-top, type badge, label, close button */
+.kiln-inspector-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  /* border-top set inline from accent colour */
+}
+
+.kiln-inspector-badge {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 2px;
+  border: 1px solid;
+}
+
+.kiln-inspector-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-inspector-close {
+  background: none;
+  border: 1px solid var(--kiln-border-subtle);
+  color: var(--kiln-text-floor);
+  font-size: 14px;
+  width: 22px;
+  height: 22px;
+  border-radius: 2px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 150ms, color 150ms;
+}
+
+.kiln-inspector-close:hover {
+  border-color: var(--kiln-oxide-red);
+  color: var(--kiln-oxide-red);
+}
+
+/* Inspector section (Configuration, etc.) */
+.kiln-inspector-section {
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+/* ── 13. CXL expression input + diagnostics ────────────────────────────────
+   Text input for CXL expressions with real-time parse validation.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-cxl-field {
+  padding: 8px 16px;
+}
+
+.kiln-cxl-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 4px;
+}
+
+.kiln-cxl-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-phosphor);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  outline: none;
+  transition: border-color 150ms;
+}
+
+.kiln-cxl-input:focus {
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-cxl-input--error {
+  border-color: var(--kiln-oxide-red);
+}
+
+.kiln-cxl-input--error:focus {
+  border-color: var(--kiln-oxide-red);
+  box-shadow: 0 0 4px rgba(183, 65, 14, 0.3);
+}
+
+/* CXL diagnostic messages */
+.kiln-cxl-diagnostics {
+  margin-top: 4px;
+}
+
+.kiln-cxl-diag {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 16px;
+  padding: 1px 0;
+}
+
+.kiln-cxl-diag--error .kiln-cxl-diag-msg { color: var(--kiln-oxide-red); }
+.kiln-cxl-diag--warning .kiln-cxl-diag-msg { color: var(--kiln-hazard); }
+
+.kiln-cxl-diag-fix {
+  color: var(--kiln-iron);
+  font-style: italic;
+}
+
+/* ── 14. Inspector scoped YAML ─────────────────────────────────────────────
+   Bottom section showing just the selected stage's YAML lines.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-inspector-yaml {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+/* Scoped YAML code area reuses the sidebar's gutter + code layout.
+   Background matches the gutter (--kiln-char) not the inspector panel
+   (--kiln-char-raised) so the two columns look unified. */
+.kiln-inspector-yaml-area {
+  overflow: auto;
+  background: var(--kiln-char);
+}
+
+/* ── 15. Inspector config section (compressible) ───────────────────────────
+   When the drawer is open, config compresses to ~42%. When closed, fills.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-inspector-config {
+  flex: 1;
+  overflow-y: auto;
+  transition: flex 300ms ease;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+.kiln-inspector-config[data-compressed="true"] {
+  flex: 0.42;
+}
+
+/* ── 16. Drawer toggle bar ─────────────────────────────────────────────────
+   Three equal-width buttons: Run (phosphor) | Docs (verdigris) | Notes (iron).
+   Spec §A2.3: 32px height, char-raised background.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-drawer-bar {
+  display: flex;
+  align-items: stretch;
+  height: 32px;
+  flex-shrink: 0;
+  background: var(--kiln-char-raised);
+  border-top: 1px solid var(--kiln-border-subtle);
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-drawer-divider {
+  width: 1px;
+  background: var(--kiln-border-medium);
+}
+
+.kiln-drawer-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  padding: 0 8px;
+  transition: background 200ms ease, color 200ms ease, border-color 200ms ease;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-drawer-btn:hover {
+  color: var(--kiln-bone);
+}
+
+.kiln-drawer-btn[data-active="true"] {
+  /* accent colour set via inline style */
+}
+
+.kiln-drawer-btn-icon {
+  font-size: 11px;
+}
+
+.kiln-drawer-btn-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.kiln-drawer-btn-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 2px;
+  padding: 0 4px;
+  line-height: 14px;
+}
+
+/* ── 17. Drawer region ─────────────────────────────────────────────────────
+   Expands/collapses below the toggle bar. Scrollable independently.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-drawer-region {
+  flex: 0;
+  overflow: hidden;
+  transition: flex 300ms ease;
+}
+
+.kiln-drawer-region[data-open="true"] {
+  flex: 0.58;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+/* Drawer content containers */
+.kiln-drawer-content {
+  padding: 16px;
+  min-height: 100%;
+}
+
+/* Run drawer — phosphor tint */
+.kiln-drawer-content--run {
+  background: rgba(212, 160, 23, 0.04);
+}
+
+/* Docs drawer — Blueprint two-tier SVG grid (same as schematics content) */
+.kiln-drawer-content--docs {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cdefs%3E%3Cpattern id='minor' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Cpath d='M 20 0 L 0 0 0 20' fill='none' stroke='%2343B3AE' stroke-width='0.3' opacity='0.08'/%3E%3C/pattern%3E%3Cpattern id='major' width='100' height='100' patternUnits='userSpaceOnUse'%3E%3Crect width='100' height='100' fill='url(%23minor)'/%3E%3Cpath d='M 100 0 L 0 0 0 100' fill='none' stroke='%2343B3AE' stroke-width='0.8' opacity='0.08'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='100' height='100' fill='url(%23major)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 100px 100px;
+  background-color: var(--kiln-char);
+}
+
+/* Notes drawer — iron tint */
+.kiln-drawer-content--notes {
+  background: rgba(138, 126, 110, 0.04);
+}
+
+/* Placeholder text for stub drawers */
+.kiln-drawer-placeholder {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  text-align: center;
+  padding: 24px 0;
+  font-style: italic;
+}
+
+/* ── 18. Notes drawer content ───────────────────────────────────────────────
+   Stage-level note and field-level annotations. Iron accent.
+   Spec §A5A.2–A5A.4.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-notes-section {
+  margin-bottom: 12px;
+}
+
+.kiln-notes-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.kiln-notes-section-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-notes-count {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  margin-left: auto;
+}
+
+.kiln-notes-block {
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  padding: 8px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--kiln-bone);
+  white-space: pre-wrap;
+}
+
+.kiln-notes-annotation {
+  margin-bottom: 8px;
+}
+
+.kiln-notes-field-key {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 4px;
+}
+
+/* Notes edit button */
+.kiln-notes-edit-btn {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--kiln-border-subtle);
+  color: var(--kiln-iron);
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 8px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: border-color 150ms, color 150ms;
+}
+
+.kiln-notes-edit-btn:hover {
+  border-color: var(--kiln-iron);
+  color: var(--kiln-bone);
+}
+
+/* Notes textarea (edit mode for stage note) */
+.kiln-notes-textarea {
+  width: 100%;
+  min-height: 60px;
+  padding: 8px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-bone);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  outline: none;
+  resize: vertical;
+  white-space: pre-wrap;
+  tab-size: 2;
+}
+
+.kiln-notes-textarea:focus {
+  border-color: var(--kiln-iron);
+}
+
+/* Notes empty state text */
+.kiln-notes-empty {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+/* Field annotation inline input */
+.kiln-notes-field-input {
+  width: 100%;
+  padding: 6px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--kiln-bone);
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  outline: none;
+}
+
+.kiln-notes-field-input:focus {
+  border-color: var(--kiln-iron);
+}
+
+/* ── 19. Docs drawer content (Blueprint sub-aesthetic) ─────────────────────
+   Auto-generated stage descriptions, metadata grid, column impact.
+   Spec §A5.2–A5.6, §A10.1.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* Auto-generated description block */
+.kiln-docs-description {
+  background: var(--kiln-char);
+  border: 1px solid rgba(67, 179, 174, 0.15);
+  border-left: 2px solid rgba(67, 179, 174, 0.3);
+  border-radius: 2px;
+  padding: 10px 12px;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--kiln-bone);
+  margin-bottom: 12px;
+}
+
+/* User-authored note rendered below auto-description */
+.kiln-docs-note-section {
+  margin-bottom: 12px;
+}
+
+.kiln-docs-note-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 4px;
+}
+
+.kiln-docs-note-block {
+  background: var(--kiln-char-raised);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  padding: 8px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--kiln-bone);
+  white-space: pre-wrap;
+}
+
+/* Stage metadata key-value grid */
+.kiln-docs-metadata {
+  margin-bottom: 12px;
+  border: 1px solid rgba(67, 179, 174, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.kiln-docs-meta-row {
+  display: flex;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  padding: 4px 10px;
+}
+
+.kiln-docs-meta-row:last-child {
+  border-bottom: none;
+}
+
+.kiln-docs-meta-key {
+  flex: 0 0 100px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-docs-meta-value {
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bone);
+}
+
+/* Column impact tags */
+.kiln-docs-columns {
+  margin-bottom: 12px;
+}
+
+.kiln-docs-columns-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+  margin-bottom: 4px;
+}
+
+.kiln-docs-column-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-docs-column-tag {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+.kiln-docs-column-tag--added {
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.12);
+  border: 1px solid rgba(67, 179, 174, 0.25);
+}
+
+/* Footer: ── AUTODOC ── */
+.kiln-docs-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.kiln-docs-footer-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(67, 179, 174, 0.3), transparent);
+}
+
+.kiln-docs-footer-label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  color: var(--kiln-iron);
+}
+
+/* ── Docs drawer: section headings ──────────────────────────────────────── */
+.kiln-docs-section {
+  margin-bottom: 12px;
+}
+
+.kiln-docs-section-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 6px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+.kiln-docs-user-desc {
+  font-family: var(--kiln-font-blueprint);
+  font-size: 11px;
+  color: var(--kiln-bp-text);
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--kiln-bp-accent-30);
+}
+
+.kiln-docs-meta-value--badge {
+  font-weight: 600;
+  color: #D4A017;
+}
+
+.kiln-docs-meta-value--path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+/* ── Schema table ──────────────────────────────────────────────────────── */
+.kiln-docs-schema-table {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  width: 100%;
+}
+
+.kiln-docs-schema-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1.5fr;
+  gap: 4px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+.kiln-docs-schema-row--header {
+  font-family: var(--kiln-font-ui);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  border-bottom: 1px solid var(--kiln-bp-accent-30);
+}
+
+.kiln-docs-schema-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--kiln-bp-text);
+}
+
+.kiln-docs-schema-cell--name {
+  color: var(--kiln-bp-accent);
+  font-weight: 500;
+}
+
+/* ── Lineage table ─────────────────────────────────────────────────────── */
+.kiln-docs-lineage-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kiln-docs-lineage-row {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+.kiln-docs-lineage-field {
+  margin-bottom: 4px;
+}
+
+.kiln-docs-lineage-expr {
+  margin-bottom: 3px;
+}
+
+.kiln-docs-lineage-code {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 5%, transparent);
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+
+.kiln-docs-lineage-refs {
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+}
+
+.kiln-docs-lineage-refs-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kiln-docs-lineage-ref {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  margin-right: 6px;
+  color: var(--kiln-bp-text);
+}
+
+/* ── Contract section ──────────────────────────────────────────────────── */
+.kiln-docs-contract-group {
+  margin-bottom: 8px;
+}
+
+.kiln-docs-contract-heading {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 3px;
+}
+
+.kiln-docs-contract-field {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.kiln-docs-contract-name {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-accent);
+}
+
+.kiln-docs-contract-type {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+}
+
+/* ── Provenance diff ───────────────────────────────────────────────────── */
+.kiln-docs-diff {
+  margin-top: 6px;
+}
+
+.kiln-docs-diff-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 3px;
+}
+
+.kiln-docs-diff-block {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 8px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+  border-radius: 2px;
+}
+
+.kiln-docs-diff-block--original {
+  color: #B7410E;
+  background: color-mix(in srgb, #B7410E 6%, transparent);
+  border: 1px solid color-mix(in srgb, #B7410E 20%, transparent);
+}
+
+.kiln-docs-diff-block--current {
+  color: var(--kiln-bp-accent);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--kiln-bp-accent) 20%, transparent);
+}
+
+/* ── CXL statement badges ──────────────────────────────────────────────── */
+.kiln-docs-stmt-badge {
+  display: inline-block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  margin-right: 6px;
+  border: 1px solid;
+  border-radius: 0;
+}
+
+.kiln-docs-stmt-badge[data-kind="emit"] {
+  color: var(--kiln-bp-accent);
+  border-color: color-mix(in srgb, var(--kiln-bp-accent) 40%, transparent);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="filter"] {
+  color: #D4A017;
+  border-color: color-mix(in srgb, #D4A017 40%, transparent);
+  background: color-mix(in srgb, #D4A017 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="let"] {
+  color: #8A7E6E;
+  border-color: color-mix(in srgb, #8A7E6E 40%, transparent);
+  background: color-mix(in srgb, #8A7E6E 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="log"] {
+  color: #666;
+  border-color: color-mix(in srgb, #666 40%, transparent);
+  background: color-mix(in srgb, #666 10%, transparent);
+}
+
+.kiln-docs-stmt-badge[data-kind="expr"] {
+  color: var(--kiln-bp-text-dim);
+  border-color: var(--kiln-bp-border);
+}
+
+.kiln-docs-field-refs-summary {
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--kiln-bp-accent) 5%, transparent);
+  border-left: 2px solid var(--kiln-bp-accent-30);
+}
+
+/* Stage card: CXL summary line */
+.kiln-stage-card-cxl-summary {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+  letter-spacing: 0.04em;
+  margin: 4px 0;
+}
+
+.kiln-stage-card-field-refs {
+  margin: 4px 0;
+}
+
+/* ── Channel banner (schematics) ───────────────────────────────────────── */
+.kiln-schematics-channel-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, #D4A017 8%, transparent);
+  border: 1px solid color-mix(in srgb, #D4A017 25%, transparent);
+}
+
+.kiln-schematics-channel-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #D4A017;
+}
+
+.kiln-schematics-channel-name {
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: #D4A017;
+  font-weight: 600;
+}
+
+.kiln-schematics-channel-mode {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, #D4A017 60%, transparent);
+  margin-left: auto;
+}
+
+/* ── 20. Schematics layout ─────────────────────────────────────────────────
+   Full-pipeline documentation view with Blueprint sub-aesthetic.
+   Spec §A7.
+   ─────────────────────────────────────────────────────────────────────── */
+.kiln-schematics {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+  background: var(--kiln-bp-bg);
+  position: relative;
+}
+
+/* Scanline overlay for schematics — matches canvas panel */
+.kiln-schematics::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.06) 2px,
+    rgba(0, 0, 0, 0.06) 4px
+  );
+}
+
+/* Noise / grain overlay for schematics — matches canvas panel */
+.kiln-schematics::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 11;
+  opacity: 0.6;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='1 0 0 0 0 0 0.7 0 0 0 0 0 0.4 0 0 0 0 0 0.16 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+.kiln-schematics-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  font-style: italic;
+}
+
+/* 2px verdigris mode indicator */
+.kiln-schematics-indicator {
+  height: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(67, 179, 174, 0.4) 20%,
+    rgba(67, 179, 174, 0.6) 50%,
+    rgba(67, 179, 174, 0.4) 80%,
+    transparent
+  );
+}
+
+/* ── Flow bar ── */
+.kiln-flow-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 40px;
+  flex-shrink: 0;
+  padding: 0 16px;
+  background: var(--kiln-char-surface);
+  border-bottom: 1px solid rgba(67, 179, 174, 0.15);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+}
+
+.kiln-flow-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--kiln-border-subtle);
+  border-top-width: 2px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.kiln-flow-pill-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  letter-spacing: 0.02em;
+}
+
+.kiln-flow-pill-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.kiln-flow-connector {
+  flex-shrink: 0;
+  margin: 0 4px;
+}
+
+/* ── Scrollable content area with Blueprint gridlines ── */
+/* Two-tier SVG grid: 20px minor (0.3 stroke) + 100px major (0.8 stroke),
+   verdigris at 0.08 opacity. RUSTPUNK_AESTHETICS.md §Grid Paper */
+.kiln-schematics-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 32px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--kiln-border-subtle) transparent;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Cdefs%3E%3Cpattern id='minor' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Cpath d='M 20 0 L 0 0 0 20' fill='none' stroke='%2343B3AE' stroke-width='0.3' opacity='0.08'/%3E%3C/pattern%3E%3Cpattern id='major' width='100' height='100' patternUnits='userSpaceOnUse'%3E%3Crect width='100' height='100' fill='url(%23minor)'/%3E%3Cpath d='M 100 0 L 0 0 0 100' fill='none' stroke='%2343B3AE' stroke-width='0.8' opacity='0.08'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='100' height='100' fill='url(%23major)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 100px 100px;
+  background-color: var(--kiln-char);
+}
+
+/* Summary section */
+.kiln-schematics-summary {
+  margin-bottom: 24px;
+}
+
+.kiln-schematics-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.kiln-schematics-diamond {
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+}
+
+.kiln-schematics-section-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+}
+
+.kiln-schematics-section-rule {
+  flex: 1;
+  height: 1px;
+  background: rgba(67, 179, 174, 0.25);
+}
+
+.kiln-schematics-summary-text {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+
+/* ── Stage detail cards ── */
+.kiln-stage-card {
+  position: relative;
+  background: var(--kiln-char-surface);
+  border: 1px solid rgba(67, 179, 174, 0.15);
+  border-top: 3px solid var(--kiln-verdigris);
+  border-radius: 2px;
+  padding: 20px 24px;
+  margin-bottom: 0;
+  /* Eroded corners: top-right 24px, bottom-left 16px — RUSTPUNK_AESTHETICS.md §Surface Treatment */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 24px) 0,
+    100% 24px,
+    100% 100%,
+    16px 100%,
+    0 calc(100% - 16px)
+  );
+}
+
+/* Registration marks — L-shaped corner indicators at non-eroded corners
+   RUSTPUNK_AESTHETICS.md §Registration Marks: 8x8px, 1.5px accent, 50% opacity */
+.kiln-stage-card::before,
+.kiln-stage-card::after {
+  content: '';
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-color: rgba(67, 179, 174, 0.5);
+  border-style: solid;
+  border-width: 0;
+  pointer-events: none;
+}
+
+/* Top-left L-mark */
+.kiln-stage-card::before {
+  top: 4px;
+  left: 4px;
+  border-top-width: 1.5px;
+  border-left-width: 1.5px;
+}
+
+/* Bottom-right L-mark */
+.kiln-stage-card::after {
+  bottom: 4px;
+  right: 4px;
+  border-bottom-width: 1.5px;
+  border-right-width: 1.5px;
+}
+
+.kiln-stage-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.kiln-stage-card-index {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+}
+
+.kiln-stage-card-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--kiln-bone);
+}
+
+.kiln-stage-card-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 7px;
+  border: 1px solid;
+  border-radius: 2px;
+}
+
+/* Blueprint rust-line — verdigris-tinted oxidation gradient */
+.kiln-stage-card-rule {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg,
+    transparent 0%, #1E5C5A 8%, #2A8A86 20%, #43B3AE 35%,
+    #2D7A76 50%, #43B3AE 65%, #1E5C5A 85%, transparent 100%);
+  opacity: 0.6;
+  margin: 6px 0 10px;
+}
+
+.kiln-stage-card-description {
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--kiln-iron);
+  margin-bottom: 8px;
+}
+
+/* User-authored note in stage card */
+.kiln-stage-card-note {
+  margin-bottom: 8px;
+}
+
+.kiln-stage-card-note-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+  margin-bottom: 3px;
+}
+
+.kiln-stage-card-note-block {
+  background: var(--kiln-char-raised);
+  border-left: 2px solid var(--kiln-iron);
+  border-radius: 2px;
+  padding: 6px 10px;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--kiln-bone);
+  white-space: pre-wrap;
+}
+
+/* Metadata grid */
+.kiln-stage-card-metadata {
+  margin-bottom: 8px;
+}
+
+.kiln-stage-card-meta-row {
+  display: flex;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-stage-card-meta-row:last-child {
+  border-bottom: none;
+}
+
+.kiln-stage-card-meta-key {
+  flex: 0 0 110px;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-iron);
+}
+
+.kiln-stage-card-meta-value {
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+}
+
+/* Column change tags */
+.kiln-stage-card-columns {
+  margin-top: 6px;
+}
+
+.kiln-stage-card-columns-heading {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-verdigris);
+  margin-bottom: 4px;
+}
+
+.kiln-stage-card-column-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.kiln-stage-card-column-tag {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.12);
+  border: 1px solid rgba(67, 179, 174, 0.25);
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+/* ── Stage card: full documentation sections ────────────────────────────── */
+
+/* Section container */
+.kiln-card-section {
+  margin-top: 10px;
+  padding-top: 6px;
+}
+
+.kiln-card-section-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 6px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+/* CXL code block */
+.kiln-card-cxl-block {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--kiln-bp-text);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 4%, var(--kiln-bp-bg));
+  border: 1px solid color-mix(in srgb, var(--kiln-bp-accent) 15%, transparent);
+  padding: 8px 10px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+  border-radius: 2px;
+}
+
+/* Key-value metadata row */
+.kiln-card-meta {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 10px;
+}
+
+.kiln-card-meta-key {
+  flex: 0 0 auto;
+  min-width: 80px;
+  font-family: var(--kiln-font-ui);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+}
+
+.kiln-card-meta-value {
+  flex: 1;
+  font-family: var(--kiln-font-blueprint);
+  color: var(--kiln-bp-text);
+  word-break: break-all;
+}
+
+.kiln-card-meta-path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+/* CXL analysis statement row */
+.kiln-card-stmt {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  flex-wrap: wrap;
+  font-size: 10px;
+}
+
+.kiln-card-emit-field {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--kiln-bp-accent);
+}
+
+.kiln-card-reads {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-bp-text-dim);
+}
+
+.kiln-card-field-ref {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text);
+}
+
+/* Schema table in cards */
+.kiln-card-schema {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+.kiln-card-schema-header {
+  display: grid;
+  grid-template-columns: 2fr 1fr 0.5fr;
+  gap: 4px;
+  padding: 2px 0;
+  font-family: var(--kiln-font-ui);
+  font-weight: 600;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  border-bottom: 1px solid var(--kiln-bp-accent-30);
+}
+
+.kiln-card-schema-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 0.5fr;
+  gap: 4px;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--kiln-bp-border);
+  color: var(--kiln-bp-text);
+}
+
+.kiln-card-schema-name {
+  color: var(--kiln-bp-accent);
+  font-weight: 500;
+}
+
+/* Contract section */
+.kiln-card-contract-group {
+  margin-bottom: 6px;
+}
+
+.kiln-card-contract-heading {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-right: 8px;
+}
+
+.kiln-card-contract-field {
+  display: inline-block;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text);
+  margin-right: 10px;
+  padding: 1px 6px;
+  border: 1px dashed var(--kiln-bp-border);
+}
+
+/* Composition sub-stage cards */
+.kiln-card-substage {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--kiln-bp-accent-30);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 3%, transparent);
+}
+
+.kiln-card-substage-header {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.kiln-card-substage-index {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+  opacity: 0.6;
+}
+
+.kiln-card-substage-summary {
+  font-family: var(--kiln-font-blueprint);
+  font-size: 11px;
+  color: var(--kiln-bp-text);
+}
+
+.kiln-card-substage-analysis {
+  margin-top: 4px;
+}
+
+.kiln-card-override-indicator {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #D4A017;
+}
+
+/* Config grid */
+.kiln-card-config-group {
+  margin-bottom: 4px;
+}
+
+.kiln-card-config-category {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-ghost);
+  margin: 4px 0 2px;
+}
+
+/* Badges row (schema count, contract, channel) */
+.kiln-stage-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.kiln-stage-card-chip {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 0;
+  border: 1px solid;
+}
+
+.kiln-stage-card-chip--schema {
+  color: var(--kiln-bp-accent);
+  border-color: color-mix(in srgb, var(--kiln-bp-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 8%, transparent);
+}
+
+.kiln-stage-card-chip--contract {
+  color: #C75B2A;
+  border-color: color-mix(in srgb, #C75B2A 30%, transparent);
+  background: color-mix(in srgb, #C75B2A 8%, transparent);
+}
+
+.kiln-stage-card-chip--channel {
+  color: #D4A017;
+  border-color: color-mix(in srgb, #D4A017 30%, transparent);
+  background: color-mix(in srgb, #D4A017 8%, transparent);
+}
+
+/* Provenance line */
+.kiln-stage-card-provenance {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+  font-style: italic;
+  margin: 4px 0;
+}
+
+/* Flow arrows between stage cards */
+.kiln-schematics-arrow {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
+}
+
+/* Footer */
+.kiln-schematics-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 32px;
+  padding-bottom: 16px;
+}
+
+.kiln-schematics-footer-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(67, 179, 174, 0.3), transparent);
+}
+
+.kiln-schematics-footer-label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--kiln-iron);
+  white-space: nowrap;
+}
+
+/* ── Dimension-line separators — addendum §Dimension Lines ─────────────── */
+
+/* Vertical dimension line between stage cards */
+.kiln-schematics-dimension {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 0;
+  opacity: 0.45;
+}
+.kiln-schematics-dimension-tick {
+  width: 8px;
+  height: 1px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.kiln-schematics-dimension-cap {
+  width: 1px;
+  height: 8px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  margin: 0 -1px;
+  flex-shrink: 0;
+}
+.kiln-schematics-dimension-line {
+  flex: 1;
+  height: 0;
+  border-top: 1px dashed var(--kiln-bp-accent-30);
+  max-width: 200px;
+}
+.kiln-schematics-dimension-label {
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  color: var(--kiln-bp-accent);
+  opacity: 0.5;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+/* Horizontal dimension line in flow bar */
+.kiln-flow-dimension {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin: 0 2px;
+  opacity: 0.45;
+}
+.kiln-flow-dimension-tick {
+  width: 1px;
+  height: 8px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.kiln-flow-dimension-cap {
+  width: 8px;
+  height: 1px;
+  background: var(--kiln-bp-accent);
+  opacity: 0.4;
+  margin: 0 -1px;
+  flex-shrink: 0;
+}
+.kiln-flow-dimension-line {
+  width: 16px;
+  height: 0;
+  border-top: 1px dashed var(--kiln-bp-accent-30);
+  flex-shrink: 0;
+}
+
+/* ── Title block stamp — addendum §Title Block Stamps ─────────────────── */
+.kiln-stage-card-stamp {
+  position: absolute;
+  top: -8px;
+  left: 20px;
+  background: var(--kiln-bp-bg);
+  padding: 0 8px;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--kiln-bp-accent);
+  opacity: 0.8;
+  font-weight: 600;
+  text-transform: lowercase;
+  z-index: 1;
+}
+
+/* ── Blueprint entry animation — addendum §Blueprint Motion ───────────── */
+@keyframes blueprintIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── 21. Scrollbar theming (WebKit) ─────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--kiln-border-subtle);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--kiln-border-medium); }
+
+/* ── 22. Channel Mode ────────────────────────────────────────────────────── */
+
+.kiln-channel-mode {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.kiln-channel-mode__indicator {
+  height: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(90deg,
+    transparent,
+    rgba(67, 179, 174, 0.5) 20%,
+    rgba(67, 179, 174, 0.7) 50%,
+    rgba(67, 179, 174, 0.5) 80%,
+    transparent);
+}
+
+.kiln-channel-mode__layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kiln-channel-mode__main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Channel tabs ──────────────────────────────────────────────────────── */
+.kiln-channel-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  padding: 0 16px;
+  background: var(--kiln-char);
+}
+
+.kiln-channel-tab {
+  all: unset;
+  font-family: var(--kiln-font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 8px 16px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms, border-color 200ms;
+}
+.kiln-channel-tab:hover {
+  color: var(--kiln-iron);
+}
+.kiln-channel-tab--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+/* ── Channel content area ──────────────────────────────────────────────── */
+.kiln-channel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.kiln-channel-content__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 12px;
+}
+.kiln-channel-content__empty-icon {
+  font-size: 32px;
+  color: var(--kiln-verdigris);
+  opacity: 0.3;
+}
+.kiln-channel-content__empty-text {
+  font-family: var(--kiln-font-ui);
+  font-size: 13px;
+  color: var(--kiln-text-floor);
+}
+
+/* ── Channel list sidebar (280px) ──────────────────────────────────────── */
+.kiln-channel-list {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char);
+  overflow: hidden;
+}
+
+.kiln-channel-list__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-channel-list__new-btn {
+  all: unset;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--kiln-font-code);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 150ms, border-color 150ms;
+}
+.kiln-channel-list__new-btn:hover {
+  color: var(--kiln-verdigris);
+  border-color: var(--kiln-verdigris);
+}
+
+.kiln-channel-list__new-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-surface);
+}
+
+.kiln-channel-list__new-input {
+  all: unset;
+  flex: 1;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-bone);
+  background: transparent;
+  border: 1px solid var(--kiln-verdigris);
+  border-radius: 3px;
+  padding: 4px 8px;
+}
+.kiln-channel-list__new-input::placeholder {
+  color: var(--kiln-text-floor);
+}
+
+.kiln-channel-list__new-cancel {
+  all: unset;
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.kiln-channel-list__new-cancel:hover {
+  color: var(--kiln-iron);
+}
+
+.kiln-channel-list__search-input {
+  all: unset;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--kiln-font-code);
+  font-size: 12px;
+  color: var(--kiln-bone);
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  padding: 6px 10px;
+  box-sizing: border-box;
+}
+.kiln-channel-list__search-input::placeholder {
+  color: var(--kiln-text-floor);
+}
+.kiln-channel-list__search-input:focus {
+  border-color: var(--kiln-verdigris);
+  outline: none;
+}
+
+/* ── Tier filter tabs ──────────────────────────────────────────────────── */
+.kiln-channel-list__tiers {
+  display: flex;
+  gap: 0;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.kiln-channel-tier {
+  all: unset;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  padding: 6px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms;
+}
+.kiln-channel-tier:hover {
+  color: var(--kiln-iron);
+}
+.kiln-channel-tier--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+/* ── Channel entries ───────────────────────────────────────────────────── */
+.kiln-channel-list__entries {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.kiln-channel-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background 150ms;
+}
+.kiln-channel-entry:hover {
+  background: var(--kiln-char-raised);
+}
+.kiln-channel-entry--active {
+  background: rgba(67, 179, 174, 0.08);
+  border-left: 2px solid var(--kiln-verdigris);
+  padding-left: 10px;
+}
+.kiln-channel-entry--inactive {
+  opacity: 0.5;
+}
+
+/* Tier pip — small colored dot */
+.kiln-channel-entry__pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--kiln-iron);
+  flex-shrink: 0;
+}
+.kiln-channel-entry__pip--group {
+  background: var(--kiln-hazard);
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+
+.kiln-channel-entry__info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.kiln-channel-entry__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-channel-entry__id {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-channel-entry__meta {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.kiln-channel-entry__badge {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+.kiln-channel-entry__badge--inactive {
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.1);
+}
+
+/* ── Groups section ────────────────────────────────────────────────────── */
+.kiln-channel-list__groups-header {
+  border-top: 1px solid var(--kiln-border-subtle);
+  padding: 0;
+}
+
+.kiln-channel-list__groups-toggle {
+  all: unset;
+  width: 100%;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 8px 12px;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+.kiln-channel-list__groups-toggle:hover {
+  color: var(--kiln-iron);
+}
+
+.kiln-channel-list__groups {
+  padding: 0 0 4px;
+}
+
+/* ── Empty state (no channels) ─────────────────────────────────────────── */
+.kiln-channel-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 16px;
+  padding: 40px;
+  text-align: center;
+}
+
+.kiln-channel-empty-state__icon {
+  font-size: 48px;
+  color: var(--kiln-verdigris);
+  opacity: 0.2;
+}
+
+.kiln-channel-empty-state__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+  letter-spacing: 0.04em;
+}
+
+.kiln-channel-empty-state__desc {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-iron);
+  line-height: 1.5;
+  max-width: 380px;
+}
+
+.kiln-channel-empty-state__hint {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-text-floor);
+  margin-top: 8px;
+}
+
+.kiln-channel-empty-state__code {
+  color: var(--kiln-verdigris);
+  background: var(--kiln-char-raised);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+/* ── 22b. Identity tab ───────────────────────────────────────────────────── */
+
+.kiln-identity-tab {
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.kiln-identity-tab__empty {
+  color: var(--kiln-text-floor);
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.kiln-identity-card {
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 0 4px 0 3px;
+  padding: 20px;
+  max-width: 520px;
+}
+
+.kiln-identity-card__header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.kiln-identity-card__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--kiln-bone);
+}
+
+.kiln-identity-card__id {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+
+.kiln-identity-card__inactive {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.1);
+  padding: 1px 6px;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kiln-identity-card__tier {
+  display: inline-block;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.1);
+  border: 1px solid rgba(67, 179, 174, 0.3);
+  padding: 2px 10px;
+  border-radius: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+
+.kiln-identity-card__desc {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-iron);
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.kiln-identity-card__field {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-identity-card__label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  min-width: 80px;
+  flex-shrink: 0;
+}
+
+.kiln-identity-card__value {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-bone);
+}
+
+.kiln-identity-card__tags {
+  padding: 10px 0;
+}
+
+.kiln-identity-card__tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.kiln-identity-card__tag {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+.kiln-identity-card__inherits {
+  padding: 10px 0;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-identity-card__inherit-chain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.kiln-identity-card__inherit-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.08);
+  border: 1px solid rgba(232, 165, 36, 0.2);
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+.kiln-identity-card__section {
+  padding: 10px 0;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-identity-card__section-title {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--kiln-text-floor);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.kiln-identity-card__section-note {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+
+/* ── 22c. Overrides tab ──────────────────────────────────────────────────── */
+
+.kiln-overrides-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.kiln-overrides-tab__views {
+  display: flex;
+  gap: 0;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  flex-shrink: 0;
+  background: var(--kiln-char-surface);
+}
+
+.kiln-overrides-view {
+  all: unset;
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms;
+}
+.kiln-overrides-view:hover { color: var(--kiln-iron); }
+.kiln-overrides-view--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+.kiln-overrides-tab__content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.kiln-overrides__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+  margin-bottom: 12px;
+}
+
+.kiln-overrides__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.kiln-overrides__empty {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  padding: 20px 0;
+}
+
+.kiln-override-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 150ms;
+}
+.kiln-override-entry:hover { background: var(--kiln-char-raised); }
+
+.kiln-override-entry__icon {
+  font-size: 10px;
+  color: var(--kiln-verdigris);
+  flex-shrink: 0;
+}
+
+.kiln-override-entry__pipeline {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-bone);
+  font-weight: 500;
+}
+
+.kiln-override-entry__path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  margin-left: auto;
+}
+
+.kiln-override-pipeline {
+  margin-bottom: 16px;
+}
+
+.kiln-override-pipeline__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  margin-bottom: 6px;
+}
+
+.kiln-override-pipeline__name {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-override-pipeline__count {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-override-pipeline__channels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.kiln-override-pipeline__channel-badge {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+/* Overrides matrix */
+.kiln-overrides-matrix__summary {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-iron);
+  margin-bottom: 12px;
+}
+
+.kiln-overrides-matrix__table {
+  display: grid;
+  gap: 1px;
+  background: var(--kiln-border-subtle);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.kiln-overrides-matrix__row {
+  display: contents;
+}
+
+.kiln-overrides-matrix__row--header .kiln-overrides-matrix__cell {
+  background: var(--kiln-char);
+  font-weight: 500;
+}
+
+.kiln-overrides-matrix__cell {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  padding: 6px 8px;
+  background: var(--kiln-char-surface);
+  color: var(--kiln-iron);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiln-overrides-matrix__cell--header {
+  color: var(--kiln-bone);
+  font-weight: 500;
+}
+
+.kiln-overrides-matrix__cell--override {
+  color: var(--kiln-verdigris);
+  background: rgba(67, 179, 174, 0.06);
+}
+
+.kiln-overrides-matrix__cell--empty {
+  color: var(--kiln-text-floor);
+  opacity: 0.4;
+}
+
+.kiln-overrides-matrix__cell--diagonal {
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-overrides-matrix__legend {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  margin-top: 8px;
+}
+
+/* ── 22d. Health tab ─────────────────────────────────────────────────────── */
+
+.kiln-health-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.kiln-health-tab__summary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-char-surface);
+  flex-shrink: 0;
+}
+
+.kiln-health-tab__title {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-health-tab__stats {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.kiln-health-stat {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kiln-health-stat--error {
+  color: #CC3333;
+  background: rgba(204, 51, 51, 0.1);
+}
+
+.kiln-health-stat--warning {
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.1);
+}
+
+.kiln-health-stat--stale {
+  color: var(--kiln-iron);
+  background: var(--kiln-border-subtle);
+}
+
+.kiln-health-stat--ok {
+  color: #7ab648;
+  background: rgba(122, 182, 72, 0.1);
+}
+
+.kiln-health-tab__results {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kiln-health-tab__empty {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  color: var(--kiln-text-floor);
+  padding: 20px 0;
+  text-align: center;
+}
+
+.kiln-health-entry {
+  background: var(--kiln-char-surface);
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 0 4px 0 3px;
+  border-left: 3px solid var(--kiln-border-subtle);
+  padding: 10px 12px;
+}
+
+.kiln-health-entry--error { border-left-color: #CC3333; }
+.kiln-health-entry--warning { border-left-color: var(--kiln-hazard); }
+.kiln-health-entry--ok { border-left-color: #7ab648; }
+
+.kiln-health-entry__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.kiln-health-entry__icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.kiln-health-entry__pipeline {
+  font-family: var(--kiln-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kiln-bone);
+}
+
+.kiln-health-entry__stale {
+  font-family: var(--kiln-font-code);
+  font-size: 9px;
+  color: var(--kiln-hazard);
+  background: rgba(232, 165, 36, 0.08);
+  padding: 1px 6px;
+  border-radius: 2px;
+  margin-left: auto;
+}
+
+.kiln-health-entry__issues {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 20px;
+}
+
+.kiln-health-issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+}
+
+.kiln-health-issue--error { color: #CC3333; }
+.kiln-health-issue--warning { color: var(--kiln-hazard); }
+.kiln-health-issue--info { color: var(--kiln-verdigris); }
+
+.kiln-health-issue__icon {
+  flex-shrink: 0;
+  font-size: 10px;
+}
+
+.kiln-health-issue__msg {
+  color: var(--kiln-iron);
+}
+
+/* ── 22e. YAML sidebar toggle ────────────────────────────────────────────── */
+
+.kiln-yaml-channel-toggle {
+  display: flex;
+  gap: 0;
+  margin-left: 8px;
+}
+
+.kiln-yaml-toggle-btn {
+  all: unset;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-text-floor);
+  padding: 2px 8px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 200ms;
+}
+.kiln-yaml-toggle-btn:hover { color: var(--kiln-iron); }
+.kiln-yaml-toggle-btn--active {
+  color: var(--kiln-verdigris);
+  border-bottom-color: var(--kiln-verdigris);
+}
+
+/* Read-only textarea indicator */
+.kiln-yaml-textarea--readonly {
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* ── 22f. Channel switcher (nox-select) ──────────────────────────────────── */
+
+.kiln-channel-select {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Trigger (badge) — resets button styling from nox-select */
+.kiln-channel-select button[role="combobox"] {
+  all: unset;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+.kiln-channel-select button[role="combobox"]:hover {
+  color: var(--kiln-verdigris);
+}
+.kiln-channel-select button[role="combobox"][data-active="true"] {
+  color: var(--kiln-verdigris);
+}
+
+/* Dropdown content */
+.kiln-channel-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  min-width: 240px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--kiln-char);
+  border: 1px solid var(--kiln-border-medium);
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  padding: 4px 0;
+  margin-top: 4px;
+}
+
+/* Hide dropdown when closed */
+.kiln-channel-select[data-select-state="closed"] .kiln-channel-dropdown {
+  display: none;
+}
+
+/* Individual items */
+.kiln-channel-dropdown [data-select-item] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  color: var(--kiln-iron);
+}
+.kiln-channel-dropdown [data-select-item]:hover,
+.kiln-channel-dropdown [data-highlighted="true"] {
+  background: var(--kiln-char-raised);
+  color: var(--kiln-bone);
+}
+.kiln-channel-dropdown [data-state="checked"] {
+  color: var(--kiln-verdigris);
+}
+
+/* Item indicator (radio dot) */
+.kiln-channel-dropdown [data-select-item-indicator] {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.kiln-channel-dropdown [data-state="checked"] [data-select-item-indicator] {
+  color: var(--kiln-verdigris);
+}
+
+/* Item text */
+.kiln-channel-dropdown [data-select-item-text] {
+  flex: 1;
+}
+
+/* Tier badge */
+.kiln-channel-dropdown__tier {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-text-floor);
+  background: var(--kiln-border-subtle);
+  padding: 1px 4px;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Override count */
+.kiln-channel-dropdown__count {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  margin-left: auto;
+}
+
+/* Description text (for "run base pipeline") */
+.kiln-channel-dropdown__desc {
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+/* ── Override Diff ────────────────────────────────────────────────────────
+   Inspector panel: shows base vs channel CXL when a stage has overrides.
+   ─────────────────────────────────────────────────────────────────────── */
+
+.kiln-override-diff {
+  border: 1px solid var(--kiln-border-subtle);
+  border-radius: 3px;
+  margin: 8px 0;
+  background: var(--kiln-bg-recessed);
+  overflow: hidden;
+}
+
+.kiln-override-diff__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--kiln-border-subtle);
+  background: var(--kiln-bg-raised);
+}
+
+.kiln-override-diff__kind {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kiln-override-diff--modified .kiln-override-diff__kind {
+  color: var(--kiln-verdigris);
+}
+.kiln-override-diff--added .kiln-override-diff__kind {
+  color: var(--kiln-phosphor);
+}
+.kiln-override-diff--removed .kiln-override-diff__kind {
+  color: var(--kiln-ember);
+}
+
+.kiln-override-diff__source {
+  font-family: var(--kiln-font-ui);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  letter-spacing: 0.04em;
+}
+
+/* Unified diff body */
+.kiln-override-diff__unified {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-x: auto;
+}
+
+/* Individual diff line: gutter + content */
+.kiln-diff-line {
+  display: flex;
+  min-height: 1.6em;
+}
+
+.kiln-diff-gutter {
+  flex: 0 0 20px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+  user-select: none;
+  line-height: 1.6;
+}
+
+.kiln-diff-content {
+  flex: 1;
+  min-width: 0;
+  padding: 0 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Context lines — no decoration */
+.kiln-diff-line--context {
+  border-left: 3px solid transparent;
+}
+.kiln-diff-line--context .kiln-diff-gutter {
+  color: transparent;
+}
+
+/* Removed lines — ember left border */
+.kiln-diff-line--removed {
+  border-left: 3px solid var(--kiln-ember);
+  background: rgba(199, 91, 42, 0.08);
+}
+.kiln-diff-line--removed .kiln-diff-gutter {
+  color: var(--kiln-ember);
+}
+
+/* Added lines — ok-green left border */
+.kiln-diff-line--added {
+  border-left: 3px solid var(--kiln-ok-green);
+  background: rgba(122, 182, 72, 0.08);
+}
+.kiln-diff-line--added .kiln-diff-gutter {
+  color: var(--kiln-ok-green);
+}
+
+/* Word-level inline highlights for changed tokens */
+.kiln-diff-highlight--removed {
+  background: rgba(199, 91, 42, 0.25);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.kiln-diff-highlight--added {
+  background: rgba(122, 182, 72, 0.25);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.kiln-override-diff__file {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--kiln-border-subtle);
+}
+
+.kiln-override-diff__file-label {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-text-floor);
+}
+
+.kiln-override-diff__file-path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-iron);
+}
