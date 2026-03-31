@@ -811,7 +811,7 @@ Each channel lives in `channels/<channel-id>/channel.yaml`. The `_channel:` meta
 
 All `${VAR}` substitution happens at text level before YAML deserialization (single pass). Priority: `--env` / `CLINKER_ENV` > channel variables > system environment variables. `$${VAR}` produces a literal `${VAR}` string (escape, same convention as Docker Compose and Kubernetes).
 
-**YAML injection safety:** Every substituted value is automatically wrapped in YAML single-quotes (`'value'`, with embedded `'` escaped to `''`). This prevents YAML structure corruption when channel variables contain `:`, `[`, `{`, `#`, or newlines (e.g., file paths, JDBC URLs). All interpolated positions produce YAML strings — typed YAML from variable substitution is a v2 concern.
+**Variable substitution uses bare text insertion** — no YAML quoting applied (industry standard: dbt, Docker Compose, Helm, envsubst). Docker Compose #8297 demonstrated that auto-quoting breaks typed fields (integers, booleans). If a variable value contains YAML-special characters (`:`, `#`, newlines), the user must quote it in the YAML source — same as dbt and Docker Compose. Serde deserialization catches malformed YAML at parse time. Channel variables come from workspace YAML files the operator writes, not from untrusted external input.
 
 #### Override files (`.channel.yaml`)
 
@@ -864,7 +864,7 @@ statement   = let_stmt / emit_stmt / trace_stmt / expr
 use_stmt    = "use" module_path ("as" IDENT)?     # Import a .cxl module (see §5.9)
               # use validators                     → qualified: validators.fn_name()
               # use shared::dates as dates         → aliased: dates.fn_name()
-module_path = IDENT ("::" IDENT)*                 # Maps to filesystem: rules/shared/dates.cxl
+module_path = IDENT ("." IDENT)*                  # Maps to filesystem: rules/shared/dates.cxl
 let_stmt    = "let" IDENT "=" expr
 emit_stmt   = "emit" IDENT "=" expr              # Explicit output field binding
 trace_stmt  = "trace" trace_level? trace_guard? string_lit   # Logging statement (see §5.10)
@@ -957,7 +957,7 @@ param_list  = IDENT ("," IDENT)*
               # fn is_valid_email(val) = val.matches('^[\\w.]+@[\\w.]+$')
               # fn in_range(val, lo, hi) = val >= lo and val <= hi
               # fn clamp(val, lo, hi) = if val < lo then lo else if val > hi then hi else val
-              # Functions are pure: no emit, no trace, no side effects.
+              # Functions are pure: no emit, no trace. .debug() is allowed.
               # Parameters are untyped in v1 (type inferred at call site).
               # Module-level let bindings are constants: let DEFAULT_REGION = "EAST"
 ```
@@ -1291,6 +1291,7 @@ The `pipeline` namespace provides read-only execution context accessible from an
 | `pipeline.start_time` | `DateTime` | Timestamp when `clinker` began executing. Fixed for the entire run — deterministic. Use this instead of `now` when you need a consistent run timestamp. |
 | `pipeline.name` | `String` | From `pipeline.name` in the YAML config. |
 | `pipeline.execution_id` | `String` | UUID v7 generated at startup. Unique per run, time-ordered across runs. Useful for audit columns and log correlation. |
+| `pipeline.batch_id` | `String` | User-supplied batch correlation ID from `--batch-id` CLI flag, or auto-generated UUID v7 if not provided. Enables orchestrator correlation — multiple clinker invocations can share one batch_id (e.g., one per region in a nightly batch). Not required to be unique across runs. |
 | `pipeline.total_count` | `Int` | Cumulative number of source records read so far across all sources. Snapshotted at chunk boundaries — all records in a chunk see the same value. |
 | `pipeline.ok_count` | `Int` | Cumulative number of records successfully processed (not routed to DLQ). Per-source running total, snapshotted at chunk boundaries. |
 | `pipeline.dlq_count` | `Int` | Cumulative number of records routed to DLQ. Per-source running total, snapshotted at chunk boundaries. |
@@ -1321,7 +1322,7 @@ emit adjusted    = amount * pipeline.rate_multiplier
 
 **Rules:**
 - `pipeline.*` is read-only. Assignment to any `pipeline.*` path is a Phase C compile error.
-- User variable names must not collide with built-in properties (`start_time`, `name`, `execution_id`, `total_count`, `ok_count`, `dlq_count`, `source_file`, `source_row`). Phase A (config parse) errors on collision.
+- User variable names must not collide with built-in properties (`start_time`, `name`, `execution_id`, `batch_id`, `total_count`, `ok_count`, `dlq_count`, `source_file`, `source_row`). Phase A (config parse) errors on collision.
 - Variable values are evaluated once at startup, before any data is read.
 - `pipeline.cutoff_date` above is a `String` — call `.to_date()` or `.try_date()` to convert.
 
@@ -1344,7 +1345,7 @@ let MAX_SALARY = 10000000
 ```
 
 **Rules for `fn`:**
-- Functions are pure. No `emit`, `trace`, or `.debug()` calls inside function bodies.
+- Functions are pure. No `emit` or `trace` statements inside function bodies. `.debug()` is allowed as a development aid (zero overhead when trace disabled, returns value unchanged).
 - Parameters are untyped in v1 — type is inferred at each call site during Phase B.
 - Return type is inferred from the body expression.
 - Recursive calls are not supported (Phase C error). Functions are single-expression bodies.
@@ -1361,14 +1362,14 @@ Import a module at the top of any inline CXL block:
 
 ```
 use validators                          # qualified: validators.is_valid_email(Email)
-use shared::date_helpers as dates       # aliased: dates.parse_date(raw, fmt)
+use shared.date_helpers as dates        # aliased: dates.parse_date(raw, fmt)
 ```
 
 - `use` must appear before any `let`, `emit`, or `trace` statements. Phase A parse error otherwise.
-- The module path maps to the filesystem: `shared::date_helpers` → `{rules_path}/shared/date_helpers.cxl`.
+- The module path maps to the filesystem using `.` as the separator: `shared.date_helpers` → `{rules_path}/shared/date_helpers.cxl`.
 - **Module search path**: defaults to `./rules/` relative to the pipeline YAML. Overridable via `pipeline.rules_path` in config or `--rules-path` CLI flag.
 - **Qualified access**: `module_name.function_name(args)` or `module_name.CONSTANT`.
-- **No wildcard imports**: `use validators::*` is not supported in v1. All access is qualified.
+- **No wildcard imports**: `use validators.*` is not supported in v1. All access is qualified.
 - **No cross-file imports**: A `.cxl` module file cannot `use` another module. This keeps the dependency graph flat (one level deep) and avoids circular import resolution. If a function in `validators.cxl` needs a helper from `utils.cxl`, extract the shared logic into both call sites or move it to a shared module that both inline CXL blocks import.
 
 #### Module compilation
@@ -1511,7 +1512,7 @@ emit tier = match {
 - Each event includes: prefix, stringified value, `_source_row`, `_source_file`, record type (multi-record).
 - Zero overhead when trace is disabled — `tracing` short-circuits before evaluating the format string.
 - Safe to leave in production CXL. No effect on expression semantics.
-- `.debug()` is **not** allowed inside `fn` bodies (module functions are pure).
+- `.debug()` **is** allowed inside `fn` bodies. Although module functions ban `emit` and `trace` (statement-level side effects), `.debug()` is a development aid with zero overhead when trace is disabled. It returns the value unchanged (functionally pure) and is safe to leave in production CXL.
 
 #### Level 4: `trace` statement (in CXL blocks)
 
@@ -1571,6 +1572,7 @@ validations:
 
 | Property | Type | Description |
 |---|---|---|
+| `name` | String | Human-readable label for the validation. Optional — auto-derived from `field` + `check` if omitted (e.g., `"email:validators.is_valid_email"`). Used in log messages and as a stable identifier for reporting. |
 | `field` | String | Field to validate. Optional — omit for cross-field checks. |
 | `check` | String | Module-qualified function name (e.g., `validators.not_null`) OR inline CXL boolean expression. Required. |
 | `args` | Map | Named arguments passed to the check function. Keys map to function parameters by name. Values must be YAML literals (int, float, string, bool) or `pipeline.*` references — not field references (use inline `check:` expressions for field-dependent validation). Only valid when `check` is a function reference. |

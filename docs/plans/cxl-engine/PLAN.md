@@ -49,9 +49,9 @@ with spill-to-disk under a configurable memory budget.
 | 31 | `--explain` plain text output; structured JSON deferred for Kiln (Phase 8 decision) | ExecutionPlan struct is the right abstraction; adding Serialize for Kiln's JSON-RPC is mechanical |
 | 32 | Callback-based ProgressReporter trait with phase-specific counters (Phase 8 decision) | Testable via VecReporter; NullReporter for --quiet; extensible for Kiln Tier 1 JSON Lines |
 | 33 | `cxl eval`: -e for inline, positional for file, --field + --record (Phase 8 decision) | Follows sed/perl -e convention; --field auto-type-inferred; no auto-detection (anti-pattern per clig.dev) |
-| 34 | `-n` partial processing deferred to Phase 10; --dry-run stays config-validation-only (Phase 8 decision) | Phase 8 scope is large enough; -n is closer to "sample mode" than dry run |
+| 34 | `-n` partial processing deferred to Phase 11 (Task 11.6); --dry-run stays config-validation-only (Phase 8 decision) | Phase 8 scope is large enough; -n is closer to "sample mode" than dry run |
 | 35 | Override files use `.channel.yaml` extension + `_channel:` header (Phase 10 decision) | Ansible entity-name→filename pattern; "channel" is the domain concept; `_channel:` header consistent with `_composition:` convention |
-| 36 | `interpolate_env_vars` auto-wraps substituted values in YAML single-quotes (Phase 10 decision) | Ansible CVE-2021-3583, Docker Compose #8607, Vector #17343 all caused by bare pre-parse substitution; single-quote wrap is lossless for string values |
+| 36 | ~~`interpolate_env_vars` auto-wraps substituted values in YAML single-quotes~~ → **Superseded by #52**: Bare text substitution (Phase 10 drill decision, spec updated) | Original rationale invalidated by Docker Compose #8297. See #52. |
 | 37 | `--channel-path <path>` (repeatable) for explicit `.channel.yaml` override injection (Phase 10 decision) | Helm/Terraform pattern; enables hotfix injection without touching workspace channel dirs; applied after derived-name file |
 | 38 | Schema types in `clinker-record`, loading/resolution in `clinker-core` (Phase 9 decision) | Follows existing Schema/Arena split. No new dependency edges. FieldDef alongside Schema in foundation crate. |
 | 39 | `FieldDef` flat struct with typed `FieldType`/`Justify` enums, `serde_json::Value` for default (Phase 9 decision) | Research: every execution engine uses typed enums (Arrow, Polars, Spark, Beam). serde-saphyr has no Value type; serde_json::Value proven to work. |
@@ -67,6 +67,23 @@ with spill-to-disk under a configurable memory budget.
 | 49 | `SchemaDefinition.format: Option<String>` not `Option<FormatKind>` (Phase 9 validation decision) | Research: 7/8 systems keep format external to schema (Arrow, Polars, Spark, Beam, Protobuf, Avro, JSON Schema). String avoids circular dep between clinker-record and clinker-core. |
 | 50 | `SchemaError` enum in `clinker-core/src/schema/mod.rs` with `PipelineError::Schema(SchemaError)` (Phase 9 validation decision) | DataFusion SchemaError pattern. Distinct from ConfigError (different lifecycle: schema resolution vs YAML parsing). |
 | 51 | Path validation deferred to Phase 11 central layer; Phase 9 load_schema() trusts paths (Phase 9 validation decision) | Research: 15+ CVEs from per-subsystem path validation (Ansible, Docker Compose, Terraform, Helm, dbt). Central validation is the correct architecture. |
+| 52 | Bare text substitution for `${VAR}` — no YAML auto-quoting (Phase 10 drill decision, revises W1) | Research: Docker Compose #8297 broke typed fields. dbt/Helm/envsubst bare insertion is industry standard. Ansible CVE-2021-3583 was re-evaluation, not quoting. |
+| 53 | `TransformEntry` uses custom `Deserialize` impl, not `#[serde(untagged)]` (Phase 10 drill decision) | serde#773 (9 years, 3 rejected PRs). Consistent with Phase 9 SortFieldSpec/SchemaSource. Concourse/Cargo/Vector migrated away from untagged. |
+| 54 | `PipelineConfig::transforms()` accessor for resolved transforms (Cargo `InheritableField` pattern) (Phase 10 drill decision) | Cargo uses identical pattern. Minimizes downstream churn from Vec type change. Panics on unresolved imports. |
+| 55 | `when:` conditions use split-based parser, not regex (Phase 10 drill decision) | Concourse StepDetector pattern. 4 operators, no nesting. ~50-80 lines, zero dependencies. |
+| 56 | `clinker.toml` is 100% CLI-owned config; `default_channel` is CLI fallback with INFO log (Phase 10 drill decision) | No Kiln-specific fields in CLI config. Visible logging prevents silent override application. |
+| 57 | Override delta structs are dedicated hand-written types, not derived from config types (Phase 10 drill decision) | Cargo precedent. Different serde attributes (no deny_unknown_fields). 3 structs / 17 fields — too small for proc macro. |
+| 58 | `use` path separator is `.` not `::` (Phase 11 drill decision, spec updated) | Research: every ETL/data tool uses `.` (dbt, Spark, Beam, SQL). `::` alien to data engineers. `.` consistent with qualified access. Parser change ~5 lines. |
+| 59 | `pipeline.batch_id` built-in: user-supplied via `--batch-id`, auto UUID v7 default (Phase 11 drill decision, spec updated) | Research: Airflow 3.0 two-ID pattern; SSIS/Informatica precedent. execution_id (auto/system) + batch_id (user/domain). |
+| 60 | Separate `parse_module()` → `Module` AST type (Phase 11 drill decision) | Research: HCL/CUE/syn/rustc all use separate entry points for different file kinds. tree-sitter #870 shows mode flags cause problems. |
+| 61 | Topological sort for module-level `let` constants (Phase 11 drill decision) | Research: CUE/Nix/Jsonnet/Terraform/Rust const all order-independent. Kahn's algorithm with cycle detection. |
+| 62 | `.debug()` allowed in fn bodies (Phase 11 drill decision, spec deviation) | Pragmatic DX; zero overhead when trace disabled; only emit/trace are banned statement-level side effects. |
+| 63 | Native YAML 1.2 inference for pipeline.vars (Phase 11 drill decision) | serde-saphyr YAML 1.2 avoids Norway problem; dbt/Helm precedent. serde_json::Value deserialization. |
+| 64 | Level 1 `when` = lifecycle hook per spec (Phase 11 drill decision) | Spec authoritative. before_transform/after_transform are executor events, not CXL expressions. |
+| 65 | Validation schema: spec properties + optional `name` (Phase 11 drill decision) | Research: Soda Core/Pandera/Griffin pattern. Auto-derived from field+check if omitted. |
+| 66 | serde-saphyr Budget API for YAML DoS limits (Phase 11 drill decision) | Research confirmed: max_depth, max_nodes, max_reader_input_bytes all available via budget! macro. |
+| 67 | Custom harness=false benchmark binary (Phase 11 drill decision) | Research: DataFusion dfbench pattern. criterion/divan can't track RSS. VmHWM for peak RSS. |
+| 68 | Generic TakeReader\<R\> for -n record limiting (Phase 11 drill decision) | One implementation for all formats. Iterator::take() pattern. ~15 lines. |
 
 ## Open Questions
 
@@ -86,7 +103,7 @@ with spill-to-disk under a configurable memory budget.
 | 7 | JSON + XML Readers/Writers | ✅ Complete | 5 | 5 | Phase 4 |
 | 8 | Sort, DLQ Polish, CLI Completion | ✅ Complete | 4 | 4 | Phase 6, 7 |
 | 9 | Schema System, Fixed-Width, Multi-Record | 🔲 Validated (READY) | 4 | 0 | Phase 7 |
-| 10 | Channel Overrides + Composition System | 🔲 Not Started | 6 | 0 | Phase 9 |
+| 10 | Channel Overrides + Composition System | 🔲 Validated (READY) | 7 | 0 | Phase 9 |
 | 11 | Modules, Logging, Validations, Polish | 🔄 In Progress | 7 | 1 | Phase 10 |
 
 > Status key: 🔲 Not Started · 🔄 In Progress · ⛔ Blocked · ✅ Complete
