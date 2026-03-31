@@ -36,6 +36,10 @@ pub struct StageDoc {
     pub provenance: Option<ProvenanceSection>,
     /// Channel override provenance (when documenting a resolved pipeline).
     pub channel_override: Option<ChannelOverrideSection>,
+    /// Raw CXL source code (transforms only).
+    pub cxl_source: Option<String>,
+    /// Expanded sub-stage docs (compositions only — each internal transform).
+    pub sub_stages: Vec<StageDoc>,
 }
 
 impl Default for StageDoc {
@@ -50,6 +54,8 @@ impl Default for StageDoc {
             config: ConfigSection { entries: vec![] },
             provenance: None,
             channel_override: None,
+            cxl_source: None,
+            sub_stages: vec![],
         }
     }
 }
@@ -271,7 +277,7 @@ pub fn generate_stage_doc(
     if stage_name.starts_with("_comp_") {
         let comp_path = &stage_name["_comp_".len()..];
         if let Some(comp) = compositions.iter().find(|c| c.path == comp_path) {
-            return Some(generate_composition_doc(comp, channel_info, stage_name));
+            return Some(generate_composition_doc(config, comp, compositions, channel_info, stage_name));
         }
     }
 
@@ -429,6 +435,8 @@ fn generate_input_doc(
         config: ConfigSection { entries },
         provenance: None,
         channel_override: build_channel_override(channel_info, stage_name),
+        cxl_source: None,
+        sub_stages: vec![],
     }
 }
 
@@ -554,6 +562,8 @@ fn generate_transform_doc(
         config: ConfigSection { entries },
         provenance,
         channel_override: build_channel_override(channel_info, stage_name),
+        cxl_source: Some(transform.cxl.clone()),
+        sub_stages: vec![],
     }
 }
 
@@ -695,6 +705,8 @@ fn generate_output_doc(
         config: ConfigSection { entries },
         provenance: None,
         channel_override: build_channel_override(channel_info, stage_name),
+        cxl_source: None,
+        sub_stages: vec![],
     }
 }
 
@@ -933,7 +945,9 @@ fn push_error_handling_entries(entries: &mut Vec<ConfigEntry>, config: &Pipeline
 // ── Composition doc generation ──────────────────────────────────────────────
 
 fn generate_composition_doc(
+    config: &PipelineConfig,
     comp: &ResolvedComposition,
+    compositions: &[ResolvedComposition],
     channel_info: Option<&ChannelDocContext>,
     stage_name: &str,
 ) -> StageDoc {
@@ -992,13 +1006,18 @@ fn generate_composition_doc(
             value: format!("{}", comp.override_count),
         });
     }
-    // List transform names
-    for (i, name) in comp.transform_names.iter().enumerate() {
-        entries.push(ConfigEntry {
-            category: ConfigCategory::Format,
-            key: format!("STEP {:02}", i + 1),
-            value: name.clone(),
-        });
+    // Build sub-stages: full doc for each transform inside the composition
+    let mut sub_stages = Vec::new();
+    for name in &comp.transform_names {
+        if let Some(transform) = config.transforms().find(|t| t.name == *name) {
+            sub_stages.push(generate_transform_doc(
+                config,
+                transform,
+                compositions,
+                channel_info,
+                name,
+            ));
+        }
     }
 
     StageDoc {
@@ -1011,6 +1030,8 @@ fn generate_composition_doc(
         config: ConfigSection { entries },
         provenance: None,
         channel_override: build_channel_override(channel_info, stage_name),
+        cxl_source: None,
+        sub_stages,
     }
 }
 

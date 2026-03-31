@@ -1,12 +1,13 @@
 use dioxus::prelude::*;
 
-use crate::autodoc::{StageDoc, CxlStatementKind};
+use crate::autodoc::{ConfigCategory, CxlStatementKind, StageDoc};
 use crate::notes::StageNotes;
 
 /// A single stage detail card in the Schematics content area.
 ///
-/// Shows compact highlights: summary, schema badge, contract badge,
-/// lineage tags, provenance line. Full detail is in the inspector drawer.
+/// Full technical documentation: CXL code, schema tables, field analysis,
+/// contracts, config grids, composition sub-cards. The card IS the
+/// documentation, not a pointer to it.
 #[component]
 pub fn StageCard(
     index: usize,
@@ -19,54 +20,8 @@ pub fn StageCard(
     let idx = format!("{:02}", index);
     let delay = index as f64 * 0.1;
 
-    // Extract compact highlights
-    let schema_badge = doc.schema.as_ref().map(|s| {
-        let count = s.fields.len();
-        format!("{} field{}", count, if count == 1 { "" } else { "s" })
-    });
-
-    let contract_badge = doc.contract.as_ref().map(|c| {
-        format!("requires {} / produces {}", c.requires.len(), c.produces.len())
-    });
-
-    // CXL analysis: extract emitted fields and statement summary
-    let emit_fields: Vec<String> = doc
-        .cxl_analysis
-        .as_ref()
-        .map(|a| a.statements.iter()
-            .filter(|s| s.kind == CxlStatementKind::Emit)
-            .filter_map(|s| s.output_field.clone())
-            .collect())
-        .unwrap_or_default();
-
-    let cxl_summary = doc.cxl_analysis.as_ref().map(|a| {
-        let emits = a.statements.iter().filter(|s| s.kind == CxlStatementKind::Emit).count();
-        let filters = a.statements.iter().filter(|s| s.kind == CxlStatementKind::Filter).count();
-        let lets = a.statements.iter().filter(|s| s.kind == CxlStatementKind::Let).count();
-        let mut parts = Vec::new();
-        if emits > 0 { parts.push(format!("{} emit{}", emits, if emits == 1 { "" } else { "s" })); }
-        if filters > 0 { parts.push(format!("{} filter{}", filters, if filters == 1 { "" } else { "s" })); }
-        if lets > 0 { parts.push(format!("{} let{}", lets, if lets == 1 { "" } else { "s" })); }
-        parts.join(" \u{00B7} ")
-    }).filter(|s| !s.is_empty());
-
-    let all_field_refs: Vec<String> = doc
-        .cxl_analysis
-        .as_ref()
-        .map(|a| a.all_field_refs.clone())
-        .unwrap_or_default();
-
-    let provenance_label = doc.provenance.as_ref().map(|p| {
-        if p.is_overridden {
-            format!("from {} (overridden)", p.composition_name)
-        } else {
-            format!("from {}", p.composition_name)
-        }
-    });
-
-    let channel_badge = doc.channel_override.as_ref().map(|co| {
-        format!("{} via {}", co.override_kind, co.override_source)
-    });
+    // Group config entries by category
+    let config_groups = group_config_entries(&doc);
 
     rsx! {
         div {
@@ -92,32 +47,15 @@ pub fn StageCard(
                 }
             }
 
-            // Verdigris separator
             hr { class: "kiln-stage-card-rule" }
 
-            // Summary
+            // ── Summary ──────────────────────────────────────────────────
             div {
                 class: "kiln-stage-card-description",
                 "{doc.summary}"
             }
 
-            // Badges row: schema count + contract + channel override
-            if schema_badge.is_some() || contract_badge.is_some() || channel_badge.is_some() {
-                div {
-                    class: "kiln-stage-card-badges",
-                    if let Some(ref sb) = schema_badge {
-                        span { class: "kiln-stage-card-chip kiln-stage-card-chip--schema", "{sb}" }
-                    }
-                    if let Some(ref cb) = contract_badge {
-                        span { class: "kiln-stage-card-chip kiln-stage-card-chip--contract", "{cb}" }
-                    }
-                    if let Some(ref ch) = channel_badge {
-                        span { class: "kiln-stage-card-chip kiln-stage-card-chip--channel", "{ch}" }
-                    }
-                }
-            }
-
-            // User-authored stage note (if present)
+            // ── User note ────────────────────────────────────────────────
             if !notes.stage_note.is_empty() {
                 div {
                     class: "kiln-stage-card-note",
@@ -129,52 +67,242 @@ pub fn StageCard(
                 }
             }
 
-            // Provenance line
-            if let Some(ref prov) = provenance_label {
+            // ── Channel override ─────────────────────────────────────────
+            if let Some(ref co) = doc.channel_override {
                 div {
-                    class: "kiln-stage-card-provenance",
-                    "{prov}"
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "CHANNEL OVERRIDE" }
+                    div { class: "kiln-card-meta",
+                        span { class: "kiln-card-meta-key", "{co.override_kind}" }
+                        span { class: "kiln-card-meta-value", "via {co.override_source}" }
+                    }
                 }
             }
 
-            // CXL statement summary (e.g. "2 emits · 1 filter")
-            if let Some(ref summary) = cxl_summary {
+            // ── CXL source code ──────────────────────────────────────────
+            if let Some(ref cxl) = doc.cxl_source {
                 div {
-                    class: "kiln-stage-card-cxl-summary",
-                    "{summary}"
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "CXL" }
+                    pre {
+                        class: "kiln-card-cxl-block",
+                        "{cxl.trim()}"
+                    }
                 }
             }
 
-            // Fields referenced by CXL
-            if !all_field_refs.is_empty() {
+            // ── CXL analysis ─────────────────────────────────────────────
+            if let Some(ref analysis) = doc.cxl_analysis {
                 div {
-                    class: "kiln-stage-card-field-refs",
-                    span { class: "kiln-stage-card-columns-heading", "READS" }
-                    div {
-                        class: "kiln-stage-card-column-tags",
-                        for field in all_field_refs.iter() {
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "FIELD ANALYSIS" }
+                    for (i, stmt) in analysis.statements.iter().enumerate() {
+                        div { class: "kiln-card-stmt",
+                            key: "stmt-{i}",
                             span {
-                                key: "ref-{field}",
-                                class: "kiln-stage-card-column-tag",
-                                "{field}"
+                                class: "kiln-docs-stmt-badge",
+                                "data-kind": stmt.kind.label().to_lowercase(),
+                                "{stmt.kind.label()}"
+                            }
+                            if let Some(ref out) = stmt.output_field {
+                                span { class: "kiln-card-emit-field", "+{out}" }
+                            }
+                            if !stmt.field_refs.is_empty() {
+                                span { class: "kiln-card-reads",
+                                    "reads "
+                                    for (j, r) in stmt.field_refs.iter().enumerate() {
+                                        if j > 0 { ", " }
+                                        span { class: "kiln-card-field-ref", "{r}" }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Emitted output fields
-            if !emit_fields.is_empty() {
+            // ── Schema table ─────────────────────────────────────────────
+            if let Some(ref schema) = doc.schema {
                 div {
-                    class: "kiln-stage-card-columns",
-                    span { class: "kiln-stage-card-columns-heading", "EMITS" }
-                    div {
-                        class: "kiln-stage-card-column-tags",
-                        for col in emit_fields.iter() {
-                            span {
-                                key: "col-{col}",
-                                class: "kiln-stage-card-column-tag",
-                                "+{col}"
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label",
+                        match &schema.source {
+                            crate::autodoc::SchemaOrigin::File(path) => format!("SCHEMA ({})", path),
+                            crate::autodoc::SchemaOrigin::Inline => "SCHEMA".to_string(),
+                            crate::autodoc::SchemaOrigin::OverridesOnly => "SCHEMA OVERRIDES".to_string(),
+                            crate::autodoc::SchemaOrigin::None => "FIELDS".to_string(),
+                        }
+                    }
+                    if !schema.fields.is_empty() {
+                        div { class: "kiln-card-schema",
+                            div { class: "kiln-card-schema-header",
+                                span { "Name" }
+                                span { "Type" }
+                                span { "Req" }
+                            }
+                            for field in schema.fields.iter() {
+                                div { class: "kiln-card-schema-row",
+                                    key: "sf-{field.name}",
+                                    span { class: "kiln-card-schema-name", "{field.name}" }
+                                    span { {field.field_type.as_deref().unwrap_or("—")} }
+                                    span { if field.required { "yes" } else { "—" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Contract ─────────────────────────────────────────────────
+            if let Some(ref contract) = doc.contract {
+                div {
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "CONTRACT" }
+                    if !contract.requires.is_empty() {
+                        div { class: "kiln-card-contract-group",
+                            span { class: "kiln-card-contract-heading", "REQUIRES" }
+                            for f in contract.requires.iter() {
+                                span { class: "kiln-card-contract-field",
+                                    key: "req-{f.name}",
+                                    "{f.name}: {f.field_type}"
+                                }
+                            }
+                        }
+                    }
+                    if !contract.produces.is_empty() {
+                        div { class: "kiln-card-contract-group",
+                            span { class: "kiln-card-contract-heading", "PRODUCES" }
+                            for f in contract.produces.iter() {
+                                span { class: "kiln-card-contract-field",
+                                    key: "prod-{f.name}",
+                                    "{f.name}: {f.field_type}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Composition sub-stages ───────────────────────────────────
+            if !doc.sub_stages.is_empty() {
+                div {
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "TRANSFORMS" }
+                    for (si, sub) in doc.sub_stages.iter().enumerate() {
+                        {
+                            let sub_name = sub.summary.split(':').next()
+                                .or_else(|| sub.summary.split('.').next())
+                                .unwrap_or(&sub.summary);
+                            // Find the actual stage name from config entries
+                            let sub_stage_name = sub.config.entries.iter()
+                                .find(|e| e.key == "TYPE")
+                                .map(|_| {
+                                    // Use provenance or fallback
+                                    sub.provenance.as_ref()
+                                        .map(|p| p.composition_name.clone())
+                                        .unwrap_or_default()
+                                })
+                                .unwrap_or_default();
+
+                            rsx! {
+                                div { class: "kiln-card-substage",
+                                    key: "sub-{si}",
+
+                                    // Sub-stage header
+                                    div { class: "kiln-card-substage-header",
+                                        span { class: "kiln-card-substage-index", "{si:02}" }
+                                        span { class: "kiln-card-substage-summary", "{sub.summary}" }
+                                    }
+
+                                    // CXL source
+                                    if let Some(ref cxl) = sub.cxl_source {
+                                        pre {
+                                            class: "kiln-card-cxl-block",
+                                            "{cxl.trim()}"
+                                        }
+                                    }
+
+                                    // CXL analysis
+                                    if let Some(ref analysis) = sub.cxl_analysis {
+                                        div { class: "kiln-card-substage-analysis",
+                                            for (i, stmt) in analysis.statements.iter().enumerate() {
+                                                div { class: "kiln-card-stmt",
+                                                    key: "sub-stmt-{i}",
+                                                    span {
+                                                        class: "kiln-docs-stmt-badge",
+                                                        "data-kind": stmt.kind.label().to_lowercase(),
+                                                        "{stmt.kind.label()}"
+                                                    }
+                                                    if let Some(ref out) = stmt.output_field {
+                                                        span { class: "kiln-card-emit-field", "+{out}" }
+                                                    }
+                                                    if !stmt.field_refs.is_empty() {
+                                                        span { class: "kiln-card-reads",
+                                                            "reads "
+                                                            for (j, r) in stmt.field_refs.iter().enumerate() {
+                                                                if j > 0 { ", " }
+                                                                span { class: "kiln-card-field-ref", "{r}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Provenance (override info)
+                                    if let Some(ref prov) = sub.provenance {
+                                        if prov.is_overridden {
+                                            div { class: "kiln-card-override-indicator",
+                                                "overridden"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Provenance ───────────────────────────────────────────────
+            if let Some(ref prov) = doc.provenance {
+                div {
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "PROVENANCE" }
+                    div { class: "kiln-card-meta",
+                        span { class: "kiln-card-meta-key", "from" }
+                        span { class: "kiln-card-meta-value", "{prov.composition_name}" }
+                    }
+                    div { class: "kiln-card-meta",
+                        span { class: "kiln-card-meta-key", "path" }
+                        span { class: "kiln-card-meta-value kiln-card-meta-path", "{prov.composition_path}" }
+                    }
+                    if prov.is_overridden {
+                        div { class: "kiln-card-meta",
+                            span { class: "kiln-card-meta-key", "status" }
+                            span { class: "kiln-card-meta-value kiln-card-override-indicator", "overridden" }
+                        }
+                    }
+                }
+            }
+
+            // ── Config grid ──────────────────────────────────────────────
+            if !config_groups.is_empty() {
+                div {
+                    class: "kiln-card-section",
+                    span { class: "kiln-card-section-label", "CONFIGURATION" }
+                    for (label, entries) in config_groups.iter() {
+                        div { class: "kiln-card-config-group",
+                            if config_groups.len() > 1 {
+                                span { class: "kiln-card-config-category", "{label}" }
+                            }
+                            for entry in entries.iter() {
+                                div { class: "kiln-card-meta",
+                                    key: "cfg-{entry.key}",
+                                    span { class: "kiln-card-meta-key", "{entry.key}" }
+                                    span { class: "kiln-card-meta-value", "{entry.value}" }
+                                }
                             }
                         }
                     }
@@ -182,4 +310,22 @@ pub fn StageCard(
             }
         }
     }
+}
+
+/// Group config entries by category for rendering.
+fn group_config_entries(doc: &StageDoc) -> Vec<(String, Vec<&crate::autodoc::ConfigEntry>)> {
+    let mut groups: Vec<(ConfigCategory, Vec<&crate::autodoc::ConfigEntry>)> = Vec::new();
+
+    for entry in &doc.config.entries {
+        if let Some(group) = groups.iter_mut().find(|(cat, _)| *cat == entry.category) {
+            group.1.push(entry);
+        } else {
+            groups.push((entry.category.clone(), vec![entry]));
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(cat, entries)| (cat.label().to_string(), entries))
+        .collect()
 }

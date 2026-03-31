@@ -5216,6 +5216,217 @@ input:-webkit-autofill:focus {
   border-radius: 2px;
 }
 
+/* ── Stage card: full documentation sections ────────────────────────────── */
+
+/* Section container */
+.kiln-card-section {
+  margin-top: 10px;
+  padding-top: 6px;
+}
+
+.kiln-card-section-label {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-bottom: 6px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--kiln-bp-border);
+}
+
+/* CXL code block */
+.kiln-card-cxl-block {
+  font-family: var(--kiln-font-code);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--kiln-bp-text);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 4%, var(--kiln-bp-bg));
+  border: 1px solid color-mix(in srgb, var(--kiln-bp-accent) 15%, transparent);
+  padding: 8px 10px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+  border-radius: 2px;
+}
+
+/* Key-value metadata row */
+.kiln-card-meta {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 10px;
+}
+
+.kiln-card-meta-key {
+  flex: 0 0 auto;
+  min-width: 80px;
+  font-family: var(--kiln-font-ui);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+}
+
+.kiln-card-meta-value {
+  flex: 1;
+  font-family: var(--kiln-font-blueprint);
+  color: var(--kiln-bp-text);
+  word-break: break-all;
+}
+
+.kiln-card-meta-path {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+/* CXL analysis statement row */
+.kiln-card-stmt {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  flex-wrap: wrap;
+  font-size: 10px;
+}
+
+.kiln-card-emit-field {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--kiln-bp-accent);
+}
+
+.kiln-card-reads {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  color: var(--kiln-bp-text-dim);
+}
+
+.kiln-card-field-ref {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text);
+}
+
+/* Schema table in cards */
+.kiln-card-schema {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+}
+
+.kiln-card-schema-header {
+  display: grid;
+  grid-template-columns: 2fr 1fr 0.5fr;
+  gap: 4px;
+  padding: 2px 0;
+  font-family: var(--kiln-font-ui);
+  font-weight: 600;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  border-bottom: 1px solid var(--kiln-bp-accent-30);
+}
+
+.kiln-card-schema-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 0.5fr;
+  gap: 4px;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--kiln-bp-border);
+  color: var(--kiln-bp-text);
+}
+
+.kiln-card-schema-name {
+  color: var(--kiln-bp-accent);
+  font-weight: 500;
+}
+
+/* Contract section */
+.kiln-card-contract-group {
+  margin-bottom: 6px;
+}
+
+.kiln-card-contract-heading {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-dim);
+  margin-right: 8px;
+}
+
+.kiln-card-contract-field {
+  display: inline-block;
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text);
+  margin-right: 10px;
+  padding: 1px 6px;
+  border: 1px dashed var(--kiln-bp-border);
+}
+
+/* Composition sub-stage cards */
+.kiln-card-substage {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--kiln-bp-accent-30);
+  background: color-mix(in srgb, var(--kiln-bp-accent) 3%, transparent);
+}
+
+.kiln-card-substage-header {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.kiln-card-substage-index {
+  font-family: var(--kiln-font-code);
+  font-size: 10px;
+  color: var(--kiln-bp-text-dim);
+  opacity: 0.6;
+}
+
+.kiln-card-substage-summary {
+  font-family: var(--kiln-font-blueprint);
+  font-size: 11px;
+  color: var(--kiln-bp-text);
+}
+
+.kiln-card-substage-analysis {
+  margin-top: 4px;
+}
+
+.kiln-card-override-indicator {
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #D4A017;
+}
+
+/* Config grid */
+.kiln-card-config-group {
+  margin-bottom: 4px;
+}
+
+.kiln-card-config-category {
+  display: block;
+  font-family: var(--kiln-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kiln-bp-text-ghost);
+  margin: 4px 0 2px;
+}
+
 /* Badges row (schema count, contract, channel) */
 .kiln-stage-card-badges {
   display: flex;
