@@ -12,7 +12,7 @@ pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
     pub inputs: Vec<InputConfig>,
     pub outputs: Vec<OutputConfig>,
-    pub transformations: Vec<TransformConfig>,
+    pub transformations: Vec<TransformEntry>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
 }
@@ -398,6 +398,49 @@ pub struct TransformConfig {
     pub validations: Option<serde_json::Value>,
 }
 
+/// A transformation list entry: either an inline transform or an `_import` directive.
+///
+/// Uses custom `Deserialize` (not `#[serde(untagged)]`) for clear error messages.
+/// Consistent with `SortFieldSpec` and `SchemaSource` (Phase 9 decision #40).
+#[derive(Debug, Clone, Serialize)]
+pub enum TransformEntry {
+    Import { _import: String },
+    Transform(TransformConfig),
+}
+
+impl<'de> Deserialize<'de> for TransformEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("_import").is_some() {
+            #[derive(Deserialize)]
+            struct ImportRef {
+                _import: String,
+            }
+            let import: ImportRef = serde_json::from_value(value).map_err(de::Error::custom)?;
+            Ok(TransformEntry::Import {
+                _import: import._import,
+            })
+        } else {
+            let transform: TransformConfig =
+                serde_json::from_value(value).map_err(de::Error::custom)?;
+            Ok(TransformEntry::Transform(transform))
+        }
+    }
+}
+
+impl PipelineConfig {
+    /// Returns resolved transforms. Panics if called before import resolution.
+    /// Cargo `InheritableField::normalized()` pattern.
+    pub fn transforms(&self) -> impl Iterator<Item = &TransformConfig> + '_ {
+        self.transformations.iter().map(|entry| match entry {
+            TransformEntry::Transform(t) => t,
+            TransformEntry::Import { _import } => {
+                panic!("unresolved _import '{_import}' — call resolve_compositions() first")
+            }
+        })
+    }
+}
+
 /// Error handling strategy and DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -623,7 +666,7 @@ transformations:
         assert_eq!(config.inputs[0].path, "/tmp/input.csv");
         assert_eq!(config.outputs.len(), 1);
         assert_eq!(config.transformations.len(), 1);
-        assert!(config.transformations[0].cxl.contains("emit full_name"));
+        assert!(config.transforms().next().unwrap().cxl.contains("emit full_name"));
         // Default error strategy
         assert_eq!(config.error_handling.strategy, ErrorStrategy::FailFast);
     }
@@ -887,8 +930,9 @@ error_handling:
 
         // Transforms
         assert_eq!(config.transformations.len(), 2);
-        assert!(config.transformations[0].cxl.contains("emit full_name"));
-        assert!(config.transformations[0].description.is_some());
+        let t0 = config.transforms().next().unwrap();
+        assert!(t0.cxl.contains("emit full_name"));
+        assert!(t0.description.is_some());
 
         // Error handling
         assert_eq!(config.error_handling.strategy, ErrorStrategy::Continue);

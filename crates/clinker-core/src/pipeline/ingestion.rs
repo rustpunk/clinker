@@ -190,6 +190,14 @@ mod tests {
     use clinker_record::{RecordStorage, Schema};
     use std::sync::Arc;
 
+    /// Extract resolved TransformConfig from TransformEntry (tests only).
+    fn t(entry: &TransformEntry) -> &TransformConfig {
+        match entry {
+            TransformEntry::Transform(t) => t,
+            _ => panic!("test expects resolved transform"),
+        }
+    }
+
     /// Helper: build a minimal pipeline config.
     fn test_config(inputs: Vec<(&str, &str)>, transforms: Vec<(&str, &str, Option<serde_json::Value>)>) -> PipelineConfig {
         PipelineConfig {
@@ -230,14 +238,14 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| TransformConfig {
+                .map(|(name, cxl, local_window)| TransformEntry::Transform(TransformConfig {
                     name: name.into(),
                     description: None,
                     cxl: cxl.into(),
                     local_window,
                     log: None,
                     validations: None,
-                })
+                }))
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
         }
@@ -265,7 +273,7 @@ mod tests {
             vec![("agg", "emit total = window.sum(amount)", Some(serde_json::json!({"group_by": ["dept"]})))],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
@@ -294,7 +302,7 @@ mod tests {
             vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
@@ -325,7 +333,7 @@ mod tests {
             vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
@@ -357,7 +365,7 @@ mod tests {
             vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
@@ -395,7 +403,7 @@ mod tests {
             vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
@@ -423,7 +431,7 @@ mod tests {
             vec![("agg", "emit total = window.sum(amount)", Some(serde_json::json!({"group_by": ["dept"]})))],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 
@@ -446,7 +454,7 @@ mod tests {
             vec![("agg", "emit total = window.sum(amount)", Some(serde_json::json!({"group_by": ["dept"]})))],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
 

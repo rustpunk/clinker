@@ -92,7 +92,8 @@ impl PipelineExecutor {
         let schema = csv_reader.schema()?;
 
         // Compile CXL transforms
-        let compiled_transforms = Self::compile_transforms(&config.transformations, &schema)?;
+        let resolved_transforms: Vec<_> = config.transforms().collect();
+        let compiled_transforms = Self::compile_transforms(&resolved_transforms, &schema)?;
 
         // Build ExecutionPlan to determine mode
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled_transforms
@@ -383,7 +384,7 @@ impl PipelineExecutor {
 
     /// Compile all CXL transform blocks against the input schema.
     fn compile_transforms(
-        transforms: &[TransformConfig],
+        transforms: &[&TransformConfig],
         schema: &Arc<Schema>,
     ) -> Result<Vec<CompiledTransform>, PipelineError> {
         let fields: Vec<&str> = schema.columns().iter().map(|c| c.as_ref()).collect();
@@ -455,7 +456,7 @@ impl PipelineExecutor {
     pub fn explain(config: &PipelineConfig) -> Result<String, PipelineError> {
         // Extract field names from CXL AST to build a synthetic schema
         let mut all_fields = Vec::new();
-        for t in &config.transformations {
+        for t in config.transforms() {
             let parsed = cxl::parser::Parser::parse(&t.cxl);
             if !parsed.errors.is_empty() {
                 return Err(PipelineError::Compilation {
@@ -472,7 +473,8 @@ impl PipelineExecutor {
             all_fields.iter().map(|f| f.as_str().into()).collect(),
         ));
 
-        let compiled = Self::compile_transforms(&config.transformations, &schema)?;
+        let resolved_transforms: Vec<_> = config.transforms().collect();
+        let compiled = Self::compile_transforms(&resolved_transforms, &schema)?;
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled
             .iter()
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
@@ -1519,7 +1521,8 @@ transformations:
 "#;
         let config = crate::config::parse_config(yaml).unwrap();
         let schema = Arc::new(Schema::new(vec!["amount".into()]));
-        let compiled = PipelineExecutor::compile_transforms(&config.transformations, &schema).unwrap();
+        let transforms: Vec<&crate::config::TransformConfig> = config.transforms().collect();
+        let compiled = PipelineExecutor::compile_transforms(&transforms, &schema).unwrap();
         // Each compiled transform holds one Arc<TypedProgram>
         for ct in &compiled {
             assert_eq!(Arc::strong_count(&ct.typed), 1,

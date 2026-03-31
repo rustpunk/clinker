@@ -68,8 +68,7 @@ impl ExecutionPlan {
 
         // Parse local_window configs
         let window_configs: Vec<Option<LocalWindowConfig>> = config
-            .transformations
-            .iter()
+            .transforms()
             .map(|t| index::parse_local_window(t).map_err(PlanError::IndexPlanning))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -268,7 +267,7 @@ impl ExecutionPlan {
 
         // CXL AST (reformatted expressions from config)
         out.push_str("=== CXL Expressions ===\n\n");
-        for t in &config.transformations {
+        for t in config.transforms() {
             out.push_str(&format!("Transform '{}':\n", t.name));
             for line in t.cxl.lines() {
                 let trimmed = line.trim();
@@ -463,6 +462,14 @@ mod tests {
     use cxl::typecheck::pass::type_check;
     use std::collections::HashMap;
 
+    /// Extract resolved TransformConfig from TransformEntry (tests only).
+    fn t(entry: &TransformEntry) -> &TransformConfig {
+        match entry {
+            TransformEntry::Transform(t) => t,
+            _ => panic!("test expects resolved transform"),
+        }
+    }
+
     /// Build a minimal PipelineConfig for testing.
     fn test_config(
         inputs: Vec<(&str, &str)>,
@@ -506,14 +513,14 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| TransformConfig {
+                .map(|(name, cxl, local_window)| TransformEntry::Transform(TransformConfig {
                     name: name.into(),
                     description: None,
                     cxl: cxl.into(),
                     local_window,
                     log: None,
                     validations: None,
-                })
+                }))
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
         }
@@ -535,7 +542,7 @@ mod tests {
             vec![("calc", "let x = amount + 1\nemit result = x * 2", None)],
         );
         let fields = &["amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("calc", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -556,7 +563,7 @@ mod tests {
             vec![("agg", "emit total = window.sum(amount)", Some(window))],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -580,8 +587,8 @@ mod tests {
             ],
         );
         let fields = &["dept", "amount", "date"];
-        let typed1 = compile_cxl(&config.transformations[0].cxl, fields);
-        let typed2 = compile_cxl(&config.transformations[1].cxl, fields);
+        let typed1 = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
         let compiled = vec![("agg1", &typed1), ("agg2", &typed2)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -603,8 +610,8 @@ mod tests {
             ],
         );
         let fields = &["dept", "region", "amount"];
-        let typed1 = compile_cxl(&config.transformations[0].cxl, fields);
-        let typed2 = compile_cxl(&config.transformations[1].cxl, fields);
+        let typed1 = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
         let compiled = vec![("agg_dept", &typed1), ("agg_region", &typed2)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -619,7 +626,7 @@ mod tests {
             vec![("calc", "emit doubled = amount * 2", None)],
         );
         let fields = &["amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("calc", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -635,7 +642,7 @@ mod tests {
             vec![("agg", "emit total = window.sum(amount)", Some(window))],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -654,7 +661,7 @@ mod tests {
             vec![("positional", "emit prev = window.lag(1)", Some(window))],
         );
         let fields = &["dept", "amount", "date"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("positional", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -673,8 +680,8 @@ mod tests {
             ],
         );
         let fields = &["dept", "amount"];
-        let typed1 = compile_cxl(&config.transformations[0].cxl, fields);
-        let typed2 = compile_cxl(&config.transformations[1].cxl, fields);
+        let typed1 = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
         let compiled = vec![("calc", &typed1), ("agg", &typed2)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -699,7 +706,7 @@ mod tests {
             vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -717,7 +724,7 @@ mod tests {
             vec![("agg", "emit total = window.sum(amount)", Some(window))],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
 
         let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
@@ -736,7 +743,7 @@ mod tests {
             vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
         );
         let fields = &["id", "amount"];
-        let typed = compile_cxl(&config.transformations[0].cxl, fields);
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
 
         let result = ExecutionPlan::compile(&config, &compiled);

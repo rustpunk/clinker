@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use clinker_core::config::{
     ErrorHandlingConfig, InputConfig, OutputConfig, PipelineConfig, SchemaSource, SortFieldSpec,
-    TransformConfig,
+    TransformConfig, TransformEntry,
 };
 use clinker_record::schema_def::FieldDef;
 
@@ -259,7 +259,10 @@ pub fn resolve_channel(
         let transform = config
             .transformations
             .iter_mut()
-            .find(|t| t.name == *name)
+            .find_map(|entry| match entry {
+                TransformEntry::Transform(t) if t.name == *name => Some(t),
+                _ => None,
+            })
             .ok_or_else(|| ChannelError::OverrideTargetNotFound {
                 name: name.clone(),
                 file: override_path.clone(),
@@ -272,21 +275,21 @@ pub fn resolve_channel(
         let anchor_pos = config
             .transformations
             .iter()
-            .position(|t| t.name == add.after)
+            .position(|entry| matches!(entry, TransformEntry::Transform(t) if t.name == add.after))
             .ok_or_else(|| ChannelError::AddAfterNotFound {
                 name: add.name.clone(),
                 after: add.after.clone(),
                 file: override_path.clone(),
             })?;
 
-        let new_transform = TransformConfig {
+        let new_transform = TransformEntry::Transform(TransformConfig {
             name: add.name.clone(),
             description: add.description.clone(),
             cxl: add.cxl.clone(),
             local_window: add.local_window.clone(),
             log: None,
             validations: None,
-        };
+        });
         config.transformations.insert(anchor_pos + 1, new_transform);
     }
 
@@ -302,7 +305,7 @@ pub fn resolve_channel(
         let anchor_pos = config
             .transformations
             .iter()
-            .position(|t| t.name == add_comp.after)
+            .position(|entry| matches!(entry, TransformEntry::Transform(t) if t.name == add_comp.after))
             .ok_or_else(|| ChannelError::AddAfterNotFound {
                 name: format!("composition:{}", add_comp.r#ref),
                 after: add_comp.after.clone(),
@@ -329,17 +332,17 @@ pub fn resolve_channel(
             provenance.insert(t.name.clone(), canonical.clone());
         }
 
-        // Insert after anchor
+        // Insert after anchor (wrap each TransformConfig in TransformEntry)
         let insert_at = anchor_pos + 1;
         for (i, t) in resolved_transforms.into_iter().enumerate() {
-            config.transformations.insert(insert_at + i, t);
+            config.transformations.insert(insert_at + i, TransformEntry::Transform(t));
         }
     }
 
     // 6. Remove transformations — by name (warning if not found)
     for name in &override_file.remove_transformations {
         let before_len = config.transformations.len();
-        config.transformations.retain(|t| t.name != *name);
+        config.transformations.retain(|entry| !matches!(entry, TransformEntry::Transform(t) if t.name == *name));
         if config.transformations.len() == before_len {
             tracing::warn!("remove_transformations: '{}' not found — skipping", name);
         }
@@ -376,7 +379,7 @@ pub fn resolve_channel(
         }
 
         for name in &names_to_remove {
-            config.transformations.retain(|t| t.name != *name);
+            config.transformations.retain(|entry| !matches!(entry, TransformEntry::Transform(t) if t.name == *name));
             provenance.remove(name);
         }
     }
@@ -522,6 +525,14 @@ mod tests {
         ErrorStrategy, InputFormat, OutputFormat, PipelineMeta,
     };
 
+    /// Unwrap a `TransformEntry::Transform` for test assertions.
+    fn t(entry: &TransformEntry) -> &TransformConfig {
+        match entry {
+            TransformEntry::Transform(t) => t,
+            _ => panic!("expected TransformEntry::Transform, got Import"),
+        }
+    }
+
     /// Helper: minimal pipeline config for testing.
     fn base_config() -> PipelineConfig {
         PipelineConfig {
@@ -560,22 +571,22 @@ mod tests {
                 format: OutputFormat::Csv(None),
             }],
             transformations: vec![
-                TransformConfig {
+                TransformEntry::Transform(TransformConfig {
                     name: "filter_active".into(),
                     description: Some("Filter active records".into()),
                     cxl: "if status != \"active\"\n  drop\nend".into(),
                     local_window: None,
                     log: None,
                     validations: None,
-                },
-                TransformConfig {
+                }),
+                TransformEntry::Transform(TransformConfig {
                     name: "normalize_names".into(),
                     description: None,
                     cxl: "emit name = name.trim()".into(),
                     local_window: None,
                     log: None,
                     validations: None,
-                },
+                }),
             ],
             error_handling: ErrorHandlingConfig::default(),
         }
@@ -726,10 +737,10 @@ mod tests {
 
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
-        assert!(result.transformations[0].cxl.contains("status.lower()"));
+        assert!(t(&result.transformations[0]).cxl.contains("status.lower()"));
         // Description preserved (not overridden)
         assert_eq!(
-            result.transformations[0].description.as_deref(),
+            t(&result.transformations[0]).description.as_deref(),
             Some("Filter active records")
         );
     }
@@ -764,9 +775,9 @@ mod tests {
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         assert_eq!(result.transformations.len(), 3);
-        assert_eq!(result.transformations[0].name, "filter_active");
-        assert_eq!(result.transformations[1].name, "acme_validation");
-        assert_eq!(result.transformations[2].name, "normalize_names");
+        assert_eq!(t(&result.transformations[0]).name, "filter_active");
+        assert_eq!(t(&result.transformations[1]).name, "acme_validation");
+        assert_eq!(t(&result.transformations[2]).name, "normalize_names");
     }
 
     #[test]
@@ -808,10 +819,10 @@ mod tests {
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         assert_eq!(result.transformations.len(), 4);
-        assert_eq!(result.transformations[0].name, "filter_active");
-        assert_eq!(result.transformations[1].name, "first_add");
-        assert_eq!(result.transformations[2].name, "second_add");
-        assert_eq!(result.transformations[3].name, "normalize_names");
+        assert_eq!(t(&result.transformations[0]).name, "filter_active");
+        assert_eq!(t(&result.transformations[1]).name, "first_add");
+        assert_eq!(t(&result.transformations[2]).name, "second_add");
+        assert_eq!(t(&result.transformations[3]).name, "normalize_names");
     }
 
     #[test]
@@ -859,8 +870,8 @@ transformations:
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         assert_eq!(result.transformations.len(), 4);
-        assert_eq!(result.transformations[1].name, "audit_stamp");
-        assert_eq!(result.transformations[2].name, "audit_user");
+        assert_eq!(t(&result.transformations[1]).name, "audit_stamp");
+        assert_eq!(t(&result.transformations[2]).name, "audit_user");
         // Provenance should track both
         assert!(provenance.contains_key("audit_stamp"));
         assert!(provenance.contains_key("audit_user"));
@@ -959,7 +970,7 @@ transformations:
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         assert_eq!(result.transformations.len(), 1);
-        assert_eq!(result.transformations[0].name, "filter_active");
+        assert_eq!(t(&result.transformations[0]).name, "filter_active");
     }
 
     #[test]
@@ -1008,22 +1019,22 @@ transformations:
 
         // Pre-populate: base config with transforms that came from this composition
         let mut config = base_config();
-        config.transformations.push(TransformConfig {
+        config.transformations.push(TransformEntry::Transform(TransformConfig {
             name: "legacy_a".into(),
             description: None,
             cxl: "emit a = 1".into(),
             local_window: None,
             log: None,
             validations: None,
-        });
-        config.transformations.push(TransformConfig {
+        }));
+        config.transformations.push(TransformEntry::Transform(TransformConfig {
             name: "legacy_b".into(),
             description: None,
             cxl: "emit b = 2".into(),
             local_window: None,
             log: None,
             validations: None,
-        });
+        }));
         provenance.insert("legacy_a".into(), canonical.clone());
         provenance.insert("legacy_b".into(), canonical.clone());
 
@@ -1048,7 +1059,7 @@ transformations:
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
         // Both legacy transforms removed
         assert_eq!(result.transformations.len(), 2); // only original filter_active + normalize_names
-        assert!(!result.transformations.iter().any(|t| t.name.starts_with("legacy")));
+        assert!(!result.transformations.iter().any(|entry| matches!(entry, TransformEntry::Transform(t) if t.name.starts_with("legacy"))));
         assert!(!provenance.contains_key("legacy_a"));
         assert!(!provenance.contains_key("legacy_b"));
     }
@@ -1304,9 +1315,9 @@ transformations:
         .unwrap();
 
         // Group changed filter_active
-        assert!(result.transformations[0].cxl.contains("group_applied"));
+        assert!(t(&result.transformations[0]).cxl.contains("group_applied"));
         // Channel changed normalize_names
-        assert!(result.transformations[1].cxl.contains("channel_applied"));
+        assert!(t(&result.transformations[1]).cxl.contains("channel_applied"));
     }
 
     #[test]
@@ -1348,7 +1359,7 @@ transformations:
         .unwrap();
 
         // Group B (later) wins over Group A on same transform
-        assert!(result.transformations[0].cxl.contains("from_group_b"));
+        assert!(t(&result.transformations[0]).cxl.contains("from_group_b"));
     }
 
     #[test]
@@ -1386,7 +1397,7 @@ transformations:
         .unwrap();
 
         // Channel wins over group
-        assert!(result.transformations[0].cxl.contains("from_channel"));
+        assert!(t(&result.transformations[0]).cxl.contains("from_channel"));
     }
 
     #[test]
@@ -1412,7 +1423,7 @@ transformations:
         .unwrap();
 
         // Base config unchanged
-        assert!(result.transformations[0].cxl.contains("status != \"active\""));
+        assert!(t(&result.transformations[0]).cxl.contains("status != \"active\""));
     }
 
     #[test]
@@ -1463,7 +1474,7 @@ transformations:
         .unwrap();
 
         // Group override skipped — base unchanged
-        assert!(!result.transformations[0].cxl.contains("should_not_apply"));
+        assert!(!t(&result.transformations[0]).cxl.contains("should_not_apply"));
     }
 
     #[test]
@@ -1499,14 +1510,14 @@ transformations:
 
         // Pre-populate config and provenance with composition transforms
         let mut config = base_config();
-        config.transformations.push(TransformConfig {
+        config.transformations.push(TransformEntry::Transform(TransformConfig {
             name: "legacy_step".into(),
             description: None,
             cxl: "emit x = 1".into(),
             local_window: None,
             log: None,
             validations: None,
-        });
+        }));
         let mut provenance = ProvenanceMap::new();
         provenance.insert("legacy_step".into(), canonical);
 
@@ -1516,7 +1527,7 @@ transformations:
         .unwrap();
 
         // Group removed the composition's transforms — channel sees them gone
-        assert!(!result.transformations.iter().any(|t| t.name == "legacy_step"));
+        assert!(!result.transformations.iter().any(|entry| matches!(entry, TransformEntry::Transform(t) if t.name == "legacy_step")));
         assert!(!provenance.contains_key("legacy_step"));
     }
 
@@ -1546,6 +1557,6 @@ transformations:
         )
         .unwrap();
 
-        assert!(result.transformations[0].cxl.contains("channel_only"));
+        assert!(t(&result.transformations[0]).cxl.contains("channel_only"));
     }
 }
