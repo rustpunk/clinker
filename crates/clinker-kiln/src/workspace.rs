@@ -29,7 +29,43 @@ pub struct WorkspaceManifest {
     #[serde(default)]
     pub compositions: Option<CompositionsConfig>,
     #[serde(default)]
+    pub channels: Option<ChannelsConfig>,
+    #[serde(default)]
     pub cli: Option<CliConfig>,
+}
+
+/// Channel configuration from `[channels]` in kiln.toml.
+///
+/// Channels are discovered from this workspace — the directory layout matches
+/// the CLI's convention so `clinker run --channel` works against the same files.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelsConfig {
+    /// Directory for per-channel subdirectories (default: "channels").
+    #[serde(default = "default_channels_dir")]
+    pub directory: String,
+    /// Subdirectory for channel group templates (default: "_groups").
+    #[serde(default = "default_groups_dir")]
+    pub groups_directory: String,
+    /// Default channel ID selected on workspace open (optional).
+    pub default: Option<String>,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            directory: default_channels_dir(),
+            groups_directory: default_groups_dir(),
+            default: None,
+        }
+    }
+}
+
+fn default_channels_dir() -> String {
+    "channels".to_string()
+}
+
+fn default_groups_dir() -> String {
+    "_groups".to_string()
 }
 
 /// Composition configuration from `[compositions]` in kiln.toml.
@@ -107,6 +143,19 @@ pub struct WorkspaceState {
     /// Search history and saved queries (spec §S2.6).
     #[serde(default)]
     pub search: Option<SearchState>,
+    /// Active channel and recent channel list for session restoration.
+    #[serde(default)]
+    pub channels: Option<ChannelPersistence>,
+}
+
+/// Persisted channel state — active selection and recent list.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ChannelPersistence {
+    /// Currently active channel ID (None = no channel).
+    pub active: Option<String>,
+    /// Recently selected channel IDs (most recent first).
+    #[serde(default)]
+    pub recent: Vec<String>,
 }
 
 /// Persisted navigation state — active context, pipeline layout mode, focus mode.
@@ -390,6 +439,133 @@ fn append_gitignore(dir: &Path) {
     let _ = fs::write(&gitignore_path, format!("{content}{addition}"));
 }
 
+// ── Channel discovery ──────────────────────────────────────────────────
+
+use crate::state::{ChannelState, ChannelSummary, GroupSummary};
+use clinker_channel::manifest::{ChannelInherits, ChannelManifest};
+
+/// Discover channels and groups by convention from the workspace root.
+///
+/// Convention-based discovery: if a `channels/` directory (or the name configured
+/// in `[channels] directory` in kiln.toml) exists in the workspace root, channels
+/// are enabled. No `clinker.toml` required.
+///
+/// Returns None if the channels directory doesn't exist (graceful degradation).
+/// Errors during individual channel parsing are silently skipped.
+pub fn discover_channels(ws: &Workspace) -> Option<ChannelState> {
+    let chan_config = ws.manifest.channels.clone().unwrap_or_default();
+    let channels_dir_name = &chan_config.directory;
+    let groups_dir_name = &chan_config.groups_directory;
+
+    let channels_abs = ws.root.join(channels_dir_name);
+    let groups_abs = channels_abs.join(groups_dir_name);
+
+    let dir_exists = channels_abs.is_dir();
+
+    // Discover channels: scan channel dir for subdirectories containing channel.yaml
+    let mut channels = Vec::new();
+    let mut groups = Vec::new();
+
+    if dir_exists {
+        if let Ok(entries) = std::fs::read_dir(&channels_abs) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // Skip the groups directory
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if dir_name == groups_dir_name || dir_name.starts_with('.') {
+                    continue;
+                }
+                let channel_yaml = path.join("channel.yaml");
+                if !channel_yaml.exists() {
+                    continue;
+                }
+                if let Ok(manifest) = ChannelManifest::load(&path) {
+                    let override_count = count_channel_yaml_files(&path);
+                    let inherits = match &manifest.metadata.inherits {
+                        ChannelInherits::None => Vec::new(),
+                        ChannelInherits::Single(id) => vec![id.clone()],
+                        ChannelInherits::Multiple(ids) => ids.clone(),
+                    };
+                    channels.push(ChannelSummary {
+                        id: manifest.metadata.id.clone(),
+                        name: manifest.metadata.name.clone(),
+                        description: manifest.metadata.description.clone(),
+                        contact: manifest.metadata.contact.clone(),
+                        tier: manifest.metadata.tier.clone(),
+                        tags: manifest.metadata.tags.clone(),
+                        active: manifest.metadata.active,
+                        inherits,
+                        override_count,
+                        variable_count: manifest.variables.len(),
+                    });
+                }
+            }
+        }
+        channels.sort_by(|a, b| a.id.cmp(&b.id));
+
+        // Discover groups: scan groups dir for subdirectories with .channel.yaml files
+        if groups_abs.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&groups_abs) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let group_id = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let override_count = count_channel_yaml_files(&path);
+                    let inheritor_ids: Vec<String> = channels
+                        .iter()
+                        .filter(|c| c.inherits.contains(&group_id))
+                        .map(|c| c.id.clone())
+                        .collect();
+                    groups.push(GroupSummary {
+                        id: group_id,
+                        override_count,
+                        inheritor_ids,
+                    });
+                }
+            }
+        }
+        groups.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+
+    Some(ChannelState {
+        workspace_root: ws.root.clone(),
+        channels_dir: channels_dir_name.clone(),
+        groups_dir: groups_dir_name.clone(),
+        default_channel: chan_config.default.clone(),
+        dir_exists,
+        channels,
+        groups,
+        active_channel: None,
+        recent_channels: Vec::new(),
+    })
+}
+
+/// Count `.channel.yaml` files in a directory (override files for pipelines).
+fn count_channel_yaml_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.ends_with(".channel.yaml") && n != "channel.yaml")
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 // ── Last workspace tracking (OS app data dir) ───────────────────────────
 
 /// Path to the last-workspace tracker file.
@@ -430,6 +606,7 @@ pub fn save_full_session(
     pipeline_layout: PipelineLayoutMode,
     run_log_expanded: bool,
     activity_bar_visible: bool,
+    channel_state: &Option<ChannelState>,
 ) {
     let Some(ws) = workspace else { return };
 
@@ -447,6 +624,7 @@ pub fn save_full_session(
         pipeline_layout,
         run_log_expanded,
         activity_bar_visible,
+        channel_state,
     );
     save_workspace_state(&ws.root, &state);
     save_last_workspace(&ws.root);
@@ -481,12 +659,18 @@ pub fn build_state_snapshot(
     pipeline_layout: PipelineLayoutMode,
     run_log_expanded: bool,
     activity_bar_visible: bool,
+    channel_state: &Option<ChannelState>,
 ) -> WorkspaceState {
     let open_paths: Vec<String> = tabs
         .iter()
         .filter_map(|t| t.file_path.as_ref())
         .map(|p| p.display().to_string())
         .collect();
+
+    let channels = channel_state.as_ref().map(|cs| ChannelPersistence {
+        active: cs.active_channel.clone(),
+        recent: cs.recent_channels.clone(),
+    });
 
     WorkspaceState {
         version: 1,
@@ -509,6 +693,7 @@ pub fn build_state_snapshot(
         pipelines: HashMap::new(),
         last_open_directory: None,
         search: None,
+        channels,
     }
 }
 

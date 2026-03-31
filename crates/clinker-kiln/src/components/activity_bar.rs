@@ -24,6 +24,12 @@ pub fn ActivityBar() -> Element {
         gs.files.len()
     }).unwrap_or(0);
 
+    // Channel badge: count of discovered channels
+    let channel_badge = (tab_mgr.channel_state)()
+        .as_ref()
+        .map(|cs| cs.channels.len())
+        .unwrap_or(0);
+
     rsx! {
         nav {
             class: "kiln-activity-bar",

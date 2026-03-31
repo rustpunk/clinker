@@ -1,0 +1,6 @@
+_channel:
+  id: acme-corp
+  name: "Acme Corp"
+  active: true
+
+variables: {}
