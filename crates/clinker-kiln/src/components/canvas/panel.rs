@@ -8,7 +8,7 @@ use crate::pipeline_view::{
     NODE_HEIGHT, NODE_WIDTH, derive_composition_drill_view, derive_partial_pipeline_view,
     derive_pipeline_view,
 };
-use crate::state::use_app_state;
+use crate::state::{ChannelViewMode, use_app_state};
 
 use super::breadcrumb::BreadcrumbBar;
 use super::connector::Connector;
@@ -63,8 +63,12 @@ pub fn CanvasPanel() -> Element {
     let drill_stack = (state.composition_drill_stack)();
     let is_drilled = !drill_stack.is_empty();
 
+    // Channel-aware pipeline selection (mirrors schematics/panel.rs pattern)
+    let channel_view = (state.channel_view_mode)();
+    let channel_res = (state.channel_pipeline)();
+
     let pipeline_view = if is_drilled {
-        // Drill-in: render the top composition's transforms
+        // Drill-in always uses base pipeline (composition structure is a base-view concept)
         let drill_entry = drill_stack.last().unwrap();
         match &*(state.pipeline).read() {
             Some(config) => {
@@ -77,17 +81,27 @@ pub fn CanvasPanel() -> Element {
             },
         }
     } else {
-        // Normal pipeline view
-        match &*(state.pipeline).read() {
-            Some(config) => derive_pipeline_view(config, &compositions_read, &expanded),
-            None => match &*(state.partial_pipeline).read() {
-                Some(partial) => derive_partial_pipeline_view(partial),
-                None => crate::pipeline_view::PipelineView {
-                    stages: Vec::new(),
-                    composition_groups: Vec::new(),
-                    connections: Vec::new(),
-                },
-            },
+        // Normal pipeline view — channel-aware
+        match (channel_view, channel_res.as_ref()) {
+            (ChannelViewMode::Resolved, Some(cr)) => {
+                // Resolved view: channel-resolved config without composition groups
+                // (compositions are flattened after channel overrides)
+                derive_pipeline_view(&cr.resolved_config, &[], &expanded)
+            }
+            _ => {
+                // Base view or no channel: use base pipeline
+                match &*(state.pipeline).read() {
+                    Some(config) => derive_pipeline_view(config, &compositions_read, &expanded),
+                    None => match &*(state.partial_pipeline).read() {
+                        Some(partial) => derive_partial_pipeline_view(partial),
+                        None => crate::pipeline_view::PipelineView {
+                            stages: Vec::new(),
+                            composition_groups: Vec::new(),
+                            connections: Vec::new(),
+                        },
+                    },
+                }
+            }
         }
     };
     let connections: Vec<_> = pipeline_view
