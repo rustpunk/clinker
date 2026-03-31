@@ -305,6 +305,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         yaml_spool,
     );
 
+    // Build runtime parameters
+    let execution_id = uuid::Uuid::now_v7().to_string();
+    let batch_id = args.resolved_batch_id();
+    let pipeline_vars = pipeline_config.pipeline.vars.as_ref()
+        .map(|v| clinker_core::config::convert_pipeline_vars(v))
+        .unwrap_or_default();
+    let run_params = clinker_core::executor::PipelineRunParams {
+        execution_id: execution_id.clone(),
+        batch_id: batch_id.clone(),
+        pipeline_vars,
+    };
+
     // Run the pipeline using file-based I/O
     let input_path = &pipeline_config.inputs[0].path;
     let output_path = &pipeline_config.outputs[0].path;
@@ -312,7 +324,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let reader = std::fs::File::open(input_path)?;
     let writer = std::fs::File::create(output_path)?;
 
-    let report = PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer)?;
+    let report = PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer, &run_params)?;
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
@@ -362,7 +374,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let duration_ms = (report.finished_at - report.started_at).num_milliseconds();
 
         let execution_metrics = ExecutionMetrics {
-            execution_id: args.resolved_batch_id(),
+            execution_id: execution_id.clone(),
             schema_version: 1,
             pipeline_name: pipeline_config.pipeline.name.clone(),
             config_path: args.config.to_string_lossy().into_owned(),

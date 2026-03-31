@@ -62,6 +62,7 @@ const PIPELINE_MEMBERS: &[&str] = &[
     "start_time",
     "name",
     "execution_id",
+    "batch_id",
     "total_count",
     "ok_count",
     "dlq_count",

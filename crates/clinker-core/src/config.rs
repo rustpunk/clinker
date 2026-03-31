@@ -596,6 +596,12 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     Ok(config)
 }
 
+/// Reserved pipeline member names that cannot be used as user variable names.
+const RESERVED_PIPELINE_NAMES: &[&str] = &[
+    "start_time", "name", "execution_id", "batch_id",
+    "total_count", "ok_count", "dlq_count", "source_file", "source_row",
+];
+
 /// Post-deserialization validation.
 fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     for input in &config.inputs {
@@ -611,7 +617,77 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
             }
         }
     }
+
+    // Validate pipeline.vars
+    if let Some(ref vars) = config.pipeline.vars {
+        validate_pipeline_vars(vars)?;
+    }
+
     Ok(())
+}
+
+/// Validate pipeline.vars: no reserved name collisions, no nested objects/arrays/null.
+fn validate_pipeline_vars(vars: &IndexMap<String, serde_json::Value>) -> Result<(), ConfigError> {
+    for (name, value) in vars {
+        // Check reserved name collision
+        if RESERVED_PIPELINE_NAMES.contains(&name.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "pipeline.vars: '{}' is a reserved pipeline member name and cannot be used as a variable",
+                name
+            )));
+        }
+
+        // Check value type — only scalars allowed
+        match value {
+            serde_json::Value::Object(_) => {
+                return Err(ConfigError::Validation(format!(
+                    "pipeline.vars.{}: nested objects are not supported — only scalar values (string, number, bool)",
+                    name
+                )));
+            }
+            serde_json::Value::Array(_) => {
+                return Err(ConfigError::Validation(format!(
+                    "pipeline.vars.{}: arrays are not supported — only scalar values (string, number, bool)",
+                    name
+                )));
+            }
+            serde_json::Value::Null => {
+                return Err(ConfigError::Validation(format!(
+                    "pipeline.vars.{}: null values are not supported — provide a scalar value",
+                    name
+                )));
+            }
+            _ => {} // String, Number, Bool — all ok
+        }
+    }
+    Ok(())
+}
+
+/// Convert validated pipeline vars from serde_json to clinker_record::Value.
+/// Only call after `validate_pipeline_vars` has passed (no null/object/array).
+pub fn convert_pipeline_vars(
+    vars: &IndexMap<String, serde_json::Value>,
+) -> IndexMap<String, clinker_record::Value> {
+    vars.iter()
+        .map(|(k, v)| {
+            let val = match v {
+                serde_json::Value::Bool(b) => clinker_record::Value::Bool(*b),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        clinker_record::Value::Integer(i)
+                    } else {
+                        clinker_record::Value::Float(n.as_f64().unwrap_or(0.0))
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    clinker_record::Value::String(s.clone().into_boxed_str())
+                }
+                // Null/Object/Array rejected by validate_pipeline_vars
+                _ => unreachable!("validate_pipeline_vars should reject non-scalar values"),
+            };
+            (k.clone(), val)
+        })
+        .collect()
 }
 
 /// Load and parse a pipeline config from a YAML file path with extra variables.
@@ -1312,5 +1388,148 @@ transformations:
 "#;
         let result = parse_config(yaml);
         assert!(result.is_err(), "sort_output at pipeline level should be rejected");
+    }
+
+    // ── Pipeline vars tests ───────────────────────────────────────
+
+    fn yaml_with_vars(vars_block: &str) -> String {
+        format!(r#"
+pipeline:
+  name: test
+  vars:
+{vars_block}
+
+inputs:
+  - name: src
+    type: csv
+    path: /tmp/in.csv
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+transformations:
+  - name: t1
+    cxl: "emit x = a"
+"#)
+    }
+
+    #[test]
+    fn test_vars_int() {
+        let yaml = yaml_with_vars("    count: 42");
+        let config = parse_config(&yaml).unwrap();
+        let vars = config.pipeline.vars.unwrap();
+        assert_eq!(vars["count"], serde_json::json!(42));
+        let converted = convert_pipeline_vars(&vars);
+        assert!(matches!(converted["count"], clinker_record::Value::Integer(42)));
+    }
+
+    #[test]
+    fn test_vars_float() {
+        let yaml = yaml_with_vars("    rate: 0.05");
+        let config = parse_config(&yaml).unwrap();
+        let vars = config.pipeline.vars.unwrap();
+        let converted = convert_pipeline_vars(&vars);
+        assert!(matches!(converted["rate"], clinker_record::Value::Float(f) if (f - 0.05).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_vars_bool() {
+        let yaml = yaml_with_vars("    active: true");
+        let config = parse_config(&yaml).unwrap();
+        let vars = config.pipeline.vars.unwrap();
+        let converted = convert_pipeline_vars(&vars);
+        assert!(matches!(converted["active"], clinker_record::Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_vars_string() {
+        let yaml = yaml_with_vars("    region: \"US\"");
+        let config = parse_config(&yaml).unwrap();
+        let vars = config.pipeline.vars.unwrap();
+        let converted = convert_pipeline_vars(&vars);
+        match &converted["region"] {
+            clinker_record::Value::String(s) => assert_eq!(&**s, "US"),
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vars_collision_start_time() {
+        let yaml = yaml_with_vars("    start_time: 123");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("reserved pipeline member name"));
+    }
+
+    #[test]
+    fn test_vars_collision_execution_id() {
+        let yaml = yaml_with_vars("    execution_id: \"abc\"");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("reserved pipeline member name"));
+    }
+
+    #[test]
+    fn test_vars_collision_all_reserved() {
+        for name in RESERVED_PIPELINE_NAMES {
+            let yaml = yaml_with_vars(&format!("    {}: 1", name));
+            let err = parse_config(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved pipeline member name"),
+                "Expected reserved name error for '{}', got: {}",
+                name,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_vars_nested_object_error() {
+        let yaml = yaml_with_vars("    nested:\n      a: 1");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("nested objects are not supported"));
+    }
+
+    #[test]
+    fn test_vars_array_error() {
+        let yaml = yaml_with_vars("    list:\n      - 1\n      - 2");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("arrays are not supported"));
+    }
+
+    #[test]
+    fn test_vars_null_value() {
+        let yaml = yaml_with_vars("    empty: null");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("null values are not supported"));
+    }
+
+    #[test]
+    fn test_vars_empty_section() {
+        let yaml = yaml_with_vars("    {}");
+        let config = parse_config(&yaml).unwrap();
+        // Empty map is valid
+        let vars = config.pipeline.vars.unwrap();
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_vars_yaml12_bool_inference() {
+        // serde-saphyr follows YAML 1.1 rules: true/false/yes/no/on/off are all Bool.
+        // Users must quote values like "NO" to get strings.
+        let yaml = yaml_with_vars("    flag: true\n    explicit_no: false");
+        let config = parse_config(&yaml).unwrap();
+        let vars = config.pipeline.vars.unwrap();
+        let converted = convert_pipeline_vars(&vars);
+        assert!(matches!(converted["flag"], clinker_record::Value::Bool(true)));
+        assert!(matches!(converted["explicit_no"], clinker_record::Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_vars_quoted_number_is_string() {
+        let yaml = yaml_with_vars("    version: \"1.0\"\n    count: \"42\"");
+        let config = parse_config(&yaml).unwrap();
+        let vars = config.pipeline.vars.unwrap();
+        let converted = convert_pipeline_vars(&vars);
+        assert!(matches!(&converted["version"], clinker_record::Value::String(s) if &**s == "1.0"));
+        assert!(matches!(&converted["count"], clinker_record::Value::String(s) if &**s == "42"));
     }
 }

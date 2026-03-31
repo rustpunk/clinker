@@ -2,7 +2,7 @@
 mod tests {
     use crate::config;
     use crate::error::PipelineError;
-    use crate::executor::{DlqEntry, PipelineExecutor};
+    use crate::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
 
     /// Helper: run executor with in-memory CSV input/output.
     fn run_pipeline(
@@ -13,8 +13,17 @@ mod tests {
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
 
+        let pipeline_vars = config.pipeline.vars.as_ref()
+            .map(|v| config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+        };
+
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
+            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf, &params)?;
 
         let output = String::from_utf8(output_buf).unwrap();
         Ok((report.counters, report.dlq_entries, output))

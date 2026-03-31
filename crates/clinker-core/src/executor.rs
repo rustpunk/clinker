@@ -22,6 +22,16 @@ use clinker_format::traits::{FormatReader, FormatWriter};
 use cxl::eval::{EvalContext, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
 
+/// Runtime parameters for a pipeline execution (not derived from config YAML).
+pub struct PipelineRunParams {
+    /// UUID v7 execution ID, unique per run.
+    pub execution_id: String,
+    /// Batch ID from --batch-id CLI flag or auto UUID v7.
+    pub batch_id: String,
+    /// Converted pipeline.vars (already validated and converted from serde_json).
+    pub pipeline_vars: IndexMap<String, Value>,
+}
+
 /// Summary returned after a pipeline execution completes (success or partial).
 ///
 /// Replaces the previous `(PipelineCounters, Vec<DlqEntry>)` tuple. Callers
@@ -82,6 +92,7 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         reader: R,
         writer: W,
+        params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
@@ -111,10 +122,10 @@ impl PipelineExecutor {
 
         let (counters, dlq_entries, peak_rss_bytes) = match execution_mode {
             ExecutionMode::Streaming => {
-                Self::execute_streaming(config, csv_reader, writer, &compiled_transforms)?
+                Self::execute_streaming(config, csv_reader, writer, &compiled_transforms, params)?
             }
             ExecutionMode::TwoPass => {
-                Self::execute_two_pass(config, csv_reader, writer, &compiled_transforms, &plan)?
+                Self::execute_two_pass(config, csv_reader, writer, &compiled_transforms, &plan, params)?
             }
         };
 
@@ -136,6 +147,7 @@ impl PipelineExecutor {
         mut csv_reader: CsvReader<R>,
         writer: W,
         transforms: &[CompiledTransform],
+        params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
         let output = &config.outputs[0];
@@ -148,7 +160,7 @@ impl PipelineExecutor {
             None => return Ok((PipelineCounters::default(), Vec::new(), rss_bytes())),
         };
 
-        let ctx = build_eval_context(config, &input.path, 1, pipeline_start_time);
+        let ctx = build_eval_context(config, &input.path, 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
         let first_result = evaluate_record(&first_record, transforms, &ctx);
 
         let schema = csv_reader.schema()?;
@@ -185,7 +197,7 @@ impl PipelineExecutor {
         let mut row_num: u64 = 2;
         while let Some(record) = csv_reader.next_record()? {
             counters.total_count += 1;
-            let ctx = build_eval_context(config, &input.path, row_num, pipeline_start_time);
+            let ctx = build_eval_context(config, &input.path, row_num, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
             match evaluate_record(&record, transforms, &ctx) {
                 Ok(emitted) => {
                     let projected = project_output(&record, &emitted, output);
@@ -213,6 +225,7 @@ impl PipelineExecutor {
         writer: W,
         transforms: &[CompiledTransform],
         plan: &ExecutionPlan,
+        params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
         let output = &config.outputs[0];
@@ -293,7 +306,7 @@ impl PipelineExecutor {
 
         // Evaluate first record to determine output schema (needed before writer init)
         let first_record = build_record_from_arena(0);
-        let first_ctx = build_eval_context(config, &input.path, 1, pipeline_start_time);
+        let first_ctx = build_eval_context(config, &input.path, 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
         let first_emitted = evaluate_record_with_window(
             &first_record, transforms, &first_ctx, plan, &arena, &indices, 0,
         );
@@ -343,7 +356,7 @@ impl PipelineExecutor {
             if use_parallel {
                 pool.install(|| {
                     chunk.par_iter_mut().for_each(|(pos, record, result)| {
-                        let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time);
+                        let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
                         *result = Some(evaluate_record_with_window(
                             record, transforms, &ctx, plan, &arena, &indices, *pos,
                         ));
@@ -351,7 +364,7 @@ impl PipelineExecutor {
                 });
             } else {
                 for (pos, record, result) in chunk.iter_mut() {
-                    let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time);
+                    let ctx = build_eval_context(config, &input.path, *pos as u64 + 1, pipeline_start_time, &params.execution_id, &params.batch_id, &params.pipeline_vars);
                     *result = Some(evaluate_record_with_window(
                         record, transforms, &ctx, plan, &arena, &indices, *pos,
                     ));
@@ -563,16 +576,20 @@ fn build_eval_context(
     source_file: &str,
     source_row: u64,
     pipeline_start_time: chrono::NaiveDateTime,
+    execution_id: &str,
+    batch_id: &str,
+    pipeline_vars: &IndexMap<String, Value>,
 ) -> EvalContext {
     EvalContext {
         clock: Box::new(WallClock),
         pipeline_start_time,
         pipeline_name: config.pipeline.name.clone(),
-        pipeline_execution_id: String::new(),
+        pipeline_execution_id: execution_id.to_string(),
+        pipeline_batch_id: batch_id.to_string(),
         pipeline_counters: PipelineCounters::default(),
         source_file: source_file.into(),
         source_row,
-        pipeline_vars: IndexMap::new(),
+        pipeline_vars: pipeline_vars.clone(),
     }
 }
 
@@ -769,8 +786,17 @@ mod tests {
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
 
+        let pipeline_vars = config.pipeline.vars.as_ref()
+            .map(|v| crate::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+        };
+
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
+            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf, &params)?;
 
         let output = String::from_utf8(output_buf).unwrap();
         Ok((report.counters, report.dlq_entries, output))
@@ -1364,8 +1390,16 @@ transformations:
         });
         let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
         let mut output_buf: Vec<u8> = Vec::new();
+        let pipeline_vars = config.pipeline.vars.as_ref()
+            .map(|v| crate::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+        };
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf)?;
+            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf, &params)?;
         let output = String::from_utf8(output_buf).unwrap();
         Ok((report.counters, report.dlq_entries, output))
     }
