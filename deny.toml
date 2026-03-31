@@ -21,6 +21,7 @@ skip = [
 ]
 
 [licenses]
+confidence-threshold = 0.8
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,4 +34,5 @@ allow = [
 ]
 
 [advisories]
-# cargo-deny v2: advisories are denied by default; use `ignore` to skip specific ones
+yanked = "warn"
+ignore = []
