@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::ast::{Expr, MatchArm, NodeId, Program, Statement};
 use crate::lexer::Span;
 use super::levenshtein::best_match;
@@ -15,6 +17,17 @@ pub enum ResolvedBinding {
     Function,
     /// The `it` binding inside a predicate_expr (window.any/all argument).
     IteratorBinding,
+    /// A qualified module function call: module_path, fn_name.
+    ModuleFunction(Box<str>, Box<str>),
+    /// A qualified module constant access: module_path, const_name.
+    ModuleConstant(Box<str>, Box<str>),
+}
+
+/// Describes what a module exports (functions and constants).
+#[derive(Debug, Clone, Default)]
+pub struct ModuleExports {
+    pub functions: HashSet<String>,
+    pub constants: HashSet<String>,
 }
 
 /// Tracks whether we are resolving inside a predicate_expr (window.any/all argument).
@@ -62,12 +75,24 @@ pub fn resolve_program(
     fields: &[&str],
     node_count: u32,
 ) -> Result<ResolvedProgram, Vec<ResolveDiagnostic>> {
+    resolve_program_with_modules(program, fields, node_count, &HashMap::new())
+}
+
+/// Run Phase B with module awareness: resolve all identifiers in the program.
+pub fn resolve_program_with_modules(
+    program: Program,
+    fields: &[&str],
+    node_count: u32,
+    module_exports: &HashMap<String, ModuleExports>,
+) -> Result<ResolvedProgram, Vec<ResolveDiagnostic>> {
     let mut resolver = Resolver {
         fields,
         let_vars: Vec::new(),
         bindings: vec![None; node_count as usize],
         diagnostics: Vec::new(),
         context: ResolveContext::Primary,
+        module_aliases: HashMap::new(),
+        module_exports,
     };
 
     for stmt in &program.statements {
@@ -91,6 +116,10 @@ struct Resolver<'a> {
     bindings: Vec<Option<ResolvedBinding>>,
     diagnostics: Vec<ResolveDiagnostic>,
     context: ResolveContext,
+    /// Maps alias name → module path key (e.g. "dates" → "shared.date_helpers")
+    module_aliases: HashMap<String, String>,
+    /// Available module exports, keyed by module path
+    module_exports: &'a HashMap<String, ModuleExports>,
 }
 
 impl<'a> Resolver<'a> {
@@ -116,8 +145,13 @@ impl<'a> Resolver<'a> {
                 }
                 self.resolve_expr(message);
             }
-            Statement::UseStmt { .. } => {
-                // Module resolution is Phase 10 scope
+            Statement::UseStmt { path, alias, .. } => {
+                let module_key = path.iter().map(|s| &**s).collect::<Vec<_>>().join(".");
+                // Alias or last segment of path as the local name
+                let local_name = alias.as_ref()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| path.last().map(|s| s.to_string()).unwrap_or_default());
+                self.module_aliases.insert(local_name, module_key);
             }
             Statement::ExprStmt { expr, .. } => {
                 self.resolve_expr(expr);
@@ -131,10 +165,45 @@ impl<'a> Resolver<'a> {
                 self.resolve_field_ref(*node_id, name, *span);
             }
             Expr::QualifiedFieldRef { node_id, parts, span } => {
-                // Qualified field lookup — runtime FieldResolver handles resolution.
-                // 2-part: source.field, 3-part: source.record_type.field
+                // Check if first part is a module alias → module constant access
+                if parts.len() == 2 {
+                    let module_lookup = self.module_aliases.get(&*parts[0]).cloned();
+                    if let Some(module_key) = module_lookup {
+                        let const_name = &*parts[1];
+                        if let Some(exports) = self.module_exports.get(&module_key) {
+                            if exports.constants.contains(const_name) {
+                                self.bind(*node_id, ResolvedBinding::ModuleConstant(
+                                    module_key.clone().into(),
+                                    const_name.into(),
+                                ));
+                                return;
+                            }
+                            // Not a constant — check if it's a function (missing parens)
+                            if exports.functions.contains(const_name) {
+                                self.diagnostics.push(ResolveDiagnostic {
+                                    span: *span,
+                                    message: format!("'{}' is a function in module '{}', not a constant", const_name, parts[0]),
+                                    help: Some(format!("use '{}.{}()' with parentheses to call it", parts[0], const_name)),
+                                });
+                                return;
+                            }
+                            // Suggest similar names
+                            let all_members: Vec<&str> = exports.constants.iter().map(|s| s.as_str())
+                                .chain(exports.functions.iter().map(|s| s.as_str()))
+                                .collect();
+                            let help = best_match(const_name, &all_members, 3)
+                                .map(|s| format!("did you mean '{}'?", s));
+                            self.diagnostics.push(ResolveDiagnostic {
+                                span: *span,
+                                message: format!("module '{}' has no member '{}'", parts[0], const_name),
+                                help,
+                            });
+                            return;
+                        }
+                    }
+                }
+                // Fall through: qualified field lookup — runtime FieldResolver handles resolution.
                 self.bind(*node_id, ResolvedBinding::Field(0));
-                let _ = (parts, span);
             }
             Expr::PipelineAccess { node_id, field, span } => {
                 if PIPELINE_MEMBERS.contains(&&**field) {
@@ -181,7 +250,47 @@ impl<'a> Resolver<'a> {
                     self.resolve_match_arm(arm);
                 }
             }
-            Expr::MethodCall { receiver, args, .. } => {
+            Expr::MethodCall { node_id, receiver, method, args, span } => {
+                // Check if this is a qualified module function call: module.fn(args)
+                if let Expr::FieldRef { name: ref recv_name, .. } = **receiver {
+                    let module_lookup = self.module_aliases.get(&**recv_name).cloned();
+                    if let Some(module_key) = module_lookup {
+                        if let Some(exports) = self.module_exports.get(&module_key) {
+                            if exports.functions.contains(&**method) {
+                                // Resolve args normally
+                                for arg in args {
+                                    self.resolve_expr(arg);
+                                }
+                                self.bind(*node_id, ResolvedBinding::ModuleFunction(
+                                    module_key.into(),
+                                    method.clone(),
+                                ));
+                                return;
+                            }
+                            // Not a function — check if it's a constant
+                            if exports.constants.contains(&**method) {
+                                self.diagnostics.push(ResolveDiagnostic {
+                                    span: *span,
+                                    message: format!("'{}' is a constant in module '{}', not a function", method, recv_name),
+                                    help: Some(format!("use '{}.{}' without parentheses", recv_name, method)),
+                                });
+                                return;
+                            }
+                            let all_members: Vec<&str> = exports.functions.iter().map(|s| s.as_str())
+                                .chain(exports.constants.iter().map(|s| s.as_str()))
+                                .collect();
+                            let help = best_match(&method, &all_members, 3)
+                                .map(|s| format!("did you mean '{}'?", s));
+                            self.diagnostics.push(ResolveDiagnostic {
+                                span: *span,
+                                message: format!("module '{}' has no function '{}'", recv_name, method),
+                                help,
+                            });
+                            return;
+                        }
+                    }
+                }
+                // Normal method call
                 self.resolve_expr(receiver);
                 for arg in args {
                     self.resolve_expr(arg);
@@ -351,5 +460,102 @@ mod tests {
             .collect();
         assert!(field_bindings.contains(&0), "Expected Field(0) for x");
         assert!(field_bindings.contains(&1), "Expected Field(1) for y");
+    }
+
+    // ── Module resolution tests ───────────────────────────────────
+
+    fn make_module_exports(fns: &[&str], consts: &[&str]) -> ModuleExports {
+        ModuleExports {
+            functions: fns.iter().map(|s| s.to_string()).collect(),
+            constants: consts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn resolve_with_modules_ok(src: &str, fields: &[&str], modules: &HashMap<String, ModuleExports>) -> ResolvedProgram {
+        let parsed = Parser::parse(src);
+        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+        resolve_program_with_modules(parsed.ast, fields, parsed.node_count, modules)
+            .unwrap_or_else(|diags| panic!("Resolve errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>()))
+    }
+
+    fn resolve_with_modules_err(src: &str, fields: &[&str], modules: &HashMap<String, ModuleExports>) -> Vec<ResolveDiagnostic> {
+        let parsed = Parser::parse(src);
+        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+        resolve_program_with_modules(parsed.ast, fields, parsed.node_count, modules)
+            .expect_err("Expected resolve errors but got Ok")
+    }
+
+    #[test]
+    fn test_module_qualified_fn_call() {
+        let mut modules = HashMap::new();
+        modules.insert("validators".to_string(), make_module_exports(&["is_valid_email"], &["MAX_SALARY"]));
+
+        let resolved = resolve_with_modules_ok(
+            "use validators\nemit valid = validators.is_valid_email(Email)",
+            &["Email"],
+            &modules,
+        );
+        let has_module_fn = resolved.bindings.iter().any(|b| matches!(b, Some(ResolvedBinding::ModuleFunction(_, _))));
+        assert!(has_module_fn, "Expected ModuleFunction binding");
+    }
+
+    #[test]
+    fn test_module_qualified_constant() {
+        let mut modules = HashMap::new();
+        modules.insert("validators".to_string(), make_module_exports(&["is_valid"], &["MAX_SALARY"]));
+
+        let resolved = resolve_with_modules_ok(
+            "use validators\nemit max = validators.MAX_SALARY",
+            &[],
+            &modules,
+        );
+        let has_module_const = resolved.bindings.iter().any(|b| matches!(b, Some(ResolvedBinding::ModuleConstant(_, _))));
+        assert!(has_module_const, "Expected ModuleConstant binding");
+    }
+
+    #[test]
+    fn test_module_qualified_nonexistent_constant() {
+        // "MAX" has no member "MAZ" — close enough for levenshtein suggestion
+        let mut modules = HashMap::new();
+        modules.insert("validators".to_string(), make_module_exports(&[], &["MAX"]));
+
+        let diags = resolve_with_modules_err(
+            "use validators\nemit val = validators.MAZ",
+            &[],
+            &modules,
+        );
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("has no member 'MAZ'"));
+        assert!(diags[0].help.as_ref().map_or(false, |h| h.contains("MAX")),
+            "Expected suggestion 'MAX', got: {:?}", diags[0].help);
+    }
+
+    #[test]
+    fn test_module_use_alias() {
+        let mut modules = HashMap::new();
+        modules.insert("shared.date_helpers".to_string(), make_module_exports(&["parse_date"], &[]));
+
+        let resolved = resolve_with_modules_ok(
+            "use shared.date_helpers as dates\nemit d = dates.parse_date(raw)",
+            &["raw"],
+            &modules,
+        );
+        let has_module_fn = resolved.bindings.iter().any(|b| matches!(b, Some(ResolvedBinding::ModuleFunction(_, _))));
+        assert!(has_module_fn, "Expected ModuleFunction binding via alias");
+    }
+
+    #[test]
+    fn test_module_fn_name_shadows_builtin() {
+        // Module fn `upper` should resolve to module function, not builtin method
+        let mut modules = HashMap::new();
+        modules.insert("validators".to_string(), make_module_exports(&["upper"], &[]));
+
+        let resolved = resolve_with_modules_ok(
+            "use validators\nemit u = validators.upper(Name)",
+            &["Name"],
+            &modules,
+        );
+        let has_module_fn = resolved.bindings.iter().any(|b| matches!(b, Some(ResolvedBinding::ModuleFunction(_, _))));
+        assert!(has_module_fn, "Expected ModuleFunction binding for shadowed name");
     }
 }

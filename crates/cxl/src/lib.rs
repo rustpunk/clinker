@@ -3,6 +3,7 @@ pub mod ast;
 pub mod builtins;
 pub mod eval;
 pub mod lexer;
+pub mod module_eval;
 pub mod parser;
 pub mod resolve;
 pub mod typecheck;

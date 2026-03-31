@@ -197,10 +197,20 @@ pub struct FnDecl {
     pub span: Span,
 }
 
+/// A parsed CXL module file (only fn declarations and let constants).
 #[derive(Debug, Clone)]
-pub struct ModuleDecl {
-    pub name: Box<str>,
+pub struct Module {
     pub functions: Vec<FnDecl>,
+    pub constants: Vec<ModuleConst>,
+    pub span: Span,
+}
+
+/// A module-level constant binding.
+#[derive(Debug, Clone)]
+pub struct ModuleConst {
+    pub node_id: NodeId,
+    pub name: Box<str>,
+    pub expr: Expr,
     pub span: Span,
 }
 
@@ -242,6 +252,8 @@ static_assertions::assert_impl_all!(Program: Send, Sync);
 static_assertions::assert_impl_all!(Statement: Send, Sync);
 static_assertions::assert_impl_all!(Expr: Send, Sync);
 static_assertions::assert_impl_all!(FnDecl: Send, Sync);
+static_assertions::assert_impl_all!(Module: Send, Sync);
+static_assertions::assert_impl_all!(ModuleConst: Send, Sync);
 static_assertions::assert_impl_all!(MatchArm: Send, Sync);
 static_assertions::assert_impl_all!(NodeId: Send, Sync);
 

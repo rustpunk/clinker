@@ -22,6 +22,14 @@ pub struct ParseError {
     pub how_to_fix: String,
 }
 
+/// Result of parsing a CXL module file (.cxl).
+pub struct ModuleParseResult {
+    pub module: Module,
+    pub errors: Vec<ParseError>,
+    /// Total number of AST nodes created. Useful for pre-sizing side-tables.
+    pub node_count: u32,
+}
+
 /// Hand-rolled Pratt parser for CXL.
 pub struct Parser {
     tokens: Vec<(Token, Span)>,
@@ -97,12 +105,30 @@ impl Parser {
         };
         let start_span = parser.current_span();
         let mut statements = Vec::new();
+        let mut seen_non_use = false;
 
         parser.skip_newlines();
         while !parser.at_eof() {
+            // Check: use must appear before let/emit/trace
+            if *parser.peek() == Token::Use && seen_non_use {
+                parser.errors.push(parser.error(
+                    "use must appear before let/emit/trace",
+                    "All use statements must come at the top of the transform, before any other statements",
+                    "Move this use statement to the top of the file",
+                ));
+                parser.recover_to_newline();
+                parser.skip_newlines();
+                continue;
+            }
             match parser.parse_statement() {
-                Ok(stmt) => statements.push(stmt),
+                Ok(stmt) => {
+                    if !matches!(stmt, Statement::UseStmt { .. }) {
+                        seen_non_use = true;
+                    }
+                    statements.push(stmt);
+                }
                 Err(e) => {
+                    seen_non_use = true;
                     parser.errors.push(e);
                     parser.recover_to_newline();
                 }
@@ -120,6 +146,112 @@ impl Parser {
             errors: parser.errors,
             node_count,
         }
+    }
+
+    /// Parse a .cxl module file. Only `fn` and `let` are accepted.
+    /// `emit`, `trace`, and `use` produce immediate parse errors.
+    pub fn parse_module(source: &str) -> ModuleParseResult {
+        let tokens = Lexer::tokenize(source);
+        let mut parser = Parser {
+            tokens,
+            pos: 0,
+            errors: Vec::new(),
+            depth: 0,
+            next_id: 0,
+        };
+        let start_span = parser.current_span();
+        let mut functions = Vec::new();
+        let mut constants = Vec::new();
+
+        parser.skip_newlines();
+        while !parser.at_eof() {
+            match parser.peek() {
+                Token::Fn => {
+                    match parser.parse_fn_decl() {
+                        Ok(decl) => {
+                            // Validate: no emit or trace in fn body
+                            if let Some(err) = Self::check_module_fn_body(&decl) {
+                                parser.errors.push(err);
+                            } else {
+                                functions.push(decl);
+                            }
+                        }
+                        Err(e) => {
+                            parser.errors.push(e);
+                            parser.recover_to_newline();
+                        }
+                    }
+                }
+                Token::Let => {
+                    match parser.parse_let() {
+                        Ok(Statement::Let { node_id, name, expr, span }) => {
+                            constants.push(ModuleConst { node_id, name, expr, span });
+                        }
+                        Ok(_) => unreachable!(),
+                        Err(e) => {
+                            parser.errors.push(e);
+                            parser.recover_to_newline();
+                        }
+                    }
+                }
+                Token::Emit => {
+                    parser.errors.push(parser.error(
+                        "emit is not allowed in module files",
+                        "Module files can only contain fn declarations and let constants",
+                        "Remove the emit statement — modules are pure",
+                    ));
+                    parser.recover_to_newline();
+                }
+                Token::Trace => {
+                    parser.errors.push(parser.error(
+                        "trace is not allowed in module files",
+                        "Module files can only contain fn declarations and let constants",
+                        "Remove the trace statement — modules are pure",
+                    ));
+                    parser.recover_to_newline();
+                }
+                Token::Use => {
+                    parser.errors.push(parser.error(
+                        "modules cannot import other modules",
+                        "Cross-module imports are not supported in v1",
+                        "Move shared logic to a separate module and import it from the transform",
+                    ));
+                    parser.recover_to_newline();
+                }
+                _ => {
+                    parser.errors.push(parser.error(
+                        &format!("unexpected token {:?} in module file", parser.peek()),
+                        "Module files can only contain fn declarations and let constants",
+                        "Use 'fn name(params) = expr' or 'let NAME = value'",
+                    ));
+                    parser.recover_to_newline();
+                }
+            }
+            parser.skip_newlines();
+        }
+
+        let end_span = parser.current_span();
+        let node_count = parser.next_id;
+        ModuleParseResult {
+            module: Module {
+                functions,
+                constants,
+                span: Span::new(start_span.start as usize, end_span.end as usize),
+            },
+            errors: parser.errors,
+            node_count,
+        }
+    }
+
+    /// Check that a module fn body does not contain emit or trace keywords.
+    /// We walk the expression tree looking for patterns that indicate emit/trace usage.
+    /// Since emit and trace are statements (not expressions), they can't appear in fn bodies
+    /// through normal parsing. But we detect if someone tries to use them as identifiers.
+    fn check_module_fn_body(_decl: &FnDecl) -> Option<ParseError> {
+        // emit and trace are keywords — they can't appear in expression position.
+        // The parser already rejects them as unexpected tokens in parse_expr().
+        // No additional validation needed here since fn body is a single expression.
+        None
     }
 
     /// Allocate the next monotonic NodeId.
@@ -222,8 +354,26 @@ impl Parser {
         self.advance(); // consume 'use'
 
         let mut path = vec![self.expect_ident("module path")?.into_boxed_str()];
-        while *self.peek() == Token::ColonColon {
-            self.advance(); // consume '::'
+
+        // Reject :: separator with helpful migration message
+        if *self.peek() == Token::ColonColon {
+            return Err(self.error(
+                "use paths use '.' separator, not '::'",
+                "CXL module paths use dot notation like 'use shared.dates'",
+                "Replace '::' with '.' — e.g. 'use shared.dates'",
+            ));
+        }
+
+        while *self.peek() == Token::Dot {
+            self.advance(); // consume '.'
+            // Reject wildcard imports: use mod.*
+            if *self.peek() == Token::Star {
+                return Err(self.error(
+                    "wildcard imports not supported in v1",
+                    "CXL does not support 'use module.*' — import the module and use qualified access",
+                    "Remove the '.*' and use qualified access like 'module.function()'",
+                ));
+            }
             path.push(self.expect_ident("module path segment")?.into_boxed_str());
         }
 
@@ -1122,10 +1272,12 @@ mod tests {
 
     #[test]
     fn test_parse_use_simple() {
-        let r = parse_ok("use shared::dates");
+        let r = parse_ok("use shared.dates");
         match first_stmt(&r) {
             Statement::UseStmt { path, alias, .. } => {
                 assert_eq!(path.len(), 2);
+                assert_eq!(&*path[0], "shared");
+                assert_eq!(&*path[1], "dates");
                 assert!(alias.is_none());
             }
             _ => panic!("expected UseStmt"),
@@ -1134,7 +1286,7 @@ mod tests {
 
     #[test]
     fn test_parse_use_with_alias() {
-        let r = parse_ok("use shared::dates as d");
+        let r = parse_ok("use shared.dates as d");
         match first_stmt(&r) {
             Statement::UseStmt { alias, .. } => {
                 assert_eq!(alias.as_deref(), Some("d"));
@@ -1231,5 +1383,205 @@ mod tests {
         // All NodeIds should be unique (monotonically increasing)
         // We can verify by checking node_count covers all allocated IDs
         assert!(r.node_count >= 4); // 2 let stmts + 2 literals minimum
+    }
+
+    // ── Module parsing tests ──────────────────────────────────────
+
+    fn parse_module_ok(src: &str) -> ModuleParseResult {
+        let result = Parser::parse_module(src);
+        assert!(
+            result.errors.is_empty(),
+            "Expected no errors for '{}', got: {:?}",
+            src,
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        result
+    }
+
+    #[test]
+    fn test_module_parse_fn_declaration() {
+        let r = parse_module_ok("fn is_valid(x) = x > 0");
+        assert_eq!(r.module.functions.len(), 1);
+        let f = &r.module.functions[0];
+        assert_eq!(&*f.name, "is_valid");
+        assert_eq!(f.params.len(), 1);
+        assert_eq!(&*f.params[0], "x");
+        assert!(matches!(*f.body, Expr::Binary { op: BinOp::Gt, .. }));
+    }
+
+    #[test]
+    fn test_module_parse_let_constant() {
+        let r = parse_module_ok("let MAX = 100");
+        assert_eq!(r.module.constants.len(), 1);
+        assert_eq!(&*r.module.constants[0].name, "MAX");
+        assert!(matches!(r.module.constants[0].expr, Expr::Literal { value: LiteralValue::Int(100), .. }));
+    }
+
+    #[test]
+    fn test_module_reject_emit_in_fn() {
+        // emit is a keyword, so "fn bad() = emit" will fail at expression parse level
+        let result = Parser::parse_module("fn bad() = emit");
+        assert!(!result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_module_reject_trace_in_fn() {
+        // trace is a keyword/statement, can't appear in expression position
+        let result = Parser::parse_module("fn bad() = trace");
+        assert!(!result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_module_reject_cross_import() {
+        let result = Parser::parse_module("use other");
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].message.contains("modules cannot import other modules"));
+    }
+
+    #[test]
+    fn test_module_empty_file() {
+        let r = parse_module_ok("");
+        assert!(r.module.functions.is_empty());
+        assert!(r.module.constants.is_empty());
+    }
+
+    #[test]
+    fn test_module_constants_only() {
+        let r = parse_module_ok("let A = 1\nlet B = 2");
+        assert!(r.module.functions.is_empty());
+        assert_eq!(r.module.constants.len(), 2);
+        assert_eq!(&*r.module.constants[0].name, "A");
+        assert_eq!(&*r.module.constants[1].name, "B");
+    }
+
+    #[test]
+    fn test_module_functions_only() {
+        let r = parse_module_ok("fn add(a, b) = a + b");
+        assert!(r.module.constants.is_empty());
+        assert_eq!(r.module.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_module_fn_no_params() {
+        let r = parse_module_ok("fn pi() = 3.14159");
+        assert_eq!(r.module.functions[0].params.len(), 0);
+        assert!(matches!(*r.module.functions[0].body, Expr::Literal { value: LiteralValue::Float(_), .. }));
+    }
+
+    #[test]
+    fn test_module_fn_method_chain_body() {
+        let r = parse_module_ok("fn clean(val) = val.trim().upper()");
+        assert_eq!(r.module.functions.len(), 1);
+        assert!(matches!(*r.module.functions[0].body, Expr::MethodCall { .. }));
+    }
+
+    #[test]
+    fn test_module_fn_conditional_body() {
+        let r = parse_module_ok("fn clamp(val, lo, hi) = if val < lo then lo else if val > hi then hi else val");
+        assert_eq!(r.module.functions.len(), 1);
+        assert!(matches!(*r.module.functions[0].body, Expr::IfThenElse { .. }));
+    }
+
+    #[test]
+    fn test_module_fn_match_body() {
+        let r = parse_module_ok("fn tier(score) = match { score >= 90 => \"A\", score >= 80 => \"B\", _ => \"C\" }");
+        assert_eq!(r.module.functions.len(), 1);
+        assert!(matches!(*r.module.functions[0].body, Expr::Match { .. }));
+    }
+
+    #[test]
+    fn test_module_with_comments() {
+        let r = parse_module_ok("# Utility functions\nfn add(a, b) = a + b\n# Constants\nlet MAX = 100");
+        assert_eq!(r.module.functions.len(), 1);
+        assert_eq!(r.module.constants.len(), 1);
+    }
+
+    #[test]
+    fn test_module_reject_wildcard_import() {
+        let result = Parser::parse("use validators.*");
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].message.contains("wildcard imports not supported"));
+    }
+
+    #[test]
+    fn test_module_use_colons_rejected() {
+        let result = Parser::parse("use validators::helpers");
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].message.contains("use paths use '.' separator, not '::'"));
+    }
+
+    #[test]
+    fn test_module_use_path_resolution() {
+        // Parse a use statement with dot separator
+        let r = parse_ok("use validators");
+        match first_stmt(&r) {
+            Statement::UseStmt { path, .. } => {
+                assert_eq!(path.len(), 1);
+                assert_eq!(&*path[0], "validators");
+            }
+            _ => panic!("expected UseStmt"),
+        }
+    }
+
+    #[test]
+    fn test_module_use_nested_path() {
+        let r = parse_ok("use reporting.fiscal");
+        match first_stmt(&r) {
+            Statement::UseStmt { path, .. } => {
+                assert_eq!(path.len(), 2);
+                assert_eq!(&*path[0], "reporting");
+                assert_eq!(&*path[1], "fiscal");
+            }
+            _ => panic!("expected UseStmt"),
+        }
+    }
+
+    #[test]
+    fn test_module_deep_nested_path() {
+        let r = parse_ok("use shared.utils.string_helpers");
+        match first_stmt(&r) {
+            Statement::UseStmt { path, .. } => {
+                assert_eq!(path.len(), 3);
+                assert_eq!(&*path[0], "shared");
+                assert_eq!(&*path[1], "utils");
+                assert_eq!(&*path[2], "string_helpers");
+            }
+            _ => panic!("expected UseStmt"),
+        }
+    }
+
+    #[test]
+    fn test_module_use_alias() {
+        let r = parse_ok("use shared.date_helpers as dates");
+        match first_stmt(&r) {
+            Statement::UseStmt { path, alias, .. } => {
+                assert_eq!(path.len(), 2);
+                assert_eq!(&*path[0], "shared");
+                assert_eq!(&*path[1], "date_helpers");
+                assert_eq!(alias.as_deref(), Some("dates"));
+            }
+            _ => panic!("expected UseStmt"),
+        }
+    }
+
+    #[test]
+    fn test_module_const_duplicate_name() {
+        // Parsing succeeds — duplicate detection happens in module_eval toposort
+        let r = parse_module_ok("let X = 1\nlet X = 2");
+        assert_eq!(r.module.constants.len(), 2);
+    }
+
+    #[test]
+    fn test_module_fn_duplicate_name() {
+        // Parsing succeeds — duplicate detection happens in module registry
+        let r = parse_module_ok("fn f(x) = x\nfn f(y) = y + 1");
+        assert_eq!(r.module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_module_use_after_let_error() {
+        let result = Parser::parse("let x = 1\nuse validators");
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].message.contains("use must appear before let/emit/trace"));
     }
 }

@@ -643,14 +643,14 @@ mod tests {
 
     #[test]
     fn test_lex_module_path() {
-        let tokens = Lexer::tokenize("use shared::dates as d");
+        let tokens = Lexer::tokenize("use shared.dates as d");
         let kinds: Vec<_> = tokens.iter().map(|(t, _)| t.clone()).collect();
         assert_eq!(
             kinds,
             vec![
                 Token::Use,
                 Token::Ident("shared".into()),
-                Token::ColonColon,
+                Token::Dot,
                 Token::Ident("dates".into()),
                 Token::As,
                 Token::Ident("d".into()),

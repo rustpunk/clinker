@@ -260,6 +260,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "clinker-channel",
  "clinker-core",
  "clinker-format",
  "miette",
@@ -274,6 +275,7 @@ name = "clinker-channel"
 version = "0.1.0"
 dependencies = [
  "clinker-core",
+ "clinker-record",
  "indexmap",
  "serde",
  "serde-saphyr",

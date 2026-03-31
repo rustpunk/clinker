@@ -5,4 +5,4 @@ pub mod levenshtein;
 
 pub use traits::{FieldResolver, WindowContext};
 pub use test_double::HashMapResolver;
-pub use pass::{ResolvedBinding, ResolvedProgram, ResolveDiagnostic, resolve_program};
+pub use pass::{ModuleExports, ResolvedBinding, ResolvedProgram, ResolveDiagnostic, resolve_program, resolve_program_with_modules};
