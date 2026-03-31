@@ -199,6 +199,38 @@ impl fmt::Display for CompactCellValue<'_> {
     }
 }
 
+// ── Stage data structs ────────────────────────────────────
+
+/// A row that was filtered/dropped by a pipeline stage, with the reason.
+/// Follows the DlqEntry pattern from clinker_core::executor.
+#[derive(Clone, Debug)]
+pub struct DroppedRow {
+    pub cells: Vec<CellValue>,
+    pub reason: String,
+}
+
+/// Cached debug data for a single pipeline stage.
+/// Keyed by stage label in DebugState.stage_cache.
+/// Clone-on-read semantics — not shared.
+#[derive(Clone, Debug)]
+pub struct StageDebugData {
+    pub columns: Vec<String>,
+    pub input_rows: Vec<Vec<CellValue>>,
+    pub output_rows: Vec<Vec<CellValue>>,
+    pub dropped_rows: Vec<DroppedRow>,
+    pub added_columns: Vec<String>,
+    pub mutated_columns: Vec<String>,
+    pub stats: StagePerfStats,
+}
+
+/// A user-defined watch expression evaluated at each stage boundary.
+/// values[i] corresponds to stage i; None = not yet reached.
+#[derive(Clone, Debug)]
+pub struct WatchExpression {
+    pub expr: String,
+    pub values: Vec<Option<f64>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +535,135 @@ mod tests {
         assert_eq!(cloned.rows_out, 95);
         assert_eq!(cloned.elapsed_ms, 12);
         assert_eq!(cloned.mem, "1.2 MB");
+    }
+
+    // ── DroppedRow ─────────────────────────────────────────────
+
+    #[test]
+    fn test_dropped_row_preserves_reason() {
+        let row = DroppedRow {
+            cells: vec![CellValue::Int(1), CellValue::Str("Alice".into())],
+            reason: "filter: status != active".into(),
+        };
+        assert_eq!(row.cells.len(), 2);
+        assert_eq!(row.reason, "filter: status != active");
+        assert!(
+            row.cells
+                .iter()
+                .all(|c| !matches!(c, CellValue::Str(s) if s.contains("filter")))
+        );
+    }
+
+    #[test]
+    fn test_dropped_row_empty_cells() {
+        let row = DroppedRow {
+            cells: vec![],
+            reason: "parse error: invalid CSV".into(),
+        };
+        assert!(row.cells.is_empty());
+        assert!(!row.reason.is_empty());
+    }
+
+    // ── StageDebugData ─────────────────────────────────────────
+
+    #[test]
+    fn test_stage_debug_data_clone() {
+        let data = StageDebugData {
+            columns: vec!["id".into(), "name".into()],
+            input_rows: vec![vec![CellValue::Int(1), CellValue::Str("Alice".into())]],
+            output_rows: vec![vec![CellValue::Int(1), CellValue::Str("ALICE".into())]],
+            dropped_rows: vec![DroppedRow {
+                cells: vec![CellValue::Int(2), CellValue::Str("Bob".into())],
+                reason: "filter: status != active".into(),
+            }],
+            added_columns: vec![],
+            mutated_columns: vec!["name".into()],
+            stats: StagePerfStats {
+                rows_in: 2,
+                rows_out: 1,
+                elapsed_ms: 12,
+                mem: "1.2 MB".into(),
+            },
+        };
+        let cloned = data.clone();
+        assert_eq!(cloned.columns, data.columns);
+        assert_eq!(cloned.input_rows.len(), 1);
+        assert_eq!(cloned.output_rows.len(), 1);
+        assert_eq!(cloned.dropped_rows.len(), 1);
+        assert_eq!(cloned.dropped_rows[0].reason, "filter: status != active");
+        assert_eq!(cloned.mutated_columns, vec!["name"]);
+        assert_eq!(cloned.stats.rows_in, 2);
+    }
+
+    #[test]
+    fn test_stage_debug_data_empty() {
+        let data = StageDebugData {
+            columns: vec![],
+            input_rows: vec![],
+            output_rows: vec![],
+            dropped_rows: vec![],
+            added_columns: vec![],
+            mutated_columns: vec![],
+            stats: StagePerfStats {
+                rows_in: 0,
+                rows_out: 0,
+                elapsed_ms: 0,
+                mem: "0 B".into(),
+            },
+        };
+        assert!(data.columns.is_empty());
+        assert!(data.dropped_rows.is_empty());
+    }
+
+    #[test]
+    fn test_stage_debug_data_dropped_rows_typed() {
+        let data = StageDebugData {
+            columns: vec!["x".into()],
+            input_rows: vec![],
+            output_rows: vec![],
+            dropped_rows: vec![
+                DroppedRow {
+                    cells: vec![CellValue::Int(1)],
+                    reason: "reason A".into(),
+                },
+                DroppedRow {
+                    cells: vec![CellValue::Int(2)],
+                    reason: "reason B".into(),
+                },
+            ],
+            added_columns: vec![],
+            mutated_columns: vec![],
+            stats: StagePerfStats {
+                rows_in: 2,
+                rows_out: 0,
+                elapsed_ms: 5,
+                mem: "0.1 MB".into(),
+            },
+        };
+        assert_eq!(data.dropped_rows[0].reason, "reason A");
+        assert_eq!(data.dropped_rows[1].reason, "reason B");
+    }
+
+    // ── WatchExpression ────────────────────────────────────────
+
+    #[test]
+    fn test_watch_expression_none_values() {
+        let watch = WatchExpression {
+            expr: "count(*)".into(),
+            values: vec![None, None, None],
+        };
+        assert_eq!(watch.values.len(), 3);
+        assert!(watch.values.iter().all(|v| v.is_none()));
+    }
+
+    #[test]
+    fn test_watch_expression_mixed_values() {
+        let watch = WatchExpression {
+            expr: "sum(amount)".into(),
+            values: vec![Some(100.0), Some(250.0), None, None],
+        };
+        assert_eq!(watch.values[0], Some(100.0));
+        assert_eq!(watch.values[1], Some(250.0));
+        assert_eq!(watch.values[2], None);
     }
 }
