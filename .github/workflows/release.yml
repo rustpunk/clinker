@@ -74,12 +74,16 @@ jobs:
           done
 
           # Kiln from dx build output
-          dx_out="crates/clinker-kiln/target/dx/clinker-kiln/release/bundle"
-          if [ -d "$dx_out" ]; then
-            archive="clinker-kiln-${tag}-${target}.tar.gz"
-            tar czf "${staging}/${archive}" -C "$dx_out" .
-            echo "Packaged ${archive}"
-          fi
+          # Linux: target/dx/clinker-kiln/release/linux/app
+          # macOS: target/dx/clinker-kiln/release/macos/ClinkerKiln.app
+          for dx_out in target/dx/clinker-kiln/release/linux/app target/dx/clinker-kiln/release/macos; do
+            if [ -d "$dx_out" ]; then
+              archive="clinker-kiln-${tag}-${target}.tar.gz"
+              tar czf "${staging}/${archive}" -C "$dx_out" .
+              echo "Packaged ${archive}"
+              break
+            fi
+          done
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
@@ -99,8 +103,8 @@ jobs:
             }
           }
 
-          # Kiln from dx build output
-          $dxOut = "crates\clinker-kiln\target\dx\clinker-kiln\release\bundle"
+          # Kiln from dx build output: target\dx\clinker-kiln\release\windows\app
+          $dxOut = "target\dx\clinker-kiln\release\windows\app"
           if (Test-Path $dxOut) {
             $archive = "artifacts\clinker-kiln-${tag}-${target}.zip"
             Compress-Archive -Path "$dxOut\*" -DestinationPath $archive
