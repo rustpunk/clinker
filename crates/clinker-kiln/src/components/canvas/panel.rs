@@ -4,7 +4,7 @@ use std::rc::Rc;
 use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
-use crate::pipeline_view::{derive_pipeline_view, derive_partial_pipeline_view, derive_composition_drill_view};
+use crate::pipeline_view::{derive_pipeline_view, derive_partial_pipeline_view, derive_composition_drill_view, NODE_WIDTH, NODE_HEIGHT};
 use crate::state::use_app_state;
 
 use super::breadcrumb::BreadcrumbBar;
@@ -68,6 +68,7 @@ pub fn CanvasPanel() -> Element {
             None => crate::pipeline_view::PipelineView {
                 stages: Vec::new(),
                 composition_groups: Vec::new(),
+                connections: Vec::new(),
             },
         }
     } else {
@@ -79,13 +80,18 @@ pub fn CanvasPanel() -> Element {
                 None => crate::pipeline_view::PipelineView {
                     stages: Vec::new(),
                     composition_groups: Vec::new(),
+                    connections: Vec::new(),
                 },
             },
         }
     };
+    let connections: Vec<_> = pipeline_view
+        .connections
+        .iter()
+        .map(|&(from, to)| (pipeline_view.stages[from].clone(), pipeline_view.stages[to].clone()))
+        .collect();
     let stages = pipeline_view.stages;
     let composition_groups = pipeline_view.composition_groups;
-    let connections: Vec<_> = stages.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
 
     // ── Transform state (local — only the canvas needs these) ────────────────
     let mut pan_x = use_signal(|| 0.0_f32);
@@ -186,9 +192,17 @@ pub fn CanvasPanel() -> Element {
         zoom.set(new_z);
     };
 
-    // SVG overlay bounds — large enough to cover the world space used by demo nodes.
-    let svg_w = 1200.0_f32;
-    let svg_h = 400.0_f32;
+    // SVG overlay bounds — computed from stage bounding box with padding.
+    let (svg_w, svg_h) = if stages.is_empty() {
+        (1200.0_f32, 400.0_f32)
+    } else {
+        let max_x = stages.iter().map(|s| s.canvas_x + NODE_WIDTH).fold(0.0_f32, f32::max);
+        let max_y = stages.iter().map(|s| s.canvas_y + NODE_HEIGHT).fold(0.0_f32, f32::max);
+        let min_y = stages.iter().map(|s| s.canvas_y).fold(f32::MAX, f32::min);
+        // Ensure SVG covers negative-Y nodes (secondary inputs above the chain).
+        let _ = min_y; // min_y handled by SVG viewBox if needed; overflow:visible covers it.
+        (max_x + 80.0, max_y + 80.0)
+    };
 
     rsx! {
         div {
