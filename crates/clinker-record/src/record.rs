@@ -143,6 +143,12 @@ impl FieldResolver for Record {
     fn available_fields(&self) -> Vec<&str> {
         self.schema().columns().iter().map(|c| &**c).collect()
     }
+
+    fn iter_fields(&self) -> Vec<(String, Value)> {
+        self.iter_all_fields()
+            .map(|(name, val)| (name.to_string(), val.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

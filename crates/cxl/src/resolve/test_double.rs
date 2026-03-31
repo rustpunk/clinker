@@ -41,6 +41,13 @@ impl FieldResolver for HashMapResolver {
     fn available_fields(&self) -> Vec<&str> {
         self.fields.keys().map(|s| s.as_str()).collect()
     }
+
+    fn iter_fields(&self) -> Vec<(String, clinker_record::Value)> {
+        self.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

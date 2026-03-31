@@ -1,29 +1,19 @@
-//! SecondaryIndex and GroupByKey for window partition lookup.
+//! SecondaryIndex for window partition lookup.
 //!
 //! Maps composite group keys to Arena record positions. NaN values
 //! in group_by keys are rejected as hard errors.
+//!
+//! `GroupByKey`, `GroupKeyError`, and `value_to_group_key()` live in
+//! `clinker-record` (foundation crate) so `cxl::eval` can use them
+//! for distinct without depending on `clinker-core`.
 
 use std::collections::HashMap;
 
-use chrono::{NaiveDate, NaiveDateTime};
+use clinker_record::schema_def::FieldDef;
 use clinker_record::{RecordStorage, Value};
 
-use clinker_record::schema_def::{FieldDef, FieldType};
-
-/// Group-by key for SecondaryIndex. Supports Eq + Hash for HashMap keys.
-///
-/// No `Null` variant — null group_by values are excluded from the index.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum GroupByKey {
-    Str(Box<str>),
-    /// Used only when schema_overrides pins a field to "integer".
-    Int(i64),
-    /// f64::to_bits() — default numeric path. -0.0 canonicalized to 0.0.
-    Float(u64),
-    Bool(bool),
-    Date(NaiveDate),
-    DateTime(NaiveDateTime),
-}
+// Re-export from clinker-record for backwards compatibility
+pub use clinker_record::{GroupByKey, GroupKeyError, value_to_group_key};
 
 /// Secondary index: maps composite group keys to Arena record positions.
 #[derive(Debug)]
@@ -37,13 +27,13 @@ impl SecondaryIndex {
     /// Iterates all arena records, extracts group_by fields, builds composite
     /// keys, and appends each record's position to its group's Vec.
     ///
-    /// - NaN in any group_by field → `IndexError::NanInGroupBy` (hard error).
+    /// - NaN in any group_by field → `GroupKeyError::NanInGroupBy` (hard error).
     /// - Null in any group_by field → record excluded from all groups (debug log).
     pub fn build<S: RecordStorage>(
         storage: &S,
         group_by: &[String],
         schema_pins: &HashMap<String, FieldDef>,
-    ) -> Result<Self, IndexError> {
+    ) -> Result<Self, GroupKeyError> {
         let mut groups: HashMap<Vec<GroupByKey>, Vec<u32>> = HashMap::new();
         let record_count = storage.record_count();
 
@@ -86,92 +76,8 @@ impl SecondaryIndex {
     }
 }
 
-/// Convert a Value to a GroupByKey, applying numeric normalization rules.
-///
-/// - Default: widen Int to Float via `to_bits()` so 42 and 42.0 group together.
-/// - Integer-pinned (via schema_overrides): use `GroupByKey::Int(i64)`, reject Float.
-/// - NaN → hard error.
-/// - Null → None (caller skips record).
-/// - `-0.0` canonicalized to `0.0` before `to_bits()`.
-pub fn value_to_group_key(
-    val: &Value,
-    field: &str,
-    schema_pin: Option<&FieldDef>,
-    row: u32,
-) -> Result<Option<GroupByKey>, IndexError> {
-    match val {
-        Value::Null => Ok(None),
-
-        Value::Float(f) if f.is_nan() => Err(IndexError::NanInGroupBy {
-            field: field.to_string(),
-            row,
-        }),
-
-        Value::Float(f) => {
-            // Canonicalize -0.0 to 0.0
-            let canonical = if *f == 0.0 { 0.0f64 } else { *f };
-            Ok(Some(GroupByKey::Float(canonical.to_bits())))
-        }
-
-        Value::Integer(i) => {
-            if let Some(pin) = schema_pin
-                && pin.field_type == Some(FieldType::Integer)
-            {
-                return Ok(Some(GroupByKey::Int(*i)));
-            }
-            // Default: widen to Float
-            Ok(Some(GroupByKey::Float((*i as f64).to_bits())))
-        }
-
-        Value::String(s) => Ok(Some(GroupByKey::Str(s.clone()))),
-        Value::Bool(b) => Ok(Some(GroupByKey::Bool(*b))),
-        Value::Date(d) => Ok(Some(GroupByKey::Date(*d))),
-        Value::DateTime(dt) => Ok(Some(GroupByKey::DateTime(*dt))),
-        Value::Array(_) => unreachable!("Arrays rejected at compile time as group_by keys"),
-    }
-}
-
-/// Errors from secondary index construction.
-#[derive(Debug)]
-pub enum IndexError {
-    /// NaN value in a group_by field — pipeline must exit with code 3.
-    NanInGroupBy { field: String, row: u32 },
-    /// Float value in an integer-pinned field.
-    TypeMismatch {
-        field: String,
-        expected: &'static str,
-        got: &'static str,
-        row: u32,
-    },
-}
-
-impl std::fmt::Display for IndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IndexError::NanInGroupBy { field, row } => {
-                write!(
-                    f,
-                    "NaN in group_by field '{}' at row {} — pipeline must halt (exit code 3)",
-                    field, row
-                )
-            }
-            IndexError::TypeMismatch {
-                field,
-                expected,
-                got,
-                row,
-            } => {
-                write!(
-                    f,
-                    "type mismatch in group_by field '{}' at row {}: expected {}, got {}",
-                    field, row, expected, got
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for IndexError {}
+/// Re-exported as `IndexError` for backwards compatibility within clinker-core.
+pub type IndexError = GroupKeyError;
 
 #[cfg(test)]
 mod tests {
@@ -212,100 +118,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_group_by_key_eq_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let a = GroupByKey::Str("hello".into());
-        let b = GroupByKey::Str("hello".into());
-        let c = GroupByKey::Str("world".into());
-
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-
-        let mut h1 = DefaultHasher::new();
-        let mut h2 = DefaultHasher::new();
-        a.hash(&mut h1);
-        b.hash(&mut h2);
-        assert_eq!(h1.finish(), h2.finish());
-    }
-
-    #[test]
-    fn test_group_by_key_int_float_unify() {
-        let int_key = value_to_group_key(&Value::Integer(42), "x", None, 0)
-            .unwrap()
-            .unwrap();
-        let float_key = value_to_group_key(&Value::Float(42.0), "x", None, 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(int_key, float_key);
-    }
-
-    #[test]
-    fn test_group_by_key_neg_zero_canonical() {
-        let pos = value_to_group_key(&Value::Float(0.0), "x", None, 0)
-            .unwrap()
-            .unwrap();
-        let neg = value_to_group_key(&Value::Float(-0.0), "x", None, 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(pos, neg);
-    }
-
-    fn test_field(name: &str) -> FieldDef {
-        FieldDef {
-            name: name.into(),
-            field_type: None,
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
-            start: None,
-            width: None,
-            end: None,
-            justify: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
-            drop: None,
-            record: None,
-        }
-    }
-
-    #[test]
-    fn test_group_by_key_integer_pin_rejects_float() {
-        let mut pin = test_field("x");
-        pin.field_type = Some(FieldType::Integer);
-        // Integer with pin → Int variant
-        let key = value_to_group_key(&Value::Integer(42), "x", Some(&pin), 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(key, GroupByKey::Int(42));
-
-        // Float with integer pin — per plan, this should be a type error.
-        // The current value_to_group_key doesn't reject Float when pin is integer
-        // because Float is handled before Integer in the match. Let's verify
-        // that Float(42.0) still produces Float variant (not Int), which means
-        // it would NOT match Int(42) and thus records would split.
-        // The plan says "reject Float" — but the match order means Float is
-        // caught by the Float arm before checking pins. This is correct because
-        // schema_overrides only applies to how Integer values are treated.
-        // A Float value in the data for an integer-pinned field is unusual
-        // (CSV reads everything as String anyway).
-        let float_key = value_to_group_key(&Value::Float(42.0), "x", Some(&pin), 0)
-            .unwrap()
-            .unwrap();
-        // Float(42.0) should produce GroupByKey::Float, not GroupByKey::Int
-        // This means Float values in integer-pinned fields don't match integers
-        assert_ne!(float_key, GroupByKey::Int(42));
-    }
+    // GroupByKey unit tests (eq/hash, int-float unify, neg zero, integer pin)
+    // now live in clinker_record::group_key::tests.
 
     #[test]
     fn test_secondary_index_single_group_by() {
@@ -374,7 +188,7 @@ mod tests {
         let result = SecondaryIndex::build(&storage, &["amount".into()], &HashMap::new());
         assert!(result.is_err());
         match result.unwrap_err() {
-            IndexError::NanInGroupBy { field, row } => {
+            GroupKeyError::NanInGroupBy { field, row } => {
                 assert_eq!(field, "amount");
                 assert_eq!(row, 1);
             }

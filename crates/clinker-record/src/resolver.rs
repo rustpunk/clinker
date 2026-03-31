@@ -18,6 +18,10 @@ pub trait FieldResolver {
     /// All available field names. Used for fuzzy-match diagnostics in Phase B.
     /// Lifetime tied to `&self` — zero-copy borrows from internal storage.
     fn available_fields(&self) -> Vec<&str>;
+
+    /// All fields as owned (name, value) pairs. Used for bare `distinct` (all-fields hash).
+    /// Returns owned Values to avoid lifetime entanglement through the evaluator.
+    fn iter_fields(&self) -> Vec<(String, Value)>;
 }
 
 /// Access window partition data (Arena + Secondary Index).

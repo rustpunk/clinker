@@ -494,6 +494,9 @@ mod tests {
             fn available_fields(&self) -> Vec<&str> {
                 vec![]
             }
+            fn iter_fields(&self) -> Vec<(String, Value)> {
+                vec![]
+            }
         }
 
         let source = "emit x = benefits.EEID.employee_id";

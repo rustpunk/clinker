@@ -19,7 +19,7 @@ use crate::projection::project_output;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
 use clinker_format::traits::{FormatReader, FormatWriter};
-use cxl::eval::{EvalContext, WallClock};
+use cxl::eval::{EvalContext, EvalResult, SkipReason, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
@@ -168,66 +168,94 @@ impl PipelineExecutor {
         let writer_config = build_writer_config(output);
         let pipeline_start_time = chrono::Local::now().naive_local();
 
-        let first_record = csv_reader.next_record()?;
-        let first_record = match first_record {
-            Some(r) => r,
-            None => return Ok((PipelineCounters::default(), Vec::new(), rss_bytes())),
-        };
-
-        let ctx = build_eval_context(
-            config,
-            &input.path,
-            1,
-            pipeline_start_time,
-            &params.execution_id,
-            &params.batch_id,
-            &params.pipeline_vars,
-        );
-        let first_result = evaluate_record(&first_record, transforms, &ctx);
-
-        let schema = csv_reader.schema()?;
-        let (output_schema, first_projected) = match &first_result {
-            Ok(emitted) => {
-                let projected = project_output(&first_record, emitted, output);
-                let schema = Arc::clone(projected.schema());
-                (schema, Some(projected))
-            }
-            Err(_) => {
-                if config.error_handling.strategy == ErrorStrategy::FailFast {
-                    return Err(first_result.unwrap_err().into());
-                }
-                (schema, None)
-            }
-        };
-
-        let mut csv_writer = CsvWriter::new(writer, Arc::clone(&output_schema), writer_config);
         let mut counters = PipelineCounters::default();
         let mut dlq_entries = Vec::new();
         let strategy = config.error_handling.strategy;
 
-        counters.total_count += 1;
-        match first_result {
-            Ok(_) => {
-                csv_writer.write_record(&first_projected.unwrap())?;
-                counters.ok_count += 1;
-            }
-            Err(eval_err) => {
-                handle_error(
-                    strategy,
-                    &first_record,
-                    1,
-                    &eval_err,
-                    &mut counters,
-                    &mut dlq_entries,
-                    output,
-                    &output_schema,
-                    &mut csv_writer,
-                )?;
+        // Scan forward until a record emits, to derive the output schema.
+        // Records that skip or error before the first emit are counted but
+        // buffered — they can't be written yet because we don't know the
+        // output schema until the first Emit.
+        let schema = csv_reader.schema()?;
+        let mut row_num: u64 = 0;
+        let mut first_projected = None;
+        let mut pending_skips_and_errors: Vec<(
+            u64,
+            Record,
+            Result<EvalResult, cxl::eval::EvalError>,
+        )> = Vec::new();
+
+        while let Some(record) = csv_reader.next_record()? {
+            row_num += 1;
+            counters.total_count += 1;
+            let ctx = build_eval_context(
+                config,
+                &input.path,
+                row_num,
+                pipeline_start_time,
+                &params.execution_id,
+                &params.batch_id,
+                &params.pipeline_vars,
+            );
+            let result = evaluate_record(&record, transforms, &ctx);
+            match &result {
+                Ok(EvalResult::Emit(emitted)) => {
+                    let projected = project_output(&record, emitted, output);
+                    first_projected = Some(projected);
+                    // Count this record
+                    counters.ok_count += 1;
+                    // Process any pending skips/errors that came before
+                    break;
+                }
+                Ok(EvalResult::Skip(_)) | Err(_) => {
+                    pending_skips_and_errors.push((row_num, record, result));
+                }
             }
         }
 
-        let mut row_num: u64 = 2;
+        let output_schema = if let Some(ref proj) = first_projected {
+            Arc::clone(proj.schema())
+        } else {
+            // All records were filtered/errored, or file was empty — use input schema
+            schema
+        };
+
+        let mut csv_writer = CsvWriter::new(writer, Arc::clone(&output_schema), writer_config);
+
+        // Process pending skips and errors from the scan-forward phase
+        for (rn, record, result) in pending_skips_and_errors {
+            match result {
+                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                    counters.filtered_count += 1;
+                }
+                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                    counters.distinct_count += 1;
+                }
+                Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
+                Err(eval_err) => {
+                    handle_error(
+                        strategy,
+                        &record,
+                        rn,
+                        &eval_err,
+                        &mut counters,
+                        &mut dlq_entries,
+                        output,
+                        &output_schema,
+                        &mut csv_writer,
+                    )?;
+                }
+            }
+        }
+
+        // Write the first emitted record
+        if let Some(projected) = first_projected {
+            csv_writer.write_record(&projected)?;
+        }
+
+        // Process remaining records
         while let Some(record) = csv_reader.next_record()? {
+            row_num += 1;
             counters.total_count += 1;
             let ctx = build_eval_context(
                 config,
@@ -239,10 +267,16 @@ impl PipelineExecutor {
                 &params.pipeline_vars,
             );
             match evaluate_record(&record, transforms, &ctx) {
-                Ok(emitted) => {
+                Ok(EvalResult::Emit(emitted)) => {
                     let projected = project_output(&record, &emitted, output);
                     csv_writer.write_record(&projected)?;
                     counters.ok_count += 1;
+                }
+                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                    counters.filtered_count += 1;
+                }
+                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                    counters.distinct_count += 1;
                 }
                 Err(eval_err) => {
                     handle_error(
@@ -365,70 +399,73 @@ impl PipelineExecutor {
             Record::new(schema, values)
         };
 
-        // Evaluate first record to determine output schema (needed before writer init)
-        let first_record = build_record_from_arena(0);
-        let first_ctx = build_eval_context(
-            config,
-            &input.path,
-            1,
-            pipeline_start_time,
-            &params.execution_id,
-            &params.batch_id,
-            &params.pipeline_vars,
-        );
-        let first_emitted = evaluate_record_with_window(
-            &first_record,
-            transforms,
-            &first_ctx,
-            plan,
-            &arena,
-            &indices,
-            0,
-        );
+        // Scan forward until a record emits, to derive the output schema.
+        let mut counters = PipelineCounters::default();
+        let mut dlq_entries = Vec::new();
+        let mut first_emit_pos: Option<u32> = None;
+        let mut first_projected = None;
 
-        let (final_output_schema, first_projected) = match &first_emitted {
-            Ok(emitted) => {
-                let projected = project_output(&first_record, emitted, output);
-                let s = Arc::clone(projected.schema());
-                (s, Some(projected))
-            }
-            Err(_) => {
-                if strategy == ErrorStrategy::FailFast {
-                    return Err(first_emitted.unwrap_err().into());
+        for pos in 0..record_count {
+            let record = build_record_from_arena(pos);
+            let ctx = build_eval_context(
+                config,
+                &input.path,
+                pos as u64 + 1,
+                pipeline_start_time,
+                &params.execution_id,
+                &params.batch_id,
+                &params.pipeline_vars,
+            );
+            let result =
+                evaluate_record_with_window(&record, transforms, &ctx, plan, &arena, &indices, pos);
+            counters.total_count += 1;
+            match result {
+                Ok(EvalResult::Emit(emitted)) => {
+                    let projected = project_output(&record, &emitted, output);
+                    first_projected = Some(projected);
+                    first_emit_pos = Some(pos);
+                    counters.ok_count += 1;
+                    break;
                 }
-                (Arc::clone(output_schema_ref), None)
+                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                    counters.filtered_count += 1;
+                }
+                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                    counters.distinct_count += 1;
+                }
+                Err(eval_err) => {
+                    if strategy == ErrorStrategy::FailFast {
+                        return Err(eval_err.into());
+                    }
+                    handle_error_no_writer(
+                        &record,
+                        pos as u64 + 1,
+                        &eval_err,
+                        &mut counters,
+                        &mut dlq_entries,
+                    );
+                }
             }
+        }
+
+        let final_output_schema = if let Some(ref proj) = first_projected {
+            Arc::clone(proj.schema())
+        } else {
+            // All records filtered/errored — use arena schema for header-only output
+            Arc::clone(output_schema_ref)
         };
 
         let mut csv_writer =
             CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
-        let mut counters = PipelineCounters::default();
-        let mut dlq_entries = Vec::new();
 
-        // Write first record result
-        counters.total_count += 1;
-        match first_emitted {
-            Ok(_) => {
-                csv_writer.write_record(&first_projected.unwrap())?;
-                counters.ok_count += 1;
-            }
-            Err(eval_err) => {
-                handle_error(
-                    strategy,
-                    &first_record,
-                    1,
-                    &eval_err,
-                    &mut counters,
-                    &mut dlq_entries,
-                    output,
-                    &final_output_schema,
-                    &mut csv_writer,
-                )?;
-            }
+        // Write the first emitted record
+        if let Some(projected) = first_projected {
+            csv_writer.write_record(&projected)?;
         }
 
-        // Process remaining records in chunks
-        let mut chunk_start = 1u32;
+        // Process remaining records in chunks.
+        // Start after the last record processed in the scan-forward phase.
+        let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
         while chunk_start < record_count {
             let chunk_end = (chunk_start + chunk_size).min(record_count);
 
@@ -437,7 +474,7 @@ impl PipelineExecutor {
             let mut chunk: Vec<(
                 u32,
                 Record,
-                Option<Result<IndexMap<String, Value>, cxl::eval::EvalError>>,
+                Option<Result<EvalResult, cxl::eval::EvalError>>,
             )> = (chunk_start..chunk_end)
                 .map(|pos| (pos, build_record_from_arena(pos), None))
                 .collect();
@@ -482,10 +519,16 @@ impl PipelineExecutor {
                 let row_num = *pos as u64 + 1;
                 counters.total_count += 1;
                 match result.as_ref().unwrap() {
-                    Ok(emitted) => {
+                    Ok(EvalResult::Emit(emitted)) => {
                         let projected = project_output(record, emitted, output);
                         csv_writer.write_record(&projected)?;
                         counters.ok_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
                     }
                     Err(eval_err) => {
                         handle_error(
@@ -512,16 +555,19 @@ impl PipelineExecutor {
     }
 
     /// Compile all CXL transform blocks against the input schema.
+    ///
+    /// Fields emitted by earlier transforms are progressively added to the
+    /// available field set so that later transforms can reference them.
     fn compile_transforms(
         transforms: &[&TransformConfig],
         schema: &Arc<Schema>,
     ) -> Result<Vec<CompiledTransform>, PipelineError> {
-        let fields: Vec<&str> = schema.columns().iter().map(|c| c.as_ref()).collect();
+        let mut fields: Vec<String> = schema.columns().iter().map(|c| c.to_string()).collect();
         // CSV fields are all strings at the data level, but CXL allows
         // polymorphic usage (e.g. `+` for concat, `.to_int()` for coercion).
         // Declare as Any so the type checker doesn't reject valid CXL.
-        let type_schema: HashMap<String, Type> =
-            fields.iter().map(|f| (f.to_string(), Type::Any)).collect();
+        let mut type_schema: HashMap<String, Type> =
+            fields.iter().map(|f| (f.clone(), Type::Any)).collect();
 
         let mut compiled = Vec::with_capacity(transforms.len());
         for t in transforms {
@@ -538,12 +584,16 @@ impl PipelineExecutor {
                 });
             }
 
-            let resolved =
-                cxl::resolve::resolve_program(parse_result.ast, &fields, parse_result.node_count)
-                    .map_err(|diags| PipelineError::Compilation {
-                    transform_name: t.name.clone(),
-                    messages: diags.into_iter().map(|d| d.message).collect(),
-                })?;
+            let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+            let resolved = cxl::resolve::resolve_program(
+                parse_result.ast,
+                &field_refs,
+                parse_result.node_count,
+            )
+            .map_err(|diags| PipelineError::Compilation {
+                transform_name: t.name.clone(),
+                messages: diags.into_iter().map(|d| d.message).collect(),
+            })?;
 
             let typed = cxl::typecheck::type_check(resolved, &type_schema).map_err(|diags| {
                 // Filter to errors only (not warnings)
@@ -564,6 +614,16 @@ impl PipelineExecutor {
                     messages: errors,
                 }
             })?;
+
+            // Add emitted fields to the available set for subsequent transforms
+            for stmt in &typed.program.statements {
+                if let cxl::ast::Statement::Emit { name, .. } = stmt
+                    && !type_schema.contains_key(name.as_ref())
+                {
+                    fields.push(name.to_string());
+                    type_schema.insert(name.to_string(), Type::Any);
+                }
+            }
 
             compiled.push(CompiledTransform {
                 name: t.name.clone(),
@@ -708,20 +768,30 @@ fn build_eval_context(
 }
 
 /// Evaluate all transforms against a single record, accumulating emitted fields.
+///
+/// Emitted fields from earlier transforms are merged into the record's overflow
+/// so that later transforms can reference them as input fields.
 fn evaluate_record(
     record: &Record,
     transforms: &[CompiledTransform],
     ctx: &EvalContext,
-) -> Result<IndexMap<String, Value>, cxl::eval::EvalError> {
+) -> Result<EvalResult, cxl::eval::EvalError> {
+    let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
     for t in transforms {
-        let emitted = cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, record, None)?;
+        let emitted = cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, &record, None)?;
+        for (name, value) in &emitted {
+            record.set_overflow(name.clone().into_boxed_str(), value.clone());
+        }
         all_emitted.extend(emitted);
     }
-    Ok(all_emitted)
+    Ok(EvalResult::Emit(all_emitted))
 }
 
 /// Evaluate all transforms with window context, accumulating emitted fields.
+///
+/// Emitted fields from earlier transforms are merged into the record's overflow
+/// so that later transforms can reference them as input fields.
 fn evaluate_record_with_window(
     record: &Record,
     transforms: &[CompiledTransform],
@@ -730,13 +800,14 @@ fn evaluate_record_with_window(
     arena: &Arena,
     indices: &[SecondaryIndex],
     record_pos: u32,
-) -> Result<IndexMap<String, Value>, cxl::eval::EvalError> {
+) -> Result<EvalResult, cxl::eval::EvalError> {
+    let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
 
     for (i, t) in transforms.iter().enumerate() {
         let tp = &plan.transforms[i];
 
-        if let Some(idx_num) = tp.window_index {
+        let emitted = if let Some(idx_num) = tp.window_index {
             // This transform uses windows — look up partition
             let spec = &plan.indices_to_build[idx_num];
             let index = &indices[idx_num];
@@ -759,26 +830,27 @@ fn evaluate_record_with_window(
                     let pos_in_partition =
                         partition.iter().position(|&p| p == record_pos).unwrap_or(0);
                     let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
-                    let emitted = cxl::eval::eval_program(&t.typed, ctx, record, Some(&wctx))?;
-                    all_emitted.extend(emitted);
+                    cxl::eval::eval_program(&t.typed, ctx, &record, Some(&wctx))?
                 } else {
                     // Record not in any partition (null key) — eval without window
-                    let emitted = cxl::eval::eval_program::<Arena>(&t.typed, ctx, record, None)?;
-                    all_emitted.extend(emitted);
+                    cxl::eval::eval_program::<Arena>(&t.typed, ctx, &record, None)?
                 }
             } else {
                 // Null key — eval without window
-                let emitted = cxl::eval::eval_program::<Arena>(&t.typed, ctx, record, None)?;
-                all_emitted.extend(emitted);
+                cxl::eval::eval_program::<Arena>(&t.typed, ctx, &record, None)?
             }
         } else {
             // Stateless transform — no window
-            let emitted = cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, record, None)?;
-            all_emitted.extend(emitted);
+            cxl::eval::eval_program::<NullStorage>(&t.typed, ctx, &record, None)?
+        };
+
+        for (name, value) in &emitted {
+            record.set_overflow(name.clone().into_boxed_str(), value.clone());
         }
+        all_emitted.extend(emitted);
     }
 
-    Ok(all_emitted)
+    Ok(EvalResult::Emit(all_emitted))
 }
 
 /// Parse memory limit from config (default 512MB).
@@ -846,6 +918,26 @@ fn handle_error<W: Write + Send>(
         }
     }
     Ok(())
+}
+
+/// Handle an evaluation error before the writer is initialized (scan-forward phase).
+/// FailFast should be handled by the caller before reaching this function.
+/// For Continue/BestEffort, we count the error and queue it for DLQ — no output write
+/// is possible because the output schema is not yet known.
+fn handle_error_no_writer(
+    record: &Record,
+    row_num: u64,
+    eval_err: &cxl::eval::EvalError,
+    counters: &mut PipelineCounters,
+    dlq_entries: &mut Vec<DlqEntry>,
+) {
+    counters.dlq_count += 1;
+    dlq_entries.push(DlqEntry {
+        source_row: row_num,
+        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        error_message: eval_err.to_string(),
+        original_record: record.clone(),
+    });
 }
 
 /// Extract field reference names from a CXL AST (for --explain schema inference).

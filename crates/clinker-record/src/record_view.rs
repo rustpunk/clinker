@@ -38,6 +38,18 @@ impl<S: RecordStorage + ?Sized> FieldResolver for RecordView<'_, S> {
     fn available_fields(&self) -> Vec<&str> {
         self.storage.available_fields(self.index)
     }
+
+    fn iter_fields(&self) -> Vec<(String, Value)> {
+        let names = self.storage.available_fields(self.index);
+        names
+            .into_iter()
+            .filter_map(|name| {
+                self.storage
+                    .resolve_field(self.index, name)
+                    .map(|val| (name.to_string(), val))
+            })
+            .collect()
+    }
 }
 
 impl<S: RecordStorage + ?Sized> std::fmt::Debug for RecordView<'_, S> {

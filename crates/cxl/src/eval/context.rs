@@ -87,6 +87,8 @@ impl EvalContext {
             "total_count" => Some(Value::Integer(self.pipeline_counters.total_count as i64)),
             "ok_count" => Some(Value::Integer(self.pipeline_counters.ok_count as i64)),
             "dlq_count" => Some(Value::Integer(self.pipeline_counters.dlq_count as i64)),
+            "filtered_count" => Some(Value::Integer(self.pipeline_counters.filtered_count as i64)),
+            "distinct_count" => Some(Value::Integer(self.pipeline_counters.distinct_count as i64)),
             "source_file" => Some(Value::String(self.source_file.to_string().into())),
             "source_row" => Some(Value::Integer(self.source_row as i64)),
             _ => {

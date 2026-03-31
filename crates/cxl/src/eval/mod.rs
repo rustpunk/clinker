@@ -17,6 +17,27 @@ use crate::typecheck::pass::TypedProgram;
 pub use context::{Clock, EvalContext, FixedClock, WallClock};
 pub use error::{EvalError, EvalErrorKind};
 
+/// Row disposition signal from CXL evaluation.
+///
+/// Returned by `ProgramEvaluator::eval_record()` (Phase 12.2) and consumed by
+/// the executor to decide whether to emit, skip, or route a record.
+#[derive(Debug)]
+pub enum EvalResult {
+    /// Record passed all filters and distinct checks — emit to output.
+    Emit(indexmap::IndexMap<String, Value>),
+    /// Record should be excluded from output.
+    Skip(SkipReason),
+}
+
+/// Why a record was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A `filter` predicate evaluated to non-true.
+    Filtered,
+    /// A `distinct` statement found a duplicate value.
+    Duplicate,
+}
+
 /// Evaluate a full CXL program against a record. Returns the output field map.
 pub fn eval_program<'w, S: RecordStorage + 'w>(
     typed: &TypedProgram,
