@@ -199,6 +199,26 @@ impl<'a> TypeChecker<'a> {
             Statement::ExprStmt { expr, .. } => {
                 self.check_expr(expr, false);
             }
+            Statement::Filter {
+                predicate, span, ..
+            } => {
+                let ty = self.check_expr(predicate, false);
+                // Only error when type is *known* to be non-Bool.
+                // Type::Any means unknown — can't verify, let it pass.
+                if ty != Type::Bool && ty != Type::Any {
+                    self.error(
+                        *span,
+                        format!(
+                            "filter predicate must be type Bool, got {ty}. \
+                             Use an explicit comparison."
+                        ),
+                        None,
+                    );
+                }
+            }
+            Statement::Distinct { .. } => {
+                // Distinct field validation deferred — schema pin needed for full check.
+            }
         }
     }
 

@@ -56,6 +56,17 @@ pub enum Statement {
         expr: Expr,
         span: Span,
     },
+    Filter {
+        node_id: NodeId,
+        predicate: Expr,
+        span: Span,
+    },
+    Distinct {
+        node_id: NodeId,
+        /// None = bare `distinct` (all fields), Some = `distinct by <field>`
+        field: Option<Box<str>>,
+        span: Span,
+    },
 }
 
 /// CXL expression — the core of the language. All variants carry a NodeId and Span.

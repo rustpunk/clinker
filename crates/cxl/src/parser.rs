@@ -226,6 +226,22 @@ impl Parser {
                     ));
                     parser.recover_to_newline();
                 }
+                Token::Filter => {
+                    parser.errors.push(parser.error(
+                        "filter is not allowed in module files",
+                        "Module files can only contain fn declarations and let constants",
+                        "Remove the filter statement — modules are pure",
+                    ));
+                    parser.recover_to_newline();
+                }
+                Token::Distinct => {
+                    parser.errors.push(parser.error(
+                        "distinct is not allowed in module files",
+                        "Module files can only contain fn declarations and let constants",
+                        "Remove the distinct statement — modules are pure",
+                    ));
+                    parser.recover_to_newline();
+                }
                 _ => {
                     parser.errors.push(parser.error(
                         &format!("unexpected token {:?} in module file", parser.peek()),
@@ -278,6 +294,8 @@ impl Parser {
             Token::Trace => self.parse_trace(),
             Token::Use => self.parse_use(),
             Token::Fn => self.parse_fn_stmt(),
+            Token::Filter => self.parse_filter(),
+            Token::Distinct => self.parse_distinct(),
             _ => {
                 let nid = self.alloc_id();
                 let expr = self.parse_expr(0)?;
@@ -321,6 +339,71 @@ impl Parser {
             expr,
             span: Span::new(start.start as usize, end.end as usize),
         })
+    }
+
+    fn parse_filter(&mut self) -> Result<Statement, ParseError> {
+        let nid = self.alloc_id();
+        let start = self.current_span();
+        self.advance(); // consume 'filter'
+
+        // Must have a predicate expression
+        if *self.peek() == Token::Newline || *self.peek() == Token::Eof {
+            return Err(self.error(
+                "filter requires a predicate expression",
+                "Expected a boolean expression after 'filter'",
+                "Example: filter status == \"active\"",
+            ));
+        }
+
+        let predicate = self.parse_expr(0)?;
+        let end = predicate.span();
+        Ok(Statement::Filter {
+            node_id: nid,
+            predicate,
+            span: Span::new(start.start as usize, end.end as usize),
+        })
+    }
+
+    fn parse_distinct(&mut self) -> Result<Statement, ParseError> {
+        let nid = self.alloc_id();
+        let start = self.current_span();
+        self.advance(); // consume 'distinct'
+
+        // Check for optional 'by <field>'
+        if *self.peek() == Token::By {
+            self.advance(); // consume 'by'
+
+            // Must have a field name after 'by'
+            if *self.peek() == Token::Newline || *self.peek() == Token::Eof {
+                return Err(self.error(
+                    "distinct by requires a field name",
+                    "Expected an identifier after 'by'",
+                    "Example: distinct by id",
+                ));
+            }
+
+            let field = self.expect_ident("field name")?;
+            let end = self.prev_span();
+            Ok(Statement::Distinct {
+                node_id: nid,
+                field: Some(field.into()),
+                span: Span::new(start.start as usize, end.end as usize),
+            })
+        } else if let Token::Ident(_) = self.peek() {
+            // "distinct id" without 'by' → error
+            Err(self.error(
+                "distinct requires 'by' before the field name",
+                "Expected 'by' keyword between 'distinct' and the field name",
+                "Example: distinct by id",
+            ))
+        } else {
+            // Bare distinct — all fields
+            Ok(Statement::Distinct {
+                node_id: nid,
+                field: None,
+                span: Span::new(start.start as usize, start.end as usize),
+            })
+        }
     }
 
     fn parse_trace(&mut self) -> Result<Statement, ParseError> {

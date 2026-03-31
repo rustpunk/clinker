@@ -158,6 +158,13 @@ impl<'a> Resolver<'a> {
             Statement::ExprStmt { expr, .. } => {
                 self.resolve_expr(expr);
             }
+            Statement::Filter { predicate, .. } => {
+                self.resolve_expr(predicate);
+            }
+            Statement::Distinct { .. } => {
+                // Distinct references a field name directly, not an expression.
+                // No expression resolution needed.
+            }
         }
     }
 

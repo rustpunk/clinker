@@ -75,11 +75,22 @@ pub fn analyze_transform(name: &str, typed: &TypedProgram) -> TransformAnalysis 
     let mut window_calls = Vec::new();
     let mut accessed_fields = HashSet::new();
 
+    let has_distinct = typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Distinct { .. }));
+
     for stmt in &typed.program.statements {
         walk_statement(stmt, &mut window_calls, &mut accessed_fields);
     }
 
-    let parallelism_hint = classify_parallelism(&window_calls);
+    // Distinct forces Sequential — mutable HashSet state cannot be parallelized.
+    let parallelism_hint = if has_distinct {
+        ParallelismHint::Sequential
+    } else {
+        classify_parallelism(&window_calls)
+    };
 
     TransformAnalysis {
         name: name.to_string(),
@@ -131,6 +142,8 @@ fn walk_statement(stmt: &Statement, calls: &mut Vec<WindowCallInfo>, fields: &mu
         }
         Statement::ExprStmt { expr, .. } => walk_expr(expr, calls, fields, None),
         Statement::UseStmt { .. } => {}
+        Statement::Filter { predicate, .. } => walk_expr(predicate, calls, fields, None),
+        Statement::Distinct { .. } => {}
     }
 }
 

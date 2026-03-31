@@ -5,9 +5,10 @@ pub mod error;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use clinker_record::Value;
+use clinker_record::{GroupByKey, GroupKeyError, Value, value_to_group_key};
 
 use crate::ast::{BinOp, Expr, LiteralValue, Statement, UnaryOp};
 use crate::lexer::Span;
@@ -36,6 +37,208 @@ pub enum SkipReason {
     Filtered,
     /// A `distinct` statement found a duplicate value.
     Duplicate,
+}
+
+/// Stateful CXL evaluator wrapping a compiled program.
+///
+/// Owns the `TypedProgram` and optional distinct dedup state. One evaluator
+/// per transform per partition/thread — never Clone, use factory construction.
+/// Follows DataFusion Accumulator / Polars GroupedReduction pattern.
+pub struct ProgramEvaluator {
+    typed: Arc<TypedProgram>,
+    /// HashSet for distinct dedup. None when no distinct statement present.
+    distinct_seen: Option<HashSet<Vec<GroupByKey>>>,
+    /// Current partition key for window-scoped distinct.
+    current_partition_key: Option<Vec<GroupByKey>>,
+    /// Whether this program has any distinct statements.
+    has_distinct: bool,
+}
+
+impl ProgramEvaluator {
+    /// Create a new evaluator for the given program.
+    /// `has_distinct` controls whether the distinct HashSet is allocated.
+    pub fn new(typed: Arc<TypedProgram>, has_distinct: bool) -> Self {
+        Self {
+            typed,
+            distinct_seen: if has_distinct {
+                Some(HashSet::new())
+            } else {
+                None
+            },
+            current_partition_key: None,
+            has_distinct,
+        }
+    }
+
+    /// Called before eval_record when transform has windows.
+    /// Clears distinct set on partition change.
+    pub fn set_partition(&mut self, key: &[GroupByKey]) {
+        if self.current_partition_key.as_deref() != Some(key) {
+            if let Some(seen) = &mut self.distinct_seen {
+                seen.clear();
+            }
+            self.current_partition_key = Some(key.to_vec());
+        }
+    }
+
+    /// Reset distinct state (between files or when reusing evaluator).
+    pub fn reset_distinct(&mut self) {
+        if let Some(seen) = &mut self.distinct_seen {
+            seen.clear();
+        }
+        self.current_partition_key = None;
+    }
+
+    /// Whether this program has any distinct statements.
+    pub fn has_distinct(&self) -> bool {
+        self.has_distinct
+    }
+
+    /// Evaluate a record through the full program, returning Emit or Skip.
+    pub fn eval_record<'w, S: RecordStorage + 'w>(
+        &mut self,
+        ctx: &EvalContext,
+        resolver: &dyn FieldResolver,
+        window: Option<&dyn WindowContext<'w, S>>,
+    ) -> Result<EvalResult, EvalError> {
+        let mut env: HashMap<String, Value> = HashMap::new();
+        let mut output = indexmap::IndexMap::new();
+
+        for stmt in &self.typed.program.statements {
+            match stmt {
+                Statement::Filter { predicate, .. } => {
+                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &env)?;
+                    if val != Value::Bool(true) {
+                        return Ok(EvalResult::Skip(SkipReason::Filtered));
+                    }
+                }
+                Statement::Distinct { field, .. } => {
+                    let key = self.build_distinct_key(field.as_deref(), &env, resolver)?;
+                    let seen = self
+                        .distinct_seen
+                        .as_mut()
+                        .expect("distinct statement requires ProgramEvaluator with distinct state");
+                    if !seen.insert(key) {
+                        return Ok(EvalResult::Skip(SkipReason::Duplicate));
+                    }
+                }
+                Statement::Let { name, expr, .. } => {
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    env.insert(name.to_string(), val);
+                }
+                Statement::Emit { name, expr, .. } => {
+                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    output.insert(name.to_string(), val);
+                }
+                Statement::Trace {
+                    level,
+                    guard,
+                    message,
+                    ..
+                } => {
+                    let should_trace = if let Some(g) = guard {
+                        matches!(
+                            eval_expr(g, &self.typed, ctx, resolver, window, &env)?,
+                            Value::Bool(true)
+                        )
+                    } else {
+                        true
+                    };
+                    if should_trace {
+                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &env)?;
+                        let msg_str = match &msg {
+                            Value::String(s) => s.to_string(),
+                            other => format!("{:?}", other),
+                        };
+                        match level.unwrap_or(crate::ast::TraceLevel::Trace) {
+                            crate::ast::TraceLevel::Trace => tracing::trace!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Debug => tracing::debug!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Info => tracing::info!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Warn => tracing::warn!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Error => tracing::error!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                        }
+                    }
+                }
+                Statement::UseStmt { .. } => {}
+                Statement::ExprStmt { expr, .. } => {
+                    eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                }
+            }
+        }
+        Ok(EvalResult::Emit(output))
+    }
+
+    /// Build the distinct key for a record.
+    fn build_distinct_key(
+        &self,
+        field: Option<&str>,
+        env: &HashMap<String, Value>,
+        resolver: &dyn FieldResolver,
+    ) -> Result<Vec<GroupByKey>, EvalError> {
+        match field {
+            Some(name) => {
+                // Resolve from let-bindings first, then input fields
+                let val = env
+                    .get(name)
+                    .cloned()
+                    .or_else(|| resolver.resolve(name))
+                    .unwrap_or(Value::Null);
+                match value_to_group_key(&val, name, None, 0) {
+                    Ok(Some(gk)) => Ok(vec![gk]),
+                    Ok(None) => Ok(vec![GroupByKey::Null]),
+                    Err(e) => Err(group_key_error_to_eval_error(e)),
+                }
+            }
+            None => {
+                // Bare distinct — hash all input fields
+                let mut key = Vec::new();
+                for (name, val) in resolver.iter_fields() {
+                    match value_to_group_key(&val, &name, None, 0) {
+                        Ok(Some(gk)) => key.push(gk),
+                        Ok(None) => key.push(GroupByKey::Null),
+                        Err(e) => return Err(group_key_error_to_eval_error(e)),
+                    }
+                }
+                Ok(key)
+            }
+        }
+    }
+}
+
+/// Convert a GroupKeyError to an EvalError.
+fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
+    let got = match &e {
+        GroupKeyError::NanInGroupBy { .. } => "NaN",
+        GroupKeyError::TypeMismatch { got, .. } => got,
+        GroupKeyError::UnsupportedType { type_name, .. } => type_name,
+    };
+    EvalError::new(
+        EvalErrorKind::TypeMismatch {
+            expected: "hashable value",
+            got,
+        },
+        Span::new(0, 0),
+    )
 }
 
 /// Evaluate a full CXL program against a record. Returns the output field map.
@@ -110,6 +313,10 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             Statement::UseStmt { .. } => {} // Module imports handled at compile time
             Statement::ExprStmt { expr, .. } => {
                 eval_expr(expr, typed, ctx, resolver, window, &env)?;
+            }
+            Statement::Filter { .. } | Statement::Distinct { .. } => {
+                // Handled by ProgramEvaluator::eval_record() (Phase 12.2.5+)
+                // eval_program() is the legacy path — these statements are no-ops here.
             }
         }
     }

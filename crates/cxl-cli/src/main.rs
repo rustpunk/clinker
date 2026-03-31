@@ -451,6 +451,13 @@ fn format_statement(stmt: &cxl::ast::Statement) -> String {
             s
         }
         cxl::ast::Statement::ExprStmt { expr, .. } => format_expr(expr),
+        cxl::ast::Statement::Filter { predicate, .. } => {
+            format!("filter {}", format_expr(predicate))
+        }
+        cxl::ast::Statement::Distinct { field, .. } => match field {
+            Some(f) => format!("distinct by {}", f),
+            None => "distinct".to_string(),
+        },
     }
 }
 
