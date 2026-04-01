@@ -95,7 +95,7 @@ pub enum RawTransformEntry {
     /// An `_import` directive referencing a `.comp.yaml` file.
     Import(ImportDirective),
     /// A regular inline transformation.
-    Inline(TransformConfig),
+    Inline(Box<TransformConfig>),
 }
 
 /// An `_import` directive in a pipeline's transformations list.
@@ -263,7 +263,7 @@ pub fn raw_to_config_no_imports(
     for entry in &raw.transformations {
         match entry {
             RawTransformEntry::Inline(transform) => {
-                resolved_transforms.push(transform.clone());
+                resolved_transforms.push((**transform).clone());
             }
             RawTransformEntry::Import(directive) => {
                 errors.push(CompositionError::IoError {
@@ -382,7 +382,7 @@ fn resolve_entries(
     for entry in entries {
         match entry {
             RawTransformEntry::Inline(transform) => {
-                resolved_transforms.push(transform.clone());
+                resolved_transforms.push((**transform).clone());
             }
             RawTransformEntry::Import(directive) => {
                 resolve_import(
@@ -465,7 +465,7 @@ fn resolve_import(
     for entry in &comp.transformations {
         match entry {
             RawTransformEntry::Inline(transform) => {
-                let mut transform = transform.clone();
+                let mut transform = (**transform).clone();
                 let original_cxl = transform.cxl.clone();
                 transform_names.push(transform.name.clone());
 

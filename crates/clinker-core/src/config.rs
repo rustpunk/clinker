@@ -462,6 +462,99 @@ impl<'de> Deserialize<'de> for SchemaSource {
     }
 }
 
+/// Routing mode for record dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMode {
+    /// First-match: evaluate predicates in order, first true wins.
+    #[default]
+    Exclusive,
+    /// All-match: evaluate all predicates, record sent to every matching branch.
+    Inclusive,
+}
+
+/// A named routing branch with a CXL boolean condition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteBranch {
+    pub name: String,
+    pub condition: String,
+}
+
+/// Route configuration for multi-output record dispatch.
+///
+/// Conditions are CXL boolean expressions evaluated per record.
+/// Mandatory `default` prevents silent record drops.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteConfig {
+    #[serde(default)]
+    pub mode: RouteMode,
+    pub branches: Vec<RouteBranch>,
+    pub default: String,
+}
+
+impl<'de> serde::Deserialize<'de> for RouteConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            mode: RouteMode,
+            branches: Vec<RouteBranch>,
+            default: Option<String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        // Mandatory default
+        let default = raw
+            .default
+            .ok_or_else(|| serde::de::Error::custom("route must have a 'default' output name"))?;
+
+        // Non-empty branches
+        if raw.branches.is_empty() {
+            return Err(serde::de::Error::custom(
+                "route must have at least one branch",
+            ));
+        }
+
+        // Max 256 outputs
+        if raw.branches.len() > 256 {
+            return Err(serde::de::Error::custom(format!(
+                "route has {} branches, maximum is 256",
+                raw.branches.len()
+            )));
+        }
+
+        // Unique branch names
+        let mut seen = std::collections::HashSet::new();
+        for branch in &raw.branches {
+            if !seen.insert(&branch.name) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate route branch name '{}'",
+                    branch.name
+                )));
+            }
+        }
+
+        // Default must not collide with a branch name
+        if seen.contains(&default) {
+            return Err(serde::de::Error::custom(format!(
+                "route default '{}' collides with a branch name",
+                default
+            )));
+        }
+
+        Ok(RouteConfig {
+            mode: raw.mode,
+            branches: raw.branches,
+            default,
+        })
+    }
+}
+
 /// Per-transform configuration block.
 ///
 /// The `cxl` field contains the multi-line CXL source text.
@@ -478,6 +571,9 @@ pub struct TransformConfig {
     pub log: Option<Vec<LogDirective>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validations: Option<Vec<ValidationEntry>>,
+    /// Route configuration for multi-output dispatch. Optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteConfig>,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
@@ -2233,5 +2329,159 @@ transformations:
         // Values can contain anything — only names are validated
         let result = interpolate_env_vars("test", &[("DB_URL", "postgres://user:pass@host/db")]);
         assert!(result.is_ok());
+    }
+
+    // --- Route config tests (Phase 13, Task 13.3) ---
+
+    #[test]
+    fn test_route_config_exclusive_deser() {
+        let yaml = r#"
+mode: exclusive
+branches:
+  - name: high
+    condition: "amount > 10000"
+  - name: medium
+    condition: "amount > 1000"
+default: low
+"#;
+        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(rc.mode, RouteMode::Exclusive);
+        assert_eq!(rc.branches.len(), 2);
+        assert_eq!(rc.branches[0].name, "high");
+        assert_eq!(rc.default, "low");
+    }
+
+    #[test]
+    fn test_route_config_inclusive_deser() {
+        let yaml = r#"
+mode: inclusive
+branches:
+  - name: audit
+    condition: "amount > 50000"
+  - name: report
+    condition: "country == 'US'"
+default: standard
+"#;
+        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(rc.mode, RouteMode::Inclusive);
+        assert_eq!(rc.branches.len(), 2);
+    }
+
+    #[test]
+    fn test_route_config_default_mode_exclusive() {
+        let yaml = r#"
+branches:
+  - name: high
+    condition: "amount > 10000"
+default: low
+"#;
+        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(rc.mode, RouteMode::Exclusive);
+    }
+
+    #[test]
+    fn test_route_config_missing_default_error() {
+        let yaml = r#"
+branches:
+  - name: high
+    condition: "amount > 10000"
+"#;
+        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("default"),
+            "error should mention default: {err}"
+        );
+    }
+
+    #[test]
+    fn test_route_config_empty_branches_error() {
+        let yaml = r#"
+branches: []
+default: low
+"#;
+        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("at least one branch"),
+            "error should mention branches: {err}"
+        );
+    }
+
+    #[test]
+    fn test_route_config_duplicate_branch_names_error() {
+        let yaml = r#"
+branches:
+  - name: high
+    condition: "amount > 10000"
+  - name: high
+    condition: "amount > 5000"
+default: low
+"#;
+        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate"),
+            "error should mention duplicate: {err}"
+        );
+    }
+
+    #[test]
+    fn test_route_config_default_collides_branch_error() {
+        let yaml = r#"
+branches:
+  - name: high
+    condition: "amount > 10000"
+default: high
+"#;
+        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("collides"),
+            "error should mention collision: {err}"
+        );
+    }
+
+    #[test]
+    fn test_transform_config_without_route_unchanged() {
+        let yaml = r#"
+pipeline:
+  name: test
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: passthrough
+    cxl: |
+      emit *
+"#;
+        let config = parse_config(yaml).unwrap();
+        let transforms: Vec<_> = config.transforms().collect();
+        assert!(transforms[0].route.is_none());
+    }
+
+    #[test]
+    fn test_route_branch_condition_complex() {
+        let yaml = r#"
+branches:
+  - name: high_intl
+    condition: "amount > 10000 && country != 'US'"
+default: standard
+"#;
+        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(
+            rc.branches[0].condition,
+            "amount > 10000 && country != 'US'"
+        );
     }
 }

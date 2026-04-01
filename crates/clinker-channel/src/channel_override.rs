@@ -286,6 +286,7 @@ pub fn resolve_channel(
             local_window: add.local_window.clone(),
             log: None,
             validations: None,
+            route: None,
             notes: None,
         });
         config.transformations.insert(anchor_pos + 1, new_transform);
@@ -577,6 +578,7 @@ mod tests {
                     local_window: None,
                     log: None,
                     validations: None,
+                    route: None,
                     notes: None,
                 }),
                 TransformEntry::Transform(TransformConfig {
@@ -586,6 +588,7 @@ mod tests {
                     local_window: None,
                     log: None,
                     validations: None,
+                    route: None,
                     notes: None,
                 }),
             ],
@@ -1030,6 +1033,7 @@ transformations:
                 local_window: None,
                 log: None,
                 validations: None,
+                route: None,
                 notes: None,
             }));
         config
@@ -1041,6 +1045,7 @@ transformations:
                 local_window: None,
                 log: None,
                 validations: None,
+                route: None,
                 notes: None,
             }));
         provenance.insert("legacy_a".into(), canonical.clone());
@@ -1571,6 +1576,7 @@ transformations:
                 local_window: None,
                 log: None,
                 validations: None,
+                route: None,
                 notes: None,
             }));
         let mut provenance = ProvenanceMap::new();

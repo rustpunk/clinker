@@ -530,6 +530,7 @@ mod tests {
                         local_window,
                         log: None,
                         validations: None,
+                        route: None,
                         notes: None,
                     })
                 })

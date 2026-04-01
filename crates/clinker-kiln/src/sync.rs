@@ -117,7 +117,7 @@ fn raw_to_resolved_no_imports(raw: &RawPipelineConfig) -> Result<PipelineConfig,
         .transformations
         .iter()
         .filter_map(|entry| match entry {
-            RawTransformEntry::Inline(t) => Some(TransformEntry::Transform(t.clone())),
+            RawTransformEntry::Inline(t) => Some(TransformEntry::Transform((**t).clone())),
             RawTransformEntry::Import(_) => None,
         })
         .collect();
