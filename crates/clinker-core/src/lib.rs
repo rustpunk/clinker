@@ -19,5 +19,8 @@ pub mod schema;
 pub mod security;
 pub mod validation;
 
+#[cfg(test)]
+pub mod test_helpers;
+
 #[allow(unused_imports)]
 use clinker_record::{PipelineCounters, Record, RecordProvenance, Schema, Value};

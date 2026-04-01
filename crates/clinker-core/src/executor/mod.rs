@@ -87,7 +87,6 @@ impl CompiledTransform {
             .iter()
             .any(|s| matches!(s, Statement::Distinct { .. }))
     }
-
 }
 
 /// Build ProgramEvaluators for a set of compiled transforms.
@@ -1059,6 +1058,8 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    mod multi_output;
+
     use super::*;
 
     /// Helper: run executor with in-memory CSV input/output.
