@@ -418,11 +418,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let input_path = &pipeline_config.inputs[0].path;
     let output_path = &pipeline_config.outputs[0].path;
 
-    let reader = std::fs::File::open(input_path)?;
-    let writer = std::fs::File::create(output_path)?;
+    let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(input_path)?);
+    let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(output_path)?);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer, &run_params)?;
+    let readers =
+        std::collections::HashMap::from([(pipeline_config.inputs[0].name.clone(), reader)]);
+    let writers =
+        std::collections::HashMap::from([(pipeline_config.outputs[0].name.clone(), writer)]);
+
+    let report = PipelineExecutor::run_with_readers_writers(
+        &pipeline_config,
+        readers,
+        writers,
+        &run_params,
+    )?;
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;

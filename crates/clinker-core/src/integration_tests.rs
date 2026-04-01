@@ -1,8 +1,11 @@
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::config;
     use crate::error::PipelineError;
     use crate::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
+    use crate::test_helpers::SharedBuffer;
 
     /// Helper: run executor with in-memory CSV input/output.
     fn run_pipeline(
@@ -10,8 +13,17 @@ mod tests {
         csv_input: &str,
     ) -> Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
         let config = config::parse_config(yaml).unwrap();
-        let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
-        let mut output_buf: Vec<u8> = Vec::new();
+        let output_buf = SharedBuffer::new();
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            config.outputs[0].name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
 
         let pipeline_vars = config
             .pipeline
@@ -26,9 +38,9 @@ mod tests {
         };
 
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf, &params)?;
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
 
-        let output = String::from_utf8(output_buf).unwrap();
+        let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
     }
 

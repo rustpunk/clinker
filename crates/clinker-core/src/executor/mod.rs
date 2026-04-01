@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -111,20 +111,30 @@ pub struct DlqEntry {
 pub struct PipelineExecutor;
 
 impl PipelineExecutor {
-    /// Run with explicit reader/writer sources.
+    /// Run with explicit reader/writer registries.
+    ///
+    /// `readers` and `writers` are keyed by the input/output `name` fields from
+    /// the pipeline config. For single-input/output pipelines, pass single-entry
+    /// HashMaps.
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
-    pub fn run_with_readers_writers<R: Read + Send, W: Write + Send>(
+    pub fn run_with_readers_writers(
         config: &PipelineConfig,
-        reader: R,
-        writer: W,
+        mut readers: HashMap<String, Box<dyn Read + Send>>,
+        mut writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
-        // Build CSV reader to get schema for CXL compilation
+        // Extract the primary reader from the registry
         let input = &config.inputs[0];
+        let reader = readers.remove(&input.name).ok_or_else(|| {
+            PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                "no reader registered for input '{}'",
+                input.name
+            )))
+        })?;
         let reader_config = build_reader_config(input);
         let mut csv_reader = CsvReader::from_reader(reader, reader_config);
         let schema = csv_reader.schema()?;
@@ -147,6 +157,16 @@ impl PipelineExecutor {
         })?;
 
         let execution_mode = plan.mode();
+
+        // Extract the primary writer from the registry, wrapped in 64 KiB BufWriter
+        let output = &config.outputs[0];
+        let raw_writer = writers.remove(&output.name).ok_or_else(|| {
+            PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                "no writer registered for output '{}'",
+                output.name
+            )))
+        })?;
+        let writer = BufWriter::with_capacity(65536, raw_writer);
 
         let (counters, dlq_entries, peak_rss_bytes) = match execution_mode {
             ExecutionMode::Streaming => {
@@ -1068,8 +1088,17 @@ mod tests {
         csv_input: &str,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
         let config = crate::config::parse_config(yaml).unwrap();
-        let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
-        let mut output_buf: Vec<u8> = Vec::new();
+        let output_buf = crate::test_helpers::SharedBuffer::new();
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            config.outputs[0].name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
 
         let pipeline_vars = config
             .pipeline
@@ -1084,9 +1113,9 @@ mod tests {
         };
 
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf, &params)?;
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
 
-        let output = String::from_utf8(output_buf).unwrap();
+        let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
     }
 
@@ -1692,8 +1721,18 @@ transformations:
             threads: Some(threads),
             chunk_size: Some(64), // small chunks to exercise chunking logic
         });
-        let reader = std::io::Cursor::new(csv_input.as_bytes().to_vec());
-        let mut output_buf: Vec<u8> = Vec::new();
+        let output_buf = crate::test_helpers::SharedBuffer::new();
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            config.outputs[0].name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+
         let pipeline_vars = config
             .pipeline
             .vars
@@ -1706,8 +1745,8 @@ transformations:
             pipeline_vars,
         };
         let report =
-            PipelineExecutor::run_with_readers_writers(&config, reader, &mut output_buf, &params)?;
-        let output = String::from_utf8(output_buf).unwrap();
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+        let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
     }
 
