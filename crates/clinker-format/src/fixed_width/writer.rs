@@ -115,7 +115,7 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
-            Value::Array(_) => String::new(),
+            Value::Array(_) | Value::Map(_) => String::new(),
         }
     }
 

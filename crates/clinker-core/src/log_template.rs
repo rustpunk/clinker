@@ -128,6 +128,18 @@ fn format_value(val: &Value, out: &mut String) {
             }
             out.push(']');
         }
+        Value::Map(m) => {
+            out.push('{');
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(k);
+                out.push_str(": ");
+                format_value(v, out);
+            }
+            out.push('}');
+        }
     }
 }
 

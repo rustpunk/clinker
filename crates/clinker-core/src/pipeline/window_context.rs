@@ -207,6 +207,7 @@ fn value_hash_key(val: &Value) -> String {
         Value::Date(d) => format!("d:{}", d),
         Value::DateTime(dt) => format!("dt:{}", dt),
         Value::Array(_) => "array".into(),
+        Value::Map(_) => "map".into(),
     }
 }
 

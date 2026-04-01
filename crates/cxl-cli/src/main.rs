@@ -452,6 +452,13 @@ fn value_to_json(v: Value) -> serde_json::Value {
             serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
         }
         Value::Array(arr) => serde_json::Value::Array(arr.into_iter().map(value_to_json).collect()),
+        Value::Map(m) => {
+            let obj = m
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
     }
 }
 

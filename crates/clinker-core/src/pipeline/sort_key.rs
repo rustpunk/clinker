@@ -87,8 +87,8 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             bytes[0] ^= 0x80;
             buf.extend_from_slice(&bytes);
         }
-        Value::Null => {}     // handled by caller
-        Value::Array(_) => {} // not a valid sort key; defensive no-op
+        Value::Null => {}                     // handled by caller
+        Value::Array(_) | Value::Map(_) => {} // not a valid sort key; defensive no-op
     }
 }
 

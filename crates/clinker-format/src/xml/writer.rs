@@ -220,6 +220,7 @@ fn value_to_text(val: &Value) -> String {
         Value::Date(d) => d.to_string(),
         Value::DateTime(dt) => dt.to_string(),
         Value::Array(arr) => arr.iter().map(value_to_text).collect::<Vec<_>>().join(","),
+        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
     }
 }
 

@@ -116,6 +116,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
         Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
+        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
     }
 }
 

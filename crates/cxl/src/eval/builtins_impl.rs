@@ -744,6 +744,16 @@ impl std::fmt::Display for ValueDisplay<'_> {
                 }
                 write!(f, "]")
             }
+            Value::Map(m) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", k, ValueDisplay(v))?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }

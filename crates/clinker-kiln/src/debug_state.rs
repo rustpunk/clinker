@@ -120,6 +120,7 @@ impl From<Value> for CellValue {
             Value::Date(d) => Self::Str(d.to_string()),
             Value::DateTime(dt) => Self::Str(dt.to_string()),
             Value::Array(arr) => Self::Array(arr.into_iter().map(CellValue::from).collect()),
+            Value::Map(m) => Self::Str(serde_json::to_string(m.as_ref()).unwrap_or_default()),
         }
     }
 }

@@ -131,6 +131,11 @@ pub fn value_to_group_key(
             type_name: "array",
             row,
         }),
+        Value::Map(_) => Err(GroupKeyError::UnsupportedType {
+            field: field.to_string(),
+            type_name: "map",
+            row,
+        }),
     }
 }
 
