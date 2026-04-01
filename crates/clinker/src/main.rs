@@ -18,7 +18,34 @@ use clinker_format::FormatReader;
 
 /// CXL streaming ETL engine.
 #[derive(Parser, Debug)]
-#[command(name = "clinker", about = "CXL streaming ETL engine")]
+#[command(
+    name = "clinker",
+    version,
+    about = "CXL streaming ETL engine",
+    long_about = "\
+Clinker is a streaming ETL engine that reads tabular data (CSV, NDJSON), \
+applies CXL transformation expressions, and writes the results to output files.\n\n\
+Pipelines are defined in YAML configuration files that specify inputs, outputs, \
+field mappings with CXL expressions, and optional channel overrides for \
+multi-tenant customization.",
+    after_long_help = "\
+QUICK START:
+  clinker run pipeline.yaml
+  clinker run pipeline.yaml --dry-run -n 10
+  clinker run pipeline.yaml --explain
+  clinker run pipeline.yaml --channel acme-corp
+
+ENVIRONMENT VARIABLES:
+  CLINKER_ENV                   Active environment for when: conditions
+  CLINKER_METRICS_SPOOL_DIR     Default metrics spool directory
+
+EXIT CODES:
+  0  Success
+  1  Configuration, schema, or CXL compilation error
+  2  Pipeline completed but DLQ entries were produced
+  3  CXL evaluation error
+  4  I/O or format error"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -28,8 +55,39 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Run a pipeline from a YAML config file
+    #[command(
+        long_about = "\
+Run a pipeline from a YAML configuration file. The pipeline reads input \
+files, applies CXL transformation expressions to each record, and writes \
+results to the configured outputs. Records that fail evaluation are routed \
+to a dead-letter queue (DLQ).",
+        after_long_help = "\
+EXAMPLES:
+  # Run a pipeline
+  clinker run pipeline.yaml
+
+  # Preview the execution plan without reading data
+  clinker run pipeline.yaml --explain
+
+  # Validate config and process 10 records as a dry run
+  clinker run pipeline.yaml --dry-run -n 10
+
+  # Run with a channel override for multi-tenant customization
+  clinker run pipeline.yaml --channel acme-corp
+
+  # Run with custom memory budget and thread count
+  clinker run pipeline.yaml --memory-limit 512M --threads 4
+
+  # Spool execution metrics for later collection
+  clinker run pipeline.yaml --metrics-spool-dir /var/spool/clinker"
+    )]
     Run(RunArgs),
     /// Metrics utilities
+    #[command(long_about = "\
+Utilities for collecting and managing pipeline execution metrics. Clinker \
+can spool per-execution metrics as JSON files during pipeline runs. Use \
+these subcommands to sweep spool directories and consolidate metrics into \
+NDJSON archives.")]
     Metrics {
         #[command(subcommand)]
         subcommand: MetricsCommands,
@@ -43,82 +101,82 @@ pub struct RunArgs {
     pub config: PathBuf,
 
     /// Memory budget (supports K/M/G suffixes), default 256M
-    #[arg(long)]
+    #[arg(long, help_heading = "Execution")]
     pub memory_limit: Option<String>,
 
     /// Thread pool size, default num_cpus
-    #[arg(long)]
+    #[arg(long, help_heading = "Execution")]
     pub threads: Option<usize>,
 
     /// Max DLQ records before abort, 0 = unlimited
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "0", help_heading = "Execution")]
     pub error_threshold: u64,
 
     /// Pipeline batch_id, default generated UUID v7
-    #[arg(long)]
+    #[arg(long, help_heading = "Execution")]
     pub batch_id: Option<String>,
 
-    /// CXL module search path
-    #[arg(long, default_value = "./rules/")]
-    pub rules_path: PathBuf,
-
     /// Print execution plan and exit (no data read)
-    #[arg(long)]
+    #[arg(long, help_heading = "Validation")]
     pub explain: bool,
 
     /// Validate config and CXL without processing data
-    #[arg(long)]
+    #[arg(long, help_heading = "Validation")]
     pub dry_run: bool,
 
     /// Process only first N records per input (requires --dry-run)
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, help_heading = "Validation")]
     pub dry_run_n: Option<u64>,
 
     /// Write dry-run output to file instead of stdout
-    #[arg(long)]
+    #[arg(long, help_heading = "Validation")]
     pub dry_run_output: Option<PathBuf>,
 
-    /// Suppress stderr progress output
-    #[arg(long)]
-    pub quiet: bool,
-
-    /// Allow output file overwrite
-    #[arg(long)]
-    pub force: bool,
+    /// CXL module search path
+    #[arg(long, default_value = "./rules/", help_heading = "Paths")]
+    pub rules_path: PathBuf,
 
     /// Base directory for relative path resolution
-    #[arg(long)]
+    #[arg(long, help_heading = "Paths")]
     pub base_dir: Option<PathBuf>,
 
     /// Permit absolute paths in YAML config
-    #[arg(long)]
+    #[arg(long, help_heading = "Paths")]
     pub allow_absolute_paths: bool,
 
-    /// Log level: error, warn, info, debug, trace
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
-
-    /// Directory to spool per-execution JSON metrics files.
-    /// Overrides CLINKER_METRICS_SPOOL_DIR env var and pipeline.metrics.spool_dir in YAML.
-    #[arg(long)]
-    pub metrics_spool_dir: Option<PathBuf>,
-
     /// Channel override to apply (e.g., "acme-corp")
-    #[arg(long)]
+    #[arg(long, help_heading = "Channels & Environment")]
     pub channel: Option<String>,
 
     /// Explicit path(s) to .channel.yaml override file(s). Bypasses derived-name lookup.
     /// May be specified multiple times; applied in declaration order (later wins on conflict).
-    #[arg(long)]
+    #[arg(long, help_heading = "Channels & Environment")]
     pub channel_path: Vec<PathBuf>,
 
     /// Workspace root (overrides clinker.toml auto-discovery)
-    #[arg(long)]
+    #[arg(long, help_heading = "Channels & Environment")]
     pub workspace: Option<PathBuf>,
 
     /// Active environment name for when: conditions (sets CLINKER_ENV).
-    #[arg(long)]
+    #[arg(long, help_heading = "Channels & Environment")]
     pub env: Option<String>,
+
+    /// Suppress stderr progress output
+    #[arg(long, help_heading = "Output")]
+    pub quiet: bool,
+
+    /// Allow output file overwrite
+    #[arg(long, help_heading = "Output")]
+    pub force: bool,
+
+    /// Log level: error, warn, info, debug, trace
+    #[arg(long, default_value = "info", help_heading = "Output")]
+    pub log_level: String,
+
+    /// Directory to spool per-execution JSON metrics files.
+    /// Overrides CLINKER_METRICS_SPOOL_DIR env var and pipeline.metrics.spool_dir in YAML.
+    #[arg(long, help_heading = "Metrics")]
+    pub metrics_spool_dir: Option<PathBuf>,
 }
 
 impl RunArgs {
@@ -139,6 +197,19 @@ impl RunArgs {
 #[derive(Subcommand, Debug)]
 pub enum MetricsCommands {
     /// Sweep the spool directory and append records to an NDJSON archive
+    #[command(
+        long_about = "\
+Sweep a spool directory for per-execution JSON metrics files and append \
+them to a consolidated NDJSON archive. Use --delete-after-collect to clean \
+up spool files after successful collection.",
+        after_long_help = "\
+EXAMPLES:
+  # Preview what would be collected
+  clinker metrics collect --spool-dir /var/spool/clinker --output-file metrics.ndjson --dry-run
+
+  # Collect and clean up spool files
+  clinker metrics collect --spool-dir /var/spool/clinker --output-file metrics.ndjson --delete-after-collect"
+    )]
     Collect(CollectArgs),
 }
 

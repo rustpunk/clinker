@@ -26,7 +26,23 @@ use cxl::resolve::HashMapResolver;
 #[derive(Parser)]
 #[command(
     name = "cxl",
-    about = "CXL language validator, evaluator, and formatter"
+    version,
+    about = "CXL language validator, evaluator, and formatter",
+    long_about = "\
+Standalone tool for the CXL expression language used by Clinker pipelines. \
+Validate .cxl files for correctness, evaluate expressions against sample \
+data, or canonically reformat source files.",
+    after_long_help = "\
+QUICK START:
+  cxl check transform.cxl
+  cxl eval -e 'emit result = 1 + 2'
+  cxl eval transform.cxl --field Price=10.5 --field Qty=3
+  cxl fmt transform.cxl
+
+EXIT CODES:
+  0  Success (or warnings only)
+  1  Parse, resolve, type-check, or evaluation errors
+  2  I/O error (file not found, invalid JSON, etc.)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,11 +52,33 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Parse, resolve, and type-check a .cxl file. Exit 0 if valid, 1 if errors.
+    #[command(long_about = "\
+Parse, resolve, and type-check a .cxl file through the full compilation \
+pipeline. Reports parse errors, unresolved references, and type mismatches \
+with source locations and fix suggestions. Exits 0 if valid, 1 if errors.")]
     Check {
         /// Path to the .cxl file
         file: String,
     },
     /// Evaluate a CXL expression against provided field values.
+    #[command(
+        long_about = "\
+Evaluate a CXL expression against provided field values and print the \
+output as JSON. Provide the expression via a .cxl file or inline with -e. \
+Supply input data as a JSON object (--record) or as individual key=value \
+pairs (--field) with automatic type inference (integer, float, bool, \
+null, or string).",
+        after_long_help = "\
+EXAMPLES:
+  # Evaluate an inline expression
+  cxl eval -e 'emit greeting = \"hello\"'
+
+  # Evaluate a file with field values
+  cxl eval transform.cxl --field name=Alice --field age=30
+
+  # Evaluate with a JSON record
+  cxl eval transform.cxl --record '{\"price\": 10.5, \"qty\": 3}'"
+    )]
     Eval {
         /// Path to a .cxl file (required unless -e is provided)
         #[arg(required_unless_present = "expr")]
@@ -56,6 +94,10 @@ enum Command {
         fields: Vec<String>,
     },
     /// Parse and pretty-print a .cxl file (canonical formatting).
+    #[command(long_about = "\
+Parse a .cxl file and print it in canonical format with normalized \
+whitespace and consistent styling. Useful for enforcing a uniform code \
+style across CXL source files.")]
     Fmt {
         /// Path to the .cxl file
         file: String,
