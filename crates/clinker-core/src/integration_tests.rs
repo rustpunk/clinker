@@ -62,9 +62,12 @@ mod tests {
                 | PipelineError::Compilation { .. },
             ) => 1,
             Err(PipelineError::Eval(_)) => 3,
-            Err(PipelineError::Io(_) | PipelineError::Format(_) | PipelineError::ThreadPool(_)) => {
-                4
-            }
+            Err(
+                PipelineError::Io(_)
+                | PipelineError::Format(_)
+                | PipelineError::ThreadPool(_)
+                | PipelineError::Multiple(_),
+            ) => 4,
         }
     }
 

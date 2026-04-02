@@ -38,6 +38,7 @@ pub struct PipelineRunParams {
 /// Replaces the previous `(PipelineCounters, Vec<DlqEntry>)` tuple. Callers
 /// that previously destructured the tuple should access `report.counters` and
 /// `report.dlq_entries` instead.
+#[derive(Debug)]
 pub struct ExecutionReport {
     /// Record counts: total, ok, dlq.
     pub counters: PipelineCounters,
@@ -98,14 +99,12 @@ fn build_evaluators(transforms: &[CompiledTransform]) -> Vec<ProgramEvaluator> {
 }
 
 /// Compiled route branch: a named CXL boolean condition evaluator.
-#[allow(dead_code)] // Used in tests now; wired into execution loop in Task 13.5
 struct CompiledRouteBranch {
     name: String,
     evaluator: ProgramEvaluator,
 }
 
 /// Compiled route configuration for multi-output dispatch.
-#[allow(dead_code)] // Used in tests now; wired into execution loop in Task 13.5
 struct CompiledRoute {
     branches: Vec<CompiledRouteBranch>,
     default: String,
@@ -118,7 +117,6 @@ impl CompiledRoute {
     /// Returns the list of output names the record should be dispatched to.
     /// In Exclusive mode: first matching branch (or default).
     /// In Inclusive mode: all matching branches (or default if none match).
-    #[cfg(test)] // Used in tests; wired into execution loop in Task 13.5
     fn evaluate(
         &mut self,
         emitted: &IndexMap<String, Value>,
@@ -164,7 +162,125 @@ impl CompiledRoute {
     }
 }
 
+/// Per-output writer channel for multi-output dispatch.
+///
+/// Each output gets a dedicated thread with a bounded SPSC channel.
+/// Records are sent as `Vec<Record>` batches (one batch per chunk or per
+/// accumulated routing result) to amortize ~50ns/send channel overhead.
+struct OutputChannel {
+    sender: crossbeam_channel::Sender<Vec<Record>>,
+    cancel_sender: crossbeam_channel::Sender<()>,
+    handle: std::thread::JoinHandle<Result<(), PipelineError>>,
+}
+
+/// Spawn a dedicated writer thread per output.
+///
+/// Each thread owns a `CsvWriter` and reads from a bounded channel (capacity 4).
+/// The channel carries `Vec<Record>` batches. The thread uses `crossbeam::select!`
+/// to wait on data or cancel signals.
+fn spawn_writer_threads(
+    writers: HashMap<String, Box<dyn Write + Send>>,
+    output_configs: &[OutputConfig],
+    output_schema: Arc<Schema>,
+) -> HashMap<String, OutputChannel> {
+    writers
+        .into_iter()
+        .map(|(name, raw_writer)| {
+            let (data_tx, data_rx) = crossbeam_channel::bounded::<Vec<Record>>(4);
+            let (cancel_tx, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+            let config = output_configs
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap()
+                .clone();
+            let schema = Arc::clone(&output_schema);
+
+            let handle = std::thread::Builder::new()
+                .name(format!("cxl-writer-{name}"))
+                .spawn(move || {
+                    let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+                    let writer_config = build_writer_config(&config);
+                    let mut csv_writer = CsvWriter::new(buf_writer, schema, writer_config);
+                    loop {
+                        crossbeam_channel::select! {
+                            recv(data_rx) -> msg => match msg {
+                                Ok(records) => {
+                                    for record in &records {
+                                        csv_writer.write_record(record)?;
+                                    }
+                                }
+                                Err(_) => break, // all senders dropped = normal EOF
+                            },
+                            recv(cancel_rx) -> _ => {
+                                // Cancel signal — drain remaining buffered items
+                                while let Ok(records) = data_rx.try_recv() {
+                                    for record in &records {
+                                        csv_writer.write_record(record)?;
+                                    }
+                                }
+                                break;
+                            },
+                        }
+                    }
+                    csv_writer.flush()?;
+                    Ok(())
+                })
+                .expect("failed to spawn writer thread");
+
+            (
+                name,
+                OutputChannel {
+                    sender: data_tx,
+                    cancel_sender: cancel_tx,
+                    handle,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Join all writer threads, collecting ALL results. Never early-return.
+/// DataFusion Collection pattern (PR #14439).
+fn join_writer_threads(channels: HashMap<String, OutputChannel>) -> Result<(), PipelineError> {
+    let mut errors = Vec::new();
+    for (_name, channel) in channels {
+        drop(channel.sender); // signal EOF
+        drop(channel.cancel_sender);
+        match channel.handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errors.push(e),
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+        }
+    }
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(errors.into_iter().next().unwrap()),
+        _ => Err(PipelineError::Multiple(errors)),
+    }
+}
+
+/// Flush accumulated per-output batches through channels.
+fn flush_output_batches(
+    per_output_batches: &mut HashMap<String, Vec<Record>>,
+    output_channels: &HashMap<String, OutputChannel>,
+) -> Result<(), PipelineError> {
+    for (name, batch) in per_output_batches.drain() {
+        if batch.is_empty() {
+            continue;
+        }
+        if let Some(channel) = output_channels.get(&name)
+            && channel.sender.send(batch).is_err()
+        {
+            // Writer thread died (panicked or errored) — channel disconnected.
+            // Don't deadlock; stop sending to this output. Errors will be
+            // collected in join_writer_threads.
+        }
+    }
+    Ok(())
+}
+
 /// Record that failed evaluation, queued for DLQ output.
+#[derive(Debug)]
 pub struct DlqEntry {
     pub source_row: u64,
     pub category: crate::dlq::DlqErrorCategory,
@@ -189,7 +305,7 @@ impl PipelineExecutor {
     pub fn run_with_readers_writers(
         config: &PipelineConfig,
         mut readers: HashMap<String, Box<dyn Read + Send>>,
-        mut writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
@@ -251,21 +367,23 @@ impl PipelineExecutor {
 
         let execution_mode = plan.mode();
 
-        // Extract the primary writer from the registry, wrapped in 64 KiB BufWriter
-        let output = &config.outputs[0];
-        let raw_writer = writers.remove(&output.name).ok_or_else(|| {
-            PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                "no writer registered for output '{}'",
-                output.name
-            )))
-        })?;
-        let writer = BufWriter::with_capacity(65536, raw_writer);
+        // Validate that all configured outputs have registered writers.
+        for output in &config.outputs {
+            if !writers.contains_key(&output.name) {
+                return Err(PipelineError::Config(
+                    crate::config::ConfigError::Validation(format!(
+                        "no writer registered for output '{}'",
+                        output.name
+                    )),
+                ));
+            }
+        }
 
         let (counters, dlq_entries, peak_rss_bytes) = match execution_mode {
             ExecutionMode::Streaming => Self::execute_streaming(
                 config,
                 csv_reader,
-                writer,
+                writers,
                 &compiled_transforms,
                 compiled_route,
                 params,
@@ -273,7 +391,7 @@ impl PipelineExecutor {
             ExecutionMode::TwoPass => Self::execute_two_pass(
                 config,
                 csv_reader,
-                writer,
+                writers,
                 &compiled_transforms,
                 compiled_route,
                 &plan,
@@ -294,17 +412,16 @@ impl PipelineExecutor {
     /// Single-pass streaming execution (no windows).
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
-    fn execute_streaming<R: Read + Send, W: Write + Send>(
+    fn execute_streaming<R: Read + Send>(
         config: &PipelineConfig,
         mut csv_reader: CsvReader<R>,
-        writer: W,
+        writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
-        _compiled_route: Option<CompiledRoute>, // Wired into execution in Task 13.5
+        compiled_route: Option<CompiledRoute>,
         params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
-        let output = &config.outputs[0];
-        let writer_config = build_writer_config(output);
+        let primary_output = &config.outputs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
         let mut counters = PipelineCounters::default();
@@ -312,13 +429,13 @@ impl PipelineExecutor {
         let strategy = config.error_handling.strategy;
         let mut evaluators = build_evaluators(transforms);
 
+        let is_multi_output = compiled_route.is_some() && writers.len() > 1;
+        let mut compiled_route = compiled_route;
+
         // Scan forward until a record emits, to derive the output schema.
-        // Records that skip or error before the first emit are counted but
-        // buffered — they can't be written yet because we don't know the
-        // output schema until the first Emit.
         let schema = csv_reader.schema()?;
         let mut row_num: u64 = 0;
-        let mut first_projected = None;
+        let mut first_emitted: Option<(Record, IndexMap<String, Value>)> = None;
         let mut pending_skips_and_errors: Vec<(
             u64,
             Record,
@@ -340,11 +457,8 @@ impl PipelineExecutor {
             let result = evaluate_record(&record, &mut evaluators, &ctx);
             match &result {
                 Ok(EvalResult::Emit(emitted)) => {
-                    let projected = project_output(&record, emitted, output);
-                    first_projected = Some(projected);
-                    // Count this record
                     counters.ok_count += 1;
-                    // Process any pending skips/errors that came before
+                    first_emitted = Some((record, emitted.clone()));
                     break;
                 }
                 Ok(EvalResult::Skip(_)) | Err(_) => {
@@ -353,89 +467,229 @@ impl PipelineExecutor {
             }
         }
 
-        let output_schema = if let Some(ref proj) = first_projected {
-            Arc::clone(proj.schema())
+        // Derive output schema from first emitted record
+        let output_schema = if let Some((ref rec, ref emitted)) = first_emitted {
+            let projected = project_output(rec, emitted, primary_output);
+            Arc::clone(projected.schema())
         } else {
-            // All records were filtered/errored, or file was empty — use input schema
             schema
         };
 
-        let mut csv_writer = CsvWriter::new(writer, Arc::clone(&output_schema), writer_config);
+        if is_multi_output {
+            // --- Multi-output path: spawn writer threads ---
+            let output_channels =
+                spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
 
-        // Process pending skips and errors from the scan-forward phase
-        for (rn, record, result) in pending_skips_and_errors {
-            match result {
-                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                    counters.filtered_count += 1;
-                }
-                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                    counters.distinct_count += 1;
-                }
-                Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
-                Err(eval_err) => {
-                    handle_error(
-                        strategy,
-                        &record,
-                        rn,
-                        &eval_err,
-                        &mut counters,
-                        &mut dlq_entries,
-                        output,
-                        &output_schema,
-                        &mut csv_writer,
-                    )?;
+            // Process pending skips/errors (no writes needed — they were filtered/errored)
+            for (_rn, _record, result) in &pending_skips_and_errors {
+                match result {
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
+                    Err(eval_err) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            // Drop channels to signal writer threads to stop
+                            drop(output_channels);
+                            return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                span: eval_err.span,
+                                kind: eval_err.kind.clone(),
+                            }));
+                        }
+                        counters.dlq_count += 1;
+                        dlq_entries.push(DlqEntry {
+                            source_row: _rn.to_owned(),
+                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: eval_err.to_string(),
+                            original_record: _record.clone(),
+                        });
+                    }
                 }
             }
-        }
 
-        // Write the first emitted record
-        if let Some(projected) = first_projected {
-            csv_writer.write_record(&projected)?;
-        }
+            // Dispatch first emitted record
+            if let Some((record, emitted)) = first_emitted {
+                let route = compiled_route.as_mut().unwrap();
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    1, // first emitted row
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                let targets = route.evaluate(&emitted, &ctx)?;
+                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                for target in &targets {
+                    let out_cfg = config
+                        .outputs
+                        .iter()
+                        .find(|o| o.name == *target)
+                        .unwrap_or(primary_output);
+                    let projected = project_output(&record, &emitted, out_cfg);
+                    per_output_batches
+                        .entry(target.clone())
+                        .or_default()
+                        .push(projected);
+                }
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
+            }
 
-        // Process remaining records
-        while let Some(record) = csv_reader.next_record()? {
-            row_num += 1;
-            counters.total_count += 1;
-            let ctx = build_eval_context(
-                config,
-                &input.path,
-                row_num,
-                pipeline_start_time,
-                &params.execution_id,
-                &params.batch_id,
-                &params.pipeline_vars,
-            );
-            match evaluate_record(&record, &mut evaluators, &ctx) {
-                Ok(EvalResult::Emit(emitted)) => {
-                    let projected = project_output(&record, &emitted, output);
-                    csv_writer.write_record(&projected)?;
-                    counters.ok_count += 1;
+            // Process remaining records
+            let route = compiled_route.as_mut().unwrap();
+            let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+            while let Some(record) = csv_reader.next_record()? {
+                row_num += 1;
+                counters.total_count += 1;
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    row_num,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                match evaluate_record(&record, &mut evaluators, &ctx) {
+                    Ok(EvalResult::Emit(emitted)) => {
+                        let targets = route.evaluate(&emitted, &ctx)?;
+                        for target in &targets {
+                            let out_cfg = config
+                                .outputs
+                                .iter()
+                                .find(|o| o.name == *target)
+                                .unwrap_or(primary_output);
+                            let projected = project_output(&record, &emitted, out_cfg);
+                            per_output_batches
+                                .entry(target.clone())
+                                .or_default()
+                                .push(projected);
+                        }
+                        counters.ok_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err(eval_err) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            drop(output_channels);
+                            return Err(eval_err.into());
+                        }
+                        counters.dlq_count += 1;
+                        dlq_entries.push(DlqEntry {
+                            source_row: row_num,
+                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: eval_err.to_string(),
+                            original_record: record,
+                        });
+                    }
                 }
-                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                    counters.filtered_count += 1;
-                }
-                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                    counters.distinct_count += 1;
-                }
-                Err(eval_err) => {
-                    handle_error(
-                        strategy,
-                        &record,
-                        row_num,
-                        &eval_err,
-                        &mut counters,
-                        &mut dlq_entries,
-                        output,
-                        &output_schema,
-                        &mut csv_writer,
-                    )?;
+
+                // Flush batches periodically (every record in streaming — batches
+                // are small; the channel's bounded capacity provides backpressure)
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
+            }
+
+            // Final flush
+            flush_output_batches(&mut per_output_batches, &output_channels)?;
+
+            // Join writer threads
+            join_writer_threads(output_channels)?;
+        } else {
+            // --- Single-output path: direct write, no channel overhead ---
+            let output = primary_output;
+            let writer_config = build_writer_config(output);
+            let raw_writer = writers
+                .into_iter()
+                .next()
+                .map(|(_, w)| w)
+                .expect("validated above");
+            let writer = BufWriter::with_capacity(65536, raw_writer);
+            let mut csv_writer = CsvWriter::new(writer, Arc::clone(&output_schema), writer_config);
+
+            // Process pending skips and errors from the scan-forward phase
+            for (rn, record, result) in pending_skips_and_errors {
+                match result {
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
+                    Err(eval_err) => {
+                        handle_error(
+                            strategy,
+                            &record,
+                            rn,
+                            &eval_err,
+                            &mut counters,
+                            &mut dlq_entries,
+                            output,
+                            &output_schema,
+                            &mut csv_writer,
+                        )?;
+                    }
                 }
             }
-            row_num += 1;
+
+            // Write the first emitted record
+            if let Some((record, emitted)) = first_emitted {
+                let projected = project_output(&record, &emitted, output);
+                csv_writer.write_record(&projected)?;
+            }
+
+            // Process remaining records
+            while let Some(record) = csv_reader.next_record()? {
+                row_num += 1;
+                counters.total_count += 1;
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    row_num,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                match evaluate_record(&record, &mut evaluators, &ctx) {
+                    Ok(EvalResult::Emit(emitted)) => {
+                        let projected = project_output(&record, &emitted, output);
+                        csv_writer.write_record(&projected)?;
+                        counters.ok_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err(eval_err) => {
+                        handle_error(
+                            strategy,
+                            &record,
+                            row_num,
+                            &eval_err,
+                            &mut counters,
+                            &mut dlq_entries,
+                            output,
+                            &output_schema,
+                            &mut csv_writer,
+                        )?;
+                    }
+                }
+            }
+
+            csv_writer.flush()?;
         }
 
-        csv_writer.flush()?;
         Ok((counters, dlq_entries, rss_bytes()))
     }
 
@@ -443,18 +697,21 @@ impl PipelineExecutor {
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`. Peak RSS is sampled
     /// via [`MemoryBudget::observe`] at each chunk boundary.
-    fn execute_two_pass<R: Read + Send, W: Write + Send>(
+    fn execute_two_pass<R: Read + Send>(
         config: &PipelineConfig,
         mut csv_reader: CsvReader<R>,
-        writer: W,
+        writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
-        _compiled_route: Option<CompiledRoute>, // Wired into execution in Task 13.5
+        compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlan,
         params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
-        let output = &config.outputs[0];
+        let primary_output = &config.outputs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
+
+        let is_multi_output = compiled_route.is_some() && writers.len() > 1;
+        let mut compiled_route = compiled_route;
 
         // Phase 1: Build Arena from primary source
         let arena_fields =
@@ -502,18 +759,10 @@ impl PipelineExecutor {
         }
 
         // Phase 2: Chunk-based evaluation with optional rayon parallelism.
-        //
-        // Records are built from Arena (projected fields only). Chunks of
-        // `chunk_size` records are evaluated, then written inline.
-        // For Stateless/IndexReading transforms, evaluation is parallelized
-        // via `pool.install(|| chunk.par_iter_mut().for_each(...))`.
-        // Sequential transforms use a plain `for` loop.
-
         let pool = build_thread_pool(config)?;
         let use_parallel = can_parallelize(plan);
 
         let output_schema_ref = arena.schema();
-        let writer_config = build_writer_config(output);
         let strategy = config.error_handling.strategy;
 
         let record_count = arena.record_count();
@@ -544,7 +793,7 @@ impl PipelineExecutor {
         let mut counters = PipelineCounters::default();
         let mut dlq_entries = Vec::new();
         let mut first_emit_pos: Option<u32> = None;
-        let mut first_projected = None;
+        let mut first_emitted: Option<(Record, IndexMap<String, Value>)> = None;
         let mut evaluators = build_evaluators(transforms);
 
         for pos in 0..record_count {
@@ -570,8 +819,7 @@ impl PipelineExecutor {
             counters.total_count += 1;
             match result {
                 Ok(EvalResult::Emit(emitted)) => {
-                    let projected = project_output(&record, &emitted, output);
-                    first_projected = Some(projected);
+                    first_emitted = Some((record, emitted));
                     first_emit_pos = Some(pos);
                     counters.ok_count += 1;
                     break;
@@ -597,41 +845,22 @@ impl PipelineExecutor {
             }
         }
 
-        let final_output_schema = if let Some(ref proj) = first_projected {
-            Arc::clone(proj.schema())
+        let final_output_schema = if let Some((ref rec, ref emitted)) = first_emitted {
+            let projected = project_output(rec, emitted, primary_output);
+            Arc::clone(projected.schema())
         } else {
-            // All records filtered/errored — use arena schema for header-only output
             Arc::clone(output_schema_ref)
         };
 
-        let mut csv_writer =
-            CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
-
-        // Write the first emitted record
-        if let Some(projected) = first_projected {
-            csv_writer.write_record(&projected)?;
-        }
-
-        // Process remaining records in chunks.
-        // Start after the last record processed in the scan-forward phase.
-        let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
-        while chunk_start < record_count {
-            let chunk_end = (chunk_start + chunk_size).min(record_count);
-
-            // Build chunk: (arena_pos, Record, eval result — None until evaluated)
-            #[allow(clippy::type_complexity)]
-            let mut chunk: Vec<(
-                u32,
-                Record,
-                Option<Result<EvalResult, cxl::eval::EvalError>>,
-            )> = (chunk_start..chunk_end)
-                .map(|pos| (pos, build_record_from_arena(pos), None))
-                .collect();
-
-            // Evaluate: parallel or sequential
+        // Helper: evaluate chunk and collect results
+        #[allow(clippy::type_complexity)]
+        let evaluate_chunk = |chunk: &mut Vec<(
+            u32,
+            Record,
+            Option<Result<EvalResult, cxl::eval::EvalError>>,
+        )>,
+                              evaluators: &mut Vec<ProgramEvaluator>| {
             if use_parallel {
-                // Parallel: each thread gets fresh evaluators (stateless only —
-                // distinct forces Sequential so parallel never runs with distinct).
                 pool.install(|| {
                     chunk.par_iter_mut().for_each(|(pos, record, result)| {
                         let ctx = build_eval_context(
@@ -656,7 +885,6 @@ impl PipelineExecutor {
                     });
                 });
             } else {
-                // Sequential: reuse shared evaluators (distinct state persists).
                 for (pos, record, result) in chunk.iter_mut() {
                     let ctx = build_eval_context(
                         config,
@@ -668,54 +896,198 @@ impl PipelineExecutor {
                         &params.pipeline_vars,
                     );
                     *result = Some(evaluate_record_with_window(
-                        record,
-                        &mut evaluators,
-                        &ctx,
-                        plan,
-                        &arena,
-                        &indices,
-                        *pos,
+                        record, evaluators, &ctx, plan, &arena, &indices, *pos,
                     ));
                 }
             }
+        };
 
-            // Write chunk results inline (single-threaded, preserves order)
-            for (pos, record, result) in &chunk {
-                let row_num = *pos as u64 + 1;
-                counters.total_count += 1;
-                match result.as_ref().unwrap() {
-                    Ok(EvalResult::Emit(emitted)) => {
-                        let projected = project_output(record, emitted, output);
-                        csv_writer.write_record(&projected)?;
-                        counters.ok_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Err(eval_err) => {
-                        handle_error(
-                            strategy,
-                            record,
-                            row_num,
-                            eval_err,
-                            &mut counters,
-                            &mut dlq_entries,
-                            output,
-                            &final_output_schema,
-                            &mut csv_writer,
-                        )?;
-                    }
+        let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
+
+        if is_multi_output {
+            // --- Multi-output path: spawn writer threads ---
+            let output_channels =
+                spawn_writer_threads(writers, &config.outputs, Arc::clone(&final_output_schema));
+
+            // Dispatch first emitted record
+            if let Some((record, emitted)) = first_emitted {
+                let route = compiled_route.as_mut().unwrap();
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    first_emit_pos.unwrap() as u64 + 1,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                let targets = route.evaluate(&emitted, &ctx)?;
+                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                for target in &targets {
+                    let out_cfg = config
+                        .outputs
+                        .iter()
+                        .find(|o| o.name == *target)
+                        .unwrap_or(primary_output);
+                    let projected = project_output(&record, &emitted, out_cfg);
+                    per_output_batches
+                        .entry(target.clone())
+                        .or_default()
+                        .push(projected);
                 }
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
             }
 
-            rss_budget.observe();
-            chunk_start = chunk_end;
+            // Process remaining records in chunks
+            let route = compiled_route.as_mut().unwrap();
+            while chunk_start < record_count {
+                let chunk_end = (chunk_start + chunk_size).min(record_count);
+
+                #[allow(clippy::type_complexity)]
+                let mut chunk: Vec<(
+                    u32,
+                    Record,
+                    Option<Result<EvalResult, cxl::eval::EvalError>>,
+                )> = (chunk_start..chunk_end)
+                    .map(|pos| (pos, build_record_from_arena(pos), None))
+                    .collect();
+
+                evaluate_chunk(&mut chunk, &mut evaluators);
+
+                // Route and dispatch chunk results
+                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                for (pos, record, result) in &chunk {
+                    let row_num = *pos as u64 + 1;
+                    counters.total_count += 1;
+                    match result.as_ref().unwrap() {
+                        Ok(EvalResult::Emit(emitted)) => {
+                            let ctx = build_eval_context(
+                                config,
+                                &input.path,
+                                row_num,
+                                pipeline_start_time,
+                                &params.execution_id,
+                                &params.batch_id,
+                                &params.pipeline_vars,
+                            );
+                            let targets = route.evaluate(emitted, &ctx)?;
+                            for target in &targets {
+                                let out_cfg = config
+                                    .outputs
+                                    .iter()
+                                    .find(|o| o.name == *target)
+                                    .unwrap_or(primary_output);
+                                let projected = project_output(record, emitted, out_cfg);
+                                per_output_batches
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .push(projected);
+                            }
+                            counters.ok_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                            counters.filtered_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                            counters.distinct_count += 1;
+                        }
+                        Err(eval_err) => {
+                            if strategy == ErrorStrategy::FailFast {
+                                drop(output_channels);
+                                return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                    span: eval_err.span,
+                                    kind: eval_err.kind.clone(),
+                                }));
+                            }
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: row_num,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: eval_err.to_string(),
+                                original_record: record.clone(),
+                            });
+                        }
+                    }
+                }
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
+
+                rss_budget.observe();
+                chunk_start = chunk_end;
+            }
+
+            join_writer_threads(output_channels)?;
+        } else {
+            // --- Single-output path: direct write, no channel overhead ---
+            let output = primary_output;
+            let writer_config = build_writer_config(output);
+            let raw_writer = writers
+                .into_iter()
+                .next()
+                .map(|(_, w)| w)
+                .expect("validated above");
+            let writer = BufWriter::with_capacity(65536, raw_writer);
+            let mut csv_writer =
+                CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
+
+            // Write the first emitted record
+            if let Some((record, emitted)) = first_emitted {
+                let projected = project_output(&record, &emitted, output);
+                csv_writer.write_record(&projected)?;
+            }
+
+            while chunk_start < record_count {
+                let chunk_end = (chunk_start + chunk_size).min(record_count);
+
+                #[allow(clippy::type_complexity)]
+                let mut chunk: Vec<(
+                    u32,
+                    Record,
+                    Option<Result<EvalResult, cxl::eval::EvalError>>,
+                )> = (chunk_start..chunk_end)
+                    .map(|pos| (pos, build_record_from_arena(pos), None))
+                    .collect();
+
+                evaluate_chunk(&mut chunk, &mut evaluators);
+
+                // Write chunk results inline (single-threaded, preserves order)
+                for (pos, record, result) in &chunk {
+                    let row_num = *pos as u64 + 1;
+                    counters.total_count += 1;
+                    match result.as_ref().unwrap() {
+                        Ok(EvalResult::Emit(emitted)) => {
+                            let projected = project_output(record, emitted, output);
+                            csv_writer.write_record(&projected)?;
+                            counters.ok_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                            counters.filtered_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                            counters.distinct_count += 1;
+                        }
+                        Err(eval_err) => {
+                            handle_error(
+                                strategy,
+                                record,
+                                row_num,
+                                eval_err,
+                                &mut counters,
+                                &mut dlq_entries,
+                                output,
+                                &final_output_schema,
+                                &mut csv_writer,
+                            )?;
+                        }
+                    }
+                }
+
+                rss_budget.observe();
+                chunk_start = chunk_end;
+            }
+
+            csv_writer.flush()?;
         }
 
-        csv_writer.flush()?;
         Ok((counters, dlq_entries, rss_budget.peak_rss))
     }
 

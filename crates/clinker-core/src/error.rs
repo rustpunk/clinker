@@ -13,6 +13,9 @@ pub enum PipelineError {
     },
     Io(std::io::Error),
     ThreadPool(String),
+    /// Multiple errors collected from parallel writer threads.
+    /// DataFusion `Collection` pattern (PR #14439).
+    Multiple(Vec<PipelineError>),
 }
 
 impl fmt::Display for PipelineError {
@@ -37,6 +40,13 @@ impl fmt::Display for PipelineError {
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::ThreadPool(e) => write!(f, "thread pool error: {e}"),
+            Self::Multiple(errors) => {
+                write!(f, "{} errors:", errors.len())?;
+                for e in errors {
+                    write!(f, "\n  - {e}")?;
+                }
+                Ok(())
+            }
         }
     }
 }

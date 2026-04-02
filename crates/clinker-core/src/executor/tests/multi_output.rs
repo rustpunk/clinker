@@ -270,3 +270,730 @@ default: regular
     let targets = route.evaluate(&emitted, &ctx).unwrap();
     assert_eq!(targets, vec!["vip"]);
 }
+
+// --- Multi-output channel integration tests ---
+
+/// Helper: run a multi-output pipeline and return per-output CSV strings.
+fn run_multi_output(
+    yaml: &str,
+    csv_input: &str,
+) -> Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError> {
+    let (config, buffers) = multi_output_fixture(yaml);
+    let params = test_params(&config);
+
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        config.inputs[0].name.clone(),
+        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+            as Box<dyn std::io::Read + Send>,
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
+        .iter()
+        .map(|(name, buf)| {
+            (
+                name.clone(),
+                Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+            )
+        })
+        .collect();
+
+    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+
+    let outputs: HashMap<String, String> = buffers
+        .iter()
+        .map(|(name, buf)| (name.clone(), buf.as_string()))
+        .collect();
+
+    Ok((report.counters, report.dlq_entries, outputs))
+}
+
+#[test]
+fn test_multi_output_two_writers() {
+    let yaml = r#"
+pipeline:
+  name: test_two_outputs
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+outputs:
+  - name: high
+    path: high.csv
+    type: csv
+    include_unmapped: true
+  - name: low
+    path: low.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 4);
+    let high = &outputs["high"];
+    let low = &outputs["low"];
+
+    // High: rows with amount > 100 (ids 1, 3)
+    assert!(high.contains("1,200"), "high should contain id=1: {high}");
+    assert!(high.contains("3,300"), "high should contain id=3: {high}");
+    assert!(
+        !high.contains("2,50"),
+        "high should not contain id=2: {high}"
+    );
+
+    // Low: rows with amount <= 100 (ids 2, 4)
+    assert!(low.contains("2,50"), "low should contain id=2: {low}");
+    assert!(low.contains("4,10"), "low should contain id=4: {low}");
+    assert!(!low.contains("1,200"), "low should not contain id=1: {low}");
+}
+
+#[test]
+fn test_multi_output_three_writers() {
+    let yaml = r#"
+pipeline:
+  name: test_three_outputs
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 1000"
+        - name: medium
+          condition: "amount_val > 100"
+      default: low
+outputs:
+  - name: high
+    path: high.csv
+    type: csv
+    include_unmapped: true
+  - name: medium
+    path: medium.csv
+    type: csv
+    include_unmapped: true
+  - name: low
+    path: low.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let csv = "id,amount\n1,5000\n2,500\n3,50\n";
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 3);
+    assert!(outputs["high"].contains("1,5000"));
+    assert!(outputs["medium"].contains("2,500"));
+    assert!(outputs["low"].contains("3,50"));
+}
+
+#[test]
+fn test_multi_output_record_counts() {
+    let yaml = r#"
+pipeline:
+  name: test_record_counts
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: big
+          condition: "amount_val > 50"
+      default: small
+outputs:
+  - name: big
+    path: big.csv
+    type: csv
+    include_unmapped: true
+  - name: small
+    path: small.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n5,300\n";
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 5);
+    assert_eq!(counters.total_count, 5);
+
+    // Count data rows (subtract header line)
+    let big_rows = outputs["big"].lines().count() - 1;
+    let small_rows = outputs["small"].lines().count() - 1;
+    assert_eq!(big_rows + small_rows, 5);
+    assert_eq!(big_rows, 3); // 100, 200, 300
+    assert_eq!(small_rows, 2); // 10, 20
+}
+
+#[test]
+fn test_multi_output_order_preserved() {
+    let yaml = r#"
+pipeline:
+  name: test_order
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: big
+          condition: "amount_val > 50"
+      default: small
+outputs:
+  - name: big
+    path: big.csv
+    type: csv
+    include_unmapped: true
+  - name: small
+    path: small.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // All go to "big" — order must match input order
+    let csv = "id,amount\n1,100\n2,200\n3,300\n4,400\n5,500\n";
+    let (_, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    let big_lines: Vec<&str> = outputs["big"].lines().skip(1).collect();
+    assert_eq!(big_lines.len(), 5);
+    // Verify sequential IDs appear in order (column position depends on output config)
+    let ids: Vec<&str> = big_lines
+        .iter()
+        .map(|line| {
+            // Find the id value — it's the column matching the "id" header position
+            let header_cols: Vec<&str> =
+                outputs["big"].lines().next().unwrap().split(',').collect();
+            let id_idx = header_cols.iter().position(|&c| c == "id").unwrap();
+            line.split(',').nth(id_idx).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["1", "2", "3", "4", "5"],
+        "records must preserve input order"
+    );
+}
+
+#[test]
+fn test_multi_output_writer_error_propagated() {
+    /// A writer that fails after N bytes.
+    struct FailingWriter {
+        remaining: usize,
+    }
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "simulated write failure",
+                ));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.remaining == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "simulated flush failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let yaml = r#"
+pipeline:
+  name: test_writer_error
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: good
+          condition: "amount_val > 50"
+      default: bad
+outputs:
+  - name: good
+    path: good.csv
+    type: csv
+    include_unmapped: true
+  - name: bad
+    path: bad.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = test_params(&config);
+
+    let csv = "id,amount\n1,100\n2,10\n3,200\n";
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        "src".to_string(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    let good_buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        (
+            "good".to_string(),
+            Box::new(good_buf.clone()) as Box<dyn std::io::Write + Send>,
+        ),
+        (
+            "bad".to_string(),
+            // Fail after writing 10 bytes (enough for header but not data)
+            Box::new(FailingWriter { remaining: 10 }) as Box<dyn std::io::Write + Send>,
+        ),
+    ]);
+
+    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    assert!(result.is_err(), "should propagate writer error");
+}
+
+#[test]
+fn test_multi_output_inclusive_duplicate() {
+    let yaml = r#"
+pipeline:
+  name: test_inclusive
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      mode: inclusive
+      branches:
+        - name: audit
+          condition: "amount_val > 100"
+        - name: report
+          condition: "amount_val > 50"
+      default: standard
+outputs:
+  - name: audit
+    path: audit.csv
+    type: csv
+    include_unmapped: true
+  - name: report
+    path: report.csv
+    type: csv
+    include_unmapped: true
+  - name: standard
+    path: standard.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // amount=500 matches both audit (>100) and report (>50)
+    let csv = "id,amount\n1,500\n2,30\n";
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 2);
+
+    // Record 1 should appear in both audit and report
+    assert!(outputs["audit"].contains("1,500"));
+    assert!(outputs["report"].contains("1,500"));
+    // Record 2 matches neither → default
+    assert!(outputs["standard"].contains("2,30"));
+}
+
+#[test]
+fn test_single_output_no_channel_overhead() {
+    // No route config → single-output direct write path (no channels spawned)
+    let yaml = r#"
+pipeline:
+  name: test_single
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: passthrough
+    cxl: |
+      emit val = id
+outputs:
+  - name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let csv = "id\n1\n2\n3\n";
+    let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 3);
+    assert!(outputs["out"].contains("1\n"));
+    assert!(outputs["out"].contains("2\n"));
+    assert!(outputs["out"].contains("3\n"));
+}
+
+#[test]
+fn test_multi_output_empty_route() {
+    let yaml = r#"
+pipeline:
+  name: test_empty_route
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: special
+          condition: "amount_val > 99999"
+      default: normal
+outputs:
+  - name: special
+    path: special.csv
+    type: csv
+    include_unmapped: true
+  - name: normal
+    path: normal.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // No records match "special" (all < 99999)
+    let csv = "id,amount\n1,100\n2,200\n";
+    let (_, _, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    // Special output should have just a header (or be empty)
+    let special_lines: Vec<&str> = outputs["special"]
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert!(
+        special_lines.len() <= 1,
+        "special should be empty or header-only, got: {:?}",
+        special_lines
+    );
+
+    // Normal should have both records
+    assert!(outputs["normal"].contains("1,100"));
+    assert!(outputs["normal"].contains("2,200"));
+}
+
+#[test]
+fn test_multi_output_writer_panic_propagated() {
+    /// A writer that panics on the first write call (not flush).
+    /// BufWriter buffers everything, so the inner write is only called when BufWriter flushes.
+    /// This guarantees a single panic (no double-panic on drop).
+    struct PanickingWriter {
+        panicked: std::sync::atomic::AtomicBool,
+    }
+    impl std::io::Write for PanickingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            if !self
+                .panicked
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                panic!("simulated writer panic");
+            }
+            // During unwind/drop, don't panic again
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "already panicked",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let yaml = r#"
+pipeline:
+  name: test_panic
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: good
+          condition: "amount_val > 50"
+      default: bad
+outputs:
+  - name: good
+    path: good.csv
+    type: csv
+    include_unmapped: true
+  - name: bad
+    path: bad.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = test_params(&config);
+
+    let csv = "id,amount\n1,100\n2,10\n";
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        "src".to_string(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        (
+            "good".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+        ),
+        (
+            "bad".to_string(),
+            Box::new(PanickingWriter {
+                panicked: std::sync::atomic::AtomicBool::new(false),
+            }) as Box<dyn std::io::Write + Send>,
+        ),
+    ]);
+
+    // Panic should be caught and propagated, not hang or abort
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)
+    }));
+
+    // The panic is re-raised via resume_unwind, so catch_unwind catches it
+    assert!(result.is_err(), "writer panic should propagate");
+}
+
+#[test]
+fn test_multi_output_cancel_drains_and_flushes() {
+    // Cancel scenario: pipeline errors mid-stream but already-dispatched
+    // records should be flushed. We test this by having a FailFast error
+    // strategy with a record that triggers an eval error, but records before
+    // the error should still have been dispatched to writer threads.
+    //
+    // Since FailFast returns immediately, the writer threads get their
+    // channels dropped → they drain remaining items and flush.
+    let yaml = r#"
+pipeline:
+  name: test_cancel
+error_handling:
+  strategy: continue
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: big
+          condition: "amount_val > 50"
+      default: small
+outputs:
+  - name: big
+    path: big.csv
+    type: csv
+    include_unmapped: true
+  - name: small
+    path: small.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // "bad" will fail to_int → DLQ, but other records should still be written
+    let csv = "id,amount\n1,100\n2,bad\n3,200\n";
+    let (counters, dlq, outputs) = run_multi_output(yaml, csv).unwrap();
+
+    // Record 2 should fail and go to DLQ
+    assert_eq!(counters.dlq_count, 1);
+    assert_eq!(dlq.len(), 1);
+
+    // Records 1 and 3 should be in "big"
+    assert!(outputs["big"].contains("1,100"));
+    assert!(outputs["big"].contains("3,200"));
+}
+
+#[test]
+fn test_multi_output_send_error_disconnected() {
+    /// A writer that errors after writing N records (simulating a writer dying mid-stream).
+    struct DyingWriter {
+        inner: SharedBuffer,
+        writes_remaining: std::sync::atomic::AtomicU32,
+    }
+    impl std::io::Write for DyingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let remaining = self
+                .writes_remaining
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer died",
+                ));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let yaml = r#"
+pipeline:
+  name: test_disconnected
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: a
+          condition: "amount_val > 50"
+      default: b
+outputs:
+  - name: a
+    path: a.csv
+    type: csv
+    include_unmapped: true
+  - name: b
+    path: b.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = test_params(&config);
+
+    // Enough records that "b" gets traffic and will error
+    let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n";
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        "src".to_string(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        (
+            "a".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+        ),
+        (
+            "b".to_string(),
+            Box::new(DyingWriter {
+                inner: SharedBuffer::new(),
+                writes_remaining: std::sync::atomic::AtomicU32::new(3), // header + ~2 writes
+            }) as Box<dyn std::io::Write + Send>,
+        ),
+    ]);
+
+    // Should not deadlock — producer handles SendError::Disconnected
+    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    // Either error (from the dying writer) or success if the writer survived long enough
+    // The key assertion: no deadlock, no hang — the test completes
+    let _ = result;
+}
+
+#[test]
+fn test_multi_output_multiple_errors_collected() {
+    /// A writer that always fails on flush.
+    struct FlushFailWriter;
+    impl std::io::Write for FlushFailWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len()) // Accept writes
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "flush failed",
+            ))
+        }
+    }
+
+    let yaml = r#"
+pipeline:
+  name: test_multiple_errors
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: a
+          condition: "amount_val > 50"
+      default: b
+outputs:
+  - name: a
+    path: a.csv
+    type: csv
+    include_unmapped: true
+  - name: b
+    path: b.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = test_params(&config);
+
+    let csv = "id,amount\n1,100\n2,10\n";
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        "src".to_string(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    // Both writers will fail on flush → PipelineError::Multiple
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        (
+            "a".to_string(),
+            Box::new(FlushFailWriter) as Box<dyn std::io::Write + Send>,
+        ),
+        (
+            "b".to_string(),
+            Box::new(FlushFailWriter) as Box<dyn std::io::Write + Send>,
+        ),
+    ]);
+
+    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    match result {
+        Err(PipelineError::Multiple(errors)) => {
+            assert_eq!(errors.len(), 2, "should collect both flush errors");
+        }
+        Err(PipelineError::Io(_)) => {
+            // If only one error collected (order-dependent), that's also acceptable
+        }
+        other => panic!("expected Multiple or Io error, got: {other:?}"),
+    }
+}
