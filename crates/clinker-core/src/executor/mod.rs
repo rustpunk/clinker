@@ -97,6 +97,73 @@ fn build_evaluators(transforms: &[CompiledTransform]) -> Vec<ProgramEvaluator> {
         .collect()
 }
 
+/// Compiled route branch: a named CXL boolean condition evaluator.
+#[allow(dead_code)] // Used in tests now; wired into execution loop in Task 13.5
+struct CompiledRouteBranch {
+    name: String,
+    evaluator: ProgramEvaluator,
+}
+
+/// Compiled route configuration for multi-output dispatch.
+#[allow(dead_code)] // Used in tests now; wired into execution loop in Task 13.5
+struct CompiledRoute {
+    branches: Vec<CompiledRouteBranch>,
+    default: String,
+    mode: crate::config::RouteMode,
+}
+
+impl CompiledRoute {
+    /// Evaluate route conditions against emitted fields.
+    ///
+    /// Returns the list of output names the record should be dispatched to.
+    /// In Exclusive mode: first matching branch (or default).
+    /// In Inclusive mode: all matching branches (or default if none match).
+    #[cfg(test)] // Used in tests; wired into execution loop in Task 13.5
+    fn evaluate(
+        &mut self,
+        emitted: &IndexMap<String, Value>,
+        ctx: &EvalContext,
+    ) -> Result<Vec<String>, cxl::eval::EvalError> {
+        // Convert emitted IndexMap to HashMap for HashMapResolver
+        let hash_fields: HashMap<String, Value> = emitted
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let resolver = clinker_record::HashMapResolver::new(hash_fields);
+
+        match self.mode {
+            crate::config::RouteMode::Exclusive => {
+                for branch in &mut self.branches {
+                    match branch
+                        .evaluator
+                        .eval_record::<NullStorage>(ctx, &resolver, None)?
+                    {
+                        EvalResult::Emit(_) => return Ok(vec![branch.name.clone()]),
+                        EvalResult::Skip(_) => continue,
+                    }
+                }
+                Ok(vec![self.default.clone()])
+            }
+            crate::config::RouteMode::Inclusive => {
+                let mut matched = Vec::new();
+                for branch in &mut self.branches {
+                    match branch
+                        .evaluator
+                        .eval_record::<NullStorage>(ctx, &resolver, None)?
+                    {
+                        EvalResult::Emit(_) => matched.push(branch.name.clone()),
+                        EvalResult::Skip(_) => {}
+                    }
+                }
+                if matched.is_empty() {
+                    matched.push(self.default.clone());
+                }
+                Ok(matched)
+            }
+        }
+    }
+}
+
 /// Record that failed evaluation, queued for DLQ output.
 pub struct DlqEntry {
     pub source_row: u64,
@@ -143,6 +210,32 @@ impl PipelineExecutor {
         let resolved_transforms: Vec<_> = config.transforms().collect();
         let compiled_transforms = Self::compile_transforms(&resolved_transforms, &schema)?;
 
+        // Compile route conditions if any transform has a route config.
+        // Collect all emitted field names for route condition resolution.
+        let compiled_route = {
+            let route_config = resolved_transforms
+                .iter()
+                .rev()
+                .find_map(|t| t.route.as_ref());
+            match route_config {
+                Some(rc) => {
+                    let mut emitted_fields: Vec<String> =
+                        schema.columns().iter().map(|c| c.to_string()).collect();
+                    for ct in &compiled_transforms {
+                        for stmt in &ct.typed.program.statements {
+                            if let Statement::Emit { name, .. } = stmt
+                                && !emitted_fields.contains(&name.to_string())
+                            {
+                                emitted_fields.push(name.to_string());
+                            }
+                        }
+                    }
+                    Some(Self::compile_route(rc, &emitted_fields)?)
+                }
+                None => None,
+            }
+        };
+
         // Build ExecutionPlan to determine mode
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled_transforms
             .iter()
@@ -169,14 +262,20 @@ impl PipelineExecutor {
         let writer = BufWriter::with_capacity(65536, raw_writer);
 
         let (counters, dlq_entries, peak_rss_bytes) = match execution_mode {
-            ExecutionMode::Streaming => {
-                Self::execute_streaming(config, csv_reader, writer, &compiled_transforms, params)?
-            }
+            ExecutionMode::Streaming => Self::execute_streaming(
+                config,
+                csv_reader,
+                writer,
+                &compiled_transforms,
+                compiled_route,
+                params,
+            )?,
             ExecutionMode::TwoPass => Self::execute_two_pass(
                 config,
                 csv_reader,
                 writer,
                 &compiled_transforms,
+                compiled_route,
                 &plan,
                 params,
             )?,
@@ -200,6 +299,7 @@ impl PipelineExecutor {
         mut csv_reader: CsvReader<R>,
         writer: W,
         transforms: &[CompiledTransform],
+        _compiled_route: Option<CompiledRoute>, // Wired into execution in Task 13.5
         params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
@@ -348,6 +448,7 @@ impl PipelineExecutor {
         mut csv_reader: CsvReader<R>,
         writer: W,
         transforms: &[CompiledTransform],
+        _compiled_route: Option<CompiledRoute>, // Wired into execution in Task 13.5
         plan: &ExecutionPlan,
         params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
@@ -695,6 +796,78 @@ impl PipelineExecutor {
             });
         }
         Ok(compiled)
+    }
+
+    /// Compile route conditions from the last transform's RouteConfig.
+    ///
+    /// Each branch condition is compiled as `filter <condition>` — a one-statement
+    /// CXL program. The filter returns Emit if true (route matches), Skip(Filtered)
+    /// if false (no match). This reuses the existing filter evaluation pattern.
+    fn compile_route(
+        route_config: &crate::config::RouteConfig,
+        emitted_fields: &[String],
+    ) -> Result<CompiledRoute, PipelineError> {
+        let type_schema: HashMap<String, Type> = emitted_fields
+            .iter()
+            .map(|f| (f.clone(), Type::Any))
+            .collect();
+        let field_refs: Vec<&str> = emitted_fields.iter().map(|s| s.as_str()).collect();
+
+        let mut branches = Vec::with_capacity(route_config.branches.len());
+        for branch in &route_config.branches {
+            // Compile condition as "filter <condition>"
+            let cxl_source = format!("filter {}", branch.condition);
+
+            let parse_result = cxl::parser::Parser::parse(&cxl_source);
+            if !parse_result.errors.is_empty() {
+                let messages: Vec<String> = parse_result
+                    .errors
+                    .iter()
+                    .map(|e| e.message.clone())
+                    .collect();
+                return Err(PipelineError::Compilation {
+                    transform_name: format!("route:{}", branch.name),
+                    messages,
+                });
+            }
+
+            let resolved = cxl::resolve::resolve_program(
+                parse_result.ast,
+                &field_refs,
+                parse_result.node_count,
+            )
+            .map_err(|diags| PipelineError::Compilation {
+                transform_name: format!("route:{}", branch.name),
+                messages: diags.into_iter().map(|d| d.message).collect(),
+            })?;
+
+            let typed = cxl::typecheck::type_check(resolved, &type_schema).map_err(|diags| {
+                let errors: Vec<String> = diags
+                    .iter()
+                    .filter(|d| !d.is_warning)
+                    .map(|d| d.message.clone())
+                    .collect();
+                PipelineError::Compilation {
+                    transform_name: format!("route:{}", branch.name),
+                    messages: if errors.is_empty() {
+                        diags.into_iter().map(|d| d.message).collect()
+                    } else {
+                        errors
+                    },
+                }
+            })?;
+
+            branches.push(CompiledRouteBranch {
+                name: branch.name.clone(),
+                evaluator: ProgramEvaluator::new(Arc::new(typed), false),
+            });
+        }
+
+        Ok(CompiledRoute {
+            branches,
+            default: route_config.default.clone(),
+            mode: route_config.mode,
+        })
     }
 
     /// Compile execution plan and return `--explain` output without reading data.

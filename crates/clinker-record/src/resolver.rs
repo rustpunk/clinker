@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::Value;
 use crate::record_view::RecordView;
 use crate::storage::RecordStorage;
@@ -85,6 +87,55 @@ const _: () = {
 
 // Note: WindowContext<'a, S> is object-safe when S is concrete (e.g. dyn WindowContext<'a, Arena>).
 // The assertion is tested in clinker-core where Arena is available.
+
+/// HashMap-backed FieldResolver for route condition evaluation and testing.
+///
+/// Wraps HashMaps for both unqualified and qualified field lookup.
+/// Promoted from test double to production code — used by route condition
+/// evaluation to resolve emitted fields.
+pub struct HashMapResolver {
+    fields: HashMap<String, Value>,
+    qualified: HashMap<(String, String), Value>,
+}
+
+impl HashMapResolver {
+    /// Create a resolver from a flat map of field names to values.
+    pub fn new(fields: HashMap<String, Value>) -> Self {
+        Self {
+            fields,
+            qualified: HashMap::new(),
+        }
+    }
+
+    /// Add a qualified field entry (`source.field` → value). Builder pattern.
+    pub fn with_qualified(mut self, source: &str, field: &str, value: Value) -> Self {
+        self.qualified.insert((source.into(), field.into()), value);
+        self
+    }
+}
+
+impl FieldResolver for HashMapResolver {
+    fn resolve(&self, name: &str) -> Option<Value> {
+        self.fields.get(name).cloned()
+    }
+
+    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
+        self.qualified
+            .get(&(source.to_owned(), field.to_owned()))
+            .cloned()
+    }
+
+    fn available_fields(&self) -> Vec<&str> {
+        self.fields.keys().map(|s| s.as_str()).collect()
+    }
+
+    fn iter_fields(&self) -> Vec<(String, Value)> {
+        self.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
 
 #[cfg(test)]
 mod tests {

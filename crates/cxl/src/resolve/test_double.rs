@@ -1,57 +1,14 @@
-use std::collections::HashMap;
-
-use clinker_record::Value;
-
-use super::traits::FieldResolver;
-
-/// Test double for unit testing the resolver and evaluator.
-/// Wraps HashMaps for both unqualified and qualified field lookup.
-pub struct HashMapResolver {
-    fields: HashMap<String, Value>,
-    qualified: HashMap<(String, String), Value>,
-}
-
-impl HashMapResolver {
-    /// Create a resolver from a flat map of field names to values.
-    pub fn new(fields: HashMap<String, Value>) -> Self {
-        Self {
-            fields,
-            qualified: HashMap::new(),
-        }
-    }
-
-    /// Add a qualified field entry (`source.field` → value). Builder pattern.
-    pub fn with_qualified(mut self, source: &str, field: &str, value: Value) -> Self {
-        self.qualified.insert((source.into(), field.into()), value);
-        self
-    }
-}
-
-impl FieldResolver for HashMapResolver {
-    fn resolve(&self, name: &str) -> Option<Value> {
-        self.fields.get(name).cloned()
-    }
-
-    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
-        self.qualified
-            .get(&(source.to_owned(), field.to_owned()))
-            .cloned()
-    }
-
-    fn available_fields(&self) -> Vec<&str> {
-        self.fields.keys().map(|s| s.as_str()).collect()
-    }
-
-    fn iter_fields(&self) -> Vec<(String, clinker_record::Value)> {
-        self.fields
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-}
+// HashMapResolver promoted to clinker-record::resolver::HashMapResolver.
+// Re-export for backward compatibility with existing cxl tests.
+pub use clinker_record::resolver::HashMapResolver;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use clinker_record::Value;
+    use clinker_record::resolver::FieldResolver;
+
     use super::*;
 
     /// FieldResolver must be object-safe for dynamic dispatch in the evaluator.
@@ -69,7 +26,6 @@ mod tests {
     #[test]
     fn test_window_context_object_safety() {
         use clinker_record::{RecordStorage, WindowContext};
-        // Dummy storage to provide a concrete S for the WindowContext trait
         struct DummyStorage;
         impl RecordStorage for DummyStorage {
             fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
@@ -85,7 +41,6 @@ mod tests {
                 0
             }
         }
-        // Compile-time check: dyn WindowContext<'_, S> is constructible as a trait object
         fn _accepts_dyn<'a>(_: &dyn WindowContext<'a, DummyStorage>) {}
     }
 
