@@ -1268,3 +1268,156 @@ outputs:
     assert!(header.contains("_cxl_dlq_stage"));
     assert!(header.contains("_cxl_dlq_route"));
 }
+
+// --- HashMap registry backward compat tests (Task 13.2) ---
+
+#[test]
+fn test_single_writer_hashmap_backward_compat() {
+    let yaml = r#"
+pipeline:
+  name: backward_compat_writer
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: identity
+    cxl: |
+      emit id_val = id
+"#;
+    let (config, buffers) = multi_output_fixture(yaml);
+    let params = test_params(&config);
+    let input_csv = "id,name\n1,Alice\n2,Bob\n";
+
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = [(
+        "src".to_string(),
+        Box::new(std::io::Cursor::new(input_csv.to_string())) as Box<dyn std::io::Read + Send>,
+    )]
+    .into_iter()
+    .collect();
+
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
+        .iter()
+        .map(|(name, buf)| {
+            (
+                name.clone(),
+                Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+            )
+        })
+        .collect();
+
+    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    assert!(
+        result.is_ok(),
+        "single-writer HashMap should work: {result:?}"
+    );
+
+    let output = buffers["dest"].as_string();
+    assert!(output.contains("Alice"), "output should contain Alice");
+    assert!(output.contains("Bob"), "output should contain Bob");
+}
+
+#[test]
+fn test_reader_hashmap_backward_compat() {
+    let yaml = r#"
+pipeline:
+  name: backward_compat_reader
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: identity
+    cxl: |
+      emit x_val = x
+"#;
+    let (config, buffers) = multi_output_fixture(yaml);
+    let params = test_params(&config);
+    let input_csv = "x\n42\n";
+
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = [(
+        "src".to_string(),
+        Box::new(std::io::Cursor::new(input_csv.to_string())) as Box<dyn std::io::Read + Send>,
+    )]
+    .into_iter()
+    .collect();
+
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
+        .iter()
+        .map(|(name, buf)| {
+            (
+                name.clone(),
+                Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+            )
+        })
+        .collect();
+
+    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    assert!(
+        result.is_ok(),
+        "single-reader HashMap should work: {result:?}"
+    );
+
+    let output = buffers["dest"].as_string();
+    assert!(
+        output.contains("42"),
+        "output should contain data from single reader"
+    );
+}
+
+// --- Route condition typecheck tests (Task 13.3) ---
+
+#[test]
+fn test_route_config_non_boolean_condition_typecheck_error() {
+    // "amount + 1" returns Int, not Bool — compile_route should reject it
+    let route_yaml = r#"
+mode: exclusive
+branches:
+  - name: bad
+    condition: "amount + 1"
+default: fallback
+"#;
+    let route_config: crate::config::RouteConfig = serde_saphyr::from_str(route_yaml).unwrap();
+    let emitted_fields = vec!["amount".to_string()];
+    let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
+    match result {
+        Err(e) => {
+            let err = e.to_string();
+            assert!(
+                err.contains("Bool"),
+                "error should mention Bool type requirement: {err}"
+            );
+        }
+        Ok(_) => panic!("non-boolean route condition should fail typecheck"),
+    }
+}
+
+#[test]
+fn test_route_config_boolean_condition_passes() {
+    // "amount > 10000" returns Bool — compile_route should succeed
+    let route_yaml = r#"
+mode: exclusive
+branches:
+  - name: high
+    condition: "amount > 10000"
+default: low
+"#;
+    let route_config: crate::config::RouteConfig = serde_saphyr::from_str(route_yaml).unwrap();
+    let emitted_fields = vec!["amount".to_string()];
+    let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
+    assert!(
+        result.is_ok(),
+        "boolean route condition should pass typecheck: {}",
+        result.err().map(|e| e.to_string()).unwrap_or_default()
+    );
+}
