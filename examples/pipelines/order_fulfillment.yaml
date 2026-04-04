@@ -40,9 +40,9 @@ transformations:
       "on": product_code
       group_by: product_code
     cxl: |
-      emit product_name = window.first().product_name
-      emit category = window.first().category
-      emit weight_kg = window.first().weight_kg
+      emit product_name = $window.first().product_name
+      emit category = $window.first().category
+      emit weight_kg = $window.first().weight_kg
 
   - _import: compositions/shipping_cost.comp.yaml
 

@@ -149,6 +149,7 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            split: None,
             notes: None,
         };
 
@@ -183,6 +184,7 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            split: None,
             notes: None,
         };
 
@@ -210,6 +212,7 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            split: None,
             notes: None,
         };
 

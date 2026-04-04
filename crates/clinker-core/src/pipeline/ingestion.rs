@@ -241,6 +241,8 @@ mod tests {
                 exclude: None,
                 sort_order: None,
                 preserve_nulls: None,
+                include_metadata: Default::default(),
+                split: None,
                 format: OutputFormat::Csv(None),
                 notes: None,
             }],

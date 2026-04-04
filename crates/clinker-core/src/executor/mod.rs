@@ -18,6 +18,7 @@ use crate::plan::execution::{ExecutionMode, ExecutionPlan, ParallelismClass};
 use crate::projection::project_output;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
+use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter};
 use clinker_format::traits::{FormatReader, FormatWriter};
 use cxl::ast::Statement;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, WallClock};
@@ -198,15 +199,34 @@ fn spawn_writer_threads(
             let handle = std::thread::Builder::new()
                 .name(format!("cxl-writer-{name}"))
                 .spawn(move || {
-                    let buf_writer = BufWriter::with_capacity(65536, raw_writer);
                     let writer_config = build_writer_config(&config);
-                    let mut csv_writer = CsvWriter::new(buf_writer, schema, writer_config);
+
+                    let mut writer: Box<dyn FormatWriter> = if let Some(ref split) = config.split {
+                        let policy = build_split_policy(split);
+                        let output_path = config.path.clone();
+                        let naming = split.naming.clone();
+
+                        let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                            let path = apply_split_naming(&output_path, &naming, seq);
+                            let file = std::fs::File::create(path)?;
+                            Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                        };
+
+                        // SplittingWriter creates its own files; don't use raw_writer.
+                        drop(raw_writer);
+
+                        Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+                    } else {
+                        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+                        Box::new(CsvWriter::new(buf_writer, schema, writer_config))
+                    };
+
                     loop {
                         crossbeam_channel::select! {
                             recv(data_rx) -> msg => match msg {
                                 Ok(records) => {
                                     for record in &records {
-                                        csv_writer.write_record(record)?;
+                                        writer.write_record(record)?;
                                     }
                                 }
                                 Err(_) => break, // all senders dropped = normal EOF
@@ -215,14 +235,14 @@ fn spawn_writer_threads(
                                 // Cancel signal — drain remaining buffered items
                                 while let Ok(records) = data_rx.try_recv() {
                                     for record in &records {
-                                        csv_writer.write_record(record)?;
+                                        writer.write_record(record)?;
                                     }
                                 }
                                 break;
                             },
                         }
                     }
-                    csv_writer.flush()?;
+                    writer.flush()?;
                     Ok(())
                 })
                 .expect("failed to spawn writer thread");
@@ -1455,6 +1475,39 @@ fn build_writer_config(output: &OutputConfig) -> CsvWriterConfig {
         config.delimiter = *b;
     }
     config
+}
+
+/// Convert serde `SplitConfig` to runtime `SplitPolicy`.
+fn build_split_policy(split: &crate::config::SplitConfig) -> SplitPolicy {
+    SplitPolicy {
+        max_records: split.max_records,
+        max_bytes: split.max_bytes,
+        group_key: split.group_key.clone(),
+        repeat_header: split.repeat_header,
+        oversize_group: match split.oversize_group {
+            crate::config::SplitOversizeGroupPolicy::Warn => OversizeGroupPolicy::Warn,
+            crate::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,
+            crate::config::SplitOversizeGroupPolicy::Allow => OversizeGroupPolicy::Allow,
+        },
+    }
+}
+
+/// Apply `{stem}_{seq:04}.{ext}` naming pattern to an output path.
+fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
+    let path = std::path::Path::new(base_path);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("dat");
+    let parent = path.parent().unwrap_or(std::path::Path::new(""));
+
+    let filename = naming
+        .replace("{stem}", stem)
+        .replace("{ext}", ext)
+        .replace("{seq:04}", &format!("{seq:04}"));
+
+    parent.join(filename).to_string_lossy().into_owned()
 }
 
 /// Build a rayon thread pool from config. Explicit pool (not global) for testability.

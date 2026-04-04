@@ -241,6 +241,10 @@ pub struct OutputConfig {
     /// Default: none (metadata stripped from output).
     #[serde(default, skip_serializing_if = "IncludeMetadata::is_none")]
     pub include_metadata: IncludeMetadata,
+    /// File splitting configuration. When present, output is split into
+    /// multiple files based on record count or byte size limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitConfig>,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
@@ -265,6 +269,55 @@ impl IncludeMetadata {
     pub fn is_none(&self) -> bool {
         matches!(self, IncludeMetadata::None)
     }
+}
+
+/// Output file splitting configuration.
+///
+/// When `group_key` is set, files are split only at key-group boundaries
+/// (greedy: first boundary after threshold). Without `group_key`, mechanical
+/// split at exact limit (like `split -l`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitConfig {
+    /// Soft record count limit per file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u64>,
+    /// Soft byte size limit per file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Optional key field — never split mid-group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<String>,
+    /// File naming pattern. Default: `"{stem}_{seq:04}.{ext}"`.
+    #[serde(default = "default_split_naming")]
+    pub naming: String,
+    /// CSV: repeat header row in each split file. Default: true.
+    #[serde(default = "default_true")]
+    pub repeat_header: bool,
+    /// Behavior when a single key group exceeds file limits.
+    #[serde(default)]
+    pub oversize_group: SplitOversizeGroupPolicy,
+}
+
+fn default_split_naming() -> String {
+    "{stem}_{seq:04}.{ext}".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Policy when a single key group exceeds split file limits.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitOversizeGroupPolicy {
+    /// Log a warning and allow the oversized file.
+    #[default]
+    Warn,
+    /// Error — pipeline stops.
+    Error,
+    /// Silently allow.
+    Allow,
 }
 
 /// Adjacently tagged format enum for outputs.

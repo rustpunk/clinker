@@ -7,6 +7,7 @@ use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
 /// Configuration for the CSV writer.
+#[derive(Clone)]
 pub struct CsvWriterConfig {
     pub delimiter: u8,
     pub include_header: bool,
@@ -44,6 +45,22 @@ impl<W: Write> CsvWriter<W> {
             config,
             header_written: false,
         }
+    }
+
+    /// Write a pre-captured header row, bypassing first-record discovery.
+    ///
+    /// Used by `SplittingWriter` on rotation to ensure all split files
+    /// have identical headers (captured from the first file).
+    pub fn write_preset_header(&mut self, header: &[Box<str>]) -> Result<(), FormatError> {
+        let refs: Vec<&str> = header.iter().map(|h| h.as_ref()).collect();
+        self.inner.write_record(&refs)?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    /// Borrow the underlying writer (e.g. for byte-count inspection).
+    pub fn get_ref(&self) -> &W {
+        self.inner.get_ref()
     }
 }
 
