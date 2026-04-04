@@ -299,6 +299,15 @@ fn flush_output_batches(
     Ok(())
 }
 
+/// Whether a DLQ entry is the root cause or correlated collateral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelationRole {
+    /// This record's own evaluation failed.
+    RootCause,
+    /// This record was DLQ'd because another record in its correlation group failed.
+    Collateral,
+}
+
 /// Record that failed evaluation, queued for DLQ output.
 #[derive(Debug)]
 pub struct DlqEntry {
@@ -312,6 +321,10 @@ pub struct DlqEntry {
     /// Route branch name if error occurred during or after routing.
     /// None for pre-routing errors.
     pub route: Option<String>,
+    /// `true` if this record's own evaluation caused the DLQ entry (root cause).
+    /// `false` if DLQ'd due to correlated group failure (collateral).
+    /// Serialized as `_cxl_dlq_trigger` column in DLQ CSV.
+    pub trigger: bool,
 }
 
 impl DlqEntry {
@@ -334,6 +347,83 @@ impl DlqEntry {
     pub fn stage_output(name: &str) -> String {
         format!("output:{name}")
     }
+}
+
+/// Check if the input's declared sort_order starts with the correlation key fields.
+fn is_sorted_by_correlation_key(
+    input_sort_order: &Option<Vec<crate::config::SortFieldSpec>>,
+    correlation_key: &crate::config::CorrelationKey,
+) -> bool {
+    let sort_order = match input_sort_order {
+        Some(so) => so,
+        None => return false,
+    };
+    let key_fields = correlation_key.fields();
+    if key_fields.len() > sort_order.len() {
+        return false;
+    }
+    for (i, key_field) in key_fields.iter().enumerate() {
+        let sort_field_name = match &sort_order[i] {
+            crate::config::SortFieldSpec::Short(name) => name.as_str(),
+            crate::config::SortFieldSpec::Full(sf) => sf.field.as_str(),
+        };
+        if sort_field_name != *key_field {
+            return false;
+        }
+    }
+    true
+}
+
+/// Auto-inject correlation key fields as a prefix to the sort order.
+/// Returns `true` if sort was injected (i.e., input was not already sorted by correlation key).
+fn maybe_inject_correlation_sort(
+    sort_order: &mut Vec<crate::config::SortFieldSpec>,
+    correlation_key: &crate::config::CorrelationKey,
+) -> bool {
+    let key_fields = correlation_key.fields();
+    let mut new_sort: Vec<crate::config::SortFieldSpec> = key_fields
+        .iter()
+        .map(|f| {
+            crate::config::SortFieldSpec::Full(crate::config::SortField {
+                field: f.to_string(),
+                order: crate::config::SortOrder::Asc,
+                null_order: None,
+            })
+        })
+        .collect();
+    new_sort.append(sort_order);
+    *sort_order = new_sort;
+    true
+}
+
+/// Extract correlation key values from a record as a vector of GroupByKey.
+fn extract_correlation_key(
+    record: &Record,
+    correlation_key: &crate::config::CorrelationKey,
+) -> Vec<GroupByKey> {
+    let fields = correlation_key.fields();
+    fields
+        .iter()
+        .map(|field| {
+            match record.get(field) {
+                Some(value) if !value.is_null() => {
+                    // Treat empty strings as null (CSV has no native null concept)
+                    if let Value::String(s) = value
+                        && s.is_empty()
+                    {
+                        return GroupByKey::Null;
+                    }
+                    // Use value_to_group_key for consistent hashing/comparison
+                    match value_to_group_key(value, field, None, 0) {
+                        Ok(Some(gk)) => gk,
+                        Ok(None) => GroupByKey::Null,
+                        Err(_) => GroupByKey::Null,
+                    }
+                }
+                _ => GroupByKey::Null,
+            }
+        })
+        .collect()
 }
 
 /// Unified pipeline executor. Plan-driven branching:
@@ -406,12 +496,42 @@ impl PipelineExecutor {
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let plan = ExecutionPlan::compile(config, &compiled_refs).map_err(|e| {
+        let mut plan = ExecutionPlan::compile(config, &compiled_refs).map_err(|e| {
             PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
             }
         })?;
+
+        // Handle correlation key: check sort, inject if needed, set plan note
+        let mut effective_sort_order: Option<Vec<crate::config::SortFieldSpec>> = None;
+        if let Some(ref correlation_key) = config.error_handling.correlation_key {
+            let input = &config.inputs[0];
+            if is_sorted_by_correlation_key(&input.sort_order, correlation_key) {
+                // Input already sorted by correlation key — no injection needed
+                plan.correlation_sort_note = Some(format!(
+                    "Correlation key: {:?} (input already sorted)",
+                    correlation_key.fields()
+                ));
+            } else {
+                // Auto-inject sort: prepend correlation key to existing sort
+                let mut sort = input.sort_order.clone().unwrap_or_default();
+                let existing_fields: Vec<String> = sort
+                    .iter()
+                    .map(|s| match s {
+                        crate::config::SortFieldSpec::Short(n) => n.clone(),
+                        crate::config::SortFieldSpec::Full(sf) => sf.field.clone(),
+                    })
+                    .collect();
+                maybe_inject_correlation_sort(&mut sort, correlation_key);
+                plan.correlation_sort_note = Some(format!(
+                    "Correlation sort (auto-injected): {:?} + existing {:?}",
+                    correlation_key.fields(),
+                    existing_fields
+                ));
+                effective_sort_order = Some(sort);
+            }
+        }
 
         let execution_mode = plan.mode();
 
@@ -444,6 +564,15 @@ impl PipelineExecutor {
                 compiled_route,
                 &plan,
                 params,
+            )?,
+            ExecutionMode::SortedStreaming => Self::execute_correlated_streaming(
+                config,
+                csv_reader,
+                writers,
+                &compiled_transforms,
+                compiled_route,
+                params,
+                effective_sort_order.as_deref(),
             )?,
         };
 
@@ -559,6 +688,7 @@ impl PipelineExecutor {
                             original_record: _record.clone(),
                             stage: Some(DlqEntry::stage_transform(transform_name)),
                             route: None,
+                            trigger: true,
                         });
                     }
                 }
@@ -607,6 +737,7 @@ impl PipelineExecutor {
                             original_record: record,
                             stage: Some(DlqEntry::stage_route_eval()),
                             route: None,
+                            trigger: true,
                         });
                     }
                 }
@@ -659,6 +790,7 @@ impl PipelineExecutor {
                                 original_record: record,
                                 stage: Some(DlqEntry::stage_route_eval()),
                                 route: None,
+                                trigger: true,
                             });
                         }
                     },
@@ -681,6 +813,7 @@ impl PipelineExecutor {
                             original_record: record,
                             stage: Some(DlqEntry::stage_transform(&transform_name)),
                             route: None,
+                            trigger: true,
                         });
                     }
                 }
@@ -790,6 +923,675 @@ impl PipelineExecutor {
         }
 
         Ok((counters, dlq_entries, rss_bytes()))
+    }
+
+    /// Correlated streaming execution: sort → group-boundary detection → batch eval → DLQ/emit.
+    ///
+    /// Reads all records, sorts by effective sort order (correlation key + user sort),
+    /// then processes groups atomically: if any record in a group fails, the entire
+    /// group is DLQ'd.
+    fn execute_correlated_streaming<R: Read + Send>(
+        config: &PipelineConfig,
+        mut csv_reader: CsvReader<R>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
+        transforms: &[CompiledTransform],
+        compiled_route: Option<CompiledRoute>,
+        params: &PipelineRunParams,
+        effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        let input = &config.inputs[0];
+        let primary_output = &config.outputs[0];
+        let pipeline_start_time = chrono::Local::now().naive_local();
+        let correlation_key = config
+            .error_handling
+            .correlation_key
+            .as_ref()
+            .expect("SortedStreaming requires correlation_key");
+        let max_group_buffer = config.error_handling.max_group_buffer.unwrap_or(100_000);
+
+        let mut counters = PipelineCounters::default();
+        let mut dlq_entries: Vec<DlqEntry> = Vec::new();
+        let strategy = config.error_handling.strategy;
+
+        // Phase 1: Read all records into memory
+        let schema = csv_reader.schema()?;
+        let mut all_records: Vec<(Record, u64)> = Vec::new();
+        let mut row_num: u64 = 0;
+        while let Some(record) = csv_reader.next_record()? {
+            row_num += 1;
+            counters.total_count += 1;
+            all_records.push((record, row_num));
+        }
+
+        if all_records.is_empty() {
+            return Ok((counters, dlq_entries, rss_bytes()));
+        }
+
+        // Phase 2: Sort by effective sort order if injection was needed
+        if let Some(sort_specs) = effective_sort_order {
+            let sort_fields: Vec<crate::config::SortField> = sort_specs
+                .iter()
+                .map(|s| s.clone().into_sort_field())
+                .collect();
+            all_records
+                .sort_by(|(a, _), (b, _)| sort::compare_records_by_fields(a, b, &sort_fields));
+        }
+
+        // Phase 3: Scan forward for first emitting record to derive output schema
+        let mut evaluators = build_evaluators(transforms);
+        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+        let is_multi_output = compiled_route.is_some() && writers.len() > 1;
+        let mut compiled_route = compiled_route;
+
+        // Find first emitting record for schema derivation
+        let mut first_emitted_schema: Option<Arc<Schema>> = None;
+        for (record, rn) in &all_records {
+            let ctx = build_eval_context(
+                config,
+                &input.path,
+                *rn,
+                pipeline_start_time,
+                &params.execution_id,
+                &params.batch_id,
+                &params.pipeline_vars,
+            );
+            if let Ok(EvalResult::Emit {
+                fields: emitted, ..
+            }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
+            {
+                let projected = project_output(record, &emitted, primary_output);
+                first_emitted_schema = Some(Arc::clone(projected.schema()));
+                break;
+            }
+        }
+
+        let output_schema = first_emitted_schema.unwrap_or(schema);
+
+        // Re-create evaluators (they were consumed during schema derivation scan)
+        let mut evaluators = build_evaluators(transforms);
+
+        // Phase 4: Spawn writer threads
+        if is_multi_output {
+            let output_channels =
+                spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
+
+            // Group-boundary streaming loop
+            let mut group_buffer: Vec<(Record, u64)> = Vec::new();
+            let mut current_key: Option<Vec<GroupByKey>> = None;
+            let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+
+            for (record, rn) in all_records {
+                let key = extract_correlation_key(&record, correlation_key);
+                let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
+
+                if is_null_key {
+                    // Null key → individual (group of one)
+                    let ctx = build_eval_context(
+                        config,
+                        &input.path,
+                        rn,
+                        pipeline_start_time,
+                        &params.execution_id,
+                        &params.batch_id,
+                        &params.pipeline_vars,
+                    );
+                    match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                        Ok(EvalResult::Emit {
+                            fields: emitted, ..
+                        }) => {
+                            Self::dispatch_to_outputs(
+                                &record,
+                                &emitted,
+                                config,
+                                primary_output,
+                                compiled_route.as_mut(),
+                                &ctx,
+                                &mut counters,
+                                &mut dlq_entries,
+                                &mut per_output_batches,
+                                strategy,
+                                rn,
+                            );
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                            counters.filtered_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                            counters.distinct_count += 1;
+                        }
+                        Err((transform_name, eval_err)) => {
+                            if strategy == ErrorStrategy::FailFast {
+                                drop(output_channels);
+                                return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                    span: eval_err.span,
+                                    kind: eval_err.kind.clone(),
+                                }));
+                            }
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: rn,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: eval_err.to_string(),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_transform(&transform_name)),
+                                route: None,
+                                trigger: true,
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                // Check group boundary
+                if current_key.as_ref() != Some(&key) {
+                    // Flush previous group
+                    Self::flush_correlated_group(
+                        &mut group_buffer,
+                        config,
+                        primary_output,
+                        input,
+                        pipeline_start_time,
+                        &transform_names,
+                        &mut evaluators,
+                        compiled_route.as_mut(),
+                        params,
+                        strategy,
+                        &mut counters,
+                        &mut dlq_entries,
+                        &mut per_output_batches,
+                        max_group_buffer,
+                    );
+                    current_key = Some(key);
+                }
+
+                // Check max_group_buffer
+                if group_buffer.len() as u64 >= max_group_buffer {
+                    // Exceeds buffer cap — DLQ everything in the group including this record
+                    group_buffer.push((record, rn));
+                    for (rec, rec_rn) in group_buffer.drain(..) {
+                        counters.dlq_count += 1;
+                        dlq_entries.push(DlqEntry {
+                            source_row: rec_rn,
+                            category: crate::dlq::DlqErrorCategory::ValidationFailure,
+                            error_message:
+                                "group_size_exceeded: correlation group exceeded max_group_buffer"
+                                    .to_string(),
+                            original_record: rec,
+                            stage: Some("transform:correlated_dlq".to_string()),
+                            route: None,
+                            trigger: false,
+                        });
+                    }
+                    // Skip remaining records in this group
+                    // (they'll be caught by the key boundary check above)
+                    current_key = None; // Reset so next record starts a fresh group
+                    continue;
+                }
+
+                group_buffer.push((record, rn));
+            }
+
+            // Flush final group
+            Self::flush_correlated_group(
+                &mut group_buffer,
+                config,
+                primary_output,
+                input,
+                pipeline_start_time,
+                &transform_names,
+                &mut evaluators,
+                compiled_route.as_mut(),
+                params,
+                strategy,
+                &mut counters,
+                &mut dlq_entries,
+                &mut per_output_batches,
+                max_group_buffer,
+            );
+
+            flush_output_batches(&mut per_output_batches, &output_channels)?;
+            drop(output_channels);
+        } else {
+            // Single-output path
+            let writer_config = build_writer_config(primary_output);
+            let raw_writer = writers
+                .into_iter()
+                .next()
+                .map(|(_, w)| w)
+                .expect("at least one writer");
+            let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+            let mut csv_writer =
+                CsvWriter::new(buf_writer, Arc::clone(&output_schema), writer_config);
+
+            // Group-boundary streaming loop (single output)
+            let mut group_buffer: Vec<(Record, u64)> = Vec::new();
+            let mut current_key: Option<Vec<GroupByKey>> = None;
+
+            for (record, rn) in all_records {
+                let key = extract_correlation_key(&record, correlation_key);
+                let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
+
+                if is_null_key {
+                    let ctx = build_eval_context(
+                        config,
+                        &input.path,
+                        rn,
+                        pipeline_start_time,
+                        &params.execution_id,
+                        &params.batch_id,
+                        &params.pipeline_vars,
+                    );
+                    match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                        Ok(EvalResult::Emit {
+                            fields: emitted, ..
+                        }) => {
+                            let projected = project_output(&record, &emitted, primary_output);
+                            csv_writer.write_record(&projected)?;
+                            counters.ok_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                            counters.filtered_count += 1;
+                        }
+                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                            counters.distinct_count += 1;
+                        }
+                        Err((transform_name, eval_err)) => {
+                            if strategy == ErrorStrategy::FailFast {
+                                return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                    span: eval_err.span,
+                                    kind: eval_err.kind.clone(),
+                                }));
+                            }
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: rn,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: eval_err.to_string(),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_transform(&transform_name)),
+                                route: None,
+                                trigger: true,
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if current_key.as_ref() != Some(&key) {
+                    Self::flush_correlated_group_single_output(
+                        &mut group_buffer,
+                        config,
+                        primary_output,
+                        input,
+                        pipeline_start_time,
+                        &transform_names,
+                        &mut evaluators,
+                        params,
+                        strategy,
+                        &mut counters,
+                        &mut dlq_entries,
+                        &mut csv_writer,
+                        max_group_buffer,
+                    )?;
+                    current_key = Some(key);
+                }
+
+                if group_buffer.len() as u64 >= max_group_buffer {
+                    group_buffer.push((record, rn));
+                    for (rec, rec_rn) in group_buffer.drain(..) {
+                        counters.dlq_count += 1;
+                        dlq_entries.push(DlqEntry {
+                            source_row: rec_rn,
+                            category: crate::dlq::DlqErrorCategory::ValidationFailure,
+                            error_message:
+                                "group_size_exceeded: correlation group exceeded max_group_buffer"
+                                    .to_string(),
+                            original_record: rec,
+                            stage: Some("transform:correlated_dlq".to_string()),
+                            route: None,
+                            trigger: false,
+                        });
+                    }
+                    current_key = None;
+                    continue;
+                }
+
+                group_buffer.push((record, rn));
+            }
+
+            Self::flush_correlated_group_single_output(
+                &mut group_buffer,
+                config,
+                primary_output,
+                input,
+                pipeline_start_time,
+                &transform_names,
+                &mut evaluators,
+                params,
+                strategy,
+                &mut counters,
+                &mut dlq_entries,
+                &mut csv_writer,
+                max_group_buffer,
+            )?;
+
+            csv_writer.flush()?;
+        }
+
+        Ok((counters, dlq_entries, rss_bytes()))
+    }
+
+    /// Flush a buffered correlation group: evaluate all records, DLQ entire group if any fails.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_correlated_group(
+        buffer: &mut Vec<(Record, u64)>,
+        config: &PipelineConfig,
+        primary_output: &OutputConfig,
+        input: &crate::config::InputConfig,
+        pipeline_start_time: chrono::NaiveDateTime,
+        transform_names: &[&str],
+        evaluators: &mut [ProgramEvaluator],
+        mut compiled_route: Option<&mut CompiledRoute>,
+        params: &PipelineRunParams,
+        strategy: ErrorStrategy,
+        counters: &mut PipelineCounters,
+        dlq_entries: &mut Vec<DlqEntry>,
+        per_output_batches: &mut HashMap<String, Vec<Record>>,
+        _max_group_buffer: u64,
+    ) {
+        if buffer.is_empty() {
+            return;
+        }
+
+        // Evaluate all records in the group, collect results
+        #[allow(clippy::type_complexity)]
+        let mut results: Vec<(
+            Record,
+            u64,
+            Result<EvalResult, (String, cxl::eval::EvalError)>,
+        )> = Vec::with_capacity(buffer.len());
+        let mut any_failed = false;
+        let mut first_failure_message: Option<String> = None;
+
+        for (record, rn) in buffer.drain(..) {
+            let ctx = build_eval_context(
+                config,
+                &input.path,
+                rn,
+                pipeline_start_time,
+                &params.execution_id,
+                &params.batch_id,
+                &params.pipeline_vars,
+            );
+            let result = evaluate_record(&record, transform_names, evaluators, &ctx);
+            if result.is_err() && !any_failed {
+                any_failed = true;
+                if let Err((_, ref eval_err)) = result {
+                    first_failure_message = Some(eval_err.to_string());
+                }
+            }
+            results.push((record, rn, result));
+        }
+
+        if any_failed {
+            // DLQ entire group
+            for (record, rn, result) in results {
+                let (is_trigger, error_message) = match result {
+                    Err((_, eval_err)) => (true, eval_err.to_string()),
+                    Ok(_) => (
+                        false,
+                        format!(
+                            "correlated with failure in group: {}",
+                            first_failure_message.as_deref().unwrap_or("unknown")
+                        ),
+                    ),
+                };
+                counters.dlq_count += 1;
+                dlq_entries.push(DlqEntry {
+                    source_row: rn,
+                    category: crate::dlq::DlqErrorCategory::ValidationFailure,
+                    error_message,
+                    original_record: record,
+                    stage: Some("transform:correlated_dlq".to_string()),
+                    route: None,
+                    trigger: is_trigger,
+                });
+            }
+        } else {
+            // All passed — dispatch to outputs
+            for (record, rn, result) in results {
+                match result {
+                    Ok(EvalResult::Emit {
+                        fields: emitted, ..
+                    }) => {
+                        if let Some(ref mut route) = compiled_route {
+                            let ctx = build_eval_context(
+                                config,
+                                &input.path,
+                                rn,
+                                pipeline_start_time,
+                                &params.execution_id,
+                                &params.batch_id,
+                                &params.pipeline_vars,
+                            );
+                            match route.evaluate(&emitted, &ctx) {
+                                Ok(targets) => {
+                                    for target in &targets {
+                                        let out_cfg = config
+                                            .outputs
+                                            .iter()
+                                            .find(|o| o.name == *target)
+                                            .unwrap_or(primary_output);
+                                        let projected = project_output(&record, &emitted, out_cfg);
+                                        per_output_batches
+                                            .entry(target.clone())
+                                            .or_default()
+                                            .push(projected);
+                                    }
+                                    counters.ok_count += 1;
+                                }
+                                Err(route_err) => {
+                                    if strategy == ErrorStrategy::FailFast {
+                                        // Can't propagate error from here easily;
+                                        // this path shouldn't hit FailFast with correlation
+                                        counters.dlq_count += 1;
+                                        dlq_entries.push(DlqEntry {
+                                            source_row: rn,
+                                            category:
+                                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                            error_message: route_err.to_string(),
+                                            original_record: record,
+                                            stage: Some(DlqEntry::stage_route_eval()),
+                                            route: None,
+                                            trigger: true,
+                                        });
+                                    } else {
+                                        counters.dlq_count += 1;
+                                        dlq_entries.push(DlqEntry {
+                                            source_row: rn,
+                                            category:
+                                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                            error_message: route_err.to_string(),
+                                            original_record: record,
+                                            stage: Some(DlqEntry::stage_route_eval()),
+                                            route: None,
+                                            trigger: true,
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            // Single-output in multi-output path (shouldn't happen, but handle)
+                            let projected = project_output(&record, &emitted, primary_output);
+                            per_output_batches
+                                .entry(primary_output.name.clone())
+                                .or_default()
+                                .push(projected);
+                            counters.ok_count += 1;
+                        }
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err(_) => unreachable!("failures handled in any_failed branch"),
+                }
+            }
+        }
+    }
+
+    /// Flush a buffered correlation group for single-output path.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_correlated_group_single_output(
+        buffer: &mut Vec<(Record, u64)>,
+        config: &PipelineConfig,
+        primary_output: &OutputConfig,
+        input: &crate::config::InputConfig,
+        pipeline_start_time: chrono::NaiveDateTime,
+        transform_names: &[&str],
+        evaluators: &mut [ProgramEvaluator],
+        params: &PipelineRunParams,
+        _strategy: ErrorStrategy,
+        counters: &mut PipelineCounters,
+        dlq_entries: &mut Vec<DlqEntry>,
+        writer: &mut dyn FormatWriter,
+        _max_group_buffer: u64,
+    ) -> Result<(), PipelineError> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        #[allow(clippy::type_complexity)]
+        let mut results: Vec<(
+            Record,
+            u64,
+            Result<EvalResult, (String, cxl::eval::EvalError)>,
+        )> = Vec::with_capacity(buffer.len());
+        let mut any_failed = false;
+        let mut first_failure_message: Option<String> = None;
+
+        for (record, rn) in buffer.drain(..) {
+            let ctx = build_eval_context(
+                config,
+                &input.path,
+                rn,
+                pipeline_start_time,
+                &params.execution_id,
+                &params.batch_id,
+                &params.pipeline_vars,
+            );
+            let result = evaluate_record(&record, transform_names, evaluators, &ctx);
+            if result.is_err() && !any_failed {
+                any_failed = true;
+                if let Err((_, ref eval_err)) = result {
+                    first_failure_message = Some(eval_err.to_string());
+                }
+            }
+            results.push((record, rn, result));
+        }
+
+        if any_failed {
+            for (record, rn, result) in results {
+                let (is_trigger, error_message) = match result {
+                    Err((_, eval_err)) => (true, eval_err.to_string()),
+                    Ok(_) => (
+                        false,
+                        format!(
+                            "correlated with failure in group: {}",
+                            first_failure_message.as_deref().unwrap_or("unknown")
+                        ),
+                    ),
+                };
+                counters.dlq_count += 1;
+                dlq_entries.push(DlqEntry {
+                    source_row: rn,
+                    category: crate::dlq::DlqErrorCategory::ValidationFailure,
+                    error_message,
+                    original_record: record,
+                    stage: Some("transform:correlated_dlq".to_string()),
+                    route: None,
+                    trigger: is_trigger,
+                });
+            }
+        } else {
+            for (record, _rn, result) in results {
+                match result {
+                    Ok(EvalResult::Emit {
+                        fields: emitted, ..
+                    }) => {
+                        let projected = project_output(&record, &emitted, primary_output);
+                        writer.write_record(&projected)?;
+                        counters.ok_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err(_) => unreachable!("failures handled in any_failed branch"),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch an emitted record to outputs via route evaluation (multi-output helper).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_to_outputs(
+        record: &Record,
+        emitted: &IndexMap<String, Value>,
+        config: &PipelineConfig,
+        primary_output: &OutputConfig,
+        compiled_route: Option<&mut CompiledRoute>,
+        ctx: &EvalContext,
+        counters: &mut PipelineCounters,
+        dlq_entries: &mut Vec<DlqEntry>,
+        per_output_batches: &mut HashMap<String, Vec<Record>>,
+        _strategy: ErrorStrategy,
+        row_num: u64,
+    ) {
+        if let Some(route) = compiled_route {
+            match route.evaluate(emitted, ctx) {
+                Ok(targets) => {
+                    for target in &targets {
+                        let out_cfg = config
+                            .outputs
+                            .iter()
+                            .find(|o| o.name == *target)
+                            .unwrap_or(primary_output);
+                        let projected = project_output(record, emitted, out_cfg);
+                        per_output_batches
+                            .entry(target.clone())
+                            .or_default()
+                            .push(projected);
+                    }
+                    counters.ok_count += 1;
+                }
+                Err(route_err) => {
+                    counters.dlq_count += 1;
+                    dlq_entries.push(DlqEntry {
+                        source_row: row_num,
+                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                        error_message: route_err.to_string(),
+                        original_record: record.clone(),
+                        stage: Some(DlqEntry::stage_route_eval()),
+                        route: None,
+                        trigger: true,
+                    });
+                }
+            }
+        } else {
+            let projected = project_output(record, emitted, primary_output);
+            per_output_batches
+                .entry(primary_output.name.clone())
+                .or_default()
+                .push(projected);
+            counters.ok_count += 1;
+        }
     }
 
     /// Two-pass execution: Phase 1 → 1.5 → Phase 2 → Phase 3.
@@ -1064,6 +1866,7 @@ impl PipelineExecutor {
                             original_record: record,
                             stage: Some(DlqEntry::stage_route_eval()),
                             route: None,
+                            trigger: true,
                         });
                     }
                 }
@@ -1132,6 +1935,7 @@ impl PipelineExecutor {
                                         original_record: record.clone(),
                                         stage: Some(DlqEntry::stage_route_eval()),
                                         route: None,
+                                        trigger: true,
                                     });
                                 }
                             }
@@ -1158,6 +1962,7 @@ impl PipelineExecutor {
                                 original_record: record.clone(),
                                 stage: Some(DlqEntry::stage_transform(transform_name)),
                                 route: None,
+                                trigger: true,
                             });
                         }
                     }
@@ -1749,6 +2554,7 @@ fn handle_error<W: Write + Send>(
                 original_record: record.clone(),
                 stage,
                 route,
+                trigger: true,
             });
             // Skip this record — don't write to output
         }
@@ -1761,6 +2567,7 @@ fn handle_error<W: Write + Send>(
                 original_record: record.clone(),
                 stage,
                 route,
+                trigger: true,
             });
             // Write original record unchanged
             let emitted = IndexMap::new();
@@ -1792,6 +2599,7 @@ fn handle_error_no_writer(
         original_record: record.clone(),
         stage,
         route: None,
+        trigger: true,
     });
 }
 

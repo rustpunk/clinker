@@ -1013,6 +1013,7 @@ fn test_dlq_stage_source() {
         original_record: record,
         stage: Some(DlqEntry::stage_source()),
         route: None,
+        trigger: true,
     };
     assert_eq!(entry.stage, Some("source".to_string()));
     assert_eq!(entry.route, None);
@@ -1130,6 +1131,7 @@ fn test_dlq_stage_output() {
         original_record: record,
         stage: Some(DlqEntry::stage_output("results")),
         route: Some("high_value".to_string()),
+        trigger: true,
     };
     assert_eq!(entry.stage, Some("output:results".to_string()));
     assert_eq!(entry.route, Some("high_value".to_string()));
@@ -1195,6 +1197,7 @@ fn test_dlq_columns_in_csv() {
         original_record: record,
         stage: Some(DlqEntry::stage_transform("my_transform")),
         route: None,
+        trigger: true,
     }];
 
     let mut buf = Vec::new();

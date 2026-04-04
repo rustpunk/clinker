@@ -42,6 +42,9 @@ pub struct ExecutionPlan {
     pub parallelism: ParallelismProfile,
     /// Route configuration, if multi-output routing is configured.
     pub route: Option<RoutePlan>,
+    /// If correlation sort was auto-injected, describes what was prepended.
+    /// Format: "Correlation sort (auto-injected): [field1, field2] + existing [field3]"
+    pub correlation_sort_note: Option<String>,
 }
 
 /// Whether the pipeline needs one pass or two.
@@ -51,15 +54,20 @@ pub enum ExecutionMode {
     Streaming,
     /// Window functions present — build arena + indices, then re-read.
     TwoPass,
+    /// No windows, but correlation_key requires sorted input for group-boundary detection.
+    /// Records are sorted in-memory, then processed in a single streaming pass.
+    SortedStreaming,
 }
 
 impl ExecutionPlan {
-    /// Derive execution mode from index requirements.
+    /// Derive execution mode from index requirements and correlation config.
     pub fn mode(&self) -> ExecutionMode {
-        if self.indices_to_build.is_empty() {
-            ExecutionMode::Streaming
-        } else {
+        if !self.indices_to_build.is_empty() {
             ExecutionMode::TwoPass
+        } else if self.correlation_sort_note.is_some() {
+            ExecutionMode::SortedStreaming
+        } else {
+            ExecutionMode::Streaming
         }
     }
 
@@ -238,6 +246,7 @@ impl ExecutionPlan {
             output_projections,
             parallelism,
             route,
+            correlation_sort_note: None,
         })
     }
 
@@ -256,6 +265,10 @@ impl ExecutionPlan {
             "Output projections: {}\n\n",
             self.output_projections.len()
         ));
+
+        if let Some(note) = &self.correlation_sort_note {
+            out.push_str(&format!("{note}\n\n"));
+        }
 
         if !self.source_dag.is_empty() {
             out.push_str("Source DAG:\n");

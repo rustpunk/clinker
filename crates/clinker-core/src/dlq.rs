@@ -42,6 +42,7 @@ pub const DLQ_COLUMNS: &[&str] = &[
     "_cxl_dlq_error_detail",
     "_cxl_dlq_stage",
     "_cxl_dlq_route",
+    "_cxl_dlq_trigger",
 ];
 
 /// Write DLQ entries to a CSV writer (DLQ is always CSV per spec §10.4).
@@ -71,9 +72,10 @@ pub fn write_dlq<W: Write>(
         header.push("_cxl_dlq_error_category");
         header.push("_cxl_dlq_error_detail");
     }
-    // Stage and route columns always present (nullable)
+    // Stage, route, and trigger columns always present (nullable)
     header.push("_cxl_dlq_stage");
     header.push("_cxl_dlq_route");
+    header.push("_cxl_dlq_trigger");
     if include_source_row {
         for col in source_schema.columns() {
             header.push(col.as_ref());
@@ -97,9 +99,10 @@ pub fn write_dlq<W: Write>(
             row.push(entry.error_message.clone());
         }
 
-        // Stage and route (empty string for null)
+        // Stage, route, and trigger
         row.push(entry.stage.clone().unwrap_or_default());
         row.push(entry.route.clone().unwrap_or_default());
+        row.push(entry.trigger.to_string());
 
         if include_source_row {
             for col in source_schema.columns() {
@@ -157,6 +160,7 @@ mod tests {
             original_record: record,
             stage: None,
             route: None,
+            trigger: true,
         }
     }
 
@@ -184,8 +188,9 @@ mod tests {
         assert_eq!(columns[5], "_cxl_dlq_error_detail");
         assert_eq!(columns[6], "_cxl_dlq_stage");
         assert_eq!(columns[7], "_cxl_dlq_route");
-        assert_eq!(columns[8], "name");
-        assert_eq!(columns[9], "value");
+        assert_eq!(columns[8], "_cxl_dlq_trigger");
+        assert_eq!(columns[9], "name");
+        assert_eq!(columns[10], "value");
     }
 
     #[test]
@@ -403,6 +408,7 @@ mod tests {
             original_record: record,
             stage: None,
             route: None,
+            trigger: true,
         }];
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -411,10 +417,10 @@ mod tests {
         let header_line = output.lines().next().unwrap();
         let columns: Vec<&str> = header_line.split(',').collect();
         // Source fields in schema order (zulu, alpha, mike), not alphabetical
-        // Columns 6-7 are _cxl_dlq_stage and _cxl_dlq_route
-        assert_eq!(columns[8], "zulu");
-        assert_eq!(columns[9], "alpha");
-        assert_eq!(columns[10], "mike");
+        // Columns 6-8 are _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger
+        assert_eq!(columns[9], "zulu");
+        assert_eq!(columns[10], "alpha");
+        assert_eq!(columns[11], "mike");
     }
 
     #[test]

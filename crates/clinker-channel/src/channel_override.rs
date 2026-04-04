@@ -1179,6 +1179,8 @@ transformations:
                 strategy: ErrorStrategy::Continue,
                 dlq: None,
                 type_error_threshold: None,
+                correlation_key: None,
+                max_group_buffer: None,
             }),
         };
 

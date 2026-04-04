@@ -776,6 +776,68 @@ impl PipelineConfig {
     }
 }
 
+/// Correlation key for grouped DLQ rejection.
+///
+/// When set on `ErrorHandlingConfig`, all records sharing a correlation key value
+/// are DLQ'd atomically if any single record in the group fails evaluation.
+/// Custom `Deserialize`: accepts `"field"` string or `["f1", "f2"]` array.
+#[derive(Debug, Clone, Serialize)]
+pub enum CorrelationKey {
+    Single(String),
+    Compound(Vec<String>),
+}
+
+impl CorrelationKey {
+    /// Return the field names that make up this correlation key.
+    pub fn fields(&self) -> Vec<&str> {
+        match self {
+            Self::Single(f) => vec![f.as_str()],
+            Self::Compound(fs) => fs.iter().map(|f| f.as_str()).collect(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CorrelationKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CorrelationKeyVisitor;
+
+        impl<'de> Visitor<'de> for CorrelationKeyVisitor {
+            type Value = CorrelationKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string (single key) or array of strings (compound key)")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CorrelationKey::Single(v.to_string()))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(field) = seq.next_element::<String>()? {
+                    fields.push(field);
+                }
+                if fields.is_empty() {
+                    return Err(de::Error::custom("correlation_key array must not be empty"));
+                }
+                if fields.len() == 1 {
+                    return Ok(CorrelationKey::Single(fields.remove(0)));
+                }
+                Ok(CorrelationKey::Compound(fields))
+            }
+        }
+
+        deserializer.deserialize_any(CorrelationKeyVisitor)
+    }
+}
+
+fn default_max_group_buffer() -> Option<u64> {
+    Some(100_000)
+}
+
 /// Error handling strategy and DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -786,6 +848,17 @@ pub struct ErrorHandlingConfig {
     pub dlq: Option<DlqConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
+    /// Correlation key for grouped DLQ rejection. When set, all records sharing
+    /// a key value are DLQ'd atomically if any record in the group fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_key: Option<CorrelationKey>,
+    /// Maximum records buffered per correlation group. Groups exceeding this cap
+    /// are DLQ'd entirely with a `group_size_exceeded` summary entry. Default: 100,000.
+    #[serde(
+        default = "default_max_group_buffer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_group_buffer: Option<u64>,
 }
 
 impl Default for ErrorHandlingConfig {
@@ -794,6 +867,8 @@ impl Default for ErrorHandlingConfig {
             strategy: default_strategy(),
             dlq: None,
             type_error_threshold: None,
+            correlation_key: None,
+            max_group_buffer: None,
         }
     }
 }
