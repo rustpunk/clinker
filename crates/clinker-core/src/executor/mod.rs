@@ -15,7 +15,7 @@ use crate::pipeline::memory::{MemoryBudget, rss_bytes};
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
 use crate::plan::execution::{ExecutionMode, ExecutionPlan, ParallelismClass};
-use crate::projection::project_output;
+use crate::projection::{project_output, project_output_with_meta};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter};
@@ -121,13 +121,18 @@ impl CompiledRoute {
     fn evaluate(
         &mut self,
         emitted: &IndexMap<String, Value>,
+        metadata: &IndexMap<String, Value>,
         ctx: &EvalContext,
     ) -> Result<Vec<String>, cxl::eval::EvalError> {
-        // Convert emitted IndexMap to HashMap for HashMapResolver
-        let hash_fields: HashMap<String, Value> = emitted
+        // Convert emitted IndexMap to HashMap for HashMapResolver.
+        // Include $meta.* entries so route conditions can reference metadata.
+        let mut hash_fields: HashMap<String, Value> = emitted
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        for (key, value) in metadata {
+            hash_fields.insert(format!("$meta.{key}"), value.clone());
+        }
         let resolver = clinker_record::HashMapResolver::new(hash_fields);
 
         match self.mode {
@@ -613,7 +618,12 @@ impl PipelineExecutor {
         // Scan forward until a record emits, to derive the output schema.
         let schema = csv_reader.schema()?;
         let mut row_num: u64 = 0;
-        let mut first_emitted: Option<(Record, IndexMap<String, Value>)> = None;
+        #[allow(clippy::type_complexity)]
+        let mut first_emitted: Option<(
+            Record,
+            IndexMap<String, Value>,
+            IndexMap<String, Value>,
+        )> = None;
         #[allow(clippy::type_complexity)]
         let mut pending_skips_and_errors: Vec<(
             u64,
@@ -636,10 +646,11 @@ impl PipelineExecutor {
             let result = evaluate_record(&record, &transform_names, &mut evaluators, &ctx);
             match &result {
                 Ok(EvalResult::Emit {
-                    fields: emitted, ..
+                    fields: emitted,
+                    metadata,
                 }) => {
                     counters.ok_count += 1;
-                    first_emitted = Some((record, emitted.clone()));
+                    first_emitted = Some((record, emitted.clone(), metadata.clone()));
                     break;
                 }
                 Ok(EvalResult::Skip(_)) | Err(_) => {
@@ -649,8 +660,8 @@ impl PipelineExecutor {
         }
 
         // Derive output schema from first emitted record
-        let output_schema = if let Some((ref rec, ref emitted)) = first_emitted {
-            let projected = project_output(rec, emitted, primary_output);
+        let output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted {
+            let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
             Arc::clone(projected.schema())
         } else {
             schema
@@ -695,7 +706,7 @@ impl PipelineExecutor {
             }
 
             // Dispatch first emitted record
-            if let Some((record, emitted)) = first_emitted {
+            if let Some((record, emitted, metadata)) = first_emitted {
                 let route = compiled_route.as_mut().unwrap();
                 let ctx = build_eval_context(
                     config,
@@ -706,7 +717,7 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                match route.evaluate(&emitted, &ctx) {
+                match route.evaluate(&emitted, &metadata, &ctx) {
                     Ok(targets) => {
                         let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
                         for target in &targets {
@@ -715,7 +726,8 @@ impl PipelineExecutor {
                                 .iter()
                                 .find(|o| o.name == *target)
                                 .unwrap_or(primary_output);
-                            let projected = project_output(&record, &emitted, out_cfg);
+                            let projected =
+                                project_output_with_meta(&record, &emitted, &metadata, out_cfg);
                             per_output_batches
                                 .entry(target.clone())
                                 .or_default()
@@ -760,8 +772,9 @@ impl PipelineExecutor {
                 );
                 match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
                     Ok(EvalResult::Emit {
-                        fields: emitted, ..
-                    }) => match route.evaluate(&emitted, &ctx) {
+                        fields: emitted,
+                        metadata,
+                    }) => match route.evaluate(&emitted, &metadata, &ctx) {
                         Ok(targets) => {
                             for target in &targets {
                                 let out_cfg = config
@@ -769,7 +782,8 @@ impl PipelineExecutor {
                                     .iter()
                                     .find(|o| o.name == *target)
                                     .unwrap_or(primary_output);
-                                let projected = project_output(&record, &emitted, out_cfg);
+                                let projected =
+                                    project_output_with_meta(&record, &emitted, &metadata, out_cfg);
                                 per_output_batches
                                     .entry(target.clone())
                                     .or_default()
@@ -837,8 +851,27 @@ impl PipelineExecutor {
                 .next()
                 .map(|(_, w)| w)
                 .expect("validated above");
-            let writer = BufWriter::with_capacity(65536, raw_writer);
-            let mut csv_writer = CsvWriter::new(writer, Arc::clone(&output_schema), writer_config);
+
+            let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
+                let policy = build_split_policy(split);
+                let output_path = output.path.clone();
+                let naming = split.naming.clone();
+                let schema = Arc::clone(&output_schema);
+                let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                    let path = apply_split_naming(&output_path, &naming, seq);
+                    let file = std::fs::File::create(path)?;
+                    Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                };
+                drop(raw_writer);
+                Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+            } else {
+                let writer = BufWriter::with_capacity(65536, raw_writer);
+                Box::new(CsvWriter::new(
+                    writer,
+                    Arc::clone(&output_schema),
+                    writer_config,
+                ))
+            };
 
             // Process pending skips and errors from the scan-forward phase
             for (rn, record, result) in pending_skips_and_errors {
@@ -862,15 +895,15 @@ impl PipelineExecutor {
                             &mut dlq_entries,
                             output,
                             &output_schema,
-                            &mut csv_writer,
+                            &mut *csv_writer,
                         )?;
                     }
                 }
             }
 
             // Write the first emitted record
-            if let Some((record, emitted)) = first_emitted {
-                let projected = project_output(&record, &emitted, output);
+            if let Some((record, emitted, metadata)) = first_emitted {
+                let projected = project_output_with_meta(&record, &emitted, &metadata, output);
                 csv_writer.write_record(&projected)?;
             }
 
@@ -889,9 +922,11 @@ impl PipelineExecutor {
                 );
                 match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
                     Ok(EvalResult::Emit {
-                        fields: emitted, ..
+                        fields: emitted,
+                        metadata,
                     }) => {
-                        let projected = project_output(&record, &emitted, output);
+                        let projected =
+                            project_output_with_meta(&record, &emitted, &metadata, output);
                         csv_writer.write_record(&projected)?;
                         counters.ok_count += 1;
                     }
@@ -913,7 +948,7 @@ impl PipelineExecutor {
                             &mut dlq_entries,
                             output,
                             &output_schema,
-                            &mut csv_writer,
+                            &mut *csv_writer,
                         )?;
                     }
                 }
@@ -1037,11 +1072,13 @@ impl PipelineExecutor {
                     );
                     match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
                         Ok(EvalResult::Emit {
-                            fields: emitted, ..
+                            fields: emitted,
+                            metadata,
                         }) => {
                             Self::dispatch_to_outputs(
                                 &record,
                                 &emitted,
+                                &metadata,
                                 config,
                                 primary_output,
                                 compiled_route.as_mut(),
@@ -1362,7 +1399,8 @@ impl PipelineExecutor {
             for (record, rn, result) in results {
                 match result {
                     Ok(EvalResult::Emit {
-                        fields: emitted, ..
+                        fields: emitted,
+                        metadata,
                     }) => {
                         if let Some(ref mut route) = compiled_route {
                             let ctx = build_eval_context(
@@ -1374,7 +1412,7 @@ impl PipelineExecutor {
                                 &params.batch_id,
                                 &params.pipeline_vars,
                             );
-                            match route.evaluate(&emitted, &ctx) {
+                            match route.evaluate(&emitted, &metadata, &ctx) {
                                 Ok(targets) => {
                                     for target in &targets {
                                         let out_cfg = config
@@ -1382,7 +1420,9 @@ impl PipelineExecutor {
                                             .iter()
                                             .find(|o| o.name == *target)
                                             .unwrap_or(primary_output);
-                                        let projected = project_output(&record, &emitted, out_cfg);
+                                        let projected = project_output_with_meta(
+                                            &record, &emitted, &metadata, out_cfg,
+                                        );
                                         per_output_batches
                                             .entry(target.clone())
                                             .or_default()
@@ -1544,6 +1584,7 @@ impl PipelineExecutor {
     fn dispatch_to_outputs(
         record: &Record,
         emitted: &IndexMap<String, Value>,
+        metadata: &IndexMap<String, Value>,
         config: &PipelineConfig,
         primary_output: &OutputConfig,
         compiled_route: Option<&mut CompiledRoute>,
@@ -1555,7 +1596,7 @@ impl PipelineExecutor {
         row_num: u64,
     ) {
         if let Some(route) = compiled_route {
-            match route.evaluate(emitted, ctx) {
+            match route.evaluate(emitted, metadata, ctx) {
                 Ok(targets) => {
                     for target in &targets {
                         let out_cfg = config
@@ -1563,7 +1604,8 @@ impl PipelineExecutor {
                             .iter()
                             .find(|o| o.name == *target)
                             .unwrap_or(primary_output);
-                        let projected = project_output(record, emitted, out_cfg);
+                        let projected =
+                            project_output_with_meta(record, emitted, metadata, out_cfg);
                         per_output_batches
                             .entry(target.clone())
                             .or_default()
@@ -1694,7 +1736,12 @@ impl PipelineExecutor {
         let mut counters = PipelineCounters::default();
         let mut dlq_entries = Vec::new();
         let mut first_emit_pos: Option<u32> = None;
-        let mut first_emitted: Option<(Record, IndexMap<String, Value>)> = None;
+        #[allow(clippy::type_complexity)]
+        let mut first_emitted: Option<(
+            Record,
+            IndexMap<String, Value>,
+            IndexMap<String, Value>,
+        )> = None;
         let mut evaluators = build_evaluators(transforms);
         let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
 
@@ -1722,9 +1769,10 @@ impl PipelineExecutor {
             counters.total_count += 1;
             match result {
                 Ok(EvalResult::Emit {
-                    fields: emitted, ..
+                    fields: emitted,
+                    metadata,
                 }) => {
-                    first_emitted = Some((record, emitted));
+                    first_emitted = Some((record, emitted, metadata));
                     first_emit_pos = Some(pos);
                     counters.ok_count += 1;
                     break;
@@ -1751,8 +1799,9 @@ impl PipelineExecutor {
             }
         }
 
-        let final_output_schema = if let Some((ref rec, ref emitted)) = first_emitted {
-            let projected = project_output(rec, emitted, primary_output);
+        let final_output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted
+        {
+            let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
             Arc::clone(projected.schema())
         } else {
             Arc::clone(output_schema_ref)
@@ -1824,7 +1873,7 @@ impl PipelineExecutor {
                 spawn_writer_threads(writers, &config.outputs, Arc::clone(&final_output_schema));
 
             // Dispatch first emitted record
-            if let Some((record, emitted)) = first_emitted {
+            if let Some((record, emitted, metadata)) = first_emitted {
                 let route = compiled_route.as_mut().unwrap();
                 let ctx = build_eval_context(
                     config,
@@ -1835,7 +1884,7 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                match route.evaluate(&emitted, &ctx) {
+                match route.evaluate(&emitted, &metadata, &ctx) {
                     Ok(targets) => {
                         let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
                         for target in &targets {
@@ -1844,7 +1893,8 @@ impl PipelineExecutor {
                                 .iter()
                                 .find(|o| o.name == *target)
                                 .unwrap_or(primary_output);
-                            let projected = project_output(&record, &emitted, out_cfg);
+                            let projected =
+                                project_output_with_meta(&record, &emitted, &metadata, out_cfg);
                             per_output_batches
                                 .entry(target.clone())
                                 .or_default()
@@ -1895,7 +1945,8 @@ impl PipelineExecutor {
                     counters.total_count += 1;
                     match result.as_ref().unwrap() {
                         Ok(EvalResult::Emit {
-                            fields: emitted, ..
+                            fields: emitted,
+                            metadata,
                         }) => {
                             let ctx = build_eval_context(
                                 config,
@@ -1906,7 +1957,7 @@ impl PipelineExecutor {
                                 &params.batch_id,
                                 &params.pipeline_vars,
                             );
-                            match route.evaluate(emitted, &ctx) {
+                            match route.evaluate(emitted, metadata, &ctx) {
                                 Ok(targets) => {
                                     for target in &targets {
                                         let out_cfg = config
@@ -1914,7 +1965,9 @@ impl PipelineExecutor {
                                             .iter()
                                             .find(|o| o.name == *target)
                                             .unwrap_or(primary_output);
-                                        let projected = project_output(record, emitted, out_cfg);
+                                        let projected = project_output_with_meta(
+                                            record, emitted, metadata, out_cfg,
+                                        );
                                         per_output_batches
                                             .entry(target.clone())
                                             .or_default()
@@ -1988,8 +2041,8 @@ impl PipelineExecutor {
                 CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
 
             // Write the first emitted record
-            if let Some((record, emitted)) = first_emitted {
-                let projected = project_output(&record, &emitted, output);
+            if let Some((record, emitted, metadata)) = first_emitted {
+                let projected = project_output_with_meta(&record, &emitted, &metadata, output);
                 csv_writer.write_record(&projected)?;
             }
 
@@ -2398,7 +2451,11 @@ fn evaluate_record(
                 metadata,
             } => {
                 for (name, value) in &emitted {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                    // Use set() for schema fields (e.g. emit amount = amount.to_int()),
+                    // set_overflow() for new fields introduced by the transform.
+                    if !record.set(name, value.clone()) {
+                        record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                    }
                 }
                 // Copy metadata onto Record so later transforms can read via $meta.*
                 for (key, value) in &metadata {
@@ -2486,7 +2543,11 @@ fn evaluate_record_with_window(
                 metadata,
             } => {
                 for (name, value) in &emitted {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                    // Use set() for schema fields (e.g. emit amount = amount.to_int()),
+                    // set_overflow() for new fields introduced by the transform.
+                    if !record.set(name, value.clone()) {
+                        record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                    }
                 }
                 for (key, value) in &metadata {
                     let _ = record.set_meta(key, value.clone());
@@ -2525,7 +2586,7 @@ fn parse_memory_limit(config: &PipelineConfig) -> usize {
 
 /// Handle an evaluation error according to the configured strategy.
 #[allow(clippy::too_many_arguments)]
-fn handle_error<W: Write + Send>(
+fn handle_error(
     strategy: ErrorStrategy,
     record: &Record,
     row_num: u64,
@@ -2536,7 +2597,7 @@ fn handle_error<W: Write + Send>(
     dlq_entries: &mut Vec<DlqEntry>,
     output: &OutputConfig,
     _output_schema: &Arc<Schema>,
-    writer: &mut CsvWriter<W>,
+    writer: &mut dyn FormatWriter,
 ) -> Result<(), PipelineError> {
     match strategy {
         ErrorStrategy::FailFast => {

@@ -70,7 +70,9 @@ default: low
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(50000))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["high"]);
 }
 
@@ -91,7 +93,9 @@ default: low
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["medium"]);
 }
 
@@ -112,7 +116,9 @@ default: low
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(500))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["low"]);
 }
 
@@ -133,7 +139,9 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["audit", "report"]);
 }
 
@@ -156,7 +164,9 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["report"]);
 }
 
@@ -177,7 +187,9 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(100))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["standard"]);
 }
 
@@ -200,7 +212,9 @@ default: standard
         ("amount".to_string(), Value::Integer(50000)),
         ("country".to_string(), Value::String("UK".into())),
     ]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["intl_high"]);
 
     // Does not match: high amount but US
@@ -208,7 +222,9 @@ default: standard
         ("amount".to_string(), Value::Integer(50000)),
         ("country".to_string(), Value::String("US".into())),
     ]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["standard"]);
 }
 
@@ -226,7 +242,9 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Null)]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     // Null > 10000 is not true → default
     assert_eq!(targets, vec!["standard"]);
 }
@@ -246,7 +264,9 @@ default: standard
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("computed_score".to_string(), Value::Integer(95))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["high"]);
 }
 
@@ -267,7 +287,9 @@ default: regular
 
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("tier".to_string(), Value::String("gold".into()))]);
-    let targets = route.evaluate(&emitted, &ctx).unwrap();
+    let targets = route
+        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .unwrap();
     assert_eq!(targets, vec!["vip"]);
 }
 

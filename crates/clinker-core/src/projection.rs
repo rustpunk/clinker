@@ -33,6 +33,19 @@ pub fn project_output(
     emitted: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
+    project_output_with_meta(input_record, emitted, &IndexMap::new(), config)
+}
+
+/// Project output with explicit metadata map (from EvalResult::Emit).
+///
+/// Metadata is sourced from the `metadata` parameter, not from `input_record.iter_meta()`,
+/// because `evaluate_record` works on a clone and the original input record has no metadata.
+pub fn project_output_with_meta(
+    input_record: &Record,
+    emitted: &IndexMap<String, Value>,
+    metadata: &IndexMap<String, Value>,
+    config: &OutputConfig,
+) -> Record {
     // Step 1: Gather
     let mut fields: IndexMap<String, Value> = IndexMap::new();
 
@@ -50,9 +63,25 @@ pub fn project_output(
         }
     }
 
-    // Step 1b: Merge metadata into output when include_metadata is set
+    // Step 1b: Merge metadata into output when include_metadata is set.
     // Metadata fields are prefixed with `meta.` in the output.
-    // No-op when include_metadata is None (default).
+    if !config.include_metadata.is_none() {
+        let meta_iter: Vec<(&str, &Value)> = match &config.include_metadata {
+            IncludeMetadata::None => vec![],
+            IncludeMetadata::All => metadata.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            IncludeMetadata::Allowlist(allow) => metadata
+                .iter()
+                .filter(|(k, _)| allow.iter().any(|a| a.as_str() == *k))
+                .map(|(k, v)| (k.as_str(), v))
+                .collect(),
+        };
+        for (key, value) in meta_iter {
+            let output_name = format!("meta.{key}");
+            if !fields.contains_key(&output_name) {
+                fields.insert(output_name, value.clone());
+            }
+        }
+    }
 
     // Step 2: Exclude
     if let Some(ref exclude_list) = config.exclude {

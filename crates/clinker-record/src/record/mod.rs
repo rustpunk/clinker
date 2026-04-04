@@ -175,6 +175,10 @@ impl Record {
 
 impl FieldResolver for Record {
     fn resolve(&self, name: &str) -> Option<Value> {
+        // Handle $meta.* namespace: resolve from per-record metadata map.
+        if let Some(meta_key) = name.strip_prefix("$meta.") {
+            return self.get_meta(meta_key).cloned();
+        }
         self.get(name).cloned()
     }
 
