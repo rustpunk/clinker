@@ -1775,6 +1775,7 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    mod correlated_dlq;
     mod multi_output;
 
     use super::*;
