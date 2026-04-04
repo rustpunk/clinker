@@ -4,6 +4,9 @@ use crate::value::Value;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
+/// Maximum number of metadata keys per record.
+const MAX_METADATA_KEYS: usize = 64;
+
 /// Schema-indexed record with optional overflow for CXL-emitted unknown fields.
 /// Overflow uses IndexMap to preserve emit statement order in output.
 #[derive(Debug, Clone)]
@@ -11,6 +14,9 @@ pub struct Record {
     schema: Arc<Schema>,
     values: Vec<Value>,
     overflow: Option<Box<IndexMap<Box<str>, Value>>>,
+    /// Per-record metadata. Stripped from output unless `include_metadata` is set.
+    /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
+    metadata: Option<Box<IndexMap<Box<str>, Value>>>,
 }
 
 impl Record {
@@ -33,6 +39,7 @@ impl Record {
             schema,
             values,
             overflow: None,
+            metadata: None,
         }
     }
 
@@ -83,6 +90,40 @@ impl Record {
             .map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
     }
 
+    // ── Metadata ────────────────────────────────────────────────────
+
+    /// Read a per-record metadata value by key.
+    pub fn get_meta(&self, key: &str) -> Option<&Value> {
+        self.metadata.as_ref().and_then(|m| m.get(key))
+    }
+
+    /// Write a per-record metadata value. Lazy-inits the map on first call.
+    /// Returns `Err` if the per-record metadata cap (64 keys) would be exceeded.
+    pub fn set_meta(&mut self, key: &str, value: Value) -> Result<(), &'static str> {
+        let map = self
+            .metadata
+            .get_or_insert_with(|| Box::new(IndexMap::new()));
+        if !map.contains_key(key) && map.len() >= MAX_METADATA_KEYS {
+            return Err("per-record metadata cap exceeded (64 keys)");
+        }
+        map.insert(key.into(), value);
+        Ok(())
+    }
+
+    /// Whether this record has any metadata entries.
+    pub fn has_meta(&self) -> bool {
+        self.metadata.as_ref().is_some_and(|m| !m.is_empty())
+    }
+
+    /// Iterator over all metadata key-value pairs.
+    pub fn iter_meta(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.metadata
+            .iter()
+            .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
+    }
+
+    // ── Fields ─────────────────────────────────────────────────────
+
     /// Iterator over ALL fields: schema fields first (in schema order), then overflow.
     pub fn iter_all_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         let schema_fields = self
@@ -112,13 +153,12 @@ impl Record {
     /// Estimated heap bytes owned by this record.
     ///
     /// Includes Vec<Value> backing store + per-value heap allocations
-    /// (strings, arrays) + overflow IndexMap if present.
+    /// (strings, arrays) + overflow/metadata IndexMaps if present.
     /// Used by SortBuffer for self-tracking allocation counting.
     pub fn estimated_heap_size(&self) -> usize {
         let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
         let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
-        let overflow_size = self.overflow.as_ref().map_or(0, |m| {
-            // IndexMap overhead: capacity * (key + value + hash)
+        let indexmap_heap = |m: &IndexMap<Box<str>, Value>| {
             let entry_size = std::mem::size_of::<Box<str>>()
                 + std::mem::size_of::<Value>()
                 + std::mem::size_of::<u64>();
@@ -126,8 +166,10 @@ impl Record {
             let keys_heap: usize = m.keys().map(|k| k.len()).sum();
             let values_heap: usize = m.values().map(Value::heap_size).sum();
             map_backing + keys_heap + values_heap
-        });
-        values_backing + values_heap + overflow_size
+        };
+        let overflow_size = self.overflow.as_ref().map_or(0, |m| indexmap_heap(m));
+        let metadata_size = self.metadata.as_ref().map_or(0, |m| indexmap_heap(m));
+        values_backing + values_heap + overflow_size + metadata_size
     }
 }
 
