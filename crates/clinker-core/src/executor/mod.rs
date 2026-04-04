@@ -2298,6 +2298,12 @@ impl PipelineExecutor {
     /// Input files are NOT opened. Field names are extracted from CXL AST
     /// so the resolver can compile without a data-derived schema.
     pub fn explain(config: &PipelineConfig) -> Result<String, PipelineError> {
+        let (plan, _) = Self::explain_dag(config)?;
+        Ok(plan.explain_full(config))
+    }
+
+    /// Compile execution plan and return the DAG for format-specific rendering.
+    pub fn explain_dag(config: &PipelineConfig) -> Result<(ExecutionPlanDag, ()), PipelineError> {
         // Extract field names from CXL AST to build a synthetic schema
         let mut all_fields = Vec::new();
         for t in config.transforms() {
@@ -2331,7 +2337,7 @@ impl PipelineExecutor {
             }
         })?;
 
-        Ok(plan.explain_full(config))
+        Ok((plan, ()))
     }
 }
 

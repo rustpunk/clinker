@@ -633,3 +633,215 @@ transformations:
         err
     );
 }
+
+// --- Task 15.3 tests: --explain format extensions ---
+
+/// Fixture with full branch wiring: route → branch transforms → merge.
+fn wired_diamond_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: wired-diamond
+
+inputs:
+  - name: primary
+    path: data.csv
+    type: csv
+
+outputs:
+  - name: output
+    path: out.csv
+    include_unmapped: true
+    type: csv
+
+transformations:
+  - name: categorize
+    cxl: |
+      emit value = amount
+    route:
+      mode: exclusive
+      branches:
+        - name: high_value
+          condition: "amount > 100"
+        - name: low_value
+          condition: "amount <= 100"
+      default: output
+
+  - name: enrich_high
+    input: categorize.high_value
+    cxl: |
+      emit tier = "premium"
+
+  - name: enrich_low
+    input: categorize.low_value
+    cxl: |
+      emit tier = "standard"
+
+  - name: finalize
+    input: [enrich_high, enrich_low]
+    cxl: |
+      emit done = true
+"#
+}
+
+/// Text output contains fork/join ASCII art for branching pipeline.
+#[test]
+fn test_explain_text_branch_indicators() {
+    let config = parse_fixture(wired_diamond_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let text = plan.explain_text(&config);
+
+    assert!(text.contains("FORK"), "should show FORK indicator: {text}");
+    assert!(text.contains("├──>"), "should show branch arrow: {text}");
+    assert!(
+        text.contains("MERGE"),
+        "should show MERGE indicator: {text}"
+    );
+    assert!(text.contains("└──<"), "should show merge arrow: {text}");
+}
+
+/// JSON output parses back and contains expected schema_version.
+#[test]
+fn test_explain_json_schema_version() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+
+    assert_eq!(json["schema_version"], "1");
+}
+
+/// JSON nodes have expected id slugs and types.
+#[test]
+fn test_explain_json_node_ids() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+    let nodes = json["nodes"].as_array().unwrap();
+
+    // Check that all nodes have id-slug-compatible type and name fields
+    for node in nodes {
+        let node_type = node["type"].as_str().unwrap();
+        let name = node["name"].as_str().unwrap();
+        assert!(
+            !node_type.is_empty() && !name.is_empty(),
+            "node must have non-empty type and name"
+        );
+    }
+
+    // Verify specific slugs exist
+    let slugs: Vec<String> = nodes
+        .iter()
+        .map(|n| {
+            format!(
+                "{}.{}",
+                n["type"].as_str().unwrap(),
+                n["name"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(slugs.contains(&"source.primary".to_string()));
+    assert!(slugs.contains(&"transform.step_one".to_string()));
+    assert!(slugs.contains(&"output.output".to_string()));
+}
+
+/// JSON depends_on correctly reflects graph edges.
+#[test]
+fn test_explain_json_depends_on() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+    let nodes = json["nodes"].as_array().unwrap();
+
+    // Source has no dependencies
+    let source = nodes.iter().find(|n| n["name"] == "primary").unwrap();
+    let source_deps = source["depends_on"].as_array().unwrap();
+    assert!(source_deps.is_empty(), "source should have no deps");
+
+    // step_one depends on source
+    let step_one = nodes.iter().find(|n| n["name"] == "step_one").unwrap();
+    let step_one_deps: Vec<&str> = step_one["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        step_one_deps.contains(&"source.primary"),
+        "step_one should depend on source.primary: {step_one_deps:?}"
+    );
+}
+
+/// JSON tier values present on all transform nodes.
+#[test]
+fn test_explain_json_tiers() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+    let nodes = json["nodes"].as_array().unwrap();
+
+    for node in nodes {
+        if node["type"].as_str() == Some("transform") {
+            assert!(
+                node.get("tier").is_some(),
+                "transform node must have tier: {}",
+                node["name"]
+            );
+        }
+    }
+}
+
+/// DOT output starts with `digraph` and contains node names.
+#[test]
+fn test_explain_dot_valid_syntax() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let dot = plan.explain_dot();
+
+    assert!(
+        dot.starts_with("digraph"),
+        "DOT output must start with 'digraph': {}",
+        &dot[..dot.len().min(50)]
+    );
+    assert!(
+        dot.contains("step_one"),
+        "DOT should contain node name step_one"
+    );
+    assert!(
+        dot.contains("step_two"),
+        "DOT should contain node name step_two"
+    );
+}
+
+/// DOT edges have dependency type labels.
+#[test]
+fn test_explain_dot_edge_labels() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let dot = plan.explain_dot();
+
+    assert!(
+        dot.contains(r#"label="data""#),
+        "DOT edges should have dependency type labels: {dot}"
+    );
+}
+
+/// Non-branching pipeline text output is backward-compatible (contains key sections).
+#[test]
+fn test_explain_linear_unchanged() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let text = plan.explain_text(&config);
+
+    // Must still contain the core explain sections
+    assert!(text.contains("=== Execution Plan ==="));
+    assert!(text.contains("=== CXL Expressions ==="));
+    assert!(text.contains("=== DAG Topology ==="));
+    // Linear pipeline should NOT have FORK/MERGE indicators
+    assert!(
+        !text.contains("FORK"),
+        "linear pipeline should not show FORK"
+    );
+    assert!(
+        !text.contains("MERGE"),
+        "linear pipeline should not show MERGE"
+    );
+}

@@ -90,6 +90,23 @@ impl PlanNode {
     pub fn id_slug(&self) -> String {
         format!("{}.{}", self.type_tag(), self.name())
     }
+
+    /// Human-readable label for DOT node annotations and text display.
+    pub fn display_name(&self) -> String {
+        match self {
+            PlanNode::Source { name } => format!("[source] {name}"),
+            PlanNode::Transform { name, .. } => format!("[transform] {name}"),
+            PlanNode::Route { name, mode, .. } => {
+                let mode_str = match mode {
+                    RouteMode::Exclusive => "exclusive",
+                    RouteMode::Inclusive => "inclusive",
+                };
+                format!("[route:{mode_str}] {name}")
+            }
+            PlanNode::Merge { name } => format!("[merge] {name}"),
+            PlanNode::Output { name } => format!("[output] {name}"),
+        }
+    }
 }
 
 /// Edge dependency type.
@@ -102,6 +119,17 @@ pub enum DependencyType {
     Index,
     /// Cross-source dependency.
     CrossSource,
+}
+
+impl DependencyType {
+    /// String label for DOT edge annotations.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DependencyType::Data => "data",
+            DependencyType::Index => "index",
+            DependencyType::CrossSource => "cross_source",
+        }
+    }
 }
 
 /// Edge in the execution plan DAG.
@@ -689,6 +717,76 @@ impl ExecutionPlanDag {
             })
             .collect()
     }
+
+    /// Enhanced text output with branch/merge ASCII indicators.
+    ///
+    /// Fork points show `├──>` per branch, merge points show `└──<`.
+    /// Linear nodes show `│` continuation.
+    pub fn explain_text(&self, config: &PipelineConfig) -> String {
+        let mut out = self.explain_full(config);
+
+        out.push_str("=== DAG Topology ===\n\n");
+        for &idx in &self.topo_order {
+            let node = &self.graph[idx];
+            match node {
+                PlanNode::Route {
+                    name,
+                    mode,
+                    branches,
+                    ..
+                } => {
+                    let mode_str = match mode {
+                        RouteMode::Exclusive => "exclusive",
+                        RouteMode::Inclusive => "inclusive",
+                    };
+                    out.push_str(&format!("  ◆ FORK [{mode_str}] '{name}'\n"));
+                    for branch in branches {
+                        out.push_str(&format!("  ├──> {branch}\n"));
+                    }
+                }
+                PlanNode::Merge { name } => {
+                    out.push_str(&format!("  └──< MERGE '{name}'\n"));
+                }
+                _ => {
+                    let deps: Vec<String> = self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .map(|pred| self.graph[pred].name().to_string())
+                        .collect();
+                    if deps.is_empty() {
+                        out.push_str(&format!("  ● {}\n", node.display_name()));
+                    } else {
+                        out.push_str(&format!("  │ {}\n", node.display_name()));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+        out
+    }
+
+    /// Render the DAG as Graphviz DOT.
+    pub fn explain_dot(&self) -> String {
+        format!(
+            "{:?}",
+            petgraph::dot::Dot::with_attr_getters(
+                &self.graph,
+                &[
+                    petgraph::dot::Config::EdgeNoLabel,
+                    petgraph::dot::Config::NodeNoLabel,
+                ],
+                &|_, edge| { format!(r#"label="{}""#, edge.weight().dependency_type.as_str()) },
+                &|_, (_, node)| { format!(r#"label="{}""#, dot_escape(&node.display_name())) },
+            )
+        )
+    }
+}
+
+/// Escape a string for Graphviz DOT attribute values.
+fn dot_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Custom Serialize: flat node-list with schema_version, id slugs, depends_on.

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use clinker_channel::channel_override::{
     ChannelOverride, resolve_channel, resolve_channel_with_inheritance,
@@ -94,6 +94,17 @@ NDJSON archives.")]
     },
 }
 
+/// Output format for --explain.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ExplainFormat {
+    /// Human-readable ASCII text with branch/merge indicators.
+    Text,
+    /// Structured JSON for Kiln canvas consumption.
+    Json,
+    /// Graphviz DOT for static visualization.
+    Dot,
+}
+
 /// Arguments for `clinker run`.
 #[derive(Parser, Debug)]
 pub struct RunArgs {
@@ -116,9 +127,16 @@ pub struct RunArgs {
     #[arg(long, help_heading = "Execution")]
     pub batch_id: Option<String>,
 
-    /// Print execution plan and exit (no data read)
-    #[arg(long, help_heading = "Validation")]
-    pub explain: bool,
+    /// Print execution plan and exit (no data read).
+    /// Optionally specify format: text (default), json, dot.
+    #[arg(
+        long,
+        help_heading = "Validation",
+        num_args(0..=1),
+        default_missing_value("text"),
+        value_enum
+    )]
+    pub explain: Option<ExplainFormat>,
 
     /// Validate config and CXL without processing data
     #[arg(long, help_heading = "Validation")]
@@ -365,9 +383,24 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     // 7. Existing logic: explain / dry_run / execute
-    if args.explain {
-        let plan_output = PipelineExecutor::explain(&pipeline_config)?;
-        println!("{}", plan_output);
+    if let Some(format) = args.explain {
+        let (dag, _) = PipelineExecutor::explain_dag(&pipeline_config)?;
+        match format {
+            ExplainFormat::Text => {
+                print!("{}", dag.explain_text(&pipeline_config));
+            }
+            ExplainFormat::Json => {
+                let json = serde_json::to_string_pretty(&dag).map_err(|e| {
+                    PipelineError::Config(clinker_core::config::ConfigError::Validation(format!(
+                        "JSON serialization failed: {e}"
+                    )))
+                })?;
+                println!("{json}");
+            }
+            ExplainFormat::Dot => {
+                print!("{}", dag.explain_dot());
+            }
+        }
         return Ok(0);
     }
 

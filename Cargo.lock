@@ -734,6 +734,7 @@ dependencies = [
  "clinker-format",
  "miette",
  "num_cpus",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -802,9 +803,7 @@ name = "clinker-format"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "clinker-bench-support",
  "clinker-record",
- "criterion",
  "csv",
  "miette",
  "quick-xml 0.37.5",
@@ -854,8 +853,6 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "chrono",
- "clinker-bench-support",
- "criterion",
  "indexmap",
  "serde",
  "serde_json",
@@ -1294,9 +1291,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "chrono",
- "clinker-bench-support",
  "clinker-record",
- "criterion",
  "indexmap",
  "miette",
  "regex",
