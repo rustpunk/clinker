@@ -7,11 +7,25 @@ use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
-use crate::config::{PipelineConfig, SortField};
+use crate::config::{PipelineConfig, RouteMode, SortField};
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 
 use cxl::analyzer::{self, ParallelismHint};
 use cxl::typecheck::pass::TypedProgram;
+
+/// Route topology for `--explain` display.
+///
+/// This is a display-only struct, separate from the runtime `CompiledRoute`.
+/// Holds condition strings (not compiled evaluators) for human-readable output.
+#[derive(Debug)]
+pub struct RoutePlan {
+    /// Routing mode: exclusive (first-match) or inclusive (all-match).
+    pub mode: RouteMode,
+    /// (branch_name, condition_expression) pairs in evaluation order.
+    pub branches: Vec<(String, String)>,
+    /// Default output name for records matching no branch.
+    pub default: String,
+}
 
 /// Full execution plan — spec §6.1 Phase F output.
 #[derive(Debug)]
@@ -26,6 +40,8 @@ pub struct ExecutionPlan {
     pub output_projections: Vec<OutputSpec>,
     /// Parallelism profile for the pipeline.
     pub parallelism: ParallelismProfile,
+    /// Route configuration, if multi-output routing is configured.
+    pub route: Option<RoutePlan>,
 }
 
 /// Whether the pipeline needs one pass or two.
@@ -201,12 +217,27 @@ impl ExecutionPlan {
                 .unwrap_or(4),
         };
 
+        // Build route plan from first transform with route config
+        let route = config
+            .transforms()
+            .find_map(|t| t.route.as_ref())
+            .map(|rc| RoutePlan {
+                mode: rc.mode,
+                branches: rc
+                    .branches
+                    .iter()
+                    .map(|b| (b.name.clone(), b.condition.clone()))
+                    .collect(),
+                default: rc.default.clone(),
+            });
+
         Ok(ExecutionPlan {
             source_dag,
             indices_to_build: indices,
             transforms,
             output_projections,
             parallelism,
+            route,
         })
     }
 
@@ -257,6 +288,26 @@ impl ExecutionPlan {
             out.push_str(&format!(
                 "  Partition lookup: {:?}\n\n",
                 tp.partition_lookup
+            ));
+        }
+
+        if let Some(route) = &self.route {
+            out.push_str(&format!(
+                "Route (mode: {}):\n",
+                match route.mode {
+                    RouteMode::Exclusive => "exclusive",
+                    RouteMode::Inclusive => "inclusive",
+                }
+            ));
+            for (name, condition) in &route.branches {
+                out.push_str(&format!(
+                    "  Branch '{}': {} → output '{}'\n",
+                    name, condition, name
+                ));
+            }
+            out.push_str(&format!(
+                "  Default: '{}' → output '{}'\n\n",
+                route.default, route.default
             ));
         }
 
@@ -800,5 +851,238 @@ mod tests {
             PlanError::UnknownSource { name, .. } => assert_eq!(name, "nonexistent"),
             other => panic!("Expected UnknownSource, got: {:?}", other),
         }
+    }
+
+    /// Build a config with route configuration on the first transform.
+    fn test_config_with_route(cxl: &str, route: crate::config::RouteConfig) -> PipelineConfig {
+        PipelineConfig {
+            pipeline: PipelineMeta {
+                name: "route-explain-test".into(),
+                memory_limit: None,
+                vars: None,
+                date_formats: None,
+                rules_path: None,
+                concurrency: None,
+                date_locale: None,
+                log_rules: None,
+                include_provenance: None,
+                metrics: None,
+            },
+            inputs: vec![InputConfig {
+                name: "src".into(),
+                path: "data.csv".into(),
+                schema: None,
+                schema_overrides: None,
+                array_paths: None,
+                sort_order: None,
+                format: InputFormat::Csv(None),
+                notes: None,
+            }],
+            outputs: vec![OutputConfig {
+                name: "output".into(),
+                path: "out.csv".into(),
+                include_unmapped: true,
+                include_header: None,
+                mapping: None,
+                exclude: None,
+                sort_order: None,
+                preserve_nulls: None,
+                format: OutputFormat::Csv(None),
+                notes: None,
+            }],
+            transformations: vec![TransformEntry::Transform(TransformConfig {
+                name: "router".into(),
+                description: None,
+                cxl: cxl.into(),
+                local_window: None,
+                log: None,
+                validations: None,
+                route: Some(route),
+                notes: None,
+            })],
+            error_handling: ErrorHandlingConfig::default(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_explain_shows_route_branches() {
+        let route = crate::config::RouteConfig {
+            mode: crate::config::RouteMode::Exclusive,
+            branches: vec![
+                crate::config::RouteBranch {
+                    name: "high_value".into(),
+                    condition: "amount > 1000".into(),
+                },
+                crate::config::RouteBranch {
+                    name: "medium_value".into(),
+                    condition: "amount > 100".into(),
+                },
+            ],
+            default: "low_value".into(),
+        };
+        let config = test_config_with_route("emit result = amount", route);
+        let fields = &["amount"];
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let compiled = vec![("router", &typed)];
+
+        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let explain = plan.explain();
+
+        assert!(
+            explain.contains("high_value"),
+            "should contain branch name 'high_value': {}",
+            explain
+        );
+        assert!(
+            explain.contains("medium_value"),
+            "should contain branch name 'medium_value': {}",
+            explain
+        );
+        assert!(
+            explain.contains("amount > 1000"),
+            "should contain condition: {}",
+            explain
+        );
+        assert!(
+            explain.contains("amount > 100"),
+            "should contain condition: {}",
+            explain
+        );
+    }
+
+    #[test]
+    fn test_explain_shows_route_mode() {
+        let route_exclusive = crate::config::RouteConfig {
+            mode: crate::config::RouteMode::Exclusive,
+            branches: vec![crate::config::RouteBranch {
+                name: "branch_a".into(),
+                condition: "status == \"active\"".into(),
+            }],
+            default: "other".into(),
+        };
+        let config = test_config_with_route("emit result = status", route_exclusive);
+        let fields = &["status"];
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let compiled = vec![("router", &typed)];
+
+        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let explain = plan.explain();
+
+        assert!(
+            explain.contains("exclusive"),
+            "should contain mode 'exclusive': {}",
+            explain
+        );
+
+        // Also test inclusive
+        let route_inclusive = crate::config::RouteConfig {
+            mode: crate::config::RouteMode::Inclusive,
+            branches: vec![crate::config::RouteBranch {
+                name: "branch_a".into(),
+                condition: "status == \"active\"".into(),
+            }],
+            default: "other".into(),
+        };
+        let config2 = test_config_with_route("emit result = status", route_inclusive);
+        let typed2 = compile_cxl(&t(&config2.transformations[0]).cxl, fields);
+        let compiled2 = vec![("router", &typed2)];
+
+        let plan2 = ExecutionPlan::compile(&config2, &compiled2).unwrap();
+        let explain2 = plan2.explain();
+
+        assert!(
+            explain2.contains("inclusive"),
+            "should contain mode 'inclusive': {}",
+            explain2
+        );
+    }
+
+    #[test]
+    fn test_explain_shows_default() {
+        let route = crate::config::RouteConfig {
+            mode: crate::config::RouteMode::Exclusive,
+            branches: vec![crate::config::RouteBranch {
+                name: "special".into(),
+                condition: "flag == true".into(),
+            }],
+            default: "fallback".into(),
+        };
+        let config = test_config_with_route("emit result = flag", route);
+        let fields = &["flag"];
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let compiled = vec![("router", &typed)];
+
+        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let explain = plan.explain();
+
+        assert!(
+            explain.contains("Default: 'fallback'"),
+            "should show default branch: {}",
+            explain
+        );
+    }
+
+    #[test]
+    fn test_explain_no_route_unchanged() {
+        // Pipeline without routes — explain output should not mention Route
+        let config = test_config(
+            vec![("primary", "data.csv")],
+            vec![("calc", "emit doubled = amount * 2", None)],
+        );
+        let fields = &["amount"];
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let compiled = vec![("calc", &typed)];
+
+        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let explain = plan.explain();
+
+        assert!(
+            !explain.contains("Route"),
+            "should not contain Route section when no routes: {}",
+            explain
+        );
+    }
+
+    #[test]
+    fn test_explain_shows_output_mapping() {
+        let route = crate::config::RouteConfig {
+            mode: crate::config::RouteMode::Exclusive,
+            branches: vec![
+                crate::config::RouteBranch {
+                    name: "errors".into(),
+                    condition: "status == \"error\"".into(),
+                },
+                crate::config::RouteBranch {
+                    name: "warnings".into(),
+                    condition: "status == \"warn\"".into(),
+                },
+            ],
+            default: "normal".into(),
+        };
+        let config = test_config_with_route("emit result = status", route);
+        let fields = &["status"];
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let compiled = vec![("router", &typed)];
+
+        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let explain = plan.explain();
+
+        // Each branch should show → output mapping
+        assert!(
+            explain.contains("→ output 'errors'"),
+            "should show output mapping for 'errors': {}",
+            explain
+        );
+        assert!(
+            explain.contains("→ output 'warnings'"),
+            "should show output mapping for 'warnings': {}",
+            explain
+        );
+        assert!(
+            explain.contains("→ output 'normal'"),
+            "should show output mapping for default: {}",
+            explain
+        );
     }
 }
