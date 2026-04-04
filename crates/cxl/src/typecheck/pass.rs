@@ -282,6 +282,11 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::MetaAccess { node_id, .. } => {
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
+
             Expr::Now { node_id, .. } => {
                 self.set_type(*node_id, Type::DateTime);
                 Type::DateTime
@@ -461,7 +466,7 @@ impl<'a> TypeChecker<'a> {
                 // Check for nested window calls inside predicate_expr
                 if in_predicate {
                     self.error(*span,
-                        format!("window.{}() cannot be called inside a window.any() or window.all() predicate", function),
+                        format!("$window.{}() cannot be called inside a $window.any() or $window.all() predicate", function),
                         Some("Move the window call outside the predicate expression".into()));
                 }
 
@@ -796,7 +801,7 @@ mod tests {
     #[test]
     fn test_typecheck_nested_window_in_predicate() {
         let diags = typecheck_err(
-            "emit val = window.any(window.sum(it) > 0)",
+            "emit val = $window.any($window.sum(it) > 0)",
             &["amount"],
             &HashMap::new(),
         );
@@ -814,7 +819,7 @@ mod tests {
         // window.sum() on a String field should produce an error
         let mut schema = HashMap::new();
         schema.insert("name".into(), Type::String);
-        let diags = typecheck_err("emit val = window.sum(name)", &["name"], &schema);
+        let diags = typecheck_err("emit val = $window.sum(name)", &["name"], &schema);
         assert!(
             diags.iter().any(|d| d.message.contains("Numeric")),
             "Expected Numeric requirement diagnostic, got: {:?}",
@@ -911,10 +916,10 @@ mod tests {
 
     #[test]
     fn test_typecheck_pipeline_access_types() {
-        let typed = typecheck_ok("emit ts = pipeline.start_time", &[], &HashMap::new());
+        let typed = typecheck_ok("emit ts = $pipeline.start_time", &[], &HashMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::DateTime);
 
-        let typed2 = typecheck_ok("emit n = pipeline.total_count", &[], &HashMap::new());
+        let typed2 = typecheck_ok("emit n = $pipeline.total_count", &[], &HashMap::new());
         assert_eq!(first_emit_expr_type(&typed2), Type::Int);
     }
 

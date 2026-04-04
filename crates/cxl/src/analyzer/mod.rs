@@ -276,6 +276,7 @@ fn walk_expr(
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::MetaAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. } => {}
     }
@@ -328,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_analyzer_aggregate_window() {
-        let typed = compile("emit total = window.sum(amount)");
+        let typed = compile("emit total = $window.sum(amount)");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         assert_eq!(analysis.window_calls[0].function_name.as_ref(), "sum");
@@ -339,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_analyzer_positional_window() {
-        let typed = compile("emit prev = window.lag(1)");
+        let typed = compile("emit prev = $window.lag(1)");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         assert_eq!(
@@ -351,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_analyzer_multiple_windows() {
-        let typed = compile("emit total = window.sum(amount)\nemit cnt = window.count()");
+        let typed = compile("emit total = $window.sum(amount)\nemit cnt = $window.count()");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 2);
         assert_eq!(analysis.parallelism_hint, ParallelismHint::IndexReading);
@@ -360,7 +361,7 @@ mod tests {
     #[test]
     fn test_analyzer_mixed_stateless_and_window() {
         let typed =
-            compile("let x = amount + 1\nemit total = window.sum(amount)\nemit doubled = x * 2");
+            compile("let x = amount + 1\nemit total = $window.sum(amount)\nemit doubled = x * 2");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         // Still IndexReading because there IS a window call

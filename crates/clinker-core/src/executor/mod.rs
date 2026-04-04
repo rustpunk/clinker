@@ -1476,7 +1476,7 @@ fn can_parallelize(plan: &ExecutionPlan) -> bool {
 /// Build an EvalContext for a given record.
 ///
 /// `pipeline_start_time` must be frozen once at pipeline start and reused for all
-/// records. This ensures `pipeline.start_time` is deterministic within a run.
+/// records. This ensures `$pipeline.start_time` is deterministic within a run.
 /// The `now` keyword uses `ctx.clock.now()` (wall-clock) and is intentionally
 /// non-deterministic — users who reference `now` opt into time-varying output.
 fn build_eval_context(
@@ -2204,7 +2204,7 @@ transformations:
 
     #[test]
     fn test_two_pass_sum_by_dept() {
-        let yaml = two_pass_yaml("emit dept_total = window.sum(amount)", "group_by: [dept]");
+        let yaml = two_pass_yaml("emit dept_total = $window.sum(amount)", "group_by: [dept]");
         let csv = "dept,amount\nA,10\nB,20\nA,30\nB,40\nA,50\n";
         let (counters, _, output) = run_test(&yaml, csv).unwrap();
         assert_eq!(counters.total_count, 5);
@@ -2219,7 +2219,7 @@ transformations:
 
     #[test]
     fn test_two_pass_count_by_group() {
-        let yaml = two_pass_yaml("emit group_count = window.count()", "group_by: [dept]");
+        let yaml = two_pass_yaml("emit group_count = $window.count()", "group_by: [dept]");
         let csv = "dept,amount\nA,10\nB,20\nA,30\nB,40\nA,50\n";
         let (counters, _, output) = run_test(&yaml, csv).unwrap();
         assert_eq!(counters.total_count, 5);
@@ -2271,7 +2271,7 @@ transformations:
 
     #[test]
     fn test_two_pass_pipeline_counters() {
-        let yaml = two_pass_yaml("emit cnt = window.count()", "group_by: [dept]");
+        let yaml = two_pass_yaml("emit cnt = $window.count()", "group_by: [dept]");
         let csv = "dept\nA\nB\nA\nB\nA\nB\nA\nB\nA\nB\n";
         let (counters, dlq, _) = run_test(&yaml, csv).unwrap();
         assert_eq!(counters.total_count, 10);
@@ -2303,7 +2303,7 @@ transformations:
       emit label = dept + "_label"
   - name: window_calc
     cxl: |
-      emit cnt = window.count()
+      emit cnt = $window.count()
     local_window:
       group_by: [dept]
 "#;
@@ -2337,12 +2337,12 @@ outputs:
 transformations:
   - name: win1
     cxl: |
-      emit cnt1 = window.count()
+      emit cnt1 = $window.count()
     local_window:
       group_by: [dept]
   - name: win2
     cxl: |
-      emit cnt2 = window.count()
+      emit cnt2 = $window.count()
     local_window:
       group_by: [dept]
 "#;
@@ -2362,7 +2362,7 @@ transformations:
         // This test verifies the error path exists by checking the error type.
         // A true NaN test would need non-CSV input or post-coercion in Arena.
         // For now, verify the pipeline runs without NaN errors for string data.
-        let yaml = two_pass_yaml("emit cnt = window.count()", "group_by: [dept]");
+        let yaml = two_pass_yaml("emit cnt = $window.count()", "group_by: [dept]");
         let csv = "dept\nA\nB\n";
         let result = run_test(&yaml, csv);
         assert!(result.is_ok()); // No NaN in string data
@@ -2371,7 +2371,7 @@ transformations:
     #[test]
     fn test_two_pass_provenance_populated() {
         // RecordProvenance is set in EvalContext — verify source_row is sequential
-        let yaml = two_pass_yaml("emit row = pipeline.source_row", "group_by: [dept]");
+        let yaml = two_pass_yaml("emit row = $pipeline.source_row", "group_by: [dept]");
         let csv = "dept\nA\nB\nA\n";
         let (counters, _, output) = run_test(&yaml, csv).unwrap();
         assert_eq!(counters.ok_count, 3);
@@ -2498,7 +2498,7 @@ outputs:
 transformations:
   - name: dept_total
     cxl: |
-      emit dept_total = window.sum(amount)
+      emit dept_total = $window.sum(amount)
     local_window:
       group_by: [dept]
 "#;
@@ -2524,7 +2524,7 @@ transformations:
 
     #[test]
     fn test_sequential_not_parallelized() {
-        // A transform using window.lag(1) is classified Sequential.
+        // A transform using $window.lag(1) is classified Sequential.
         // Verify the pipeline runs correctly (sequential dispatch path).
         let yaml = r#"
 pipeline:
@@ -2541,7 +2541,7 @@ outputs:
 transformations:
   - name: lagged
     cxl: |
-      emit prev = window.lag(1)
+      emit prev = $window.lag(1)
     local_window:
       group_by: [dept]
       sort_by:
@@ -2865,7 +2865,7 @@ outputs:
     path: /tmp/out.csv
 transformations:
   - name: t1
-    cxl: "emit total = window.sum(amount)"
+    cxl: "emit total = $window.sum(amount)"
     local_window:
       group_by: [dept]
       sort_by:

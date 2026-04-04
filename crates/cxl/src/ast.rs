@@ -36,6 +36,8 @@ pub enum Statement {
         node_id: NodeId,
         name: Box<str>,
         expr: Expr,
+        /// When true, writes to per-record metadata (`$meta.*`) instead of output.
+        is_meta: bool,
         span: Span,
     },
     Trace {
@@ -139,6 +141,11 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    MetaAccess {
+        node_id: NodeId,
+        field: Box<str>,
+        span: Span,
+    },
     /// The `now` keyword — wall-clock DateTime at the point of evaluation.
     Now {
         node_id: NodeId,
@@ -165,6 +172,7 @@ impl Expr {
             | Expr::Coalesce { span, .. }
             | Expr::WindowCall { span, .. }
             | Expr::PipelineAccess { span, .. }
+            | Expr::MetaAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. } => *span,
         }
@@ -184,6 +192,7 @@ impl Expr {
             | Expr::Coalesce { node_id, .. }
             | Expr::WindowCall { node_id, .. }
             | Expr::PipelineAccess { node_id, .. }
+            | Expr::MetaAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. } => *node_id,
         }
@@ -298,6 +307,7 @@ mod tests {
                         name: "x".into(),
                         span,
                     },
+                    is_meta: false,
                     span,
                 },
                 Statement::ExprStmt {
@@ -326,6 +336,7 @@ mod tests {
                 name: "label".into(),
                 span,
             },
+            is_meta: false,
             span,
         };
         if let Statement::Emit { name, .. } = stmt {

@@ -526,7 +526,8 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         }
         cxl::ast::Expr::Now { .. } => "now".into(),
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
-        cxl::ast::Expr::PipelineAccess { field, .. } => format!("pipeline.{}", field),
+        cxl::ast::Expr::PipelineAccess { field, .. } => format!("$pipeline.{}", field),
+        cxl::ast::Expr::MetaAccess { field, .. } => format!("$meta.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {
                 cxl::ast::BinOp::Add => "+",
@@ -566,7 +567,7 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         }
         cxl::ast::Expr::WindowCall { function, args, .. } => {
             let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
-            format!("window.{}({})", function, args_str)
+            format!("$window.{}({})", function, args_str)
         }
         cxl::ast::Expr::IfThenElse {
             condition,

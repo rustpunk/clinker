@@ -632,7 +632,7 @@ mod tests {
         });
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("agg", "emit total = window.sum(amount)", Some(window))],
+            vec![("agg", "emit total = $window.sum(amount)", Some(window))],
         );
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -656,10 +656,10 @@ mod tests {
             vec![
                 (
                     "agg1",
-                    "emit total = window.sum(amount)",
+                    "emit total = $window.sum(amount)",
                     Some(window.clone()),
                 ),
-                ("agg2", "emit cnt = window.count()", Some(window)),
+                ("agg2", "emit cnt = $window.count()", Some(window)),
             ],
         );
         let fields = &["dept", "amount", "date"];
@@ -683,12 +683,12 @@ mod tests {
             vec![
                 (
                     "agg_dept",
-                    "emit total = window.sum(amount)",
+                    "emit total = $window.sum(amount)",
                     Some(window_a),
                 ),
                 (
                     "agg_region",
-                    "emit total = window.sum(amount)",
+                    "emit total = $window.sum(amount)",
                     Some(window_b),
                 ),
             ],
@@ -726,7 +726,7 @@ mod tests {
         let window = serde_json::json!({ "group_by": ["dept"] });
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("agg", "emit total = window.sum(amount)", Some(window))],
+            vec![("agg", "emit total = $window.sum(amount)", Some(window))],
         );
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -748,7 +748,7 @@ mod tests {
         });
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("positional", "emit prev = window.lag(1)", Some(window))],
+            vec![("positional", "emit prev = $window.lag(1)", Some(window))],
         );
         let fields = &["dept", "amount", "date"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -769,7 +769,7 @@ mod tests {
             vec![("primary", "data.csv")],
             vec![
                 ("calc", "emit doubled = amount * 2", None),
-                ("agg", "emit total = window.sum(amount)", Some(window)),
+                ("agg", "emit total = $window.sum(amount)", Some(window)),
             ],
         );
         let fields = &["dept", "amount"];
@@ -796,7 +796,7 @@ mod tests {
         });
         let config = test_config(
             vec![("primary", "data.csv"), ("reference", "ref.csv")],
-            vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
+            vec![("lookup", "emit ref_val = $window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -818,7 +818,7 @@ mod tests {
         let window = serde_json::json!({ "group_by": ["dept"] });
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("agg", "emit total = window.sum(amount)", Some(window))],
+            vec![("agg", "emit total = $window.sum(amount)", Some(window))],
         );
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
@@ -837,7 +837,7 @@ mod tests {
         });
         let config = test_config(
             vec![("primary", "data.csv")],
-            vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
+            vec![("lookup", "emit ref_val = $window.sum(amount)", Some(window))],
         );
         let fields = &["id", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);

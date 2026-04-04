@@ -366,6 +366,13 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             Ok(ctx.resolve_pipeline(field).unwrap_or(Value::Null))
         }
 
+        Expr::MetaAccess { field, .. } => {
+            // Phase 14: reads from per-record metadata. Stubbed until Record.metadata lands.
+            Ok(resolver
+                .resolve(&format!("$meta.{field}"))
+                .unwrap_or(Value::Null))
+        }
+
         Expr::Now { .. } => Ok(Value::DateTime(ctx.clock.now())),
 
         Expr::Wildcard { .. } => Ok(Value::Bool(true)), // Wildcard in match = always matches

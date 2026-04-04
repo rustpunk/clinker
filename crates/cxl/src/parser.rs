@@ -329,7 +329,29 @@ impl Parser {
         let nid = self.alloc_id();
         let start = self.current_span();
         self.advance(); // consume 'emit'
-        let name = self.expect_ident("output field name")?;
+
+        // Check for `emit $meta.field = expr`
+        let (name, is_meta) = if *self.peek() == Token::Dollar {
+            self.advance(); // consume '$'
+            let ns = self.expect_ident("system namespace after '$'")?;
+            if ns != "meta" {
+                return Err(self.error(
+                    &format!(
+                        "emit ${}... is not valid; only emit $meta.field is allowed",
+                        ns
+                    ),
+                    "Only $meta fields can be set with emit",
+                    "Use: emit $meta.field_name = expr",
+                ));
+            }
+            self.expect_token(&Token::Dot, "'.'")?;
+            let field = self.expect_ident("metadata field name")?;
+            (field, true)
+        } else {
+            let field = self.expect_ident("output field name")?;
+            (field, false)
+        };
+
         self.expect_token(&Token::Eq, "'='")?;
         let expr = self.parse_expr(0)?;
         let end = expr.span();
@@ -337,6 +359,7 @@ impl Parser {
             node_id: nid,
             name: name.into(),
             expr,
+            is_meta,
             span: Span::new(start.start as usize, end.end as usize),
         })
     }
@@ -848,47 +871,63 @@ impl Parser {
                 })
             }
 
-            // window.fn() or pipeline.field
-            Token::Window => {
-                self.advance();
+            // $pipeline.field, $window.fn(), $meta.field
+            Token::Dollar => {
+                self.advance(); // consume '$'
+                let ns = self.expect_ident("system namespace (pipeline, window, meta)")?;
                 self.expect_token(&Token::Dot, "'.'")?;
-                let fn_name = self.expect_ident("window function name")?;
 
-                if *self.peek() == Token::LParen {
-                    let nid = self.alloc_id();
-                    self.advance();
-                    let args = self.parse_arg_list()?;
-                    let end = self.prev_span();
-                    Ok(Expr::WindowCall {
-                        node_id: nid,
-                        function: fn_name.into(),
-                        args,
-                        span: Span::new(start.start as usize, end.end as usize),
-                    })
-                } else {
-                    // window.first without parens — still a WindowCall with no args
-                    let nid = self.alloc_id();
-                    let end = self.prev_span();
-                    Ok(Expr::WindowCall {
-                        node_id: nid,
-                        function: fn_name.into(),
-                        args: vec![],
-                        span: Span::new(start.start as usize, end.end as usize),
-                    })
+                match ns.as_str() {
+                    "pipeline" => {
+                        let nid = self.alloc_id();
+                        let field = self.expect_ident("pipeline property name")?;
+                        let end = self.prev_span();
+                        Ok(Expr::PipelineAccess {
+                            node_id: nid,
+                            field: field.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
+                    "window" => {
+                        let fn_name = self.expect_ident("window function name")?;
+                        if *self.peek() == Token::LParen {
+                            let nid = self.alloc_id();
+                            self.advance();
+                            let args = self.parse_arg_list()?;
+                            let end = self.prev_span();
+                            Ok(Expr::WindowCall {
+                                node_id: nid,
+                                function: fn_name.into(),
+                                args,
+                                span: Span::new(start.start as usize, end.end as usize),
+                            })
+                        } else {
+                            let nid = self.alloc_id();
+                            let end = self.prev_span();
+                            Ok(Expr::WindowCall {
+                                node_id: nid,
+                                function: fn_name.into(),
+                                args: vec![],
+                                span: Span::new(start.start as usize, end.end as usize),
+                            })
+                        }
+                    }
+                    "meta" => {
+                        let nid = self.alloc_id();
+                        let field = self.expect_ident("metadata field name")?;
+                        let end = self.prev_span();
+                        Ok(Expr::MetaAccess {
+                            node_id: nid,
+                            field: field.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
+                    other => Err(self.error(
+                        &format!("unknown system namespace '${other}'"),
+                        "Valid system namespaces are: pipeline, window, meta",
+                        "Use $pipeline.field, $window.fn(), or $meta.field",
+                    )),
                 }
-            }
-
-            Token::Pipeline => {
-                let nid = self.alloc_id();
-                self.advance();
-                self.expect_token(&Token::Dot, "'.'")?;
-                let field = self.expect_ident("pipeline property name")?;
-                let end = self.prev_span();
-                Ok(Expr::PipelineAccess {
-                    node_id: nid,
-                    field: field.into(),
-                    span: Span::new(start.start as usize, end.end as usize),
-                })
             }
 
             // Identifiers (field references)
@@ -1388,7 +1427,7 @@ mod tests {
 
     #[test]
     fn test_parse_window_call() {
-        let r = parse_ok("let x = window.sum(amount)");
+        let r = parse_ok("let x = $window.sum(amount)");
         let expr = let_expr(&r);
         match expr {
             Expr::WindowCall { function, args, .. } => {
@@ -1401,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_parse_pipeline_access() {
-        let r = parse_ok("let x = pipeline.start_time");
+        let r = parse_ok("let x = $pipeline.start_time");
         let expr = let_expr(&r);
         match expr {
             Expr::PipelineAccess { field, .. } => {

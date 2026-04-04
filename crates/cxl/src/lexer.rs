@@ -20,7 +20,7 @@ impl Span {
 /// CXL token produced by the lexer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // --- Keywords (23) ---
+    // --- Keywords (21) ---
     Let,
     Emit,
     If,
@@ -39,8 +39,6 @@ pub enum Token {
     False,
     Now,
     It,
-    Window,
-    Pipeline,
     Filter,
     Distinct,
     By,
@@ -74,6 +72,7 @@ pub enum Token {
     Pipe,
     Underscore,
     ColonColon,
+    Dollar,
 
     // --- Literals ---
     StringLit(Box<str>),
@@ -239,6 +238,9 @@ impl<'src> Lexer<'src> {
 
             // Numbers
             b'0'..=b'9' => self.lex_number(start),
+
+            // System namespace sigil
+            b'$' => self.single(Token::Dollar, start),
 
             // Identifiers and keywords
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident(start),
@@ -422,8 +424,6 @@ impl<'src> Lexer<'src> {
             "false" => Token::False,
             "now" => Token::Now,
             "it" => Token::It,
-            "window" => Token::Window,
-            "pipeline" => Token::Pipeline,
             "filter" => Token::Filter,
             "distinct" => Token::Distinct,
             "by" => Token::By,
@@ -461,7 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lex_keywords_all_23() {
+    fn test_lex_keywords_all_21() {
         let keywords = [
             ("let", Token::Let),
             ("emit", Token::Emit),
@@ -481,13 +481,11 @@ mod tests {
             ("false", Token::False),
             ("now", Token::Now),
             ("it", Token::It),
-            ("window", Token::Window),
-            ("pipeline", Token::Pipeline),
             ("filter", Token::Filter),
             ("distinct", Token::Distinct),
             ("by", Token::By),
         ];
-        assert_eq!(keywords.len(), 23);
+        assert_eq!(keywords.len(), 21);
         for (src, expected) in keywords {
             let tokens = Lexer::tokenize(src);
             assert_eq!(tokens[0].0, expected, "keyword '{}' failed", src);
