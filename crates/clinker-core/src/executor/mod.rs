@@ -14,7 +14,7 @@ use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
 use crate::pipeline::memory::{MemoryBudget, rss_bytes};
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
-use crate::plan::execution::{ExecutionMode, ExecutionPlan, ParallelismClass};
+use crate::plan::execution::{ExecutionPlanDag, ParallelismClass};
 use crate::projection::{project_output, project_output_with_meta};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
@@ -45,8 +45,12 @@ pub struct ExecutionReport {
     pub counters: PipelineCounters,
     /// Records that were routed to the dead-letter queue.
     pub dlq_entries: Vec<DlqEntry>,
-    /// Whether the pipeline ran in single-pass streaming or two-pass arena mode.
-    pub execution_mode: ExecutionMode,
+    /// Human-readable execution summary (e.g., "Streaming", "TwoPass", "SortedStreaming").
+    pub execution_summary: String,
+    /// Whether any transform required arena allocation (window functions).
+    pub required_arena: bool,
+    /// Whether any transform required sorted input (correlation key).
+    pub required_sorted_input: bool,
     /// Peak process RSS observed across chunk boundaries. `None` only on
     /// platforms where RSS measurement is unavailable (e.g., FreeBSD).
     pub peak_rss_bytes: Option<u64>,
@@ -485,13 +489,13 @@ impl PipelineExecutor {
             }
         };
 
-        // Build ExecutionPlan to determine mode
+        // Build ExecutionPlanDag to determine mode
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled_transforms
             .iter()
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let mut plan = ExecutionPlan::compile(config, &compiled_refs).map_err(|e| {
+        let mut plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
             PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
@@ -528,7 +532,9 @@ impl PipelineExecutor {
             }
         }
 
-        let execution_mode = plan.mode();
+        let execution_summary = plan.execution_summary();
+        let required_arena = plan.required_arena();
+        let required_sorted_input = plan.required_sorted_input();
 
         // Validate that all configured outputs have registered writers.
         for output in &config.outputs {
@@ -542,16 +548,8 @@ impl PipelineExecutor {
             }
         }
 
-        let (counters, dlq_entries, peak_rss_bytes) = match execution_mode {
-            ExecutionMode::Streaming => Self::execute_streaming(
-                config,
-                csv_reader,
-                writers,
-                &compiled_transforms,
-                compiled_route,
-                params,
-            )?,
-            ExecutionMode::TwoPass => Self::execute_two_pass(
+        let (counters, dlq_entries, peak_rss_bytes) = if required_arena {
+            Self::execute_two_pass(
                 config,
                 csv_reader,
                 writers,
@@ -559,8 +557,9 @@ impl PipelineExecutor {
                 compiled_route,
                 &plan,
                 params,
-            )?,
-            ExecutionMode::SortedStreaming => Self::execute_correlated_streaming(
+            )?
+        } else if required_sorted_input {
+            Self::execute_correlated_streaming(
                 config,
                 csv_reader,
                 writers,
@@ -568,13 +567,24 @@ impl PipelineExecutor {
                 compiled_route,
                 params,
                 effective_sort_order.as_deref(),
-            )?,
+            )?
+        } else {
+            Self::execute_streaming(
+                config,
+                csv_reader,
+                writers,
+                &compiled_transforms,
+                compiled_route,
+                params,
+            )?
         };
 
         Ok(ExecutionReport {
             counters,
             dlq_entries,
-            execution_mode,
+            execution_summary,
+            required_arena,
+            required_sorted_input,
             peak_rss_bytes,
             started_at,
             finished_at: Utc::now(),
@@ -1655,7 +1665,7 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
-        plan: &ExecutionPlan,
+        plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
@@ -2314,7 +2324,7 @@ impl PipelineExecutor {
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let plan = ExecutionPlan::compile(config, &compiled_refs).map_err(|e| {
+        let plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
             PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
@@ -2413,7 +2423,7 @@ fn build_thread_pool(config: &PipelineConfig) -> Result<rayon::ThreadPool, Pipel
 }
 
 /// Determine if all transforms can be parallelized (Stateless or IndexReading).
-fn can_parallelize(plan: &ExecutionPlan) -> bool {
+fn can_parallelize(plan: &ExecutionPlanDag) -> bool {
     plan.parallelism.per_transform.iter().all(|c| {
         matches!(
             c,
@@ -2512,7 +2522,7 @@ fn evaluate_record_with_window(
     transform_names: &[&str],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     arena: &Arena,
     indices: &[SecondaryIndex],
     record_pos: u32,

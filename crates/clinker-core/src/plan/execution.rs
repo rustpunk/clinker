@@ -1,80 +1,167 @@
 //! Phase F: Execution plan emission.
 //!
-//! Compiles a `PipelineConfig` + CXL programs into an `ExecutionPlan`
-//! that orchestrates the two-pass pipeline.
+//! Compiles a `PipelineConfig` + CXL programs into an `ExecutionPlanDag`
+//! that orchestrates the pipeline via a petgraph DAG.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
+use petgraph::algo::toposort;
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::{Control, DfsEvent, depth_first_search};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 
-use crate::config::{PipelineConfig, RouteMode, SortField};
+use crate::config::{PipelineConfig, RouteMode, SortField, TransformInput};
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 
 use cxl::analyzer::{self, ParallelismHint};
 use cxl::typecheck::pass::TypedProgram;
 
-/// Route topology for `--explain` display.
+/// Per-node execution strategy — replaces global ExecutionMode.
 ///
-/// This is a display-only struct, separate from the runtime `CompiledRoute`.
-/// Holds condition strings (not compiled evaluators) for human-readable output.
-#[derive(Debug)]
-pub struct RoutePlan {
-    /// Routing mode: exclusive (first-match) or inclusive (all-match).
-    pub mode: RouteMode,
-    /// (branch_name, condition_expression) pairs in evaluation order.
-    pub branches: Vec<(String, String)>,
-    /// Default output name for records matching no branch.
-    pub default: String,
+/// Each transform declares what it needs from the executor.
+/// The topo-walk applies the appropriate materialization at each node.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeExecutionReqs {
+    /// Single-pass streaming — no arena, no sort.
+    Streaming,
+    /// Window functions present — build arena + indices first.
+    RequiresArena,
+    /// Correlation key — sorted input for group-boundary detection.
+    RequiresSortedInput { sort_fields: Vec<SortField> },
 }
 
-/// Full execution plan — spec §6.1 Phase F output.
+/// Node in the execution plan DAG.
+///
+/// Self-contained — owns all display and topology data. Execution-time details
+/// (window_index, partition_lookup) live in CompiledTransform, indexed by name.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlanNode {
+    Source {
+        name: String,
+    },
+    Transform {
+        name: String,
+        parallelism_class: ParallelismClass,
+        tier: u32,
+        execution_reqs: NodeExecutionReqs,
+    },
+    Route {
+        name: String,
+        mode: RouteMode,
+        branches: Vec<String>,
+        default: String,
+    },
+    Merge {
+        name: String,
+    },
+    Output {
+        name: String,
+    },
+}
+
+impl PlanNode {
+    /// Get the name of this node regardless of variant.
+    pub fn name(&self) -> &str {
+        match self {
+            PlanNode::Source { name }
+            | PlanNode::Transform { name, .. }
+            | PlanNode::Route { name, .. }
+            | PlanNode::Merge { name }
+            | PlanNode::Output { name } => name,
+        }
+    }
+
+    /// Get the type tag string for id slug construction.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            PlanNode::Source { .. } => "source",
+            PlanNode::Transform { .. } => "transform",
+            PlanNode::Route { .. } => "route",
+            PlanNode::Merge { .. } => "merge",
+            PlanNode::Output { .. } => "output",
+        }
+    }
+
+    /// Build the id slug: `"{type}.{name}"`.
+    pub fn id_slug(&self) -> String {
+        format!("{}.{}", self.type_tag(), self.name())
+    }
+}
+
+/// Edge dependency type.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyType {
+    /// Record data flows along this edge.
+    Data,
+    /// Index/lookup dependency (no data flow — ordering constraint only).
+    Index,
+    /// Cross-source dependency.
+    CrossSource,
+}
+
+/// Edge in the execution plan DAG.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEdge {
+    pub dependency_type: DependencyType,
+}
+
+/// DAG-based execution plan — replaces ExecutionPlan.
+///
+/// The single source of truth for pipeline topology and execution strategy.
+/// Custom Serialize emits flat node-list JSON for Kiln consumption.
 #[derive(Debug)]
-pub struct ExecutionPlan {
+pub struct ExecutionPlanDag {
+    /// petgraph DAG of PlanNode/PlanEdge.
+    pub graph: DiGraph<PlanNode, PlanEdge>,
+    /// Topologically sorted node indices.
+    pub topo_order: Vec<NodeIndex>,
     /// Topologically sorted source tiers for Phase 1 ordering.
     pub source_dag: Vec<SourceTier>,
     /// Indices to build during Phase 1. Deduplicated.
     pub indices_to_build: Vec<IndexSpec>,
     /// Per-transform execution units with compiled CXL and classification.
+    /// Kept for backward compat with executor until Task 15.4 rewrites it.
     pub transforms: Vec<TransformPlan>,
     /// Per-output projection rules.
     pub output_projections: Vec<OutputSpec>,
     /// Parallelism profile for the pipeline.
     pub parallelism: ParallelismProfile,
-    /// Route configuration, if multi-output routing is configured.
-    pub route: Option<RoutePlan>,
     /// If correlation sort was auto-injected, describes what was prepended.
-    /// Format: "Correlation sort (auto-injected): [field1, field2] + existing [field3]"
     pub correlation_sort_note: Option<String>,
 }
 
-/// Whether the pipeline needs one pass or two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    /// No window functions — single-pass streaming.
-    Streaming,
-    /// Window functions present — build arena + indices, then re-read.
-    TwoPass,
-    /// No windows, but correlation_key requires sorted input for group-boundary detection.
-    /// Records are sorted in-memory, then processed in a single streaming pass.
-    SortedStreaming,
-}
+impl ExecutionPlanDag {
+    /// Whether any node requires arena allocation (window functions).
+    pub fn required_arena(&self) -> bool {
+        !self.indices_to_build.is_empty()
+    }
 
-impl ExecutionPlan {
-    /// Derive execution mode from index requirements and correlation config.
-    pub fn mode(&self) -> ExecutionMode {
-        if !self.indices_to_build.is_empty() {
-            ExecutionMode::TwoPass
-        } else if self.correlation_sort_note.is_some() {
-            ExecutionMode::SortedStreaming
+    /// Whether any node requires sorted input (correlation key).
+    pub fn required_sorted_input(&self) -> bool {
+        self.correlation_sort_note.is_some() && !self.required_arena()
+    }
+
+    /// Human-readable execution summary replacing `ExecutionMode` debug format.
+    pub fn execution_summary(&self) -> String {
+        if self.required_arena() {
+            "TwoPass".to_string()
+        } else if self.required_sorted_input() {
+            "SortedStreaming".to_string()
         } else {
-            ExecutionMode::Streaming
+            "Streaming".to_string()
         }
     }
 
-    /// Compile a PipelineConfig + pre-compiled transforms into an ExecutionPlan.
+    /// Compile a PipelineConfig + pre-compiled transforms into a DAG plan.
     ///
-    /// `compiled`: vec of (transform_name, TypedProgram) pairs, already compiled
-    /// in the order they appear in config.transformations.
+    /// Validates all `input:` references with full config context.
+    /// Derives `NodeExecutionReqs` per transform from analyzer output.
+    /// Builds the petgraph DAG with source, transform, route, merge, and output nodes.
     pub fn compile(
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
@@ -145,7 +232,7 @@ impl ExecutionPlan {
 
         let indices = index::deduplicate_indices(raw_requests.clone());
 
-        // Phase F: build transform plans
+        // Phase F: build transform plans (backward compat for executor)
         let transforms: Vec<TransformPlan> = compiled
             .iter()
             .enumerate()
@@ -153,24 +240,7 @@ impl ExecutionPlan {
                 let analysis = &report.transforms[i];
                 let wc = &window_configs[i];
 
-                let parallelism_class = match analysis.parallelism_hint {
-                    ParallelismHint::Stateless => ParallelismClass::Stateless,
-                    ParallelismHint::IndexReading => {
-                        // Check if cross-source
-                        if let Some(wc) = wc {
-                            let source =
-                                wc.source.clone().unwrap_or_else(|| primary_source.clone());
-                            if source != primary_source {
-                                ParallelismClass::CrossSource
-                            } else {
-                                ParallelismClass::IndexReading
-                            }
-                        } else {
-                            ParallelismClass::IndexReading
-                        }
-                    }
-                    ParallelismHint::Sequential => ParallelismClass::Sequential,
-                };
+                let parallelism_class = derive_parallelism_class(analysis, wc, &primary_source);
 
                 let window_index = if let Some(wc) = wc {
                     let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
@@ -225,27 +295,248 @@ impl ExecutionPlan {
                 .unwrap_or(4),
         };
 
-        // Build route plan from first transform with route config
-        let route = config
-            .transforms()
-            .find_map(|t| t.route.as_ref())
-            .map(|rc| RoutePlan {
-                mode: rc.mode,
-                branches: rc
-                    .branches
-                    .iter()
-                    .map(|b| (b.name.clone(), b.condition.clone()))
-                    .collect(),
-                default: rc.default.clone(),
-            });
+        // --- Build the petgraph DAG ---
+        // Phase 1: Add all nodes. Phase 2: Wire all edges.
+        // Two-phase approach allows forward references and cycle detection.
+        let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
+        let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
+        let mut slug_set: HashSet<String> = HashSet::new();
 
-        Ok(ExecutionPlan {
+        // Helper to insert a node with slug uniqueness check
+        let add_node = |graph: &mut DiGraph<PlanNode, PlanEdge>,
+                        node: PlanNode,
+                        node_by_name: &mut HashMap<String, NodeIndex>,
+                        slug_set: &mut HashSet<String>|
+         -> Result<NodeIndex, PlanError> {
+            let slug = node.id_slug();
+            if !slug_set.insert(slug.clone()) {
+                return Err(PlanError::DuplicateIdSlug { slug });
+            }
+            let key = format!("{}.{}", node.type_tag(), node.name());
+            let idx = graph.add_node(node);
+            node_by_name.insert(key, idx);
+            Ok(idx)
+        };
+
+        // --- Phase 1: Add all nodes ---
+
+        // Source nodes
+        for input in &config.inputs {
+            add_node(
+                &mut graph,
+                PlanNode::Source {
+                    name: input.name.clone(),
+                },
+                &mut node_by_name,
+                &mut slug_set,
+            )?;
+        }
+
+        // Transform nodes in declaration order (deterministic toposort per V-7-2)
+        let resolved_transforms: Vec<_> = config.transforms().collect();
+        for (i, tc) in resolved_transforms.iter().enumerate() {
+            let analysis = &report.transforms[i];
+            let wc = &window_configs[i];
+            let parallelism_class = derive_parallelism_class(analysis, wc, &primary_source);
+
+            let execution_reqs = if wc.is_some() {
+                NodeExecutionReqs::RequiresArena
+            } else {
+                NodeExecutionReqs::Streaming
+            };
+
+            add_node(
+                &mut graph,
+                PlanNode::Transform {
+                    name: tc.name.clone(),
+                    parallelism_class,
+                    tier: 0, // assigned later via BFS
+                    execution_reqs,
+                },
+                &mut node_by_name,
+                &mut slug_set,
+            )?;
+
+            // Route node for this transform (if configured)
+            if let Some(ref rc) = tc.route {
+                add_node(
+                    &mut graph,
+                    PlanNode::Route {
+                        name: format!("route_{}", tc.name),
+                        mode: rc.mode,
+                        branches: rc.branches.iter().map(|b| b.name.clone()).collect(),
+                        default: rc.default.clone(),
+                    },
+                    &mut node_by_name,
+                    &mut slug_set,
+                )?;
+            }
+
+            // Merge node for multiple inputs
+            if let Some(TransformInput::Multiple(_)) = &tc.input {
+                add_node(
+                    &mut graph,
+                    PlanNode::Merge {
+                        name: format!("merge_{}", tc.name),
+                    },
+                    &mut node_by_name,
+                    &mut slug_set,
+                )?;
+            }
+        }
+
+        // Output nodes
+        for output in &config.outputs {
+            add_node(
+                &mut graph,
+                PlanNode::Output {
+                    name: output.name.clone(),
+                },
+                &mut node_by_name,
+                &mut slug_set,
+            )?;
+        }
+
+        // --- Phase 2: Wire all edges ---
+        let mut prev_transform_key: Option<String> = None;
+
+        for (i, tc) in resolved_transforms.iter().enumerate() {
+            let wc = &window_configs[i];
+            let transform_key = format!("transform.{}", tc.name);
+            let transform_idx = node_by_name[&transform_key];
+
+            // Wire edges from input: or implicit linear chain
+            match &tc.input {
+                Some(TransformInput::Single(upstream)) => {
+                    let upstream_idx =
+                        resolve_input_reference(upstream, &node_by_name, &tc.name, config)?;
+                    graph.add_edge(
+                        upstream_idx,
+                        transform_idx,
+                        PlanEdge {
+                            dependency_type: DependencyType::Data,
+                        },
+                    );
+                }
+                Some(TransformInput::Multiple(upstreams)) => {
+                    let merge_key = format!("merge.merge_{}", tc.name);
+                    let merge_idx = node_by_name[&merge_key];
+                    for upstream in upstreams {
+                        let upstream_idx =
+                            resolve_input_reference(upstream, &node_by_name, &tc.name, config)?;
+                        graph.add_edge(
+                            upstream_idx,
+                            merge_idx,
+                            PlanEdge {
+                                dependency_type: DependencyType::Data,
+                            },
+                        );
+                    }
+                    graph.add_edge(
+                        merge_idx,
+                        transform_idx,
+                        PlanEdge {
+                            dependency_type: DependencyType::Data,
+                        },
+                    );
+                }
+                None => {
+                    // Implicit linear chain: wire to previous transform or source
+                    if let Some(ref prev_key) = prev_transform_key
+                        && let Some(&prev_idx) = node_by_name.get(prev_key)
+                    {
+                        graph.add_edge(
+                            prev_idx,
+                            transform_idx,
+                            PlanEdge {
+                                dependency_type: DependencyType::Data,
+                            },
+                        );
+                    } else if prev_transform_key.is_none() {
+                        // First transform: wire to primary source
+                        let source_key = format!("source.{}", primary_source);
+                        if let Some(&source_idx) = node_by_name.get(&source_key) {
+                            graph.add_edge(
+                                source_idx,
+                                transform_idx,
+                                PlanEdge {
+                                    dependency_type: DependencyType::Data,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Cross-source Index edges from window configs
+            if let Some(wc) = wc {
+                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
+                if source != primary_source {
+                    let source_key = format!("source.{}", source);
+                    if let Some(&source_idx) = node_by_name.get(&source_key) {
+                        graph.add_edge(
+                            source_idx,
+                            transform_idx,
+                            PlanEdge {
+                                dependency_type: DependencyType::Index,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Wire transform → route if configured
+            if tc.route.is_some() {
+                let route_key = format!("route.route_{}", tc.name);
+                let route_idx = node_by_name[&route_key];
+                graph.add_edge(
+                    transform_idx,
+                    route_idx,
+                    PlanEdge {
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+            }
+
+            prev_transform_key = Some(transform_key);
+        }
+
+        // Wire output nodes to last transform
+        for output in &config.outputs {
+            let output_key = format!("output.{}", output.name);
+            let output_idx = node_by_name[&output_key];
+
+            if let Some(ref prev_key) = prev_transform_key
+                && let Some(&prev_idx) = node_by_name.get(prev_key)
+            {
+                graph.add_edge(
+                    prev_idx,
+                    output_idx,
+                    PlanEdge {
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+            }
+        }
+
+        // Topological sort with cycle detection
+        let topo_order = toposort(&graph, None).map_err(|cycle| {
+            // Extract cycle path using DFS
+            let cycle_path = extract_cycle_path(&graph, cycle.node_id());
+            PlanError::CycleDetected { path: cycle_path }
+        })?;
+
+        // Assign tiers via BFS: each node's tier = max(predecessor tiers) + 1
+        assign_tiers(&mut graph, &topo_order);
+
+        Ok(ExecutionPlanDag {
+            graph,
+            topo_order,
             source_dag,
             indices_to_build: indices,
             transforms,
             output_projections,
             parallelism,
-            route,
             correlation_sort_note: None,
         })
     }
@@ -255,16 +546,17 @@ impl ExecutionPlan {
         let mut out = String::new();
         out.push_str("=== Execution Plan ===\n\n");
 
-        out.push_str(&format!("Mode: {:?}\n", self.mode()));
+        out.push_str(&format!("Mode: {}\n", self.execution_summary()));
         out.push_str(&format!(
             "Indices to build: {}\n",
             self.indices_to_build.len()
         ));
         out.push_str(&format!("Transforms: {}\n", self.transforms.len()));
         out.push_str(&format!(
-            "Output projections: {}\n\n",
+            "Output projections: {}\n",
             self.output_projections.len()
         ));
+        out.push_str(&format!("DAG nodes: {}\n\n", self.graph.node_count()));
 
         if let Some(note) = &self.correlation_sort_note {
             out.push_str(&format!("{note}\n\n"));
@@ -304,33 +596,40 @@ impl ExecutionPlan {
             ));
         }
 
-        if let Some(route) = &self.route {
-            out.push_str(&format!(
-                "Route (mode: {}):\n",
-                match route.mode {
-                    RouteMode::Exclusive => "exclusive",
-                    RouteMode::Inclusive => "inclusive",
-                }
-            ));
-            for (name, condition) in &route.branches {
+        // Show route info from graph nodes
+        for node in self.graph.node_weights() {
+            if let PlanNode::Route {
+                name,
+                mode,
+                branches,
+                default,
+            } = node
+            {
                 out.push_str(&format!(
-                    "  Branch '{}': {} → output '{}'\n",
-                    name, condition, name
+                    "Route '{}' (mode: {}):\n",
+                    name,
+                    match mode {
+                        RouteMode::Exclusive => "exclusive",
+                        RouteMode::Inclusive => "inclusive",
+                    }
+                ));
+                for branch_name in branches {
+                    out.push_str(&format!(
+                        "  Branch '{}' → output '{}'\n",
+                        branch_name, branch_name
+                    ));
+                }
+                out.push_str(&format!(
+                    "  Default: '{}' → output '{}'\n\n",
+                    default, default
                 ));
             }
-            out.push_str(&format!(
-                "  Default: '{}' → output '{}'\n\n",
-                route.default, route.default
-            ));
         }
 
         out
     }
 
     /// Full `--explain` output combining execution plan with config context.
-    ///
-    /// Includes: AST (CXL expressions), type annotations, source DAG,
-    /// indices to build, parallelism classification, and memory budget.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let mut out = self.explain();
 
@@ -375,6 +674,206 @@ impl ExecutionPlan {
 
         out
     }
+
+    /// Get all transform nodes from the graph in topological order.
+    pub fn transform_nodes(&self) -> Vec<&PlanNode> {
+        self.topo_order
+            .iter()
+            .filter_map(|&idx| {
+                let node = &self.graph[idx];
+                if matches!(node, PlanNode::Transform { .. }) {
+                    Some(node)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Custom Serialize: flat node-list with schema_version, id slugs, depends_on.
+impl Serialize for ExecutionPlanDag {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("schema_version", "1")?;
+
+        // Build node list in topo order
+        struct NodeList<'a>(&'a ExecutionPlanDag);
+        impl<'a> Serialize for NodeList<'a> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let dag = self.0;
+                let mut seq = serializer.serialize_seq(Some(dag.topo_order.len()))?;
+                for &idx in &dag.topo_order {
+                    let node = &dag.graph[idx];
+                    // Collect depends_on from incoming edges
+                    let depends_on: Vec<String> = dag
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .map(|pred| dag.graph[pred].id_slug())
+                        .collect();
+
+                    let entry = NodeEntry {
+                        node,
+                        depends_on: &depends_on,
+                    };
+                    seq.serialize_element(&entry)?;
+                }
+                seq.end()
+            }
+        }
+
+        map.serialize_entry("nodes", &NodeList(self))?;
+        map.end()
+    }
+}
+
+/// Helper for JSON node serialization.
+#[derive(Serialize)]
+struct NodeEntry<'a> {
+    #[serde(flatten)]
+    node: &'a PlanNode,
+    depends_on: &'a Vec<String>,
+}
+
+/// Resolve an input reference to a NodeIndex.
+///
+/// Handles both plain transform names ("transform_name") and
+/// dotted branch references ("categorize.high_value").
+fn resolve_input_reference(
+    reference: &str,
+    node_by_name: &HashMap<String, NodeIndex>,
+    current_transform: &str,
+    config: &PipelineConfig,
+) -> Result<NodeIndex, PlanError> {
+    // Self-reference check
+    if reference == current_transform {
+        return Err(PlanError::SelfReference {
+            transform: current_transform.to_string(),
+        });
+    }
+
+    // Try plain transform reference first
+    let transform_key = format!("transform.{}", reference);
+    if let Some(&idx) = node_by_name.get(&transform_key) {
+        return Ok(idx);
+    }
+
+    // Try dotted branch reference: "route_name.branch_name" -> route node
+    if reference.contains('.') {
+        let parts: Vec<&str> = reference.splitn(2, '.').collect();
+        let route_key = format!("route.route_{}", parts[0]);
+        if let Some(&idx) = node_by_name.get(&route_key) {
+            return Ok(idx);
+        }
+    }
+
+    // Collect available transforms and branches for error message
+    let available: Vec<String> = config.transforms().map(|t| t.name.clone()).collect();
+
+    Err(PlanError::InvalidInputReference {
+        reference: reference.to_string(),
+        transform: current_transform.to_string(),
+        available,
+    })
+}
+
+/// Extract the cycle path from a DFS back-edge detection.
+///
+/// Uses `depth_first_search` with `DfsEvent::BackEdge` + predecessor map
+/// to extract the full cycle path. Formats as `"A" --> "B" --> "A"`.
+fn extract_cycle_path(graph: &DiGraph<PlanNode, PlanEdge>, start: NodeIndex) -> String {
+    let mut predecessors: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+    let mut cycle_edge: Option<(NodeIndex, NodeIndex)> = None;
+
+    depth_first_search(graph, Some(start), |event| match event {
+        DfsEvent::TreeEdge(u, v) => {
+            predecessors.insert(v, u);
+            Control::<()>::Continue
+        }
+        DfsEvent::BackEdge(u, v) => {
+            cycle_edge = Some((u, v));
+            Control::Break(())
+        }
+        _ => Control::Continue,
+    });
+
+    if let Some((from, to)) = cycle_edge {
+        // Walk back from `from` to `to` to get the cycle path
+        let mut path = vec![graph[from].name().to_string()];
+        let mut current = from;
+        while current != to {
+            if let Some(&pred) = predecessors.get(&current) {
+                current = pred;
+                path.push(graph[current].name().to_string());
+            } else {
+                break;
+            }
+        }
+        path.reverse();
+        // Close the cycle
+        path.push(path[0].clone());
+        path.iter()
+            .map(|n| format!("\"{}\"", n))
+            .collect::<Vec<_>>()
+            .join(" --> ")
+    } else {
+        format!("\"{}\"", graph[start].name())
+    }
+}
+
+/// Assign tiers via BFS: each node's tier = max(predecessor tiers) + 1.
+fn assign_tiers(graph: &mut DiGraph<PlanNode, PlanEdge>, topo_order: &[NodeIndex]) {
+    let mut tiers: HashMap<NodeIndex, u32> = HashMap::new();
+
+    for &idx in topo_order {
+        let max_pred_tier = graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .filter_map(|pred| tiers.get(&pred))
+            .max()
+            .copied();
+
+        let tier = match max_pred_tier {
+            Some(t) => t + 1,
+            None => 0, // Root node (source)
+        };
+        tiers.insert(idx, tier);
+
+        // Update the tier field on Transform nodes
+        if let PlanNode::Transform {
+            tier: ref mut node_tier,
+            ..
+        } = graph[idx]
+        {
+            *node_tier = tier;
+        }
+    }
+}
+
+/// Derive ParallelismClass from analyzer output and window config.
+fn derive_parallelism_class(
+    analysis: &cxl::analyzer::TransformAnalysis,
+    wc: &Option<LocalWindowConfig>,
+    primary_source: &str,
+) -> ParallelismClass {
+    match analysis.parallelism_hint {
+        ParallelismHint::Stateless => ParallelismClass::Stateless,
+        ParallelismHint::IndexReading => {
+            if let Some(wc) = wc {
+                let source = wc
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| primary_source.to_string());
+                if source != primary_source {
+                    ParallelismClass::CrossSource
+                } else {
+                    ParallelismClass::IndexReading
+                }
+            } else {
+                ParallelismClass::IndexReading
+            }
+        }
+        ParallelismHint::Sequential => ParallelismClass::Sequential,
+    }
 }
 
 /// One tier of the source dependency DAG. Sources within a tier are independent.
@@ -388,7 +887,7 @@ pub struct SourceTier {
 pub struct TransformPlan {
     pub name: String,
     pub parallelism_class: ParallelismClass,
-    /// Index into `ExecutionPlan.indices_to_build`, if this transform uses windows.
+    /// Index into `ExecutionPlanDag.indices_to_build`, if this transform uses windows.
     pub window_index: Option<usize>,
     /// How to look up the partition for this transform's window.
     pub partition_lookup: Option<PartitionLookupKind>,
@@ -404,7 +903,8 @@ pub enum PartitionLookupKind {
 }
 
 /// AST compiler's parallelism classification per transform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParallelismClass {
     /// No window references — fully parallelizable.
     Stateless,
@@ -496,8 +996,31 @@ fn check_already_sorted(_config: &PipelineConfig, _source: &str, _sort_by: &[Sor
 #[derive(Debug)]
 pub enum PlanError {
     IndexPlanning(PlanIndexError),
-    MissingLocalWindow { transform: String },
-    UnknownSource { name: String, transform: String },
+    MissingLocalWindow {
+        transform: String,
+    },
+    UnknownSource {
+        name: String,
+        transform: String,
+    },
+    /// Cycle detected in the DAG with path trace.
+    CycleDetected {
+        path: String,
+    },
+    /// An `input:` reference does not resolve to any declared transform or branch.
+    InvalidInputReference {
+        reference: String,
+        transform: String,
+        available: Vec<String>,
+    },
+    /// Two nodes produce the same id slug.
+    DuplicateIdSlug {
+        slug: String,
+    },
+    /// A transform's `input:` references itself.
+    SelfReference {
+        transform: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -516,6 +1039,32 @@ impl std::fmt::Display for PlanError {
                     f,
                     "transform '{}' references unknown source '{}'",
                     transform, name
+                )
+            }
+            PlanError::CycleDetected { path } => {
+                write!(f, "cycle detected in transform DAG: {}", path)
+            }
+            PlanError::InvalidInputReference {
+                reference,
+                transform,
+                available,
+            } => {
+                write!(
+                    f,
+                    "transform '{}' references unknown input '{}'. Available transforms: [{}]",
+                    transform,
+                    reference,
+                    available.join(", ")
+                )
+            }
+            PlanError::DuplicateIdSlug { slug } => {
+                write!(f, "duplicate id slug in execution plan: '{}'", slug)
+            }
+            PlanError::SelfReference { transform } => {
+                write!(
+                    f,
+                    "transform '{}' references itself in input: field",
+                    transform
                 )
             }
         }
@@ -631,7 +1180,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("calc", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert!(plan.indices_to_build.is_empty());
         assert_eq!(plan.transforms.len(), 1);
@@ -639,7 +1188,7 @@ mod tests {
             plan.transforms[0].parallelism_class,
             ParallelismClass::Stateless
         );
-        assert_eq!(plan.mode(), ExecutionMode::Streaming);
+        assert_eq!(plan.execution_summary(), "Streaming");
     }
 
     #[test]
@@ -655,11 +1204,11 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(plan.indices_to_build.len(), 1);
         assert_eq!(plan.indices_to_build[0].group_by, vec!["dept".to_string()]);
-        assert_eq!(plan.mode(), ExecutionMode::TwoPass);
+        assert_eq!(plan.execution_summary(), "TwoPass");
     }
 
     #[test]
@@ -684,7 +1233,7 @@ mod tests {
         let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
         let compiled = vec![("agg1", &typed1), ("agg2", &typed2)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(plan.indices_to_build.len(), 1, "should share one index");
         assert_eq!(plan.transforms[0].window_index, Some(0));
@@ -715,7 +1264,7 @@ mod tests {
         let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
         let compiled = vec![("agg_dept", &typed1), ("agg_region", &typed2)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(plan.indices_to_build.len(), 2);
     }
@@ -730,7 +1279,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("calc", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(
             plan.transforms[0].parallelism_class,
@@ -749,7 +1298,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(
             plan.transforms[0].parallelism_class,
@@ -771,7 +1320,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("positional", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(
             plan.transforms[0].parallelism_class,
@@ -794,7 +1343,7 @@ mod tests {
         let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
         let compiled = vec![("calc", &typed1), ("agg", &typed2)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
         let explain = plan.explain();
 
         assert!(explain.contains("Mode: TwoPass"));
@@ -819,7 +1368,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(plan.source_dag.len(), 2);
         assert!(
@@ -841,9 +1390,10 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
-        assert_eq!(plan.mode(), ExecutionMode::TwoPass);
+        assert!(plan.required_arena());
+        assert_eq!(plan.execution_summary(), "TwoPass");
     }
 
     #[test]
@@ -860,7 +1410,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
 
-        let result = ExecutionPlan::compile(&config, &compiled);
+        let result = ExecutionPlanDag::compile(&config, &compiled);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -947,7 +1497,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("router", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
         let explain = plan.explain();
 
         assert!(
@@ -958,16 +1508,6 @@ mod tests {
         assert!(
             explain.contains("medium_value"),
             "should contain branch name 'medium_value': {}",
-            explain
-        );
-        assert!(
-            explain.contains("amount > 1000"),
-            "should contain condition: {}",
-            explain
-        );
-        assert!(
-            explain.contains("amount > 100"),
-            "should contain condition: {}",
             explain
         );
     }
@@ -987,7 +1527,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("router", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
         let explain = plan.explain();
 
         assert!(
@@ -1009,7 +1549,7 @@ mod tests {
         let typed2 = compile_cxl(&t(&config2.transformations[0]).cxl, fields);
         let compiled2 = vec![("router", &typed2)];
 
-        let plan2 = ExecutionPlan::compile(&config2, &compiled2).unwrap();
+        let plan2 = ExecutionPlanDag::compile(&config2, &compiled2).unwrap();
         let explain2 = plan2.explain();
 
         assert!(
@@ -1034,7 +1574,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("router", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
         let explain = plan.explain();
 
         assert!(
@@ -1055,7 +1595,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("calc", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
         let explain = plan.explain();
 
         assert!(
@@ -1086,7 +1626,7 @@ mod tests {
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("router", &typed)];
 
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
         let explain = plan.explain();
 
         // Each branch should show → output mapping
@@ -1104,6 +1644,86 @@ mod tests {
             explain.contains("→ output 'normal'"),
             "should show output mapping for default: {}",
             explain
+        );
+    }
+
+    // --- DAG-specific tests ---
+
+    #[test]
+    fn test_dag_node_count_linear() {
+        let config = test_config(
+            vec![("primary", "data.csv")],
+            vec![
+                ("step_one", "emit x = amount + 1", None),
+                ("step_two", "emit y = amount * 2", None),
+            ],
+        );
+        let fields = &["amount"];
+        let typed1 = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
+        let compiled = vec![("step_one", &typed1), ("step_two", &typed2)];
+
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
+
+        // source + 2 transforms + output = 4
+        assert_eq!(plan.graph.node_count(), 4);
+        assert_eq!(plan.graph.edge_count(), 3);
+    }
+
+    #[test]
+    fn test_dag_topo_order_linear() {
+        let config = test_config(
+            vec![("primary", "data.csv")],
+            vec![
+                ("step_one", "emit x = amount + 1", None),
+                ("step_two", "emit y = amount * 2", None),
+            ],
+        );
+        let fields = &["amount"];
+        let typed1 = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let typed2 = compile_cxl(&t(&config.transformations[1]).cxl, fields);
+        let compiled = vec![("step_one", &typed1), ("step_two", &typed2)];
+
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
+
+        let names: Vec<&str> = plan
+            .topo_order
+            .iter()
+            .map(|&idx| plan.graph[idx].name())
+            .collect();
+        assert_eq!(names, vec!["primary", "step_one", "step_two", "output"]);
+    }
+
+    #[test]
+    fn test_dag_json_serialization() {
+        let config = test_config(
+            vec![("primary", "data.csv")],
+            vec![("calc", "emit doubled = amount * 2", None)],
+        );
+        let fields = &["amount"];
+        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
+        let compiled = vec![("calc", &typed)];
+
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
+        let json = serde_json::to_value(&plan).unwrap();
+
+        assert_eq!(json["schema_version"], "1");
+        let nodes = json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3); // source + transform + output
+
+        // Check first node is source
+        assert_eq!(nodes[0]["type"], "source");
+        assert_eq!(nodes[0]["name"], "primary");
+        assert!(nodes[0]["depends_on"].as_array().unwrap().is_empty());
+
+        // Check transform depends on source
+        assert_eq!(nodes[1]["type"], "transform");
+        assert_eq!(nodes[1]["name"], "calc");
+        assert!(
+            nodes[1]["depends_on"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("source.primary"))
         );
     }
 }

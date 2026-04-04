@@ -497,7 +497,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             records_total: counters.total_count,
             records_ok: counters.ok_count,
             records_dlq: counters.dlq_count,
-            execution_mode: format!("{:?}", report.execution_mode),
+            execution_mode: report.execution_summary.clone(),
             peak_rss_bytes: report.peak_rss_bytes,
             thread_count: num_threads(args),
             input_files: pipeline_config

@@ -14,7 +14,7 @@ use crate::config::PipelineConfig;
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::SecondaryIndex;
-use crate::plan::execution::ExecutionPlan;
+use crate::plan::execution::ExecutionPlanDag;
 use crate::plan::index;
 use clinker_format::traits::FormatReader;
 
@@ -37,7 +37,7 @@ pub struct IngestionOutput {
 /// Each source thread builds its own Arena + SecondaryIndices locally.
 /// After `thread::scope` joins, results are moved into `IngestionOutput`.
 pub fn ingest_sources<F>(
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     config: &PipelineConfig,
     memory_limit: usize,
     open_reader: F,
@@ -90,7 +90,7 @@ where
 /// Ingest a single source: build Arena + SecondaryIndices.
 fn ingest_one_source<F>(
     source_name: &str,
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     config: &PipelineConfig,
     memory_limit: usize,
     open_reader: &F,
@@ -158,7 +158,7 @@ where
 
 /// Fast path for single-source pipelines — no `thread::scope` overhead.
 fn ingest_single_source<F>(
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     config: &PipelineConfig,
     memory_limit: usize,
     open_reader: &F,
@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::config::{self, *};
     use crate::pipeline::shutdown;
-    use crate::plan::execution::ExecutionPlan;
+    use crate::plan::execution::ExecutionPlanDag;
     use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
     use clinker_record::{RecordStorage, Schema};
     use std::sync::Arc;
@@ -302,7 +302,7 @@ mod tests {
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         let csv_data = "dept,amount\nA,100\nB,200\nA,150\n";
         let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |_path| {
@@ -331,7 +331,7 @@ mod tests {
         let fields = &["id", "ref_id", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         let primary_csv = "id,ref_id,amount\n1,R1,100\n2,R2,200\n";
         let ref_csv = "id,amount\nR1,50\nR2,75\n";
@@ -372,7 +372,7 @@ mod tests {
         let fields = &["id", "ref_id", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         let primary_csv = "id,ref_id,amount\n1,R1,100\n2,R2,200\n";
         let ref_csv = "id,amount\nR1,50\nR2,75\n";
@@ -409,7 +409,7 @@ mod tests {
         let fields = &["id", "ref_id", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         let primary_csv = "id,ref_id,amount\n1,R1,100\n";
         let ref_csv = "id,amount\nR1,50\n";
@@ -455,7 +455,7 @@ mod tests {
         let fields = &["id", "ref_id", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         // Verify DAG: reference should be in tier 0 (built first)
         assert!(plan.source_dag.len() >= 2, "Should have at least 2 tiers");
@@ -496,7 +496,7 @@ mod tests {
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         // Return an error from the reader factory
         let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |_path| {
@@ -523,7 +523,7 @@ mod tests {
         let fields = &["dept", "amount"];
         let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
         let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         // Request shutdown before ingestion
         shutdown::request_shutdown();

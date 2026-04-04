@@ -281,7 +281,7 @@ outputs:
 #[test]
 fn test_correlated_dlq_explain_shows_sort() {
     // --explain output shows injected sort
-    use crate::plan::execution::ExecutionPlan;
+    use crate::plan::execution::ExecutionPlanDag;
 
     let yaml = r#"
 pipeline:
@@ -315,7 +315,7 @@ outputs:
         .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
         .collect();
 
-    let mut plan = ExecutionPlan::compile(&config, &compiled_refs).unwrap();
+    let mut plan = ExecutionPlanDag::compile(&config, &compiled_refs).unwrap();
 
     // Simulate the sort injection that run_with_readers_writers does
     let correlation_key = config.error_handling.correlation_key.as_ref().unwrap();
