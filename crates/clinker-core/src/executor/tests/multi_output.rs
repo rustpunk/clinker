@@ -997,3 +997,274 @@ outputs:
         other => panic!("expected Multiple or Io error, got: {other:?}"),
     }
 }
+
+// --- DLQ stage/route extension tests (Task 13.6) ---
+
+#[test]
+fn test_dlq_stage_source() {
+    // Unit test: verify DlqEntry::stage_source() produces "source"
+    // and a DlqEntry with stage "source" has route: None.
+    let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["id".into()]));
+    let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
+    let entry = DlqEntry {
+        source_row: 1,
+        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        error_message: "source read error".to_string(),
+        original_record: record,
+        stage: Some(DlqEntry::stage_source()),
+        route: None,
+    };
+    assert_eq!(entry.stage, Some("source".to_string()));
+    assert_eq!(entry.route, None);
+}
+
+#[test]
+fn test_dlq_stage_transform() {
+    // Run a pipeline with a transform eval error (non-integer value + to_int),
+    // verify DLQ entry has stage "transform:classify".
+    let yaml = r#"
+pipeline:
+  name: test_dlq_transform
+error_handling:
+  strategy: continue
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+outputs:
+  - name: high
+    path: high.csv
+    type: csv
+    include_unmapped: true
+  - name: low
+    path: low.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // "bad_value" cannot be converted to int → transform eval error
+    let csv = "id,amount\n1,bad_value\n";
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.dlq_count, 1);
+    assert_eq!(dlq.len(), 1);
+    assert_eq!(
+        dlq[0].stage,
+        Some("transform:classify".to_string()),
+        "stage should be transform:classify"
+    );
+    assert_eq!(
+        dlq[0].route, None,
+        "pre-routing error should have null route"
+    );
+}
+
+#[test]
+fn test_dlq_stage_route_eval() {
+    // Route condition that causes division by zero → DLQ with stage "route_eval".
+    let yaml = r#"
+pipeline:
+  name: test_dlq_route_eval
+error_handling:
+  strategy: continue
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: calc
+    cxl: |
+      emit amount_val = amount.to_int()
+      emit divisor = zero.to_int()
+    route:
+      branches:
+        - name: special
+          condition: "amount_val / divisor > 0"
+      default: normal
+outputs:
+  - name: special
+    path: special.csv
+    type: csv
+    include_unmapped: true
+  - name: normal
+    path: normal.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    let csv = "id,amount,zero\n1,100,0\n";
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(
+        counters.dlq_count, 1,
+        "division by zero in route condition should produce DLQ entry"
+    );
+    assert_eq!(dlq.len(), 1);
+    assert_eq!(
+        dlq[0].stage,
+        Some("route_eval".to_string()),
+        "stage should be route_eval"
+    );
+    assert_eq!(dlq[0].route, None, "route eval error has null route");
+}
+
+#[test]
+fn test_dlq_stage_output() {
+    // Unit test: verify DlqEntry::stage_output() produces "output:{name}"
+    // and that a DlqEntry can carry both stage and route.
+    let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["id".into()]));
+    let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
+    let entry = DlqEntry {
+        source_row: 1,
+        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        error_message: "write error".to_string(),
+        original_record: record,
+        stage: Some(DlqEntry::stage_output("results")),
+        route: Some("high_value".to_string()),
+    };
+    assert_eq!(entry.stage, Some("output:results".to_string()));
+    assert_eq!(entry.route, Some("high_value".to_string()));
+}
+
+#[test]
+fn test_dlq_pre_routing_null_route() {
+    // Pre-routing errors (transform eval) always have route: None.
+    let yaml = r#"
+pipeline:
+  name: test_dlq_pre_routing
+error_handling:
+  strategy: continue
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+outputs:
+  - name: high
+    path: high.csv
+    type: csv
+    include_unmapped: true
+  - name: low
+    path: low.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // Two records fail, one succeeds
+    let csv = "id,amount\n1,bad\n2,worse\n3,200\n";
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.dlq_count, 2);
+    for entry in &dlq {
+        assert_eq!(entry.route, None, "pre-routing errors must have null route");
+        assert!(
+            entry.stage.as_ref().unwrap().starts_with("transform:"),
+            "pre-routing errors should have transform stage"
+        );
+    }
+}
+
+#[test]
+fn test_dlq_columns_in_csv() {
+    // Verify that DLQ CSV output includes _cxl_dlq_stage and _cxl_dlq_route columns.
+    use crate::dlq::write_dlq;
+
+    let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["name".into()]));
+    let record = clinker_record::Record::new(schema.clone(), vec![Value::String("Alice".into())]);
+    let entries = vec![DlqEntry {
+        source_row: 1,
+        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+        error_message: "eval error".to_string(),
+        original_record: record,
+        stage: Some(DlqEntry::stage_transform("my_transform")),
+        route: None,
+    }];
+
+    let mut buf = Vec::new();
+    write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+    let output = String::from_utf8(buf).unwrap();
+
+    let header = output.lines().next().unwrap();
+    assert!(
+        header.contains("_cxl_dlq_stage"),
+        "header should contain _cxl_dlq_stage: {header}"
+    );
+    assert!(
+        header.contains("_cxl_dlq_route"),
+        "header should contain _cxl_dlq_route: {header}"
+    );
+
+    // Check data row has the stage value
+    let data = output.lines().nth(1).unwrap();
+    assert!(
+        data.contains("transform:my_transform"),
+        "data should contain stage value: {data}"
+    );
+}
+
+#[test]
+fn test_dlq_backward_compat() {
+    // Single-output pipeline DLQ has new columns with null (empty) values.
+    let yaml = r#"
+pipeline:
+  name: test_dlq_compat
+error_handling:
+  strategy: continue
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+transformations:
+  - name: calc
+    cxl: |
+      emit val = amount.to_int()
+outputs:
+  - name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+    // "bad" fails to_int → DLQ
+    let csv = "id,amount\n1,bad\n2,100\n";
+    let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
+
+    assert_eq!(counters.dlq_count, 1);
+    assert_eq!(dlq.len(), 1);
+    // Single-output pipeline still populates stage
+    assert!(
+        dlq[0].stage.is_some(),
+        "single-output DLQ should have stage field populated"
+    );
+    assert_eq!(
+        dlq[0].route, None,
+        "single-output DLQ should have null route"
+    );
+
+    // Verify the DLQ CSV includes new columns
+    use crate::dlq::write_dlq;
+    let schema = dlq[0].original_record.schema().clone();
+    let mut buf = Vec::new();
+    write_dlq(&mut buf, &dlq, &schema, "input.csv", true, true).unwrap();
+    let output = String::from_utf8(buf).unwrap();
+    let header = output.lines().next().unwrap();
+    assert!(header.contains("_cxl_dlq_stage"));
+    assert!(header.contains("_cxl_dlq_route"));
+}

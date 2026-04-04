@@ -286,6 +286,34 @@ pub struct DlqEntry {
     pub category: crate::dlq::DlqErrorCategory,
     pub error_message: String,
     pub original_record: Record,
+    /// Pipeline stage where error occurred.
+    /// Convention: "source", "transform:{name}", "route_eval", "output:{name}"
+    pub stage: Option<String>,
+    /// Route branch name if error occurred during or after routing.
+    /// None for pre-routing errors.
+    pub route: Option<String>,
+}
+
+impl DlqEntry {
+    /// Stage: source read error.
+    pub fn stage_source() -> String {
+        "source".into()
+    }
+
+    /// Stage: transform evaluation error.
+    pub fn stage_transform(name: &str) -> String {
+        format!("transform:{name}")
+    }
+
+    /// Stage: route condition evaluation error.
+    pub fn stage_route_eval() -> String {
+        "route_eval".into()
+    }
+
+    /// Stage: output write error.
+    pub fn stage_output(name: &str) -> String {
+        format!("output:{name}")
+    }
 }
 
 /// Unified pipeline executor. Plan-driven branching:
@@ -428,6 +456,7 @@ impl PipelineExecutor {
         let mut dlq_entries = Vec::new();
         let strategy = config.error_handling.strategy;
         let mut evaluators = build_evaluators(transforms);
+        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
 
         let is_multi_output = compiled_route.is_some() && writers.len() > 1;
         let mut compiled_route = compiled_route;
@@ -436,10 +465,11 @@ impl PipelineExecutor {
         let schema = csv_reader.schema()?;
         let mut row_num: u64 = 0;
         let mut first_emitted: Option<(Record, IndexMap<String, Value>)> = None;
+        #[allow(clippy::type_complexity)]
         let mut pending_skips_and_errors: Vec<(
             u64,
             Record,
-            Result<EvalResult, cxl::eval::EvalError>,
+            Result<EvalResult, (String, cxl::eval::EvalError)>,
         )> = Vec::new();
 
         while let Some(record) = csv_reader.next_record()? {
@@ -454,7 +484,7 @@ impl PipelineExecutor {
                 &params.batch_id,
                 &params.pipeline_vars,
             );
-            let result = evaluate_record(&record, &mut evaluators, &ctx);
+            let result = evaluate_record(&record, &transform_names, &mut evaluators, &ctx);
             match &result {
                 Ok(EvalResult::Emit(emitted)) => {
                     counters.ok_count += 1;
@@ -490,7 +520,7 @@ impl PipelineExecutor {
                         counters.distinct_count += 1;
                     }
                     Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
-                    Err(eval_err) => {
+                    Err((transform_name, eval_err)) => {
                         if strategy == ErrorStrategy::FailFast {
                             // Drop channels to signal writer threads to stop
                             drop(output_channels);
@@ -505,6 +535,8 @@ impl PipelineExecutor {
                             category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                             error_message: eval_err.to_string(),
                             original_record: _record.clone(),
+                            stage: Some(DlqEntry::stage_transform(transform_name)),
+                            route: None,
                         });
                     }
                 }
@@ -522,21 +554,40 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                let targets = route.evaluate(&emitted, &ctx)?;
-                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                for target in &targets {
-                    let out_cfg = config
-                        .outputs
-                        .iter()
-                        .find(|o| o.name == *target)
-                        .unwrap_or(primary_output);
-                    let projected = project_output(&record, &emitted, out_cfg);
-                    per_output_batches
-                        .entry(target.clone())
-                        .or_default()
-                        .push(projected);
+                match route.evaluate(&emitted, &ctx) {
+                    Ok(targets) => {
+                        let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                        for target in &targets {
+                            let out_cfg = config
+                                .outputs
+                                .iter()
+                                .find(|o| o.name == *target)
+                                .unwrap_or(primary_output);
+                            let projected = project_output(&record, &emitted, out_cfg);
+                            per_output_batches
+                                .entry(target.clone())
+                                .or_default()
+                                .push(projected);
+                        }
+                        flush_output_batches(&mut per_output_batches, &output_channels)?;
+                    }
+                    Err(route_err) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            drop(output_channels);
+                            return Err(route_err.into());
+                        }
+                        counters.dlq_count += 1;
+                        counters.ok_count = counters.ok_count.saturating_sub(1);
+                        dlq_entries.push(DlqEntry {
+                            source_row: 1,
+                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: route_err.to_string(),
+                            original_record: record,
+                            stage: Some(DlqEntry::stage_route_eval()),
+                            route: None,
+                        });
+                    }
                 }
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
             }
 
             // Process remaining records
@@ -554,30 +605,46 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                match evaluate_record(&record, &mut evaluators, &ctx) {
-                    Ok(EvalResult::Emit(emitted)) => {
-                        let targets = route.evaluate(&emitted, &ctx)?;
-                        for target in &targets {
-                            let out_cfg = config
-                                .outputs
-                                .iter()
-                                .find(|o| o.name == *target)
-                                .unwrap_or(primary_output);
-                            let projected = project_output(&record, &emitted, out_cfg);
-                            per_output_batches
-                                .entry(target.clone())
-                                .or_default()
-                                .push(projected);
+                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                    Ok(EvalResult::Emit(emitted)) => match route.evaluate(&emitted, &ctx) {
+                        Ok(targets) => {
+                            for target in &targets {
+                                let out_cfg = config
+                                    .outputs
+                                    .iter()
+                                    .find(|o| o.name == *target)
+                                    .unwrap_or(primary_output);
+                                let projected = project_output(&record, &emitted, out_cfg);
+                                per_output_batches
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .push(projected);
+                            }
+                            counters.ok_count += 1;
                         }
-                        counters.ok_count += 1;
-                    }
+                        Err(route_err) => {
+                            if strategy == ErrorStrategy::FailFast {
+                                drop(output_channels);
+                                return Err(route_err.into());
+                            }
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: row_num,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: route_err.to_string(),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_route_eval()),
+                                route: None,
+                            });
+                        }
+                    },
                     Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                         counters.filtered_count += 1;
                     }
                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                         counters.distinct_count += 1;
                     }
-                    Err(eval_err) => {
+                    Err((transform_name, eval_err)) => {
                         if strategy == ErrorStrategy::FailFast {
                             drop(output_channels);
                             return Err(eval_err.into());
@@ -588,6 +655,8 @@ impl PipelineExecutor {
                             category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                             error_message: eval_err.to_string(),
                             original_record: record,
+                            stage: Some(DlqEntry::stage_transform(&transform_name)),
+                            route: None,
                         });
                     }
                 }
@@ -624,12 +693,14 @@ impl PipelineExecutor {
                         counters.distinct_count += 1;
                     }
                     Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
-                    Err(eval_err) => {
+                    Err((transform_name, eval_err)) => {
                         handle_error(
                             strategy,
                             &record,
                             rn,
                             &eval_err,
+                            Some(DlqEntry::stage_transform(&transform_name)),
+                            None,
                             &mut counters,
                             &mut dlq_entries,
                             output,
@@ -659,7 +730,7 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                match evaluate_record(&record, &mut evaluators, &ctx) {
+                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
                     Ok(EvalResult::Emit(emitted)) => {
                         let projected = project_output(&record, &emitted, output);
                         csv_writer.write_record(&projected)?;
@@ -671,12 +742,14 @@ impl PipelineExecutor {
                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                         counters.distinct_count += 1;
                     }
-                    Err(eval_err) => {
+                    Err((transform_name, eval_err)) => {
                         handle_error(
                             strategy,
                             &record,
                             row_num,
                             &eval_err,
+                            Some(DlqEntry::stage_transform(&transform_name)),
+                            None,
                             &mut counters,
                             &mut dlq_entries,
                             output,
@@ -795,6 +868,7 @@ impl PipelineExecutor {
         let mut first_emit_pos: Option<u32> = None;
         let mut first_emitted: Option<(Record, IndexMap<String, Value>)> = None;
         let mut evaluators = build_evaluators(transforms);
+        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
 
         for pos in 0..record_count {
             let record = build_record_from_arena(pos);
@@ -809,6 +883,7 @@ impl PipelineExecutor {
             );
             let result = evaluate_record_with_window(
                 &record,
+                &transform_names,
                 &mut evaluators,
                 &ctx,
                 plan,
@@ -830,7 +905,7 @@ impl PipelineExecutor {
                 Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                     counters.distinct_count += 1;
                 }
-                Err(eval_err) => {
+                Err((transform_name, eval_err)) => {
                     if strategy == ErrorStrategy::FailFast {
                         return Err(eval_err.into());
                     }
@@ -838,6 +913,7 @@ impl PipelineExecutor {
                         &record,
                         pos as u64 + 1,
                         &eval_err,
+                        Some(DlqEntry::stage_transform(&transform_name)),
                         &mut counters,
                         &mut dlq_entries,
                     );
@@ -857,7 +933,7 @@ impl PipelineExecutor {
         let evaluate_chunk = |chunk: &mut Vec<(
             u32,
             Record,
-            Option<Result<EvalResult, cxl::eval::EvalError>>,
+            Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
         )>,
                               evaluators: &mut Vec<ProgramEvaluator>| {
             if use_parallel {
@@ -875,6 +951,7 @@ impl PipelineExecutor {
                         let mut local_evals = build_evaluators(transforms);
                         *result = Some(evaluate_record_with_window(
                             record,
+                            &transform_names,
                             &mut local_evals,
                             &ctx,
                             plan,
@@ -896,7 +973,14 @@ impl PipelineExecutor {
                         &params.pipeline_vars,
                     );
                     *result = Some(evaluate_record_with_window(
-                        record, evaluators, &ctx, plan, &arena, &indices, *pos,
+                        record,
+                        &transform_names,
+                        evaluators,
+                        &ctx,
+                        plan,
+                        &arena,
+                        &indices,
+                        *pos,
                     ));
                 }
             }
@@ -921,21 +1005,40 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                let targets = route.evaluate(&emitted, &ctx)?;
-                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                for target in &targets {
-                    let out_cfg = config
-                        .outputs
-                        .iter()
-                        .find(|o| o.name == *target)
-                        .unwrap_or(primary_output);
-                    let projected = project_output(&record, &emitted, out_cfg);
-                    per_output_batches
-                        .entry(target.clone())
-                        .or_default()
-                        .push(projected);
+                match route.evaluate(&emitted, &ctx) {
+                    Ok(targets) => {
+                        let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                        for target in &targets {
+                            let out_cfg = config
+                                .outputs
+                                .iter()
+                                .find(|o| o.name == *target)
+                                .unwrap_or(primary_output);
+                            let projected = project_output(&record, &emitted, out_cfg);
+                            per_output_batches
+                                .entry(target.clone())
+                                .or_default()
+                                .push(projected);
+                        }
+                        flush_output_batches(&mut per_output_batches, &output_channels)?;
+                    }
+                    Err(route_err) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            drop(output_channels);
+                            return Err(route_err.into());
+                        }
+                        counters.dlq_count += 1;
+                        counters.ok_count = counters.ok_count.saturating_sub(1);
+                        dlq_entries.push(DlqEntry {
+                            source_row: first_emit_pos.unwrap() as u64 + 1,
+                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: route_err.to_string(),
+                            original_record: record,
+                            stage: Some(DlqEntry::stage_route_eval()),
+                            route: None,
+                        });
+                    }
                 }
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
             }
 
             // Process remaining records in chunks
@@ -947,7 +1050,7 @@ impl PipelineExecutor {
                 let mut chunk: Vec<(
                     u32,
                     Record,
-                    Option<Result<EvalResult, cxl::eval::EvalError>>,
+                    Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
                 )> = (chunk_start..chunk_end)
                     .map(|pos| (pos, build_record_from_arena(pos), None))
                     .collect();
@@ -970,20 +1073,38 @@ impl PipelineExecutor {
                                 &params.batch_id,
                                 &params.pipeline_vars,
                             );
-                            let targets = route.evaluate(emitted, &ctx)?;
-                            for target in &targets {
-                                let out_cfg = config
-                                    .outputs
-                                    .iter()
-                                    .find(|o| o.name == *target)
-                                    .unwrap_or(primary_output);
-                                let projected = project_output(record, emitted, out_cfg);
-                                per_output_batches
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .push(projected);
+                            match route.evaluate(emitted, &ctx) {
+                                Ok(targets) => {
+                                    for target in &targets {
+                                        let out_cfg = config
+                                            .outputs
+                                            .iter()
+                                            .find(|o| o.name == *target)
+                                            .unwrap_or(primary_output);
+                                        let projected = project_output(record, emitted, out_cfg);
+                                        per_output_batches
+                                            .entry(target.clone())
+                                            .or_default()
+                                            .push(projected);
+                                    }
+                                    counters.ok_count += 1;
+                                }
+                                Err(route_err) => {
+                                    if strategy == ErrorStrategy::FailFast {
+                                        drop(output_channels);
+                                        return Err(route_err.into());
+                                    }
+                                    counters.dlq_count += 1;
+                                    dlq_entries.push(DlqEntry {
+                                        source_row: row_num,
+                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                        error_message: route_err.to_string(),
+                                        original_record: record.clone(),
+                                        stage: Some(DlqEntry::stage_route_eval()),
+                                        route: None,
+                                    });
+                                }
                             }
-                            counters.ok_count += 1;
                         }
                         Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                             counters.filtered_count += 1;
@@ -991,7 +1112,7 @@ impl PipelineExecutor {
                         Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                             counters.distinct_count += 1;
                         }
-                        Err(eval_err) => {
+                        Err((transform_name, eval_err)) => {
                             if strategy == ErrorStrategy::FailFast {
                                 drop(output_channels);
                                 return Err(PipelineError::Eval(cxl::eval::EvalError {
@@ -1005,6 +1126,8 @@ impl PipelineExecutor {
                                 category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                                 error_message: eval_err.to_string(),
                                 original_record: record.clone(),
+                                stage: Some(DlqEntry::stage_transform(transform_name)),
+                                route: None,
                             });
                         }
                     }
@@ -1042,7 +1165,7 @@ impl PipelineExecutor {
                 let mut chunk: Vec<(
                     u32,
                     Record,
-                    Option<Result<EvalResult, cxl::eval::EvalError>>,
+                    Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
                 )> = (chunk_start..chunk_end)
                     .map(|pos| (pos, build_record_from_arena(pos), None))
                     .collect();
@@ -1065,12 +1188,14 @@ impl PipelineExecutor {
                         Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                             counters.distinct_count += 1;
                         }
-                        Err(eval_err) => {
+                        Err((transform_name, eval_err)) => {
                             handle_error(
                                 strategy,
                                 record,
                                 row_num,
                                 eval_err,
+                                Some(DlqEntry::stage_transform(transform_name)),
+                                None,
                                 &mut counters,
                                 &mut dlq_entries,
                                 output,
@@ -1380,15 +1505,23 @@ fn build_eval_context(
 ///
 /// Emitted fields from earlier transforms are merged into the record's overflow
 /// so that later transforms can reference them as input fields.
+///
+/// On error, returns `(transform_name, EvalError)` so callers can populate
+/// the DLQ stage field with `"transform:{name}"`.
 fn evaluate_record(
     record: &Record,
+    transform_names: &[&str],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
-) -> Result<EvalResult, cxl::eval::EvalError> {
+) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
-    for eval in evaluators.iter_mut() {
-        match eval.eval_record::<NullStorage>(ctx, &record, None)? {
+    for (i, eval) in evaluators.iter_mut().enumerate() {
+        let name = transform_names.get(i).copied().unwrap_or("unknown");
+        match eval
+            .eval_record::<NullStorage>(ctx, &record, None)
+            .map_err(|e| (name.to_string(), e))?
+        {
             EvalResult::Emit(emitted) => {
                 for (name, value) in &emitted {
                     record.set_overflow(name.clone().into_boxed_str(), value.clone());
@@ -1405,20 +1538,26 @@ fn evaluate_record(
 ///
 /// Emitted fields from earlier transforms are merged into the record's overflow
 /// so that later transforms can reference them as input fields.
+///
+/// On error, returns `(transform_name, EvalError)` so callers can populate
+/// the DLQ stage field with `"transform:{name}"`.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_record_with_window(
     record: &Record,
+    transform_names: &[&str],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
     plan: &ExecutionPlan,
     arena: &Arena,
     indices: &[SecondaryIndex],
     record_pos: u32,
-) -> Result<EvalResult, cxl::eval::EvalError> {
+) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
 
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let tp = &plan.transforms[i];
+        let name = transform_names.get(i).copied().unwrap_or("unknown");
 
         let result = if let Some(idx_num) = tp.window_index {
             // This transform uses windows — look up partition
@@ -1443,15 +1582,19 @@ fn evaluate_record_with_window(
                     let pos_in_partition =
                         partition.iter().position(|&p| p == record_pos).unwrap_or(0);
                     let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
-                    eval.eval_record(ctx, &record, Some(&wctx))?
+                    eval.eval_record(ctx, &record, Some(&wctx))
+                        .map_err(|e| (name.to_string(), e))?
                 } else {
-                    eval.eval_record::<Arena>(ctx, &record, None)?
+                    eval.eval_record::<Arena>(ctx, &record, None)
+                        .map_err(|e| (name.to_string(), e))?
                 }
             } else {
-                eval.eval_record::<Arena>(ctx, &record, None)?
+                eval.eval_record::<Arena>(ctx, &record, None)
+                    .map_err(|e| (name.to_string(), e))?
             }
         } else {
-            eval.eval_record::<NullStorage>(ctx, &record, None)?
+            eval.eval_record::<NullStorage>(ctx, &record, None)
+                .map_err(|e| (name.to_string(), e))?
         };
 
         match result {
@@ -1494,6 +1637,8 @@ fn handle_error<W: Write + Send>(
     record: &Record,
     row_num: u64,
     eval_err: &cxl::eval::EvalError,
+    stage: Option<String>,
+    route: Option<String>,
     counters: &mut PipelineCounters,
     dlq_entries: &mut Vec<DlqEntry>,
     output: &OutputConfig,
@@ -1514,6 +1659,8 @@ fn handle_error<W: Write + Send>(
                 category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                 error_message: eval_err.to_string(),
                 original_record: record.clone(),
+                stage,
+                route,
             });
             // Skip this record — don't write to output
         }
@@ -1524,6 +1671,8 @@ fn handle_error<W: Write + Send>(
                 category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                 error_message: eval_err.to_string(),
                 original_record: record.clone(),
+                stage,
+                route,
             });
             // Write original record unchanged
             let emitted = IndexMap::new();
@@ -1543,6 +1692,7 @@ fn handle_error_no_writer(
     record: &Record,
     row_num: u64,
     eval_err: &cxl::eval::EvalError,
+    stage: Option<String>,
     counters: &mut PipelineCounters,
     dlq_entries: &mut Vec<DlqEntry>,
 ) {
@@ -1552,6 +1702,8 @@ fn handle_error_no_writer(
         category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: eval_err.to_string(),
         original_record: record.clone(),
+        stage,
+        route: None,
     });
 }
 

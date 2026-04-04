@@ -40,6 +40,8 @@ pub const DLQ_COLUMNS: &[&str] = &[
     "_cxl_dlq_source_row",
     "_cxl_dlq_error_category",
     "_cxl_dlq_error_detail",
+    "_cxl_dlq_stage",
+    "_cxl_dlq_route",
 ];
 
 /// Write DLQ entries to a CSV writer (DLQ is always CSV per spec §10.4).
@@ -69,6 +71,9 @@ pub fn write_dlq<W: Write>(
         header.push("_cxl_dlq_error_category");
         header.push("_cxl_dlq_error_detail");
     }
+    // Stage and route columns always present (nullable)
+    header.push("_cxl_dlq_stage");
+    header.push("_cxl_dlq_route");
     if include_source_row {
         for col in source_schema.columns() {
             header.push(col.as_ref());
@@ -91,6 +96,10 @@ pub fn write_dlq<W: Write>(
             row.push(entry.category.as_str().to_string());
             row.push(entry.error_message.clone());
         }
+
+        // Stage and route (empty string for null)
+        row.push(entry.stage.clone().unwrap_or_default());
+        row.push(entry.route.clone().unwrap_or_default());
 
         if include_source_row {
             for col in source_schema.columns() {
@@ -146,6 +155,8 @@ mod tests {
             category,
             error_message: error.to_string(),
             original_record: record,
+            stage: None,
+            route: None,
         }
     }
 
@@ -171,8 +182,10 @@ mod tests {
         assert_eq!(columns[3], "_cxl_dlq_source_row");
         assert_eq!(columns[4], "_cxl_dlq_error_category");
         assert_eq!(columns[5], "_cxl_dlq_error_detail");
-        assert_eq!(columns[6], "name");
-        assert_eq!(columns[7], "value");
+        assert_eq!(columns[6], "_cxl_dlq_stage");
+        assert_eq!(columns[7], "_cxl_dlq_route");
+        assert_eq!(columns[8], "name");
+        assert_eq!(columns[9], "value");
     }
 
     #[test]
@@ -388,6 +401,8 @@ mod tests {
             category: DlqErrorCategory::TypeCoercionFailure,
             error_message: "err".to_string(),
             original_record: record,
+            stage: None,
+            route: None,
         }];
         let mut buf = Vec::new();
         write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
@@ -396,9 +411,10 @@ mod tests {
         let header_line = output.lines().next().unwrap();
         let columns: Vec<&str> = header_line.split(',').collect();
         // Source fields in schema order (zulu, alpha, mike), not alphabetical
-        assert_eq!(columns[6], "zulu");
-        assert_eq!(columns[7], "alpha");
-        assert_eq!(columns[8], "mike");
+        // Columns 6-7 are _cxl_dlq_stage and _cxl_dlq_route
+        assert_eq!(columns[8], "zulu");
+        assert_eq!(columns[9], "alpha");
+        assert_eq!(columns[10], "mike");
     }
 
     #[test]
