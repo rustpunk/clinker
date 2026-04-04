@@ -631,11 +631,70 @@ impl<'de> serde::Deserialize<'de> for RouteConfig {
     }
 }
 
+/// Input wiring for a transform — specifies which upstream transform(s) feed records.
+///
+/// String values become `Single`; arrays become `Multiple`.
+/// Custom deserialization handles both forms.
+#[derive(Debug, Clone, Serialize)]
+pub enum TransformInput {
+    /// Single upstream: `"categorize.high_value"` or `"transform_name"`.
+    Single(String),
+    /// Multiple upstreams (union): `["branch_a", "branch_b"]`.
+    Multiple(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for TransformInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TransformInputVisitor;
+
+        impl<'de> de::Visitor<'de> for TransformInputVisitor {
+            type Value = TransformInput;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or array of strings")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(TransformInput::Single(v.to_owned()))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<String>()? {
+                    items.push(item);
+                }
+                if items.is_empty() {
+                    return Err(de::Error::custom(
+                        "transform input array must not be empty (use a single string for one upstream, or omit for default flow)",
+                    ));
+                }
+                Ok(TransformInput::Multiple(items))
+            }
+        }
+
+        deserializer.deserialize_any(TransformInputVisitor)
+    }
+}
+
+/// Per-transform parallelism override.
+///
+/// Allows pipeline authors to override the auto-detected parallelism class
+/// for a specific transform.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelismOverride {
+    /// Let the engine decide based on CXL analysis.
+    Auto,
+    /// Force stateless (no shared state, fully parallelizable).
+    Stateless,
+    /// Force sequential (single-threaded execution).
+    Sequential,
+}
+
 /// Per-transform configuration block.
 ///
 /// The `cxl` field contains the multi-line CXL source text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TransformConfig {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -650,9 +709,62 @@ pub struct TransformConfig {
     /// Route configuration for multi-output dispatch. Optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<RouteConfig>,
+    /// Optional upstream wiring. None = receives from previous transform in
+    /// declaration order (implicit linear chain). Some = explicit DAG wiring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<TransformInput>,
+    /// Optional parallelism override for this transform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<ParallelismOverride>,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for TransformConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            name: String,
+            description: Option<String>,
+            cxl: String,
+            local_window: Option<serde_json::Value>,
+            log: Option<Vec<LogDirective>>,
+            validations: Option<Vec<ValidationEntry>>,
+            route: Option<RouteConfig>,
+            input: Option<TransformInput>,
+            parallelism: Option<ParallelismOverride>,
+            #[serde(default, rename = "_notes")]
+            notes: Option<serde_json::Value>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        // Dot-ban: transform names must not contain '.' (reserved for branch references).
+        if raw.name.contains('.') {
+            return Err(de::Error::custom(format!(
+                "transform name '{}' is invalid: '.' is reserved for branch references (use underscores or hyphens)",
+                raw.name
+            )));
+        }
+
+        Ok(TransformConfig {
+            name: raw.name,
+            description: raw.description,
+            cxl: raw.cxl,
+            local_window: raw.local_window,
+            log: raw.log,
+            validations: raw.validations,
+            route: raw.route,
+            input: raw.input,
+            parallelism: raw.parallelism,
+            notes: raw.notes,
+        })
+    }
 }
 
 /// A declarative validation attached to a transform.
@@ -2634,5 +2746,141 @@ default: standard
             rc.branches[0].condition,
             "amount > 10000 && country != 'US'"
         );
+    }
+
+    // --- Phase 15 gate tests: TransformInput + dot-ban + ParallelismOverride ---
+
+    /// String input deserializes to Single variant.
+    #[test]
+    fn test_transform_input_single_deser() {
+        let yaml = r#""source_a""#;
+        let input: TransformInput = serde_json::from_str(yaml).unwrap();
+        match input {
+            TransformInput::Single(s) => assert_eq!(s, "source_a"),
+            _ => panic!("expected Single"),
+        }
+    }
+
+    /// Array input deserializes to Multiple variant.
+    #[test]
+    fn test_transform_input_multiple_deser() {
+        let input: TransformInput = serde_json::from_str(r#"["a", "b"]"#).unwrap();
+        match input {
+            TransformInput::Multiple(v) => assert_eq!(v, vec!["a", "b"]),
+            _ => panic!("expected Multiple"),
+        }
+    }
+
+    /// Dotted branch reference deserializes correctly.
+    #[test]
+    fn test_transform_input_dotted_branch_deser() {
+        let input: TransformInput = serde_json::from_str(r#""categorize.high_value""#).unwrap();
+        match input {
+            TransformInput::Single(s) => assert_eq!(s, "categorize.high_value"),
+            _ => panic!("expected Single"),
+        }
+    }
+
+    /// Empty array produces a clear error.
+    #[test]
+    fn test_transform_input_empty_array_error() {
+        let result = serde_json::from_str::<TransformInput>("[]");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must not be empty"),
+            "expected empty array error, got: {err}"
+        );
+    }
+
+    /// No input field means None (default flow).
+    #[test]
+    fn test_transform_input_none_default_flow() {
+        let yaml = r#"
+pipeline:
+  name: test
+
+inputs:
+  - name: source
+    type: csv
+    path: /tmp/in.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+
+transformations:
+  - name: identity
+    cxl: |
+      emit x = 1
+"#;
+        let config = parse_config(yaml).unwrap();
+        let t = match &config.transformations[0] {
+            TransformEntry::Transform(t) => t,
+            _ => panic!("expected Transform"),
+        };
+        assert!(t.input.is_none());
+    }
+
+    /// Transform name containing dot is rejected.
+    #[test]
+    fn test_transform_name_dot_banned() {
+        let yaml = r#"
+pipeline:
+  name: test
+
+inputs:
+  - name: source
+    type: csv
+    path: /tmp/in.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+
+transformations:
+  - name: my.transform
+    cxl: |
+      emit x = 1
+"#;
+        let result = parse_config(yaml);
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("'.' is reserved for branch references"),
+            "expected dot-ban error, got: {err}"
+        );
+    }
+
+    /// Transform name with underscores and hyphens is accepted.
+    #[test]
+    fn test_transform_name_valid_chars() {
+        let yaml = r#"
+pipeline:
+  name: test
+
+inputs:
+  - name: source
+    type: csv
+    path: /tmp/in.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: /tmp/out.csv
+
+transformations:
+  - name: my-transform_v2
+    cxl: |
+      emit x = 1
+"#;
+        let config = parse_config(yaml).unwrap();
+        let t = match &config.transformations[0] {
+            TransformEntry::Transform(t) => t,
+            _ => panic!("expected Transform"),
+        };
+        assert_eq!(t.name, "my-transform_v2");
     }
 }

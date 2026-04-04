@@ -257,6 +257,8 @@ mod tests {
                         log: None,
                         validations: None,
                         route: None,
+                        input: None,
+                        parallelism: None,
                         notes: None,
                     })
                 })
