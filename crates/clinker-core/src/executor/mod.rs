@@ -303,16 +303,6 @@ fn flush_output_batches(
     }
     Ok(())
 }
-
-/// Whether a DLQ entry is the root cause or correlated collateral.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CorrelationRole {
-    /// This record's own evaluation failed.
-    RootCause,
-    /// This record was DLQ'd because another record in its correlation group failed.
-    Collateral,
-}
-
 /// Record that failed evaluation, queued for DLQ output.
 #[derive(Debug)]
 pub struct DlqEntry {
@@ -1196,9 +1186,28 @@ impl PipelineExecutor {
                 .next()
                 .map(|(_, w)| w)
                 .expect("at least one writer");
-            let buf_writer = BufWriter::with_capacity(65536, raw_writer);
-            let mut csv_writer =
-                CsvWriter::new(buf_writer, Arc::clone(&output_schema), writer_config);
+
+            let mut csv_writer: Box<dyn FormatWriter> =
+                if let Some(ref split) = primary_output.split {
+                    let policy = build_split_policy(split);
+                    let output_path = primary_output.path.clone();
+                    let naming = split.naming.clone();
+                    let schema = Arc::clone(&output_schema);
+                    let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                        let path = apply_split_naming(&output_path, &naming, seq);
+                        let file = std::fs::File::create(path)?;
+                        Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                    };
+                    drop(raw_writer);
+                    Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+                } else {
+                    let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+                    Box::new(CsvWriter::new(
+                        buf_writer,
+                        Arc::clone(&output_schema),
+                        writer_config,
+                    ))
+                };
 
             // Group-boundary streaming loop (single output)
             let mut group_buffer: Vec<(Record, u64)> = Vec::new();
@@ -1267,7 +1276,7 @@ impl PipelineExecutor {
                         strategy,
                         &mut counters,
                         &mut dlq_entries,
-                        &mut csv_writer,
+                        &mut *csv_writer,
                         max_group_buffer,
                     )?;
                     current_key = Some(key);
@@ -1308,7 +1317,7 @@ impl PipelineExecutor {
                 strategy,
                 &mut counters,
                 &mut dlq_entries,
-                &mut csv_writer,
+                &mut *csv_writer,
                 max_group_buffer,
             )?;
 
@@ -2036,9 +2045,26 @@ impl PipelineExecutor {
                 .next()
                 .map(|(_, w)| w)
                 .expect("validated above");
-            let writer = BufWriter::with_capacity(65536, raw_writer);
-            let mut csv_writer =
-                CsvWriter::new(writer, Arc::clone(&final_output_schema), writer_config);
+            let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
+                let policy = build_split_policy(split);
+                let output_path = output.path.clone();
+                let naming = split.naming.clone();
+                let schema = Arc::clone(&final_output_schema);
+                let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                    let path = apply_split_naming(&output_path, &naming, seq);
+                    let file = std::fs::File::create(path)?;
+                    Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                };
+                drop(raw_writer);
+                Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+            } else {
+                let writer = BufWriter::with_capacity(65536, raw_writer);
+                Box::new(CsvWriter::new(
+                    writer,
+                    Arc::clone(&final_output_schema),
+                    writer_config,
+                ))
+            };
 
             // Write the first emitted record
             if let Some((record, emitted, metadata)) = first_emitted {
@@ -2090,7 +2116,7 @@ impl PipelineExecutor {
                                 &mut dlq_entries,
                                 output,
                                 &final_output_schema,
-                                &mut csv_writer,
+                                &mut *csv_writer,
                             )?;
                         }
                     }
@@ -2732,6 +2758,7 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    mod branching;
     mod correlated_dlq;
     mod multi_output;
 
