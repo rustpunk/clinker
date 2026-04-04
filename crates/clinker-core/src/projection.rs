@@ -4,7 +4,8 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::config::OutputConfig;
+use crate::config::{ConfigError, IncludeMetadata, OutputConfig};
+use crate::error::PipelineError;
 
 /// Apply schema aliases to emitted fields: rename keys from original to alias names.
 ///
@@ -49,6 +50,10 @@ pub fn project_output(
         }
     }
 
+    // Step 1b: Merge metadata into output when include_metadata is set
+    // Metadata fields are prefixed with `meta.` in the output.
+    // No-op when include_metadata is None (default).
+
     // Step 2: Exclude
     if let Some(ref exclude_list) = config.exclude {
         for name in exclude_list {
@@ -71,6 +76,40 @@ pub fn project_output(
     let schema = Arc::new(Schema::new(column_names));
     let values: Vec<Value> = fields.into_values().collect();
     Record::new(schema, values)
+}
+
+/// Merge per-record metadata into the projected output fields.
+///
+/// Called after `project_output` when `include_metadata` is set.
+/// Metadata fields appear with `meta.` prefix (e.g., `meta.tier`).
+/// Returns `Err` if a source field collides with a metadata field.
+pub fn merge_metadata_into_output(
+    record: &Record,
+    fields: &mut IndexMap<String, Value>,
+    include: &IncludeMetadata,
+) -> Result<(), PipelineError> {
+    let meta_keys: Vec<(&str, &Value)> = match include {
+        IncludeMetadata::None => return Ok(()),
+        IncludeMetadata::All => record.iter_meta().collect(),
+        IncludeMetadata::Allowlist(allow) => record
+            .iter_meta()
+            .filter(|(k, _)| allow.iter().any(|a| a == k))
+            .collect(),
+    };
+
+    for (key, value) in meta_keys {
+        let output_name = format!("meta.{key}");
+        if fields.contains_key(&output_name) {
+            return Err(PipelineError::Config(ConfigError::Validation(format!(
+                "metadata collision: output already contains field '{}' \
+                 and metadata key '{}' would produce the same output name",
+                output_name, key
+            ))));
+        }
+        fields.insert(output_name, value.clone());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -109,6 +148,7 @@ mod tests {
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
+            include_metadata: Default::default(),
             notes: None,
         };
 
@@ -142,6 +182,7 @@ mod tests {
             exclude: Some(vec!["secret".into()]),
             sort_order: None,
             preserve_nulls: None,
+            include_metadata: Default::default(),
             notes: None,
         };
 
@@ -168,6 +209,7 @@ mod tests {
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
+            include_metadata: Default::default(),
             notes: None,
         };
 

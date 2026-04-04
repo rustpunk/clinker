@@ -20,14 +20,28 @@ pub use error::{EvalError, EvalErrorKind};
 
 /// Row disposition signal from CXL evaluation.
 ///
-/// Returned by `ProgramEvaluator::eval_record()` (Phase 12.2) and consumed by
+/// Returned by `ProgramEvaluator::eval_record()` and consumed by
 /// the executor to decide whether to emit, skip, or route a record.
 #[derive(Debug)]
 pub enum EvalResult {
     /// Record passed all filters and distinct checks — emit to output.
-    Emit(indexmap::IndexMap<String, Value>),
+    /// `fields` = output field values, `metadata` = `$meta.*` writes.
+    Emit {
+        fields: indexmap::IndexMap<String, Value>,
+        metadata: indexmap::IndexMap<String, Value>,
+    },
     /// Record should be excluded from output.
     Skip(SkipReason),
+}
+
+impl EvalResult {
+    /// Convenience: unwrap the emitted fields (panics on Skip).
+    pub fn into_fields(self) -> indexmap::IndexMap<String, Value> {
+        match self {
+            EvalResult::Emit { fields, .. } => fields,
+            EvalResult::Skip(_) => panic!("called into_fields on Skip"),
+        }
+    }
 }
 
 /// Why a record was skipped.
@@ -103,11 +117,20 @@ impl ProgramEvaluator {
     ) -> Result<EvalResult, EvalError> {
         let mut env: HashMap<String, Value> = HashMap::new();
         let mut output = indexmap::IndexMap::new();
+        let mut meta_output = indexmap::IndexMap::new();
 
         for stmt in &self.typed.program.statements {
             match stmt {
                 Statement::Filter { predicate, .. } => {
-                    let val = eval_expr(predicate, &self.typed, ctx, resolver, window, &env)?;
+                    let val = eval_expr(
+                        predicate,
+                        &self.typed,
+                        ctx,
+                        resolver,
+                        window,
+                        &env,
+                        &meta_output,
+                    )?;
                     if val != Value::Bool(true) {
                         return Ok(EvalResult::Skip(SkipReason::Filtered));
                     }
@@ -123,12 +146,23 @@ impl ProgramEvaluator {
                     }
                 }
                 Statement::Let { name, expr, .. } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    let val =
+                        eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
                     env.insert(name.to_string(), val);
                 }
-                Statement::Emit { name, expr, .. } => {
-                    let val = eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
-                    output.insert(name.to_string(), val);
+                Statement::Emit {
+                    name,
+                    expr,
+                    is_meta,
+                    ..
+                } => {
+                    let val =
+                        eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
+                    if *is_meta {
+                        meta_output.insert(name.to_string(), val);
+                    } else {
+                        output.insert(name.to_string(), val);
+                    }
                 }
                 Statement::Trace {
                     level,
@@ -138,14 +172,22 @@ impl ProgramEvaluator {
                 } => {
                     let should_trace = if let Some(g) = guard {
                         matches!(
-                            eval_expr(g, &self.typed, ctx, resolver, window, &env)?,
+                            eval_expr(g, &self.typed, ctx, resolver, window, &env, &meta_output)?,
                             Value::Bool(true)
                         )
                     } else {
                         true
                     };
                     if should_trace {
-                        let msg = eval_expr(message, &self.typed, ctx, resolver, window, &env)?;
+                        let msg = eval_expr(
+                            message,
+                            &self.typed,
+                            ctx,
+                            resolver,
+                            window,
+                            &env,
+                            &meta_output,
+                        )?;
                         let msg_str = match &msg {
                             Value::String(s) => s.to_string(),
                             other => format!("{:?}", other),
@@ -181,11 +223,14 @@ impl ProgramEvaluator {
                 }
                 Statement::UseStmt { .. } => {}
                 Statement::ExprStmt { expr, .. } => {
-                    eval_expr(expr, &self.typed, ctx, resolver, window, &env)?;
+                    eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
                 }
             }
         }
-        Ok(EvalResult::Emit(output))
+        Ok(EvalResult::Emit {
+            fields: output,
+            metadata: meta_output,
+        })
     }
 
     /// Build the distinct key for a record.
@@ -250,15 +295,16 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
 ) -> Result<indexmap::IndexMap<String, Value>, EvalError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     let mut output = indexmap::IndexMap::new();
+    let meta_state = indexmap::IndexMap::new();
 
     for stmt in &typed.program.statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
                 env.insert(name.to_string(), val);
             }
             Statement::Emit { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
                 output.insert(name.to_string(), val);
             }
             Statement::Trace {
@@ -269,14 +315,14 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             } => {
                 let should_trace = if let Some(g) = guard {
                     matches!(
-                        eval_expr(g, typed, ctx, resolver, window, &env)?,
+                        eval_expr(g, typed, ctx, resolver, window, &env, &meta_state)?,
                         Value::Bool(true)
                     )
                 } else {
                     true
                 };
                 if should_trace {
-                    let msg = eval_expr(message, typed, ctx, resolver, window, &env)?;
+                    let msg = eval_expr(message, typed, ctx, resolver, window, &env, &meta_state)?;
                     let msg_str = match &msg {
                         Value::String(s) => s.to_string(),
                         other => format!("{:?}", other),
@@ -312,7 +358,7 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             }
             Statement::UseStmt { .. } => {} // Module imports handled at compile time
             Statement::ExprStmt { expr, .. } => {
-                eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
             }
             Statement::Filter { .. } | Statement::Distinct { .. } => {
                 // Handled by ProgramEvaluator::eval_record() (Phase 12.2.5+)
@@ -332,6 +378,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
+    meta_state: &indexmap::IndexMap<String, Value>,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Literal { value, .. } => Ok(literal_to_value(value)),
@@ -367,7 +414,11 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
         }
 
         Expr::MetaAccess { field, .. } => {
-            // Phase 14: reads from per-record metadata. Stubbed until Record.metadata lands.
+            // Check locally-emitted metadata first (same transform), then resolver
+            if let Some(val) = meta_state.get(&**field) {
+                return Ok(val.clone());
+            }
+            // Fall back to Record metadata (set by earlier transforms)
             Ok(resolver
                 .resolve(&format!("$meta.{field}"))
                 .unwrap_or(Value::Null))
@@ -379,12 +430,14 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
 
         Expr::Binary {
             op, lhs, rhs, span, ..
-        } => eval_binary(*op, lhs, rhs, *span, typed, ctx, resolver, window, env),
+        } => eval_binary(
+            *op, lhs, rhs, *span, typed, ctx, resolver, window, env, meta_state,
+        ),
 
         Expr::Unary {
             op, operand, span, ..
         } => {
-            let val = eval_expr(operand, typed, ctx, resolver, window, env)?;
+            let val = eval_expr(operand, typed, ctx, resolver, window, env, meta_state)?;
             match op {
                 UnaryOp::Neg => match val {
                     Value::Integer(n) => n
@@ -404,9 +457,9 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
         }
 
         Expr::Coalesce { lhs, rhs, .. } => {
-            let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
+            let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
             if left.is_null() {
-                eval_expr(rhs, typed, ctx, resolver, window, env)
+                eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)
             } else {
                 Ok(left) // Short-circuit: RHS not evaluated
             }
@@ -418,12 +471,14 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             else_branch,
             ..
         } => {
-            let cond = eval_expr(condition, typed, ctx, resolver, window, env)?;
+            let cond = eval_expr(condition, typed, ctx, resolver, window, env, meta_state)?;
             match cond {
-                Value::Bool(true) => eval_expr(then_branch, typed, ctx, resolver, window, env),
+                Value::Bool(true) => {
+                    eval_expr(then_branch, typed, ctx, resolver, window, env, meta_state)
+                }
                 _ => {
                     if let Some(eb) = else_branch {
-                        eval_expr(eb, typed, ctx, resolver, window, env)
+                        eval_expr(eb, typed, ctx, resolver, window, env, meta_state)
                     } else {
                         Ok(Value::Null)
                     }
@@ -434,14 +489,16 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
         Expr::Match { subject, arms, .. } => {
             if let Some(scrutinee) = subject {
                 // Value-form match
-                let scrutinee_val = eval_expr(scrutinee, typed, ctx, resolver, window, env)?;
+                let scrutinee_val =
+                    eval_expr(scrutinee, typed, ctx, resolver, window, env, meta_state)?;
                 for arm in arms {
                     if matches!(arm.pattern, Expr::Wildcard { .. }) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
-                    let pat_val = eval_expr(&arm.pattern, typed, ctx, resolver, window, env)?;
+                    let pat_val =
+                        eval_expr(&arm.pattern, typed, ctx, resolver, window, env, meta_state)?;
                     if values_equal(&scrutinee_val, &pat_val) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
                 }
                 Ok(Value::Null)
@@ -449,11 +506,12 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 // Condition-form match
                 for arm in arms {
                     if matches!(arm.pattern, Expr::Wildcard { .. }) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
-                    let cond = eval_expr(&arm.pattern, typed, ctx, resolver, window, env)?;
+                    let cond =
+                        eval_expr(&arm.pattern, typed, ctx, resolver, window, env, meta_state)?;
                     if matches!(cond, Value::Bool(true)) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
                 }
                 Ok(Value::Null)
@@ -467,10 +525,12 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             args,
             span,
         } => {
-            let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env)?;
+            let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env, meta_state)?;
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
-                arg_vals.push(eval_expr(arg, typed, ctx, resolver, window, env)?);
+                arg_vals.push(eval_expr(
+                    arg, typed, ctx, resolver, window, env, meta_state,
+                )?);
             }
 
             // Get pre-compiled regex if available
@@ -547,7 +607,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 "lag" => {
                     let offset = args
                         .first()
-                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
+                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env, meta_state))
                         .transpose()?
                         .and_then(|v| {
                             if let Value::Integer(n) = v {
@@ -562,7 +622,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 "lead" => {
                     let offset = args
                         .first()
-                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
+                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env, meta_state))
                         .transpose()?
                         .and_then(|v| {
                             if let Value::Integer(n) = v {
@@ -606,16 +666,17 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
+    meta_state: &indexmap::IndexMap<String, Value>,
 ) -> Result<Value, EvalError> {
     // Three-valued AND/OR: short-circuit before evaluating RHS
     match op {
         BinOp::And => {
-            let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
+            let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
             return match left {
                 Value::Bool(false) => Ok(Value::Bool(false)), // false && anything = false
-                Value::Bool(true) => eval_expr(rhs, typed, ctx, resolver, window, env),
+                Value::Bool(true) => eval_expr(rhs, typed, ctx, resolver, window, env, meta_state),
                 Value::Null => {
-                    let right = eval_expr(rhs, typed, ctx, resolver, window, env)?;
+                    let right = eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)?;
                     match right {
                         Value::Bool(false) => Ok(Value::Bool(false)), // null && false = false
                         _ => Ok(Value::Null),
@@ -625,12 +686,12 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
             };
         }
         BinOp::Or => {
-            let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
+            let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
             return match left {
                 Value::Bool(true) => Ok(Value::Bool(true)), // true || anything = true
-                Value::Bool(false) => eval_expr(rhs, typed, ctx, resolver, window, env),
+                Value::Bool(false) => eval_expr(rhs, typed, ctx, resolver, window, env, meta_state),
                 Value::Null => {
-                    let right = eval_expr(rhs, typed, ctx, resolver, window, env)?;
+                    let right = eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)?;
                     match right {
                         Value::Bool(true) => Ok(Value::Bool(true)), // null || true = true
                         _ => Ok(Value::Null),
@@ -642,8 +703,8 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
         _ => {}
     }
 
-    let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
-    let right = eval_expr(rhs, typed, ctx, resolver, window, env)?;
+    let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
+    let right = eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)?;
 
     // Equality: never null (per spec)
     match op {

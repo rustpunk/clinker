@@ -237,11 +237,34 @@ pub struct OutputConfig {
     pub sort_order: Option<Vec<SortFieldSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preserve_nulls: Option<bool>,
+    /// Controls whether per-record `$meta.*` metadata is included in output.
+    /// Default: none (metadata stripped from output).
+    #[serde(default, skip_serializing_if = "IncludeMetadata::is_none")]
+    pub include_metadata: IncludeMetadata,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+/// Controls which `$meta.*` fields appear in output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncludeMetadata {
+    /// No metadata in output (default).
+    #[default]
+    None,
+    /// Include all metadata fields, prefixed with `meta.`.
+    All,
+    /// Include only the listed metadata keys, prefixed with `meta.`.
+    Allowlist(Vec<String>),
+}
+
+impl IncludeMetadata {
+    pub fn is_none(&self) -> bool {
+        matches!(self, IncludeMetadata::None)
+    }
 }
 
 /// Adjacently tagged format enum for outputs.

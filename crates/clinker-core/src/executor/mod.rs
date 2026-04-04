@@ -136,7 +136,7 @@ impl CompiledRoute {
                         .evaluator
                         .eval_record::<NullStorage>(ctx, &resolver, None)?
                     {
-                        EvalResult::Emit(_) => return Ok(vec![branch.name.clone()]),
+                        EvalResult::Emit { .. } => return Ok(vec![branch.name.clone()]),
                         EvalResult::Skip(_) => continue,
                     }
                 }
@@ -149,7 +149,7 @@ impl CompiledRoute {
                         .evaluator
                         .eval_record::<NullStorage>(ctx, &resolver, None)?
                     {
-                        EvalResult::Emit(_) => matched.push(branch.name.clone()),
+                        EvalResult::Emit { .. } => matched.push(branch.name.clone()),
                         EvalResult::Skip(_) => {}
                     }
                 }
@@ -486,7 +486,9 @@ impl PipelineExecutor {
             );
             let result = evaluate_record(&record, &transform_names, &mut evaluators, &ctx);
             match &result {
-                Ok(EvalResult::Emit(emitted)) => {
+                Ok(EvalResult::Emit {
+                    fields: emitted, ..
+                }) => {
                     counters.ok_count += 1;
                     first_emitted = Some((record, emitted.clone()));
                     break;
@@ -519,7 +521,7 @@ impl PipelineExecutor {
                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                         counters.distinct_count += 1;
                     }
-                    Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
+                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
                     Err((transform_name, eval_err)) => {
                         if strategy == ErrorStrategy::FailFast {
                             // Drop channels to signal writer threads to stop
@@ -606,7 +608,9 @@ impl PipelineExecutor {
                     &params.pipeline_vars,
                 );
                 match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
-                    Ok(EvalResult::Emit(emitted)) => match route.evaluate(&emitted, &ctx) {
+                    Ok(EvalResult::Emit {
+                        fields: emitted, ..
+                    }) => match route.evaluate(&emitted, &ctx) {
                         Ok(targets) => {
                             for target in &targets {
                                 let out_cfg = config
@@ -692,7 +696,7 @@ impl PipelineExecutor {
                     Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                         counters.distinct_count += 1;
                     }
-                    Ok(EvalResult::Emit(_)) => unreachable!("emits handled in scan"),
+                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
                     Err((transform_name, eval_err)) => {
                         handle_error(
                             strategy,
@@ -731,7 +735,9 @@ impl PipelineExecutor {
                     &params.pipeline_vars,
                 );
                 match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
-                    Ok(EvalResult::Emit(emitted)) => {
+                    Ok(EvalResult::Emit {
+                        fields: emitted, ..
+                    }) => {
                         let projected = project_output(&record, &emitted, output);
                         csv_writer.write_record(&projected)?;
                         counters.ok_count += 1;
@@ -893,7 +899,9 @@ impl PipelineExecutor {
             );
             counters.total_count += 1;
             match result {
-                Ok(EvalResult::Emit(emitted)) => {
+                Ok(EvalResult::Emit {
+                    fields: emitted, ..
+                }) => {
                     first_emitted = Some((record, emitted));
                     first_emit_pos = Some(pos);
                     counters.ok_count += 1;
@@ -1063,7 +1071,9 @@ impl PipelineExecutor {
                     let row_num = *pos as u64 + 1;
                     counters.total_count += 1;
                     match result.as_ref().unwrap() {
-                        Ok(EvalResult::Emit(emitted)) => {
+                        Ok(EvalResult::Emit {
+                            fields: emitted, ..
+                        }) => {
                             let ctx = build_eval_context(
                                 config,
                                 &input.path,
@@ -1177,7 +1187,9 @@ impl PipelineExecutor {
                     let row_num = *pos as u64 + 1;
                     counters.total_count += 1;
                     match result.as_ref().unwrap() {
-                        Ok(EvalResult::Emit(emitted)) => {
+                        Ok(EvalResult::Emit {
+                            fields: emitted, ..
+                        }) => {
                             let projected = project_output(record, emitted, output);
                             csv_writer.write_record(&projected)?;
                             counters.ok_count += 1;
@@ -1516,22 +1528,34 @@ fn evaluate_record(
 ) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
+    let mut all_metadata = IndexMap::new();
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let name = transform_names.get(i).copied().unwrap_or("unknown");
         match eval
             .eval_record::<NullStorage>(ctx, &record, None)
             .map_err(|e| (name.to_string(), e))?
         {
-            EvalResult::Emit(emitted) => {
+            EvalResult::Emit {
+                fields: emitted,
+                metadata,
+            } => {
                 for (name, value) in &emitted {
                     record.set_overflow(name.clone().into_boxed_str(), value.clone());
                 }
+                // Copy metadata onto Record so later transforms can read via $meta.*
+                for (key, value) in &metadata {
+                    let _ = record.set_meta(key, value.clone());
+                }
                 all_emitted.extend(emitted);
+                all_metadata.extend(metadata);
             }
             skip @ EvalResult::Skip(_) => return Ok(skip),
         }
     }
-    Ok(EvalResult::Emit(all_emitted))
+    Ok(EvalResult::Emit {
+        fields: all_emitted,
+        metadata: all_metadata,
+    })
 }
 
 /// Evaluate all transforms with window context, accumulating emitted fields.
@@ -1554,6 +1578,7 @@ fn evaluate_record_with_window(
 ) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
+    let mut all_metadata = IndexMap::new();
 
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let tp = &plan.transforms[i];
@@ -1598,17 +1623,27 @@ fn evaluate_record_with_window(
         };
 
         match result {
-            EvalResult::Emit(emitted) => {
+            EvalResult::Emit {
+                fields: emitted,
+                metadata,
+            } => {
                 for (name, value) in &emitted {
                     record.set_overflow(name.clone().into_boxed_str(), value.clone());
                 }
+                for (key, value) in &metadata {
+                    let _ = record.set_meta(key, value.clone());
+                }
                 all_emitted.extend(emitted);
+                all_metadata.extend(metadata);
             }
             skip @ EvalResult::Skip(_) => return Ok(skip),
         }
     }
 
-    Ok(EvalResult::Emit(all_emitted))
+    Ok(EvalResult::Emit {
+        fields: all_emitted,
+        metadata: all_metadata,
+    })
 }
 
 /// Parse memory limit from config (default 512MB).
