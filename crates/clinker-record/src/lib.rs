@@ -1,3 +1,4 @@
+pub mod accumulator;
 pub mod coercion;
 pub mod counters;
 pub mod group_key;
