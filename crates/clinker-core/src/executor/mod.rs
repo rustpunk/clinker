@@ -1086,65 +1086,81 @@ impl PipelineExecutor {
             };
 
             // Evaluate chunk helper (same as execute_two_pass)
+            // Returns accumulated transform eval duration for this chunk.
             #[allow(clippy::type_complexity)]
-            let evaluate_chunk =
-                |chunk: &mut Vec<(
-                    u32,
-                    Record,
-                    Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-                )>,
-                 evaluators: &mut Vec<ProgramEvaluator>| {
-                    if use_parallel {
-                        pool.install(|| {
-                            chunk.par_iter_mut().for_each(|(pos, record, result)| {
-                                let ctx = build_eval_context(
-                                    config,
-                                    &input.path,
-                                    *pos as u64 + 1,
-                                    pipeline_start_time,
-                                    &params.execution_id,
-                                    &params.batch_id,
-                                    &params.pipeline_vars,
-                                );
-                                let mut local_evals = build_evaluators(transforms);
-                                *result = Some(evaluate_record_with_window(
-                                    record,
-                                    &transform_names,
-                                    &mut local_evals,
-                                    &ctx,
-                                    plan,
-                                    &arena,
-                                    &indices,
-                                    *pos,
-                                ));
-                            });
-                        });
-                    } else {
-                        for (pos, record, result) in chunk.iter_mut() {
-                            let ctx = build_eval_context(
-                                config,
-                                &input.path,
-                                *pos as u64 + 1,
-                                pipeline_start_time,
-                                &params.execution_id,
-                                &params.batch_id,
-                                &params.pipeline_vars,
-                            );
-                            *result = Some(evaluate_record_with_window(
-                                record,
-                                &transform_names,
-                                evaluators,
-                                &ctx,
-                                plan,
-                                &arena,
-                                &indices,
-                                *pos,
-                            ));
-                        }
+            let evaluate_chunk = |chunk: &mut Vec<(
+                u32,
+                Record,
+                Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
+            )>,
+                                  evaluators: &mut Vec<ProgramEvaluator>|
+             -> std::time::Duration {
+                if use_parallel {
+                    pool.install(|| {
+                        chunk
+                            .par_iter_mut()
+                            .fold(
+                                stage_metrics::ChunkTimers::default,
+                                |mut timers, (pos, record, result)| {
+                                    let start = std::time::Instant::now();
+                                    let ctx = build_eval_context(
+                                        config,
+                                        &input.path,
+                                        *pos as u64 + 1,
+                                        pipeline_start_time,
+                                        &params.execution_id,
+                                        &params.batch_id,
+                                        &params.pipeline_vars,
+                                    );
+                                    let mut local_evals = build_evaluators(transforms);
+                                    *result = Some(evaluate_record_with_window(
+                                        record,
+                                        &transform_names,
+                                        &mut local_evals,
+                                        &ctx,
+                                        plan,
+                                        &arena,
+                                        &indices,
+                                        *pos,
+                                    ));
+                                    timers.transform_eval += start.elapsed();
+                                    timers
+                                },
+                            )
+                            .reduce(stage_metrics::ChunkTimers::default, |a, b| a.merge(b))
+                            .transform_eval
+                    })
+                } else {
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for (pos, record, result) in chunk.iter_mut() {
+                        let start = std::time::Instant::now();
+                        let ctx = build_eval_context(
+                            config,
+                            &input.path,
+                            *pos as u64 + 1,
+                            pipeline_start_time,
+                            &params.execution_id,
+                            &params.batch_id,
+                            &params.pipeline_vars,
+                        );
+                        *result = Some(evaluate_record_with_window(
+                            record,
+                            &transform_names,
+                            evaluators,
+                            &ctx,
+                            plan,
+                            &arena,
+                            &indices,
+                            *pos,
+                        ));
+                        elapsed += start.elapsed();
                     }
-                };
+                    elapsed
+                }
+            };
 
             let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
+            let first_emitted_was_some = first_emitted.is_some();
 
             if is_multi_output {
                 let output_channels = spawn_writer_threads(
@@ -1206,6 +1222,12 @@ impl PipelineExecutor {
 
                 // Process remaining records in chunks
                 let route = compiled_route.as_mut().unwrap();
+                let mut transform_dur = std::time::Duration::ZERO;
+                let mut projection_timer = stage_metrics::CumulativeTimer::new();
+                let mut route_timer = stage_metrics::CumulativeTimer::new();
+                let mut write_timer = stage_metrics::CumulativeTimer::new();
+                let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
+
                 while chunk_start < record_count {
                     let chunk_end = (chunk_start + chunk_size).min(record_count);
 
@@ -1218,7 +1240,7 @@ impl PipelineExecutor {
                         .map(|pos| (pos, build_record_from_arena(pos), None))
                         .collect();
 
-                    evaluate_chunk(&mut chunk, &mut evaluators);
+                    transform_dur += evaluate_chunk(&mut chunk, &mut evaluators);
 
                     let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
                     for (pos, record, result) in &chunk {
@@ -1238,7 +1260,11 @@ impl PipelineExecutor {
                                     &params.batch_id,
                                     &params.pipeline_vars,
                                 );
-                                match route.evaluate(emitted, metadata, &ctx) {
+                                let route_result = {
+                                    let _guard = route_timer.guard();
+                                    route.evaluate(emitted, metadata, &ctx)
+                                };
+                                match route_result {
                                     Ok(targets) => {
                                         for target in &targets {
                                             let out_cfg = config
@@ -1246,15 +1272,19 @@ impl PipelineExecutor {
                                                 .iter()
                                                 .find(|o| o.name == *target)
                                                 .unwrap_or(primary_output);
-                                            let projected = project_output_with_meta(
-                                                record, emitted, metadata, out_cfg,
-                                            );
+                                            let projected = {
+                                                let _guard = projection_timer.guard();
+                                                project_output_with_meta(
+                                                    record, emitted, metadata, out_cfg,
+                                                )
+                                            };
                                             per_output_batches
                                                 .entry(target.clone())
                                                 .or_default()
                                                 .push(projected);
                                         }
                                         counters.ok_count += 1;
+                                        records_emitted += 1;
                                     }
                                     Err(route_err) => {
                                         if strategy == ErrorStrategy::FailFast {
@@ -1302,13 +1332,42 @@ impl PipelineExecutor {
                             }
                         }
                     }
-                    flush_output_batches(&mut per_output_batches, &output_channels)?;
+                    {
+                        let _guard = write_timer.guard();
+                        flush_output_batches(&mut per_output_batches, &output_channels)?;
+                    }
 
                     rss_budget.observe();
                     chunk_start = chunk_end;
                 }
 
                 join_writer_threads(output_channels)?;
+
+                collector.record(stage_metrics::StageMetrics {
+                    name: stage_metrics::StageName::TransformEval,
+                    elapsed: transform_dur,
+                    records_in: record_count as u64,
+                    records_out: records_emitted,
+                    bytes_written: None,
+                    rss_after: None,
+                    heap_delta_bytes: None,
+                    heap_alloc_count: None,
+                });
+                collector.record(projection_timer.finish(
+                    stage_metrics::StageName::Projection,
+                    records_emitted,
+                    records_emitted,
+                ));
+                collector.record(route_timer.finish(
+                    stage_metrics::StageName::RouteEval,
+                    records_emitted,
+                    records_emitted,
+                ));
+                collector.record(write_timer.finish(
+                    stage_metrics::StageName::Write,
+                    records_emitted,
+                    records_emitted,
+                ));
             } else {
                 // Single-output path
                 let output = primary_output;
@@ -1326,6 +1385,11 @@ impl PipelineExecutor {
                     csv_writer.write_record(&projected)?;
                 }
 
+                let mut transform_dur = std::time::Duration::ZERO;
+                let mut projection_timer = stage_metrics::CumulativeTimer::new();
+                let mut write_timer = stage_metrics::CumulativeTimer::new();
+                let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
+
                 while chunk_start < record_count {
                     let chunk_end = (chunk_start + chunk_size).min(record_count);
 
@@ -1338,7 +1402,7 @@ impl PipelineExecutor {
                         .map(|pos| (pos, build_record_from_arena(pos), None))
                         .collect();
 
-                    evaluate_chunk(&mut chunk, &mut evaluators);
+                    transform_dur += evaluate_chunk(&mut chunk, &mut evaluators);
 
                     for (pos, record, result) in &chunk {
                         let row_num = *pos as u64 + 1;
@@ -1347,9 +1411,16 @@ impl PipelineExecutor {
                             Ok(EvalResult::Emit {
                                 fields: emitted, ..
                             }) => {
-                                let projected = project_output(record, emitted, output);
-                                csv_writer.write_record(&projected)?;
+                                let projected = {
+                                    let _guard = projection_timer.guard();
+                                    project_output(record, emitted, output)
+                                };
+                                {
+                                    let _guard = write_timer.guard();
+                                    csv_writer.write_record(&projected)?;
+                                }
                                 counters.ok_count += 1;
+                                records_emitted += 1;
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                                 counters.filtered_count += 1;
@@ -1380,6 +1451,29 @@ impl PipelineExecutor {
                 }
 
                 csv_writer.flush()?;
+
+                collector.record(stage_metrics::StageMetrics {
+                    name: stage_metrics::StageName::TransformEval,
+                    elapsed: transform_dur,
+                    records_in: record_count as u64,
+                    records_out: records_emitted,
+                    bytes_written: None,
+                    rss_after: None,
+                    heap_delta_bytes: None,
+                    heap_alloc_count: None,
+                });
+                collector.record(projection_timer.finish(
+                    stage_metrics::StageName::Projection,
+                    records_emitted,
+                    records_emitted,
+                ));
+                let mut write_metrics = write_timer.finish(
+                    stage_metrics::StageName::Write,
+                    records_emitted,
+                    records_emitted,
+                );
+                write_metrics.bytes_written = csv_writer.bytes_written();
+                collector.record(write_metrics);
             }
 
             return Ok((counters, dlq_entries, rss_budget.peak_rss));
@@ -1482,6 +1576,12 @@ impl PipelineExecutor {
                 let mut group_buffer: Vec<(Record, u64)> = Vec::new();
                 let mut current_key: Option<Vec<GroupByKey>> = None;
                 let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                let mut transform_timer = stage_metrics::CumulativeTimer::new();
+                let mut projection_timer = stage_metrics::CumulativeTimer::new();
+                let mut route_timer = stage_metrics::CumulativeTimer::new();
+                let mut write_timer = stage_metrics::CumulativeTimer::new();
+                let total_records = all_records.len() as u64;
+                let mut records_emitted: u64 = 0;
 
                 for (record, rn) in all_records {
                     let key = extract_correlation_key(&record, correlation_key);
@@ -1497,25 +1597,34 @@ impl PipelineExecutor {
                             &params.batch_id,
                             &params.pipeline_vars,
                         );
-                        match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                        let result = {
+                            let _guard = transform_timer.guard();
+                            evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                        };
+                        match result {
                             Ok(EvalResult::Emit {
                                 fields: emitted,
                                 metadata,
                             }) => {
-                                Self::dispatch_to_outputs(
-                                    &record,
-                                    &emitted,
-                                    &metadata,
-                                    config,
-                                    primary_output,
-                                    compiled_route.as_mut(),
-                                    &ctx,
-                                    &mut counters,
-                                    &mut dlq_entries,
-                                    &mut per_output_batches,
-                                    strategy,
-                                    rn,
-                                );
+                                {
+                                    let _guard = route_timer.guard();
+                                    let _guard2 = projection_timer.guard();
+                                    Self::dispatch_to_outputs(
+                                        &record,
+                                        &emitted,
+                                        &metadata,
+                                        config,
+                                        primary_output,
+                                        compiled_route.as_mut(),
+                                        &ctx,
+                                        &mut counters,
+                                        &mut dlq_entries,
+                                        &mut per_output_batches,
+                                        strategy,
+                                        rn,
+                                    );
+                                }
+                                records_emitted += 1;
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                                 counters.filtered_count += 1;
@@ -1607,8 +1716,32 @@ impl PipelineExecutor {
                     max_group_buffer,
                 );
 
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
+                {
+                    let _guard = write_timer.guard();
+                    flush_output_batches(&mut per_output_batches, &output_channels)?;
+                }
                 drop(output_channels);
+
+                collector.record(transform_timer.finish(
+                    stage_metrics::StageName::TransformEval,
+                    total_records,
+                    records_emitted,
+                ));
+                collector.record(projection_timer.finish(
+                    stage_metrics::StageName::Projection,
+                    records_emitted,
+                    records_emitted,
+                ));
+                collector.record(route_timer.finish(
+                    stage_metrics::StageName::RouteEval,
+                    records_emitted,
+                    records_emitted,
+                ));
+                collector.record(write_timer.finish(
+                    stage_metrics::StageName::Write,
+                    records_emitted,
+                    records_emitted,
+                ));
             } else {
                 // Single-output correlated path
                 let raw_writer = writers
@@ -1622,6 +1755,11 @@ impl PipelineExecutor {
 
                 let mut group_buffer: Vec<(Record, u64)> = Vec::new();
                 let mut current_key: Option<Vec<GroupByKey>> = None;
+                let mut transform_timer = stage_metrics::CumulativeTimer::new();
+                let mut projection_timer = stage_metrics::CumulativeTimer::new();
+                let mut write_timer = stage_metrics::CumulativeTimer::new();
+                let total_records = all_records.len() as u64;
+                let mut records_emitted: u64 = 0;
 
                 for (record, rn) in all_records {
                     let key = extract_correlation_key(&record, correlation_key);
@@ -1637,13 +1775,24 @@ impl PipelineExecutor {
                             &params.batch_id,
                             &params.pipeline_vars,
                         );
-                        match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                        let result = {
+                            let _guard = transform_timer.guard();
+                            evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                        };
+                        match result {
                             Ok(EvalResult::Emit {
                                 fields: emitted, ..
                             }) => {
-                                let projected = project_output(&record, &emitted, primary_output);
-                                csv_writer.write_record(&projected)?;
+                                let projected = {
+                                    let _guard = projection_timer.guard();
+                                    project_output(&record, &emitted, primary_output)
+                                };
+                                {
+                                    let _guard = write_timer.guard();
+                                    csv_writer.write_record(&projected)?;
+                                }
                                 counters.ok_count += 1;
+                                records_emitted += 1;
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                                 counters.filtered_count += 1;
@@ -1732,6 +1881,24 @@ impl PipelineExecutor {
                 )?;
 
                 csv_writer.flush()?;
+
+                collector.record(transform_timer.finish(
+                    stage_metrics::StageName::TransformEval,
+                    total_records,
+                    records_emitted,
+                ));
+                collector.record(projection_timer.finish(
+                    stage_metrics::StageName::Projection,
+                    records_emitted,
+                    records_emitted,
+                ));
+                let mut write_metrics = write_timer.finish(
+                    stage_metrics::StageName::Write,
+                    records_emitted,
+                    records_emitted,
+                );
+                write_metrics.bytes_written = csv_writer.bytes_written();
+                collector.record(write_metrics);
             }
 
             return Ok((counters, dlq_entries, rss_bytes()));
@@ -1833,6 +2000,7 @@ impl PipelineExecutor {
             }
 
             // Dispatch first emitted record
+            let first_emitted_was_some = first_emitted.is_some();
             if let Some((record, emitted, metadata)) = first_emitted {
                 let route = compiled_route.as_mut().unwrap();
                 let ctx = build_eval_context(
@@ -1885,6 +2053,13 @@ impl PipelineExecutor {
             // Process remaining records
             let route = compiled_route.as_mut().unwrap();
             let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+            let mut transform_timer = stage_metrics::CumulativeTimer::new();
+            let mut projection_timer = stage_metrics::CumulativeTimer::new();
+            let mut route_timer = stage_metrics::CumulativeTimer::new();
+            let mut write_timer = stage_metrics::CumulativeTimer::new();
+            let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
+            let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
+
             for (record, rn) in all_records.into_iter().skip(scan_idx) {
                 let ctx = build_eval_context(
                     config,
@@ -1895,44 +2070,59 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                let result = {
+                    let _guard = transform_timer.guard();
+                    evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                };
+                match result {
                     Ok(EvalResult::Emit {
                         fields: emitted,
                         metadata,
-                    }) => match route.evaluate(&emitted, &metadata, &ctx) {
-                        Ok(targets) => {
-                            for target in &targets {
-                                let out_cfg = config
-                                    .outputs
-                                    .iter()
-                                    .find(|o| o.name == *target)
-                                    .unwrap_or(primary_output);
-                                let projected =
-                                    project_output_with_meta(&record, &emitted, &metadata, out_cfg);
-                                per_output_batches
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .push(projected);
+                    }) => {
+                        let route_result = {
+                            let _guard = route_timer.guard();
+                            route.evaluate(&emitted, &metadata, &ctx)
+                        };
+                        match route_result {
+                            Ok(targets) => {
+                                for target in &targets {
+                                    let out_cfg = config
+                                        .outputs
+                                        .iter()
+                                        .find(|o| o.name == *target)
+                                        .unwrap_or(primary_output);
+                                    let projected = {
+                                        let _guard = projection_timer.guard();
+                                        project_output_with_meta(
+                                            &record, &emitted, &metadata, out_cfg,
+                                        )
+                                    };
+                                    per_output_batches
+                                        .entry(target.clone())
+                                        .or_default()
+                                        .push(projected);
+                                }
+                                counters.ok_count += 1;
+                                records_emitted += 1;
                             }
-                            counters.ok_count += 1;
-                        }
-                        Err(route_err) => {
-                            if strategy == ErrorStrategy::FailFast {
-                                drop(output_channels);
-                                return Err(route_err.into());
+                            Err(route_err) => {
+                                if strategy == ErrorStrategy::FailFast {
+                                    drop(output_channels);
+                                    return Err(route_err.into());
+                                }
+                                counters.dlq_count += 1;
+                                dlq_entries.push(DlqEntry {
+                                    source_row: rn,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: route_err.to_string(),
+                                    original_record: record,
+                                    stage: Some(DlqEntry::stage_route_eval()),
+                                    route: None,
+                                    trigger: true,
+                                });
                             }
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: route_err.to_string(),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_route_eval()),
-                                route: None,
-                                trigger: true,
-                            });
                         }
-                    },
+                    }
                     Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                         counters.filtered_count += 1;
                     }
@@ -1957,12 +2147,40 @@ impl PipelineExecutor {
                     }
                 }
 
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
+                {
+                    let _guard = write_timer.guard();
+                    flush_output_batches(&mut per_output_batches, &output_channels)?;
+                }
             }
 
             // Final flush
-            flush_output_batches(&mut per_output_batches, &output_channels)?;
+            {
+                let _guard = write_timer.guard();
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
+            }
             join_writer_threads(output_channels)?;
+
+            let total_records = records_scanned + remaining_count;
+            collector.record(transform_timer.finish(
+                stage_metrics::StageName::TransformEval,
+                total_records,
+                records_emitted,
+            ));
+            collector.record(projection_timer.finish(
+                stage_metrics::StageName::Projection,
+                records_emitted,
+                records_emitted,
+            ));
+            collector.record(route_timer.finish(
+                stage_metrics::StageName::RouteEval,
+                records_emitted,
+                records_emitted,
+            ));
+            collector.record(write_timer.finish(
+                stage_metrics::StageName::Write,
+                records_emitted,
+                records_emitted,
+            ));
         } else {
             // Single-output streaming path
             let output = primary_output;
@@ -2004,12 +2222,19 @@ impl PipelineExecutor {
             }
 
             // Write first emitted record (ok_count already incremented during scan)
+            let first_emitted_was_some = first_emitted.is_some();
             if let Some((record, emitted, metadata)) = first_emitted {
                 let projected = project_output_with_meta(&record, &emitted, &metadata, output);
                 csv_writer.write_record(&projected)?;
             }
 
             // Process remaining records
+            let mut transform_timer = stage_metrics::CumulativeTimer::new();
+            let mut projection_timer = stage_metrics::CumulativeTimer::new();
+            let mut write_timer = stage_metrics::CumulativeTimer::new();
+            let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
+            let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
+
             for (record, rn) in all_records.into_iter().skip(scan_idx) {
                 let ctx = build_eval_context(
                     config,
@@ -2020,15 +2245,25 @@ impl PipelineExecutor {
                     &params.batch_id,
                     &params.pipeline_vars,
                 );
-                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                let result = {
+                    let _guard = transform_timer.guard();
+                    evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                };
+                match result {
                     Ok(EvalResult::Emit {
                         fields: emitted,
                         metadata,
                     }) => {
-                        let projected =
-                            project_output_with_meta(&record, &emitted, &metadata, output);
-                        csv_writer.write_record(&projected)?;
+                        let projected = {
+                            let _guard = projection_timer.guard();
+                            project_output_with_meta(&record, &emitted, &metadata, output)
+                        };
+                        {
+                            let _guard = write_timer.guard();
+                            csv_writer.write_record(&projected)?;
+                        }
                         counters.ok_count += 1;
+                        records_emitted += 1;
                     }
                     Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                         counters.filtered_count += 1;
@@ -2055,6 +2290,25 @@ impl PipelineExecutor {
             }
 
             csv_writer.flush()?;
+
+            let total_records = records_scanned + remaining_count;
+            collector.record(transform_timer.finish(
+                stage_metrics::StageName::TransformEval,
+                total_records,
+                records_emitted,
+            ));
+            collector.record(projection_timer.finish(
+                stage_metrics::StageName::Projection,
+                records_emitted,
+                records_emitted,
+            ));
+            let mut write_metrics = write_timer.finish(
+                stage_metrics::StageName::Write,
+                records_emitted,
+                records_emitted,
+            );
+            write_metrics.bytes_written = csv_writer.bytes_written();
+            collector.record(write_metrics);
         }
 
         Ok((counters, dlq_entries, rss_bytes()))
@@ -2083,7 +2337,7 @@ impl PipelineExecutor {
         params: &PipelineRunParams,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
-        _collector: &mut stage_metrics::StageCollector,
+        collector: &mut stage_metrics::StageCollector,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
@@ -2092,6 +2346,12 @@ impl PipelineExecutor {
         let pipeline_start_time = chrono::Local::now().naive_local();
         let strategy = config.error_handling.strategy;
         let mut compiled_route = compiled_route;
+        let mut transform_timer = stage_metrics::CumulativeTimer::new();
+        let mut route_timer = stage_metrics::CumulativeTimer::new();
+        let mut projection_timer = stage_metrics::CumulativeTimer::new();
+        let mut write_timer = stage_metrics::CumulativeTimer::new();
+        let total_records = all_records.len() as u64;
+        let mut records_emitted: u64 = 0;
 
         // Build transform name -> index map for looking up CompiledTransform by name
         let transform_by_name: HashMap<&str, usize> = transforms
@@ -2174,7 +2434,11 @@ impl PipelineExecutor {
                             &params.pipeline_vars,
                         );
 
-                        match evaluate_single_transform(&record, name, &mut evaluator, &ctx) {
+                        let eval_result = {
+                            let _guard = transform_timer.guard();
+                            evaluate_single_transform(&record, name, &mut evaluator, &ctx)
+                        };
+                        match eval_result {
                             Ok((modified_record, Ok((emitted, metadata)))) => {
                                 all_emitted.extend(emitted);
                                 all_metadata.extend(metadata);
@@ -2277,7 +2541,11 @@ impl PipelineExecutor {
                                 &params.pipeline_vars,
                             );
 
-                            match route.evaluate(&all_emitted, &all_metadata, &ctx) {
+                            let route_result = {
+                                let _guard = route_timer.guard();
+                                route.evaluate(&all_emitted, &all_metadata, &ctx)
+                            };
+                            match route_result {
                                 Ok(targets) => {
                                     for target in &targets {
                                         if let Some(&succ) = branch_to_succ.get(target.as_str()) {
@@ -2380,7 +2648,9 @@ impl PipelineExecutor {
                         .unwrap_or_default();
 
                     // Count ok records
-                    counters.ok_count += input_records.len() as u64;
+                    let output_record_count = input_records.len() as u64;
+                    counters.ok_count += output_record_count;
+                    records_emitted += output_record_count;
 
                     // Derive output schema from first emitted record
                     let scan_timer =
@@ -2391,33 +2661,64 @@ impl PipelineExecutor {
                         .find(|o| o.name == *name)
                         .unwrap_or(primary_output);
 
-                    let output_schema = if let Some((rec, _, emitted, metadata)) =
-                        input_records.first()
-                    {
-                        let projected = project_output_with_meta(rec, emitted, metadata, out_cfg);
-                        Arc::clone(projected.schema())
-                    } else {
-                        // No records to write — use empty schema
-                        _collector.record(scan_timer.finish(0, 0));
-                        continue;
-                    };
+                    let output_schema =
+                        if let Some((rec, _, emitted, metadata)) = input_records.first() {
+                            let projected = {
+                                let _guard = projection_timer.guard();
+                                project_output_with_meta(rec, emitted, metadata, out_cfg)
+                            };
+                            Arc::clone(projected.schema())
+                        } else {
+                            // No records to write — use empty schema
+                            collector.record(scan_timer.finish(0, 0));
+                            continue;
+                        };
 
                     // Find and take the writer for this output
                     if let Some(raw_writer) = writers.remove(name) {
                         let mut csv_writer =
                             build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema))?;
-                        _collector.record(scan_timer.finish(1, 1));
+                        collector.record(scan_timer.finish(1, 1));
 
                         for (record, _rn, emitted, metadata) in &input_records {
-                            let projected =
-                                project_output_with_meta(record, emitted, metadata, out_cfg);
-                            csv_writer.write_record(&projected)?;
+                            let projected = {
+                                let _guard = projection_timer.guard();
+                                project_output_with_meta(record, emitted, metadata, out_cfg)
+                            };
+                            {
+                                let _guard = write_timer.guard();
+                                csv_writer.write_record(&projected)?;
+                            }
                         }
-                        csv_writer.flush()?;
+                        {
+                            let _guard = write_timer.guard();
+                            csv_writer.flush()?;
+                        }
                     }
                 }
             }
         }
+
+        collector.record(transform_timer.finish(
+            stage_metrics::StageName::TransformEval,
+            total_records,
+            records_emitted,
+        ));
+        collector.record(projection_timer.finish(
+            stage_metrics::StageName::Projection,
+            records_emitted,
+            records_emitted,
+        ));
+        collector.record(route_timer.finish(
+            stage_metrics::StageName::RouteEval,
+            total_records,
+            records_emitted,
+        ));
+        collector.record(write_timer.finish(
+            stage_metrics::StageName::Write,
+            records_emitted,
+            records_emitted,
+        ));
 
         Ok((
             std::mem::take(counters),
@@ -3456,6 +3757,7 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    mod aggregation;
     mod branching;
     mod correlated_dlq;
     mod format_dispatch;
@@ -3754,6 +4056,130 @@ transformations:
         assert!(
             names.contains(&&stage_metrics::StageName::SchemaScan),
             "Missing SchemaScan stage in two-pass pipeline"
+        );
+    }
+
+    #[test]
+    fn test_streaming_cumulative_stages_present() {
+        let yaml = r#"
+pipeline:
+  name: passthrough
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: add_x
+    cxl: "emit x = 1"
+"#;
+        let csv = "name,age\nAlice,30\nBob,25\nCarol,28\nDave,31\nEve,22\n\
+                   Frank,27\nGrace,29\nHenry,33\nIvy,24\nJack,26\n";
+        let (report, _output) = run_test_report(yaml, csv).unwrap();
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&stage_metrics::StageName::TransformEval),
+            "Missing TransformEval: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&&stage_metrics::StageName::Projection),
+            "Missing Projection: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&&stage_metrics::StageName::Write),
+            "Missing Write: {:?}",
+            names
+        );
+        for stage in report.stages.iter().filter(|s| {
+            matches!(
+                s.name,
+                stage_metrics::StageName::TransformEval
+                    | stage_metrics::StageName::Projection
+                    | stage_metrics::StageName::Write
+            )
+        }) {
+            assert!(
+                stage.elapsed > std::time::Duration::ZERO,
+                "Stage {:?} has zero elapsed",
+                stage.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_output_has_route_eval_stage() {
+        let yaml = r#"
+pipeline:
+  name: multi_out
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: high
+    type: csv
+    path: high.csv
+    include_unmapped: true
+  - name: low
+    type: csv
+    path: low.csv
+    include_unmapped: true
+transformations:
+  - name: classify
+    cxl: |
+      emit x = age.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "x > 28"
+      default: low
+"#;
+        let csv = "name,age\nAlice,30\nBob,25\n";
+        let config = crate::config::parse_config(yaml).unwrap();
+        let high_buf = crate::test_helpers::SharedBuffer::new();
+        let low_buf = crate::test_helpers::SharedBuffer::new();
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+            (
+                "high".to_string(),
+                Box::new(high_buf.clone()) as Box<dyn std::io::Write + Send>,
+            ),
+            (
+                "low".to_string(),
+                Box::new(low_buf.clone()) as Box<dyn std::io::Write + Send>,
+            ),
+        ]);
+
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(|v| crate::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+        };
+
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&stage_metrics::StageName::RouteEval),
+            "Missing RouteEval in multi-output pipeline: {:?}",
+            names
         );
     }
 

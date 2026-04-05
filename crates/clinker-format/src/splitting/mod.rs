@@ -101,6 +101,8 @@ pub struct SplittingWriter {
     file_seq: u32,
     /// Whether an oversize warning has been emitted for the current group.
     oversize_warned: bool,
+    /// Cumulative bytes written across all rotated files (excludes current file).
+    total_bytes: u64,
 }
 
 impl SplittingWriter {
@@ -121,6 +123,7 @@ impl SplittingWriter {
             current_key: None,
             file_seq: 0,
             oversize_warned: false,
+            total_bytes: 0,
         }
     }
 
@@ -128,6 +131,7 @@ impl SplittingWriter {
     fn open_new_file(&mut self) -> Result<(), FormatError> {
         self.file_seq += 1;
         let raw = (self.file_factory)(self.file_seq).map_err(FormatError::Io)?;
+        self.total_bytes += self.byte_counter.bytes_written();
         self.byte_counter.reset();
         let counting = CountingWriter::new(raw, self.byte_counter.clone());
         let writer = (self.writer_factory)(counting, Arc::clone(&self.schema))?;
@@ -213,6 +217,11 @@ impl SplittingWriter {
     pub fn file_count(&self) -> u32 {
         self.file_seq
     }
+
+    /// Total bytes written across all rotated files plus current file.
+    pub fn total_bytes_written(&self) -> u64 {
+        self.total_bytes + self.byte_counter.bytes_written()
+    }
 }
 
 impl FormatWriter for SplittingWriter {
@@ -270,5 +279,9 @@ impl FormatWriter for SplittingWriter {
             writer.flush()?;
         }
         Ok(())
+    }
+
+    fn bytes_written(&self) -> Option<u64> {
+        Some(self.total_bytes + self.byte_counter.bytes_written())
     }
 }
