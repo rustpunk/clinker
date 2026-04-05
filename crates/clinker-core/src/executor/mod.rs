@@ -934,6 +934,7 @@ impl PipelineExecutor {
             let arena_fields =
                 crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
             let memory_limit = parse_memory_limit(config);
+            let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
             let arena =
                 Arena::build(&mut *format_reader, &arena_fields, memory_limit).map_err(|e| {
                     PipelineError::Compilation {
@@ -941,6 +942,8 @@ impl PipelineExecutor {
                         messages: vec![e.to_string()],
                     }
                 })?;
+            let arena_len = arena.record_count() as u64;
+            collector.record(arena_timer.finish(arena_len, arena_len));
 
             let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
                 .schema_overrides
@@ -955,6 +958,11 @@ impl PipelineExecutor {
 
             let mut indices: Vec<SecondaryIndex> = Vec::new();
             for spec in &plan.indices_to_build {
+                let index_name = format!("{}:{}", spec.source, spec.group_by.join(","));
+                let index_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
+                        name: index_name,
+                    });
                 let idx =
                     SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
                         PipelineError::Compilation {
@@ -962,6 +970,7 @@ impl PipelineExecutor {
                             messages: vec![e.to_string()],
                         }
                     })?;
+                collector.record(index_timer.finish(arena_len, arena_len));
                 indices.push(idx);
             }
 
@@ -1514,12 +1523,15 @@ impl PipelineExecutor {
 
         // Phase 2: Sort if correlated streaming
         if requires_sorted_input && let Some(sort_specs) = effective_sort_order {
+            let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+            let sort_count = all_records.len() as u64;
             let sort_fields: Vec<crate::config::SortField> = sort_specs
                 .iter()
                 .map(|s| s.clone().into_sort_field())
                 .collect();
             all_records
                 .sort_by(|(a, _), (b, _)| sort::compare_records_by_fields(a, b, &sort_fields));
+            collector.record(sort_timer.finish(sort_count, sort_count));
         }
 
         // Phase 3: Schema derivation (scan for first emitting record)
@@ -1580,8 +1592,11 @@ impl PipelineExecutor {
                 let mut projection_timer = stage_metrics::CumulativeTimer::new();
                 let mut route_timer = stage_metrics::CumulativeTimer::new();
                 let mut write_timer = stage_metrics::CumulativeTimer::new();
+                let mut group_flush_timer = stage_metrics::CumulativeTimer::new();
                 let total_records = all_records.len() as u64;
                 let mut records_emitted: u64 = 0;
+                let mut group_flush_records_in: u64 = 0;
+                let mut group_flush_records_out: u64 = 0;
 
                 for (record, rn) in all_records {
                     let key = extract_correlation_key(&record, correlation_key);
@@ -1656,22 +1671,28 @@ impl PipelineExecutor {
                     }
 
                     if current_key.as_ref() != Some(&key) {
-                        Self::flush_correlated_group(
-                            &mut group_buffer,
-                            config,
-                            primary_output,
-                            input,
-                            pipeline_start_time,
-                            &transform_names,
-                            &mut evaluators,
-                            compiled_route.as_mut(),
-                            params,
-                            strategy,
-                            &mut counters,
-                            &mut dlq_entries,
-                            &mut per_output_batches,
-                            max_group_buffer,
-                        );
+                        {
+                            let _guard = group_flush_timer.guard();
+                            group_flush_records_in += group_buffer.len() as u64;
+                            let before = counters.ok_count;
+                            Self::flush_correlated_group(
+                                &mut group_buffer,
+                                config,
+                                primary_output,
+                                input,
+                                pipeline_start_time,
+                                &transform_names,
+                                &mut evaluators,
+                                compiled_route.as_mut(),
+                                params,
+                                strategy,
+                                &mut counters,
+                                &mut dlq_entries,
+                                &mut per_output_batches,
+                                max_group_buffer,
+                            );
+                            group_flush_records_out += counters.ok_count - before;
+                        }
                         current_key = Some(key);
                     }
 
@@ -1699,22 +1720,28 @@ impl PipelineExecutor {
                 }
 
                 // Flush final group
-                Self::flush_correlated_group(
-                    &mut group_buffer,
-                    config,
-                    primary_output,
-                    input,
-                    pipeline_start_time,
-                    &transform_names,
-                    &mut evaluators,
-                    compiled_route.as_mut(),
-                    params,
-                    strategy,
-                    &mut counters,
-                    &mut dlq_entries,
-                    &mut per_output_batches,
-                    max_group_buffer,
-                );
+                {
+                    let _guard = group_flush_timer.guard();
+                    group_flush_records_in += group_buffer.len() as u64;
+                    let before = counters.ok_count;
+                    Self::flush_correlated_group(
+                        &mut group_buffer,
+                        config,
+                        primary_output,
+                        input,
+                        pipeline_start_time,
+                        &transform_names,
+                        &mut evaluators,
+                        compiled_route.as_mut(),
+                        params,
+                        strategy,
+                        &mut counters,
+                        &mut dlq_entries,
+                        &mut per_output_batches,
+                        max_group_buffer,
+                    );
+                    group_flush_records_out += counters.ok_count - before;
+                }
 
                 {
                     let _guard = write_timer.guard();
@@ -1742,6 +1769,11 @@ impl PipelineExecutor {
                     records_emitted,
                     records_emitted,
                 ));
+                collector.record(group_flush_timer.finish(
+                    stage_metrics::StageName::GroupFlush,
+                    group_flush_records_in,
+                    group_flush_records_out,
+                ));
             } else {
                 // Single-output correlated path
                 let raw_writer = writers
@@ -1758,8 +1790,11 @@ impl PipelineExecutor {
                 let mut transform_timer = stage_metrics::CumulativeTimer::new();
                 let mut projection_timer = stage_metrics::CumulativeTimer::new();
                 let mut write_timer = stage_metrics::CumulativeTimer::new();
+                let mut group_flush_timer = stage_metrics::CumulativeTimer::new();
                 let total_records = all_records.len() as u64;
                 let mut records_emitted: u64 = 0;
+                let mut group_flush_records_in: u64 = 0;
+                let mut group_flush_records_out: u64 = 0;
 
                 for (record, rn) in all_records {
                     let key = extract_correlation_key(&record, correlation_key);
@@ -1823,21 +1858,27 @@ impl PipelineExecutor {
                     }
 
                     if current_key.as_ref() != Some(&key) {
-                        Self::flush_correlated_group_single_output(
-                            &mut group_buffer,
-                            config,
-                            primary_output,
-                            input,
-                            pipeline_start_time,
-                            &transform_names,
-                            &mut evaluators,
-                            params,
-                            strategy,
-                            &mut counters,
-                            &mut dlq_entries,
-                            &mut *csv_writer,
-                            max_group_buffer,
-                        )?;
+                        {
+                            let _guard = group_flush_timer.guard();
+                            group_flush_records_in += group_buffer.len() as u64;
+                            let before = counters.ok_count;
+                            Self::flush_correlated_group_single_output(
+                                &mut group_buffer,
+                                config,
+                                primary_output,
+                                input,
+                                pipeline_start_time,
+                                &transform_names,
+                                &mut evaluators,
+                                params,
+                                strategy,
+                                &mut counters,
+                                &mut dlq_entries,
+                                &mut *csv_writer,
+                                max_group_buffer,
+                            )?;
+                            group_flush_records_out += counters.ok_count - before;
+                        }
                         current_key = Some(key);
                     }
 
@@ -1864,21 +1905,27 @@ impl PipelineExecutor {
                     group_buffer.push((record, rn));
                 }
 
-                Self::flush_correlated_group_single_output(
-                    &mut group_buffer,
-                    config,
-                    primary_output,
-                    input,
-                    pipeline_start_time,
-                    &transform_names,
-                    &mut evaluators,
-                    params,
-                    strategy,
-                    &mut counters,
-                    &mut dlq_entries,
-                    &mut *csv_writer,
-                    max_group_buffer,
-                )?;
+                {
+                    let _guard = group_flush_timer.guard();
+                    group_flush_records_in += group_buffer.len() as u64;
+                    let before = counters.ok_count;
+                    Self::flush_correlated_group_single_output(
+                        &mut group_buffer,
+                        config,
+                        primary_output,
+                        input,
+                        pipeline_start_time,
+                        &transform_names,
+                        &mut evaluators,
+                        params,
+                        strategy,
+                        &mut counters,
+                        &mut dlq_entries,
+                        &mut *csv_writer,
+                        max_group_buffer,
+                    )?;
+                    group_flush_records_out += counters.ok_count - before;
+                }
 
                 csv_writer.flush()?;
 
@@ -1899,6 +1946,11 @@ impl PipelineExecutor {
                 );
                 write_metrics.bytes_written = csv_writer.bytes_written();
                 collector.record(write_metrics);
+                collector.record(group_flush_timer.finish(
+                    stage_metrics::StageName::GroupFlush,
+                    group_flush_records_in,
+                    group_flush_records_out,
+                ));
             }
 
             return Ok((counters, dlq_entries, rss_bytes()));
@@ -5318,6 +5370,134 @@ transformations:
         assert!(
             result.is_err(),
             "invalid CXL should produce compilation error"
+        );
+    }
+
+    #[test]
+    fn test_correlated_pipeline_has_sort_and_group_flush_stages() {
+        let yaml = r#"
+pipeline:
+  name: correlated_test
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+transformations:
+  - name: validate
+    cxl: |
+      emit emp_id = employee_id
+      emit val = value
+outputs:
+  - name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+        let csv_input = "employee_id,value\nA,1\nA,2\nB,3\n";
+        let (report, _output) = run_correlated_test_report(yaml, csv_input).unwrap();
+        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
+        assert!(
+            stage_names.iter().any(|n| n == "Sort"),
+            "correlated pipeline should have Sort stage, got: {stage_names:?}"
+        );
+        assert!(
+            stage_names.iter().any(|n| n == "GroupFlush"),
+            "correlated pipeline should have GroupFlush stage, got: {stage_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_stage_count_streaming_mode() {
+        let yaml = r#"
+pipeline:
+  name: streaming_test
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: passthrough
+    cxl: |
+      emit x = name
+"#;
+        let csv_input = "name\nAlice\nBob\n";
+        let (report, _output) = run_test_report(yaml, csv_input).unwrap();
+        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
+        assert_eq!(
+            stage_names.len(),
+            6,
+            "streaming pipeline should have 6 stages (ReaderInit + Compile + SchemaScan + TransformEval + Projection + Write), got: {stage_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_stage_count_two_pass_mode() {
+        let yaml = r#"
+pipeline:
+  name: two_pass_test
+inputs:
+  - name: primary
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: window_transform
+    cxl: |
+      emit dept_total = $window.sum(amount)
+    local_window:
+      group_by: [dept]
+"#;
+        let csv_input = "dept,amount\nA,10\nA,20\nB,30\n";
+        let (report, _output) = run_test_report(yaml, csv_input).unwrap();
+        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
+        assert!(
+            stage_names.len() >= 8,
+            "two-pass pipeline should have >= 8 stages, got {}: {stage_names:?}",
+            stage_names.len()
+        );
+    }
+
+    #[test]
+    fn test_empty_pipeline_stages_minimal() {
+        let yaml = r#"
+pipeline:
+  name: empty_test
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: passthrough
+    cxl: |
+      emit x = name
+"#;
+        let csv_input = "name\n";
+        let (report, _output) = run_test_report(yaml, csv_input).unwrap();
+        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
+        assert!(
+            stage_names.iter().any(|n| n == "ReaderInit"),
+            "empty pipeline should have ReaderInit stage, got: {stage_names:?}"
+        );
+        assert!(
+            stage_names.iter().any(|n| n == "Compile"),
+            "empty pipeline should have Compile stage, got: {stage_names:?}"
         );
     }
 }
