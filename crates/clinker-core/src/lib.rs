@@ -22,5 +22,7 @@ pub mod validation;
 #[cfg(test)]
 pub mod test_helpers;
 
+pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
+
 #[allow(unused_imports)]
 use clinker_record::{PipelineCounters, Record, RecordProvenance, Schema, Value};

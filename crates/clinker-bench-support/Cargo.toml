@@ -1,0 +1,13 @@
+[package]
+name = "clinker-bench-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared deterministic data generators for Clinker benchmarks"
+
+[features]
+bench-alloc = []
+
+[dependencies]
+clinker-record = { workspace = true }
+fastrand = "2"

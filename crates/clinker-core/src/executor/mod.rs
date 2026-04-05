@@ -1,3 +1,5 @@
+pub mod stage_metrics;
+
 use std::collections::HashMap;
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::AtomicU32;
