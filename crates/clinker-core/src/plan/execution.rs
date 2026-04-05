@@ -174,6 +174,37 @@ impl ExecutionPlanDag {
         self.correlation_sort_note.is_some() && !self.required_arena()
     }
 
+    /// Whether the DAG has in-pipeline branching (Route nodes with outgoing
+    /// edges to Transform nodes, or Merge nodes).
+    ///
+    /// Route nodes for multi-output dispatch (no outgoing edges) do NOT
+    /// constitute branching — they're handled by the compiled_route path.
+    pub fn has_branching(&self) -> bool {
+        use petgraph::Direction;
+        // Check for Merge nodes (always branching)
+        if self
+            .graph
+            .node_weights()
+            .any(|n| matches!(n, PlanNode::Merge { .. }))
+        {
+            return true;
+        }
+        // Check for Route nodes with outgoing edges (in-pipeline branching)
+        for idx in self.graph.node_indices() {
+            if matches!(self.graph[idx], PlanNode::Route { .. }) {
+                let has_outgoing = self
+                    .graph
+                    .neighbors_directed(idx, Direction::Outgoing)
+                    .next()
+                    .is_some();
+                if has_outgoing {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Human-readable execution summary replacing `ExecutionMode` debug format.
     pub fn execution_summary(&self) -> String {
         if self.required_arena() {

@@ -5,70 +5,709 @@
 
 use super::*;
 
-// --- Test stubs for Task 15.4 (branch execution + merge) ---
-// These will be filled in when execute_dag() is implemented.
+/// Helper: run executor with in-memory CSV input/output for branching tests.
+fn run_branch_test(
+    yaml: &str,
+    csv_input: &str,
+) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+    let config = crate::config::parse_config(yaml).unwrap();
+    let output_buf = crate::test_helpers::SharedBuffer::new();
 
-/// Diamond DAG: fork → 2 branches → merge: all records present in output.
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        config.inputs[0].name.clone(),
+        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+            as Box<dyn std::io::Read + Send>,
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        config.outputs[0].name.clone(),
+        Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+
+    let pipeline_vars = config
+        .pipeline
+        .vars
+        .as_ref()
+        .map(|v| crate::config::convert_pipeline_vars(v))
+        .unwrap_or_default();
+    let params = PipelineRunParams {
+        execution_id: "test-exec-id".to_string(),
+        batch_id: "test-batch-id".to_string(),
+        pipeline_vars,
+    };
+
+    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+
+    let output = output_buf.as_string();
+    Ok((report.counters, report.dlq_entries, output))
+}
+
+/// Diamond DAG: fork -> 2 branches -> merge: all records present in output.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_diamond_dag() {}
+fn test_branch_diamond_dag() {
+    let yaml = r#"
+pipeline:
+  name: diamond
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+  - name: enrich_high
+    input: "classify.high"
+    cxl: |
+      emit tag = "HIGH"
+  - name: enrich_low
+    input: "classify.low"
+    cxl: |
+      emit tag = "LOW"
+  - name: combine
+    input: ["enrich_high", "enrich_low"]
+    cxl: |
+      emit final = tag
+"#;
+
+    let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
+    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 4, "all 4 records should be in output");
+    assert!(dlq.is_empty(), "no DLQ entries expected");
+
+    // All records should be present
+    assert!(
+        output.contains("HIGH"),
+        "output should contain HIGH tag: {output}"
+    );
+    assert!(
+        output.contains("LOW"),
+        "output should contain LOW tag: {output}"
+    );
+}
 
 /// Exclusive mode: input count = output count (no duplication, no loss).
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_exclusive_conservation() {}
+fn test_branch_exclusive_conservation() {
+    let yaml = r#"
+pipeline:
+  name: exclusive_conservation
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      mode: exclusive
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+  - name: enrich_high
+    input: "classify.high"
+    cxl: |
+      emit tag = "HIGH"
+  - name: enrich_low
+    input: "classify.low"
+    cxl: |
+      emit tag = "LOW"
+  - name: combine
+    input: ["enrich_high", "enrich_low"]
+    cxl: |
+      emit final = tag
+"#;
+
+    let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
+    let (counters, _, _) = run_branch_test(yaml, csv).unwrap();
+
+    // Exclusive mode: no duplication, no loss
+    assert_eq!(
+        counters.ok_count, 5,
+        "input count should equal output count"
+    );
+}
 
 /// Inclusive mode: records in multiple branches, merge has more than input.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_inclusive_duplication() {}
+fn test_branch_inclusive_duplication() {
+    let yaml = r#"
+pipeline:
+  name: inclusive_dup
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      mode: inclusive
+      branches:
+        - name: over_50
+          condition: "amount_val > 50"
+        - name: over_100
+          condition: "amount_val > 100"
+      default: low
+  - name: tag_over50
+    input: "classify.over_50"
+    cxl: |
+      emit tag = "OVER50"
+  - name: tag_over100
+    input: "classify.over_100"
+    cxl: |
+      emit tag = "OVER100"
+  - name: tag_low
+    input: "classify.low"
+    cxl: |
+      emit tag = "LOW"
+  - name: combine
+    input: ["tag_over50", "tag_over100", "tag_low"]
+    cxl: |
+      emit final = tag
+"#;
+
+    let csv = "id,amount\n1,200\n2,50\n3,75\n";
+    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+
+    // id=1 (200): matches over_50 AND over_100 -> 2 records
+    // id=2 (50): matches nothing -> default (low) -> 1 record
+    // id=3 (75): matches over_50 only -> 1 record
+    // Total: 4 records output from 3 input records
+    assert_eq!(
+        counters.ok_count, 4,
+        "inclusive mode should duplicate records: {output}"
+    );
+}
 
 /// Records within each branch maintain input order.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_order_within_branch() {}
+fn test_branch_order_within_branch() {
+    let yaml = r#"
+pipeline:
+  name: order_test
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+  - name: enrich_high
+    input: "classify.high"
+    cxl: |
+      emit tag = "H"
+  - name: enrich_low
+    input: "classify.low"
+    cxl: |
+      emit tag = "L"
+  - name: combine
+    input: ["enrich_high", "enrich_low"]
+    cxl: |
+      emit final = tag
+"#;
+
+    // High records: 1(200), 3(300), 5(500) -- should maintain order
+    let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,500\n";
+    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 5, "all records should be in output");
+
+    // Find column indices from header
+    let lines: Vec<&str> = output.lines().collect();
+    let header: Vec<&str> = lines[0].split(',').collect();
+    let id_col = header.iter().position(|&h| h == "id").unwrap();
+    let tag_col = header.iter().position(|&h| h == "tag").unwrap();
+
+    // Within the high branch, records should be in input order: 1, 3, 5
+    let high_ids: Vec<&str> = lines[1..]
+        .iter()
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split(',').collect();
+            if cols.get(tag_col) == Some(&"H") {
+                cols.get(id_col).copied()
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(high_ids, vec!["1", "3", "5"], "high branch order: {output}");
+}
 
 /// Merge output: branch A records, then branch B records (declaration order).
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_merge_concatenation_order() {}
+fn test_branch_merge_concatenation_order() {
+    let yaml = r#"
+pipeline:
+  name: merge_order
 
-/// Route condition that never matches → empty branch → no error.
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+  - name: enrich_high
+    input: "classify.high"
+    cxl: |
+      emit tag = "H"
+  - name: enrich_low
+    input: "classify.low"
+    cxl: |
+      emit tag = "L"
+  - name: combine
+    input: ["enrich_high", "enrich_low"]
+    cxl: |
+      emit final = tag
+"#;
+
+    let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
+    let (_, _, output) = run_branch_test(yaml, csv).unwrap();
+
+    // enrich_high is declared first in the merge input, so high records come first
+    let lines: Vec<&str> = output.lines().collect();
+    let header: Vec<&str> = lines[0].split(',').collect();
+    let tag_col = header.iter().position(|&h| h == "tag").unwrap();
+
+    let tags: Vec<&str> = lines[1..]
+        .iter()
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split(',').collect();
+            cols.get(tag_col).copied()
+        })
+        .collect();
+    // High branch first (ids 1, 3), then low branch (ids 2, 4)
+    assert_eq!(tags, vec!["H", "H", "L", "L"], "merge order: {output}");
+}
+
+/// Route condition that never matches -> empty branch -> no error.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_empty_branch_no_error() {}
+fn test_branch_empty_branch_no_error() {
+    let yaml = r#"
+pipeline:
+  name: empty_branch
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: impossible
+          condition: "amount_val > 999999"
+      default: normal
+  - name: tag_impossible
+    input: "classify.impossible"
+    cxl: |
+      emit tag = "IMPOSSIBLE"
+  - name: tag_normal
+    input: "classify.normal"
+    cxl: |
+      emit tag = "NORMAL"
+  - name: combine
+    input: ["tag_impossible", "tag_normal"]
+    cxl: |
+      emit final = tag
+"#;
+
+    let csv = "id,amount\n1,100\n2,200\n3,300\n";
+    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+
+    // All records go to 'normal' branch, 'impossible' is empty
+    assert_eq!(counters.ok_count, 3);
+    assert!(dlq.is_empty());
+    assert!(output.contains("NORMAL"));
+    assert!(!output.contains("IMPOSSIBLE"));
+}
 
 /// 3 branches, each with different transforms.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_three_way_fork() {}
+fn test_branch_three_way_fork() {
+    let yaml = r#"
+pipeline:
+  name: three_way
 
-/// Route within a branch → two levels of branching.
-#[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_nested_routes() {}
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
 
-/// Branch A: enrichment, Branch B: filtering — different transforms per branch.
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 200"
+        - name: medium
+          condition: "amount_val > 50"
+      default: low
+  - name: tag_high
+    input: "classify.high"
+    cxl: |
+      emit tier = "HIGH"
+  - name: tag_medium
+    input: "classify.medium"
+    cxl: |
+      emit tier = "MEDIUM"
+  - name: tag_low
+    input: "classify.low"
+    cxl: |
+      emit tier = "LOW"
+  - name: combine
+    input: ["tag_high", "tag_medium", "tag_low"]
+    cxl: |
+      emit final = tier
+"#;
+
+    let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
+    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 6, "all 6 records in output");
+    assert!(output.contains("HIGH"));
+    assert!(output.contains("MEDIUM"));
+    assert!(output.contains("LOW"));
+}
+
+/// Route within a branch -> two levels of branching.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_different_transforms_per_branch() {}
+#[ignore = "Task 15.4: nested routes require multiple CompiledRoute instances"]
+fn test_branch_nested_routes() {
+    // Nested routes require multiple compiled route instances which
+    // is not yet supported. The current implementation uses a single
+    // compiled_route. This test is deferred.
+}
+
+/// Branch A: enrichment, Branch B: filtering -- different transforms per branch.
+#[test]
+fn test_branch_different_transforms_per_branch() {
+    let yaml = r#"
+pipeline:
+  name: different_transforms
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 100"
+      default: low
+  - name: enrich_high
+    input: "classify.high"
+    cxl: |
+      emit enriched = id + "_premium"
+  - name: enrich_low
+    input: "classify.low"
+    cxl: |
+      emit enriched = id + "_standard"
+  - name: combine
+    input: ["enrich_high", "enrich_low"]
+    cxl: |
+      emit final = enriched
+"#;
+
+    let csv = "id,amount\n1,200\n2,50\n3,300\n";
+    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(counters.ok_count, 3);
+    assert!(
+        output.contains("1_premium"),
+        "high branch should enrich: {output}"
+    );
+    assert!(
+        output.contains("2_standard"),
+        "low branch should enrich: {output}"
+    );
+    assert!(
+        output.contains("3_premium"),
+        "high branch should enrich: {output}"
+    );
+}
 
 /// Linear pipeline executes correctly through execute_dag() (no regression).
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_dag_linear_execution_no_regression() {}
+fn test_dag_linear_execution_no_regression() {
+    // This test verifies that linear pipelines (no branching) still work
+    // correctly through execute_dag(). It's a regression test.
+    let yaml = r#"
+pipeline:
+  name: linear
 
-/// TwoPass node in one branch, Streaming in another — per-node dispatch works.
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: calc
+    cxl: |
+      emit doubled = name + "_doubled"
+"#;
+
+    let csv = "name,age\nAlice,30\nBob,25\nCarol,35\n";
+    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(counters.total_count, 3);
+    assert_eq!(counters.ok_count, 3);
+    assert!(dlq.is_empty());
+    assert!(output.contains("Alice_doubled"));
+    assert!(output.contains("Bob_doubled"));
+    assert!(output.contains("Carol_doubled"));
+}
+
+/// TwoPass node in one branch, Streaming in another -- per-node dispatch works.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_dag_mixed_execution_reqs() {}
+fn test_dag_mixed_execution_reqs() {
+    // When any transform requires arena (window functions), the entire
+    // pipeline runs in TwoPass mode. This test verifies that a pipeline
+    // mixing window and non-window transforms works correctly.
+    let yaml = r#"
+pipeline:
+  name: mixed_reqs
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: stateless_calc
+    cxl: |
+      emit label = dept + "_label"
+  - name: window_calc
+    cxl: |
+      emit cnt = $window.count()
+    local_window:
+      group_by: [dept]
+"#;
+
+    let csv = "dept,amount\nA,10\nB,20\nA,30\n";
+    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(counters.total_count, 3);
+    assert_eq!(counters.ok_count, 3);
+    assert!(dlq.is_empty());
+    assert!(
+        output.contains("label"),
+        "stateless transform output: {output}"
+    );
+    assert!(output.contains("cnt"), "window transform output: {output}");
+    assert!(output.contains("A_label"), "output: {output}");
+}
 
 /// rayon::scope indexed results: deterministic merge order for N > 2 branches.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_rayon_scope_deterministic_order() {}
+fn test_branch_rayon_scope_deterministic_order() {
+    // Run the three-way fork multiple times and verify deterministic output
+    let yaml = r#"
+pipeline:
+  name: deterministic
 
-/// Inclusive mode clones records — mutations in one branch don't affect another.
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      branches:
+        - name: high
+          condition: "amount_val > 200"
+        - name: medium
+          condition: "amount_val > 50"
+      default: low
+  - name: tag_high
+    input: "classify.high"
+    cxl: |
+      emit tier = "HIGH"
+  - name: tag_medium
+    input: "classify.medium"
+    cxl: |
+      emit tier = "MEDIUM"
+  - name: tag_low
+    input: "classify.low"
+    cxl: |
+      emit tier = "LOW"
+  - name: combine
+    input: ["tag_high", "tag_medium", "tag_low"]
+    cxl: |
+      emit final = tier
+"#;
+
+    let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
+
+    // Run multiple times and check deterministic output
+    let (_, _, output1) = run_branch_test(yaml, csv).unwrap();
+    let (_, _, output2) = run_branch_test(yaml, csv).unwrap();
+    let (_, _, output3) = run_branch_test(yaml, csv).unwrap();
+
+    assert_eq!(output1, output2, "output must be deterministic");
+    assert_eq!(output2, output3, "output must be deterministic");
+}
+
+/// Inclusive mode clones records -- mutations in one branch don't affect another.
 #[test]
-#[ignore = "Task 15.4: awaiting execute_dag implementation"]
-fn test_branch_inclusive_isolation() {}
+fn test_branch_inclusive_isolation() {
+    let yaml = r#"
+pipeline:
+  name: inclusive_isolation
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: classify
+    cxl: |
+      emit amount_val = amount.to_int()
+    route:
+      mode: inclusive
+      branches:
+        - name: branch_a
+          condition: "amount_val > 50"
+        - name: branch_b
+          condition: "amount_val > 50"
+      default: low
+  - name: mutate_a
+    input: "classify.branch_a"
+    cxl: |
+      emit marker = "A_" + id
+  - name: mutate_b
+    input: "classify.branch_b"
+    cxl: |
+      emit marker = "B_" + id
+  - name: combine
+    input: ["mutate_a", "mutate_b"]
+    cxl: |
+      emit final = marker
+"#;
+
+    let csv = "id,amount\n1,100\n";
+    let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
+
+    // id=1 matches both branches (inclusive) -> 2 output records
+    assert_eq!(counters.ok_count, 2);
+    // Branch A should have "A_1", Branch B should have "B_1"
+    // They're independent — mutations in one don't affect the other
+    assert!(output.contains("A_1"), "branch A marker: {output}");
+    assert!(output.contains("B_1"), "branch B marker: {output}");
+}

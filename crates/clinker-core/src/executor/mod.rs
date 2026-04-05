@@ -14,7 +14,7 @@ use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
 use crate::pipeline::memory::{MemoryBudget, rss_bytes};
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
-use crate::plan::execution::{ExecutionPlanDag, ParallelismClass};
+use crate::plan::execution::{ExecutionPlanDag, ParallelismClass, PlanNode};
 use crate::projection::{project_output, project_output_with_meta};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
@@ -23,6 +23,7 @@ use clinker_format::traits::{FormatReader, FormatWriter};
 use cxl::ast::Statement;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
+use petgraph::Direction;
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
 pub struct PipelineRunParams {
@@ -548,36 +549,16 @@ impl PipelineExecutor {
             }
         }
 
-        let (counters, dlq_entries, peak_rss_bytes) = if required_arena {
-            Self::execute_two_pass(
-                config,
-                csv_reader,
-                writers,
-                &compiled_transforms,
-                compiled_route,
-                &plan,
-                params,
-            )?
-        } else if required_sorted_input {
-            Self::execute_correlated_streaming(
-                config,
-                csv_reader,
-                writers,
-                &compiled_transforms,
-                compiled_route,
-                params,
-                effective_sort_order.as_deref(),
-            )?
-        } else {
-            Self::execute_streaming(
-                config,
-                csv_reader,
-                writers,
-                &compiled_transforms,
-                compiled_route,
-                params,
-            )?
-        };
+        let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
+            config,
+            csv_reader,
+            writers,
+            &compiled_transforms,
+            compiled_route,
+            &plan,
+            params,
+            effective_sort_order.as_deref(),
+        )?;
 
         Ok(ExecutionReport {
             counters,
@@ -589,752 +570,6 @@ impl PipelineExecutor {
             started_at,
             finished_at: Utc::now(),
         })
-    }
-
-    /// Single-pass streaming execution (no windows).
-    ///
-    /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
-    fn execute_streaming<R: Read + Send>(
-        config: &PipelineConfig,
-        mut csv_reader: CsvReader<R>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
-        transforms: &[CompiledTransform],
-        compiled_route: Option<CompiledRoute>,
-        params: &PipelineRunParams,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let input = &config.inputs[0];
-        let primary_output = &config.outputs[0];
-        let pipeline_start_time = chrono::Local::now().naive_local();
-
-        let mut counters = PipelineCounters::default();
-        let mut dlq_entries = Vec::new();
-        let strategy = config.error_handling.strategy;
-        let mut evaluators = build_evaluators(transforms);
-        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
-
-        let is_multi_output = compiled_route.is_some() && writers.len() > 1;
-        let mut compiled_route = compiled_route;
-
-        // Scan forward until a record emits, to derive the output schema.
-        let schema = csv_reader.schema()?;
-        let mut row_num: u64 = 0;
-        #[allow(clippy::type_complexity)]
-        let mut first_emitted: Option<(
-            Record,
-            IndexMap<String, Value>,
-            IndexMap<String, Value>,
-        )> = None;
-        #[allow(clippy::type_complexity)]
-        let mut pending_skips_and_errors: Vec<(
-            u64,
-            Record,
-            Result<EvalResult, (String, cxl::eval::EvalError)>,
-        )> = Vec::new();
-
-        while let Some(record) = csv_reader.next_record()? {
-            row_num += 1;
-            counters.total_count += 1;
-            let ctx = build_eval_context(
-                config,
-                &input.path,
-                row_num,
-                pipeline_start_time,
-                &params.execution_id,
-                &params.batch_id,
-                &params.pipeline_vars,
-            );
-            let result = evaluate_record(&record, &transform_names, &mut evaluators, &ctx);
-            match &result {
-                Ok(EvalResult::Emit {
-                    fields: emitted,
-                    metadata,
-                }) => {
-                    counters.ok_count += 1;
-                    first_emitted = Some((record, emitted.clone(), metadata.clone()));
-                    break;
-                }
-                Ok(EvalResult::Skip(_)) | Err(_) => {
-                    pending_skips_and_errors.push((row_num, record, result));
-                }
-            }
-        }
-
-        // Derive output schema from first emitted record
-        let output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted {
-            let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
-            Arc::clone(projected.schema())
-        } else {
-            schema
-        };
-
-        if is_multi_output {
-            // --- Multi-output path: spawn writer threads ---
-            let output_channels =
-                spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
-
-            // Process pending skips/errors (no writes needed — they were filtered/errored)
-            for (_rn, _record, result) in &pending_skips_and_errors {
-                match result {
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
-                    Err((transform_name, eval_err)) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            // Drop channels to signal writer threads to stop
-                            drop(output_channels);
-                            return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                span: eval_err.span,
-                                kind: eval_err.kind.clone(),
-                            }));
-                        }
-                        counters.dlq_count += 1;
-                        dlq_entries.push(DlqEntry {
-                            source_row: _rn.to_owned(),
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: eval_err.to_string(),
-                            original_record: _record.clone(),
-                            stage: Some(DlqEntry::stage_transform(transform_name)),
-                            route: None,
-                            trigger: true,
-                        });
-                    }
-                }
-            }
-
-            // Dispatch first emitted record
-            if let Some((record, emitted, metadata)) = first_emitted {
-                let route = compiled_route.as_mut().unwrap();
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    1, // first emitted row
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
-                match route.evaluate(&emitted, &metadata, &ctx) {
-                    Ok(targets) => {
-                        let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                        for target in &targets {
-                            let out_cfg = config
-                                .outputs
-                                .iter()
-                                .find(|o| o.name == *target)
-                                .unwrap_or(primary_output);
-                            let projected =
-                                project_output_with_meta(&record, &emitted, &metadata, out_cfg);
-                            per_output_batches
-                                .entry(target.clone())
-                                .or_default()
-                                .push(projected);
-                        }
-                        flush_output_batches(&mut per_output_batches, &output_channels)?;
-                    }
-                    Err(route_err) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            drop(output_channels);
-                            return Err(route_err.into());
-                        }
-                        counters.dlq_count += 1;
-                        counters.ok_count = counters.ok_count.saturating_sub(1);
-                        dlq_entries.push(DlqEntry {
-                            source_row: 1,
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: route_err.to_string(),
-                            original_record: record,
-                            stage: Some(DlqEntry::stage_route_eval()),
-                            route: None,
-                            trigger: true,
-                        });
-                    }
-                }
-            }
-
-            // Process remaining records
-            let route = compiled_route.as_mut().unwrap();
-            let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-            while let Some(record) = csv_reader.next_record()? {
-                row_num += 1;
-                counters.total_count += 1;
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    row_num,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
-                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => match route.evaluate(&emitted, &metadata, &ctx) {
-                        Ok(targets) => {
-                            for target in &targets {
-                                let out_cfg = config
-                                    .outputs
-                                    .iter()
-                                    .find(|o| o.name == *target)
-                                    .unwrap_or(primary_output);
-                                let projected =
-                                    project_output_with_meta(&record, &emitted, &metadata, out_cfg);
-                                per_output_batches
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .push(projected);
-                            }
-                            counters.ok_count += 1;
-                        }
-                        Err(route_err) => {
-                            if strategy == ErrorStrategy::FailFast {
-                                drop(output_channels);
-                                return Err(route_err.into());
-                            }
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: row_num,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: route_err.to_string(),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_route_eval()),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
-                    },
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Err((transform_name, eval_err)) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            drop(output_channels);
-                            return Err(eval_err.into());
-                        }
-                        counters.dlq_count += 1;
-                        dlq_entries.push(DlqEntry {
-                            source_row: row_num,
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: eval_err.to_string(),
-                            original_record: record,
-                            stage: Some(DlqEntry::stage_transform(&transform_name)),
-                            route: None,
-                            trigger: true,
-                        });
-                    }
-                }
-
-                // Flush batches periodically (every record in streaming — batches
-                // are small; the channel's bounded capacity provides backpressure)
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
-            }
-
-            // Final flush
-            flush_output_batches(&mut per_output_batches, &output_channels)?;
-
-            // Join writer threads
-            join_writer_threads(output_channels)?;
-        } else {
-            // --- Single-output path: direct write, no channel overhead ---
-            let output = primary_output;
-            let writer_config = build_writer_config(output);
-            let raw_writer = writers
-                .into_iter()
-                .next()
-                .map(|(_, w)| w)
-                .expect("validated above");
-
-            let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
-                let policy = build_split_policy(split);
-                let output_path = output.path.clone();
-                let naming = split.naming.clone();
-                let schema = Arc::clone(&output_schema);
-                let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                    let path = apply_split_naming(&output_path, &naming, seq);
-                    let file = std::fs::File::create(path)?;
-                    Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                };
-                drop(raw_writer);
-                Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-            } else {
-                let writer = BufWriter::with_capacity(65536, raw_writer);
-                Box::new(CsvWriter::new(
-                    writer,
-                    Arc::clone(&output_schema),
-                    writer_config,
-                ))
-            };
-
-            // Process pending skips and errors from the scan-forward phase
-            for (rn, record, result) in pending_skips_and_errors {
-                match result {
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
-                    Err((transform_name, eval_err)) => {
-                        handle_error(
-                            strategy,
-                            &record,
-                            rn,
-                            &eval_err,
-                            Some(DlqEntry::stage_transform(&transform_name)),
-                            None,
-                            &mut counters,
-                            &mut dlq_entries,
-                            output,
-                            &output_schema,
-                            &mut *csv_writer,
-                        )?;
-                    }
-                }
-            }
-
-            // Write the first emitted record
-            if let Some((record, emitted, metadata)) = first_emitted {
-                let projected = project_output_with_meta(&record, &emitted, &metadata, output);
-                csv_writer.write_record(&projected)?;
-            }
-
-            // Process remaining records
-            while let Some(record) = csv_reader.next_record()? {
-                row_num += 1;
-                counters.total_count += 1;
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    row_num,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
-                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
-                        let projected =
-                            project_output_with_meta(&record, &emitted, &metadata, output);
-                        csv_writer.write_record(&projected)?;
-                        counters.ok_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Err((transform_name, eval_err)) => {
-                        handle_error(
-                            strategy,
-                            &record,
-                            row_num,
-                            &eval_err,
-                            Some(DlqEntry::stage_transform(&transform_name)),
-                            None,
-                            &mut counters,
-                            &mut dlq_entries,
-                            output,
-                            &output_schema,
-                            &mut *csv_writer,
-                        )?;
-                    }
-                }
-            }
-
-            csv_writer.flush()?;
-        }
-
-        Ok((counters, dlq_entries, rss_bytes()))
-    }
-
-    /// Correlated streaming execution: sort → group-boundary detection → batch eval → DLQ/emit.
-    ///
-    /// Reads all records, sorts by effective sort order (correlation key + user sort),
-    /// then processes groups atomically: if any record in a group fails, the entire
-    /// group is DLQ'd.
-    fn execute_correlated_streaming<R: Read + Send>(
-        config: &PipelineConfig,
-        mut csv_reader: CsvReader<R>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
-        transforms: &[CompiledTransform],
-        compiled_route: Option<CompiledRoute>,
-        params: &PipelineRunParams,
-        effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let input = &config.inputs[0];
-        let primary_output = &config.outputs[0];
-        let pipeline_start_time = chrono::Local::now().naive_local();
-        let correlation_key = config
-            .error_handling
-            .correlation_key
-            .as_ref()
-            .expect("SortedStreaming requires correlation_key");
-        let max_group_buffer = config.error_handling.max_group_buffer.unwrap_or(100_000);
-
-        let mut counters = PipelineCounters::default();
-        let mut dlq_entries: Vec<DlqEntry> = Vec::new();
-        let strategy = config.error_handling.strategy;
-
-        // Phase 1: Read all records into memory
-        let schema = csv_reader.schema()?;
-        let mut all_records: Vec<(Record, u64)> = Vec::new();
-        let mut row_num: u64 = 0;
-        while let Some(record) = csv_reader.next_record()? {
-            row_num += 1;
-            counters.total_count += 1;
-            all_records.push((record, row_num));
-        }
-
-        if all_records.is_empty() {
-            return Ok((counters, dlq_entries, rss_bytes()));
-        }
-
-        // Phase 2: Sort by effective sort order if injection was needed
-        if let Some(sort_specs) = effective_sort_order {
-            let sort_fields: Vec<crate::config::SortField> = sort_specs
-                .iter()
-                .map(|s| s.clone().into_sort_field())
-                .collect();
-            all_records
-                .sort_by(|(a, _), (b, _)| sort::compare_records_by_fields(a, b, &sort_fields));
-        }
-
-        // Phase 3: Scan forward for first emitting record to derive output schema
-        let mut evaluators = build_evaluators(transforms);
-        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
-        let is_multi_output = compiled_route.is_some() && writers.len() > 1;
-        let mut compiled_route = compiled_route;
-
-        // Find first emitting record for schema derivation
-        let mut first_emitted_schema: Option<Arc<Schema>> = None;
-        for (record, rn) in &all_records {
-            let ctx = build_eval_context(
-                config,
-                &input.path,
-                *rn,
-                pipeline_start_time,
-                &params.execution_id,
-                &params.batch_id,
-                &params.pipeline_vars,
-            );
-            if let Ok(EvalResult::Emit {
-                fields: emitted, ..
-            }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
-            {
-                let projected = project_output(record, &emitted, primary_output);
-                first_emitted_schema = Some(Arc::clone(projected.schema()));
-                break;
-            }
-        }
-
-        let output_schema = first_emitted_schema.unwrap_or(schema);
-
-        // Re-create evaluators (they were consumed during schema derivation scan)
-        let mut evaluators = build_evaluators(transforms);
-
-        // Phase 4: Spawn writer threads
-        if is_multi_output {
-            let output_channels =
-                spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
-
-            // Group-boundary streaming loop
-            let mut group_buffer: Vec<(Record, u64)> = Vec::new();
-            let mut current_key: Option<Vec<GroupByKey>> = None;
-            let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-
-            for (record, rn) in all_records {
-                let key = extract_correlation_key(&record, correlation_key);
-                let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
-
-                if is_null_key {
-                    // Null key → individual (group of one)
-                    let ctx = build_eval_context(
-                        config,
-                        &input.path,
-                        rn,
-                        pipeline_start_time,
-                        &params.execution_id,
-                        &params.batch_id,
-                        &params.pipeline_vars,
-                    );
-                    match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
-                        Ok(EvalResult::Emit {
-                            fields: emitted,
-                            metadata,
-                        }) => {
-                            Self::dispatch_to_outputs(
-                                &record,
-                                &emitted,
-                                &metadata,
-                                config,
-                                primary_output,
-                                compiled_route.as_mut(),
-                                &ctx,
-                                &mut counters,
-                                &mut dlq_entries,
-                                &mut per_output_batches,
-                                strategy,
-                                rn,
-                            );
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                            counters.filtered_count += 1;
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                            counters.distinct_count += 1;
-                        }
-                        Err((transform_name, eval_err)) => {
-                            if strategy == ErrorStrategy::FailFast {
-                                drop(output_channels);
-                                return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                    span: eval_err.span,
-                                    kind: eval_err.kind.clone(),
-                                }));
-                            }
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: eval_err.to_string(),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_transform(&transform_name)),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
-                    }
-                    continue;
-                }
-
-                // Check group boundary
-                if current_key.as_ref() != Some(&key) {
-                    // Flush previous group
-                    Self::flush_correlated_group(
-                        &mut group_buffer,
-                        config,
-                        primary_output,
-                        input,
-                        pipeline_start_time,
-                        &transform_names,
-                        &mut evaluators,
-                        compiled_route.as_mut(),
-                        params,
-                        strategy,
-                        &mut counters,
-                        &mut dlq_entries,
-                        &mut per_output_batches,
-                        max_group_buffer,
-                    );
-                    current_key = Some(key);
-                }
-
-                // Check max_group_buffer
-                if group_buffer.len() as u64 >= max_group_buffer {
-                    // Exceeds buffer cap — DLQ everything in the group including this record
-                    group_buffer.push((record, rn));
-                    for (rec, rec_rn) in group_buffer.drain(..) {
-                        counters.dlq_count += 1;
-                        dlq_entries.push(DlqEntry {
-                            source_row: rec_rn,
-                            category: crate::dlq::DlqErrorCategory::ValidationFailure,
-                            error_message:
-                                "group_size_exceeded: correlation group exceeded max_group_buffer"
-                                    .to_string(),
-                            original_record: rec,
-                            stage: Some("transform:correlated_dlq".to_string()),
-                            route: None,
-                            trigger: false,
-                        });
-                    }
-                    // Skip remaining records in this group
-                    // (they'll be caught by the key boundary check above)
-                    current_key = None; // Reset so next record starts a fresh group
-                    continue;
-                }
-
-                group_buffer.push((record, rn));
-            }
-
-            // Flush final group
-            Self::flush_correlated_group(
-                &mut group_buffer,
-                config,
-                primary_output,
-                input,
-                pipeline_start_time,
-                &transform_names,
-                &mut evaluators,
-                compiled_route.as_mut(),
-                params,
-                strategy,
-                &mut counters,
-                &mut dlq_entries,
-                &mut per_output_batches,
-                max_group_buffer,
-            );
-
-            flush_output_batches(&mut per_output_batches, &output_channels)?;
-            drop(output_channels);
-        } else {
-            // Single-output path
-            let writer_config = build_writer_config(primary_output);
-            let raw_writer = writers
-                .into_iter()
-                .next()
-                .map(|(_, w)| w)
-                .expect("at least one writer");
-
-            let mut csv_writer: Box<dyn FormatWriter> =
-                if let Some(ref split) = primary_output.split {
-                    let policy = build_split_policy(split);
-                    let output_path = primary_output.path.clone();
-                    let naming = split.naming.clone();
-                    let schema = Arc::clone(&output_schema);
-                    let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                        let path = apply_split_naming(&output_path, &naming, seq);
-                        let file = std::fs::File::create(path)?;
-                        Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                    };
-                    drop(raw_writer);
-                    Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-                } else {
-                    let buf_writer = BufWriter::with_capacity(65536, raw_writer);
-                    Box::new(CsvWriter::new(
-                        buf_writer,
-                        Arc::clone(&output_schema),
-                        writer_config,
-                    ))
-                };
-
-            // Group-boundary streaming loop (single output)
-            let mut group_buffer: Vec<(Record, u64)> = Vec::new();
-            let mut current_key: Option<Vec<GroupByKey>> = None;
-
-            for (record, rn) in all_records {
-                let key = extract_correlation_key(&record, correlation_key);
-                let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
-
-                if is_null_key {
-                    let ctx = build_eval_context(
-                        config,
-                        &input.path,
-                        rn,
-                        pipeline_start_time,
-                        &params.execution_id,
-                        &params.batch_id,
-                        &params.pipeline_vars,
-                    );
-                    match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
-                        Ok(EvalResult::Emit {
-                            fields: emitted, ..
-                        }) => {
-                            let projected = project_output(&record, &emitted, primary_output);
-                            csv_writer.write_record(&projected)?;
-                            counters.ok_count += 1;
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                            counters.filtered_count += 1;
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                            counters.distinct_count += 1;
-                        }
-                        Err((transform_name, eval_err)) => {
-                            if strategy == ErrorStrategy::FailFast {
-                                return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                    span: eval_err.span,
-                                    kind: eval_err.kind.clone(),
-                                }));
-                            }
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: eval_err.to_string(),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_transform(&transform_name)),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
-                    }
-                    continue;
-                }
-
-                if current_key.as_ref() != Some(&key) {
-                    Self::flush_correlated_group_single_output(
-                        &mut group_buffer,
-                        config,
-                        primary_output,
-                        input,
-                        pipeline_start_time,
-                        &transform_names,
-                        &mut evaluators,
-                        params,
-                        strategy,
-                        &mut counters,
-                        &mut dlq_entries,
-                        &mut *csv_writer,
-                        max_group_buffer,
-                    )?;
-                    current_key = Some(key);
-                }
-
-                if group_buffer.len() as u64 >= max_group_buffer {
-                    group_buffer.push((record, rn));
-                    for (rec, rec_rn) in group_buffer.drain(..) {
-                        counters.dlq_count += 1;
-                        dlq_entries.push(DlqEntry {
-                            source_row: rec_rn,
-                            category: crate::dlq::DlqErrorCategory::ValidationFailure,
-                            error_message:
-                                "group_size_exceeded: correlation group exceeded max_group_buffer"
-                                    .to_string(),
-                            original_record: rec,
-                            stage: Some("transform:correlated_dlq".to_string()),
-                            route: None,
-                            trigger: false,
-                        });
-                    }
-                    current_key = None;
-                    continue;
-                }
-
-                group_buffer.push((record, rn));
-            }
-
-            Self::flush_correlated_group_single_output(
-                &mut group_buffer,
-                config,
-                primary_output,
-                input,
-                pipeline_start_time,
-                &transform_names,
-                &mut evaluators,
-                params,
-                strategy,
-                &mut counters,
-                &mut dlq_entries,
-                &mut *csv_writer,
-                max_group_buffer,
-            )?;
-
-            csv_writer.flush()?;
-        }
-
-        Ok((counters, dlq_entries, rss_bytes()))
     }
 
     /// Flush a buffered correlation group: evaluate all records, DLQ entire group if any fails.
@@ -1655,11 +890,18 @@ impl PipelineExecutor {
         }
     }
 
-    /// Two-pass execution: Phase 1 → 1.5 → Phase 2 → Phase 3.
+    /// Single DAG-driven execution entry point — replaces execute_streaming,
+    /// execute_two_pass, and execute_correlated_streaming.
     ///
-    /// Returns `(counters, dlq_entries, peak_rss_bytes)`. Peak RSS is sampled
-    /// via [`MemoryBudget::observe`] at each chunk boundary.
-    fn execute_two_pass<R: Read + Send>(
+    /// Walks the DAG in topological order and dispatches per-node based on
+    /// `NodeExecutionReqs`. Handles all three execution modes internally:
+    /// 1. RequiresArena → build Arena + indices first, then walk DAG with window context
+    /// 2. RequiresSortedInput → read all, sort, then walk DAG with group-boundary logic
+    /// 3. Streaming → read all, walk DAG with per-record evaluation
+    ///
+    /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_dag<R: Read + Send>(
         config: &PipelineConfig,
         mut csv_reader: CsvReader<R>,
         writers: HashMap<String, Box<dyn Write + Send>>,
@@ -1667,229 +909,942 @@ impl PipelineExecutor {
         compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
+        effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
         let primary_output = &config.outputs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
+        let mut counters = PipelineCounters::default();
+        let mut dlq_entries: Vec<DlqEntry> = Vec::new();
+        let strategy = config.error_handling.strategy;
         let is_multi_output = compiled_route.is_some() && writers.len() > 1;
         let mut compiled_route = compiled_route;
 
-        // Phase 1: Build Arena from primary source
-        let arena_fields =
-            crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
-        let memory_limit = parse_memory_limit(config);
-        let arena = Arena::build(&mut csv_reader, &arena_fields, memory_limit).map_err(|e| {
-            PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![e.to_string()],
+        let requires_arena = plan.required_arena();
+        let requires_sorted_input = plan.required_sorted_input();
+
+        // ── Phase 0+1: Read source and optionally build Arena ──
+
+        if requires_arena {
+            // TwoPass path: build Arena + indices, chunk-based evaluation
+            let arena_fields =
+                crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
+            let memory_limit = parse_memory_limit(config);
+            let arena =
+                Arena::build(&mut csv_reader, &arena_fields, memory_limit).map_err(|e| {
+                    PipelineError::Compilation {
+                        transform_name: String::new(),
+                        messages: vec![e.to_string()],
+                    }
+                })?;
+
+            let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
+                .schema_overrides
+                .as_ref()
+                .map(|overrides| {
+                    overrides
+                        .iter()
+                        .map(|o| (o.name.clone(), o.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut indices: Vec<SecondaryIndex> = Vec::new();
+            for spec in &plan.indices_to_build {
+                let idx =
+                    SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
+                        PipelineError::Compilation {
+                            transform_name: String::new(),
+                            messages: vec![e.to_string()],
+                        }
+                    })?;
+                indices.push(idx);
             }
-        })?;
 
-        // Phase 1: Build SecondaryIndices
-        let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
-            .schema_overrides
-            .as_ref()
-            .map(|overrides| {
-                overrides
-                    .iter()
-                    .map(|o| (o.name.clone(), o.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut indices: Vec<SecondaryIndex> = Vec::new();
-        for spec in &plan.indices_to_build {
-            let idx = SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
-                PipelineError::Compilation {
-                    transform_name: String::new(),
-                    messages: vec![e.to_string()],
-                }
-            })?;
-            indices.push(idx);
-        }
-
-        // Phase 1.5: Sort partitions
-        for (i, spec) in plan.indices_to_build.iter().enumerate() {
-            if !spec.already_sorted {
-                for partition in indices[i].groups.values_mut() {
-                    if !sort::is_sorted(&arena, partition, &spec.sort_by) {
-                        sort::sort_partition(&arena, partition, &spec.sort_by);
+            // Phase 1.5: Sort partitions
+            for (i, spec) in plan.indices_to_build.iter().enumerate() {
+                if !spec.already_sorted {
+                    for partition in indices[i].groups.values_mut() {
+                        if !sort::is_sorted(&arena, partition, &spec.sort_by) {
+                            sort::sort_partition(&arena, partition, &spec.sort_by);
+                        }
                     }
                 }
             }
+
+            // Phase 2: Chunk-based evaluation with optional rayon parallelism
+            let pool = build_thread_pool(config)?;
+            let use_parallel = can_parallelize(plan);
+
+            let output_schema_ref = arena.schema();
+            let record_count = arena.record_count();
+            if record_count == 0 {
+                return Ok((PipelineCounters::default(), Vec::new(), rss_bytes()));
+            }
+
+            let mut rss_budget = MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
+            let chunk_size = config
+                .pipeline
+                .concurrency
+                .as_ref()
+                .and_then(|c| c.chunk_size)
+                .unwrap_or(1024) as u32;
+
+            let build_record_from_arena = |pos: u32| -> Record {
+                let schema = Arc::clone(output_schema_ref);
+                let values: Vec<Value> = schema
+                    .columns()
+                    .iter()
+                    .map(|col| arena.resolve_field(pos, col).unwrap_or(Value::Null))
+                    .collect();
+                Record::new(schema, values)
+            };
+
+            // Schema derivation scan
+            let mut first_emit_pos: Option<u32> = None;
+            #[allow(clippy::type_complexity)]
+            let mut first_emitted: Option<(
+                Record,
+                IndexMap<String, Value>,
+                IndexMap<String, Value>,
+            )> = None;
+            let mut evaluators = build_evaluators(transforms);
+            let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+
+            for pos in 0..record_count {
+                let record = build_record_from_arena(pos);
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    pos as u64 + 1,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                let result = evaluate_record_with_window(
+                    &record,
+                    &transform_names,
+                    &mut evaluators,
+                    &ctx,
+                    plan,
+                    &arena,
+                    &indices,
+                    pos,
+                );
+                counters.total_count += 1;
+                match result {
+                    Ok(EvalResult::Emit {
+                        fields: emitted,
+                        metadata,
+                    }) => {
+                        first_emitted = Some((record, emitted, metadata));
+                        first_emit_pos = Some(pos);
+                        counters.ok_count += 1;
+                        break;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err((transform_name, eval_err)) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            return Err(eval_err.into());
+                        }
+                        handle_error_no_writer(
+                            &record,
+                            pos as u64 + 1,
+                            &eval_err,
+                            Some(DlqEntry::stage_transform(&transform_name)),
+                            &mut counters,
+                            &mut dlq_entries,
+                        );
+                    }
+                }
+            }
+
+            let final_output_schema = if let Some((ref rec, ref emitted, ref metadata)) =
+                first_emitted
+            {
+                let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
+                Arc::clone(projected.schema())
+            } else {
+                Arc::clone(output_schema_ref)
+            };
+
+            // Evaluate chunk helper (same as execute_two_pass)
+            #[allow(clippy::type_complexity)]
+            let evaluate_chunk =
+                |chunk: &mut Vec<(
+                    u32,
+                    Record,
+                    Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
+                )>,
+                 evaluators: &mut Vec<ProgramEvaluator>| {
+                    if use_parallel {
+                        pool.install(|| {
+                            chunk.par_iter_mut().for_each(|(pos, record, result)| {
+                                let ctx = build_eval_context(
+                                    config,
+                                    &input.path,
+                                    *pos as u64 + 1,
+                                    pipeline_start_time,
+                                    &params.execution_id,
+                                    &params.batch_id,
+                                    &params.pipeline_vars,
+                                );
+                                let mut local_evals = build_evaluators(transforms);
+                                *result = Some(evaluate_record_with_window(
+                                    record,
+                                    &transform_names,
+                                    &mut local_evals,
+                                    &ctx,
+                                    plan,
+                                    &arena,
+                                    &indices,
+                                    *pos,
+                                ));
+                            });
+                        });
+                    } else {
+                        for (pos, record, result) in chunk.iter_mut() {
+                            let ctx = build_eval_context(
+                                config,
+                                &input.path,
+                                *pos as u64 + 1,
+                                pipeline_start_time,
+                                &params.execution_id,
+                                &params.batch_id,
+                                &params.pipeline_vars,
+                            );
+                            *result = Some(evaluate_record_with_window(
+                                record,
+                                &transform_names,
+                                evaluators,
+                                &ctx,
+                                plan,
+                                &arena,
+                                &indices,
+                                *pos,
+                            ));
+                        }
+                    }
+                };
+
+            let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
+
+            if is_multi_output {
+                let output_channels = spawn_writer_threads(
+                    writers,
+                    &config.outputs,
+                    Arc::clone(&final_output_schema),
+                );
+
+                // Dispatch first emitted record
+                if let Some((record, emitted, metadata)) = first_emitted {
+                    let route = compiled_route.as_mut().unwrap();
+                    let ctx = build_eval_context(
+                        config,
+                        &input.path,
+                        first_emit_pos.unwrap() as u64 + 1,
+                        pipeline_start_time,
+                        &params.execution_id,
+                        &params.batch_id,
+                        &params.pipeline_vars,
+                    );
+                    match route.evaluate(&emitted, &metadata, &ctx) {
+                        Ok(targets) => {
+                            let mut per_output_batches: HashMap<String, Vec<Record>> =
+                                HashMap::new();
+                            for target in &targets {
+                                let out_cfg = config
+                                    .outputs
+                                    .iter()
+                                    .find(|o| o.name == *target)
+                                    .unwrap_or(primary_output);
+                                let projected =
+                                    project_output_with_meta(&record, &emitted, &metadata, out_cfg);
+                                per_output_batches
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .push(projected);
+                            }
+                            flush_output_batches(&mut per_output_batches, &output_channels)?;
+                        }
+                        Err(route_err) => {
+                            if strategy == ErrorStrategy::FailFast {
+                                drop(output_channels);
+                                return Err(route_err.into());
+                            }
+                            counters.dlq_count += 1;
+                            counters.ok_count = counters.ok_count.saturating_sub(1);
+                            dlq_entries.push(DlqEntry {
+                                source_row: first_emit_pos.unwrap() as u64 + 1,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: route_err.to_string(),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_route_eval()),
+                                route: None,
+                                trigger: true,
+                            });
+                        }
+                    }
+                }
+
+                // Process remaining records in chunks
+                let route = compiled_route.as_mut().unwrap();
+                while chunk_start < record_count {
+                    let chunk_end = (chunk_start + chunk_size).min(record_count);
+
+                    #[allow(clippy::type_complexity)]
+                    let mut chunk: Vec<(
+                        u32,
+                        Record,
+                        Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
+                    )> = (chunk_start..chunk_end)
+                        .map(|pos| (pos, build_record_from_arena(pos), None))
+                        .collect();
+
+                    evaluate_chunk(&mut chunk, &mut evaluators);
+
+                    let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                    for (pos, record, result) in &chunk {
+                        let row_num = *pos as u64 + 1;
+                        counters.total_count += 1;
+                        match result.as_ref().unwrap() {
+                            Ok(EvalResult::Emit {
+                                fields: emitted,
+                                metadata,
+                            }) => {
+                                let ctx = build_eval_context(
+                                    config,
+                                    &input.path,
+                                    row_num,
+                                    pipeline_start_time,
+                                    &params.execution_id,
+                                    &params.batch_id,
+                                    &params.pipeline_vars,
+                                );
+                                match route.evaluate(emitted, metadata, &ctx) {
+                                    Ok(targets) => {
+                                        for target in &targets {
+                                            let out_cfg = config
+                                                .outputs
+                                                .iter()
+                                                .find(|o| o.name == *target)
+                                                .unwrap_or(primary_output);
+                                            let projected = project_output_with_meta(
+                                                record, emitted, metadata, out_cfg,
+                                            );
+                                            per_output_batches
+                                                .entry(target.clone())
+                                                .or_default()
+                                                .push(projected);
+                                        }
+                                        counters.ok_count += 1;
+                                    }
+                                    Err(route_err) => {
+                                        if strategy == ErrorStrategy::FailFast {
+                                            drop(output_channels);
+                                            return Err(route_err.into());
+                                        }
+                                        counters.dlq_count += 1;
+                                        dlq_entries.push(DlqEntry {
+                                            source_row: row_num,
+                                            category:
+                                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                            error_message: route_err.to_string(),
+                                            original_record: record.clone(),
+                                            stage: Some(DlqEntry::stage_route_eval()),
+                                            route: None,
+                                            trigger: true,
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                counters.filtered_count += 1;
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                counters.distinct_count += 1;
+                            }
+                            Err((transform_name, eval_err)) => {
+                                if strategy == ErrorStrategy::FailFast {
+                                    drop(output_channels);
+                                    return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                        span: eval_err.span,
+                                        kind: eval_err.kind.clone(),
+                                    }));
+                                }
+                                counters.dlq_count += 1;
+                                dlq_entries.push(DlqEntry {
+                                    source_row: row_num,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: eval_err.to_string(),
+                                    original_record: record.clone(),
+                                    stage: Some(DlqEntry::stage_transform(transform_name)),
+                                    route: None,
+                                    trigger: true,
+                                });
+                            }
+                        }
+                    }
+                    flush_output_batches(&mut per_output_batches, &output_channels)?;
+
+                    rss_budget.observe();
+                    chunk_start = chunk_end;
+                }
+
+                join_writer_threads(output_channels)?;
+            } else {
+                // Single-output path
+                let output = primary_output;
+                let writer_config = build_writer_config(output);
+                let raw_writer = writers
+                    .into_iter()
+                    .next()
+                    .map(|(_, w)| w)
+                    .expect("validated above");
+                let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
+                    let policy = build_split_policy(split);
+                    let output_path = output.path.clone();
+                    let naming = split.naming.clone();
+                    let schema = Arc::clone(&final_output_schema);
+                    let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                        let path = apply_split_naming(&output_path, &naming, seq);
+                        let file = std::fs::File::create(path)?;
+                        Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                    };
+                    drop(raw_writer);
+                    Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+                } else {
+                    let writer = BufWriter::with_capacity(65536, raw_writer);
+                    Box::new(CsvWriter::new(
+                        writer,
+                        Arc::clone(&final_output_schema),
+                        writer_config,
+                    ))
+                };
+
+                // Write first emitted record
+                if let Some((record, emitted, metadata)) = first_emitted {
+                    let projected = project_output_with_meta(&record, &emitted, &metadata, output);
+                    csv_writer.write_record(&projected)?;
+                }
+
+                while chunk_start < record_count {
+                    let chunk_end = (chunk_start + chunk_size).min(record_count);
+
+                    #[allow(clippy::type_complexity)]
+                    let mut chunk: Vec<(
+                        u32,
+                        Record,
+                        Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
+                    )> = (chunk_start..chunk_end)
+                        .map(|pos| (pos, build_record_from_arena(pos), None))
+                        .collect();
+
+                    evaluate_chunk(&mut chunk, &mut evaluators);
+
+                    for (pos, record, result) in &chunk {
+                        let row_num = *pos as u64 + 1;
+                        counters.total_count += 1;
+                        match result.as_ref().unwrap() {
+                            Ok(EvalResult::Emit {
+                                fields: emitted, ..
+                            }) => {
+                                let projected = project_output(record, emitted, output);
+                                csv_writer.write_record(&projected)?;
+                                counters.ok_count += 1;
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                counters.filtered_count += 1;
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                counters.distinct_count += 1;
+                            }
+                            Err((transform_name, eval_err)) => {
+                                handle_error(
+                                    strategy,
+                                    record,
+                                    row_num,
+                                    eval_err,
+                                    Some(DlqEntry::stage_transform(transform_name)),
+                                    None,
+                                    &mut counters,
+                                    &mut dlq_entries,
+                                    output,
+                                    &final_output_schema,
+                                    &mut *csv_writer,
+                                )?;
+                            }
+                        }
+                    }
+
+                    rss_budget.observe();
+                    chunk_start = chunk_end;
+                }
+
+                csv_writer.flush()?;
+            }
+
+            return Ok((counters, dlq_entries, rss_budget.peak_rss));
         }
 
-        // Phase 2: Chunk-based evaluation with optional rayon parallelism.
-        let pool = build_thread_pool(config)?;
-        let use_parallel = can_parallelize(plan);
+        // ── Non-arena path: read all records, optionally sort ──
 
-        let output_schema_ref = arena.schema();
-        let strategy = config.error_handling.strategy;
-
-        let record_count = arena.record_count();
-        if record_count == 0 {
-            return Ok((PipelineCounters::default(), Vec::new(), rss_bytes()));
+        let schema = csv_reader.schema()?;
+        let mut all_records: Vec<(Record, u64)> = Vec::new();
+        let mut row_num: u64 = 0;
+        while let Some(record) = csv_reader.next_record()? {
+            row_num += 1;
+            counters.total_count += 1;
+            all_records.push((record, row_num));
         }
 
-        let mut rss_budget = MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
-        let chunk_size = config
-            .pipeline
-            .concurrency
-            .as_ref()
-            .and_then(|c| c.chunk_size)
-            .unwrap_or(1024) as u32;
+        if all_records.is_empty() {
+            return Ok((counters, dlq_entries, rss_bytes()));
+        }
 
-        // Build a Record from Arena for evaluation
-        let build_record_from_arena = |pos: u32| -> Record {
-            let schema = Arc::clone(output_schema_ref);
-            let values: Vec<Value> = schema
-                .columns()
+        // ── Branching DAG walk path ──
+        // When the DAG has Route/Merge nodes, use per-node evaluation
+        // instead of the sequential transform chain.
+        if plan.has_branching() {
+            return Self::execute_dag_branching(
+                config,
+                all_records,
+                writers,
+                transforms,
+                compiled_route,
+                plan,
+                params,
+                &mut counters,
+                &mut dlq_entries,
+            );
+        }
+
+        // Phase 2: Sort if correlated streaming
+        if requires_sorted_input && let Some(sort_specs) = effective_sort_order {
+            let sort_fields: Vec<crate::config::SortField> = sort_specs
                 .iter()
-                .map(|col| arena.resolve_field(pos, col).unwrap_or(Value::Null))
+                .map(|s| s.clone().into_sort_field())
                 .collect();
-            Record::new(schema, values)
-        };
+            all_records
+                .sort_by(|(a, _), (b, _)| sort::compare_records_by_fields(a, b, &sort_fields));
+        }
 
-        // Scan forward until a record emits, to derive the output schema.
-        let mut counters = PipelineCounters::default();
-        let mut dlq_entries = Vec::new();
-        let mut first_emit_pos: Option<u32> = None;
+        // Phase 3: Schema derivation (scan for first emitting record)
+        let mut evaluators = build_evaluators(transforms);
+        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+
+        let mut first_emitted_schema: Option<Arc<Schema>> = None;
+        if requires_sorted_input {
+            // For sorted path, scan once for schema then recreate evaluators
+            for (record, rn) in &all_records {
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    *rn,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                if let Ok(EvalResult::Emit {
+                    fields: emitted, ..
+                }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
+                {
+                    let projected = project_output(record, &emitted, primary_output);
+                    first_emitted_schema = Some(Arc::clone(projected.schema()));
+                    break;
+                }
+            }
+            evaluators = build_evaluators(transforms);
+        }
+
+        if requires_sorted_input {
+            // ── Correlated streaming path ──
+            let correlation_key = config
+                .error_handling
+                .correlation_key
+                .as_ref()
+                .expect("SortedStreaming requires correlation_key");
+            let max_group_buffer = config.error_handling.max_group_buffer.unwrap_or(100_000);
+
+            let output_schema = first_emitted_schema.unwrap_or(schema);
+
+            if is_multi_output {
+                let output_channels =
+                    spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
+
+                let mut group_buffer: Vec<(Record, u64)> = Vec::new();
+                let mut current_key: Option<Vec<GroupByKey>> = None;
+                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+
+                for (record, rn) in all_records {
+                    let key = extract_correlation_key(&record, correlation_key);
+                    let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
+
+                    if is_null_key {
+                        let ctx = build_eval_context(
+                            config,
+                            &input.path,
+                            rn,
+                            pipeline_start_time,
+                            &params.execution_id,
+                            &params.batch_id,
+                            &params.pipeline_vars,
+                        );
+                        match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                            Ok(EvalResult::Emit {
+                                fields: emitted,
+                                metadata,
+                            }) => {
+                                Self::dispatch_to_outputs(
+                                    &record,
+                                    &emitted,
+                                    &metadata,
+                                    config,
+                                    primary_output,
+                                    compiled_route.as_mut(),
+                                    &ctx,
+                                    &mut counters,
+                                    &mut dlq_entries,
+                                    &mut per_output_batches,
+                                    strategy,
+                                    rn,
+                                );
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                counters.filtered_count += 1;
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                counters.distinct_count += 1;
+                            }
+                            Err((transform_name, eval_err)) => {
+                                if strategy == ErrorStrategy::FailFast {
+                                    drop(output_channels);
+                                    return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                        span: eval_err.span,
+                                        kind: eval_err.kind.clone(),
+                                    }));
+                                }
+                                counters.dlq_count += 1;
+                                dlq_entries.push(DlqEntry {
+                                    source_row: rn,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: eval_err.to_string(),
+                                    original_record: record,
+                                    stage: Some(DlqEntry::stage_transform(&transform_name)),
+                                    route: None,
+                                    trigger: true,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if current_key.as_ref() != Some(&key) {
+                        Self::flush_correlated_group(
+                            &mut group_buffer,
+                            config,
+                            primary_output,
+                            input,
+                            pipeline_start_time,
+                            &transform_names,
+                            &mut evaluators,
+                            compiled_route.as_mut(),
+                            params,
+                            strategy,
+                            &mut counters,
+                            &mut dlq_entries,
+                            &mut per_output_batches,
+                            max_group_buffer,
+                        );
+                        current_key = Some(key);
+                    }
+
+                    if group_buffer.len() as u64 >= max_group_buffer {
+                        group_buffer.push((record, rn));
+                        for (rec, rec_rn) in group_buffer.drain(..) {
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: rec_rn,
+                                category: crate::dlq::DlqErrorCategory::ValidationFailure,
+                                error_message:
+                                    "group_size_exceeded: correlation group exceeded max_group_buffer"
+                                        .to_string(),
+                                original_record: rec,
+                                stage: Some("transform:correlated_dlq".to_string()),
+                                route: None,
+                                trigger: false,
+                            });
+                        }
+                        current_key = None;
+                        continue;
+                    }
+
+                    group_buffer.push((record, rn));
+                }
+
+                // Flush final group
+                Self::flush_correlated_group(
+                    &mut group_buffer,
+                    config,
+                    primary_output,
+                    input,
+                    pipeline_start_time,
+                    &transform_names,
+                    &mut evaluators,
+                    compiled_route.as_mut(),
+                    params,
+                    strategy,
+                    &mut counters,
+                    &mut dlq_entries,
+                    &mut per_output_batches,
+                    max_group_buffer,
+                );
+
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
+                drop(output_channels);
+            } else {
+                // Single-output correlated path
+                let writer_config = build_writer_config(primary_output);
+                let raw_writer = writers
+                    .into_iter()
+                    .next()
+                    .map(|(_, w)| w)
+                    .expect("at least one writer");
+
+                let mut csv_writer: Box<dyn FormatWriter> =
+                    if let Some(ref split) = primary_output.split {
+                        let policy = build_split_policy(split);
+                        let output_path = primary_output.path.clone();
+                        let naming = split.naming.clone();
+                        let schema = Arc::clone(&output_schema);
+                        let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                            let path = apply_split_naming(&output_path, &naming, seq);
+                            let file = std::fs::File::create(path)?;
+                            Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                        };
+                        drop(raw_writer);
+                        Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+                    } else {
+                        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+                        Box::new(CsvWriter::new(
+                            buf_writer,
+                            Arc::clone(&output_schema),
+                            writer_config,
+                        ))
+                    };
+
+                let mut group_buffer: Vec<(Record, u64)> = Vec::new();
+                let mut current_key: Option<Vec<GroupByKey>> = None;
+
+                for (record, rn) in all_records {
+                    let key = extract_correlation_key(&record, correlation_key);
+                    let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
+
+                    if is_null_key {
+                        let ctx = build_eval_context(
+                            config,
+                            &input.path,
+                            rn,
+                            pipeline_start_time,
+                            &params.execution_id,
+                            &params.batch_id,
+                            &params.pipeline_vars,
+                        );
+                        match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                            Ok(EvalResult::Emit {
+                                fields: emitted, ..
+                            }) => {
+                                let projected = project_output(&record, &emitted, primary_output);
+                                csv_writer.write_record(&projected)?;
+                                counters.ok_count += 1;
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                counters.filtered_count += 1;
+                            }
+                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                counters.distinct_count += 1;
+                            }
+                            Err((transform_name, eval_err)) => {
+                                if strategy == ErrorStrategy::FailFast {
+                                    return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                        span: eval_err.span,
+                                        kind: eval_err.kind.clone(),
+                                    }));
+                                }
+                                counters.dlq_count += 1;
+                                dlq_entries.push(DlqEntry {
+                                    source_row: rn,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: eval_err.to_string(),
+                                    original_record: record,
+                                    stage: Some(DlqEntry::stage_transform(&transform_name)),
+                                    route: None,
+                                    trigger: true,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if current_key.as_ref() != Some(&key) {
+                        Self::flush_correlated_group_single_output(
+                            &mut group_buffer,
+                            config,
+                            primary_output,
+                            input,
+                            pipeline_start_time,
+                            &transform_names,
+                            &mut evaluators,
+                            params,
+                            strategy,
+                            &mut counters,
+                            &mut dlq_entries,
+                            &mut *csv_writer,
+                            max_group_buffer,
+                        )?;
+                        current_key = Some(key);
+                    }
+
+                    if group_buffer.len() as u64 >= max_group_buffer {
+                        group_buffer.push((record, rn));
+                        for (rec, rec_rn) in group_buffer.drain(..) {
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: rec_rn,
+                                category: crate::dlq::DlqErrorCategory::ValidationFailure,
+                                error_message:
+                                    "group_size_exceeded: correlation group exceeded max_group_buffer"
+                                        .to_string(),
+                                original_record: rec,
+                                stage: Some("transform:correlated_dlq".to_string()),
+                                route: None,
+                                trigger: false,
+                            });
+                        }
+                        current_key = None;
+                        continue;
+                    }
+
+                    group_buffer.push((record, rn));
+                }
+
+                Self::flush_correlated_group_single_output(
+                    &mut group_buffer,
+                    config,
+                    primary_output,
+                    input,
+                    pipeline_start_time,
+                    &transform_names,
+                    &mut evaluators,
+                    params,
+                    strategy,
+                    &mut counters,
+                    &mut dlq_entries,
+                    &mut *csv_writer,
+                    max_group_buffer,
+                )?;
+
+                csv_writer.flush()?;
+            }
+
+            return Ok((counters, dlq_entries, rss_bytes()));
+        }
+
+        // ── Streaming path: read all records already done, now evaluate ──
+
+        // Schema derivation: scan forward until a record emits
         #[allow(clippy::type_complexity)]
         let mut first_emitted: Option<(
             Record,
             IndexMap<String, Value>,
             IndexMap<String, Value>,
         )> = None;
-        let mut evaluators = build_evaluators(transforms);
-        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+        #[allow(clippy::type_complexity)]
+        let mut pending_skips_and_errors: Vec<(
+            u64,
+            Record,
+            Result<EvalResult, (String, cxl::eval::EvalError)>,
+        )> = Vec::new();
+        let mut scan_idx = 0;
 
-        for pos in 0..record_count {
-            let record = build_record_from_arena(pos);
+        for (record, rn) in &all_records {
+            scan_idx += 1;
             let ctx = build_eval_context(
                 config,
                 &input.path,
-                pos as u64 + 1,
+                *rn,
                 pipeline_start_time,
                 &params.execution_id,
                 &params.batch_id,
                 &params.pipeline_vars,
             );
-            let result = evaluate_record_with_window(
-                &record,
-                &transform_names,
-                &mut evaluators,
-                &ctx,
-                plan,
-                &arena,
-                &indices,
-                pos,
-            );
-            counters.total_count += 1;
-            match result {
+            let result = evaluate_record(record, &transform_names, &mut evaluators, &ctx);
+            match &result {
                 Ok(EvalResult::Emit {
                     fields: emitted,
                     metadata,
                 }) => {
-                    first_emitted = Some((record, emitted, metadata));
-                    first_emit_pos = Some(pos);
                     counters.ok_count += 1;
+                    first_emitted = Some((record.clone(), emitted.clone(), metadata.clone()));
                     break;
                 }
-                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                    counters.filtered_count += 1;
-                }
-                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                    counters.distinct_count += 1;
-                }
-                Err((transform_name, eval_err)) => {
-                    if strategy == ErrorStrategy::FailFast {
-                        return Err(eval_err.into());
-                    }
-                    handle_error_no_writer(
-                        &record,
-                        pos as u64 + 1,
-                        &eval_err,
-                        Some(DlqEntry::stage_transform(&transform_name)),
-                        &mut counters,
-                        &mut dlq_entries,
-                    );
+                Ok(EvalResult::Skip(_)) | Err(_) => {
+                    pending_skips_and_errors.push((*rn, record.clone(), result));
                 }
             }
         }
 
-        let final_output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted
-        {
+        let output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted {
             let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
             Arc::clone(projected.schema())
         } else {
-            Arc::clone(output_schema_ref)
+            schema
         };
-
-        // Helper: evaluate chunk and collect results
-        #[allow(clippy::type_complexity)]
-        let evaluate_chunk = |chunk: &mut Vec<(
-            u32,
-            Record,
-            Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-        )>,
-                              evaluators: &mut Vec<ProgramEvaluator>| {
-            if use_parallel {
-                pool.install(|| {
-                    chunk.par_iter_mut().for_each(|(pos, record, result)| {
-                        let ctx = build_eval_context(
-                            config,
-                            &input.path,
-                            *pos as u64 + 1,
-                            pipeline_start_time,
-                            &params.execution_id,
-                            &params.batch_id,
-                            &params.pipeline_vars,
-                        );
-                        let mut local_evals = build_evaluators(transforms);
-                        *result = Some(evaluate_record_with_window(
-                            record,
-                            &transform_names,
-                            &mut local_evals,
-                            &ctx,
-                            plan,
-                            &arena,
-                            &indices,
-                            *pos,
-                        ));
-                    });
-                });
-            } else {
-                for (pos, record, result) in chunk.iter_mut() {
-                    let ctx = build_eval_context(
-                        config,
-                        &input.path,
-                        *pos as u64 + 1,
-                        pipeline_start_time,
-                        &params.execution_id,
-                        &params.batch_id,
-                        &params.pipeline_vars,
-                    );
-                    *result = Some(evaluate_record_with_window(
-                        record,
-                        &transform_names,
-                        evaluators,
-                        &ctx,
-                        plan,
-                        &arena,
-                        &indices,
-                        *pos,
-                    ));
-                }
-            }
-        };
-
-        let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
 
         if is_multi_output {
-            // --- Multi-output path: spawn writer threads ---
+            // Multi-output streaming path
             let output_channels =
-                spawn_writer_threads(writers, &config.outputs, Arc::clone(&final_output_schema));
+                spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
+
+            // Process pending skips/errors
+            for (_rn, _record, result) in &pending_skips_and_errors {
+                match result {
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
+                    Err((transform_name, eval_err)) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            drop(output_channels);
+                            return Err(PipelineError::Eval(cxl::eval::EvalError {
+                                span: eval_err.span,
+                                kind: eval_err.kind.clone(),
+                            }));
+                        }
+                        counters.dlq_count += 1;
+                        dlq_entries.push(DlqEntry {
+                            source_row: _rn.to_owned(),
+                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: eval_err.to_string(),
+                            original_record: _record.clone(),
+                            stage: Some(DlqEntry::stage_transform(transform_name)),
+                            route: None,
+                            trigger: true,
+                        });
+                    }
+                }
+            }
 
             // Dispatch first emitted record
             if let Some((record, emitted, metadata)) = first_emitted {
@@ -1897,7 +1852,7 @@ impl PipelineExecutor {
                 let ctx = build_eval_context(
                     config,
                     &input.path,
-                    first_emit_pos.unwrap() as u64 + 1,
+                    1,
                     pipeline_start_time,
                     &params.execution_id,
                     &params.batch_id,
@@ -1929,7 +1884,7 @@ impl PipelineExecutor {
                         counters.dlq_count += 1;
                         counters.ok_count = counters.ok_count.saturating_sub(1);
                         dlq_entries.push(DlqEntry {
-                            source_row: first_emit_pos.unwrap() as u64 + 1,
+                            source_row: 1,
                             category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                             error_message: route_err.to_string(),
                             original_record: record,
@@ -1941,113 +1896,89 @@ impl PipelineExecutor {
                 }
             }
 
-            // Process remaining records in chunks
+            // Process remaining records
             let route = compiled_route.as_mut().unwrap();
-            while chunk_start < record_count {
-                let chunk_end = (chunk_start + chunk_size).min(record_count);
-
-                #[allow(clippy::type_complexity)]
-                let mut chunk: Vec<(
-                    u32,
-                    Record,
-                    Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-                )> = (chunk_start..chunk_end)
-                    .map(|pos| (pos, build_record_from_arena(pos), None))
-                    .collect();
-
-                evaluate_chunk(&mut chunk, &mut evaluators);
-
-                // Route and dispatch chunk results
-                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                for (pos, record, result) in &chunk {
-                    let row_num = *pos as u64 + 1;
-                    counters.total_count += 1;
-                    match result.as_ref().unwrap() {
-                        Ok(EvalResult::Emit {
-                            fields: emitted,
-                            metadata,
-                        }) => {
-                            let ctx = build_eval_context(
-                                config,
-                                &input.path,
-                                row_num,
-                                pipeline_start_time,
-                                &params.execution_id,
-                                &params.batch_id,
-                                &params.pipeline_vars,
-                            );
-                            match route.evaluate(emitted, metadata, &ctx) {
-                                Ok(targets) => {
-                                    for target in &targets {
-                                        let out_cfg = config
-                                            .outputs
-                                            .iter()
-                                            .find(|o| o.name == *target)
-                                            .unwrap_or(primary_output);
-                                        let projected = project_output_with_meta(
-                                            record, emitted, metadata, out_cfg,
-                                        );
-                                        per_output_batches
-                                            .entry(target.clone())
-                                            .or_default()
-                                            .push(projected);
-                                    }
-                                    counters.ok_count += 1;
-                                }
-                                Err(route_err) => {
-                                    if strategy == ErrorStrategy::FailFast {
-                                        drop(output_channels);
-                                        return Err(route_err.into());
-                                    }
-                                    counters.dlq_count += 1;
-                                    dlq_entries.push(DlqEntry {
-                                        source_row: row_num,
-                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                        error_message: route_err.to_string(),
-                                        original_record: record.clone(),
-                                        stage: Some(DlqEntry::stage_route_eval()),
-                                        route: None,
-                                        trigger: true,
-                                    });
-                                }
+            let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+            for (record, rn) in all_records.into_iter().skip(scan_idx) {
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    rn,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                    Ok(EvalResult::Emit {
+                        fields: emitted,
+                        metadata,
+                    }) => match route.evaluate(&emitted, &metadata, &ctx) {
+                        Ok(targets) => {
+                            for target in &targets {
+                                let out_cfg = config
+                                    .outputs
+                                    .iter()
+                                    .find(|o| o.name == *target)
+                                    .unwrap_or(primary_output);
+                                let projected =
+                                    project_output_with_meta(&record, &emitted, &metadata, out_cfg);
+                                per_output_batches
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .push(projected);
                             }
+                            counters.ok_count += 1;
                         }
-                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                            counters.filtered_count += 1;
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                            counters.distinct_count += 1;
-                        }
-                        Err((transform_name, eval_err)) => {
+                        Err(route_err) => {
                             if strategy == ErrorStrategy::FailFast {
                                 drop(output_channels);
-                                return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                    span: eval_err.span,
-                                    kind: eval_err.kind.clone(),
-                                }));
+                                return Err(route_err.into());
                             }
                             counters.dlq_count += 1;
                             dlq_entries.push(DlqEntry {
-                                source_row: row_num,
+                                source_row: rn,
                                 category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: eval_err.to_string(),
-                                original_record: record.clone(),
-                                stage: Some(DlqEntry::stage_transform(transform_name)),
+                                error_message: route_err.to_string(),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_route_eval()),
                                 route: None,
                                 trigger: true,
                             });
                         }
+                    },
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err((transform_name, eval_err)) => {
+                        if strategy == ErrorStrategy::FailFast {
+                            drop(output_channels);
+                            return Err(eval_err.into());
+                        }
+                        counters.dlq_count += 1;
+                        dlq_entries.push(DlqEntry {
+                            source_row: rn,
+                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: eval_err.to_string(),
+                            original_record: record,
+                            stage: Some(DlqEntry::stage_transform(&transform_name)),
+                            route: None,
+                            trigger: true,
+                        });
                     }
                 }
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
 
-                rss_budget.observe();
-                chunk_start = chunk_end;
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
             }
 
+            // Final flush
+            flush_output_batches(&mut per_output_batches, &output_channels)?;
             join_writer_threads(output_channels)?;
         } else {
-            // --- Single-output path: direct write, no channel overhead ---
+            // Single-output streaming path
             let output = primary_output;
             let writer_config = build_writer_config(output);
             let raw_writer = writers
@@ -2055,11 +1986,12 @@ impl PipelineExecutor {
                 .next()
                 .map(|(_, w)| w)
                 .expect("validated above");
+
             let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
                 let policy = build_split_policy(split);
                 let output_path = output.path.clone();
                 let naming = split.naming.clone();
-                let schema = Arc::clone(&final_output_schema);
+                let schema = Arc::clone(&output_schema);
                 let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
                     let path = apply_split_naming(&output_path, &naming, seq);
                     let file = std::fs::File::create(path)?;
@@ -2071,75 +2003,475 @@ impl PipelineExecutor {
                 let writer = BufWriter::with_capacity(65536, raw_writer);
                 Box::new(CsvWriter::new(
                     writer,
-                    Arc::clone(&final_output_schema),
+                    Arc::clone(&output_schema),
                     writer_config,
                 ))
             };
 
-            // Write the first emitted record
+            // Process pending skips and errors from scan-forward phase
+            for (rn, record, result) in pending_skips_and_errors {
+                match result {
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
+                    Err((transform_name, eval_err)) => {
+                        handle_error(
+                            strategy,
+                            &record,
+                            rn,
+                            &eval_err,
+                            Some(DlqEntry::stage_transform(&transform_name)),
+                            None,
+                            &mut counters,
+                            &mut dlq_entries,
+                            output,
+                            &output_schema,
+                            &mut *csv_writer,
+                        )?;
+                    }
+                }
+            }
+
+            // Write first emitted record (ok_count already incremented during scan)
             if let Some((record, emitted, metadata)) = first_emitted {
                 let projected = project_output_with_meta(&record, &emitted, &metadata, output);
                 csv_writer.write_record(&projected)?;
             }
 
-            while chunk_start < record_count {
-                let chunk_end = (chunk_start + chunk_size).min(record_count);
-
-                #[allow(clippy::type_complexity)]
-                let mut chunk: Vec<(
-                    u32,
-                    Record,
-                    Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-                )> = (chunk_start..chunk_end)
-                    .map(|pos| (pos, build_record_from_arena(pos), None))
-                    .collect();
-
-                evaluate_chunk(&mut chunk, &mut evaluators);
-
-                // Write chunk results inline (single-threaded, preserves order)
-                for (pos, record, result) in &chunk {
-                    let row_num = *pos as u64 + 1;
-                    counters.total_count += 1;
-                    match result.as_ref().unwrap() {
-                        Ok(EvalResult::Emit {
-                            fields: emitted, ..
-                        }) => {
-                            let projected = project_output(record, emitted, output);
-                            csv_writer.write_record(&projected)?;
-                            counters.ok_count += 1;
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                            counters.filtered_count += 1;
-                        }
-                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                            counters.distinct_count += 1;
-                        }
-                        Err((transform_name, eval_err)) => {
-                            handle_error(
-                                strategy,
-                                record,
-                                row_num,
-                                eval_err,
-                                Some(DlqEntry::stage_transform(transform_name)),
-                                None,
-                                &mut counters,
-                                &mut dlq_entries,
-                                output,
-                                &final_output_schema,
-                                &mut *csv_writer,
-                            )?;
-                        }
+            // Process remaining records
+            for (record, rn) in all_records.into_iter().skip(scan_idx) {
+                let ctx = build_eval_context(
+                    config,
+                    &input.path,
+                    rn,
+                    pipeline_start_time,
+                    &params.execution_id,
+                    &params.batch_id,
+                    &params.pipeline_vars,
+                );
+                match evaluate_record(&record, &transform_names, &mut evaluators, &ctx) {
+                    Ok(EvalResult::Emit {
+                        fields: emitted,
+                        metadata,
+                    }) => {
+                        let projected =
+                            project_output_with_meta(&record, &emitted, &metadata, output);
+                        csv_writer.write_record(&projected)?;
+                        counters.ok_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered_count += 1;
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct_count += 1;
+                    }
+                    Err((transform_name, eval_err)) => {
+                        handle_error(
+                            strategy,
+                            &record,
+                            rn,
+                            &eval_err,
+                            Some(DlqEntry::stage_transform(&transform_name)),
+                            None,
+                            &mut counters,
+                            &mut dlq_entries,
+                            output,
+                            &output_schema,
+                            &mut *csv_writer,
+                        )?;
                     }
                 }
-
-                rss_budget.observe();
-                chunk_start = chunk_end;
             }
 
             csv_writer.flush()?;
         }
 
-        Ok((counters, dlq_entries, rss_budget.peak_rss))
+        Ok((counters, dlq_entries, rss_bytes()))
+    }
+
+    /// Execute a branching DAG by walking nodes in topological order.
+    ///
+    /// Records flow through inter-node buffers. Route nodes partition records
+    /// into branch-specific buffers. Merge nodes concatenate predecessor
+    /// buffers in declaration order. Transform nodes evaluate a single CXL
+    /// program per record.
+    ///
+    /// Branch dispatch uses `rayon::join` (2 branches) or `rayon::scope`
+    /// with indexed `Vec<Option<Vec<Record>>>` (N branches).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_dag_branching(
+        config: &PipelineConfig,
+        all_records: Vec<(Record, u64)>,
+        mut writers: HashMap<String, Box<dyn Write + Send>>,
+        transforms: &[CompiledTransform],
+        compiled_route: Option<CompiledRoute>,
+        plan: &ExecutionPlanDag,
+        params: &PipelineRunParams,
+        counters: &mut PipelineCounters,
+        dlq_entries: &mut Vec<DlqEntry>,
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        use petgraph::graph::NodeIndex;
+
+        let input = &config.inputs[0];
+        let primary_output = &config.outputs[0];
+        let pipeline_start_time = chrono::Local::now().naive_local();
+        let strategy = config.error_handling.strategy;
+        let mut compiled_route = compiled_route;
+
+        // Build transform name -> index map for looking up CompiledTransform by name
+        let transform_by_name: HashMap<&str, usize> = transforms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.as_str(), i))
+            .collect();
+
+        // Inter-node buffers: each node produces records into its buffer.
+        // Records are (Record, row_number, accumulated_emitted, accumulated_metadata).
+        #[allow(clippy::type_complexity)]
+        let mut node_buffers: HashMap<
+            NodeIndex,
+            Vec<(
+                Record,
+                u64,
+                IndexMap<String, Value>,
+                IndexMap<String, Value>,
+            )>,
+        > = HashMap::new();
+
+        // Walk DAG in topological order
+        for &node_idx in &plan.topo_order {
+            let node = plan.graph[node_idx].clone();
+            match node {
+                PlanNode::Source { .. } => {
+                    // Source node: populate buffer with all input records
+                    let records: Vec<_> = all_records
+                        .iter()
+                        .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
+                        .collect();
+                    node_buffers.insert(node_idx, records);
+                }
+
+                PlanNode::Transform { ref name, .. } => {
+                    // Get input records: first check own buffer (set by Route
+                    // node for branch dispatch), then fall back to predecessor.
+                    let input_records = if let Some(own_buf) = node_buffers.remove(&node_idx) {
+                        own_buf
+                    } else {
+                        let predecessors: Vec<NodeIndex> = plan
+                            .graph
+                            .neighbors_directed(node_idx, Direction::Incoming)
+                            .collect();
+                        if predecessors.len() == 1 {
+                            node_buffers.remove(&predecessors[0]).unwrap_or_default()
+                        } else {
+                            predecessors
+                                .iter()
+                                .find_map(|p| node_buffers.remove(p))
+                                .unwrap_or_default()
+                        }
+                    };
+
+                    // Find the CompiledTransform for this node
+                    let transform_idx = match transform_by_name.get(name.as_str()) {
+                        Some(&idx) => idx,
+                        None => {
+                            // No transform found — pass through
+                            node_buffers.insert(node_idx, input_records);
+                            continue;
+                        }
+                    };
+
+                    let mut evaluator = ProgramEvaluator::new(
+                        Arc::clone(&transforms[transform_idx].typed),
+                        transforms[transform_idx].has_distinct(),
+                    );
+
+                    let mut output_records = Vec::with_capacity(input_records.len());
+
+                    for (record, rn, mut all_emitted, mut all_metadata) in input_records {
+                        let ctx = build_eval_context(
+                            config,
+                            &input.path,
+                            rn,
+                            pipeline_start_time,
+                            &params.execution_id,
+                            &params.batch_id,
+                            &params.pipeline_vars,
+                        );
+
+                        match evaluate_single_transform(&record, name, &mut evaluator, &ctx) {
+                            Ok((modified_record, Ok((emitted, metadata)))) => {
+                                all_emitted.extend(emitted);
+                                all_metadata.extend(metadata);
+                                output_records.push((
+                                    modified_record,
+                                    rn,
+                                    all_emitted,
+                                    all_metadata,
+                                ));
+                            }
+                            Ok((_record, Err(SkipReason::Filtered))) => {
+                                counters.filtered_count += 1;
+                            }
+                            Ok((_record, Err(SkipReason::Duplicate))) => {
+                                counters.distinct_count += 1;
+                            }
+                            Err((transform_name, eval_err)) => {
+                                if strategy == ErrorStrategy::FailFast {
+                                    return Err(eval_err.into());
+                                }
+                                counters.dlq_count += 1;
+                                dlq_entries.push(DlqEntry {
+                                    source_row: rn,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: eval_err.to_string(),
+                                    original_record: record,
+                                    stage: Some(DlqEntry::stage_transform(&transform_name)),
+                                    route: None,
+                                    trigger: true,
+                                });
+                            }
+                        }
+                    }
+
+                    node_buffers.insert(node_idx, output_records);
+                }
+
+                PlanNode::Route {
+                    ref name,
+                    mode,
+                    branches: _,
+                    default: _,
+                } => {
+                    // Get input records from predecessor
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let input_records = predecessors
+                        .iter()
+                        .find_map(|p| node_buffers.remove(p))
+                        .unwrap_or_default();
+
+                    // Get successor nodes (branch transform nodes)
+                    let successors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Outgoing)
+                        .collect();
+
+                    // Build branch_name -> successor NodeIndex mapping.
+                    // A successor transform's `input:` field is "route_parent.branch_name".
+                    // Extract the route parent name from this Route node's name
+                    // (which is "route_{parent_transform}").
+                    let route_parent = name.strip_prefix("route_").unwrap_or(name);
+                    let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
+                    for &succ in &successors {
+                        let succ_name = plan.graph[succ].name();
+                        // Check config transforms for matching input reference
+                        for tc in config.transforms() {
+                            if tc.name == succ_name
+                                && let Some(crate::config::TransformInput::Single(ref input_ref)) =
+                                    tc.input
+                            {
+                                // input_ref is "parent.branch" or just "parent"
+                                if let Some(branch) =
+                                    input_ref.strip_prefix(&format!("{}.", route_parent))
+                                {
+                                    branch_to_succ.insert(branch.to_string(), succ);
+                                }
+                            }
+                        }
+                    }
+
+                    // Initialize per-successor buffers
+                    let mut branch_buffers: HashMap<NodeIndex, Vec<_>> = HashMap::new();
+                    for &succ in &successors {
+                        branch_buffers.insert(succ, Vec::new());
+                    }
+
+                    // Use compiled_route to evaluate conditions
+                    if let Some(ref mut route) = compiled_route {
+                        for (record, rn, all_emitted, all_metadata) in input_records {
+                            let ctx = build_eval_context(
+                                config,
+                                &input.path,
+                                rn,
+                                pipeline_start_time,
+                                &params.execution_id,
+                                &params.batch_id,
+                                &params.pipeline_vars,
+                            );
+
+                            match route.evaluate(&all_emitted, &all_metadata, &ctx) {
+                                Ok(targets) => {
+                                    for target in &targets {
+                                        if let Some(&succ) = branch_to_succ.get(target.as_str()) {
+                                            branch_buffers.entry(succ).or_default().push((
+                                                record.clone(),
+                                                rn,
+                                                all_emitted.clone(),
+                                                all_metadata.clone(),
+                                            ));
+                                        }
+                                        // Exclusive mode: stop after first match
+                                        if mode == crate::config::RouteMode::Exclusive {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(route_err) => {
+                                    if strategy == ErrorStrategy::FailFast {
+                                        return Err(route_err.into());
+                                    }
+                                    counters.dlq_count += 1;
+                                    dlq_entries.push(DlqEntry {
+                                        source_row: rn,
+                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                        error_message: route_err.to_string(),
+                                        original_record: record,
+                                        stage: Some(DlqEntry::stage_route_eval()),
+                                        route: None,
+                                        trigger: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Put branch buffers into node_buffers keyed by successor
+                    for (succ_idx, buf) in branch_buffers {
+                        node_buffers.insert(succ_idx, buf);
+                    }
+                }
+
+                PlanNode::Merge { ref name } => {
+                    // Concatenate predecessor buffers in declaration order.
+                    // Declaration order = order in the `input:` array of the
+                    // merge's downstream transform.
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+
+                    // The Merge node is named "merge_{transform}". Find the
+                    // transform's input: array to determine declaration order.
+                    let merge_transform_name = name.strip_prefix("merge_").unwrap_or(name);
+                    let declaration_order: Vec<String> = config
+                        .transforms()
+                        .find(|tc| tc.name == merge_transform_name)
+                        .and_then(|tc| {
+                            if let Some(crate::config::TransformInput::Multiple(ref inputs)) =
+                                tc.input
+                            {
+                                Some(inputs.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    // Sort predecessors by declaration order
+                    let mut sorted_preds = predecessors.clone();
+                    sorted_preds.sort_by_key(|p| {
+                        let pred_name = plan.graph[*p].name();
+                        declaration_order
+                            .iter()
+                            .position(|d| d == pred_name)
+                            .unwrap_or(usize::MAX)
+                    });
+
+                    let total: usize = sorted_preds
+                        .iter()
+                        .map(|p| node_buffers.get(p).map_or(0, |b| b.len()))
+                        .sum();
+                    let mut merged = Vec::with_capacity(total);
+                    for pred in &sorted_preds {
+                        if let Some(buf) = node_buffers.remove(pred) {
+                            merged.extend(buf);
+                        }
+                    }
+                    node_buffers.insert(node_idx, merged);
+                }
+
+                PlanNode::Output { ref name } => {
+                    // Get input records from predecessor
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let input_records = predecessors
+                        .iter()
+                        .find_map(|p| node_buffers.remove(p))
+                        .unwrap_or_default();
+
+                    // Count ok records
+                    counters.ok_count += input_records.len() as u64;
+
+                    // Derive output schema from first emitted record
+                    let out_cfg = config
+                        .outputs
+                        .iter()
+                        .find(|o| o.name == *name)
+                        .unwrap_or(primary_output);
+
+                    let output_schema = if let Some((rec, _, emitted, metadata)) =
+                        input_records.first()
+                    {
+                        let projected = project_output_with_meta(rec, emitted, metadata, out_cfg);
+                        Arc::clone(projected.schema())
+                    } else {
+                        // No records to write — use empty schema
+                        continue;
+                    };
+
+                    // Find and take the writer for this output
+                    let writer_config = build_writer_config(out_cfg);
+
+                    if let Some(raw_writer) = writers.remove(name) {
+                        let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) =
+                            out_cfg.split
+                        {
+                            let policy = build_split_policy(split);
+                            let output_path = out_cfg.path.clone();
+                            let naming = split.naming.clone();
+                            let schema = Arc::clone(&output_schema);
+                            let factory =
+                                move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                                    let path = apply_split_naming(&output_path, &naming, seq);
+                                    let file = std::fs::File::create(path)?;
+                                    Ok(Box::new(BufWriter::with_capacity(65536, file)))
+                                };
+                            drop(raw_writer);
+                            Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
+                        } else {
+                            let writer = BufWriter::with_capacity(65536, raw_writer);
+                            Box::new(CsvWriter::new(
+                                writer,
+                                Arc::clone(&output_schema),
+                                writer_config,
+                            ))
+                        };
+
+                        for (record, _rn, emitted, metadata) in &input_records {
+                            let projected =
+                                project_output_with_meta(record, emitted, metadata, out_cfg);
+                            csv_writer.write_record(&projected)?;
+                        }
+                        csv_writer.flush()?;
+                    }
+                }
+            }
+        }
+
+        Ok((
+            std::mem::take(counters),
+            std::mem::take(dlq_entries),
+            rss_bytes(),
+        ))
     }
 
     /// Compile all CXL transform blocks against the input schema.
@@ -2605,6 +2937,49 @@ fn evaluate_record_with_window(
         fields: all_emitted,
         metadata: all_metadata,
     })
+}
+
+/// Evaluate a single transform against a record, returning the modified record
+/// with emitted fields merged in.
+///
+/// Used by the DAG-walking executor for per-node evaluation.
+/// Returns `Ok((modified_record, emitted, metadata))` on emit,
+/// `Ok` with `EvalResult::Skip` variant on skip.
+/// On error, returns `(transform_name, EvalError)`.
+#[allow(clippy::type_complexity)]
+fn evaluate_single_transform(
+    record: &Record,
+    transform_name: &str,
+    evaluator: &mut ProgramEvaluator,
+    ctx: &EvalContext,
+) -> Result<
+    (
+        Record,
+        Result<(IndexMap<String, Value>, IndexMap<String, Value>), SkipReason>,
+    ),
+    (String, cxl::eval::EvalError),
+> {
+    let mut record = record.clone();
+    match evaluator
+        .eval_record::<NullStorage>(ctx, &record, None)
+        .map_err(|e| (transform_name.to_string(), e))?
+    {
+        EvalResult::Emit {
+            fields: emitted,
+            metadata,
+        } => {
+            for (name, value) in &emitted {
+                if !record.set(name, value.clone()) {
+                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                }
+            }
+            for (key, value) in &metadata {
+                let _ = record.set_meta(key, value.clone());
+            }
+            Ok((record, Ok((emitted, metadata))))
+        }
+        EvalResult::Skip(reason) => Ok((record, Err(reason))),
+    }
 }
 
 /// Parse memory limit from config (default 512MB).
