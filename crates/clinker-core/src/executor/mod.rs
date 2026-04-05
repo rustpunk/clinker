@@ -18,8 +18,15 @@ use crate::plan::execution::{ExecutionPlanDag, ParallelismClass, PlanNode};
 use crate::projection::{project_output, project_output_with_meta};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
+use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
+use clinker_format::json::reader::{
+    ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
+};
 use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter};
 use clinker_format::traits::{FormatReader, FormatWriter};
+use clinker_format::xml::reader::{
+    NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
+};
 use cxl::ast::Statement;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
@@ -456,9 +463,8 @@ impl PipelineExecutor {
                 input.name
             )))
         })?;
-        let reader_config = build_reader_config(input);
-        let mut csv_reader = CsvReader::from_reader(reader, reader_config);
-        let schema = csv_reader.schema()?;
+        let mut format_reader = build_format_reader(input, reader)?;
+        let schema = format_reader.schema()?;
 
         // Compile CXL transforms
         let resolved_transforms: Vec<_> = config.transforms().collect();
@@ -551,7 +557,7 @@ impl PipelineExecutor {
 
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
-            csv_reader,
+            format_reader,
             writers,
             &compiled_transforms,
             compiled_route,
@@ -901,9 +907,9 @@ impl PipelineExecutor {
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     #[allow(clippy::too_many_arguments)]
-    fn execute_dag<R: Read + Send>(
+    fn execute_dag(
         config: &PipelineConfig,
-        mut csv_reader: CsvReader<R>,
+        mut format_reader: Box<dyn FormatReader>,
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
@@ -932,7 +938,7 @@ impl PipelineExecutor {
                 crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
             let memory_limit = parse_memory_limit(config);
             let arena =
-                Arena::build(&mut csv_reader, &arena_fields, memory_limit).map_err(|e| {
+                Arena::build(&mut *format_reader, &arena_fields, memory_limit).map_err(|e| {
                     PipelineError::Compilation {
                         transform_name: String::new(),
                         messages: vec![e.to_string()],
@@ -1396,10 +1402,10 @@ impl PipelineExecutor {
 
         // ── Non-arena path: read all records, optionally sort ──
 
-        let schema = csv_reader.schema()?;
+        let schema = format_reader.schema()?;
         let mut all_records: Vec<(Record, u64)> = Vec::new();
         let mut row_num: u64 = 0;
-        while let Some(record) = csv_reader.next_record()? {
+        while let Some(record) = format_reader.next_record()? {
             row_num += 1;
             counters.total_count += 1;
             all_records.push((record, row_num));
@@ -2676,10 +2682,71 @@ impl PipelineExecutor {
     }
 }
 
-/// Build a CsvReaderConfig from the input config options.
-fn build_reader_config(input: &crate::config::InputConfig) -> CsvReaderConfig {
+/// Build a format-specific reader from input config and raw reader.
+///
+/// Dispatches on `InputFormat` to construct the correct reader type.
+/// Returns `Box<dyn FormatReader>` — all downstream code uses trait methods
+/// (`schema()`, `next_record()`).
+fn build_format_reader(
+    input: &crate::config::InputConfig,
+    reader: Box<dyn Read + Send>,
+) -> Result<Box<dyn FormatReader>, PipelineError> {
+    match &input.format {
+        crate::config::InputFormat::Csv(opts) => {
+            let config = build_csv_reader_config(opts.as_ref());
+            Ok(Box::new(CsvReader::from_reader(reader, config)))
+        }
+        crate::config::InputFormat::Json(opts) => {
+            let config = build_json_reader_config(opts.as_ref(), input.array_paths.as_deref());
+            Ok(Box::new(JsonReader::from_reader(reader, config)?))
+        }
+        crate::config::InputFormat::Xml(opts) => {
+            let config = build_xml_reader_config(opts.as_ref(), input.array_paths.as_deref());
+            let buf_reader = std::io::BufReader::new(reader);
+            Ok(Box::new(XmlReader::new(buf_reader, config)))
+        }
+        crate::config::InputFormat::FixedWidth(opts) => {
+            let fields = extract_field_defs(input)?;
+            let config = build_fw_reader_config(opts.as_ref());
+            Ok(Box::new(FixedWidthReader::new(reader, fields, config)?))
+        }
+    }
+}
+
+/// Extract `Vec<FieldDef>` from `InputConfig.schema` for fixed-width format.
+///
+/// Resolves `SchemaSource::Inline` or `SchemaSource::FilePath` to `Vec<FieldDef>`.
+/// Returns a config validation error if schema is `None` (fixed-width requires
+/// explicit schema with field definitions).
+fn extract_field_defs(
+    input: &crate::config::InputConfig,
+) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
+    let schema_source = input.schema.as_ref().ok_or_else(|| {
+        PipelineError::Config(crate::config::ConfigError::Validation(
+            "fixed-width format requires explicit schema with field definitions".into(),
+        ))
+    })?;
+    let def = match schema_source {
+        crate::config::SchemaSource::Inline(def) => def.clone(),
+        crate::config::SchemaSource::FilePath(path) => {
+            crate::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
+                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                    "failed to load schema from '{path}': {e}",
+                )))
+            })?
+        }
+    };
+    def.fields.ok_or_else(|| {
+        PipelineError::Config(crate::config::ConfigError::Validation(
+            "fixed-width schema must have 'fields' defined".into(),
+        ))
+    })
+}
+
+/// Build CSV reader config from optional CSV input options.
+fn build_csv_reader_config(opts: Option<&crate::config::CsvInputOptions>) -> CsvReaderConfig {
     let mut config = CsvReaderConfig::default();
-    if let Some(opts) = input.csv_options() {
+    if let Some(opts) = opts {
         if let Some(ref d) = opts.delimiter
             && let Some(b) = d.as_bytes().first()
         {
@@ -2693,6 +2760,81 @@ fn build_reader_config(input: &crate::config::InputConfig) -> CsvReaderConfig {
         if let Some(h) = opts.has_header {
             config.has_header = h;
         }
+    }
+    config
+}
+
+/// Build JSON reader config from optional JSON input options and array paths.
+fn build_json_reader_config(
+    opts: Option<&crate::config::JsonInputOptions>,
+    array_paths: Option<&[crate::config::ArrayPathConfig]>,
+) -> JsonReaderConfig {
+    let mut config = JsonReaderConfig::default();
+    if let Some(opts) = opts {
+        config.format = opts.format.as_ref().map(|f| match f {
+            crate::config::JsonFormat::Array => JsonMode::Array,
+            crate::config::JsonFormat::Ndjson => JsonMode::Ndjson,
+            crate::config::JsonFormat::Object => JsonMode::Object,
+        });
+        config.record_path = opts.record_path.clone();
+    }
+    if let Some(paths) = array_paths {
+        config.array_paths = paths
+            .iter()
+            .map(|p| ArrayPathSpec {
+                path: p.path.clone(),
+                mode: match p.mode {
+                    crate::config::ArrayMode::Explode => ArrayPathMode::Explode,
+                    crate::config::ArrayMode::Join => ArrayPathMode::Join,
+                },
+                separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
+            })
+            .collect();
+    }
+    config
+}
+
+/// Build XML reader config from optional XML input options and array paths.
+fn build_xml_reader_config(
+    opts: Option<&crate::config::XmlInputOptions>,
+    array_paths: Option<&[crate::config::ArrayPathConfig]>,
+) -> XmlReaderConfig {
+    let mut config = XmlReaderConfig::default();
+    if let Some(opts) = opts {
+        config.record_path = opts.record_path.clone();
+        if let Some(ref prefix) = opts.attribute_prefix {
+            config.attribute_prefix = prefix.clone();
+        }
+        config.namespace_handling = match opts.namespace_handling {
+            Some(crate::config::NamespaceHandling::Qualify) => NamespaceMode::Qualify,
+            _ => NamespaceMode::Strip,
+        };
+    }
+    if let Some(paths) = array_paths {
+        config.array_paths = paths
+            .iter()
+            .map(|p| XmlArrayPath {
+                path: p.path.clone(),
+                mode: match p.mode {
+                    crate::config::ArrayMode::Explode => XmlArrayMode::Explode,
+                    crate::config::ArrayMode::Join => XmlArrayMode::Join,
+                },
+                separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
+            })
+            .collect();
+    }
+    config
+}
+
+/// Build fixed-width reader config from optional fixed-width input options.
+fn build_fw_reader_config(
+    opts: Option<&crate::config::FixedWidthInputOptions>,
+) -> FixedWidthReaderConfig {
+    let mut config = FixedWidthReaderConfig::default();
+    if let Some(opts) = opts
+        && let Some(ref sep) = opts.line_separator
+    {
+        config.line_separator = sep.clone();
     }
     config
 }
@@ -2872,11 +3014,13 @@ fn evaluate_record_with_window(
     let mut all_emitted = IndexMap::new();
     let mut all_metadata = IndexMap::new();
 
+    let window_info = plan.transform_window_info();
+
     for (i, eval) in evaluators.iter_mut().enumerate() {
-        let tp = &plan.transforms[i];
+        let (wi, _pl) = &window_info[i];
         let name = transform_names.get(i).copied().unwrap_or("unknown");
 
-        let result = if let Some(idx_num) = tp.window_index {
+        let result = if let Some(idx_num) = *wi {
             // This transform uses windows — look up partition
             let spec = &plan.indices_to_build[idx_num];
             let index = &indices[idx_num];
