@@ -452,10 +452,14 @@ impl PipelineExecutor {
                 input.name
             )))
         })?;
+        let mut collector = stage_metrics::StageCollector::default();
+        let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
         let mut format_reader = build_format_reader(input, reader)?;
         let schema = format_reader.schema()?;
+        collector.record(reader_timer.finish(0, 0));
 
         // Compile CXL transforms
+        let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let resolved_transforms: Vec<_> = config.transforms().collect();
         let compiled_transforms = Self::compile_transforms(&resolved_transforms, &schema)?;
 
@@ -497,6 +501,7 @@ impl PipelineExecutor {
                 messages: vec![e.to_string()],
             }
         })?;
+        collector.record(compile_timer.finish(0, 0));
 
         // Handle correlation key: check sort, inject if needed, set plan note
         let mut effective_sort_order: Option<Vec<crate::config::SortFieldSpec>> = None;
@@ -543,8 +548,6 @@ impl PipelineExecutor {
                 ));
             }
         }
-
-        let mut collector = stage_metrics::StageCollector::default();
 
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
@@ -1002,6 +1005,8 @@ impl PipelineExecutor {
             };
 
             // Schema derivation scan
+            let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
+            let mut records_scanned: u64 = 0;
             let mut first_emit_pos: Option<u32> = None;
             #[allow(clippy::type_complexity)]
             let mut first_emitted: Option<(
@@ -1013,6 +1018,7 @@ impl PipelineExecutor {
             let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
 
             for pos in 0..record_count {
+                records_scanned += 1;
                 let record = build_record_from_arena(pos);
                 let ctx = build_eval_context(
                     config,
@@ -1065,6 +1071,10 @@ impl PipelineExecutor {
                     }
                 }
             }
+
+            collector.record(
+                scan_timer.finish(records_scanned, if first_emitted.is_some() { 1 } else { 0 }),
+            );
 
             let final_output_schema = if let Some((ref rec, ref emitted, ref metadata)) =
                 first_emitted
@@ -1425,7 +1435,10 @@ impl PipelineExecutor {
         let mut first_emitted_schema: Option<Arc<Schema>> = None;
         if requires_sorted_input {
             // For sorted path, scan once for schema then recreate evaluators
+            let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
+            let mut records_scanned: u64 = 0;
             for (record, rn) in &all_records {
+                records_scanned += 1;
                 let ctx = build_eval_context(
                     config,
                     &input.path,
@@ -1444,6 +1457,10 @@ impl PipelineExecutor {
                     break;
                 }
             }
+            collector.record(scan_timer.finish(
+                records_scanned,
+                if first_emitted_schema.is_some() { 1 } else { 0 },
+            ));
             evaluators = build_evaluators(transforms);
         }
 
@@ -1723,6 +1740,8 @@ impl PipelineExecutor {
         // ── Streaming path: read all records already done, now evaluate ──
 
         // Schema derivation: scan forward until a record emits
+        let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
+        let mut records_scanned: u64 = 0;
         #[allow(clippy::type_complexity)]
         let mut first_emitted: Option<(
             Record,
@@ -1739,6 +1758,7 @@ impl PipelineExecutor {
 
         for (record, rn) in &all_records {
             scan_idx += 1;
+            records_scanned += 1;
             let ctx = build_eval_context(
                 config,
                 &input.path,
@@ -1763,6 +1783,10 @@ impl PipelineExecutor {
                 }
             }
         }
+
+        collector.record(
+            scan_timer.finish(records_scanned, if first_emitted.is_some() { 1 } else { 0 }),
+        );
 
         let output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted {
             let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
@@ -2359,6 +2383,8 @@ impl PipelineExecutor {
                     counters.ok_count += input_records.len() as u64;
 
                     // Derive output schema from first emitted record
+                    let scan_timer =
+                        stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
                     let out_cfg = config
                         .outputs
                         .iter()
@@ -2372,6 +2398,7 @@ impl PipelineExecutor {
                         Arc::clone(projected.schema())
                     } else {
                         // No records to write — use empty schema
+                        _collector.record(scan_timer.finish(0, 0));
                         continue;
                     };
 
@@ -2379,6 +2406,7 @@ impl PipelineExecutor {
                     if let Some(raw_writer) = writers.remove(name) {
                         let mut csv_writer =
                             build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema))?;
+                        _collector.record(scan_timer.finish(1, 1));
 
                         for (record, _rn, emitted, metadata) in &input_records {
                             let projected =
@@ -3530,8 +3558,11 @@ transformations: []
 "#;
         let csv = "name,age\nAlice,30\nBob,25\n";
         let (report, _output) = run_test_report(yaml, csv).unwrap();
-        // No instrumentation yet — stages is empty until Tasks 1.2-1.4
-        assert!(report.stages.is_empty());
+        // ReaderInit + Compile + SchemaScan present
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        assert!(names.contains(&&stage_metrics::StageName::ReaderInit));
+        assert!(names.contains(&&stage_metrics::StageName::Compile));
+        assert!(names.contains(&&stage_metrics::StageName::SchemaScan));
     }
 
     #[test]
@@ -3541,6 +3572,189 @@ transformations: []
             .record(stage_metrics::StageTimer::new(stage_metrics::StageName::Compile).finish(0, 0));
         let stages = collector.into_stages();
         assert_eq!(stages.len(), 1);
+    }
+
+    #[test]
+    fn test_streaming_pipeline_has_compile_reader_schemascan_stages() {
+        let yaml = r#"
+pipeline:
+  name: passthrough
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: add_x
+    cxl: "emit x = 1"
+"#;
+        let csv = "name,age\nAlice,30\nBob,25\nCarol,28\nDave,31\nEve,22\n";
+        let (report, _output) = run_test_report(yaml, csv).unwrap();
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&stage_metrics::StageName::ReaderInit),
+            "Missing ReaderInit stage"
+        );
+        assert!(
+            names.contains(&&stage_metrics::StageName::Compile),
+            "Missing Compile stage"
+        );
+        assert!(
+            names.contains(&&stage_metrics::StageName::SchemaScan),
+            "Missing SchemaScan stage"
+        );
+        for stage in &report.stages {
+            assert!(
+                stage.elapsed > std::time::Duration::ZERO,
+                "Stage {:?} has zero elapsed",
+                stage.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage_order_matches_execution_sequence() {
+        let yaml = r#"
+pipeline:
+  name: passthrough
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations:
+  - name: add_x
+    cxl: "emit x = 1"
+"#;
+        let csv = "name,age\nAlice,30\nBob,25\n";
+        let (report, _output) = run_test_report(yaml, csv).unwrap();
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        let ri_pos = names
+            .iter()
+            .position(|n| **n == stage_metrics::StageName::ReaderInit)
+            .expect("ReaderInit missing");
+        let c_pos = names
+            .iter()
+            .position(|n| **n == stage_metrics::StageName::Compile)
+            .expect("Compile missing");
+        let ss_pos = names
+            .iter()
+            .position(|n| **n == stage_metrics::StageName::SchemaScan)
+            .expect("SchemaScan missing");
+        assert!(ri_pos < c_pos, "ReaderInit should come before Compile");
+        assert!(c_pos < ss_pos, "Compile should come before SchemaScan");
+    }
+
+    /// Helper: run a correlated pipeline and return the full report.
+    fn run_correlated_test_report(
+        yaml: &str,
+        csv_input: &str,
+    ) -> Result<(ExecutionReport, String), PipelineError> {
+        let config = crate::config::parse_config(yaml).unwrap();
+        let output_buf = crate::test_helpers::SharedBuffer::new();
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            config.outputs[0].name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(|v| crate::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+        };
+
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+        let output = output_buf.as_string();
+        Ok((report, output))
+    }
+
+    #[test]
+    fn test_correlated_pipeline_has_schemascan() {
+        let yaml = r#"
+pipeline:
+  name: correlated_test
+inputs:
+  - name: src
+    path: input.csv
+    type: csv
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+transformations:
+  - name: validate
+    cxl: |
+      emit emp_id = employee_id
+      emit val = value
+outputs:
+  - name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+        let csv = "employee_id,value\nA,10\nA,20\nB,30\nB,40\n";
+        let (report, _output) = run_correlated_test_report(yaml, csv).unwrap();
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&stage_metrics::StageName::SchemaScan),
+            "Missing SchemaScan stage in correlated pipeline"
+        );
+    }
+
+    #[test]
+    fn test_two_pass_pipeline_has_schemascan() {
+        let yaml = r#"
+pipeline:
+  name: two_pass_test
+inputs:
+  - name: primary
+    type: csv
+    path: input.csv
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+transformations:
+  - name: window_transform
+    cxl: |
+      emit dept_total = $window.sum(amount)
+    local_window:
+      group_by: [dept]
+"#;
+        let csv = "dept,amount\nA,10\nB,20\nA,30\n";
+        let (report, _output) = run_test_report(yaml, csv).unwrap();
+        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
+        assert!(
+            names.contains(&&stage_metrics::StageName::SchemaScan),
+            "Missing SchemaScan stage in two-pass pipeline"
+        );
     }
 
     #[test]
