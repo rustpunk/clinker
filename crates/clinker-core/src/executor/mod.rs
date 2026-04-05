@@ -21,6 +21,7 @@ use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCo
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
+use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
@@ -2791,15 +2792,58 @@ fn build_xml_writer_config(opts: Option<&crate::config::XmlOutputOptions>) -> Xm
     config
 }
 
+fn build_fw_writer_config(
+    opts: Option<&crate::config::FixedWidthOutputOptions>,
+) -> FixedWidthWriterConfig {
+    let mut config = FixedWidthWriterConfig::default();
+    if let Some(opts) = opts
+        && let Some(ref sep) = opts.line_separator
+    {
+        config.line_separator = sep.clone();
+    }
+    config
+}
+
+/// Extract `Vec<FieldDef>` from an output config's schema for fixed-width format.
+///
+/// Fixed-width output requires explicit schema with field definitions specifying
+/// field names, widths, and optionally start positions, justification, and padding.
+fn extract_output_field_defs(
+    output: &OutputConfig,
+) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
+    let schema_source = output.schema.as_ref().ok_or_else(|| {
+        PipelineError::Config(crate::config::ConfigError::Validation(
+            "fixed-width output format requires explicit schema with field definitions".into(),
+        ))
+    })?;
+    let def = match schema_source {
+        crate::config::SchemaSource::Inline(def) => def.clone(),
+        crate::config::SchemaSource::FilePath(path) => {
+            crate::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
+                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                    "failed to load output schema from '{path}': {e}",
+                )))
+            })?
+        }
+    };
+    def.fields.ok_or_else(|| {
+        PipelineError::Config(crate::config::ConfigError::Validation(
+            "fixed-width output schema must have 'fields' defined".into(),
+        ))
+    })
+}
+
 /// Build a writer factory closure for the given output format.
 ///
 /// The returned `WriterFactory` creates format writers wrapping a `CountingWriter`.
 /// For CSV with `repeat_header`, the first call creates a `HeaderCapturingCsvWriter`
 /// and subsequent calls replay the captured header via `write_preset_header`.
+/// For fixed-width, the factory captures pre-resolved `FieldDef`s from the output schema.
 fn build_writer_factory(
     format: &crate::config::OutputFormat,
     include_header: Option<bool>,
     repeat_header: bool,
+    field_defs: Option<Vec<clinker_record::schema_def::FieldDef>>,
 ) -> WriterFactory {
     match format {
         crate::config::OutputFormat::Csv(opts) => {
@@ -2857,13 +2901,18 @@ fn build_writer_factory(
                 )))
             })
         }
-        crate::config::OutputFormat::FixedWidth(_) => {
-            // Fixed-width writer dispatch deferred to Task 0.3
-            Box::new(|_counting_writer, _schema| {
-                Err(clinker_format::error::FormatError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "fixed-width writer not yet implemented",
-                )))
+        crate::config::OutputFormat::FixedWidth(opts) => {
+            let fw_config = build_fw_writer_config(opts.as_ref());
+            let fields = field_defs.expect(
+                "fixed-width writer factory requires field_defs — \
+                 build_format_writer must validate schema before calling",
+            );
+            Box::new(move |counting_writer, _schema| {
+                Ok(Box::new(FixedWidthWriter::new(
+                    counting_writer,
+                    fields.clone(),
+                    fw_config.clone(),
+                )?))
             })
         }
     }
@@ -2878,8 +2927,20 @@ fn build_format_writer(
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
 ) -> Result<Box<dyn FormatWriter>, PipelineError> {
+    // Extract field definitions for fixed-width output (requires explicit schema).
+    let field_defs = if matches!(output.format, crate::config::OutputFormat::FixedWidth(_)) {
+        Some(extract_output_field_defs(output)?)
+    } else {
+        None
+    };
+
     let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
-    let writer_factory = build_writer_factory(&output.format, output.include_header, repeat_header);
+    let writer_factory = build_writer_factory(
+        &output.format,
+        output.include_header,
+        repeat_header,
+        field_defs,
+    );
 
     if let Some(ref split) = output.split {
         let policy = build_split_policy(split);

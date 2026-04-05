@@ -7,6 +7,7 @@ use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
 /// Configuration for the fixed-width writer.
+#[derive(Clone)]
 pub struct FixedWidthWriterConfig {
     pub line_separator: LineSeparator,
 }

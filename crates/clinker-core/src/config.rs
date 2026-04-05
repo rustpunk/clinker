@@ -241,6 +241,10 @@ pub struct OutputConfig {
     /// Default: none (metadata stripped from output).
     #[serde(default, skip_serializing_if = "IncludeMetadata::is_none")]
     pub include_metadata: IncludeMetadata,
+    /// Explicit schema for output formats that require field definitions
+    /// (e.g., fixed-width output needs field names, widths, and positions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaSource>,
     /// File splitting configuration. When present, output is split into
     /// multiple files based on record count or byte size limits.
     #[serde(skip_serializing_if = "Option::is_none")]

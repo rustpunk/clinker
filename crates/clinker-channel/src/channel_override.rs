@@ -570,6 +570,7 @@ mod tests {
                 sort_order: None,
                 preserve_nulls: None,
                 include_metadata: Default::default(),
+                schema: None,
                 split: None,
                 format: OutputFormat::Csv(None),
                 notes: None,

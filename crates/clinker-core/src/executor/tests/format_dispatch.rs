@@ -33,9 +33,48 @@ fn xml_input(root: &str, record_el: &str, records: &[Vec<(&str, &str)>]) -> Curs
 }
 
 /// Construct minimal fixed-width input as in-memory bytes.
-#[allow(dead_code)]
 fn fixed_width_input(lines: &[&str]) -> Cursor<Vec<u8>> {
     Cursor::new(lines.join("\n").into_bytes())
+}
+
+/// Compute `Vec<FieldDef>` with `start` as running sum of preceding widths.
+///
+/// Fixed-width reader requires `start` on every `FieldDef`. This helper takes
+/// `(name, width, field_type)` tuples and produces positioned `FieldDef`s.
+fn compute_field_layout(
+    fields: &[(&str, usize, clinker_record::schema_def::FieldType)],
+) -> Vec<clinker_record::schema_def::FieldDef> {
+    let mut start = 0;
+    fields
+        .iter()
+        .map(|(name, width, ftype)| {
+            let field = clinker_record::schema_def::FieldDef {
+                name: name.to_string(),
+                field_type: Some(ftype.clone()),
+                start: Some(start),
+                width: Some(*width),
+                required: None,
+                format: None,
+                coerce: None,
+                default: None,
+                allowed_values: None,
+                alias: None,
+                inherits: None,
+                end: None,
+                justify: None,
+                pad: None,
+                trim: None,
+                truncation: None,
+                precision: None,
+                scale: None,
+                path: None,
+                drop: None,
+                record: None,
+            };
+            start += width;
+            field
+        })
+        .collect()
 }
 
 /// Build a PipelineRunParams with test defaults.
@@ -321,5 +360,141 @@ transformations: []
     assert!(
         output.contains("Charlie"),
         "output missing Charlie: {output}"
+    );
+}
+
+/// Fixed-width input with inline schema produces records through the executor.
+/// Constructs 2 fixed-width records with 2 fields (name: start=0 width=10, age: start=10 width=5),
+/// runs through a passthrough pipeline, verifies correct field extraction.
+#[test]
+fn test_format_dispatch_fixed_width_input_with_schema() {
+    let yaml = r#"
+pipeline:
+  name: fw-input-test
+
+inputs:
+  - name: src
+    type: fixed_width
+    path: input.dat
+    schema:
+      fields:
+        - name: name
+          type: string
+          start: 0
+          width: 10
+        - name: age
+          type: integer
+          start: 10
+          width: 5
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations: []
+"#;
+    let input_data = fixed_width_input(&["Alice     00030", "Bob       00025"]);
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    assert_eq!(counters.total_count, 2, "expected 2 records");
+    assert_eq!(counters.ok_count, 2);
+    assert_eq!(counters.dlq_count, 0);
+    assert!(dlq.is_empty());
+    assert!(output.contains("Alice"), "output missing Alice: {output}");
+    assert!(output.contains("Bob"), "output missing Bob: {output}");
+}
+
+/// Fixed-width output produces correctly aligned columns.
+/// CSV input → fixed-width output with inline schema, verify output has
+/// correct column widths and alignment.
+#[test]
+fn test_format_dispatch_fixed_width_output_produces_valid_data() {
+    let yaml = r#"
+pipeline:
+  name: fw-output-test
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: fixed_width
+    path: output.dat
+    schema:
+      fields:
+        - name: name
+          type: string
+          width: 10
+        - name: age
+          type: integer
+          width: 5
+    include_unmapped: true
+
+transformations: []
+"#;
+    let csv_input = "name,age\nAlice,30\nBob,25\n";
+    let input_data = Cursor::new(csv_input.as_bytes().to_vec());
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    assert_eq!(counters.total_count, 2, "expected 2 records");
+    assert_eq!(counters.ok_count, 2);
+
+    // Each line should be exactly 15 chars (10 for name + 5 for age)
+    let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected 2 fixed-width lines, got: {output}"
+    );
+    for line in &lines {
+        assert_eq!(
+            line.len(),
+            15,
+            "expected 15 chars per line, got {} for '{line}'",
+            line.len()
+        );
+    }
+    // First line: "Alice" left-justified in 10 chars, "30" right-justified in 5 chars
+    assert!(
+        lines[0].starts_with("Alice"),
+        "first line should start with Alice: '{}'",
+        lines[0]
+    );
+    assert!(
+        lines[0].ends_with("   30"),
+        "first line should end with right-justified '   30': '{}'",
+        lines[0]
+    );
+}
+
+/// Fixed-width input without schema returns a validation error.
+/// Config validation catches the missing schema early with an actionable message.
+#[test]
+fn test_format_dispatch_fixed_width_missing_schema_errors() {
+    let yaml = r#"
+pipeline:
+  name: fw-no-schema-test
+
+inputs:
+  - name: src
+    type: fixed_width
+    path: input.dat
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+
+transformations: []
+"#;
+    let input_data = fixed_width_input(&["Alice     00030"]);
+    let result = run_format_test(yaml, "src", input_data);
+    assert!(result.is_err(), "expected error for missing schema");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("schema") || err.contains("field"),
+        "error should mention schema requirement: {err}"
     );
 }
