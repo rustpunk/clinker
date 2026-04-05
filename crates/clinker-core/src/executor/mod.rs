@@ -2100,8 +2100,11 @@ impl PipelineExecutor {
     /// buffers in declaration order. Transform nodes evaluate a single CXL
     /// program per record.
     ///
-    /// Branch dispatch uses `rayon::join` (2 branches) or `rayon::scope`
-    /// with indexed `Vec<Option<Vec<Record>>>` (N branches).
+    /// Branch dispatch is sequential: each branch runs its transform chain
+    /// in topo order. Industry consensus (DataFusion, Polars, DuckDB, Flink)
+    /// is partition-level parallelism (par_iter_mut on chunks), not
+    /// branch-level fork-join — scheduling overhead exceeds benefit at
+    /// typical ETL branch sizes (2-4 branches, millisecond chains).
     #[allow(clippy::too_many_arguments)]
     fn execute_dag_branching(
         config: &PipelineConfig,
@@ -3151,6 +3154,7 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
 mod tests {
     mod branching;
     mod correlated_dlq;
+    mod format_dispatch;
     mod multi_output;
 
     use super::*;
