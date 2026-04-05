@@ -35,8 +35,8 @@ pub enum NodeExecutionReqs {
 
 /// Node in the execution plan DAG.
 ///
-/// Self-contained — owns all display and topology data. Execution-time details
-/// (window_index, partition_lookup) live in CompiledTransform, indexed by name.
+/// Self-contained — owns all display, topology, and execution-time data.
+/// The DAG is the single source of truth for pipeline structure.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlanNode {
@@ -48,6 +48,12 @@ pub enum PlanNode {
         parallelism_class: ParallelismClass,
         tier: u32,
         execution_reqs: NodeExecutionReqs,
+        /// Index into `ExecutionPlanDag.indices_to_build`, if this transform uses windows.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window_index: Option<usize>,
+        /// How to look up the partition for this transform's window.
+        #[serde(skip)]
+        partition_lookup: Option<PartitionLookupKind>,
     },
     Route {
         name: String,
@@ -152,9 +158,6 @@ pub struct ExecutionPlanDag {
     pub source_dag: Vec<SourceTier>,
     /// Indices to build during Phase 1. Deduplicated.
     pub indices_to_build: Vec<IndexSpec>,
-    /// Per-transform execution units with compiled CXL and classification.
-    /// Kept for backward compat with executor until Task 15.4 rewrites it.
-    pub transforms: Vec<TransformPlan>,
     /// Per-output projection rules.
     pub output_projections: Vec<OutputSpec>,
     /// Parallelism profile for the pipeline.
@@ -172,6 +175,37 @@ impl ExecutionPlanDag {
     /// Whether any node requires sorted input (correlation key).
     pub fn required_sorted_input(&self) -> bool {
         self.correlation_sort_note.is_some() && !self.required_arena()
+    }
+
+    /// Get transform nodes in topological order.
+    ///
+    /// Returns `(window_index, partition_lookup)` per transform in topo order.
+    /// The executor uses this to look up per-transform window context.
+    pub fn transform_window_info(&self) -> Vec<(Option<usize>, Option<PartitionLookupKind>)> {
+        self.topo_order
+            .iter()
+            .filter_map(|&idx| match &self.graph[idx] {
+                PlanNode::Transform {
+                    window_index,
+                    partition_lookup,
+                    ..
+                } => Some((*window_index, partition_lookup.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get transform parallelism classes in topological order.
+    pub fn transform_parallelism_classes(&self) -> Vec<ParallelismClass> {
+        self.topo_order
+            .iter()
+            .filter_map(|&idx| match &self.graph[idx] {
+                PlanNode::Transform {
+                    parallelism_class, ..
+                } => Some(*parallelism_class),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether the DAG has in-pipeline branching (Route nodes with outgoing
@@ -291,43 +325,6 @@ impl ExecutionPlanDag {
 
         let indices = index::deduplicate_indices(raw_requests.clone());
 
-        // Phase F: build transform plans (backward compat for executor)
-        let transforms: Vec<TransformPlan> = compiled
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _typed))| {
-                let analysis = &report.transforms[i];
-                let wc = &window_configs[i];
-
-                let parallelism_class = derive_parallelism_class(analysis, wc, &primary_source);
-
-                let window_index = if let Some(wc) = wc {
-                    let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
-                    index::find_index_for(&indices, &source, &wc.group_by, &wc.sort_by)
-                } else {
-                    None
-                };
-
-                let partition_lookup = wc.as_ref().map(|wc| {
-                    let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
-                    if source == primary_source && wc.on.is_none() {
-                        PartitionLookupKind::SameSource
-                    } else {
-                        PartitionLookupKind::CrossSource {
-                            on_expr: wc.on.clone(),
-                        }
-                    }
-                });
-
-                TransformPlan {
-                    name: name.to_string(),
-                    parallelism_class,
-                    window_index,
-                    partition_lookup,
-                }
-            })
-            .collect();
-
         // Build source DAG
         let source_dag = build_source_dag(config, &window_configs, &primary_source)?;
 
@@ -342,17 +339,6 @@ impl ExecutionPlanDag {
                 include_unmapped: o.include_unmapped,
             })
             .collect();
-
-        // Build parallelism profile
-        let parallelism = ParallelismProfile {
-            per_transform: transforms.iter().map(|t| t.parallelism_class).collect(),
-            worker_threads: config
-                .pipeline
-                .concurrency
-                .as_ref()
-                .and_then(|c| c.threads)
-                .unwrap_or(4),
-        };
 
         // --- Build the petgraph DAG ---
         // Phase 1: Add all nodes. Phase 2: Wire all edges.
@@ -404,6 +390,24 @@ impl ExecutionPlanDag {
                 NodeExecutionReqs::Streaming
             };
 
+            let window_index = if let Some(wc) = wc {
+                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
+                index::find_index_for(&indices, &source, &wc.group_by, &wc.sort_by)
+            } else {
+                None
+            };
+
+            let partition_lookup = wc.as_ref().map(|wc| {
+                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
+                if source == primary_source && wc.on.is_none() {
+                    PartitionLookupKind::SameSource
+                } else {
+                    PartitionLookupKind::CrossSource {
+                        on_expr: wc.on.clone(),
+                    }
+                }
+            });
+
             add_node(
                 &mut graph,
                 PlanNode::Transform {
@@ -411,6 +415,8 @@ impl ExecutionPlanDag {
                     parallelism_class,
                     tier: 0, // assigned later via BFS
                     execution_reqs,
+                    window_index,
+                    partition_lookup,
                 },
                 &mut node_by_name,
                 &mut slug_set,
@@ -588,12 +594,30 @@ impl ExecutionPlanDag {
         // Assign tiers via BFS: each node's tier = max(predecessor tiers) + 1
         assign_tiers(&mut graph, &topo_order);
 
+        // Build parallelism profile from DAG graph nodes
+        let parallelism = ParallelismProfile {
+            per_transform: topo_order
+                .iter()
+                .filter_map(|&idx| match &graph[idx] {
+                    PlanNode::Transform {
+                        parallelism_class, ..
+                    } => Some(*parallelism_class),
+                    _ => None,
+                })
+                .collect(),
+            worker_threads: config
+                .pipeline
+                .concurrency
+                .as_ref()
+                .and_then(|c| c.threads)
+                .unwrap_or(4),
+        };
+
         Ok(ExecutionPlanDag {
             graph,
             topo_order,
             source_dag,
             indices_to_build: indices,
-            transforms,
             output_projections,
             parallelism,
             correlation_sort_note: None,
@@ -610,7 +634,12 @@ impl ExecutionPlanDag {
             "Indices to build: {}\n",
             self.indices_to_build.len()
         ));
-        out.push_str(&format!("Transforms: {}\n", self.transforms.len()));
+        let transform_count = self
+            .graph
+            .node_weights()
+            .filter(|n| matches!(n, PlanNode::Transform { .. }))
+            .count();
+        out.push_str(&format!("Transforms: {}\n", transform_count));
         out.push_str(&format!(
             "Output projections: {}\n",
             self.output_projections.len()
@@ -645,14 +674,20 @@ impl ExecutionPlanDag {
             out.push_str(&format!("  Already sorted: {}\n\n", spec.already_sorted));
         }
 
-        for tp in &self.transforms {
-            out.push_str(&format!("Transform '{}':\n", tp.name));
-            out.push_str(&format!("  Parallelism: {:?}\n", tp.parallelism_class));
-            out.push_str(&format!("  Window index: {:?}\n", tp.window_index));
-            out.push_str(&format!(
-                "  Partition lookup: {:?}\n\n",
-                tp.partition_lookup
-            ));
+        for node in self.graph.node_weights() {
+            if let PlanNode::Transform {
+                name,
+                parallelism_class,
+                window_index,
+                partition_lookup,
+                ..
+            } = node
+            {
+                out.push_str(&format!("Transform '{name}':\n"));
+                out.push_str(&format!("  Parallelism: {parallelism_class:?}\n"));
+                out.push_str(&format!("  Window index: {window_index:?}\n"));
+                out.push_str(&format!("  Partition lookup: {partition_lookup:?}\n\n"));
+            }
         }
 
         // Show route info from graph nodes
@@ -707,11 +742,12 @@ impl ExecutionPlanDag {
 
         // Type annotations (inferred types per output field)
         out.push_str("=== Type Annotations ===\n\n");
-        for tp in &self.transforms {
-            out.push_str(&format!(
-                "Transform '{}': (types inferred at compile time)\n",
-                tp.name
-            ));
+        for node in self.graph.node_weights() {
+            if let PlanNode::Transform { name, .. } = node {
+                out.push_str(&format!(
+                    "Transform '{name}': (types inferred at compile time)\n"
+                ));
+            }
         }
         out.push('\n');
 
@@ -1011,17 +1047,6 @@ pub struct SourceTier {
     pub sources: Vec<String>,
 }
 
-/// Per-transform execution unit.
-#[derive(Debug, Clone)]
-pub struct TransformPlan {
-    pub name: String,
-    pub parallelism_class: ParallelismClass,
-    /// Index into `ExecutionPlanDag.indices_to_build`, if this transform uses windows.
-    pub window_index: Option<usize>,
-    /// How to look up the partition for this transform's window.
-    pub partition_lookup: Option<PartitionLookupKind>,
-}
-
 /// How to look up a record's partition during Phase 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionLookupKind {
@@ -1312,11 +1337,9 @@ mod tests {
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert!(plan.indices_to_build.is_empty());
-        assert_eq!(plan.transforms.len(), 1);
-        assert_eq!(
-            plan.transforms[0].parallelism_class,
-            ParallelismClass::Stateless
-        );
+        let classes = plan.transform_parallelism_classes();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0], ParallelismClass::Stateless);
         assert_eq!(plan.execution_summary(), "Streaming");
     }
 
@@ -1365,8 +1388,9 @@ mod tests {
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(plan.indices_to_build.len(), 1, "should share one index");
-        assert_eq!(plan.transforms[0].window_index, Some(0));
-        assert_eq!(plan.transforms[1].window_index, Some(0));
+        let wi = plan.transform_window_info();
+        assert_eq!(wi[0].0, Some(0));
+        assert_eq!(wi[1].0, Some(0));
     }
 
     #[test]
@@ -1411,7 +1435,7 @@ mod tests {
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(
-            plan.transforms[0].parallelism_class,
+            plan.transform_parallelism_classes()[0],
             ParallelismClass::Stateless
         );
     }
@@ -1430,7 +1454,7 @@ mod tests {
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(
-            plan.transforms[0].parallelism_class,
+            plan.transform_parallelism_classes()[0],
             ParallelismClass::IndexReading
         );
     }
@@ -1452,7 +1476,7 @@ mod tests {
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
         assert_eq!(
-            plan.transforms[0].parallelism_class,
+            plan.transform_parallelism_classes()[0],
             ParallelismClass::Sequential
         );
     }

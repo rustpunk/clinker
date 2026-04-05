@@ -845,3 +845,23 @@ fn test_explain_linear_unchanged() {
         "linear pipeline should not show MERGE"
     );
 }
+
+/// Bare --explain defaults to text format: explain_text() produces non-empty
+/// output with the standard section headers.
+#[test]
+fn test_explain_default_format_text() {
+    let config = parse_fixture(linear_fixture_yaml());
+    let plan = compile_fixture(&config, &["amount"]);
+    let text = plan.explain_text(&config);
+
+    // Default text format must contain the standard sections
+    assert!(!text.is_empty(), "text output must not be empty");
+    assert!(
+        text.contains("=== Execution Plan ==="),
+        "must contain Execution Plan header"
+    );
+    assert!(
+        text.contains("=== DAG Topology ==="),
+        "must contain DAG Topology header"
+    );
+}

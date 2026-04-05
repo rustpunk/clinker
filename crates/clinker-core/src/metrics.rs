@@ -51,7 +51,7 @@ pub struct ExecutionMetrics {
     pub records_ok: u64,
     /// Records routed to the DLQ.
     pub records_dlq: u64,
-    /// Execution mode: `"Streaming"` or `"TwoPass"`.
+    /// DAG-derived execution summary from `ExecutionReport.execution_summary`.
     pub execution_mode: String,
     /// Peak process RSS in bytes observed across chunk boundaries.
     /// Measured on Linux, macOS, and Windows. `null` only on unsupported
