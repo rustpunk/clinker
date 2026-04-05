@@ -73,6 +73,8 @@ pub struct ExecutionReport {
     pub started_at: DateTime<Utc>,
     /// Wall-clock time immediately after the last write and flush completed.
     pub finished_at: DateTime<Utc>,
+    /// Per-stage instrumentation metrics, ordered by execution sequence.
+    pub stages: Vec<stage_metrics::StageMetrics>,
 }
 
 /// Dummy storage type for streaming (no-window) evaluation.
@@ -542,6 +544,8 @@ impl PipelineExecutor {
             }
         }
 
+        let mut collector = stage_metrics::StageCollector::default();
+
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
             format_reader,
@@ -551,6 +555,7 @@ impl PipelineExecutor {
             &plan,
             params,
             effective_sort_order.as_deref(),
+            &mut collector,
         )?;
 
         Ok(ExecutionReport {
@@ -562,6 +567,7 @@ impl PipelineExecutor {
             peak_rss_bytes,
             started_at,
             finished_at: Utc::now(),
+            stages: collector.into_stages(),
         })
     }
 
@@ -903,6 +909,7 @@ impl PipelineExecutor {
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
         effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
+        collector: &mut stage_metrics::StageCollector,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
         let primary_output = &config.outputs[0];
@@ -1397,6 +1404,7 @@ impl PipelineExecutor {
                 params,
                 &mut counters,
                 &mut dlq_entries,
+                collector,
             );
         }
 
@@ -2051,6 +2059,7 @@ impl PipelineExecutor {
         params: &PipelineRunParams,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
+        _collector: &mut stage_metrics::StageCollector,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
@@ -3461,6 +3470,77 @@ mod tests {
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
+    }
+
+    /// Helper: run executor with in-memory CSV and return the full ExecutionReport.
+    fn run_test_report(
+        yaml: &str,
+        csv_input: &str,
+    ) -> Result<(ExecutionReport, String), PipelineError> {
+        let config = crate::config::parse_config(yaml).unwrap();
+        let output_buf = crate::test_helpers::SharedBuffer::new();
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            config.outputs[0].name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(|v| crate::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+        };
+
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+
+        let output = output_buf.as_string();
+        Ok((report, output))
+    }
+
+    #[test]
+    fn test_execution_report_has_stages_field() {
+        let yaml = r#"
+pipeline:
+  name: identity
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+
+transformations: []
+"#;
+        let csv = "name,age\nAlice,30\nBob,25\n";
+        let (report, _output) = run_test_report(yaml, csv).unwrap();
+        // No instrumentation yet — stages is empty until Tasks 1.2-1.4
+        assert!(report.stages.is_empty());
+    }
+
+    #[test]
+    fn test_execution_report_stages_from_collector() {
+        let mut collector = stage_metrics::StageCollector::default();
+        collector
+            .record(stage_metrics::StageTimer::new(stage_metrics::StageName::Compile).finish(0, 0));
+        let stages = collector.into_stages();
+        assert_eq!(stages.len(), 1);
     }
 
     #[test]
