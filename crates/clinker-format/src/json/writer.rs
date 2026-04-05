@@ -19,6 +19,7 @@ pub enum JsonOutputMode {
     Ndjson,
 }
 
+#[derive(Clone)]
 pub struct JsonWriterConfig {
     pub format: JsonOutputMode,
     pub pretty: bool,

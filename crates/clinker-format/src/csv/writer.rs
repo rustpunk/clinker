@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clinker_record::{Record, Schema, Value};
 
@@ -99,6 +99,53 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn flush(&mut self) -> Result<(), FormatError> {
         self.inner.flush()?;
         Ok(())
+    }
+}
+
+/// CSV writer wrapper that captures the header (schema + overflow fields)
+/// from the first record into shared state for replay on split rotation.
+///
+/// Only used by the CSV writer factory when splitting is enabled.
+/// Subsequent split files receive the captured header via `write_preset_header()`.
+/// Non-CSV formats do not need this — their factories are stateless.
+pub struct HeaderCapturingCsvWriter<W: Write> {
+    inner: CsvWriter<W>,
+    schema: Arc<Schema>,
+    shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
+    captured: bool,
+}
+
+impl<W: Write> HeaderCapturingCsvWriter<W> {
+    pub fn new(
+        inner: CsvWriter<W>,
+        schema: Arc<Schema>,
+        shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
+    ) -> Self {
+        Self {
+            inner,
+            schema,
+            shared_header,
+            captured: false,
+        }
+    }
+}
+
+impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        if !self.captured {
+            // Capture header: schema columns + overflow fields from first record
+            let mut header: Vec<Box<str>> = self.schema.columns().to_vec();
+            if let Some(overflow) = record.overflow_fields() {
+                header.extend(overflow.map(|(k, _)| Box::from(k)));
+            }
+            *self.shared_header.lock().unwrap() = Some(header);
+            self.captured = true;
+        }
+        self.inner.write_record(record)
+    }
+
+    fn flush(&mut self) -> Result<(), FormatError> {
+        self.inner.flush()
     }
 }
 

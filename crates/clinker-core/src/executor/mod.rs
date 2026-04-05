@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufWriter, Read, Write};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
@@ -16,17 +17,20 @@ use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
 use crate::plan::execution::{ExecutionPlanDag, ParallelismClass, PlanNode};
 use crate::projection::{project_output, project_output_with_meta};
+use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
-use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
+use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
 };
-use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter};
+use clinker_format::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+use clinker_format::splitting::{OversizeGroupPolicy, SplitPolicy, SplittingWriter, WriterFactory};
 use clinker_format::traits::{FormatReader, FormatWriter};
 use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
 };
+use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use cxl::ast::Statement;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, WallClock};
 use cxl::typecheck::{Type, TypedProgram};
@@ -216,27 +220,7 @@ fn spawn_writer_threads(
             let handle = std::thread::Builder::new()
                 .name(format!("cxl-writer-{name}"))
                 .spawn(move || {
-                    let writer_config = build_writer_config(&config);
-
-                    let mut writer: Box<dyn FormatWriter> = if let Some(ref split) = config.split {
-                        let policy = build_split_policy(split);
-                        let output_path = config.path.clone();
-                        let naming = split.naming.clone();
-
-                        let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                            let path = apply_split_naming(&output_path, &naming, seq);
-                            let file = std::fs::File::create(path)?;
-                            Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                        };
-
-                        // SplittingWriter creates its own files; don't use raw_writer.
-                        drop(raw_writer);
-
-                        Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-                    } else {
-                        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
-                        Box::new(CsvWriter::new(buf_writer, schema, writer_config))
-                    };
+                    let mut writer = build_format_writer(&config, raw_writer, schema)?;
 
                     loop {
                         crossbeam_channel::select! {
@@ -1308,32 +1292,13 @@ impl PipelineExecutor {
             } else {
                 // Single-output path
                 let output = primary_output;
-                let writer_config = build_writer_config(output);
                 let raw_writer = writers
                     .into_iter()
                     .next()
                     .map(|(_, w)| w)
                     .expect("validated above");
-                let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
-                    let policy = build_split_policy(split);
-                    let output_path = output.path.clone();
-                    let naming = split.naming.clone();
-                    let schema = Arc::clone(&final_output_schema);
-                    let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                        let path = apply_split_naming(&output_path, &naming, seq);
-                        let file = std::fs::File::create(path)?;
-                        Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                    };
-                    drop(raw_writer);
-                    Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-                } else {
-                    let writer = BufWriter::with_capacity(65536, raw_writer);
-                    Box::new(CsvWriter::new(
-                        writer,
-                        Arc::clone(&final_output_schema),
-                        writer_config,
-                    ))
-                };
+                let mut csv_writer =
+                    build_format_writer(output, raw_writer, Arc::clone(&final_output_schema))?;
 
                 // Write first emitted record
                 if let Some((record, emitted, metadata)) = first_emitted {
@@ -1618,34 +1583,14 @@ impl PipelineExecutor {
                 drop(output_channels);
             } else {
                 // Single-output correlated path
-                let writer_config = build_writer_config(primary_output);
                 let raw_writer = writers
                     .into_iter()
                     .next()
                     .map(|(_, w)| w)
                     .expect("at least one writer");
 
-                let mut csv_writer: Box<dyn FormatWriter> =
-                    if let Some(ref split) = primary_output.split {
-                        let policy = build_split_policy(split);
-                        let output_path = primary_output.path.clone();
-                        let naming = split.naming.clone();
-                        let schema = Arc::clone(&output_schema);
-                        let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                            let path = apply_split_naming(&output_path, &naming, seq);
-                            let file = std::fs::File::create(path)?;
-                            Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                        };
-                        drop(raw_writer);
-                        Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-                    } else {
-                        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
-                        Box::new(CsvWriter::new(
-                            buf_writer,
-                            Arc::clone(&output_schema),
-                            writer_config,
-                        ))
-                    };
+                let mut csv_writer =
+                    build_format_writer(primary_output, raw_writer, Arc::clone(&output_schema))?;
 
                 let mut group_buffer: Vec<(Record, u64)> = Vec::new();
                 let mut current_key: Option<Vec<GroupByKey>> = None;
@@ -1986,33 +1931,14 @@ impl PipelineExecutor {
         } else {
             // Single-output streaming path
             let output = primary_output;
-            let writer_config = build_writer_config(output);
             let raw_writer = writers
                 .into_iter()
                 .next()
                 .map(|(_, w)| w)
                 .expect("validated above");
 
-            let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) = output.split {
-                let policy = build_split_policy(split);
-                let output_path = output.path.clone();
-                let naming = split.naming.clone();
-                let schema = Arc::clone(&output_schema);
-                let factory = move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                    let path = apply_split_naming(&output_path, &naming, seq);
-                    let file = std::fs::File::create(path)?;
-                    Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                };
-                drop(raw_writer);
-                Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-            } else {
-                let writer = BufWriter::with_capacity(65536, raw_writer);
-                Box::new(CsvWriter::new(
-                    writer,
-                    Arc::clone(&output_schema),
-                    writer_config,
-                ))
-            };
+            let mut csv_writer =
+                build_format_writer(output, raw_writer, Arc::clone(&output_schema))?;
 
             // Process pending skips and errors from scan-forward phase
             for (rn, record, result) in pending_skips_and_errors {
@@ -2438,32 +2364,9 @@ impl PipelineExecutor {
                     };
 
                     // Find and take the writer for this output
-                    let writer_config = build_writer_config(out_cfg);
-
                     if let Some(raw_writer) = writers.remove(name) {
-                        let mut csv_writer: Box<dyn FormatWriter> = if let Some(ref split) =
-                            out_cfg.split
-                        {
-                            let policy = build_split_policy(split);
-                            let output_path = out_cfg.path.clone();
-                            let naming = split.naming.clone();
-                            let schema = Arc::clone(&output_schema);
-                            let factory =
-                                move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                                    let path = apply_split_naming(&output_path, &naming, seq);
-                                    let file = std::fs::File::create(path)?;
-                                    Ok(Box::new(BufWriter::with_capacity(65536, file)))
-                                };
-                            drop(raw_writer);
-                            Box::new(SplittingWriter::new(factory, schema, writer_config, policy))
-                        } else {
-                            let writer = BufWriter::with_capacity(65536, raw_writer);
-                            Box::new(CsvWriter::new(
-                                writer,
-                                Arc::clone(&output_schema),
-                                writer_config,
-                            ))
-                        };
+                        let mut csv_writer =
+                            build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema))?;
 
                         for (record, _rn, emitted, metadata) in &input_records {
                             let projected =
@@ -2839,19 +2742,176 @@ fn build_fw_reader_config(
     config
 }
 
-/// Build a CsvWriterConfig from the output config options.
-fn build_writer_config(output: &OutputConfig) -> CsvWriterConfig {
+/// Build a CsvWriterConfig from CSV output options and the top-level include_header flag.
+fn build_csv_writer_config(
+    opts: Option<&crate::config::CsvOutputOptions>,
+    include_header: Option<bool>,
+) -> CsvWriterConfig {
     let mut config = CsvWriterConfig::default();
-    if let Some(h) = output.include_header {
+    if let Some(h) = include_header {
         config.include_header = h;
     }
-    if let crate::config::OutputFormat::Csv(Some(ref opts)) = output.format
+    if let Some(opts) = opts
         && let Some(ref d) = opts.delimiter
         && let Some(b) = d.as_bytes().first()
     {
         config.delimiter = *b;
     }
     config
+}
+
+/// Build a JsonWriterConfig from JSON output options.
+fn build_json_writer_config(opts: Option<&crate::config::JsonOutputOptions>) -> JsonWriterConfig {
+    let mut config = JsonWriterConfig::default();
+    if let Some(opts) = opts {
+        if let Some(ref fmt) = opts.format {
+            config.format = match fmt {
+                crate::config::JsonOutputFormat::Array => JsonOutputMode::Array,
+                crate::config::JsonOutputFormat::Ndjson => JsonOutputMode::Ndjson,
+            };
+        }
+        if let Some(pretty) = opts.pretty {
+            config.pretty = pretty;
+        }
+    }
+    config
+}
+
+/// Build an XmlWriterConfig from XML output options.
+fn build_xml_writer_config(opts: Option<&crate::config::XmlOutputOptions>) -> XmlWriterConfig {
+    let mut config = XmlWriterConfig::default();
+    if let Some(opts) = opts {
+        if let Some(ref root) = opts.root_element {
+            config.root_element = root.clone();
+        }
+        if let Some(ref rec) = opts.record_element {
+            config.record_element = rec.clone();
+        }
+    }
+    config
+}
+
+/// Build a writer factory closure for the given output format.
+///
+/// The returned `WriterFactory` creates format writers wrapping a `CountingWriter`.
+/// For CSV with `repeat_header`, the first call creates a `HeaderCapturingCsvWriter`
+/// and subsequent calls replay the captured header via `write_preset_header`.
+fn build_writer_factory(
+    format: &crate::config::OutputFormat,
+    include_header: Option<bool>,
+    repeat_header: bool,
+) -> WriterFactory {
+    match format {
+        crate::config::OutputFormat::Csv(opts) => {
+            let csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            if repeat_header {
+                let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
+                let call_count = Arc::new(AtomicU32::new(0));
+                Box::new(move |counting_writer, schema| {
+                    let seq = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let inner_csv =
+                        CsvWriter::new(counting_writer, schema.clone(), csv_config.clone());
+                    if seq == 0 {
+                        // First file: capture header from first record
+                        Ok(Box::new(HeaderCapturingCsvWriter::new(
+                            inner_csv,
+                            schema,
+                            Arc::clone(&shared_header),
+                        )))
+                    } else {
+                        // Subsequent files: replay captured header
+                        let mut csv = inner_csv;
+                        if let Some(header) = shared_header.lock().unwrap().as_ref() {
+                            csv.write_preset_header(header)?;
+                        }
+                        Ok(Box::new(csv))
+                    }
+                })
+            } else {
+                Box::new(move |counting_writer, schema| {
+                    Ok(Box::new(CsvWriter::new(
+                        counting_writer,
+                        schema,
+                        csv_config.clone(),
+                    )))
+                })
+            }
+        }
+        crate::config::OutputFormat::Json(opts) => {
+            let json_config = build_json_writer_config(opts.as_ref());
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(JsonWriter::new(
+                    counting_writer,
+                    schema,
+                    json_config.clone(),
+                )))
+            })
+        }
+        crate::config::OutputFormat::Xml(opts) => {
+            let xml_config = build_xml_writer_config(opts.as_ref());
+            Box::new(move |counting_writer, schema| {
+                Ok(Box::new(XmlWriter::new(
+                    counting_writer,
+                    schema,
+                    xml_config.clone(),
+                )))
+            })
+        }
+        crate::config::OutputFormat::FixedWidth(_) => {
+            // Fixed-width writer dispatch deferred to Task 0.3
+            Box::new(|_counting_writer, _schema| {
+                Err(clinker_format::error::FormatError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "fixed-width writer not yet implemented",
+                )))
+            })
+        }
+    }
+}
+
+/// Build a format writer for an output config, handling both split and non-split paths.
+///
+/// For split outputs: creates a `SplittingWriter` with a file factory and writer factory.
+/// For non-split outputs: creates a single writer wrapped in `CountedFormatWriter`.
+fn build_format_writer(
+    output: &OutputConfig,
+    raw_writer: Box<dyn Write + Send>,
+    schema: Arc<Schema>,
+) -> Result<Box<dyn FormatWriter>, PipelineError> {
+    let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
+    let writer_factory = build_writer_factory(&output.format, output.include_header, repeat_header);
+
+    if let Some(ref split) = output.split {
+        let policy = build_split_policy(split);
+        let output_path = output.path.clone();
+        let naming = split.naming.clone();
+
+        let file_factory: clinker_format::splitting::FileFactory =
+            Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
+                let path = apply_split_naming(&output_path, &naming, seq);
+                let file = std::fs::File::create(path)?;
+                Ok(Box::new(BufWriter::with_capacity(65536, file)))
+            });
+
+        // SplittingWriter creates its own files; don't use raw_writer.
+        drop(raw_writer);
+
+        Ok(Box::new(SplittingWriter::new(
+            file_factory,
+            writer_factory,
+            schema,
+            policy,
+        )))
+    } else {
+        let buf_writer = BufWriter::with_capacity(65536, raw_writer);
+        let counter = SharedByteCounter::new();
+        let counting_writer = CountingWriter::new(
+            Box::new(buf_writer) as Box<dyn Write + Send>,
+            counter.clone(),
+        );
+        let inner = writer_factory(counting_writer, schema).map_err(PipelineError::Format)?;
+        Ok(Box::new(CountedFormatWriter::new(inner, counter)))
+    }
 }
 
 /// Convert serde `SplitConfig` to runtime `SplitPolicy`.

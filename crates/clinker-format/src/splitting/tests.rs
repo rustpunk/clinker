@@ -1,7 +1,7 @@
-//! Phase 14 splitting tests — `SplittingWriter` and `CountingWriter`.
+//! Splitting tests — `SplittingWriter` format-agnostic rotation.
 //!
 //! Tests: record count splitting, byte size splitting, key-group preservation,
-//! oversize group policies, CSV header repetition, file naming, CountingWriter accuracy.
+//! oversize group policies, CSV header repetition, file naming, byte counting accuracy.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use clinker_record::{Record, Schema, Value};
 
 use super::*;
-use crate::csv::writer::CsvWriterConfig;
+use crate::counting::{CountingWriter, SharedByteCounter};
+use crate::csv::writer::{CsvWriter, CsvWriterConfig};
 use crate::traits::FormatWriter;
 
 // ---------------------------------------------------------------------------
@@ -57,13 +58,13 @@ impl FileRegistry {
         }
     }
 
-    fn factory(&self) -> impl Fn(u32) -> io::Result<Box<dyn Write + Send>> + Send {
+    fn file_factory(&self) -> FileFactory {
         let files = Arc::clone(&self.files);
-        move |_seq: u32| -> io::Result<Box<dyn Write + Send>> {
+        Box::new(move |_seq: u32| -> io::Result<Box<dyn Write + Send>> {
             let buf = SharedBuffer::new();
             files.lock().unwrap().push(buf.clone());
             Ok(Box::new(buf))
-        }
+        })
     }
 
     fn file_count(&self) -> usize {
@@ -79,6 +80,7 @@ impl FileRegistry {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn file_bytes(&self) -> Vec<usize> {
         self.files
             .lock()
@@ -97,8 +99,49 @@ fn make_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
     Record::new(Arc::clone(schema), values)
 }
 
-fn default_csv_config() -> CsvWriterConfig {
-    CsvWriterConfig::default()
+/// Build a CSV writer factory with header capture support.
+///
+/// Creates `HeaderCapturingCsvWriter` on first call (captures header from
+/// first record into shared state). Subsequent calls create a `CsvWriter`
+/// and replay the captured header via `write_preset_header()`.
+fn csv_writer_factory(config: CsvWriterConfig, repeat_header: bool) -> WriterFactory {
+    let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
+    let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    Box::new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: Arc<Schema>| {
+            let seq = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seq == 0 {
+                // First file: use HeaderCapturingCsvWriter to capture header
+                use crate::csv::writer::HeaderCapturingCsvWriter;
+                let csv = CsvWriter::new(counting, Arc::clone(&schema), config.clone());
+                Ok(Box::new(HeaderCapturingCsvWriter::new(
+                    csv,
+                    Arc::clone(&schema),
+                    Arc::clone(&shared_header),
+                )) as Box<dyn FormatWriter>)
+            } else {
+                // Subsequent files: replay captured header
+                let mut csv = CsvWriter::new(counting, Arc::clone(&schema), config.clone());
+                if repeat_header {
+                    if let Some(ref header) = *shared_header.lock().unwrap() {
+                        csv.write_preset_header(header)?;
+                    }
+                }
+                Ok(Box::new(csv) as Box<dyn FormatWriter>)
+            }
+        },
+    )
+}
+
+/// Build a simple CSV writer factory (no header capture — for tests with `include_header: false`).
+fn csv_writer_factory_simple(config: CsvWriterConfig) -> WriterFactory {
+    Box::new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: Arc<Schema>| {
+            let csv = CsvWriter::new(counting, schema, config.clone());
+            Ok(Box::new(csv) as Box<dyn FormatWriter>)
+        },
+    )
 }
 
 fn count_csv_data_rows(csv_text: &str) -> usize {
@@ -116,25 +159,29 @@ fn count_csv_data_rows(csv_text: &str) -> usize {
 
 #[test]
 fn test_counting_writer_accuracy() {
+    let counter = SharedByteCounter::new();
     let mut buf = Vec::new();
-    let mut cw = CountingWriter::new(&mut buf);
+    let mut cw = CountingWriter::new(&mut buf, counter.clone());
     let data1 = b"hello";
     let data2 = b" world";
     cw.write_all(data1).unwrap();
     cw.write_all(data2).unwrap();
     assert_eq!(cw.bytes_written(), 11);
+    assert_eq!(counter.bytes_written(), 11);
     assert_eq!(buf.len(), 11);
 }
 
 #[test]
 fn test_counting_writer_flush_on_rotation() {
+    let counter = SharedByteCounter::new();
     let buf = SharedBuffer::new();
-    let mut cw = CountingWriter::new(buf.clone());
+    let mut cw = CountingWriter::new(buf.clone(), counter.clone());
     cw.write_all(b"data before flush").unwrap();
     cw.flush().unwrap();
     // After flush, all data should be available
     assert_eq!(buf.byte_len(), 17);
     assert_eq!(cw.bytes_written(), 17);
+    assert_eq!(counter.bytes_written(), 17);
 }
 
 // ---------------------------------------------------------------------------
@@ -155,9 +202,9 @@ fn test_split_by_record_count() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -192,12 +239,12 @@ fn test_split_by_byte_size() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
-        Arc::clone(&schema),
-        CsvWriterConfig {
+        registry.file_factory(),
+        csv_writer_factory_simple(CsvWriterConfig {
             include_header: false,
-            ..default_csv_config()
-        },
+            ..CsvWriterConfig::default()
+        }),
+        Arc::clone(&schema),
         policy,
     );
 
@@ -237,9 +284,9 @@ fn test_split_preserves_key_groups() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -282,9 +329,9 @@ fn test_split_oversize_group_warn() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -317,9 +364,9 @@ fn test_split_oversize_group_error() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -356,9 +403,9 @@ fn test_split_csv_repeat_header() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -398,9 +445,9 @@ fn test_split_csv_header_consistent() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -438,9 +485,9 @@ fn test_split_csv_header_excluded_from_count() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -491,12 +538,12 @@ fn test_split_both_limits_either_triggers() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
-        Arc::clone(&schema),
-        CsvWriterConfig {
+        registry.file_factory(),
+        csv_writer_factory_simple(CsvWriterConfig {
             include_header: false,
-            ..default_csv_config()
-        },
+            ..CsvWriterConfig::default()
+        }),
+        Arc::clone(&schema),
         policy,
     );
 
@@ -527,12 +574,12 @@ fn test_split_no_group_key_mechanical() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
-        Arc::clone(&schema),
-        CsvWriterConfig {
+        registry.file_factory(),
+        csv_writer_factory_simple(CsvWriterConfig {
             include_header: false,
-            ..default_csv_config()
-        },
+            ..CsvWriterConfig::default()
+        }),
+        Arc::clone(&schema),
         policy,
     );
 
@@ -564,9 +611,9 @@ fn test_split_zero_records_no_file() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -592,12 +639,12 @@ fn test_split_null_key_treated_as_group() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
-        Arc::clone(&schema),
-        CsvWriterConfig {
+        registry.file_factory(),
+        csv_writer_factory_simple(CsvWriterConfig {
             include_header: false,
-            ..default_csv_config()
-        },
+            ..CsvWriterConfig::default()
+        }),
+        Arc::clone(&schema),
         policy,
     );
 
@@ -635,12 +682,12 @@ fn test_split_by_byte_size_only() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
-        Arc::clone(&schema),
-        CsvWriterConfig {
+        registry.file_factory(),
+        csv_writer_factory_simple(CsvWriterConfig {
             include_header: false,
-            ..default_csv_config()
-        },
+            ..CsvWriterConfig::default()
+        }),
+        Arc::clone(&schema),
         policy,
     );
 
@@ -677,9 +724,9 @@ fn test_split_single_record_one_file() {
     };
 
     let mut writer = SplittingWriter::new(
-        registry.factory(),
+        registry.file_factory(),
+        csv_writer_factory(CsvWriterConfig::default(), true),
         Arc::clone(&schema),
-        default_csv_config(),
         policy,
     );
 
@@ -689,6 +736,148 @@ fn test_split_single_record_one_file() {
 
     assert_eq!(registry.file_count(), 1);
     assert_eq!(count_csv_data_rows(&registry.file_contents()[0]), 1);
+}
+
+/// SplittingWriter with JSON NDJSON format produces valid JSON on each split file.
+/// Each file should be independently valid NDJSON (one JSON object per line).
+#[test]
+fn test_splitting_writer_json_produces_valid_files() {
+    use crate::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+
+    let schema = make_schema(&["id", "name"]);
+    let registry = FileRegistry::new();
+    let policy = SplitPolicy {
+        max_records: Some(3),
+        max_bytes: None,
+        group_key: None,
+        repeat_header: false,
+        oversize_group: OversizeGroupPolicy::default(),
+    };
+
+    let json_config = JsonWriterConfig {
+        format: JsonOutputMode::Ndjson,
+        pretty: false,
+        preserve_nulls: false,
+    };
+
+    let json_factory: WriterFactory = Box::new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: Arc<Schema>| {
+            Ok(
+                Box::new(JsonWriter::new(counting, schema, json_config.clone()))
+                    as Box<dyn FormatWriter>,
+            )
+        },
+    );
+
+    let mut writer = SplittingWriter::new(
+        registry.file_factory(),
+        json_factory,
+        Arc::clone(&schema),
+        policy,
+    );
+
+    // Write 7 records → should produce 3 files (3+3+1)
+    for i in 0..7 {
+        let record = make_record(
+            &schema,
+            vec![Value::Integer(i), Value::String(format!("name_{i}").into())],
+        );
+        writer.write_record(&record).unwrap();
+    }
+    writer.flush().unwrap();
+
+    assert_eq!(registry.file_count(), 3, "expected 3 split files");
+    let contents = registry.file_contents();
+
+    // Each file should contain valid NDJSON lines
+    let mut total_lines = 0;
+    for (idx, content) in contents.iter().enumerate() {
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert!(!lines.is_empty(), "file {idx} should not be empty");
+        for (li, line) in lines.iter().enumerate() {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
+            assert!(parsed.is_ok(), "file {idx} line {li} invalid JSON: {line}");
+            let obj = parsed.unwrap();
+            assert!(obj.is_object(), "file {idx} line {li} not an object");
+            assert!(obj.get("id").is_some(), "missing 'id' field");
+            assert!(obj.get("name").is_some(), "missing 'name' field");
+        }
+        total_lines += lines.len();
+    }
+    assert_eq!(total_lines, 7, "total records across all files");
+}
+
+/// SplittingWriter with XML format produces valid XML files on rotation.
+/// Each split file must have proper root element open/close tags.
+#[test]
+fn test_splitting_writer_xml_produces_valid_files() {
+    use crate::xml::writer::{XmlWriter, XmlWriterConfig};
+
+    let schema = make_schema(&["id", "val"]);
+    let registry = FileRegistry::new();
+    let policy = SplitPolicy {
+        max_records: Some(3),
+        max_bytes: None,
+        group_key: None,
+        repeat_header: false,
+        oversize_group: OversizeGroupPolicy::default(),
+    };
+
+    let xml_config = XmlWriterConfig {
+        root_element: "items".into(),
+        record_element: "item".into(),
+        preserve_nulls: false,
+    };
+
+    let xml_factory: WriterFactory = Box::new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: Arc<Schema>| {
+            Ok(
+                Box::new(XmlWriter::new(counting, schema, xml_config.clone()))
+                    as Box<dyn FormatWriter>,
+            )
+        },
+    );
+
+    let mut writer = SplittingWriter::new(
+        registry.file_factory(),
+        xml_factory,
+        Arc::clone(&schema),
+        policy,
+    );
+
+    // Write 7 records → 3 files (3+3+1)
+    for i in 0..7 {
+        let record = make_record(
+            &schema,
+            vec![Value::Integer(i), Value::String(format!("v{i}").into())],
+        );
+        writer.write_record(&record).unwrap();
+    }
+    writer.flush().unwrap();
+
+    assert_eq!(registry.file_count(), 3, "expected 3 split files");
+    let contents = registry.file_contents();
+
+    for (idx, content) in contents.iter().enumerate() {
+        assert!(
+            content.contains("<items>"),
+            "file {idx} missing root open tag: {content}"
+        );
+        assert!(
+            content.contains("</items>"),
+            "file {idx} missing root close tag: {content}"
+        );
+        assert!(
+            content.contains("<item>"),
+            "file {idx} missing record element: {content}"
+        );
+    }
+
+    // Verify record counts: file 0 and 1 have 3 <item> each, file 2 has 1
+    let count_items = |s: &str| s.matches("<item>").count();
+    assert_eq!(count_items(&contents[0]), 3);
+    assert_eq!(count_items(&contents[1]), 3);
+    assert_eq!(count_items(&contents[2]), 1);
 }
 
 // Helper for test_split_naming_pattern — wraps the executor's apply_split_naming logic

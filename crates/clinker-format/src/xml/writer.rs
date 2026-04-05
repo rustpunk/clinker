@@ -12,6 +12,7 @@ use clinker_record::{Record, Schema, Value};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
+#[derive(Clone)]
 pub struct XmlWriterConfig {
     pub root_element: String,
     pub record_element: String,

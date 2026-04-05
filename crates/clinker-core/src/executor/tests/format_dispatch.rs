@@ -158,6 +158,138 @@ transformations: []
     assert!(output.contains("Bob"), "output missing Bob: {output}");
 }
 
+/// JSON NDJSON output produces valid newline-delimited JSON.
+/// CSV input → NDJSON output, verify each line parses as JSON.
+#[test]
+fn test_format_dispatch_json_output_produces_valid_ndjson() {
+    let yaml = r#"
+pipeline:
+  name: json-output-test
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: json
+    path: output.json
+    options:
+      format: ndjson
+    include_unmapped: true
+
+transformations: []
+"#;
+    let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
+    let input_data = Cursor::new(csv_input.as_bytes().to_vec());
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    assert_eq!(counters.total_count, 3, "expected 3 records");
+    assert_eq!(counters.ok_count, 3);
+
+    // Each non-empty line should parse as valid JSON
+    let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3, "expected 3 NDJSON lines, got: {output}");
+    for (i, line) in lines.iter().enumerate() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i} invalid JSON: {e}"));
+        assert!(parsed.is_object(), "line {i} should be JSON object");
+    }
+    // Verify field values
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["name"], "Alice");
+}
+
+/// XML output produces valid XML with configured root/record elements.
+/// CSV input → XML output, verify output parses as valid XML.
+#[test]
+fn test_format_dispatch_xml_output_produces_valid_xml() {
+    let yaml = r#"
+pipeline:
+  name: xml-output-test
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: xml
+    path: output.xml
+    options:
+      root_element: records
+      record_element: record
+    include_unmapped: true
+
+transformations: []
+"#;
+    let csv_input = "name,age\nAlice,30\nBob,25\n";
+    let input_data = Cursor::new(csv_input.as_bytes().to_vec());
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    assert_eq!(counters.total_count, 2, "expected 2 records");
+    assert_eq!(counters.ok_count, 2);
+
+    // Output should be valid XML containing records element
+    assert!(
+        output.contains("<records>"),
+        "missing root element: {output}"
+    );
+    assert!(
+        output.contains("</records>"),
+        "missing closing root: {output}"
+    );
+    assert!(
+        output.contains("<record>"),
+        "missing record element: {output}"
+    );
+    assert!(
+        output.contains("<name>Alice</name>"),
+        "missing Alice: {output}"
+    );
+    assert!(output.contains("<name>Bob</name>"), "missing Bob: {output}");
+}
+
+/// Cross-format: CSV input, JSON output.
+/// Verifies that input format ≠ output format works correctly.
+#[test]
+fn test_format_dispatch_csv_to_json_cross_format() {
+    let yaml = r#"
+pipeline:
+  name: csv-to-json-test
+
+inputs:
+  - name: src
+    type: csv
+    path: input.csv
+
+outputs:
+  - name: dest
+    type: json
+    path: output.json
+    options:
+      format: ndjson
+    include_unmapped: true
+
+transformations: []
+"#;
+    let csv_input = "id,value\n1,alpha\n2,beta\n3,gamma\n";
+    let input_data = Cursor::new(csv_input.as_bytes().to_vec());
+    let (counters, _dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    assert_eq!(counters.total_count, 3, "expected 3 records");
+    assert_eq!(counters.ok_count, 3);
+
+    // Parse each line and verify field values match input CSV
+    let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["id"], "1");
+    assert_eq!(first["value"], "alpha");
+    let third: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(third["id"], "3");
+    assert_eq!(third["value"], "gamma");
+}
+
 /// CSV input backward compatibility — existing behavior unchanged after dispatch refactor.
 #[test]
 fn test_format_dispatch_csv_input_backward_compat() {

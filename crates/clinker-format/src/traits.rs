@@ -21,4 +21,12 @@ pub trait FormatReader: Send {
 pub trait FormatWriter: Send {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError>;
     fn flush(&mut self) -> Result<(), FormatError>;
+
+    /// Bytes written to the underlying I/O sink since this writer was created.
+    /// Returns `None` if byte counting is not enabled for this writer.
+    /// Used by `SplittingWriter` for byte-limit rotation and by `StageMetrics`
+    /// for per-stage write accounting.
+    fn bytes_written(&self) -> Option<u64> {
+        None
+    }
 }

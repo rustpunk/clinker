@@ -1,62 +1,23 @@
-//! Output file splitting — `SplittingWriter` with key-group-preserving rotation.
+//! Output file splitting — format-agnostic `SplittingWriter` with key-group-preserving rotation.
 //!
-//! Wraps a `FormatWriter` inside the writer thread. Uses factory pattern
-//! to create new writer instances on rotation. Captures header from first
-//! file and reuses for all splits.
+//! Delegates format-specific concerns (headers, preambles, footers) entirely
+//! to the writer factory. On rotation: flush + drop current writer, create
+//! new file via file factory, create new format writer via writer factory.
+//!
+//! Architecture: Beam FileIO.Sink pattern — the splitter is a pure rotation
+//! orchestrator, the factory owns format lifecycle.
 
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, Value, value_to_group_key};
 
-use crate::csv::writer::{CsvWriter, CsvWriterConfig};
+use crate::counting::{CountingWriter, SharedByteCounter};
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
 #[cfg(test)]
 mod tests;
-
-// ---------------------------------------------------------------------------
-// CountingWriter
-// ---------------------------------------------------------------------------
-
-/// Counts bytes written through the inner writer.
-///
-/// Wraps `BufWriter` — counts format-output bytes (pre-buffer I/O).
-/// Flush mandatory on rotation (SO #23452660).
-pub struct CountingWriter<W: Write> {
-    inner: W,
-    bytes_written: u64,
-}
-
-impl<W: Write> CountingWriter<W> {
-    pub fn new(inner: W) -> Self {
-        Self {
-            inner,
-            bytes_written: 0,
-        }
-    }
-
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.bytes_written += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SplitPolicy + OversizeGroupPolicy
@@ -74,7 +35,8 @@ pub struct SplitPolicy {
     pub max_bytes: Option<u64>,
     /// Optional field name — never split mid-group.
     pub group_key: Option<String>,
-    /// CSV: repeat header row in each split file.
+    /// Repeat format-specific preamble (e.g. CSV header) in each split file.
+    /// Passed to the writer factory; SplittingWriter itself is format-agnostic.
     pub repeat_header: bool,
     /// Behavior when a single key group exceeds file limits.
     pub oversize_group: OversizeGroupPolicy,
@@ -93,29 +55,46 @@ pub enum OversizeGroupPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Type aliases for factory closures
+// ---------------------------------------------------------------------------
+
+/// Factory that creates a new raw I/O sink for each split file.
+/// `seq` is the 1-based file sequence number.
+pub type FileFactory = Box<dyn Fn(u32) -> io::Result<Box<dyn Write + Send>> + Send>;
+
+/// Factory that creates a new format writer wrapping a `CountingWriter`.
+/// Called on each rotation (including the first file). The factory closure
+/// owns all format-specific state (e.g. CSV shared header for replay).
+pub type WriterFactory = Box<
+    dyn Fn(
+            CountingWriter<Box<dyn Write + Send>>,
+            Arc<Schema>,
+        ) -> Result<Box<dyn FormatWriter>, FormatError>
+        + Send,
+>;
+
+// ---------------------------------------------------------------------------
 // SplittingWriter
 // ---------------------------------------------------------------------------
 
-/// File-splitting wrapper around `CsvWriter`.
+/// File-splitting wrapper — format-agnostic.
 ///
-/// Lives inside the writer thread (7/7 systems surveyed place rotation
-/// inside the writer). Uses factory pattern to create new writer instances
-/// on rotation. Captures header from first file and reuses for all splits.
+/// Delegates format-specific concerns (headers, preambles, footers) entirely
+/// to the writer factory. On rotation: flush + drop current writer, create
+/// new file via file factory, create new format writer via writer factory.
 ///
 /// Rotation trigger: `(limit_reached AND key_changed)` when `group_key` is
 /// set, or `limit_reached` for mechanical splitting without `group_key`.
 /// Greedy split at first key boundary after threshold is optimal (ICDT 2009).
-pub struct SplittingWriter<F>
-where
-    F: Fn(u32) -> io::Result<Box<dyn Write + Send>> + Send,
-{
-    factory: F,
+pub struct SplittingWriter {
+    file_factory: FileFactory,
+    writer_factory: WriterFactory,
     schema: Arc<Schema>,
-    writer_config: CsvWriterConfig,
     policy: SplitPolicy,
-    current_writer: Option<CsvWriter<CountingWriter<Box<dyn Write + Send>>>>,
-    /// Header captured from first file, reused for all splits.
-    captured_header: Option<Vec<Box<str>>>,
+    current_writer: Option<Box<dyn FormatWriter>>,
+    /// Shared byte counter — owned by SplittingWriter, passed to each
+    /// `CountingWriter` on rotation. Reset to zero on file open.
+    byte_counter: SharedByteCounter,
     /// Records written to the *current* file (reset on rotation).
     records_in_file: u64,
     current_key: Option<Vec<GroupByKey>>,
@@ -124,23 +103,20 @@ where
     oversize_warned: bool,
 }
 
-impl<F> SplittingWriter<F>
-where
-    F: Fn(u32) -> io::Result<Box<dyn Write + Send>> + Send,
-{
+impl SplittingWriter {
     pub fn new(
-        factory: F,
+        file_factory: FileFactory,
+        writer_factory: WriterFactory,
         schema: Arc<Schema>,
-        writer_config: CsvWriterConfig,
         policy: SplitPolicy,
     ) -> Self {
         Self {
-            factory,
+            file_factory,
+            writer_factory,
             schema,
-            writer_config,
             policy,
             current_writer: None,
-            captured_header: None,
+            byte_counter: SharedByteCounter::new(),
             records_in_file: 0,
             current_key: None,
             file_seq: 0,
@@ -148,25 +124,14 @@ where
         }
     }
 
-    /// Open a new split file via the factory.
+    /// Open a new split file via the factories.
     fn open_new_file(&mut self) -> Result<(), FormatError> {
         self.file_seq += 1;
-        let raw = (self.factory)(self.file_seq).map_err(FormatError::Io)?;
-        let counting = CountingWriter::new(raw);
-        let mut csv = CsvWriter::new(
-            counting,
-            Arc::clone(&self.schema),
-            self.writer_config.clone(),
-        );
-
-        // On rotation (not first file), replay captured header
-        if let Some(ref header) = self.captured_header
-            && self.policy.repeat_header
-        {
-            csv.write_preset_header(header)?;
-        }
-
-        self.current_writer = Some(csv);
+        let raw = (self.file_factory)(self.file_seq).map_err(FormatError::Io)?;
+        self.byte_counter.reset();
+        let counting = CountingWriter::new(raw, self.byte_counter.clone());
+        let writer = (self.writer_factory)(counting, Arc::clone(&self.schema))?;
+        self.current_writer = Some(writer);
         self.records_in_file = 0;
         self.oversize_warned = false;
         Ok(())
@@ -209,8 +174,8 @@ where
             return true;
         }
         if let Some(max) = self.policy.max_bytes
-            && let Some(ref writer) = self.current_writer
-            && writer.get_ref().bytes_written() >= max
+            && self.current_writer.is_some()
+            && self.byte_counter.bytes_written() >= max
         {
             return true;
         }
@@ -244,34 +209,17 @@ where
         }
     }
 
-    /// Capture header from the first record (schema columns + overflow).
-    fn capture_header(&mut self, record: &Record) {
-        let mut header: Vec<Box<str>> = self.schema.columns().to_vec();
-        if let Some(overflow) = record.overflow_fields() {
-            header.extend(overflow.map(|(k, _)| Box::from(k)));
-        }
-        self.captured_header = Some(header);
-    }
-
     /// Number of split files written so far (including the current one).
     pub fn file_count(&self) -> u32 {
         self.file_seq
     }
 }
 
-impl<F> FormatWriter for SplittingWriter<F>
-where
-    F: Fn(u32) -> io::Result<Box<dyn Write + Send>> + Send,
-{
+impl FormatWriter for SplittingWriter {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         // Lazy-open first file if no current writer
         if self.current_writer.is_none() {
             self.open_new_file()?;
-        }
-
-        // Capture header from first record (for reuse on rotation)
-        if self.captured_header.is_none() {
-            self.capture_header(record);
         }
 
         // Extract group key if configured
@@ -308,8 +256,8 @@ where
         self.current_writer.as_mut().unwrap().write_record(record)?;
         self.records_in_file += 1;
 
-        // Flush csv internal buffer to push bytes through to CountingWriter.
-        // Required for accurate byte-limit checking (csv::Writer buffers 8KB).
+        // Flush format writer's internal buffer to push bytes through to CountingWriter.
+        // Required for accurate byte-limit checking (format writers may buffer internally).
         if self.policy.max_bytes.is_some() {
             self.current_writer.as_mut().unwrap().flush()?;
         }
