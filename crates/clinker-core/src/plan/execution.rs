@@ -803,6 +803,50 @@ impl ExecutionPlanDag {
             }
         }
 
+        // Show planner-synthesized Sort nodes (drill pass 3, 16.0.5.12).
+        for &idx in &self.topo_order {
+            if let PlanNode::Sort { name, sort_fields } = &self.graph[idx] {
+                out.push_str(&format!("[sort] {name}\n"));
+                out.push_str("  sort_fields:\n");
+                for sf in sort_fields {
+                    out.push_str(&format!(
+                        "    - {} {:?} (nulls {:?})\n",
+                        sf.field, sf.order, sf.null_order
+                    ));
+                }
+                out.push('\n');
+            }
+        }
+
+        // Physical Properties (NodeProperties side-table) — task 16.0.5.12.
+        // Only emitted when the property pass has run (post-compile DAGs).
+        if !self.node_properties.is_empty() {
+            out.push_str("=== Physical Properties ===\n\n");
+            for &idx in &self.topo_order {
+                let node = &self.graph[idx];
+                let Some(props) = self.node_properties.get(&idx) else {
+                    continue;
+                };
+                out.push_str(&format!("{}:\n", node.id_slug()));
+                match &props.ordering.sort_order {
+                    Some(order) => {
+                        let fields: Vec<String> = order.iter().map(|s| s.field.clone()).collect();
+                        out.push_str(&format!("  ordering: {}\n", fields.join(", ")));
+                    }
+                    None => out.push_str("  ordering: <none>\n"),
+                }
+                out.push_str(&format!(
+                    "  ordering_provenance: {:?}\n",
+                    props.ordering.provenance
+                ));
+                out.push_str(&format!("  partitioning: {:?}\n", props.partitioning.kind));
+                out.push_str(&format!(
+                    "  partitioning_provenance: {:?}\n\n",
+                    props.partitioning.provenance
+                ));
+            }
+        }
+
         // Show route info from graph nodes
         for node in self.graph.node_weights() {
             if let PlanNode::Route {
@@ -973,9 +1017,14 @@ fn dot_escape(s: &str) -> String {
 }
 
 /// Custom Serialize: flat node-list with schema_version, id slugs, depends_on.
+///
+/// Includes a `node_properties` map keyed by node *name* (not `NodeIndex`),
+/// ordered by topo position. Keying by name keeps the JSON contract stable
+/// for downstream consumers (Kiln canvas, debugger, third-party tooling)
+/// across recompiles where `NodeIndex` values change.
 impl Serialize for ExecutionPlanDag {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(3))?;
         map.serialize_entry("schema_version", "1")?;
 
         // Build node list in topo order
@@ -1004,6 +1053,24 @@ impl Serialize for ExecutionPlanDag {
         }
 
         map.serialize_entry("nodes", &NodeList(self))?;
+
+        // node_properties keyed by node name, in topo order. Built as an
+        // IndexMap so the JSON object preserves topo iteration order.
+        struct PropsMap<'a>(&'a ExecutionPlanDag);
+        impl<'a> Serialize for PropsMap<'a> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let dag = self.0;
+                let mut m = serializer.serialize_map(Some(dag.topo_order.len()))?;
+                for &idx in &dag.topo_order {
+                    let name = dag.graph[idx].name();
+                    if let Some(props) = dag.node_properties.get(&idx) {
+                        m.serialize_entry(name, props)?;
+                    }
+                }
+                m.end()
+            }
+        }
+        map.serialize_entry("node_properties", &PropsMap(self))?;
         map.end()
     }
 }
@@ -3341,5 +3408,83 @@ mod tests {
         let json = serde_json::to_value(&node).unwrap();
         assert_eq!(json["type"], "sort");
         assert_eq!(json["name"], "x");
+    }
+
+    // ----- Task 16.0.5.12: --explain text + JSON for PlanNode::Sort -----
+
+    /// Build a Source -> Sort -> Transform DAG via the same call chain
+    /// `ExecutionPlanDag::compile` uses, returning the populated DAG.
+    fn dag_with_enforcer_sort() -> ExecutionPlanDag {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        dag.topo_order = toposort(&dag.graph, None).unwrap();
+        dag.compute_node_properties(&inputs).unwrap();
+        dag
+    }
+
+    /// Gate: `--explain` text rendering shows the synthesized Sort node
+    /// with its `sort_fields:` block and a Physical Properties section
+    /// recording ordering + provenance for it.
+    #[test]
+    fn test_explain_text_shows_enforced_sort_node() {
+        let dag = dag_with_enforcer_sort();
+        let text = dag.explain();
+
+        assert!(
+            text.contains("[sort] __sort_for_consumer"),
+            "explain text must show synthesized sort node:\n{text}"
+        );
+        assert!(
+            text.contains("sort_fields:"),
+            "explain text must show sort_fields block:\n{text}"
+        );
+        assert!(
+            text.contains("=== Physical Properties ==="),
+            "explain text must include Physical Properties section:\n{text}"
+        );
+        assert!(
+            text.contains("sort.__sort_for_consumer"),
+            "Physical Properties must list the sort node by id slug:\n{text}"
+        );
+        assert!(
+            text.contains("ordering: k"),
+            "Physical Properties must show the sort node's ordering:\n{text}"
+        );
+    }
+
+    /// Gate: `--explain=json` includes the synthesized Sort node and a
+    /// `node_properties` section keyed by node *name* with an entry for
+    /// the sort node carrying its ordering.
+    #[test]
+    fn test_explain_json_roundtrip_includes_sort_node() {
+        let dag = dag_with_enforcer_sort();
+        let json = serde_json::to_value(&dag).unwrap();
+
+        // Sort node appears in `nodes` with type=sort and a __sort_for_ name.
+        let nodes = json["nodes"].as_array().unwrap();
+        let sort_node = nodes
+            .iter()
+            .find(|n| n["type"] == "sort")
+            .expect("sort node must appear in JSON nodes list");
+        let sort_name = sort_node["name"].as_str().unwrap();
+        assert!(
+            sort_name.starts_with("__sort_for_"),
+            "sort node name must use reserved prefix: {sort_name}"
+        );
+
+        // node_properties is keyed by node name and contains the sort node.
+        let props = json["node_properties"]
+            .as_object()
+            .expect("node_properties must be an object keyed by node name");
+        let sort_props = props
+            .get(sort_name)
+            .expect("node_properties must contain the synthesized sort node");
+        let order = sort_props["ordering"]["sort_order"]
+            .as_array()
+            .expect("sort node ordering.sort_order must be present");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0]["field"], "k");
     }
 }

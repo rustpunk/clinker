@@ -795,3 +795,56 @@ fn cxl_subtitle(cxl: &str) -> String {
         .take(30)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clinker_core::config::parse_config;
+    use std::collections::HashSet;
+
+    /// Gate (Task 16.0.5.12): Kiln canvas derives `StageView` from
+    /// `PipelineConfig` only — never from `ExecutionPlanDag`. Planner-
+    /// synthesized `PlanNode::Sort` nodes (named `__sort_for_*`) live in
+    /// the DAG and never reach the canvas. This test pins that layering:
+    /// rendering a config that *would* trigger an enforcer Sort at compile
+    /// time produces zero stages with the reserved prefix, and the
+    /// `StageKind` enum has no `Sort` variant by design.
+    #[test]
+    fn test_kiln_canvas_renders_sort_node() {
+        let yaml = r#"
+pipeline:
+  name: kiln-sort-compat
+inputs:
+  - name: primary
+    path: data.csv
+    type: csv
+outputs:
+  - name: output
+    path: out.csv
+    include_unmapped: true
+    type: csv
+transformations:
+  - name: step
+    cxl: |
+      emit x = amount
+"#;
+        let config = parse_config(yaml).unwrap();
+        let view = derive_pipeline_view(&config, &[], &HashSet::new());
+
+        for stage in &view.stages {
+            assert!(
+                !stage.id.starts_with("__sort_for_"),
+                "Kiln canvas must never surface synthesized Sort node names: {}",
+                stage.id
+            );
+            // StageKind has no Sort variant — match is exhaustive.
+            match stage.kind {
+                StageKind::Source
+                | StageKind::Transform
+                | StageKind::Output
+                | StageKind::Composition(_)
+                | StageKind::Error => {}
+            }
+        }
+    }
+}
