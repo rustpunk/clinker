@@ -1165,6 +1165,26 @@ fn build_source_dag(
     Ok(tiers)
 }
 
+/// Idempotency predicate for Phase 16.0.5 enforcer-sort insertion.
+///
+/// Returns true iff `declared` (the upstream source's actual ordering) is a
+/// strict prefix of, or equal to, `required` viewed the other way around: the
+/// required ordering must be a prefix of the declared ordering. Element-wise
+/// equality is on `(field, order, null_order)`. Mirrors DataFusion's
+/// `extract_common_sort_prefix` semantics.
+///
+/// An empty `required` is always satisfied. An empty `declared` only satisfies
+/// an empty `required`.
+pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField]) -> bool {
+    if required.len() > declared.len() {
+        return false;
+    }
+    declared
+        .iter()
+        .zip(required.iter())
+        .all(|(d, r)| d.field == r.field && d.order == r.order && d.null_order == r.null_order)
+}
+
 /// Check if a source's declared sort_order matches the window's sort_by.
 fn check_already_sorted(_config: &PipelineConfig, _source: &str, _sort_by: &[SortField]) -> bool {
     // InputConfig doesn't have sort_order yet (to be added in Task 5.4.1)
@@ -1908,6 +1928,70 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("source.primary"))
         );
+    }
+
+    // ----- Task 16.0.5.4: source_ordering_satisfies predicate -----
+
+    fn sf(field: &str, order: SortOrder, null_order: Option<NullOrder>) -> SortField {
+        SortField {
+            field: field.into(),
+            order,
+            null_order,
+        }
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_prefix() {
+        let declared = vec![
+            sf("a", SortOrder::Asc, None),
+            sf("b", SortOrder::Asc, None),
+            sf("c", SortOrder::Asc, None),
+        ];
+        let required = vec![sf("a", SortOrder::Asc, None), sf("b", SortOrder::Asc, None)];
+        assert!(source_ordering_satisfies(&declared, &required));
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_equal_length() {
+        let v = vec![
+            sf("a", SortOrder::Asc, None),
+            sf("b", SortOrder::Desc, None),
+        ];
+        assert!(source_ordering_satisfies(&v.clone(), &v));
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_superset_required_fails() {
+        let declared = vec![sf("a", SortOrder::Asc, None)];
+        let required = vec![sf("a", SortOrder::Asc, None), sf("b", SortOrder::Asc, None)];
+        assert!(!source_ordering_satisfies(&declared, &required));
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_direction_mismatch_fails() {
+        let declared = vec![sf("a", SortOrder::Asc, None)];
+        let required = vec![sf("a", SortOrder::Desc, None)];
+        assert!(!source_ordering_satisfies(&declared, &required));
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_nulls_mismatch_fails() {
+        let declared = vec![sf("a", SortOrder::Asc, Some(NullOrder::First))];
+        let required = vec![sf("a", SortOrder::Asc, Some(NullOrder::Last))];
+        assert!(!source_ordering_satisfies(&declared, &required));
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_empty_required_always() {
+        let declared = vec![sf("a", SortOrder::Asc, None)];
+        assert!(source_ordering_satisfies(&declared, &[]));
+        assert!(source_ordering_satisfies(&[], &[]));
+    }
+
+    #[test]
+    fn test_source_ordering_satisfies_empty_declared_only_empty_required() {
+        let required = vec![sf("a", SortOrder::Asc, None)];
+        assert!(!source_ordering_satisfies(&[], &required));
     }
 
     /// Gate test for Task 16.0.5.3: PlanNode::Sort variant exists,
