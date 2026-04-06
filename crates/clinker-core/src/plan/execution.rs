@@ -68,6 +68,12 @@ pub enum PlanNode {
         /// coupling. See `docs/research/RESEARCH-property-derivation-layering.md`.
         #[serde(skip_serializing_if = "BTreeSet::is_empty")]
         write_set: BTreeSet<String>,
+        /// True iff the CXL transform contains a `distinct` statement. Populated
+        /// at compile time alongside `write_set`. Consumed by
+        /// `compute_node_properties` to emit `DestroyedByDistinct` for the
+        /// downstream stream's ordering provenance.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        has_distinct: bool,
     },
     Route {
         name: String,
@@ -448,6 +454,7 @@ impl ExecutionPlanDag {
             // TypedProgram. The `compiled` slice is in the same declaration
             // order as `config.transforms()` (see analyzer::analyze_all).
             let write_set = extract_write_set(compiled[i].1);
+            let has_distinct = extract_has_distinct(compiled[i].1);
 
             add_node(
                 &mut graph,
@@ -459,6 +466,7 @@ impl ExecutionPlanDag {
                     window_index,
                     partition_lookup,
                     write_set,
+                    has_distinct,
                 },
                 &mut node_by_name,
                 &mut slug_set,
@@ -1297,24 +1305,17 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
-    /// Phase 16.0.5.6 — populate `node_properties` via topological walk.
+    /// Populate `node_properties` via topological walk.
     ///
     /// Computes [`NodeProperties`] for every node in the DAG, derived from
     /// already-populated parent properties plus declared per-node data
     /// (`InputConfig.sort_order` for sources, `sort_fields` on
-    /// [`PlanNode::Sort`], `write_set` on [`PlanNode::Transform`] in 16.0.5.7).
-    /// The pass never inspects operator implementations — it reads only what
-    /// the plan node already declares, mirroring Trino's
-    /// `PropertyDerivations.Visitor` and Spark's `AliasAwareOutputExpression`
-    /// (see `docs/research/RESEARCH-property-derivation-layering.md`).
-    ///
-    /// # Sub-task scope (16.0.5.6)
-    ///
-    /// Only the [`PlanNode::Sort`] arm is fully populated in this sub-task:
-    /// it ignores parent ordering and emits
-    /// [`OrderingProvenance::Preserved`] from itself. All other variants
-    /// receive an [`NodeProperties::unordered_single`] placeholder; per-op
-    /// preservation rules land in 16.0.5.7.
+    /// [`PlanNode::Sort`], `write_set` and `has_distinct` on
+    /// [`PlanNode::Transform`]). The pass never inspects operator
+    /// implementations — it reads only what the plan node already declares,
+    /// mirroring Trino's `PropertyDerivations.Visitor` and Spark's
+    /// `AliasAwareOutputExpression` (see
+    /// `docs/research/RESEARCH-property-derivation-layering.md`).
     ///
     /// # Panics / errors
     ///
@@ -1332,12 +1333,14 @@ impl ExecutionPlanDag {
 
         let mut topo = Topo::new(&self.graph);
         while let Some(idx) = topo.next(&self.graph) {
-            let parent_props: Option<&NodeProperties> = self
-                .graph
-                .neighbors_directed(idx, petgraph::Direction::Incoming)
-                .find_map(|p| self.node_properties.get(&p));
-
-            let props = compute_one(&self.graph[idx], parent_props, inputs);
+            let props = {
+                let parents: Vec<&NodeProperties> = self
+                    .graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .filter_map(|p| self.node_properties.get(&p))
+                    .collect();
+                compute_one(&self.graph[idx], &parents, inputs)
+            };
             self.node_properties.insert(idx, props);
         }
 
@@ -1348,16 +1351,50 @@ impl ExecutionPlanDag {
 /// Per-node property derivation rule. Pure function over the node and its
 /// (already-computed) parent properties — never sees operator implementations.
 ///
-/// In sub-task 16.0.5.6 only the [`PlanNode::Sort`] arm is populated; other
-/// arms return [`NodeProperties::unordered_single`] as a placeholder. Per-op
-/// preservation rules for Source / Transform / Route / Merge / Output land in
-/// 16.0.5.7.
+/// Per Decision D46, the `Transform` arm MUST NOT advertise any ordering
+/// produced by Phase 6 arena `sort_partition` — that sort is intra-partition
+/// inside a `RequiresArena` materialization layer and is invisible at the
+/// stream level. The rule below reads only `write_set` / `has_distinct` and
+/// the parent's already-computed ordering, so arena-internal sorts cannot
+/// leak in.
 fn compute_one(
     node: &PlanNode,
-    parent_props: Option<&NodeProperties>,
-    _inputs: &HashMap<String, InputConfig>,
+    parents: &[&NodeProperties],
+    inputs: &HashMap<String, InputConfig>,
 ) -> NodeProperties {
+    let single_stream_partitioning = || Partitioning {
+        kind: PartitioningKind::Single,
+        provenance: PartitioningProvenance::SingleStream,
+    };
+    let parent_partitioning = || {
+        parents
+            .first()
+            .map(|p| p.partitioning.clone())
+            .unwrap_or_else(single_stream_partitioning)
+    };
+
     match node {
+        PlanNode::Source { name } => {
+            let sort_order: Option<Vec<SortField>> = inputs
+                .get(name)
+                .and_then(|ic| ic.sort_order.as_ref())
+                .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect());
+            let provenance = if sort_order.is_some() {
+                OrderingProvenance::DeclaredOnInput {
+                    input_name: name.clone(),
+                }
+            } else {
+                OrderingProvenance::NoOrdering
+            };
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order,
+                    provenance,
+                },
+                partitioning: single_stream_partitioning(),
+            }
+        }
+
         PlanNode::Sort { name, sort_fields } => NodeProperties {
             ordering: Ordering {
                 sort_order: Some(sort_fields.clone()),
@@ -1365,18 +1402,172 @@ fn compute_one(
                     from_node: name.clone(),
                 },
             },
-            partitioning: parent_props
-                .map(|p| p.partitioning.clone())
-                .unwrap_or(Partitioning {
-                    kind: PartitioningKind::Single,
-                    provenance: PartitioningProvenance::SingleStream,
-                }),
+            partitioning: parent_partitioning(),
         },
-        // Placeholder for variants handled in 16.0.5.7. Suppressing the
-        // unused-binding warning preserves the symbol for that follow-up.
-        _ => {
-            let _ = parent_props;
-            NodeProperties::unordered_single()
+
+        PlanNode::Transform {
+            name,
+            write_set,
+            has_distinct,
+            ..
+        } => {
+            let partitioning = parent_partitioning();
+
+            // Distinct destroys ordering unconditionally.
+            if *has_distinct {
+                return NodeProperties {
+                    ordering: Ordering {
+                        sort_order: None,
+                        provenance: OrderingProvenance::DestroyedByDistinct {
+                            at_node: name.clone(),
+                        },
+                    },
+                    partitioning,
+                };
+            }
+
+            // No parent or parent had no ordering — nothing to preserve.
+            let parent = parents.first();
+            let parent_sort = parent.and_then(|p| p.ordering.sort_order.as_ref());
+            let Some(parent_sort) = parent_sort else {
+                return NodeProperties {
+                    ordering: Ordering {
+                        sort_order: None,
+                        provenance: parent
+                            .map(|p| p.ordering.provenance.clone())
+                            .unwrap_or(OrderingProvenance::NoOrdering),
+                    },
+                    partitioning,
+                };
+            };
+
+            // Intersect write_set with parent's sort-key field names. Note:
+            // arena `sort_partition` (Phase 6) does not appear here — only
+            // record fields written via `emit name = ...` enter `write_set`.
+            let lost: Vec<String> = parent_sort
+                .iter()
+                .filter(|sf| write_set.contains(&sf.field))
+                .map(|sf| sf.field.clone())
+                .collect();
+            if lost.is_empty() {
+                NodeProperties {
+                    ordering: Ordering {
+                        sort_order: Some(parent_sort.clone()),
+                        provenance: OrderingProvenance::Preserved {
+                            from_node: name.clone(),
+                        },
+                    },
+                    partitioning,
+                }
+            } else {
+                NodeProperties {
+                    ordering: Ordering {
+                        sort_order: None,
+                        provenance: OrderingProvenance::DestroyedByTransformWriteSet {
+                            at_node: name.clone(),
+                            fields_written: write_set.iter().cloned().collect(),
+                            sort_fields_lost: lost,
+                        },
+                    },
+                    partitioning,
+                }
+            }
+        }
+
+        PlanNode::Route { name, .. } => {
+            // Row-selection only — every branch inherits parent ordering and
+            // partitioning unchanged. Provenance is rewritten to point at this
+            // node so explain can chain through.
+            let parent = match parents.first() {
+                Some(p) => p,
+                None => return NodeProperties::unordered_single(),
+            };
+            let provenance = if parent.ordering.sort_order.is_some() {
+                OrderingProvenance::Preserved {
+                    from_node: name.clone(),
+                }
+            } else {
+                parent.ordering.provenance.clone()
+            };
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: parent.ordering.sort_order.clone(),
+                    provenance,
+                },
+                partitioning: parent.partitioning.clone(),
+            }
+        }
+
+        PlanNode::Merge { name } => {
+            if parents.is_empty() {
+                return NodeProperties::unordered_single();
+            }
+            let first_so = parents[0].ordering.sort_order.clone();
+            let all_match = parents
+                .iter()
+                .all(|p| sort_orders_equal(&p.ordering.sort_order, &first_so));
+            let partitioning = if parents
+                .iter()
+                .all(|p| matches!(p.partitioning.kind, PartitioningKind::Single))
+            {
+                single_stream_partitioning()
+            } else {
+                parents[0].partitioning.clone()
+            };
+            if all_match {
+                let provenance = if first_so.is_some() {
+                    OrderingProvenance::Preserved {
+                        from_node: name.clone(),
+                    }
+                } else {
+                    OrderingProvenance::NoOrdering
+                };
+                NodeProperties {
+                    ordering: Ordering {
+                        sort_order: first_so,
+                        provenance,
+                    },
+                    partitioning,
+                }
+            } else {
+                NodeProperties {
+                    ordering: Ordering {
+                        sort_order: None,
+                        provenance: OrderingProvenance::DestroyedByMergeMismatch {
+                            at_node: name.clone(),
+                            parent_orderings: parents
+                                .iter()
+                                .map(|p| p.ordering.sort_order.clone())
+                                .collect(),
+                        },
+                    },
+                    partitioning,
+                }
+            }
+        }
+
+        PlanNode::Output { name } => {
+            // Terminal — properties still computed for debugging. Inherit
+            // parent, rewrite provenance to point at this node when ordering
+            // is non-None so explain chains through.
+            let parent = match parents.first() {
+                Some(p) => p,
+                None => return NodeProperties::unordered_single(),
+            };
+            let provenance = if parent.ordering.sort_order.is_some() {
+                OrderingProvenance::Preserved {
+                    from_node: name.clone(),
+                }
+            } else {
+                parent.ordering.provenance.clone()
+            };
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: parent.ordering.sort_order.clone(),
+                    provenance,
+                },
+                partitioning: parent.partitioning.clone(),
+            }
         }
     }
 }
@@ -1426,6 +1617,39 @@ fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
         }
     }
     set
+}
+
+/// Field-wise equality for `Option<Vec<SortField>>` — `SortField` itself does
+/// not derive `PartialEq` and we deliberately avoid adding the derive in this
+/// task. Used by the `Merge` arm of `compute_one` for parent-ordering
+/// reconciliation.
+fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter().zip(y.iter()).all(|(p, q)| {
+                    p.field == q.field && p.order == q.order && p.null_order == q.null_order
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Detect whether a CXL transform contains any `distinct` statement.
+///
+/// Sibling of [`extract_write_set`] — sourced from the same `TypedProgram`
+/// during plan compilation. Persisted as `has_distinct` on
+/// [`PlanNode::Transform`] so the property pass can emit
+/// [`OrderingProvenance::DestroyedByDistinct`] without reaching into
+/// executor-private types (Phase 16.0.5.7, see
+/// `docs/research/RESEARCH-property-derivation-layering.md`).
+fn extract_has_distinct(typed: &TypedProgram) -> bool {
+    typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Distinct { .. }))
 }
 
 /// Check if a source's declared sort_order matches the window's sort_by.
@@ -2196,6 +2420,7 @@ mod tests {
             window_index: None,
             partition_lookup: None,
             write_set: BTreeSet::new(),
+            has_distinct: false,
         });
         graph.add_edge(
             s,
@@ -2446,6 +2671,346 @@ mod tests {
         let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
         dag.compute_node_properties(&inputs).unwrap();
         dag.compute_node_properties(&inputs).unwrap();
+    }
+
+    // ----- Task 16.0.5.7: per-operator preservation rules -----
+
+    /// Build a minimal `ExecutionPlanDag` with just the supplied nodes and
+    /// edges, computing `topo_order` from petgraph. Used by the per-operator
+    /// rule tests below to construct surgical fixtures without going through
+    /// `ExecutionPlanDag::compile`.
+    fn dag_from_nodes(
+        nodes: Vec<PlanNode>,
+        edges: &[(usize, usize)],
+    ) -> (ExecutionPlanDag, Vec<NodeIndex>) {
+        let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
+        let idxs: Vec<NodeIndex> = nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        for &(a, b) in edges {
+            graph.add_edge(
+                idxs[a],
+                idxs[b],
+                PlanEdge {
+                    dependency_type: DependencyType::Data,
+                },
+            );
+        }
+        let topo_order = toposort(&graph, None).unwrap();
+        let dag = ExecutionPlanDag {
+            graph,
+            topo_order,
+            source_dag: vec![],
+            indices_to_build: vec![],
+            output_projections: vec![],
+            parallelism: ParallelismProfile {
+                per_transform: vec![],
+                worker_threads: 1,
+            },
+            correlation_sort_note: None,
+            node_properties: HashMap::new(),
+        };
+        (dag, idxs)
+    }
+
+    fn make_transform(name: &str, write_set: BTreeSet<String>, has_distinct: bool) -> PlanNode {
+        PlanNode::Transform {
+            name: name.into(),
+            parallelism_class: ParallelismClass::Stateless,
+            tier: 0,
+            execution_reqs: NodeExecutionReqs::Streaming,
+            window_index: None,
+            partition_lookup: None,
+            write_set,
+            has_distinct,
+        }
+    }
+
+    fn make_arena_transform(name: &str) -> PlanNode {
+        PlanNode::Transform {
+            name: name.into(),
+            parallelism_class: ParallelismClass::Stateless,
+            tier: 0,
+            execution_reqs: NodeExecutionReqs::RequiresArena,
+            window_index: None,
+            partition_lookup: None,
+            write_set: BTreeSet::new(),
+            has_distinct: false,
+        }
+    }
+
+    #[test]
+    fn test_node_properties_source_declared_input() {
+        let (mut dag, idxs) = dag_from_nodes(vec![PlanNode::Source { name: "src".into() }], &[]);
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[0]).unwrap();
+        assert!(props.ordering.sort_order.is_some());
+        match &props.ordering.provenance {
+            OrderingProvenance::DeclaredOnInput { input_name } => {
+                assert_eq!(input_name, "src");
+            }
+            other => panic!("expected DeclaredOnInput, got {other:?}"),
+        }
+        assert!(matches!(props.partitioning.kind, PartitioningKind::Single));
+    }
+
+    #[test]
+    fn test_node_properties_transform_preserves_when_write_set_disjoint() {
+        // Source(sort=k) -> Transform(write_set={x}) -> preserves k.
+        let mut ws = BTreeSet::new();
+        ws.insert("x".to_string());
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_transform("t", ws, false),
+            ],
+            &[(0, 1)],
+        );
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[1]).unwrap();
+        let so = props.ordering.sort_order.as_ref().expect("preserved");
+        assert_eq!(so.len(), 1);
+        assert_eq!(so[0].field, "k");
+        match &props.ordering.provenance {
+            OrderingProvenance::Preserved { from_node } => assert_eq!(from_node, "t"),
+            other => panic!("expected Preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_node_properties_transform_destroys_on_write_set_hit() {
+        // Source(sort=k) -> Transform(write_set={k}) -> destroyed.
+        let mut ws = BTreeSet::new();
+        ws.insert("k".to_string());
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_transform("t", ws, false),
+            ],
+            &[(0, 1)],
+        );
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[1]).unwrap();
+        assert!(props.ordering.sort_order.is_none());
+        match &props.ordering.provenance {
+            OrderingProvenance::DestroyedByTransformWriteSet {
+                at_node,
+                fields_written,
+                sort_fields_lost,
+            } => {
+                assert_eq!(at_node, "t");
+                assert!(fields_written.contains(&"k".to_string()));
+                assert_eq!(sort_fields_lost, &vec!["k".to_string()]);
+            }
+            other => panic!("expected DestroyedByTransformWriteSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_node_properties_transform_destroys_on_distinct() {
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_transform("t", BTreeSet::new(), true),
+            ],
+            &[(0, 1)],
+        );
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[1]).unwrap();
+        assert!(props.ordering.sort_order.is_none());
+        assert!(matches!(
+            props.ordering.provenance,
+            OrderingProvenance::DestroyedByDistinct { .. }
+        ));
+    }
+
+    #[test]
+    fn test_node_properties_distinct_destroys_unconditionally() {
+        // Even with an unsorted source, the Transform's provenance should
+        // be `DestroyedByDistinct` (not `NoOrdering` propagated).
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_transform("t", BTreeSet::new(), true),
+            ],
+            &[(0, 1)],
+        );
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[1]).unwrap();
+        match &props.ordering.provenance {
+            OrderingProvenance::DestroyedByDistinct { at_node } => {
+                assert_eq!(at_node, "t");
+            }
+            other => panic!("expected DestroyedByDistinct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_node_properties_route_fans_out_unchanged() {
+        // Source(sort=k) -> Transform(disjoint) -> Route -> verify Route preserves.
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_transform("t", BTreeSet::new(), false),
+                PlanNode::Route {
+                    name: "r".into(),
+                    mode: RouteMode::Exclusive,
+                    branches: vec![],
+                    default: "x".into(),
+                },
+            ],
+            &[(0, 1), (1, 2)],
+        );
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let route_props = dag.node_properties.get(&idxs[2]).unwrap();
+        let so = route_props.ordering.sort_order.as_ref().expect("preserved");
+        assert_eq!(so[0].field, "k");
+        assert!(matches!(
+            route_props.ordering.provenance,
+            OrderingProvenance::Preserved { .. }
+        ));
+    }
+
+    #[test]
+    fn test_streaming_agg_after_route_each_branch_qualifies() {
+        // D45: route fan-out preserves ordering on every outgoing edge so
+        // streaming aggregation can qualify per-branch. We model this by
+        // attaching two downstream Transforms (one per branch) and asserting
+        // both inherit `Preserved`.
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_transform("t0", BTreeSet::new(), false),
+                PlanNode::Route {
+                    name: "r".into(),
+                    mode: RouteMode::Inclusive,
+                    branches: vec![],
+                    default: "x".into(),
+                },
+                make_transform("branch_a", BTreeSet::new(), false),
+                make_transform("branch_b", BTreeSet::new(), false),
+            ],
+            &[(0, 1), (1, 2), (2, 3), (2, 4)],
+        );
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        for branch_idx in [idxs[3], idxs[4]] {
+            let p = dag.node_properties.get(&branch_idx).unwrap();
+            assert!(
+                p.ordering.sort_order.is_some(),
+                "branch must inherit ordering from Route"
+            );
+            assert!(matches!(
+                p.ordering.provenance,
+                OrderingProvenance::Preserved { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_node_properties_merge_identical_parents_preserves() {
+        // Two Sources with the same sort_order -> Merge -> Preserved.
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "a".into() },
+                PlanNode::Source { name: "b".into() },
+                PlanNode::Merge { name: "m".into() },
+            ],
+            &[(0, 2), (1, 2)],
+        );
+        let so = vec![sf("k", SortOrder::Asc, None)];
+        let inputs = HashMap::from([
+            ("a".to_string(), input_with_sort("a", Some(so.clone()))),
+            ("b".to_string(), input_with_sort("b", Some(so.clone()))),
+        ]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[2]).unwrap();
+        let got = props.ordering.sort_order.as_ref().expect("preserved");
+        assert_eq!(got[0].field, "k");
+        assert!(matches!(
+            props.ordering.provenance,
+            OrderingProvenance::Preserved { .. }
+        ));
+    }
+
+    #[test]
+    fn test_node_properties_merge_mismatch_destroys() {
+        // Two Sources with different sort orders -> Merge -> destroyed.
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "a".into() },
+                PlanNode::Source { name: "b".into() },
+                PlanNode::Merge { name: "m".into() },
+            ],
+            &[(0, 2), (1, 2)],
+        );
+        let inputs = HashMap::from([
+            (
+                "a".to_string(),
+                input_with_sort("a", Some(vec![sf("k", SortOrder::Asc, None)])),
+            ),
+            (
+                "b".to_string(),
+                input_with_sort("b", Some(vec![sf("j", SortOrder::Asc, None)])),
+            ),
+        ]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[2]).unwrap();
+        assert!(props.ordering.sort_order.is_none());
+        match &props.ordering.provenance {
+            OrderingProvenance::DestroyedByMergeMismatch {
+                at_node,
+                parent_orderings,
+            } => {
+                assert_eq!(at_node, "m");
+                assert_eq!(parent_orderings.len(), 2);
+            }
+            other => panic!("expected DestroyedByMergeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arena_partition_sort_does_not_leak_into_node_properties() {
+        // D46 boundary: a `RequiresArena` Transform with an empty `write_set`
+        // and an unsorted Source must NOT advertise any ordering. The Phase 6
+        // arena `sort_partition` runs intra-partition inside the
+        // materialization layer and is invisible to NodeProperties.
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_arena_transform("arena_t"),
+            ],
+            &[(0, 1)],
+        );
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        dag.compute_node_properties(&inputs).unwrap();
+        let props = dag.node_properties.get(&idxs[1]).unwrap();
+        assert!(
+            props.ordering.sort_order.is_none(),
+            "arena sort_partition must not surface as stream-level ordering"
+        );
     }
 
     /// Gate test for Task 16.0.5.3: PlanNode::Sort variant exists,
