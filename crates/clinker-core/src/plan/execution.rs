@@ -164,6 +164,11 @@ pub struct ExecutionPlanDag {
     pub parallelism: ParallelismProfile,
     /// If correlation sort was auto-injected, describes what was prepended.
     pub correlation_sort_note: Option<String>,
+    /// Physical properties (ordering, partitioning) per node, keyed by
+    /// `NodeIndex`. Populated by
+    /// [`compute_node_properties`](ExecutionPlanDag::compute_node_properties)
+    /// after transform compilation. Default-empty on construction.
+    pub node_properties: HashMap<NodeIndex, crate::plan::properties::NodeProperties>,
 }
 
 impl ExecutionPlanDag {
@@ -621,6 +626,7 @@ impl ExecutionPlanDag {
             output_projections,
             parallelism,
             correlation_sort_note: None,
+            node_properties: HashMap::new(),
         })
     }
 
