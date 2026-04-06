@@ -663,7 +663,7 @@ impl ExecutionPlanDag {
                 .unwrap_or(4),
         };
 
-        Ok(ExecutionPlanDag {
+        let mut dag = ExecutionPlanDag {
             graph,
             topo_order,
             source_dag,
@@ -672,7 +672,34 @@ impl ExecutionPlanDag {
             parallelism,
             correlation_sort_note: None,
             node_properties: HashMap::new(),
-        })
+        };
+
+        // Task 16.0.5.10: enforcer-insertion → property derivation, in that
+        // order, exactly once, before the executor sees the DAG. D50 mandates
+        // a single sequential call chain with explicit intermediate binding
+        // (not a type-state newtype). `insert_enforcer_sorts` is structurally
+        // idempotent (prefix-guarded) and `compute_node_properties` asserts
+        // its own double-call guard, so this pair is safe but must run in
+        // order: properties derived from a DAG missing enforcer Sorts would
+        // mis-attribute ordering provenance.
+        let inputs_map: HashMap<String, InputConfig> = config
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.clone()))
+            .collect();
+        dag.insert_enforcer_sorts(&inputs_map)
+            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
+        // Enforcer may have grown the graph; re-derive topo + tiers before
+        // property derivation walks it.
+        dag.topo_order = toposort(&dag.graph, None).map_err(|cycle| {
+            let cycle_path = extract_cycle_path(&dag.graph, cycle.node_id());
+            PlanError::CycleDetected { path: cycle_path }
+        })?;
+        assign_tiers(&mut dag.graph, &dag.topo_order);
+        dag.compute_node_properties(&inputs_map)
+            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
+
+        Ok(dag)
     }
 
     /// Format the execution plan for `--explain` display.
@@ -1688,6 +1715,8 @@ pub enum PlanError {
     SelfReference {
         transform: String,
     },
+    /// Enforcer-insertion or property-derivation pass failure.
+    PropertyDerivation(String),
 }
 
 impl std::fmt::Display for PlanError {
@@ -1733,6 +1762,9 @@ impl std::fmt::Display for PlanError {
                     "transform '{}' references itself in input: field",
                     transform
                 )
+            }
+            PlanError::PropertyDerivation(msg) => {
+                write!(f, "property derivation failed: {}", msg)
             }
         }
     }
@@ -2671,6 +2703,78 @@ mod tests {
         let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
         dag.compute_node_properties(&inputs).unwrap();
         dag.compute_node_properties(&inputs).unwrap();
+    }
+
+    // ----- Task 16.0.5.10: enforcer-then-properties wired into compile -----
+
+    /// Gate: `ExecutionPlanDag::compile` runs `insert_enforcer_sorts`
+    /// before `compute_node_properties`. We replicate the exact in-compile
+    /// sequence on a hand-built DAG that has a `RequiresSortedInput`
+    /// consumer (real CXL doesn't yet emit this — analyzer wiring is
+    /// deferred — but the call sequence is what's under test). After the
+    /// chain runs, the synthesized `PlanNode::Sort` must (a) exist (proves
+    /// enforcer ran) and (b) carry `node_properties` whose ordering
+    /// provenance is `Preserved { from_node: "__sort_for_..." }` (proves
+    /// property derivation ran *after* the enforcer, on the rewritten DAG).
+    #[test]
+    fn test_compile_runs_enforcer_before_properties() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+
+        // Same call chain as inside ExecutionPlanDag::compile (D50).
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        dag.topo_order = toposort(&dag.graph, None).unwrap();
+        dag.compute_node_properties(&inputs).unwrap();
+
+        // (a) Enforcer ran: a Sort node was inserted.
+        let sort_idx = dag
+            .graph
+            .node_indices()
+            .find(|&i| matches!(dag.graph[i], PlanNode::Sort { .. }))
+            .expect("enforcer must insert a PlanNode::Sort");
+        let sort_name = dag.graph[sort_idx].name().to_string();
+        assert!(
+            sort_name.starts_with(ENFORCER_SORT_PREFIX),
+            "enforcer Sort node uses reserved prefix"
+        );
+
+        // (b) Property derivation ran *after*: Sort node has properties
+        // with Preserved { from_node: <itself> }.
+        let props = dag
+            .node_properties
+            .get(&sort_idx)
+            .expect("Sort node must have NodeProperties (compute ran after enforcer)");
+        assert!(props.ordering.sort_order.is_some());
+        match &props.ordering.provenance {
+            OrderingProvenance::Preserved { from_node } => {
+                assert_eq!(from_node, &sort_name);
+                assert!(from_node.starts_with(ENFORCER_SORT_PREFIX));
+            }
+            other => panic!("expected Preserved {{ from_node }}, got {other:?}"),
+        }
+    }
+
+    /// Sanity: `ExecutionPlanDag::compile` populates `node_properties` for
+    /// every node in the resulting DAG (proves the in-compile call chain
+    /// actually fires on the production code path, even when no enforcer
+    /// insertion is needed).
+    #[test]
+    fn test_compile_populates_node_properties_for_every_node() {
+        let config = test_config(
+            vec![("primary", "data.csv")],
+            vec![("calc", "let x = amount + 1\nemit result = x * 2", None)],
+        );
+        let fields = &["amount"];
+        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let compiled = vec![("calc", &typed)];
+
+        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
+        assert_eq!(
+            plan.node_properties.len(),
+            plan.graph.node_count(),
+            "compute_node_properties must run inside compile"
+        );
     }
 
     // ----- Task 16.0.5.7: per-operator preservation rules -----
