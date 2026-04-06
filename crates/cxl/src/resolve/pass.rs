@@ -261,6 +261,9 @@ impl<'a> Resolver<'a> {
             Expr::Wildcard { .. } => {
                 // Wildcards don't resolve to anything
             }
+            Expr::AggSlot { .. } | Expr::GroupKey { .. } => {
+                // Extractor-produced leaves; never present during resolve pass.
+            }
             Expr::Literal { .. } => {
                 // Literals don't need resolution
             }

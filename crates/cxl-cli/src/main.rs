@@ -608,6 +608,8 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
             s.push_str(" }");
             s
         }
+        cxl::ast::Expr::AggSlot { slot, .. } => format!("__agg_slot_{}", slot),
+        cxl::ast::Expr::GroupKey { slot, .. } => format!("__group_key_{}", slot),
     }
 }
 

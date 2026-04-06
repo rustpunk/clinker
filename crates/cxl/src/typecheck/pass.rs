@@ -364,6 +364,13 @@ impl<'a> TypeChecker<'a> {
                 Type::Any
             }
 
+            // Extractor-produced leaves: never present during typecheck pass.
+            // Types are assigned during aggregate extraction, not here.
+            Expr::AggSlot { node_id, .. } | Expr::GroupKey { node_id, .. } => {
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
+
             Expr::Binary {
                 node_id,
                 op,
@@ -793,7 +800,9 @@ impl<'a> TypeChecker<'a> {
             | Expr::PipelineAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::Now { .. }
-            | Expr::Wildcard { .. } => {}
+            | Expr::Wildcard { .. }
+            | Expr::AggSlot { .. }
+            | Expr::GroupKey { .. } => {}
         }
     }
 

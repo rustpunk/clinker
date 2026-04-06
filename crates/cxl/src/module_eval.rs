@@ -140,7 +140,11 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
                 walk_expr(arg, refs);
             }
         }
-        Expr::Literal { .. } | Expr::Now { .. } | Expr::Wildcard { .. } => {}
+        Expr::Literal { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
         Expr::QualifiedFieldRef { .. } => {
             // Qualified refs like module.CONST are handled separately
         }
@@ -261,7 +265,9 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
         | Expr::PipelineAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
-        | Expr::Wildcard { .. } => false,
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => false,
     }
 }
 

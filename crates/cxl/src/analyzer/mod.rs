@@ -283,7 +283,9 @@ fn walk_expr(
         | Expr::PipelineAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::Now { .. }
-        | Expr::Wildcard { .. } => {}
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
     }
 }
 

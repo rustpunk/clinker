@@ -165,6 +165,25 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// Extractor-produced leaf: references the Nth accumulator slot in a
+    /// CompiledAggregate. Never emitted by the parser; introduced by
+    /// `extract_aggregates` when rewriting an emit RHS that contains AggCalls.
+    /// At finalize time, the aggregate evaluator resolves this to the
+    /// accumulator's `finalize()` result.
+    AggSlot {
+        node_id: NodeId,
+        slot: u32,
+        span: Span,
+    },
+    /// Extractor-produced leaf: references the Nth group-by key column.
+    /// Introduced when a bare `FieldRef` in an emit RHS matches a group-by
+    /// field name — reverses the `value_to_group_key → Value` conversion at
+    /// finalize time.
+    GroupKey {
+        node_id: NodeId,
+        slot: u32,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -185,7 +204,9 @@ impl Expr {
             | Expr::MetaAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. }
-            | Expr::AggCall { span, .. } => *span,
+            | Expr::AggCall { span, .. }
+            | Expr::AggSlot { span, .. }
+            | Expr::GroupKey { span, .. } => *span,
         }
     }
 
@@ -206,7 +227,9 @@ impl Expr {
             | Expr::MetaAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. }
-            | Expr::AggCall { node_id, .. } => *node_id,
+            | Expr::AggCall { node_id, .. }
+            | Expr::AggSlot { node_id, .. }
+            | Expr::GroupKey { node_id, .. } => *node_id,
         }
     }
 }

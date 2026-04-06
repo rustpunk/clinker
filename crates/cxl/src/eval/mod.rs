@@ -666,6 +666,24 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 *span,
             ))
         }
+
+        // Extractor-produced leaves. Reaching the row-level evaluator means a
+        // post-extraction residual was evaluated without an aggregate scope —
+        // the aggregate finalize path has its own evaluator (Task 16.3.12).
+        Expr::AggSlot { span, .. } => Err(EvalError::new(
+            EvalErrorKind::TypeMismatch {
+                expected: "row-level expression",
+                got: "aggregate slot reference",
+            },
+            *span,
+        )),
+        Expr::GroupKey { span, .. } => Err(EvalError::new(
+            EvalErrorKind::TypeMismatch {
+                expected: "row-level expression",
+                got: "group-by key reference",
+            },
+            *span,
+        )),
     }
 }
 
