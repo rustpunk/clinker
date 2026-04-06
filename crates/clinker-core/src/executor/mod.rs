@@ -2688,6 +2688,18 @@ impl PipelineExecutor {
                     node_buffers.insert(node_idx, merged);
                 }
 
+                PlanNode::Sort { ref name, .. } => {
+                    // Sort enforcer dispatch is deferred to Task 16.0.5.8.
+                    // The enforcer-insertion pass (16.0.5.5) does not yet
+                    // exist, so no Sort node should be present in any DAG
+                    // produced by `ExecutionPlanDag::compile`. If this fires,
+                    // something inserted a Sort node prematurely.
+                    unreachable!(
+                        "PlanNode::Sort {{ name: {name:?} }} dispatch deferred \
+                         to Task 16.0.5.8; enforcer insertion pass not yet implemented"
+                    );
+                }
+
                 PlanNode::Output { ref name } => {
                     // Get input records from predecessor
                     let predecessors: Vec<NodeIndex> = plan

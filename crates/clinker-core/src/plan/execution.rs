@@ -67,6 +67,20 @@ pub enum PlanNode {
     Output {
         name: String,
     },
+    /// Planner-synthesized sort enforcer (drill pass 3, D46/D47).
+    ///
+    /// Inserted by `ExecutionPlanDag::insert_enforcer_sorts` on edges feeding
+    /// transforms with `RequiresSortedInput` whose upstream `Source` does not
+    /// already satisfy the requirement (per `source_ordering_satisfies`).
+    ///
+    /// Distinct from Phase 6 arena `sort_partition` (window-local, never lifted
+    /// into the DAG) and Phase 8 declared Source/Output sorts. The variant name
+    /// is reserved with the prefix `__sort_for_{consumer}`; user-declared node
+    /// names starting with `__sort_for_` are rejected at compile time.
+    Sort {
+        name: String,
+        sort_fields: Vec<SortField>,
+    },
 }
 
 impl PlanNode {
@@ -77,7 +91,8 @@ impl PlanNode {
             | PlanNode::Transform { name, .. }
             | PlanNode::Route { name, .. }
             | PlanNode::Merge { name }
-            | PlanNode::Output { name } => name,
+            | PlanNode::Output { name }
+            | PlanNode::Sort { name, .. } => name,
         }
     }
 
@@ -89,6 +104,7 @@ impl PlanNode {
             PlanNode::Route { .. } => "route",
             PlanNode::Merge { .. } => "merge",
             PlanNode::Output { .. } => "output",
+            PlanNode::Sort { .. } => "sort",
         }
     }
 
@@ -111,6 +127,7 @@ impl PlanNode {
             }
             PlanNode::Merge { name } => format!("[merge] {name}"),
             PlanNode::Output { name } => format!("[output] {name}"),
+            PlanNode::Sort { name, .. } => format!("[sort] {name}"),
         }
     }
 }
@@ -820,7 +837,10 @@ impl ExecutionPlanDag {
                 PlanNode::Merge { name } => {
                     out.push_str(&format!("  └──< MERGE '{name}'\n"));
                 }
-                _ => {
+                PlanNode::Source { .. }
+                | PlanNode::Transform { .. }
+                | PlanNode::Output { .. }
+                | PlanNode::Sort { .. } => {
                     let deps: Vec<String> = self
                         .graph
                         .neighbors_directed(idx, petgraph::Direction::Incoming)
@@ -1888,5 +1908,27 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("source.primary"))
         );
+    }
+
+    /// Gate test for Task 16.0.5.3: PlanNode::Sort variant exists,
+    /// has correct serde tag, name/type_tag/display_name/id_slug arms,
+    /// and round-trips through JSON.
+    #[test]
+    fn test_plan_node_sort_exhaustive_matches() {
+        let node = PlanNode::Sort {
+            name: "x".into(),
+            sort_fields: vec![],
+        };
+
+        // Method arms exist for Sort.
+        assert_eq!(node.name(), "x");
+        assert_eq!(node.type_tag(), "sort");
+        assert_eq!(node.id_slug(), "sort.x");
+        assert_eq!(node.display_name(), "[sort] x");
+
+        // Serde round-trip: tag is "sort".
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["type"], "sort");
+        assert_eq!(json["name"], "x");
     }
 }
