@@ -1,212 +1,411 @@
 //! Unit tests for AccumulatorEnum and all 7 built-in aggregates.
-//!
-//! Covers: Sum (i128 + Kahan), Count (all/field), Avg, Min, Max,
-//! Collect (NULL-inclusive), WeightedAvg. Tests NULL handling, merge
-//! correctness, serde round-trip, heap_size reporting, and overflow.
 
-// Imports will be added when AccumulatorEnum is implemented in Task 16.1.
-// use super::*;
+use super::*;
+
+fn sum() -> AccumulatorEnum {
+    AccumulatorEnum::Sum(SumState::default())
+}
+fn count_all() -> AccumulatorEnum {
+    AccumulatorEnum::Count(CountState::new_count_all())
+}
+fn count_field() -> AccumulatorEnum {
+    AccumulatorEnum::Count(CountState::new_count_field())
+}
+fn avg() -> AccumulatorEnum {
+    AccumulatorEnum::Avg(AvgState::default())
+}
+fn min() -> AccumulatorEnum {
+    AccumulatorEnum::Min(MinMaxState::default())
+}
+fn max() -> AccumulatorEnum {
+    AccumulatorEnum::Max(MinMaxState::default())
+}
+fn collect() -> AccumulatorEnum {
+    AccumulatorEnum::Collect(CollectState::default())
+}
+fn weighted_avg() -> AccumulatorEnum {
+    AccumulatorEnum::WeightedAvg(WeightedAvgState::default())
+}
+
+fn add_all(acc: &mut AccumulatorEnum, values: &[Value]) {
+    for v in values {
+        acc.add(v);
+    }
+}
 
 // ---------- Sum ----------
 
 #[test]
 fn test_sum_integers() {
-    // Sum of [1, 2, 3] → Integer(6)
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(
+        &mut a,
+        &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+    );
+    assert_eq!(a.finalize().unwrap(), Value::Integer(6));
 }
 
 #[test]
 fn test_sum_floats() {
-    // Sum of [1.5, 2.5] → Float(4.0)
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(&mut a, &[Value::Float(1.5), Value::Float(2.5)]);
+    assert_eq!(a.finalize().unwrap(), Value::Float(4.0));
 }
 
 #[test]
 fn test_sum_mixed_int_float() {
-    // Int + Float → Float result
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(&mut a, &[Value::Integer(2), Value::Float(0.5)]);
+    assert_eq!(a.finalize().unwrap(), Value::Float(2.5));
 }
 
 #[test]
 fn test_sum_null_skipped() {
-    // Sum of [1, Null, 3] → Integer(4)
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(&mut a, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
+    assert_eq!(a.finalize().unwrap(), Value::Integer(4));
 }
 
 #[test]
 fn test_sum_all_null() {
-    // Sum of [Null, Null] → Null
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(&mut a, &[Value::Null, Value::Null]);
+    assert_eq!(a.finalize().unwrap(), Value::Null);
 }
 
 #[test]
 fn test_sum_kahan_precision() {
-    // 1M additions of 0.1 → closer to 100000.0 than naive
-    todo!("Task 16.1")
+    // Sum 1,000,000 × 0.1 should be closer to 100_000.0 than a naive sum.
+    let mut a = sum();
+    for _ in 0..1_000_000 {
+        a.add(&Value::Float(0.1));
+    }
+    let result = a.finalize().unwrap();
+    let Value::Float(f) = result else {
+        panic!("expected Float, got {result:?}");
+    };
+    let kahan_err = (f - 100_000.0).abs();
+
+    // Naive summation for comparison.
+    let mut naive = 0.0_f64;
+    for _ in 0..1_000_000 {
+        naive += 0.1;
+    }
+    let naive_err = (naive - 100_000.0).abs();
+
+    assert!(
+        kahan_err <= naive_err,
+        "Kahan error {kahan_err} exceeded naive error {naive_err}"
+    );
+    // Kahan should get within ~1e-9.
+    assert!(kahan_err < 1e-6, "Kahan error {kahan_err} too large");
 }
 
 #[test]
 fn test_sum_merge() {
-    // Two partial sums merged → correct total
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(&mut a, &[Value::Integer(1), Value::Integer(2)]);
+    let mut b = sum();
+    add_all(&mut b, &[Value::Integer(3), Value::Integer(4)]);
+    a.merge(&b);
+    assert_eq!(a.finalize().unwrap(), Value::Integer(10));
 }
 
 #[test]
 fn test_sum_i128_no_overflow() {
-    // Sum of [i64::MAX, i64::MAX] → SumOverflow error (exceeds i64)
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(
+        &mut a,
+        &[Value::Integer(i64::MAX), Value::Integer(i64::MAX)],
+    );
+    // i128 accumulation succeeded, but i64::try_from at finalize must fail.
+    match a.finalize() {
+        Err(AccumulatorError::SumOverflow { .. }) => {}
+        other => panic!("expected SumOverflow, got {other:?}"),
+    }
 }
 
 #[test]
 fn test_sum_i128_large_cancel() {
-    // Sum of [i64::MAX, -i64::MAX, 1] → Integer(1) (cancellation fits i64)
-    todo!("Task 16.1")
+    let mut a = sum();
+    add_all(
+        &mut a,
+        &[
+            Value::Integer(i64::MAX),
+            Value::Integer(-i64::MAX),
+            Value::Integer(1),
+        ],
+    );
+    // i128 intermediate is transiently large but final fits i64.
+    assert_eq!(a.finalize().unwrap(), Value::Integer(1));
 }
 
 // ---------- Count ----------
 
 #[test]
 fn test_count_all() {
-    // COUNT(*) of [1, Null, 3] → Integer(3)
-    todo!("Task 16.1")
+    let mut a = count_all();
+    add_all(&mut a, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
+    assert_eq!(a.finalize().unwrap(), Value::Integer(3));
 }
 
 #[test]
 fn test_count_field() {
-    // COUNT(field) of [1, Null, 3] → Integer(2)
-    todo!("Task 16.1")
+    let mut a = count_field();
+    add_all(&mut a, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
+    assert_eq!(a.finalize().unwrap(), Value::Integer(2));
 }
 
 // ---------- Avg ----------
 
 #[test]
 fn test_avg_basic() {
-    // Avg of [2, 4, 6] → Float(4.0)
-    todo!("Task 16.1")
+    let mut a = avg();
+    add_all(
+        &mut a,
+        &[Value::Integer(2), Value::Integer(4), Value::Integer(6)],
+    );
+    assert_eq!(a.finalize().unwrap(), Value::Float(4.0));
 }
 
 #[test]
 fn test_avg_null_skipped() {
-    // Avg of [2, Null, 6] → Float(4.0)
-    todo!("Task 16.1")
+    let mut a = avg();
+    add_all(&mut a, &[Value::Integer(2), Value::Null, Value::Integer(6)]);
+    assert_eq!(a.finalize().unwrap(), Value::Float(4.0));
 }
 
 #[test]
 fn test_avg_all_null() {
-    // Avg of [Null] → Null
-    todo!("Task 16.1")
+    let mut a = avg();
+    add_all(&mut a, &[Value::Null]);
+    assert_eq!(a.finalize().unwrap(), Value::Null);
 }
 
 #[test]
 fn test_avg_kahan() {
-    // Kahan precision for avg over 1M values
-    todo!("Task 16.1")
+    // 1M × 0.1 averaged → 0.1 exactly (within Kahan tolerance).
+    let mut a = avg();
+    for _ in 0..1_000_000 {
+        a.add(&Value::Float(0.1));
+    }
+    let result = a.finalize().unwrap();
+    let Value::Float(f) = result else {
+        panic!("expected Float, got {result:?}");
+    };
+    assert!(
+        (f - 0.1).abs() < 1e-12,
+        "avg error {} too large",
+        (f - 0.1).abs()
+    );
 }
 
 // ---------- Min ----------
 
 #[test]
 fn test_min_basic() {
-    // Min of [3, 1, 2] → Integer(1)
-    todo!("Task 16.1")
+    let mut a = min();
+    add_all(
+        &mut a,
+        &[Value::Integer(3), Value::Integer(1), Value::Integer(2)],
+    );
+    assert_eq!(a.finalize().unwrap(), Value::Integer(1));
 }
 
 #[test]
 fn test_min_null_skipped() {
-    // Min of [3, Null, 1] → Integer(1)
-    todo!("Task 16.1")
+    let mut a = min();
+    add_all(&mut a, &[Value::Integer(3), Value::Null, Value::Integer(1)]);
+    assert_eq!(a.finalize().unwrap(), Value::Integer(1));
 }
 
 #[test]
 fn test_min_all_null() {
-    // Min of [Null] → Null
-    todo!("Task 16.1")
+    let mut a = min();
+    add_all(&mut a, &[Value::Null]);
+    assert_eq!(a.finalize().unwrap(), Value::Null);
 }
 
 // ---------- Max ----------
 
 #[test]
 fn test_max_basic() {
-    // Max of [1, 3, 2] → Integer(3)
-    todo!("Task 16.1")
+    let mut a = max();
+    add_all(
+        &mut a,
+        &[Value::Integer(1), Value::Integer(3), Value::Integer(2)],
+    );
+    assert_eq!(a.finalize().unwrap(), Value::Integer(3));
 }
 
 #[test]
 fn test_max_strings() {
-    // Max of ["b", "a", "c"] → String("c")
-    todo!("Task 16.1")
+    let mut a = max();
+    add_all(
+        &mut a,
+        &[
+            Value::String("b".into()),
+            Value::String("a".into()),
+            Value::String("c".into()),
+        ],
+    );
+    assert_eq!(a.finalize().unwrap(), Value::String("c".into()));
 }
 
 // ---------- Collect ----------
 
 #[test]
 fn test_collect_produces_array() {
-    // Collect of [Integer(1), Integer(2)] ��� Array([Integer(1), Integer(2)])
-    todo!("Task 16.1")
+    let mut a = collect();
+    add_all(&mut a, &[Value::Integer(1), Value::Integer(2)]);
+    assert_eq!(
+        a.finalize().unwrap(),
+        Value::Array(vec![Value::Integer(1), Value::Integer(2)])
+    );
 }
 
 #[test]
 fn test_collect_includes_nulls() {
-    // Collect of [Integer(1), Null, Integer(3)] → Array([Integer(1), Null, Integer(3)])
-    todo!("Task 16.1")
+    let mut a = collect();
+    add_all(&mut a, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
+    assert_eq!(
+        a.finalize().unwrap(),
+        Value::Array(vec![Value::Integer(1), Value::Null, Value::Integer(3)])
+    );
 }
 
 #[test]
 fn test_collect_empty() {
-    // Collect of [] → Array([])
-    todo!("Task 16.1")
+    let a = collect();
+    assert_eq!(a.finalize().unwrap(), Value::Array(vec![]));
 }
 
 #[test]
 fn test_collect_merge() {
-    // Two partial collects merged → correct combined array
-    todo!("Task 16.1")
+    let mut a = collect();
+    add_all(&mut a, &[Value::Integer(1), Value::Integer(2)]);
+    let mut b = collect();
+    add_all(&mut b, &[Value::Integer(3)]);
+    a.merge(&b);
+    assert_eq!(
+        a.finalize().unwrap(),
+        Value::Array(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ])
+    );
 }
 
 #[test]
 fn test_collect_heap_size_capacity() {
-    // heap_size() reflects Vec capacity, not just len
-    todo!("Task 16.1")
+    let mut a = collect();
+    // Pre-push to force capacity growth beyond len.
+    for i in 0..4 {
+        a.add(&Value::Integer(i));
+    }
+    let heap = a.heap_size();
+    // Vec of 4 Value slots = 4 × 24 bytes = 96 bytes minimum (capacity ≥ len).
+    // Integer values have zero heap of their own, so total ≥ capacity × 24.
+    let AccumulatorEnum::Collect(inner) = &a else {
+        unreachable!()
+    };
+    let expected_min = inner.values.capacity() * std::mem::size_of::<Value>();
+    assert_eq!(heap, expected_min);
+    // And capacity must be ≥ len.
+    assert!(inner.values.capacity() >= inner.values.len());
 }
 
 // ---------- WeightedAvg ----------
 
 #[test]
 fn test_weighted_avg_basic() {
-    // weighted_avg([(2,3), (4,1)]) → Float(2.5)
-    todo!("Task 16.1")
+    let mut a = weighted_avg();
+    // (2*3 + 4*1) / (3+1) = 10/4 = 2.5
+    a.add_weighted(&Value::Integer(2), &Value::Integer(3));
+    a.add_weighted(&Value::Integer(4), &Value::Integer(1));
+    assert_eq!(a.finalize().unwrap(), Value::Float(2.5));
 }
 
 #[test]
 fn test_weighted_avg_null_skipped() {
-    // weighted_avg([(2,3), (Null,1), (4,1)]) �� Float(2.5)
-    todo!("Task 16.1")
+    let mut a = weighted_avg();
+    a.add_weighted(&Value::Integer(2), &Value::Integer(3));
+    a.add_weighted(&Value::Null, &Value::Integer(1));
+    a.add_weighted(&Value::Integer(4), &Value::Integer(1));
+    assert_eq!(a.finalize().unwrap(), Value::Float(2.5));
 }
 
 #[test]
 fn test_weighted_avg_merge() {
-    // Two partial weighted avgs merged → correct result
-    todo!("Task 16.1")
+    let mut a = weighted_avg();
+    a.add_weighted(&Value::Integer(2), &Value::Integer(3));
+    let mut b = weighted_avg();
+    b.add_weighted(&Value::Integer(4), &Value::Integer(1));
+    a.merge(&b);
+    assert_eq!(a.finalize().unwrap(), Value::Float(2.5));
 }
 
 #[test]
 fn test_weighted_avg_zero_weight() {
-    // Zero total weight → Null (V-7-2a)
-    todo!("Task 16.1")
+    // V-7-2a: zero total weight → Null, not NaN/Infinity.
+    let mut a = weighted_avg();
+    a.add_weighted(&Value::Integer(5), &Value::Integer(0));
+    assert_eq!(a.finalize().unwrap(), Value::Null);
 }
 
 // ---------- Serde round-trip ----------
 
 #[test]
 fn test_accumulator_serde_roundtrip() {
-    // Serde derive round-trip preserves all 7 variants' internal state
-    todo!("Task 16.1")
+    // Build one of each variant with non-default state.
+    let mut s = sum();
+    add_all(&mut s, &[Value::Integer(10), Value::Float(1.5)]);
+
+    let mut ca = count_all();
+    add_all(&mut ca, &[Value::Integer(1), Value::Null]);
+
+    let mut av = avg();
+    add_all(&mut av, &[Value::Integer(2), Value::Integer(4)]);
+
+    let mut mi = min();
+    add_all(&mut mi, &[Value::Integer(5), Value::Integer(1)]);
+
+    let mut mx = max();
+    add_all(&mut mx, &[Value::Integer(5), Value::Integer(1)]);
+
+    let mut co = collect();
+    add_all(&mut co, &[Value::Integer(1), Value::String("x".into())]);
+
+    let mut wa = weighted_avg();
+    wa.add_weighted(&Value::Integer(2), &Value::Integer(3));
+
+    for acc in [s, ca, av, mi, mx, co, wa] {
+        let json = serde_json::to_string(&acc).expect("serialize");
+        let recovered: AccumulatorEnum = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(acc, recovered, "round-trip failed for {acc:?}");
+    }
 }
 
 // ---------- heap_size ----------
 
 #[test]
 fn test_accumulator_heap_size_fixed() {
-    // Fixed-size variants return size_of::<Self>()
-    todo!("Task 16.1")
+    // Fixed-size variants (all except Collect) return size_of::<Self>().
+    let expected = std::mem::size_of::<AccumulatorEnum>();
+    for acc in [
+        sum(),
+        count_all(),
+        count_field(),
+        avg(),
+        min(),
+        max(),
+        weighted_avg(),
+    ] {
+        assert_eq!(acc.heap_size(), expected, "variant {acc:?}");
+    }
+    // Collect diverges (reports Vec capacity).
+    let c = collect();
+    // Empty collect: capacity 0 → heap 0.
+    assert_eq!(c.heap_size(), 0);
 }
