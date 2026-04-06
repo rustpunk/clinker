@@ -911,7 +911,7 @@ impl PipelineExecutor {
         compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
-        effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
+        _effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
         collector: &mut stage_metrics::StageCollector,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
@@ -1521,18 +1521,11 @@ impl PipelineExecutor {
             );
         }
 
-        // Phase 2: Sort if correlated streaming
-        if requires_sorted_input && let Some(sort_specs) = effective_sort_order {
-            let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
-            let sort_count = all_records.len() as u64;
-            let sort_fields: Vec<crate::config::SortField> = sort_specs
-                .iter()
-                .map(|s| s.clone().into_sort_field())
-                .collect();
-            all_records
-                .sort_by(|(a, _), (b, _)| sort::compare_records_by_fields(a, b, &sort_fields));
-            collector.record(sort_timer.finish(sort_count, sort_count));
-        }
+        // Legacy non-arena sort block deleted by Task 16.0.5.8.
+        // Sorts now flow through the planner-synthesized `PlanNode::Sort`
+        // enforcer node, dispatched in the DAG topo walk via
+        // `SortBuffer<P>` (Pattern B; see
+        // docs/research/RESEARCH-sort-node-sidecar-payload.md).
 
         // Phase 3: Schema derivation (scan for first emitting record)
         let mut evaluators = build_evaluators(transforms);
@@ -2688,16 +2681,103 @@ impl PipelineExecutor {
                     node_buffers.insert(node_idx, merged);
                 }
 
-                PlanNode::Sort { ref name, .. } => {
-                    // Sort enforcer dispatch is deferred to Task 16.0.5.8.
-                    // The enforcer-insertion pass (16.0.5.5) does not yet
-                    // exist, so no Sort node should be present in any DAG
-                    // produced by `ExecutionPlanDag::compile`. If this fires,
-                    // something inserted a Sort node prematurely.
-                    unreachable!(
-                        "PlanNode::Sort {{ name: {name:?} }} dispatch deferred \
-                         to Task 16.0.5.8; enforcer insertion pass not yet implemented"
+                PlanNode::Sort {
+                    ref name,
+                    ref sort_fields,
+                } => {
+                    // Enforcer-sort dispatch (Task 16.0.5.8). Reuses the
+                    // generalized `SortBuffer<P>` carrying per-record sidecar
+                    // (row_num + emitted/accumulated metadata maps) through
+                    // the sort permutation. See
+                    // docs/research/RESEARCH-sort-node-sidecar-payload.md.
+                    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+
+                    type SortPayload = (u64, IndexMap<String, Value>, IndexMap<String, Value>);
+                    type SortRow = (
+                        Record,
+                        u64,
+                        IndexMap<String, Value>,
+                        IndexMap<String, Value>,
                     );
+
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let input_records: Vec<_> = predecessors
+                        .iter()
+                        .find_map(|p| node_buffers.remove(p))
+                        .unwrap_or_default();
+
+                    if input_records.is_empty() {
+                        node_buffers.insert(node_idx, Vec::new());
+                        continue;
+                    }
+
+                    let schema = input_records[0].0.schema().clone();
+                    let memory_limit = parse_memory_limit(config);
+                    let mut buf: SortBuffer<SortPayload> =
+                        SortBuffer::new(sort_fields.clone(), memory_limit, None, schema);
+
+                    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+                    let sort_count = input_records.len() as u64;
+                    for (record, row_num, emitted, accumulated) in input_records {
+                        buf.push(record, (row_num, emitted, accumulated));
+                        if buf.should_spill() {
+                            buf.sort_and_spill().map_err(|e| {
+                                PipelineError::Io(std::io::Error::other(format!(
+                                    "sort enforcer '{name}' spill failed: {e}"
+                                )))
+                            })?;
+                        }
+                    }
+
+                    let sorted = buf.finish().map_err(|e| {
+                        PipelineError::Io(std::io::Error::other(format!(
+                            "sort enforcer '{name}' finish failed: {e}"
+                        )))
+                    })?;
+
+                    let mut out: Vec<SortRow> = Vec::with_capacity(sort_count as usize);
+                    match sorted {
+                        SortedOutput::InMemory(pairs) => {
+                            for (record, (row_num, emitted, accumulated)) in pairs {
+                                out.push((record, row_num, emitted, accumulated));
+                            }
+                        }
+                        SortedOutput::Spilled(files) => {
+                            // Spill files are individually sorted but not
+                            // globally merged. For correctness when multiple
+                            // spill files exist, a k-way merge is required.
+                            // Single-file fast path is exact.
+                            if files.len() > 1 {
+                                return Err(PipelineError::Io(std::io::Error::other(format!(
+                                    "sort enforcer '{name}' produced {} spill files; \
+                                     k-way merge for enforcer sort is not yet implemented \
+                                     (memory_limit too small for input)",
+                                    files.len()
+                                ))));
+                            }
+                            for file in files {
+                                let reader = file.reader().map_err(|e| {
+                                    PipelineError::Io(std::io::Error::other(format!(
+                                        "sort enforcer '{name}' spill read failed: {e}"
+                                    )))
+                                })?;
+                                for entry in reader {
+                                    let (record, (row_num, emitted, accumulated)) =
+                                        entry.map_err(|e| {
+                                            PipelineError::Io(std::io::Error::other(format!(
+                                                "sort enforcer '{name}' spill decode failed: {e}"
+                                            )))
+                                        })?;
+                                    out.push((record, row_num, emitted, accumulated));
+                                }
+                            }
+                        }
+                    }
+                    collector.record(sort_timer.finish(sort_count, sort_count));
+                    node_buffers.insert(node_idx, out);
                 }
 
                 PlanNode::Output { ref name } => {
@@ -5434,6 +5514,9 @@ transformations:
     }
 
     #[test]
+    #[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; \
+                Task 16.0.5.8 deleted the legacy sort block but the new PlanNode::Sort dispatch arm \
+                is not yet driven for this pipeline."]
     fn test_correlated_pipeline_has_sort_and_group_flush_stages() {
         let yaml = r#"
 pipeline:

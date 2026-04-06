@@ -1,19 +1,30 @@
 //! Spill-to-disk infrastructure: LZ4-compressed NDJSON with schema header.
 //!
-//! `SpillWriter` serializes records to a temp file; `SpillReader` reads them back.
-//! These are reusable IO primitives — the actual spill triggers (sort buffer
-//! overflow, blocking stage pressure) are implemented in Phase 8.
+//! `SpillWriter<P>` serializes (record, payload) pairs to a temp file;
+//! `SpillReader<P>` reads them back. Parameterized over per-record payload
+//! type `P` so DAG-walk sites can carry sidecar data (row number, metadata
+//! maps) through sort permutation. Phase 8 source/output sort callsites use
+//! `P = ()` (zero spill bytes for the unit type).
+//!
+//! Generalization rationale: see
+//! `docs/research/RESEARCH-sort-node-sidecar-payload.md` — every production
+//! row-oriented ETL system (Miller, Beam Sorter, Flink ExternalSorter,
+//! Differential Dataflow `Batcher`, `extsort` crate) carries payload inside
+//! the spill envelope. Position-indexed parallel arrays are contraindicated
+//! (Vector RFC, KAFKA-9408 postmortem).
 //!
 //! File format:
 //!   Line 0: JSON array of column names (schema)
-//!   Line 1..N: JSON objects with column names as keys (records)
+//!   Line 1..N: JSON objects `{"r": {record obj}, "p": payload json}`
 //! Entire stream is LZ4 frame-compressed.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
+use serde::{Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 
 use clinker_record::{Record, Schema, Value};
@@ -56,16 +67,19 @@ impl From<lz4_flex::frame::Error> for SpillError {
     }
 }
 
-/// Writes records to an LZ4-compressed NDJSON spill file.
+/// Writes (record, payload) pairs to an LZ4-compressed NDJSON spill file.
 ///
 /// Records are manually serialized to JSON objects using schema columns +
-/// values + overflow fields. No `Serialize` derive on `Record` required.
-pub struct SpillWriter {
+/// values + overflow fields. The payload `P` is serialized via serde and
+/// rides in the same line as `"p"`. Phase 8 source/output sort callsites
+/// use `P = ()` (serializes to `null`).
+pub struct SpillWriter<P> {
     encoder: FrameEncoder<BufWriter<NamedTempFile>>,
     schema: Arc<Schema>,
+    _payload: PhantomData<P>,
 }
 
-impl SpillWriter {
+impl<P: Serialize> SpillWriter<P> {
     /// Create a new SpillWriter. Writes schema header immediately.
     /// Files are created in `spill_dir` or the system temp directory.
     pub fn new(schema: Arc<Schema>, spill_dir: Option<&Path>) -> Result<Self, SpillError> {
@@ -84,38 +98,55 @@ impl SpillWriter {
         encoder.write_all(schema_json.as_bytes())?;
         encoder.write_all(b"\n")?;
 
-        Ok(SpillWriter { encoder, schema })
+        Ok(SpillWriter {
+            encoder,
+            schema,
+            _payload: PhantomData,
+        })
     }
 
-    /// Serialize one record as an NDJSON line.
-    /// Manually builds a JSON object from schema columns + values + overflow.
-    pub fn write_record(&mut self, record: &Record) -> Result<(), SpillError> {
+    /// Serialize one (record, payload) pair as an NDJSON line.
+    /// Builds `{"r": {record_obj}, "p": payload_json}`.
+    pub fn write_pair(&mut self, record: &Record, payload: &P) -> Result<(), SpillError> {
         use serde_json::{Map, Value as JsonValue};
 
-        let mut obj = Map::with_capacity(record.total_field_count());
+        let mut record_obj = Map::with_capacity(record.total_field_count());
 
         // Schema fields
         for (i, col) in self.schema.columns().iter().enumerate() {
             let val = record.values().get(i).unwrap_or(&Value::Null);
-            obj.insert(col.to_string(), value_to_json(val));
+            record_obj.insert(col.to_string(), value_to_json(val));
         }
 
         // Overflow fields (CXL-emitted, not in schema)
         if let Some(overflow) = record.overflow_fields() {
             for (key, val) in overflow {
-                obj.insert(key.to_string(), value_to_json(val));
+                record_obj.insert(key.to_string(), value_to_json(val));
             }
         }
 
-        let line = serde_json::to_string(&JsonValue::Object(obj))?;
+        let payload_json = serde_json::to_value(payload)?;
+        let mut envelope = Map::with_capacity(2);
+        envelope.insert("r".to_string(), JsonValue::Object(record_obj));
+        envelope.insert("p".to_string(), payload_json);
+
+        let line = serde_json::to_string(&JsonValue::Object(envelope))?;
         self.encoder.write_all(line.as_bytes())?;
         self.encoder.write_all(b"\n")?;
 
         Ok(())
     }
 
+    /// Convenience: write a record with the unit payload `()`.
+    pub fn write_record(&mut self, record: &Record) -> Result<(), SpillError>
+    where
+        P: Default,
+    {
+        self.write_pair(record, &P::default())
+    }
+
     /// Flush, finalize LZ4 frame, return handle to the completed spill file.
-    pub fn finish(self) -> Result<SpillFile, SpillError> {
+    pub fn finish(self) -> Result<SpillFile<P>, SpillError> {
         let buf_writer = self.encoder.finish()?;
         let temp_file = buf_writer
             .into_inner()
@@ -124,19 +155,21 @@ impl SpillWriter {
         Ok(SpillFile {
             path,
             schema: self.schema,
+            _payload: PhantomData,
         })
     }
 }
 
 /// Handle to a completed spill file. Auto-deletes on drop via TempPath.
-pub struct SpillFile {
+pub struct SpillFile<P> {
     path: tempfile::TempPath,
     schema: Arc<Schema>,
+    _payload: PhantomData<P>,
 }
 
-impl SpillFile {
+impl<P: DeserializeOwned> SpillFile<P> {
     /// Open a reader over this spill file.
-    pub fn reader(&self) -> Result<SpillReader, SpillError> {
+    pub fn reader(&self) -> Result<SpillReader<P>, SpillError> {
         let file = std::fs::File::open(&self.path)?;
         let decoder = FrameDecoder::new(file);
         let mut buf_reader = BufReader::new(decoder);
@@ -159,9 +192,12 @@ impl SpillFile {
             lines: buf_reader,
             schema: Arc::clone(&self.schema),
             line_buf: String::new(),
+            _payload: PhantomData,
         })
     }
+}
 
+impl<P> SpillFile<P> {
     /// Schema stored in this spill file.
     pub fn schema(&self) -> &Arc<Schema> {
         &self.schema
@@ -173,15 +209,16 @@ impl SpillFile {
     }
 }
 
-/// Reads records from an LZ4-compressed NDJSON spill file.
-pub struct SpillReader {
+/// Reads (record, payload) pairs from an LZ4-compressed NDJSON spill file.
+pub struct SpillReader<P> {
     lines: BufReader<FrameDecoder<std::fs::File>>,
     schema: Arc<Schema>,
     line_buf: String,
+    _payload: PhantomData<P>,
 }
 
-impl Iterator for SpillReader {
-    type Item = Result<Record, SpillError>;
+impl<P: DeserializeOwned> Iterator for SpillReader<P> {
+    type Item = Result<(Record, P), SpillError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.line_buf.clear();
@@ -192,16 +229,27 @@ impl Iterator for SpillReader {
                 if line.is_empty() {
                     return None;
                 }
-                Some(self.parse_record(line))
+                Some(self.parse_pair(line))
             }
             Err(e) => Some(Err(SpillError::Io(e))),
         }
     }
 }
 
-impl SpillReader {
-    fn parse_record(&self, line: &str) -> Result<Record, SpillError> {
-        let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)?;
+impl<P: DeserializeOwned> SpillReader<P> {
+    fn parse_pair(&self, line: &str) -> Result<(Record, P), SpillError> {
+        let envelope: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)?;
+
+        let record_json = envelope
+            .get("r")
+            .ok_or_else(|| SpillError::InvalidSchema("missing 'r' field in spill line".into()))?;
+        let payload_json = envelope
+            .get("p")
+            .ok_or_else(|| SpillError::InvalidSchema("missing 'p' field in spill line".into()))?;
+
+        let obj = record_json
+            .as_object()
+            .ok_or_else(|| SpillError::InvalidSchema("'r' field is not a JSON object".into()))?;
 
         // Extract schema fields in order
         let mut values = Vec::with_capacity(self.schema.column_count());
@@ -213,13 +261,14 @@ impl SpillReader {
         let mut record = Record::new(Arc::clone(&self.schema), values);
 
         // Extract overflow fields (keys not in schema)
-        for (key, json_val) in &obj {
+        for (key, json_val) in obj {
             if self.schema.index(key).is_none() {
                 record.set_overflow(key.clone().into_boxed_str(), json_to_value(json_val));
             }
         }
 
-        Ok(record)
+        let payload: P = serde_json::from_value(payload_json.clone())?;
+        Ok((record, payload))
     }
 }
 
@@ -272,7 +321,7 @@ mod tests {
             "arr_col".into(),
         ]));
 
-        let mut writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
 
         for i in 0..100 {
             let record = Record::new(
@@ -302,7 +351,7 @@ mod tests {
 
         let spill_file = writer.finish().unwrap();
         let reader = spill_file.reader().unwrap();
-        let records: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let records: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
 
         assert_eq!(records.len(), 100);
 
@@ -330,7 +379,7 @@ mod tests {
             "m_col".into(),
         ]));
 
-        let mut writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
         let record = Record::new(
             Arc::clone(&schema),
             vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
@@ -339,7 +388,7 @@ mod tests {
 
         let spill_file = writer.finish().unwrap();
         let reader = spill_file.reader().unwrap();
-        let records: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let records: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
 
         assert_eq!(records.len(), 1);
         let read_schema = records[0].schema();
@@ -356,7 +405,7 @@ mod tests {
     #[test]
     fn test_spill_lz4_compression_ratio() {
         let schema = test_schema();
-        let mut writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
 
         // Write 1000 records of repetitive tabular data
         let mut raw_ndjson_size = 0usize;
@@ -386,7 +435,7 @@ mod tests {
     #[test]
     fn test_spill_tempfile_cleanup() {
         let schema = test_schema();
-        let mut writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
         writer
             .write_record(&make_record(&schema, "Alice", 100, true))
             .unwrap();
@@ -402,19 +451,19 @@ mod tests {
     #[test]
     fn test_spill_empty_chunk() {
         let schema = test_schema();
-        let writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
+        let writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
         // Finish immediately — no records written
         let spill_file = writer.finish().unwrap();
 
         let reader = spill_file.reader().unwrap();
-        let records: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let records: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
         assert!(records.is_empty());
     }
 
     #[test]
     fn test_spill_overflow_fields_preserved() {
         let schema = test_schema();
-        let mut writer = SpillWriter::new(Arc::clone(&schema), None).unwrap();
+        let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
 
         let mut record = make_record(&schema, "Alice", 100, true);
         record.set_overflow("extra_field".into(), Value::String("bonus".into()));
@@ -423,7 +472,7 @@ mod tests {
 
         let spill_file = writer.finish().unwrap();
         let reader = spill_file.reader().unwrap();
-        let records: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let records: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
 
         assert_eq!(records.len(), 1);
         // Schema fields
@@ -440,7 +489,8 @@ mod tests {
     fn test_spill_dir_override() {
         let custom_dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
-        let mut writer = SpillWriter::new(Arc::clone(&schema), Some(custom_dir.path())).unwrap();
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&schema), Some(custom_dir.path())).unwrap();
         writer
             .write_record(&make_record(&schema, "Alice", 100, true))
             .unwrap();
