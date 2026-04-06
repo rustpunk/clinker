@@ -1280,6 +1280,10 @@ impl PipelineExecutor {
                     records_out: records_emitted,
                     bytes_written: None,
                     rss_after: None,
+                    cpu_user_delta_ns: None,
+                    cpu_sys_delta_ns: None,
+                    io_read_delta: None,
+                    io_write_delta: None,
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
                 });
@@ -1389,6 +1393,10 @@ impl PipelineExecutor {
                     records_out: records_emitted,
                     bytes_written: None,
                     rss_after: None,
+                    cpu_user_delta_ns: None,
+                    cpu_sys_delta_ns: None,
+                    io_read_delta: None,
+                    io_write_delta: None,
                     heap_delta_bytes: None,
                     heap_alloc_count: None,
                 });

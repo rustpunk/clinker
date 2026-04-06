@@ -8,6 +8,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::pipeline::memory::rss_bytes;
+use crate::pipeline::sysstats::{CpuTimes, IoCounters, cpu_times, io_counters};
 
 /// Metrics for a single pipeline stage.
 #[derive(Debug, Clone)]
@@ -20,6 +21,17 @@ pub struct StageMetrics {
     pub bytes_written: Option<u64>,
     /// RSS snapshot at stage exit (always populated on supported platforms).
     pub rss_after: Option<u64>,
+    /// Process-wide user CPU time consumed during this stage (nanoseconds).
+    /// Sums across rayon workers under parallel execution; advisory per-stage,
+    /// authoritative when summed run-wide.
+    pub cpu_user_delta_ns: Option<u64>,
+    /// Process-wide system CPU time consumed during this stage (nanoseconds).
+    pub cpu_sys_delta_ns: Option<u64>,
+    /// Process-wide bytes read from disk during this stage. Excludes
+    /// page-cache hits. Advisory per-stage under parallel execution.
+    pub io_read_delta: Option<u64>,
+    /// Process-wide bytes written to disk during this stage.
+    pub io_write_delta: Option<u64>,
     /// Heap delta bytes over the stage's lifetime. `bench-alloc` feature-gated.
     pub heap_delta_bytes: Option<i64>,
     /// Number of heap allocations during the stage. `bench-alloc` feature-gated.
@@ -69,6 +81,8 @@ impl fmt::Display for StageName {
 pub struct StageTimer {
     name: StageName,
     start: Instant,
+    cpu_baseline: Option<CpuTimes>,
+    io_baseline: Option<IoCounters>,
     #[cfg(feature = "bench-alloc")]
     region: clinker_bench_support::alloc::Region,
 }
@@ -78,6 +92,8 @@ impl StageTimer {
         Self {
             name,
             start: Instant::now(),
+            cpu_baseline: cpu_times(),
+            io_baseline: io_counters(),
             #[cfg(feature = "bench-alloc")]
             region: clinker_bench_support::alloc::Region::new(&clinker_bench_support::alloc::ALLOC),
         }
@@ -90,6 +106,24 @@ impl StageTimer {
     pub fn finish(self, records_in: u64, records_out: u64) -> StageMetrics {
         let elapsed = self.start.elapsed();
         let rss_after = rss_bytes();
+
+        let cpu_after = cpu_times();
+        let (cpu_user_delta_ns, cpu_sys_delta_ns) = match (self.cpu_baseline, cpu_after) {
+            (Some(b), Some(a)) => (
+                Some(a.user_ns.saturating_sub(b.user_ns)),
+                Some(a.sys_ns.saturating_sub(b.sys_ns)),
+            ),
+            _ => (None, None),
+        };
+
+        let io_after = io_counters();
+        let (io_read_delta, io_write_delta) = match (self.io_baseline, io_after) {
+            (Some(b), Some(a)) => (
+                Some(a.read_bytes.saturating_sub(b.read_bytes)),
+                Some(a.write_bytes.saturating_sub(b.write_bytes)),
+            ),
+            _ => (None, None),
+        };
 
         #[cfg(feature = "bench-alloc")]
         let (heap_delta, heap_count) = {
@@ -106,6 +140,10 @@ impl StageTimer {
             records_out,
             bytes_written: None,
             rss_after,
+            cpu_user_delta_ns,
+            cpu_sys_delta_ns,
+            io_read_delta,
+            io_write_delta,
             heap_delta_bytes: heap_delta,
             heap_alloc_count: heap_count,
         }
@@ -149,6 +187,10 @@ impl CumulativeTimer {
             records_out,
             bytes_written: None,
             rss_after: None,
+            cpu_user_delta_ns: None,
+            cpu_sys_delta_ns: None,
+            io_read_delta: None,
+            io_write_delta: None,
             heap_delta_bytes: None,
             heap_alloc_count: None,
         }
@@ -239,6 +281,85 @@ mod tests {
         assert_eq!(metrics.name, StageName::ReaderInit);
         assert_eq!(metrics.records_in, 5);
         assert_eq!(metrics.records_out, 3);
+    }
+
+    #[test]
+    fn stage_timer_populates_cpu_deltas() {
+        let timer = StageTimer::new(StageName::Compile);
+        let metrics = timer.finish(0, 0);
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            assert!(metrics.cpu_user_delta_ns.is_some());
+            assert!(metrics.cpu_sys_delta_ns.is_some());
+        }
+    }
+
+    #[test]
+    fn stage_timer_populates_io_deltas() {
+        let timer = StageTimer::new(StageName::Compile);
+        let metrics = timer.finish(0, 0);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(metrics.io_read_delta.is_some());
+            assert!(metrics.io_write_delta.is_some());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // /proc/self/io exists on virtually all production kernels
+            if super::io_counters().is_some() {
+                assert!(metrics.io_read_delta.is_some());
+                assert!(metrics.io_write_delta.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn stage_timer_cpu_delta_nonzero_after_busy_work() {
+        let timer = StageTimer::new(StageName::TransformEval);
+        let start = std::time::Instant::now();
+        let mut x: u64 = 0;
+        while start.elapsed() < std::time::Duration::from_millis(50) {
+            x = x.wrapping_add(1);
+            std::hint::black_box(&x);
+        }
+        let metrics = timer.finish(0, 0);
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        assert!(
+            metrics.cpu_user_delta_ns.unwrap_or(0) > 0,
+            "expected nonzero cpu_user_delta_ns after spin"
+        );
+    }
+
+    #[test]
+    fn cumulative_timer_leaves_cpu_io_none() {
+        let timer = CumulativeTimer::new();
+        let metrics = timer.finish(StageName::Projection, 0, 0);
+        assert!(metrics.cpu_user_delta_ns.is_none());
+        assert!(metrics.cpu_sys_delta_ns.is_none());
+        assert!(metrics.io_read_delta.is_none());
+        assert!(metrics.io_write_delta.is_none());
+    }
+
+    #[test]
+    fn stage_metrics_default_cpu_io_fields_none_without_capture() {
+        let m = StageMetrics {
+            name: StageName::Compile,
+            elapsed: Duration::ZERO,
+            records_in: 0,
+            records_out: 0,
+            bytes_written: None,
+            rss_after: None,
+            cpu_user_delta_ns: None,
+            cpu_sys_delta_ns: None,
+            io_read_delta: None,
+            io_write_delta: None,
+            heap_delta_bytes: None,
+            heap_alloc_count: None,
+        };
+        assert!(m.cpu_user_delta_ns.is_none());
+        assert!(m.cpu_sys_delta_ns.is_none());
+        assert!(m.io_read_delta.is_none());
+        assert!(m.io_write_delta.is_none());
     }
 
     #[test]
