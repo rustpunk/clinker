@@ -3,20 +3,25 @@
 //! Compiles a `PipelineConfig` + CXL programs into an `ExecutionPlanDag`
 //! that orchestrates the pipeline via a petgraph DAG.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::{Control, DfsEvent, depth_first_search};
+use petgraph::visit::{Control, DfsEvent, Topo, depth_first_search};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
 use crate::config::{InputConfig, PipelineConfig, RouteMode, SortField, TransformInput};
 use crate::error::PipelineError;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
+use crate::plan::properties::{
+    NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
+    PartitioningProvenance,
+};
 
 use cxl::analyzer::{self, ParallelismHint};
+use cxl::ast::Statement;
 use cxl::typecheck::pass::TypedProgram;
 
 /// Per-node execution strategy — replaces global ExecutionMode.
@@ -55,6 +60,14 @@ pub enum PlanNode {
         /// How to look up the partition for this transform's window.
         #[serde(skip)]
         partition_lookup: Option<PartitionLookupKind>,
+        /// Field names this transform writes (assigns to via `emit name = ...`,
+        /// excluding `$meta.*` writes). Populated at compile time from the CXL
+        /// `TypedProgram`. Single source of truth for
+        /// `compute_node_properties`'s `DestroyedByTransformWriteSet` rule —
+        /// the property pass reads this directly off the node, no executor
+        /// coupling. See `docs/research/RESEARCH-property-derivation-layering.md`.
+        #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+        write_set: BTreeSet<String>,
     },
     Route {
         name: String,
@@ -431,6 +444,11 @@ impl ExecutionPlanDag {
                 }
             });
 
+            // Extract the per-transform write set from the matching CXL
+            // TypedProgram. The `compiled` slice is in the same declaration
+            // order as `config.transforms()` (see analyzer::analyze_all).
+            let write_set = extract_write_set(compiled[i].1);
+
             add_node(
                 &mut graph,
                 PlanNode::Transform {
@@ -440,6 +458,7 @@ impl ExecutionPlanDag {
                     execution_reqs,
                     window_index,
                     partition_lookup,
+                    write_set,
                 },
                 &mut node_by_name,
                 &mut slug_set,
@@ -1277,6 +1296,89 @@ impl ExecutionPlanDag {
 
         Ok(())
     }
+
+    /// Phase 16.0.5.6 — populate `node_properties` via topological walk.
+    ///
+    /// Computes [`NodeProperties`] for every node in the DAG, derived from
+    /// already-populated parent properties plus declared per-node data
+    /// (`InputConfig.sort_order` for sources, `sort_fields` on
+    /// [`PlanNode::Sort`], `write_set` on [`PlanNode::Transform`] in 16.0.5.7).
+    /// The pass never inspects operator implementations — it reads only what
+    /// the plan node already declares, mirroring Trino's
+    /// `PropertyDerivations.Visitor` and Spark's `AliasAwareOutputExpression`
+    /// (see `docs/research/RESEARCH-property-derivation-layering.md`).
+    ///
+    /// # Sub-task scope (16.0.5.6)
+    ///
+    /// Only the [`PlanNode::Sort`] arm is fully populated in this sub-task:
+    /// it ignores parent ordering and emits
+    /// [`OrderingProvenance::Preserved`] from itself. All other variants
+    /// receive an [`NodeProperties::unordered_single`] placeholder; per-op
+    /// preservation rules land in 16.0.5.7.
+    ///
+    /// # Panics / errors
+    ///
+    /// Asserts `self.node_properties.is_empty()` on entry as a double-call
+    /// guard. Returns [`PipelineError::Compilation`] only if a future variant
+    /// rule fails (currently infallible).
+    pub fn compute_node_properties(
+        &mut self,
+        inputs: &HashMap<String, InputConfig>,
+    ) -> Result<(), PipelineError> {
+        assert!(
+            self.node_properties.is_empty(),
+            "compute_node_properties called twice on the same ExecutionPlanDag"
+        );
+
+        let mut topo = Topo::new(&self.graph);
+        while let Some(idx) = topo.next(&self.graph) {
+            let parent_props: Option<&NodeProperties> = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .find_map(|p| self.node_properties.get(&p));
+
+            let props = compute_one(&self.graph[idx], parent_props, inputs);
+            self.node_properties.insert(idx, props);
+        }
+
+        Ok(())
+    }
+}
+
+/// Per-node property derivation rule. Pure function over the node and its
+/// (already-computed) parent properties — never sees operator implementations.
+///
+/// In sub-task 16.0.5.6 only the [`PlanNode::Sort`] arm is populated; other
+/// arms return [`NodeProperties::unordered_single`] as a placeholder. Per-op
+/// preservation rules for Source / Transform / Route / Merge / Output land in
+/// 16.0.5.7.
+fn compute_one(
+    node: &PlanNode,
+    parent_props: Option<&NodeProperties>,
+    _inputs: &HashMap<String, InputConfig>,
+) -> NodeProperties {
+    match node {
+        PlanNode::Sort { name, sort_fields } => NodeProperties {
+            ordering: Ordering {
+                sort_order: Some(sort_fields.clone()),
+                provenance: OrderingProvenance::Preserved {
+                    from_node: name.clone(),
+                },
+            },
+            partitioning: parent_props
+                .map(|p| p.partitioning.clone())
+                .unwrap_or(Partitioning {
+                    kind: PartitioningKind::Single,
+                    provenance: PartitioningProvenance::SingleStream,
+                }),
+        },
+        // Placeholder for variants handled in 16.0.5.7. Suppressing the
+        // unused-binding warning preserves the symbol for that follow-up.
+        _ => {
+            let _ = parent_props;
+            NodeProperties::unordered_single()
+        }
+    }
 }
 
 /// Idempotency predicate for Phase 16.0.5 enforcer-sort insertion.
@@ -1297,6 +1399,33 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
         .iter()
         .zip(required.iter())
         .all(|(d, r)| d.field == r.field && d.order == r.order && d.null_order == r.null_order)
+}
+
+/// Extract the set of record-field names a CXL transform writes.
+///
+/// Walks the `TypedProgram`'s top-level statements and collects the names of
+/// every `emit name = ...` whose target is the record (not `$meta.*`). `let`
+/// statements bind locals only and are ignored; `filter`, `distinct`, `trace`,
+/// and bare expression statements do not write to fields.
+///
+/// Consumed by `compute_node_properties` to populate the
+/// `DestroyedByTransformWriteSet` provenance variant in Phase 16.0.5.7. The
+/// write set lives directly on `PlanNode::Transform` so the property pass
+/// never has to reach into executor-private types
+/// (see `docs/research/RESEARCH-property-derivation-layering.md`).
+fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for stmt in &typed.program.statements {
+        if let Statement::Emit {
+            name,
+            is_meta: false,
+            ..
+        } = stmt
+        {
+            set.insert(name.to_string());
+        }
+    }
+    set
 }
 
 /// Check if a source's declared sort_order matches the window's sort_by.
@@ -2066,6 +2195,7 @@ mod tests {
             },
             window_index: None,
             partition_lookup: None,
+            write_set: BTreeSet::new(),
         });
         graph.add_edge(
             s,
@@ -2257,6 +2387,65 @@ mod tests {
     fn test_source_ordering_satisfies_empty_declared_only_empty_required() {
         let required = vec![sf("a", SortOrder::Asc, None)];
         assert!(!source_ordering_satisfies(&[], &required));
+    }
+
+    // ----- Task 16.0.5.6: compute_node_properties -----
+
+    /// Gate test for Task 16.0.5.6: a `PlanNode::Sort` node in a
+    /// `Source -> Sort -> Transform` chain owns its declared `sort_fields`
+    /// in `NodeProperties.ordering`, with `Preserved { from_node }` provenance
+    /// pointing at itself. Confirms the topo walk runs, the double-call guard
+    /// holds, and the Sort arm ignores parent ordering.
+    #[test]
+    fn test_node_properties_sort_node_owns_its_order() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req.clone());
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+
+        // Insert the enforcer Sort first so the chain is Source -> Sort -> Transform.
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        assert_eq!(count_sort_nodes(&dag), 1);
+
+        // Topo order may have grown — re-derive from petgraph.
+        dag.topo_order = toposort(&dag.graph, None).unwrap();
+
+        dag.compute_node_properties(&inputs).unwrap();
+
+        // Every node has properties.
+        assert_eq!(dag.node_properties.len(), dag.graph.node_count());
+
+        // Locate the Sort node and verify ordering + provenance.
+        let sort_idx = dag
+            .graph
+            .node_indices()
+            .find(|&i| matches!(dag.graph[i], PlanNode::Sort { .. }))
+            .unwrap();
+        let sort_name = dag.graph[sort_idx].name().to_string();
+        let props = dag.node_properties.get(&sort_idx).unwrap();
+        let got = props.ordering.sort_order.as_ref().expect("sort_order set");
+        assert_eq!(got.len(), req.len());
+        for (g, r) in got.iter().zip(req.iter()) {
+            assert_eq!(g.field, r.field);
+            assert_eq!(g.order, r.order);
+            assert_eq!(g.null_order, r.null_order);
+        }
+        match &props.ordering.provenance {
+            OrderingProvenance::Preserved { from_node } => {
+                assert_eq!(from_node, &sort_name);
+            }
+            other => panic!("expected Preserved {{ from_node }}, got {other:?}"),
+        }
+    }
+
+    /// Sanity check: calling `compute_node_properties` twice panics.
+    #[test]
+    #[should_panic(expected = "compute_node_properties called twice")]
+    fn test_compute_node_properties_double_call_panics() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        dag.compute_node_properties(&inputs).unwrap();
+        dag.compute_node_properties(&inputs).unwrap();
     }
 
     /// Gate test for Task 16.0.5.3: PlanNode::Sort variant exists,
