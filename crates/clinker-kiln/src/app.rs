@@ -37,8 +37,6 @@ use crate::sync::{EditSource, ParseResult, serialize_raw_yaml, try_parse_yaml};
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
-const KILN_CSS: Asset = asset!("/assets/kiln.css");
-
 #[component]
 pub fn AppShell() -> Element {
     // ── Global signals (shared across all tabs) ──────────────────────────
@@ -598,7 +596,6 @@ pub fn AppShell() -> Element {
     let current_ctx = (active_context)();
 
     rsx! {
-        document::Stylesheet { href: KILN_CSS }
         document::Title { "clinker kiln" }
 
         div {

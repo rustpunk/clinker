@@ -56,17 +56,32 @@ fn main() {
         let _ = CLI_WORKSPACE.set(resolved);
     }
 
-    dioxus::LaunchBuilder::new()
-        .with_cfg(
-            Config::new()
-                .with_window(
-                    WindowBuilder::new()
-                        .with_title("clinker kiln")
-                        .with_decorations(false)
-                        .with_inner_size(LogicalSize::new(1400, 900))
-                        .with_min_inner_size(LogicalSize::new(800, 600)),
-                )
-                .with_disable_context_menu(true),
+    // Inlined into <head> via with_custom_head to bypass the wry custom-protocol
+    // asset path on Windows (WebView2 IPC marshaling is ~10s for a 173KB file)
+    // and to work around DioxusLabs/dioxus#2847 (asset!()-loaded CSS paints late).
+    const KILN_CSS: &str = include_str!("../assets/kiln.css");
+
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut cfg = Config::new()
+        .with_window(
+            WindowBuilder::new()
+                .with_title("clinker kiln")
+                .with_decorations(false)
+                .with_inner_size(LogicalSize::new(1400, 900))
+                .with_min_inner_size(LogicalSize::new(800, 600)),
         )
+        .with_disable_context_menu(true)
+        .with_custom_head(format!("<style>{KILN_CSS}</style>"));
+
+    // Workaround for DioxusLabs/dioxus#2304: keep WebView2's user-data folder
+    // in %LOCALAPPDATA% instead of next to the .exe, where ACLs / OneDrive
+    // sync can add seconds of cold-start retries.
+    #[cfg(target_os = "windows")]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        cfg = cfg.with_data_directory(PathBuf::from(local).join("Kiln").join("WebView2"));
+    }
+
+    dioxus::LaunchBuilder::new()
+        .with_cfg(cfg)
         .launch(app::AppShell);
 }
