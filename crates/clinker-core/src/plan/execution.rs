@@ -12,7 +12,8 @@ use petgraph::visit::{Control, DfsEvent, depth_first_search};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
-use crate::config::{PipelineConfig, RouteMode, SortField, TransformInput};
+use crate::config::{InputConfig, PipelineConfig, RouteMode, SortField, TransformInput};
+use crate::error::PipelineError;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 
 use cxl::analyzer::{self, ParallelismHint};
@@ -1165,6 +1166,119 @@ fn build_source_dag(
     Ok(tiers)
 }
 
+/// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes.
+pub const ENFORCER_SORT_PREFIX: &str = "__sort_for_";
+
+impl ExecutionPlanDag {
+    /// Phase 16.0.5 enforcer-sort insertion (drill pass 3, D46/D47).
+    ///
+    /// Walks every [`PlanNode::Transform`] whose
+    /// [`NodeExecutionReqs::RequiresSortedInput`] is unsatisfied by its
+    /// upstream [`PlanNode::Source`]'s declared `sort_order`, and inserts a
+    /// new [`PlanNode::Sort`] enforcer node on the connecting edge.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError::Compilation`] if any user-declared node name
+    /// starts with the reserved [`ENFORCER_SORT_PREFIX`].
+    ///
+    /// # Idempotency
+    /// A second call adds zero new nodes: enforcers inserted on the first
+    /// pass are themselves [`PlanNode::Sort`], and the walk only operates on
+    /// [`PlanNode::Source`] direct parents.
+    pub fn insert_enforcer_sorts(
+        &mut self,
+        inputs: &HashMap<String, InputConfig>,
+    ) -> Result<(), PipelineError> {
+        // Reserved-prefix guard: validate up-front so insertions cannot
+        // collide with a user-declared name.
+        for idx in self.graph.node_indices() {
+            let node = &self.graph[idx];
+            if matches!(node, PlanNode::Sort { .. }) {
+                continue;
+            }
+            if node.name().starts_with(ENFORCER_SORT_PREFIX) {
+                return Err(PipelineError::Compilation {
+                    transform_name: node.name().to_string(),
+                    messages: vec![format!(
+                        "node name '{}' uses reserved prefix '{}' (planner-synthesized sort enforcers only)",
+                        node.name(),
+                        ENFORCER_SORT_PREFIX
+                    )],
+                });
+            }
+        }
+
+        // Snapshot consumer indices + their required ordering before mutating.
+        let consumers: Vec<(NodeIndex, Vec<SortField>)> = self
+            .graph
+            .node_indices()
+            .filter_map(|idx| match &self.graph[idx] {
+                PlanNode::Transform {
+                    execution_reqs: NodeExecutionReqs::RequiresSortedInput { sort_fields },
+                    ..
+                } => Some((idx, sort_fields.clone())),
+                _ => None,
+            })
+            .collect();
+
+        for (consumer_idx, required) in consumers {
+            // Today's only requirement class (Phase 14 correlated DLQ) consumes
+            // a Source directly. Find the unique direct Source parent; skip
+            // otherwise (later phases extending this will widen the walk).
+            let source_idx = self
+                .graph
+                .neighbors_directed(consumer_idx, petgraph::Direction::Incoming)
+                .find(|&p| matches!(self.graph[p], PlanNode::Source { .. }));
+            let Some(source_idx) = source_idx else {
+                continue;
+            };
+
+            let source_name = self.graph[source_idx].name().to_string();
+            let declared: Vec<SortField> = inputs
+                .get(&source_name)
+                .and_then(|ic| ic.sort_order.as_ref())
+                .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect())
+                .unwrap_or_default();
+
+            if source_ordering_satisfies(&declared, &required) {
+                continue;
+            }
+
+            // Locate and remove the direct Source→consumer edge, capturing
+            // its dependency type for re-use on the rewritten edges.
+            let edge_id = self
+                .graph
+                .find_edge(source_idx, consumer_idx)
+                .expect("source parent must have outgoing edge to consumer");
+            let dep_type = self.graph[edge_id].dependency_type;
+            self.graph.remove_edge(edge_id);
+
+            let consumer_name = self.graph[consumer_idx].name().to_string();
+            let sort_node = PlanNode::Sort {
+                name: format!("{ENFORCER_SORT_PREFIX}{consumer_name}"),
+                sort_fields: required,
+            };
+            let sort_idx = self.graph.add_node(sort_node);
+            self.graph.add_edge(
+                source_idx,
+                sort_idx,
+                PlanEdge {
+                    dependency_type: dep_type,
+                },
+            );
+            self.graph.add_edge(
+                sort_idx,
+                consumer_idx,
+                PlanEdge {
+                    dependency_type: dep_type,
+                },
+            );
+        }
+
+        Ok(())
+    }
+}
+
 /// Idempotency predicate for Phase 16.0.5 enforcer-sort insertion.
 ///
 /// Returns true iff `declared` (the upstream source's actual ordering) is a
@@ -1928,6 +2042,157 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("source.primary"))
         );
+    }
+
+    // ----- Task 16.0.5.5: insert_enforcer_sorts -----
+
+    /// Build a minimal 2-node DAG: Source -> Transform with the given
+    /// `RequiresSortedInput` requirement. Returns the populated DAG.
+    fn dag_with_sorted_consumer(
+        source_name: &str,
+        consumer_name: &str,
+        required: Vec<SortField>,
+    ) -> ExecutionPlanDag {
+        let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
+        let s = graph.add_node(PlanNode::Source {
+            name: source_name.into(),
+        });
+        let t = graph.add_node(PlanNode::Transform {
+            name: consumer_name.into(),
+            parallelism_class: ParallelismClass::Stateless,
+            tier: 0,
+            execution_reqs: NodeExecutionReqs::RequiresSortedInput {
+                sort_fields: required,
+            },
+            window_index: None,
+            partition_lookup: None,
+        });
+        graph.add_edge(
+            s,
+            t,
+            PlanEdge {
+                dependency_type: DependencyType::Data,
+            },
+        );
+        let topo_order = vec![s, t];
+        ExecutionPlanDag {
+            graph,
+            topo_order,
+            source_dag: vec![],
+            indices_to_build: vec![],
+            output_projections: vec![],
+            parallelism: ParallelismProfile {
+                per_transform: vec![],
+                worker_threads: 1,
+            },
+            correlation_sort_note: None,
+            node_properties: HashMap::new(),
+        }
+    }
+
+    fn input_with_sort(name: &str, sort: Option<Vec<SortField>>) -> InputConfig {
+        InputConfig {
+            name: name.into(),
+            path: "x.csv".into(),
+            schema: None,
+            schema_overrides: None,
+            array_paths: None,
+            sort_order: sort.map(|v| v.into_iter().map(SortFieldSpec::Full).collect()),
+            format: InputFormat::Csv(None),
+            notes: None,
+        }
+    }
+
+    fn count_sort_nodes(dag: &ExecutionPlanDag) -> usize {
+        dag.graph
+            .node_weights()
+            .filter(|n| matches!(n, PlanNode::Sort { .. }))
+            .count()
+    }
+
+    #[test]
+    fn test_enforcer_noop_when_declared_prefix_satisfies() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req.clone());
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort(
+                "src",
+                Some(vec![
+                    sf("k", SortOrder::Asc, None),
+                    sf("extra", SortOrder::Asc, None),
+                ]),
+            ),
+        )]);
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        assert_eq!(count_sort_nodes(&dag), 0);
+    }
+
+    #[test]
+    fn test_enforcer_inserts_when_source_unordered() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        assert_eq!(count_sort_nodes(&dag), 1);
+        // Verify the inserted node has the reserved-prefix name.
+        let sort = dag
+            .graph
+            .node_weights()
+            .find(|n| matches!(n, PlanNode::Sort { .. }))
+            .unwrap();
+        assert_eq!(sort.name(), "__sort_for_consumer");
+        // Verify topology: Source -> Sort -> Transform
+        let src_idx = dag
+            .graph
+            .node_indices()
+            .find(|&i| matches!(dag.graph[i], PlanNode::Source { .. }))
+            .unwrap();
+        let consumer_idx = dag
+            .graph
+            .node_indices()
+            .find(|&i| matches!(dag.graph[i], PlanNode::Transform { .. }))
+            .unwrap();
+        assert!(dag.graph.find_edge(src_idx, consumer_idx).is_none());
+    }
+
+    #[test]
+    fn test_enforcer_inserts_when_order_direction_mismatches() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req);
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Desc, None)])),
+        )]);
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        assert_eq!(count_sort_nodes(&dag), 1);
+    }
+
+    #[test]
+    fn test_enforcer_idempotent_on_recompile() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "consumer", req);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        let after_first = count_sort_nodes(&dag);
+        dag.insert_enforcer_sorts(&inputs).unwrap();
+        let after_second = count_sort_nodes(&dag);
+        assert_eq!(after_first, 1);
+        assert_eq!(after_second, 1);
+    }
+
+    #[test]
+    fn test_enforcer_rejects_user_declared_reserved_prefix() {
+        let req = vec![sf("k", SortOrder::Asc, None)];
+        let mut dag = dag_with_sorted_consumer("src", "__sort_for_user", req);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", None))]);
+        let err = dag.insert_enforcer_sorts(&inputs).unwrap_err();
+        match err {
+            PipelineError::Compilation { transform_name, .. } => {
+                assert_eq!(transform_name, "__sort_for_user");
+            }
+            other => panic!("expected Compilation error, got {other:?}"),
+        }
     }
 
     // ----- Task 16.0.5.4: source_ordering_satisfies predicate -----
