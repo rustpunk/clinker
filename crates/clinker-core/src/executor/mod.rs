@@ -69,12 +69,46 @@ pub struct ExecutionReport {
     /// Peak process RSS observed across chunk boundaries. `None` only on
     /// platforms where RSS measurement is unavailable (e.g., FreeBSD).
     pub peak_rss_bytes: Option<u64>,
+    /// Total user CPU time across all stages with capture (nanoseconds).
+    /// `None` if no stage captured CPU times. Process-wide; sums across rayon workers.
+    pub total_cpu_user_ns: Option<u64>,
+    /// Total system CPU time across all stages with capture (nanoseconds).
+    pub total_cpu_sys_ns: Option<u64>,
+    /// Total disk bytes read across all stages with capture.
+    /// Excludes page-cache hits — cold-cache mode required for meaningful numbers.
+    pub total_io_read_bytes: Option<u64>,
+    /// Total disk bytes written across all stages with capture.
+    pub total_io_write_bytes: Option<u64>,
     /// Wall-clock time when `run_with_readers_writers` was entered.
     pub started_at: DateTime<Utc>,
     /// Wall-clock time immediately after the last write and flush completed.
     pub finished_at: DateTime<Utc>,
     /// Per-stage instrumentation metrics, ordered by execution sequence.
     pub stages: Vec<stage_metrics::StageMetrics>,
+}
+
+/// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`
+/// (e.g. cumulative timers) are skipped. Returns `None` per metric if no stage
+/// reported a value, otherwise `Some(sum)`.
+fn sum_cpu_io_totals(
+    stages: &[stage_metrics::StageMetrics],
+) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    let mut cpu_user: Option<u64> = None;
+    let mut cpu_sys: Option<u64> = None;
+    let mut io_read: Option<u64> = None;
+    let mut io_write: Option<u64> = None;
+    fn add(acc: &mut Option<u64>, v: Option<u64>) {
+        if let Some(x) = v {
+            *acc = Some(acc.unwrap_or(0).saturating_add(x));
+        }
+    }
+    for s in stages {
+        add(&mut cpu_user, s.cpu_user_delta_ns);
+        add(&mut cpu_sys, s.cpu_sys_delta_ns);
+        add(&mut io_read, s.io_read_delta);
+        add(&mut io_write, s.io_write_delta);
+    }
+    (cpu_user, cpu_sys, io_read, io_write)
 }
 
 /// Dummy storage type for streaming (no-window) evaluation.
@@ -483,6 +517,10 @@ impl PipelineExecutor {
             &mut collector,
         )?;
 
+        let stages = collector.into_stages();
+        let (total_cpu_user_ns, total_cpu_sys_ns, total_io_read_bytes, total_io_write_bytes) =
+            sum_cpu_io_totals(&stages);
+
         Ok(ExecutionReport {
             counters,
             dlq_entries,
@@ -490,9 +528,13 @@ impl PipelineExecutor {
             required_arena,
             required_sorted_input,
             peak_rss_bytes,
+            total_cpu_user_ns,
+            total_cpu_sys_ns,
+            total_io_read_bytes,
+            total_io_write_bytes,
             started_at,
             finished_at: Utc::now(),
-            stages: collector.into_stages(),
+            stages,
         })
     }
 
@@ -5571,5 +5613,74 @@ transformations:
             stage_names.iter().any(|n| n == "Compile"),
             "empty pipeline should have Compile stage, got: {stage_names:?}"
         );
+    }
+
+    fn synthetic_stage(
+        cpu_user: Option<u64>,
+        cpu_sys: Option<u64>,
+        io_read: Option<u64>,
+        io_write: Option<u64>,
+    ) -> stage_metrics::StageMetrics {
+        stage_metrics::StageMetrics {
+            name: stage_metrics::StageName::Compile,
+            elapsed: std::time::Duration::ZERO,
+            records_in: 0,
+            records_out: 0,
+            bytes_written: None,
+            rss_after: None,
+            cpu_user_delta_ns: cpu_user,
+            cpu_sys_delta_ns: cpu_sys,
+            io_read_delta: io_read,
+            io_write_delta: io_write,
+            heap_delta_bytes: None,
+            heap_alloc_count: None,
+        }
+    }
+
+    #[test]
+    fn execution_report_aggregates_cpu_totals() {
+        let stages = vec![
+            synthetic_stage(Some(100), Some(10), None, None),
+            synthetic_stage(Some(200), Some(20), None, None),
+            synthetic_stage(Some(50), Some(5), None, None),
+        ];
+        let (cu, cs, ir, iw) = sum_cpu_io_totals(&stages);
+        assert_eq!(cu, Some(350));
+        assert_eq!(cs, Some(35));
+        assert_eq!(ir, None);
+        assert_eq!(iw, None);
+    }
+
+    #[test]
+    fn execution_report_aggregates_io_totals() {
+        let stages = vec![
+            synthetic_stage(None, None, Some(1024), Some(2048)),
+            synthetic_stage(None, None, Some(512), Some(4096)),
+        ];
+        let (_, _, ir, iw) = sum_cpu_io_totals(&stages);
+        assert_eq!(ir, Some(1536));
+        assert_eq!(iw, Some(6144));
+    }
+
+    #[test]
+    fn execution_report_handles_partial_none() {
+        let stages = vec![
+            synthetic_stage(Some(100), Some(10), Some(1000), Some(2000)),
+            synthetic_stage(None, None, None, None), // cumulative timer
+            synthetic_stage(Some(50), Some(5), Some(500), Some(1000)),
+        ];
+        let (cu, cs, ir, iw) = sum_cpu_io_totals(&stages);
+        assert_eq!(cu, Some(150));
+        assert_eq!(cs, Some(15));
+        assert_eq!(ir, Some(1500));
+        assert_eq!(iw, Some(3000));
+
+        // All-None stages produce all-None totals (no panic).
+        let empty_stages = vec![synthetic_stage(None, None, None, None)];
+        let (cu, cs, ir, iw) = sum_cpu_io_totals(&empty_stages);
+        assert_eq!(cu, None);
+        assert_eq!(cs, None);
+        assert_eq!(ir, None);
+        assert_eq!(iw, None);
     }
 }
