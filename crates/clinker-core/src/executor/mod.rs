@@ -2796,7 +2796,7 @@ impl PipelineExecutor {
 
         let mut compiled = Vec::with_capacity(transforms.len());
         for t in transforms {
-            let parse_result = cxl::parser::Parser::parse(&t.cxl);
+            let parse_result = cxl::parser::Parser::parse(t.cxl_source());
             if !parse_result.errors.is_empty() {
                 let messages: Vec<String> = parse_result
                     .errors
@@ -2820,33 +2820,81 @@ impl PipelineExecutor {
                 messages: diags.into_iter().map(|d| d.message).collect(),
             })?;
 
-            let typed = cxl::typecheck::type_check(resolved, &type_schema).map_err(|diags| {
-                // Filter to errors only (not warnings)
-                let errors: Vec<String> = diags
-                    .iter()
-                    .filter(|d| !d.is_warning)
-                    .map(|d| d.message.clone())
-                    .collect();
-                if errors.is_empty() {
-                    // Only warnings — this shouldn't happen but be safe
-                    return PipelineError::Compilation {
+            // Determine aggregate mode. For aggregate transforms, validate that
+            // every group_by field exists in the current schema, then typecheck
+            // in GroupBy mode so bare non-grouped field references are rejected.
+            let agg_mode = if let Some(agg) = &t.aggregate {
+                let mut missing = Vec::new();
+                for gb in &agg.group_by {
+                    if !type_schema.contains_key(gb) {
+                        missing.push(format!("group_by field `{gb}` not found in schema"));
+                    }
+                }
+                if !missing.is_empty() {
+                    return Err(PipelineError::Compilation {
                         transform_name: t.name.clone(),
-                        messages: diags.into_iter().map(|d| d.message).collect(),
-                    };
+                        messages: missing,
+                    });
                 }
-                PipelineError::Compilation {
-                    transform_name: t.name.clone(),
-                    messages: errors,
+                cxl::typecheck::AggregateMode::GroupBy {
+                    group_by_fields: agg.group_by.iter().cloned().collect(),
                 }
-            })?;
+            } else {
+                cxl::typecheck::AggregateMode::Row
+            };
 
-            // Add emitted fields to the available set for subsequent transforms
-            for stmt in &typed.program.statements {
-                if let cxl::ast::Statement::Emit { name, .. } = stmt
-                    && !type_schema.contains_key(name.as_ref())
-                {
-                    fields.push(name.to_string());
-                    type_schema.insert(name.to_string(), Type::Any);
+            let typed = cxl::typecheck::type_check_with_mode(resolved, &type_schema, agg_mode)
+                .map_err(|diags| {
+                    let errors: Vec<String> = diags
+                        .iter()
+                        .filter(|d| !d.is_warning)
+                        .map(|d| d.message.clone())
+                        .collect();
+                    if errors.is_empty() {
+                        return PipelineError::Compilation {
+                            transform_name: t.name.clone(),
+                            messages: diags.into_iter().map(|d| d.message).collect(),
+                        };
+                    }
+                    PipelineError::Compilation {
+                        transform_name: t.name.clone(),
+                        messages: errors,
+                    }
+                })?;
+
+            // Build the output schema for subsequent transforms.
+            //
+            // For aggregate transforms, the output schema is strictly
+            // {group_by fields} ∪ {emitted aggregate result names}: row-level
+            // fields that are not grouped cease to exist after aggregation.
+            // For row transforms, emitted fields are appended to the existing
+            // field set.
+            if t.aggregate.is_some() {
+                let agg = t.aggregate.as_ref().unwrap();
+                let mut new_fields: Vec<String> = agg.group_by.clone();
+                let mut new_type_schema: HashMap<String, Type> = agg
+                    .group_by
+                    .iter()
+                    .map(|g| (g.clone(), Type::Any))
+                    .collect();
+                for stmt in &typed.program.statements {
+                    if let cxl::ast::Statement::Emit { name, .. } = stmt
+                        && !new_type_schema.contains_key(name.as_ref())
+                    {
+                        new_fields.push(name.to_string());
+                        new_type_schema.insert(name.to_string(), Type::Any);
+                    }
+                }
+                fields = new_fields;
+                type_schema = new_type_schema;
+            } else {
+                for stmt in &typed.program.statements {
+                    if let cxl::ast::Statement::Emit { name, .. } = stmt
+                        && !type_schema.contains_key(name.as_ref())
+                    {
+                        fields.push(name.to_string());
+                        type_schema.insert(name.to_string(), Type::Any);
+                    }
                 }
             }
 
@@ -2944,7 +2992,7 @@ impl PipelineExecutor {
         // Extract field names from CXL AST to build a synthetic schema
         let mut all_fields = Vec::new();
         for t in config.transforms() {
-            let parsed = cxl::parser::Parser::parse(&t.cxl);
+            let parsed = cxl::parser::Parser::parse(t.cxl_source());
             if !parsed.errors.is_empty() {
                 return Err(PipelineError::Compilation {
                     transform_name: t.name.clone(),

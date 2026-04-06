@@ -282,7 +282,8 @@ pub fn resolve_channel(
         let new_transform = TransformEntry::Transform(TransformConfig {
             name: add.name.clone(),
             description: add.description.clone(),
-            cxl: add.cxl.clone(),
+            cxl: Some(add.cxl.clone()),
+            aggregate: None,
             local_window: add.local_window.clone(),
             log: None,
             validations: None,
@@ -487,7 +488,7 @@ fn apply_input_delta(input: &mut InputConfig, delta: &InputOverrideDelta) {
 
 fn apply_transform_delta(transform: &mut TransformConfig, delta: &TransformOverrideDelta) {
     if let Some(ref cxl) = delta.cxl {
-        transform.cxl = cxl.clone();
+        transform.cxl = Some(cxl.clone());
     }
     if let Some(ref desc) = delta.description {
         transform.description = Some(desc.clone());
@@ -579,7 +580,8 @@ mod tests {
                 TransformEntry::Transform(TransformConfig {
                     name: "filter_active".into(),
                     description: Some("Filter active records".into()),
-                    cxl: "if status != \"active\"\n  drop\nend".into(),
+                    cxl: Some("if status != \"active\"\n  drop\nend".into()),
+                    aggregate: None,
                     local_window: None,
                     log: None,
                     validations: None,
@@ -591,7 +593,8 @@ mod tests {
                 TransformEntry::Transform(TransformConfig {
                     name: "normalize_names".into(),
                     description: None,
-                    cxl: "emit name = name.trim()".into(),
+                    cxl: Some("emit name = name.trim()".into()),
+                    aggregate: None,
                     local_window: None,
                     log: None,
                     validations: None,
@@ -751,7 +754,11 @@ mod tests {
 
         let config = base_config();
         let result = resolve_channel(config, &co, &workspace, &[], &mut provenance).unwrap();
-        assert!(t(&result.transformations[0]).cxl.contains("status.lower()"));
+        assert!(
+            t(&result.transformations[0])
+                .cxl_source()
+                .contains("status.lower()")
+        );
         // Description preserved (not overridden)
         assert_eq!(
             t(&result.transformations[0]).description.as_deref(),
@@ -1038,7 +1045,8 @@ transformations:
             .push(TransformEntry::Transform(TransformConfig {
                 name: "legacy_a".into(),
                 description: None,
-                cxl: "emit a = 1".into(),
+                cxl: Some("emit a = 1".into()),
+                aggregate: None,
                 local_window: None,
                 log: None,
                 validations: None,
@@ -1052,7 +1060,8 @@ transformations:
             .push(TransformEntry::Transform(TransformConfig {
                 name: "legacy_b".into(),
                 description: None,
-                cxl: "emit b = 2".into(),
+                cxl: Some("emit b = 2".into()),
+                aggregate: None,
                 local_window: None,
                 log: None,
                 validations: None,
@@ -1350,11 +1359,15 @@ transformations:
         .unwrap();
 
         // Group changed filter_active
-        assert!(t(&result.transformations[0]).cxl.contains("group_applied"));
+        assert!(
+            t(&result.transformations[0])
+                .cxl_source()
+                .contains("group_applied")
+        );
         // Channel changed normalize_names
         assert!(
             t(&result.transformations[1])
-                .cxl
+                .cxl_source()
                 .contains("channel_applied")
         );
     }
@@ -1403,7 +1416,11 @@ transformations:
         .unwrap();
 
         // Group B (later) wins over Group A on same transform
-        assert!(t(&result.transformations[0]).cxl.contains("from_group_b"));
+        assert!(
+            t(&result.transformations[0])
+                .cxl_source()
+                .contains("from_group_b")
+        );
     }
 
     #[test]
@@ -1446,7 +1463,11 @@ transformations:
         .unwrap();
 
         // Channel wins over group
-        assert!(t(&result.transformations[0]).cxl.contains("from_channel"));
+        assert!(
+            t(&result.transformations[0])
+                .cxl_source()
+                .contains("from_channel")
+        );
     }
 
     #[test]
@@ -1479,7 +1500,7 @@ transformations:
         // Base config unchanged
         assert!(
             t(&result.transformations[0])
-                .cxl
+                .cxl_source()
                 .contains("status != \"active\"")
         );
     }
@@ -1544,7 +1565,7 @@ transformations:
         // Group override skipped — base unchanged
         assert!(
             !t(&result.transformations[0])
-                .cxl
+                .cxl_source()
                 .contains("should_not_apply")
         );
     }
@@ -1587,7 +1608,8 @@ transformations:
             .push(TransformEntry::Transform(TransformConfig {
                 name: "legacy_step".into(),
                 description: None,
-                cxl: "emit x = 1".into(),
+                cxl: Some("emit x = 1".into()),
+                aggregate: None,
                 local_window: None,
                 log: None,
                 validations: None,
@@ -1649,6 +1671,10 @@ transformations:
         )
         .unwrap();
 
-        assert!(t(&result.transformations[0]).cxl.contains("channel_only"));
+        assert!(
+            t(&result.transformations[0])
+                .cxl_source()
+                .contains("channel_only")
+        );
     }
 }

@@ -70,7 +70,7 @@ pub fn validate_pipeline(
     for transform in config.transforms() {
         validate_transform(transform, &available_fields, &mut warnings);
         // Add emitted fields to available set
-        for emitted in extract_emit_fields(&transform.cxl) {
+        for emitted in extract_emit_fields(transform.cxl_source()) {
             available_fields.insert(emitted);
         }
     }
@@ -151,7 +151,7 @@ fn validate_transform(
     }
 
     // Extract field references from CXL (simple heuristic)
-    let referenced = extract_referenced_fields(&transform.cxl);
+    let referenced = extract_referenced_fields(transform.cxl_source());
     let schema_fields: Vec<&str> = available_fields.iter().map(|s| s.as_str()).collect();
 
     for field in referenced {

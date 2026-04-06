@@ -208,7 +208,7 @@ pub fn derive_pipeline_view(
                 for i in 0..comp.transform_names.len() {
                     let t = transforms[transform_idx + i];
                     let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
-                    let subtitle = cxl_subtitle(&t.cxl);
+                    let subtitle = cxl_subtitle(t.cxl_source());
                     let origin = comp.origins.get(origin_idx + i).cloned();
 
                     transform_stages.push(StageView {
@@ -218,7 +218,7 @@ pub fn derive_pipeline_view(
                         subtitle,
                         canvas_x: x,
                         canvas_y: y,
-                        cxl_source: Some(t.cxl.clone()),
+                        cxl_source: Some(t.cxl_source().to_string()),
                         description: t.description.clone(),
                         from_composition: origin,
                         error_message: None,
@@ -278,7 +278,7 @@ pub fn derive_pipeline_view(
             }
         } else {
             let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
-            let subtitle = cxl_subtitle(&transform.cxl);
+            let subtitle = cxl_subtitle(transform.cxl_source());
             transform_stages.push(StageView {
                 id: transform.name.clone(),
                 label: transform.name.clone(),
@@ -286,7 +286,7 @@ pub fn derive_pipeline_view(
                 subtitle,
                 canvas_x: x,
                 canvas_y: y,
-                cxl_source: Some(transform.cxl.clone()),
+                cxl_source: Some(transform.cxl_source().to_string()),
                 description: transform.description.clone(),
 
                 from_composition: None,
@@ -523,7 +523,7 @@ pub fn derive_composition_drill_view(
             }
 
             let y = BASE_Y + if i % 2 == 0 { 0.0 } else { STAGGER_Y };
-            let subtitle = cxl_subtitle(&t.cxl);
+            let subtitle = cxl_subtitle(t.cxl_source());
             let origin = comp.origins.get(i).cloned();
 
             stages.push(StageView {
@@ -533,7 +533,7 @@ pub fn derive_composition_drill_view(
                 subtitle,
                 canvas_x: x,
                 canvas_y: y,
-                cxl_source: Some(t.cxl.clone()),
+                cxl_source: Some(t.cxl_source().to_string()),
                 description: t.description.clone(),
                 from_composition: origin,
                 error_message: None,
@@ -614,7 +614,7 @@ pub fn derive_partial_pipeline_view(
         match item {
             PartialItem::Ok(entry) => match entry {
                 RawTransformEntry::Inline(t) => {
-                    let subtitle = cxl_subtitle(&t.cxl);
+                    let subtitle = cxl_subtitle(t.cxl_source());
                     transform_stages.push(StageView {
                         id: t.name.clone(),
                         label: t.name.clone(),
@@ -622,7 +622,7 @@ pub fn derive_partial_pipeline_view(
                         subtitle,
                         canvas_x: x,
                         canvas_y: y,
-                        cxl_source: Some(t.cxl.clone()),
+                        cxl_source: Some(t.cxl_source().to_string()),
                         description: t.description.clone(),
                         from_composition: None,
                         error_message: None,

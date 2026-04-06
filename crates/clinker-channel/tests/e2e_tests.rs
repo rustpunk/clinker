@@ -296,7 +296,7 @@ transformations:
         .transforms()
         .find(|t| t.name == "audit_stamp")
         .unwrap();
-    assert_eq!(audit.cxl, "emit ts = custom_now()");
+    assert_eq!(audit.cxl_source(), "emit ts = custom_now()");
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +810,7 @@ transformations:
     assert_eq!(config.outputs[0].path, "/data/enterprise/output.csv");
     // Channel override applied: transform cxl changed
     let normalize = config.transforms().find(|t| t.name == "normalize").unwrap();
-    assert_eq!(normalize.cxl, "emit name = name.upper()");
+    assert_eq!(normalize.cxl_source(), "emit name = name.upper()");
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +904,7 @@ transformations:
         .transforms()
         .find(|t| t.name == "audit_stamp")
         .unwrap();
-    assert_eq!(audit.cxl, "emit ts = acme_now()");
+    assert_eq!(audit.cxl_source(), "emit ts = acme_now()");
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +991,7 @@ outputs:
     // After first: path changed, transform changed
     assert_eq!(config.outputs[0].path, "/data/first/output.csv");
     let normalize = config.transforms().find(|t| t.name == "normalize").unwrap();
-    assert_eq!(normalize.cxl, "emit name = name.trim()");
+    assert_eq!(normalize.cxl_source(), "emit name = name.trim()");
 
     // Apply second override
     let second_path = ws.join("overrides/second.channel.yaml");
@@ -1002,5 +1002,5 @@ outputs:
     assert_eq!(config.outputs[0].path, "/data/second/output.csv");
     // Transform stays as first override set it (second didn't touch it)
     let normalize = config.transforms().find(|t| t.name == "normalize").unwrap();
-    assert_eq!(normalize.cxl, "emit name = name.trim()");
+    assert_eq!(normalize.cxl_source(), "emit name = name.trim()");
 }

@@ -153,6 +153,11 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
             // pipeline.*/meta.* not allowed in module constants — but we don't
             // reject here; the evaluator will catch it at runtime
         }
+        Expr::AggCall { args, .. } => {
+            for arg in args {
+                walk_expr(arg, refs);
+            }
+        }
     }
 }
 
@@ -249,6 +254,7 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
                 })
         }
         Expr::WindowCall { args, .. } => args.iter().any(|a| contains_self_call(fn_name, a)),
+        Expr::AggCall { args, .. } => args.iter().any(|a| contains_self_call(fn_name, a)),
         Expr::FieldRef { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::Literal { .. }

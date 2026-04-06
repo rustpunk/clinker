@@ -695,15 +695,33 @@ pub enum ParallelismOverride {
     Sequential,
 }
 
+/// Configuration for GROUP BY aggregation on a transform.
+///
+/// Research: RESEARCH-aggregate-yaml-config.md — nested block is universal ETL
+/// pattern (Beam YAML Combine, SOPE group_by, Informatica Aggregator).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateConfig {
+    /// Fields to group by. Empty = global fold (one output row).
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    /// CXL source with aggregate function calls.
+    pub cxl: String,
+}
+
 /// Per-transform configuration block.
 ///
-/// The `cxl` field contains the multi-line CXL source text.
+/// Exactly one of `cxl` (row-level transform) or `aggregate` (GROUP BY) must be
+/// set. Mutual exclusivity is enforced in the custom `Deserialize` impl.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformConfig {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub cxl: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cxl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<AggregateConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_window: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -725,6 +743,28 @@ pub struct TransformConfig {
     pub notes: Option<serde_json::Value>,
 }
 
+impl TransformConfig {
+    /// Return the CXL source text for this transform.
+    ///
+    /// For row-level transforms this is the top-level `cxl` field; for
+    /// aggregate transforms it is the nested `aggregate.cxl`. Returns an empty
+    /// string only in malformed configs that somehow bypassed validation.
+    pub fn cxl_source(&self) -> &str {
+        if let Some(ref agg) = self.aggregate {
+            agg.cxl.as_str()
+        } else if let Some(ref s) = self.cxl {
+            s.as_str()
+        } else {
+            ""
+        }
+    }
+
+    /// True if this transform is a GROUP BY aggregate transform.
+    pub fn is_aggregate(&self) -> bool {
+        self.aggregate.is_some()
+    }
+}
+
 impl<'de> Deserialize<'de> for TransformConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -735,7 +775,8 @@ impl<'de> Deserialize<'de> for TransformConfig {
         struct Raw {
             name: String,
             description: Option<String>,
-            cxl: String,
+            cxl: Option<String>,
+            aggregate: Option<AggregateConfig>,
             local_window: Option<serde_json::Value>,
             log: Option<Vec<LogDirective>>,
             validations: Option<Vec<ValidationEntry>>,
@@ -756,10 +797,28 @@ impl<'de> Deserialize<'de> for TransformConfig {
             )));
         }
 
+        // Mutual exclusivity: exactly one of `cxl` or `aggregate` must be set.
+        match (&raw.cxl, &raw.aggregate) {
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom(format!(
+                    "transform '{}' has both 'cxl' and 'aggregate' — use one or the other",
+                    raw.name
+                )));
+            }
+            (None, None) => {
+                return Err(de::Error::custom(format!(
+                    "transform '{}' must set either 'cxl' (row-level) or 'aggregate' (GROUP BY)",
+                    raw.name
+                )));
+            }
+            _ => {}
+        }
+
         Ok(TransformConfig {
             name: raw.name,
             description: raw.description,
             cxl: raw.cxl,
+            aggregate: raw.aggregate,
             local_window: raw.local_window,
             log: raw.log,
             validations: raw.validations,
@@ -1351,7 +1410,7 @@ transformations:
                 .transforms()
                 .next()
                 .unwrap()
-                .cxl
+                .cxl_source()
                 .contains("emit full_name")
         );
         // Default error strategy
@@ -1635,7 +1694,7 @@ error_handling:
         // Transforms
         assert_eq!(config.transformations.len(), 2);
         let t0 = config.transforms().next().unwrap();
-        assert!(t0.cxl.contains("emit full_name"));
+        assert!(t0.cxl_source().contains("emit full_name"));
         assert!(t0.description.is_some());
 
         // Error handling
@@ -2886,5 +2945,67 @@ transformations:
             _ => panic!("expected Transform"),
         };
         assert_eq!(t.name, "my-transform_v2");
+    }
+
+    // ── Phase 16 Task 16.2 — AggregateConfig tests ─────────────────
+
+    fn parse_transform(yaml: &str) -> Result<TransformConfig, serde_saphyr::Error> {
+        serde_saphyr::from_str::<TransformConfig>(yaml)
+    }
+
+    #[test]
+    fn test_aggregate_config_deser() {
+        let yaml = r#"
+name: department_summary
+aggregate:
+  group_by: [department]
+  cxl: |
+    emit total_salary = sum(salary)
+"#;
+        let t = parse_transform(yaml).expect("should parse");
+        let agg = t.aggregate.as_ref().expect("aggregate set");
+        assert_eq!(agg.group_by, vec!["department".to_string()]);
+        assert!(agg.cxl.contains("sum(salary)"));
+        assert!(t.cxl.is_none());
+        assert!(t.is_aggregate());
+    }
+
+    #[test]
+    fn test_aggregate_config_multiple_group_by() {
+        let yaml = r#"
+name: multi
+aggregate:
+  group_by: [dept, region]
+  cxl: emit total = sum(amount)
+"#;
+        let t = parse_transform(yaml).expect("should parse");
+        let agg = t.aggregate.as_ref().unwrap();
+        assert_eq!(agg.group_by, vec!["dept".to_string(), "region".to_string()]);
+    }
+
+    #[test]
+    fn test_aggregate_and_cxl_mutual_exclusion() {
+        let yaml = r#"
+name: bad
+cxl: emit x = 1
+aggregate:
+  group_by: []
+  cxl: emit total = sum(amount)
+"#;
+        let err = parse_transform(yaml).expect_err("should error");
+        let msg = err.to_string();
+        assert!(msg.contains("cxl"), "error should mention cxl: {msg}");
+        assert!(
+            msg.contains("aggregate"),
+            "error should mention aggregate: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_neither_cxl_nor_aggregate_rejected() {
+        let yaml = r#"
+name: bad
+"#;
+        assert!(parse_transform(yaml).is_err());
     }
 }

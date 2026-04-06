@@ -148,7 +148,8 @@ pub struct CompositionOrigin {
     /// The transform's name within the composition.
     pub transform_name: String,
     /// The original CXL from the `.comp.yaml` file, before any override was applied.
-    pub original_cxl: String,
+    /// None when the origin transform was an aggregate (no top-level `cxl`).
+    pub original_cxl: Option<String>,
 }
 
 /// Warning from contract validation. Compositions only produce warnings, never errors.
@@ -471,7 +472,7 @@ fn resolve_import(
 
                 if let Some(ovr) = directive.overrides.get(&transform.name) {
                     if let Some(ref cxl) = ovr.cxl {
-                        transform.cxl = cxl.clone();
+                        transform.cxl = Some(cxl.clone());
                         override_count += 1;
                     }
                     if let Some(ref desc) = ovr.description {
@@ -549,7 +550,7 @@ pub fn validate_contract(
             .transformations
             .iter()
             .filter_map(|entry| match entry {
-                RawTransformEntry::Inline(t) => Some(t.cxl.as_str()),
+                RawTransformEntry::Inline(t) => Some(t.cxl_source()),
                 RawTransformEntry::Import(_) => None,
             })
             .collect::<Vec<_>>()
@@ -785,13 +786,13 @@ transformations:
         // First transform unchanged
         assert!(
             as_transform(&resolved.transformations[0])
-                .cxl
+                .cxl_source()
                 .contains("emit full_name")
         );
         // Second transform overridden
         assert!(
             as_transform(&resolved.transformations[1])
-                .cxl
+                .cxl_source()
                 .contains("contains")
         );
 
@@ -804,6 +805,8 @@ transformations:
         assert!(
             origin
                 .original_cxl
+                .as_deref()
+                .unwrap_or("")
                 .contains("emit email_valid = email_lower")
         );
     }

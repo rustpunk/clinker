@@ -4,6 +4,19 @@ use crate::lexer::{Lexer, Span, Token};
 /// Maximum expression nesting depth. Prevents stack overflow on malicious input.
 const MAX_DEPTH: u32 = 256;
 
+/// Returns true for identifiers that are aggregate function names. Used by
+/// NUD lookahead in `parse_nud()` to branch to `parse_agg_call()` instead of
+/// treating the identifier as a field reference.
+///
+/// Phase 16 set (7): sum, count, avg, min, max, collect, weighted_avg.
+/// `first`/`last` are window-only (spec grammar) and are NOT aggregate names.
+pub(crate) fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "sum" | "count" | "avg" | "min" | "max" | "collect" | "weighted_avg"
+    )
+}
+
 /// Result of parsing: a (possibly partial) AST plus collected errors.
 pub struct ParseResult {
     pub ast: Program,
@@ -930,16 +943,23 @@ impl Parser {
                 }
             }
 
-            // Identifiers (field references)
+            // Identifiers (field references) — with aggregate function lookahead.
+            // If the identifier matches a known aggregate name AND the next token
+            // is `(`, parse as an `AggCall`. Otherwise parse as a `FieldRef` so that
+            // columns named e.g. `sum` or `count` still work outside a call site.
             Token::Ident(ref name) => {
-                let nid = self.alloc_id();
-                let name = name.clone();
-                self.advance();
-                Ok(Expr::FieldRef {
-                    node_id: nid,
-                    name,
-                    span: start,
-                })
+                let name_cloned = name.clone();
+                if is_aggregate_name(&name_cloned) && matches!(self.peek_ahead(1), Token::LParen) {
+                    self.parse_agg_call(name_cloned, start)
+                } else {
+                    let nid = self.alloc_id();
+                    self.advance();
+                    Ok(Expr::FieldRef {
+                        node_id: nid,
+                        name: name_cloned,
+                        span: start,
+                    })
+                }
             }
 
             _ => Err(self.error(
@@ -1049,11 +1069,74 @@ impl Parser {
         Ok(args)
     }
 
+    /// Parse a free-standing aggregate function call: `name(args...)`.
+    /// The identifier token is still at `self.pos`.
+    fn parse_agg_call(&mut self, name: Box<str>, start: Span) -> Result<Expr, ParseError> {
+        let nid = self.alloc_id();
+        self.advance(); // consume the identifier
+        self.expect_token(&Token::LParen, "'('")?;
+        let args = self.parse_agg_arg_list()?;
+        let end = self.prev_span();
+
+        // `count()` with no args is sugar for `count(*)` — emit a Wildcard arg.
+        // `collect()` with no args is deferred to Phase 17 (window aggregates).
+        let args = if args.is_empty() && &*name == "count" {
+            let wnid = self.alloc_id();
+            vec![Expr::Wildcard {
+                node_id: wnid,
+                span: start,
+            }]
+        } else {
+            args
+        };
+
+        Ok(Expr::AggCall {
+            node_id: nid,
+            name,
+            args,
+            span: Span::new(start.start as usize, end.end as usize),
+        })
+    }
+
+    /// Parse an aggregate argument list. Unlike `parse_arg_list`, this intercepts
+    /// `Token::Star` before entering `parse_expr(0)` so that `count(*)` parses
+    /// as `[Wildcard]` rather than trying to consume `*` as multiplication.
+    fn parse_agg_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        if *self.peek() != Token::RParen {
+            args.push(self.parse_agg_arg()?);
+            while *self.peek() == Token::Comma {
+                self.advance();
+                args.push(self.parse_agg_arg()?);
+            }
+        }
+        self.expect_token(&Token::RParen, "')'")?;
+        Ok(args)
+    }
+
+    fn parse_agg_arg(&mut self) -> Result<Expr, ParseError> {
+        if *self.peek() == Token::Star {
+            let nid = self.alloc_id();
+            let span = self.current_span();
+            self.advance();
+            Ok(Expr::Wildcard { node_id: nid, span })
+        } else {
+            self.parse_expr(0)
+        }
+    }
+
     // ── Token stream helpers ───────────────────────────────────────
 
     fn peek(&self) -> &Token {
         self.tokens
             .get(self.pos)
+            .map(|(t, _)| t)
+            .unwrap_or(&Token::Eof)
+    }
+
+    fn peek_ahead(&self, offset: usize) -> &Token {
+        self.tokens
+            .get(self.pos + offset)
             .map(|(t, _)| t)
             .unwrap_or(&Token::Eof)
     }
@@ -1835,5 +1918,131 @@ mod tests {
                 .message
                 .contains("use must appear before let/emit/trace")
         );
+    }
+
+    // ── Phase 16 Task 16.2 — aggregate function parsing ─────────────────
+
+    fn emit_expr(r: &ParseResult) -> &Expr {
+        match &r.ast.statements[0] {
+            Statement::Emit { expr, .. } => expr,
+            _ => panic!("expected emit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sum_function() {
+        let r = parse_ok("emit t = sum(salary)");
+        match emit_expr(&r) {
+            Expr::AggCall { name, args, .. } => {
+                assert_eq!(&**name, "sum");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], Expr::FieldRef { name, .. } if &**name == "salary"));
+            }
+            other => panic!("expected AggCall, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_star() {
+        let r = parse_ok("emit c = count(*)");
+        match emit_expr(&r) {
+            Expr::AggCall { name, args, .. } => {
+                assert_eq!(&**name, "count");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], Expr::Wildcard { .. }));
+            }
+            _ => panic!("expected AggCall"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_field() {
+        let r = parse_ok("emit c = count(employee_id)");
+        match emit_expr(&r) {
+            Expr::AggCall { name, args, .. } => {
+                assert_eq!(&**name, "count");
+                assert!(
+                    matches!(&args[0], Expr::FieldRef { name, .. } if &**name == "employee_id")
+                );
+            }
+            _ => panic!("expected AggCall"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_bare() {
+        // count() is sugar for count(*)
+        let r = parse_ok("emit c = count()");
+        match emit_expr(&r) {
+            Expr::AggCall { name, args, .. } => {
+                assert_eq!(&**name, "count");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], Expr::Wildcard { .. }));
+            }
+            _ => panic!("expected AggCall"),
+        }
+    }
+
+    #[test]
+    fn test_parse_all_agg_functions() {
+        // All 7 agg names + count(*)
+        let cases = [
+            ("sum(x)", "sum"),
+            ("count(x)", "count"),
+            ("count(*)", "count"),
+            ("avg(x)", "avg"),
+            ("min(x)", "min"),
+            ("max(x)", "max"),
+            ("collect(x)", "collect"),
+            ("weighted_avg(x, y)", "weighted_avg"),
+        ];
+        for (src, expected) in cases {
+            let r = parse_ok(&format!("emit t = {src}"));
+            match emit_expr(&r) {
+                Expr::AggCall { name, .. } => assert_eq!(&**name, expected, "for {src}"),
+                _ => panic!("expected AggCall for {src}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_weighted_avg_two_args() {
+        let r = parse_ok("emit t = weighted_avg(score, weight)");
+        match emit_expr(&r) {
+            Expr::AggCall { name, args, .. } => {
+                assert_eq!(&**name, "weighted_avg");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("expected AggCall"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_star_plus_one_does_not_misparse() {
+        // count(*) + 1 — the star must not be treated as multiplication.
+        let r = parse_ok("emit c = count(*) + 1");
+        match emit_expr(&r) {
+            Expr::Binary { lhs, .. } => match &**lhs {
+                Expr::AggCall { name, args, .. } => {
+                    assert_eq!(&**name, "count");
+                    assert!(matches!(&args[0], Expr::Wildcard { .. }));
+                }
+                _ => panic!("lhs should be count(*) AggCall"),
+            },
+            _ => panic!("expected Binary at top"),
+        }
+    }
+
+    #[test]
+    fn test_field_named_sum_still_parses_as_fieldref() {
+        // A bare identifier `sum` (no parens) must still be a FieldRef so that
+        // columns named `sum`, `count`, etc. can be referenced.
+        let r = parse_ok("emit t = sum + 1");
+        match emit_expr(&r) {
+            Expr::Binary { lhs, .. } => {
+                assert!(matches!(&**lhs, Expr::FieldRef { name, .. } if &**name == "sum"));
+            }
+            _ => panic!("expected Binary"),
+        }
     }
 }

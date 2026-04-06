@@ -457,7 +457,7 @@ fn generate_transform_doc(
     stage_name: &str,
 ) -> StageDoc {
     // Analyze CXL statements
-    let analysis = analyze_cxl(&transform.cxl);
+    let analysis = analyze_cxl(transform.cxl_source());
 
     let emit_stmts: Vec<_> = analysis
         .statements
@@ -524,7 +524,8 @@ fn generate_transform_doc(
     };
 
     // Find composition origin and contract
-    let (contract, provenance) = find_composition_info(compositions, stage_name, &transform.cxl);
+    let (contract, provenance) =
+        find_composition_info(compositions, stage_name, transform.cxl_source());
 
     // Build config section
     let has_filters = filter_count > 0;
@@ -578,7 +579,7 @@ fn generate_transform_doc(
         config: ConfigSection { entries },
         provenance,
         channel_override: build_channel_override(channel_info, stage_name),
-        cxl_source: Some(transform.cxl.clone()),
+        cxl_source: Some(transform.cxl_source().to_string()),
         sub_stages: vec![],
     }
 }
@@ -877,14 +878,15 @@ fn find_composition_info(
                     .collect(),
             });
 
-            let is_overridden = origin.original_cxl != current_cxl;
+            let original_cxl_str = origin.original_cxl.as_deref().unwrap_or("");
+            let is_overridden = original_cxl_str != current_cxl;
             let provenance = Some(ProvenanceSection {
                 composition_path: origin.composition_path.clone(),
                 composition_name: comp.meta.name.clone(),
                 composition_version: comp.meta.version.clone(),
                 is_overridden,
                 original_cxl: if is_overridden {
-                    Some(origin.original_cxl.clone())
+                    Some(original_cxl_str.to_string())
                 } else {
                     None
                 },

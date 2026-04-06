@@ -210,7 +210,7 @@ pub fn apply_composition_override(
             && directive.path == origin.composition_path
         {
             // Compare with original (whitespace-normalized)
-            if new_cxl.trim() == origin.original_cxl.trim() {
+            if new_cxl.trim() == origin.original_cxl.as_deref().unwrap_or("").trim() {
                 // Reverted to base — remove override
                 if directive.overrides.contains_key(&origin.transform_name) {
                     directive.overrides.swap_remove(&origin.transform_name);
@@ -286,7 +286,7 @@ pub fn validate_composition_contracts(
         }
 
         // Add emitted fields from this transform to the available set
-        for line in transform.cxl.lines() {
+        for line in transform.cxl_source().lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("emit ")
                 && let Some(field_name) = rest.split('=').next()

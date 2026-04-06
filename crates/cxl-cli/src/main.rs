@@ -569,6 +569,10 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
             let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("$window.{}({})", function, args_str)
         }
+        cxl::ast::Expr::AggCall { name, args, .. } => {
+            let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("{}({})", name, args_str)
+        }
         cxl::ast::Expr::IfThenElse {
             condition,
             then_branch,

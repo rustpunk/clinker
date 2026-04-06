@@ -273,6 +273,11 @@ fn walk_expr(
                 walk_match_arm(arm, calls, fields);
             }
         }
+        Expr::AggCall { args, .. } => {
+            for arg in args {
+                walk_expr(arg, calls, fields, None);
+            }
+        }
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }

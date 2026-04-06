@@ -652,6 +652,20 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 _ => Ok(Value::Null),
             }
         }
+
+        // AggCall is handled by the hash/streaming aggregator, not the row-level
+        // evaluator. Reaching here means the typecheck pass failed to reject an
+        // aggregate call in a row-level context.
+        Expr::AggCall { name, span, .. } => {
+            let _ = name;
+            Err(EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "row-level expression",
+                    got: "aggregate function call",
+                },
+                *span,
+            ))
+        }
     }
 }
 

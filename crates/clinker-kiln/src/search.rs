@@ -498,11 +498,15 @@ pub fn structural_search(
 
         // Check transformations
         for transform in config.transforms() {
-            if stage_matches_tags(tags, "transform", &transform.name, &transform.cxl) {
-                let detail = transform
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| transform.cxl.lines().next().unwrap_or("").to_string());
+            if stage_matches_tags(tags, "transform", &transform.name, transform.cxl_source()) {
+                let detail = transform.description.clone().unwrap_or_else(|| {
+                    transform
+                        .cxl_source()
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                });
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
                     stage_name: transform.name.clone(),

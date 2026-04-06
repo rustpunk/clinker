@@ -382,6 +382,11 @@ impl<'a> Resolver<'a> {
                 }
                 let _ = (node_id, span);
             }
+            Expr::AggCall { args, .. } => {
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+            }
         }
     }
 

@@ -46,7 +46,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         return rsx! {};
     };
 
-    let cxl_source = transform.map(|t| t.cxl.clone());
+    let cxl_source = transform.map(|t| t.cxl_source().to_string());
     let drawer_open = (active_drawer)() != ActiveDrawer::None;
 
     // Channel override info for this stage
@@ -68,7 +68,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
             cr.resolved_config
                 .transforms()
                 .find(|t| t.name == stage_id)
-                .map(|t| t.cxl.clone())
+                .map(|t| t.cxl_source().to_string())
         })
         .unwrap_or_default();
 

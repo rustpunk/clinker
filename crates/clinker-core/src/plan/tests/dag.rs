@@ -117,7 +117,7 @@ fn compile_fixture(config: &PipelineConfig, fields: &[&str]) -> ExecutionPlanDag
     let transforms: Vec<_> = config.transforms().collect();
     let typed_programs: Vec<_> = transforms
         .iter()
-        .map(|tc| compile_cxl(&tc.cxl, fields))
+        .map(|tc| compile_cxl(tc.cxl_source(), fields))
         .collect();
     let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
         .iter()
@@ -192,7 +192,7 @@ transformations:
     let transforms: Vec<_> = config.transforms().collect();
     let typed_programs: Vec<_> = transforms
         .iter()
-        .map(|tc| compile_cxl(&tc.cxl, &["amount"]))
+        .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
         .collect();
     let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
         .iter()
@@ -425,7 +425,7 @@ transformations:
     let transforms: Vec<_> = config.transforms().collect();
     let typed_programs: Vec<_> = transforms
         .iter()
-        .map(|tc| compile_cxl(&tc.cxl, &["amount"]))
+        .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
         .collect();
     let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
         .iter()
@@ -617,7 +617,7 @@ transformations:
     let transforms: Vec<_> = config.transforms().collect();
     let typed_programs: Vec<_> = transforms
         .iter()
-        .map(|tc| compile_cxl(&tc.cxl, &["amount"]))
+        .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
         .collect();
     let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
         .iter()

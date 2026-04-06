@@ -155,6 +155,16 @@ pub enum Expr {
         node_id: NodeId,
         span: Span,
     },
+    /// Free-standing aggregate function call (sum, count, avg, min, max,
+    /// collect, weighted_avg). Parsed via NUD lookahead: Ident + LParen where
+    /// the identifier matches a known aggregate name. Distinct from
+    /// MethodCall (which is receiver-based via `.`).
+    AggCall {
+        node_id: NodeId,
+        name: Box<str>,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -174,7 +184,8 @@ impl Expr {
             | Expr::PipelineAccess { span, .. }
             | Expr::MetaAccess { span, .. }
             | Expr::Now { span, .. }
-            | Expr::Wildcard { span, .. } => *span,
+            | Expr::Wildcard { span, .. }
+            | Expr::AggCall { span, .. } => *span,
         }
     }
 
@@ -194,7 +205,8 @@ impl Expr {
             | Expr::PipelineAccess { node_id, .. }
             | Expr::MetaAccess { node_id, .. }
             | Expr::Now { node_id, .. }
-            | Expr::Wildcard { node_id, .. } => *node_id,
+            | Expr::Wildcard { node_id, .. }
+            | Expr::AggCall { node_id, .. } => *node_id,
         }
     }
 }

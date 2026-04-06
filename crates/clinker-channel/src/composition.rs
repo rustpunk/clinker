@@ -221,7 +221,8 @@ mod tests {
         TransformEntry::Transform(TransformConfig {
             name: name.into(),
             description: None,
-            cxl: cxl.into(),
+            cxl: Some(cxl.into()),
+            aggregate: None,
             local_window: None,
             log: None,
             validations: None,
