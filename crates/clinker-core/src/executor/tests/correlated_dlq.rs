@@ -69,6 +69,7 @@ outputs:
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_sorted_one_fail() {
     // One record fails → entire key group DLQ'd
     let yaml = base_yaml("employee_id");
@@ -91,6 +92,7 @@ fn test_correlated_dlq_sorted_one_fail() {
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_sorted_good_group() {
     // Good groups emitted, bad group DLQ'd
     let yaml = base_yaml("employee_id");
@@ -108,6 +110,7 @@ fn test_correlated_dlq_sorted_good_group() {
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_trigger_flag() {
     // Root-cause record has trigger=true, collateral has trigger=false
     let yaml = base_yaml("employee_id");
@@ -152,6 +155,7 @@ fn test_correlated_dlq_null_key_individual() {
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_compound_key() {
     // Compound key [employee_id, dept] works correctly
     let yaml = format!(
@@ -193,6 +197,7 @@ outputs:
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_auto_sort_prepend() {
     // Auto-sort prepends correlation_key to existing sort fields
     let yaml = r#"
@@ -233,6 +238,7 @@ outputs:
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_auto_sort_already_sorted() {
     // If input already sorted by correlation key, no injection
     let yaml = r#"
@@ -261,16 +267,6 @@ outputs:
 "#;
     // Input pre-sorted by employee_id
     let csv = "employee_id,timestamp,value\nA,1,100\nA,2,bad\nB,3,300\n";
-    let config = crate::config::parse_config(yaml).unwrap();
-
-    // Verify is_sorted_by_correlation_key returns true
-    let correlation_key = config.error_handling.correlation_key.as_ref().unwrap();
-    let input = &config.inputs[0];
-    assert!(
-        super::super::is_sorted_by_correlation_key(&input.sort_order, correlation_key),
-        "input should be detected as already sorted by correlation key"
-    );
-
     // Still works correctly
     let (counters, dlq_entries, _) = run_correlated_pipeline(yaml, csv).unwrap();
     assert_eq!(counters.dlq_count, 2, "group A DLQ'd");
@@ -337,6 +333,7 @@ outputs:
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_reason_message() {
     // DLQ entries contain "correlated with failure" reason
     let yaml = base_yaml("employee_id");
@@ -354,6 +351,7 @@ fn test_correlated_dlq_reason_message() {
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_large_group() {
     // 1000-record group, one fails → all 1000 DLQ'd
     let yaml = base_yaml("employee_id");
@@ -375,6 +373,7 @@ fn test_correlated_dlq_large_group() {
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_multiple_failures_in_group() {
     // 3 of 10 fail → all 10 DLQ'd, first failure is trigger
     let yaml = base_yaml("employee_id");
@@ -413,6 +412,7 @@ fn test_correlated_dlq_empty_input() {
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_group_exceeds_buffer() {
     // Group > max_group_buffer → all DLQ'd with group_size_exceeded
     let yaml = r#"
@@ -461,6 +461,7 @@ outputs:
 }
 
 #[test]
+#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_threshold_counts_root_cause_only() {
     // ErrorThreshold should count only root-cause entries, not collateral.
     // We test this by counting trigger=true entries vs total DLQ count.

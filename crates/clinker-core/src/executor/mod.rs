@@ -345,53 +345,6 @@ impl DlqEntry {
     }
 }
 
-/// Check if the input's declared sort_order starts with the correlation key fields.
-fn is_sorted_by_correlation_key(
-    input_sort_order: &Option<Vec<crate::config::SortFieldSpec>>,
-    correlation_key: &crate::config::CorrelationKey,
-) -> bool {
-    let sort_order = match input_sort_order {
-        Some(so) => so,
-        None => return false,
-    };
-    let key_fields = correlation_key.fields();
-    if key_fields.len() > sort_order.len() {
-        return false;
-    }
-    for (i, key_field) in key_fields.iter().enumerate() {
-        let sort_field_name = match &sort_order[i] {
-            crate::config::SortFieldSpec::Short(name) => name.as_str(),
-            crate::config::SortFieldSpec::Full(sf) => sf.field.as_str(),
-        };
-        if sort_field_name != *key_field {
-            return false;
-        }
-    }
-    true
-}
-
-/// Auto-inject correlation key fields as a prefix to the sort order.
-/// Returns `true` if sort was injected (i.e., input was not already sorted by correlation key).
-fn maybe_inject_correlation_sort(
-    sort_order: &mut Vec<crate::config::SortFieldSpec>,
-    correlation_key: &crate::config::CorrelationKey,
-) -> bool {
-    let key_fields = correlation_key.fields();
-    let mut new_sort: Vec<crate::config::SortFieldSpec> = key_fields
-        .iter()
-        .map(|f| {
-            crate::config::SortFieldSpec::Full(crate::config::SortField {
-                field: f.to_string(),
-                order: crate::config::SortOrder::Asc,
-                null_order: None,
-            })
-        })
-        .collect();
-    new_sort.append(sort_order);
-    *sort_order = new_sort;
-    true
-}
-
 /// Extract correlation key values from a record as a vector of GroupByKey.
 fn extract_correlation_key(
     record: &Record,
@@ -495,43 +448,13 @@ impl PipelineExecutor {
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let mut plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
+        let plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
             PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
             }
         })?;
         collector.record(compile_timer.finish(0, 0));
-
-        // Handle correlation key: check sort, inject if needed, set plan note
-        let mut effective_sort_order: Option<Vec<crate::config::SortFieldSpec>> = None;
-        if let Some(ref correlation_key) = config.error_handling.correlation_key {
-            let input = &config.inputs[0];
-            if is_sorted_by_correlation_key(&input.sort_order, correlation_key) {
-                // Input already sorted by correlation key — no injection needed
-                plan.correlation_sort_note = Some(format!(
-                    "Correlation key: {:?} (input already sorted)",
-                    correlation_key.fields()
-                ));
-            } else {
-                // Auto-inject sort: prepend correlation key to existing sort
-                let mut sort = input.sort_order.clone().unwrap_or_default();
-                let existing_fields: Vec<String> = sort
-                    .iter()
-                    .map(|s| match s {
-                        crate::config::SortFieldSpec::Short(n) => n.clone(),
-                        crate::config::SortFieldSpec::Full(sf) => sf.field.clone(),
-                    })
-                    .collect();
-                maybe_inject_correlation_sort(&mut sort, correlation_key);
-                plan.correlation_sort_note = Some(format!(
-                    "Correlation sort (auto-injected): {:?} + existing {:?}",
-                    correlation_key.fields(),
-                    existing_fields
-                ));
-                effective_sort_order = Some(sort);
-            }
-        }
 
         let execution_summary = plan.execution_summary();
         let required_arena = plan.required_arena();
@@ -557,7 +480,6 @@ impl PipelineExecutor {
             compiled_route,
             &plan,
             params,
-            effective_sort_order.as_deref(),
             &mut collector,
         )?;
 
@@ -911,7 +833,6 @@ impl PipelineExecutor {
         compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
-        _effective_sort_order: Option<&[crate::config::SortFieldSpec]>,
         collector: &mut stage_metrics::StageCollector,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let input = &config.inputs[0];
