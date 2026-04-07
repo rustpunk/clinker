@@ -6,225 +6,12 @@
 
 use super::*;
 
-// ---------- Hash aggregation ----------
-
-#[test]
-fn test_hash_agg_basic_sum_count() {
-    // GROUP BY dept, SUM(salary), COUNT(*) → correct per-group (set-equality)
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_null_group_key() {
-    // NULL dept → all NULLs in one group
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_multi_column_key() {
-    // GROUP BY (dept, region) → correct groups
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_single_group() {
-    // All records same key → one output record
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_all_unique() {
-    // N records → N output records
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_memory_delta_tracking() {
-    // value_heap_bytes increases with CollectAccumulator adds, Sum adds return 0 delta
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_resize_aware_spill() {
-    // allocation_size() * 3 exceeds budget → spill before resize, no OOM
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_spill_triggered() {
-    // Low budget → spill occurs, correct results via merge
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_spill_flush_merge() {
-    // Multiple spills + final flush → all merged via StreamingAggregator, correct results
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_empty_input() {
-    // Zero records → zero output
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_factory_clone() {
-    // Factory prototype clone produces independent accumulators
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_hash_agg_output_schema() {
-    // Output schema = group-by fields ++ emit fields, derived at plan time
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_accumulator_enum_serde_roundtrip() {
-    // Serialize + deserialize AccumulatorEnum (all 7 variants) → identical state
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_group_key_to_value_roundtrip() {
-    // GroupByKey::to_value() produces correct Value for all variants
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_group_key_sort_order_consistency() {
-    // GroupByKey → Value → encode_sort_key() order matches direct GroupByKey comparison
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_plan_node_aggregation() {
-    // PlanNode::Aggregation constructed with correct output schema at plan time
-    todo!("Task 16.3")
-}
-
-#[test]
-fn test_aggregation_input_enum() {
-    // AggregateInput::RawRecord and SpilledState both processed correctly
-    todo!("Task 16.3")
-}
-
-// ---------- Streaming aggregation ----------
-
-#[test]
-fn test_streaming_agg_sorted_input() {
-    // Sorted by dept → streaming mode, correct results (set-equality)
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_streaming_agg_vs_hash_same_results() {
-    // Same input: streaming and hash produce identical output (set-equality)
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_streaming_agg_o1_memory() {
-    // 1M records, 10 groups → peak memory constant (fixed-size accumulators)
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_streaming_agg_last_group_flushed() {
-    // Last group emitted after flush()
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_streaming_agg_single_group() {
-    // All records same key → one output
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_streaming_agg_key_boundary_all_types() {
-    // Int, Str, Float, Null key types → correct boundaries
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_streaming_agg_null_key() {
-    // NULL key records grouped together
-    todo!("Task 16.4")
-}
-
-// ---------- Sort verification ----------
-
-#[test]
-fn test_sort_order_violation_hard_error() {
-    // Out-of-order key at boundary → PipelineError::SortOrderViolation
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_sort_order_violation_message_contains_keys() {
-    // Error message includes offending key values
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_sort_order_first_group_no_false_positive() {
-    // First group transition (None → Some) does not trigger violation
-    todo!("Task 16.4")
-}
-
-// ---------- Plan-time strategy selection ----------
-
-#[test]
-fn test_no_sort_order_uses_hash() {
-    // No sort_order declared → AggregateStrategy::Hash (no auto-detection)
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_sort_order_prefix_match_streaming() {
-    // sort_order [dept, region, name] + group_by [dept, region] → Streaming
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_sort_order_partial_prefix_uses_hash() {
-    // sort_order [dept] + group_by [dept, region] → Hash fallback
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_group_by_reordered_to_match_sort() {
-    // sort_order [region, dept] + group_by [dept, region] → Streaming with reordered [region, dept]
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_global_fold_always_streaming() {
-    // group_by: [] → Streaming regardless of sort_order
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_disjoint_sort_fields_uses_hash() {
-    // sort_order [name, age] + group_by [dept, region] → Hash
-    todo!("Task 16.4")
-}
-
-// ---------- Merge mode ----------
-
-#[test]
-fn test_merge_mode_streaming() {
-    // StreamingAggregator<MergeState> produces correct results from spilled AccumulatorRow inputs
-    todo!("Task 16.4")
-}
-
-#[test]
-fn test_merge_mode_key_boundary() {
-    // Key boundary detection in merge mode identical to raw mode
-    todo!("Task 16.4")
-}
+// Note: 23 stub tests from Tasks 16.3 / 16.4 were removed; their concerns
+// are now covered by the `dispatch`, `streaming`, `group_boundary`,
+// `sort_key_encoder`, and `spill` submodules below, plus the
+// `test_qualifies_*`, `test_addraw_*`, `test_mergestate_*`, and
+// `test_merge_sidecars_*` tests in `crates/clinker-core/src/aggregation.rs`.
+// See git history for the original stub list.
 
 // ===========================================================================
 // Task 16.3.13 — executor PlanNode::Aggregation dispatch arm
@@ -265,6 +52,8 @@ mod dispatch {
         group_by: &[&str],
         cxl_src: &str,
         transform_name: &str,
+        memory_budget: usize,
+        spill_dir: Option<std::path::PathBuf>,
     ) -> HashAggregator {
         let parsed = Parser::parse(cxl_src);
         assert!(
@@ -316,8 +105,8 @@ mod dispatch {
             output_schema,
             spill_schema,
             Vec::new(),
-            64 * 1024 * 1024,
-            None,
+            memory_budget,
+            spill_dir,
             transform_name.to_string(),
         )
     }
@@ -344,6 +133,8 @@ mod dispatch {
             &["k"],
             "emit k = k\nemit c = count(*)",
             "agg_test",
+            64 * 1024 * 1024,
+            None,
         )
     }
 
@@ -672,6 +463,8 @@ outputs:
             &["k"],
             "emit k = k\nemit s = sum(v)",
             "overflow_agg",
+            64 * 1024 * 1024,
+            None,
         );
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("test.csv");
@@ -957,6 +750,500 @@ outputs:
         // above (always {0, 1} regardless of input length).
         let ctx4 = ctx_for(&stable, &file, 0);
         agg.flush(&ctx4, &mut out).unwrap();
+    }
+
+    // ====================================================================
+    // Phase 16 Task 16.3 backfill — hash-aggregation data shapes & spill
+    // ====================================================================
+
+    /// NULL group keys all collapse into a single `GroupByKey::Null` bucket.
+    #[test]
+    fn test_hash_agg_null_group_key() {
+        let input = make_schema(&["k", "v"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            "null_key",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..3u64 {
+            let r = make_record(&input, vec![Value::Null, Value::Integer(i as i64)]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert_eq!(agg.groups().len(), 1, "all NULL keys → one bucket");
+        let null_key = vec![GroupByKey::Null];
+        assert!(
+            agg.groups().contains_key(&null_key),
+            "key is GroupByKey::Null"
+        );
+    }
+
+    /// Composite group key (dept, region) creates one bucket per (k1, k2) pair.
+    #[test]
+    fn test_hash_agg_multi_column_key() {
+        let input = make_schema(&["dept", "region", "v"]);
+        let mut agg = build_aggregator(
+            &[
+                ("dept", Type::String),
+                ("region", Type::String),
+                ("v", Type::Int),
+            ],
+            &["dept", "region"],
+            "emit dept = dept\nemit region = region\nemit n = count(*)",
+            "multi_key",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let rows: &[(&str, &str)] = &[("eng", "us"), ("eng", "us"), ("eng", "eu"), ("sales", "us")];
+        for (i, (d, r)) in rows.iter().enumerate() {
+            let rec = make_record(
+                &input,
+                vec![
+                    Value::String((*d).into()),
+                    Value::String((*r).into()),
+                    Value::Integer(1),
+                ],
+            );
+            agg.add_record(
+                &rec,
+                i as u64,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i as u64),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            agg.groups().len(),
+            3,
+            "expected 3 distinct (dept, region) buckets"
+        );
+    }
+
+    /// All-unique keys → one group per record.
+    #[test]
+    fn test_hash_agg_all_unique() {
+        let input = make_schema(&["k"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            "all_unique",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..32u64 {
+            let r = make_record(&input, vec![Value::String(format!("k{i}").into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert_eq!(agg.groups().len(), 32, "N records → N groups");
+    }
+
+    /// `value_heap_bytes` accounts for `Collect` accumulator growth and
+    /// stays at zero for fixed-size accumulators (Sum / Count).
+    #[test]
+    fn test_hash_agg_memory_delta_tracking() {
+        // 1) Sum-only aggregator: value_heap_bytes must stay at 0 across
+        //    every add_record call (SumState is fixed-size).
+        let input = make_schema(&["k", "v"]);
+        let mut sum_agg = build_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit s = sum(v)",
+            "fixed_size",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..16u64 {
+            let r = make_record(
+                &input,
+                vec![Value::String("g".into()), Value::Integer(i as i64)],
+            );
+            sum_agg
+                .add_record(
+                    &r,
+                    i,
+                    &IndexMap::new(),
+                    &IndexMap::new(),
+                    &ctx_for(&stable, &file, i),
+                )
+                .unwrap();
+            assert_eq!(
+                sum_agg.value_heap_bytes(),
+                0,
+                "Sum is fixed-size — no heap growth (after row {i})"
+            );
+        }
+
+        // 2) Collect-based aggregator: value_heap_bytes is monotonically
+        //    non-decreasing as we accumulate values into the per-group Vec.
+        let mut col_agg = build_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit xs = collect(v)",
+            "collect_growth",
+            64 * 1024 * 1024,
+            None,
+        );
+        let mut prev = col_agg.value_heap_bytes();
+        let mut grew = false;
+        for i in 0..16u64 {
+            let r = make_record(
+                &input,
+                vec![Value::String("g".into()), Value::Integer(i as i64)],
+            );
+            col_agg
+                .add_record(
+                    &r,
+                    i,
+                    &IndexMap::new(),
+                    &IndexMap::new(),
+                    &ctx_for(&stable, &file, i),
+                )
+                .unwrap();
+            let now = col_agg.value_heap_bytes();
+            assert!(
+                now >= prev,
+                "value_heap_bytes monotonic: {prev} -> {now} at row {i}"
+            );
+            if now > prev {
+                grew = true;
+            }
+            prev = now;
+        }
+        assert!(grew, "Collect path must increment value_heap_bytes");
+    }
+
+    /// Resize-aware spill guard: with a tiny memory budget and many groups,
+    /// the aggregator spills to disk before the hashbrown table resize blows
+    /// the budget. The check is `table_alloc * 3 > headroom`.
+    #[test]
+    fn test_hash_agg_resize_aware_spill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        // Tiny budget — a few cents of headroom forces the resize-aware
+        // guard at line 1207 of aggregation.rs to fire.
+        let mut agg = build_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            "resize_spill",
+            1024,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..256u64 {
+            let r = make_record(&input, vec![Value::String(format!("k{i}").into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .expect("add_record must not OOM under tiny budget");
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "tiny budget + many keys must trigger at least one spill"
+        );
+    }
+
+    /// Low memory budget triggers spill, and `finalize` still produces
+    /// the correct per-group counts via the spill-merge path.
+    #[test]
+    fn test_hash_agg_spill_triggered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            "spill_correct",
+            1024,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // 4 distinct keys × 16 records each = 64 inputs, 4 expected output groups.
+        let keys = ["a", "b", "c", "d"];
+        for i in 0..64u64 {
+            let k = keys[(i as usize) % keys.len()];
+            let r = make_record(&input, vec![Value::String(k.into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "expected at least one spill under tiny budget"
+        );
+
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize after spill");
+        assert_eq!(out.len(), 4, "four distinct groups after spill-merge");
+        // Each group has count(*) == 16, regardless of how many spill
+        // segments contributed to it.
+        for (rec, _row_num, _e, _a) in &out {
+            assert_eq!(
+                rec.values()[1],
+                Value::Integer(16),
+                "per-group count(*) preserved through spill merge"
+            );
+        }
+    }
+
+    /// Multiple spill rounds (more than one spill file) plus the final
+    /// in-memory flush all merge associatively into the right per-group
+    /// totals via the `StreamingAggregator<MergeState>` finalize path.
+    #[test]
+    fn test_hash_agg_spill_flush_merge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            "multi_spill",
+            512,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // 8 distinct keys × 32 records — large enough to force several
+        // resize-spill cycles under a 512-byte budget.
+        let keys = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for i in 0..256u64 {
+            let k = keys[(i as usize) % keys.len()];
+            let r = make_record(&input, vec![Value::String(k.into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert!(
+            agg.spill_files().len() >= 2,
+            "expected multiple spill files, got {}",
+            agg.spill_files().len()
+        );
+
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out)
+            .expect("multi-spill finalize merges through StreamingAggregator<MergeState>");
+        assert_eq!(out.len(), 8, "eight distinct groups after k-way merge");
+        for (rec, _, _, _) in &out {
+            assert_eq!(
+                rec.values()[1],
+                Value::Integer(32),
+                "32 records per group survive multi-round merge"
+            );
+        }
+    }
+
+    // ====================================================================
+    // Phase 16 Task 16.4 backfill — streaming-aggregation extras
+    // ====================================================================
+
+    /// NULL group key in streaming mode: a run of NULL-keyed records
+    /// forms exactly one emitted group.
+    #[test]
+    fn test_streaming_agg_null_key() {
+        let input = make_schema(&["k", "v"]);
+        let mut agg = build_streaming_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            "stream_null_key",
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        for i in 0..4u64 {
+            let r = make_record(&input, vec![Value::Null, Value::Integer(i as i64)]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let ctx = ctx_for(&stable, &file, 0);
+        agg.flush(&ctx, &mut out).unwrap();
+        assert_eq!(out.len(), 1, "all NULLs collapse to one streaming group");
+        let (rec, _, _, _) = &out[0];
+        assert_eq!(rec.values()[0], Value::Null);
+        assert_eq!(rec.values()[1], Value::Integer(4));
+    }
+
+    /// Streaming and hash strategies must produce identical per-group
+    /// totals on the same sorted input. Cross-strategy oracle for the
+    /// `select_aggregation_strategies` post-pass.
+    #[test]
+    fn test_streaming_agg_vs_hash_same_results() {
+        let input = make_schema(&["k", "v"]);
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // Sorted input by k so streaming is legal.
+        let inputs: Vec<(&str, i64)> = vec![
+            ("a", 1),
+            ("a", 2),
+            ("a", 3),
+            ("b", 10),
+            ("b", 20),
+            ("c", 100),
+        ];
+
+        // Hash path.
+        let mut hash_agg = build_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit s = sum(v)",
+            "oracle_hash",
+            64 * 1024 * 1024,
+            None,
+        );
+        for (i, (k, v)) in inputs.iter().enumerate() {
+            let r = make_record(&input, vec![Value::String((*k).into()), Value::Integer(*v)]);
+            hash_agg
+                .add_record(
+                    &r,
+                    i as u64,
+                    &IndexMap::new(),
+                    &IndexMap::new(),
+                    &ctx_for(&stable, &file, i as u64),
+                )
+                .unwrap();
+        }
+        let mut hash_out: Vec<crate::aggregation::SortRow> = Vec::new();
+        hash_agg
+            .finalize(&ctx_for(&stable, &file, 0), &mut hash_out)
+            .unwrap();
+
+        // Streaming path.
+        let mut stream_agg = build_streaming_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit s = sum(v)",
+            "oracle_stream",
+        );
+        let mut stream_out: Vec<crate::aggregation::SortRow> = Vec::new();
+        for (i, (k, v)) in inputs.iter().enumerate() {
+            let r = make_record(&input, vec![Value::String((*k).into()), Value::Integer(*v)]);
+            stream_agg
+                .add_record(
+                    &r,
+                    i as u64,
+                    &IndexMap::new(),
+                    &IndexMap::new(),
+                    &ctx_for(&stable, &file, i as u64),
+                    &mut stream_out,
+                )
+                .unwrap();
+        }
+        stream_agg
+            .flush(&ctx_for(&stable, &file, 0), &mut stream_out)
+            .unwrap();
+
+        // Set-equality on (k, sum) pairs (hash output is unordered).
+        fn project(rows: &[crate::aggregation::SortRow]) -> Vec<(Value, Value)> {
+            let mut v: Vec<(Value, Value)> = rows
+                .iter()
+                .map(|(rec, _, _, _)| (rec.values()[0].clone(), rec.values()[1].clone()))
+                .collect();
+            v.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+            v
+        }
+        assert_eq!(project(&hash_out), project(&stream_out));
+    }
+
+    /// Streaming aggregation has O(1) memory in the number of input rows:
+    /// driving 100k records through 10 groups must keep
+    /// `current_row_count()` bounded at exactly 1 throughout (one open
+    /// group at a time, every previous group already emitted).
+    #[test]
+    fn test_streaming_agg_o1_memory() {
+        let input = make_schema(&["k", "v"]);
+        let mut agg = build_streaming_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit s = sum(v)",
+            "o1_mem",
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        // 10 groups × 10_000 sorted records = 100_000 inputs.
+        let groups = 10u64;
+        let per_group = 10_000u64;
+        let mut max_open = 0usize;
+        for g in 0..groups {
+            let key = format!("k{:02}", g);
+            for i in 0..per_group {
+                let row_num = g * per_group + i;
+                let r = make_record(
+                    &input,
+                    vec![Value::String(key.clone().into()), Value::Integer(i as i64)],
+                );
+                agg.add_record(
+                    &r,
+                    row_num,
+                    &IndexMap::new(),
+                    &IndexMap::new(),
+                    &ctx_for(&stable, &file, row_num),
+                    &mut out,
+                )
+                .unwrap();
+                let open = agg.current_row_count();
+                if open > max_open {
+                    max_open = open;
+                }
+            }
+        }
+        assert_eq!(
+            max_open, 1,
+            "O(1) invariant violated: max open groups = {max_open}"
+        );
+        agg.flush(&ctx_for(&stable, &file, 0), &mut out).unwrap();
+        assert_eq!(out.len(), groups as usize, "one row per group at the end");
     }
 }
 
