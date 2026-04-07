@@ -28,15 +28,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use clinker_record::accumulator::{AccumulatorEnum, AccumulatorRow};
+use clinker_record::accumulator::{AccumulatorEnum, AccumulatorError, AccumulatorRow};
 use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
 use clinker_record::{GroupByKey, Record, RecordStorage, Value};
 use cxl::ast::{BinOp, Expr, LiteralValue, UnaryOp};
 use cxl::eval::{EvalContext, EvalError, ProgramEvaluator, eval_expr};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
+use indexmap::IndexMap;
 
-use crate::config::SortField;
+use crate::config::{NullOrder, SortField, SortOrder};
+use crate::pipeline::loser_tree::{LoserTree, MergeEntry};
+use crate::pipeline::sort_key::encode_sort_key;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 
 /// Local stand-in to satisfy `eval_expr`'s `S: RecordStorage` type
@@ -661,6 +664,17 @@ pub enum HashAggError {
     /// Spill path raised an I/O error. Stub until 16.3.10 lands the
     /// real spill writer integration.
     Spill(String),
+    /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). Routed
+    /// to `PipelineError::Accumulator` by the 16.3.13 dispatch arm.
+    Accumulator {
+        transform: String,
+        binding: String,
+        source: AccumulatorError,
+    },
+    /// A post-extraction emit residual failed to evaluate in
+    /// `AggregateEvalScope`. Indicates an extractor/executor mismatch or
+    /// an unsupported residual construct.
+    Residual(AggregateEvalError),
 }
 
 impl std::fmt::Display for HashAggError {
@@ -676,6 +690,15 @@ impl std::fmt::Display for HashAggError {
                 "group-key extraction failed for `{field}` at row {row}: {message}"
             ),
             HashAggError::Spill(msg) => write!(f, "spill failed: {msg}"),
+            HashAggError::Accumulator {
+                transform,
+                binding,
+                source,
+            } => write!(
+                f,
+                "aggregate {transform}.{binding}: accumulator finalize failed: {source:?}"
+            ),
+            HashAggError::Residual(e) => write!(f, "aggregate residual eval failed: {e}"),
         }
     }
 }
@@ -970,6 +993,261 @@ impl HashAggregator {
         self.value_heap_bytes = 0;
         Ok(())
     }
+
+    /// Drive the aggregator to completion.
+    ///
+    /// Dispatches across three paths (D2, D11 revised, D12, D13):
+    ///
+    /// 1. **Global-fold empty-input special case** (D12): no rows
+    ///    passed the pre-agg filter, no group-by columns, no spill
+    ///    files — emit a single defaulted row via the factory
+    ///    prototype so SQL-standard global aggregates over empty
+    ///    inputs still produce a result.
+    /// 2. **In-memory fast path**: no spill files — drain `self.groups`
+    ///    and finalize each group through `finalize_group`.
+    /// 3. **Spill recovery path**: flush remaining in-memory state as
+    ///    one final spill file, then k-way merge every spill file
+    ///    through a `LoserTree`, merging `AccumulatorRow` +
+    ///    `MetadataCommonTracker` partials at each key boundary, and
+    ///    route each finalized group through the same
+    ///    `finalize_group` helper so both paths agree byte-for-byte.
+    pub fn finalize(mut self, ctx: &EvalContext) -> Result<Vec<Record>, HashAggError> {
+        // D12: global-fold empty-input special case.
+        if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
+            let empty_key: Vec<GroupByKey> = Vec::new();
+            let state = AggregatorGroupState {
+                row: self.factory.create_accumulators(),
+                meta_tracker: MetadataCommonTracker::new(),
+            };
+            let record = self.finalize_group(&empty_key, &state, ctx)?;
+            return Ok(vec![record]);
+        }
+
+        if self.spill_files.is_empty() {
+            let entries: Vec<(Vec<GroupByKey>, AggregatorGroupState)> =
+                self.groups.drain().collect();
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, state) in entries {
+                out.push(self.finalize_group(&key, &state, ctx)?);
+            }
+            Ok(out)
+        } else {
+            self.finalize_with_spill(ctx)
+        }
+    }
+
+    /// Finalize one group into an output [`Record`].
+    ///
+    /// Shared by the in-memory fast path and the spill-merge path so
+    /// both produce identical results:
+    ///
+    /// 1. Finalize each accumulator in `state.row` into a slot vector.
+    /// 2. Build an [`AggregateEvalScope`] and evaluate every
+    ///    [`CompiledEmit`] residual. `is_meta` emits collect into
+    ///    `user_meta`; data emits populate `values` by output-schema
+    ///    column name.
+    /// 3. Merge the auto-tracked common metadata (D11 revised) — user
+    ///    explicit emits win on conflict, tracker fills only keys the
+    ///    user did not supply.
+    /// 4. Construct the output `Record` and install metadata.
+    fn finalize_group(
+        &self,
+        key: &[GroupByKey],
+        state: &AggregatorGroupState,
+        _ctx: &EvalContext,
+    ) -> Result<Record, HashAggError> {
+        // 1. Finalize accumulator slots.
+        let bindings = self.factory.bindings();
+        let mut slots: Vec<Value> = Vec::with_capacity(state.row.len());
+        for (i, acc) in state.row.iter().enumerate() {
+            let v = acc.finalize().map_err(|e| HashAggError::Accumulator {
+                transform: self.transform_name.clone(),
+                binding: bindings[i].output_name.to_string(),
+                source: e,
+            })?;
+            slots.push(v);
+        }
+
+        // 2. Evaluate emit residuals in aggregate scope.
+        let scope = AggregateEvalScope { key, slots: &slots };
+        let compiled = self.factory.compiled();
+        let mut values: Vec<Value> = vec![Value::Null; self.output_schema.column_count()];
+        let mut user_meta: IndexMap<Box<str>, Value> = IndexMap::new();
+        for emit in &compiled.emits {
+            let v =
+                eval_expr_in_agg_scope(&emit.residual, &scope).map_err(HashAggError::Residual)?;
+            if emit.is_meta {
+                user_meta.insert(emit.output_name.clone(), v);
+            } else if let Some(idx) = self.output_schema.index(&emit.output_name) {
+                values[idx] = v;
+            }
+        }
+
+        // 3. Auto-propagate common metadata. User explicit emits win.
+        let auto_pairs = state.meta_tracker.clone().finalize();
+        for (k, v) in auto_pairs {
+            if !user_meta.contains_key(&k) {
+                user_meta.insert(k, v);
+            }
+        }
+
+        // 4. Build the output record.
+        let mut record = Record::new(Arc::clone(&self.output_schema), values);
+        for (k, v) in user_meta {
+            // Best-effort: ignore MAX_METADATA_KEYS overflow here (the
+            // executor dispatch arm in 16.3.13 can surface it as a
+            // dedicated error if needed).
+            let _ = record.set_meta(&k, v);
+        }
+        Ok(record)
+    }
+
+    /// Spill-recovery finalize path. Flushes remaining in-memory state
+    /// as a final spill file, then k-way merges every spill file via a
+    /// `LoserTree` keyed on the group-by columns. At every group-key
+    /// boundary in the merge stream, `AccumulatorEnum::merge` and
+    /// `MetadataCommonTracker::merge` combine partial states
+    /// associatively — conflicts propagate correctly because both
+    /// merges are associative per D11 revised.
+    fn finalize_with_spill(mut self, ctx: &EvalContext) -> Result<Vec<Record>, HashAggError> {
+        if !self.groups.is_empty() {
+            self.spill()?;
+        }
+
+        // Open readers over every spill file.
+        let spill_err = |e: crate::pipeline::spill::SpillError| HashAggError::Spill(e.to_string());
+        let mut readers: Vec<crate::pipeline::spill::SpillReader<()>> = self
+            .spill_files
+            .iter()
+            .map(|f| f.reader().map_err(spill_err))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Sort fields for the memcomparable merge encoder. Group-by
+        // columns are always ASC nulls-first in the spill sort order —
+        // matches the ordering produced by `spill()` via
+        // `compare_group_keys` (nulls sort as the lowest variant tag).
+        let sort_fields: Vec<SortField> = self
+            .group_by_fields
+            .iter()
+            .map(|name| SortField {
+                field: name.clone(),
+                order: SortOrder::Asc,
+                null_order: Some(NullOrder::First),
+            })
+            .collect();
+
+        // Prime the loser tree with one entry per reader.
+        let mut initial: Vec<Option<MergeEntry>> = Vec::with_capacity(readers.len());
+        for reader in &mut readers {
+            match reader.next() {
+                Some(Ok((record, _))) => {
+                    let key = encode_sort_key(&record, &sort_fields);
+                    initial.push(Some(MergeEntry { key, record }));
+                }
+                Some(Err(e)) => return Err(HashAggError::Spill(e.to_string())),
+                None => initial.push(None),
+            }
+        }
+        let mut tree = LoserTree::new(initial);
+
+        let gb_count = self.group_by_indices.len();
+        let mut out: Vec<Record> = Vec::new();
+        let mut current: Option<(Vec<GroupByKey>, AggregatorGroupState)> = None;
+
+        while tree.winner().is_some() {
+            let stream_idx = tree.winner_index();
+            let record = tree.winner().unwrap().record.clone();
+
+            let (key, state) = decode_spill_record(&record, &self.group_by_fields, gb_count)?;
+
+            let matches_current = matches!(current.as_ref(), Some((cur_key, _)) if *cur_key == key);
+            if matches_current {
+                let (_, cur_state) = current.as_mut().unwrap();
+                for (a, b) in cur_state.row.iter_mut().zip(state.row.iter()) {
+                    a.merge(b);
+                }
+                cur_state.meta_tracker.merge(state.meta_tracker);
+            } else {
+                if let Some((k, s)) = current.take() {
+                    out.push(self.finalize_group(&k, &s, ctx)?);
+                }
+                current = Some((key, state));
+            }
+
+            // Advance the winning stream.
+            let next = match readers[stream_idx].next() {
+                Some(Ok((record, _))) => {
+                    let key = encode_sort_key(&record, &sort_fields);
+                    Some(MergeEntry { key, record })
+                }
+                Some(Err(e)) => return Err(HashAggError::Spill(e.to_string())),
+                None => None,
+            };
+            tree.replace_winner(next);
+        }
+
+        if let Some((k, s)) = current {
+            out.push(self.finalize_group(&k, &s, ctx)?);
+        }
+
+        Ok(out)
+    }
+}
+
+/// Decode one spill record produced by [`HashAggregator::spill`] back
+/// into its `(group_key, AggregatorGroupState)` representation.
+///
+/// The spill schema is: `[group-by columns..] ++ __acc_state ++
+/// __meta_tracker`. Both trailer columns hold JSON-serialized
+/// `AccumulatorRow` / `MetadataCommonTracker` strings.
+fn decode_spill_record(
+    record: &Record,
+    gb_fields: &[String],
+    gb_count: usize,
+) -> Result<(Vec<GroupByKey>, AggregatorGroupState), HashAggError> {
+    let values = record.values();
+    if values.len() < gb_count + 2 {
+        return Err(HashAggError::Spill(format!(
+            "spill record has {} columns, expected at least {}",
+            values.len(),
+            gb_count + 2
+        )));
+    }
+
+    let mut key: Vec<GroupByKey> = Vec::with_capacity(gb_count);
+    for (i, name) in gb_fields.iter().enumerate() {
+        let v = &values[i];
+        match value_to_group_key(v, name, None, 0)
+            .map_err(|e| HashAggError::Spill(format!("spill group-key decode: {e:?}")))?
+        {
+            Some(k) => key.push(k),
+            None => key.push(GroupByKey::Null),
+        }
+    }
+
+    let acc_json = match &values[gb_count] {
+        Value::String(s) => s.as_ref(),
+        other => {
+            return Err(HashAggError::Spill(format!(
+                "spill __acc_state column is not a string: {other:?}"
+            )));
+        }
+    };
+    let meta_json = match &values[gb_count + 1] {
+        Value::String(s) => s.as_ref(),
+        other => {
+            return Err(HashAggError::Spill(format!(
+                "spill __meta_tracker column is not a string: {other:?}"
+            )));
+        }
+    };
+
+    let row: AccumulatorRow = serde_json::from_str(acc_json)
+        .map_err(|e| HashAggError::Spill(format!("__acc_state decode: {e}")))?;
+    let meta_tracker: MetadataCommonTracker = serde_json::from_str(meta_json)
+        .map_err(|e| HashAggError::Spill(format!("__meta_tracker decode: {e}")))?;
+
+    Ok((key, AggregatorGroupState { row, meta_tracker }))
 }
 
 /// Total ordering on group-key tuples for spill sorting.
