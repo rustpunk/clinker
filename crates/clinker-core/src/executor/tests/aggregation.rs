@@ -753,4 +753,130 @@ outputs:
         }
         let _ = ErrorStrategy::FailFast;
     }
+
+    // ----- Task 16.4.0 smoke test: StreamingAggregator<AddRaw> -----
+
+    /// Build a [`StreamingAggregator`](crate::aggregation::StreamingAggregator)
+    /// over the `AddRaw` mode using the same real Parser → resolve →
+    /// typecheck pipeline as `build_aggregator`.
+    #[allow(clippy::type_complexity)]
+    fn build_streaming_aggregator(
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+        transform_name: &str,
+    ) -> crate::aggregation::StreamingAggregator<clinker_record::accumulator::AddRaw> {
+        let parsed = Parser::parse(cxl_src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
+        let resolved =
+            resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
+        let schema_map: HashMap<String, Type> = input_fields
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .collect();
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let typed = type_check_with_mode(resolved, &schema_map, mode).expect("typecheck");
+        let schema_names: Vec<String> =
+            input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
+        let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
+        let compiled = extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract");
+
+        let output_columns: Vec<Box<str>> = compiled
+            .emits
+            .iter()
+            .filter(|e| !e.is_meta)
+            .map(|e| e.output_name.clone())
+            .collect();
+        let output_schema = Arc::new(Schema::new(output_columns));
+        let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+        crate::aggregation::StreamingAggregator::new_for_raw(
+            Arc::new(compiled),
+            evaluator,
+            output_schema,
+            transform_name.to_string(),
+        )
+    }
+
+    #[test]
+    fn test_streaming_aggregator_two_groups_sorted_smoke() {
+        // Two distinct keys arriving in ascending sorted order. Streaming
+        // aggregator must emit exactly two SortRow entries with the right
+        // per-group counts and the right D57 sidecars (min row_num per
+        // group). Exercises AddRaw add_record → GroupBoundary → finalize.
+        let input_schema = make_schema(&["k"]);
+        let mut agg = build_streaming_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit c = count(*)",
+            "stream_smoke",
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("test.csv");
+
+        let records = [
+            ("a", 10u64),
+            ("a", 11u64),
+            ("a", 12u64),
+            ("b", 20u64),
+            ("b", 21u64),
+        ];
+        for (k, row_num) in records {
+            let rec = make_record(&input_schema, vec![Value::String(k.into())]);
+            let ctx = ctx_for(&stable, &file, row_num);
+            agg.add_record(&rec, row_num, &IndexMap::new(), &IndexMap::new(), &ctx)
+                .expect("add_record");
+        }
+
+        let ctx = ctx_for(&stable, &file, 0);
+        let rows = agg.finalize(&ctx).expect("finalize");
+        assert_eq!(rows.len(), 2, "two groups: {rows:?}");
+
+        // Expect (k, row_num, c) = (a, 10, 3) and (b, 20, 2) in sorted
+        // emission order (GroupBoundary preserves input order).
+        let (ra, rn_a, _, _) = &rows[0];
+        let (rb, rn_b, _, _) = &rows[1];
+        assert_eq!(*rn_a, 10, "group a min row_num");
+        assert_eq!(*rn_b, 20, "group b min row_num");
+        assert_eq!(ra.values()[0], Value::String("a".into()));
+        assert_eq!(rb.values()[0], Value::String("b".into()));
+        // count(*) leg: the emit schema is [k, c] in declaration order.
+        assert_eq!(ra.values()[1], Value::Integer(3));
+        assert_eq!(rb.values()[1], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_streaming_aggregator_out_of_order_is_sort_violation() {
+        // Second record's key < first record's key → GroupBoundary must
+        // raise HashAggError::SortOrderViolation, which maps to
+        // PipelineError::SortOrderViolation via the From impl (Task 16.4.0).
+        let input_schema = make_schema(&["k"]);
+        let mut agg = build_streaming_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit c = count(*)",
+            "stream_violation",
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("test.csv");
+
+        let r1 = make_record(&input_schema, vec![Value::String("b".into())]);
+        let r2 = make_record(&input_schema, vec![Value::String("a".into())]);
+        let ctx = ctx_for(&stable, &file, 1);
+        agg.add_record(&r1, 1, &IndexMap::new(), &IndexMap::new(), &ctx)
+            .expect("first ok");
+        let ctx = ctx_for(&stable, &file, 2);
+        let err = agg
+            .add_record(&r2, 2, &IndexMap::new(), &IndexMap::new(), &ctx)
+            .expect_err("out-of-order must fail");
+        let pe: PipelineError = err.into();
+        match pe {
+            PipelineError::SortOrderViolation { message } => {
+                assert!(message.contains("sorts before"), "msg = {message}");
+            }
+            other => panic!("expected SortOrderViolation, got {other:?}"),
+        }
+    }
 }

@@ -65,6 +65,14 @@ pub enum OrderingProvenance {
     },
     /// Source has no declared sort order.
     NoOrdering,
+    /// Ordering asserted by a streaming aggregate's group-by prefix at
+    /// `at_node`, enabled by an upstream `Ordering` provenance chain
+    /// (`enabled_by`). Phase 16 Task 16.4.0 introduces the variant; the
+    /// property-pass walker that produces it lands in Task 16.4.9a.
+    IntroducedByStreamingAggregate {
+        at_node: String,
+        enabled_by: Box<OrderingProvenance>,
+    },
 }
 
 /// Partitioning of a node's output stream.

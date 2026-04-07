@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use clinker_record::accumulator::{AccumulatorEnum, AccumulatorError, AccumulatorRow};
+use clinker_record::accumulator::{
+    AccumulatorEnum, AccumulatorError, AccumulatorOp, AccumulatorRow, AddRaw,
+};
 use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
 use clinker_record::{GroupByKey, Record, RecordStorage, Value};
@@ -743,6 +745,15 @@ pub enum HashAggError {
     /// `AggregateEvalScope`. Indicates an extractor/executor mismatch or
     /// an unsupported residual construct.
     Residual(AggregateEvalError),
+    /// Streaming aggregation observed an input record whose group-by key
+    /// sorts strictly before the currently-open group, violating the
+    /// pre-sorted-input invariant of `StreamingAggregator<AddRaw>`. This
+    /// is always a hard abort regardless of error strategy — it means
+    /// either the upstream ordering contract was wrong or the plan
+    /// property pass qualified streaming aggregation on a node whose
+    /// output was not actually sorted (DataFusion #12086-class bug).
+    /// Phase 16 Task 16.4.0.
+    SortOrderViolation { message: String },
 }
 
 impl std::fmt::Display for HashAggError {
@@ -767,6 +778,9 @@ impl std::fmt::Display for HashAggError {
                 "aggregate {transform}.{binding}: accumulator finalize failed: {source:?}"
             ),
             HashAggError::Residual(e) => write!(f, "aggregate residual eval failed: {e}"),
+            HashAggError::SortOrderViolation { message } => {
+                write!(f, "streaming aggregate sort-order violation: {message}")
+            }
         }
     }
 }
@@ -815,6 +829,9 @@ impl From<HashAggError> for PipelineError {
                 node: String::new(),
                 detail: format!("aggregate residual eval failed: {r}"),
             },
+            HashAggError::SortOrderViolation { message } => {
+                PipelineError::SortOrderViolation { message }
+            }
         }
     }
 }
@@ -833,6 +850,10 @@ impl From<HashAggError> for PipelineError {
 #[non_exhaustive]
 pub enum AggregateStream {
     Hash(HashAggregator),
+    /// Streaming aggregation over a pre-sorted upstream. Landed in
+    /// Phase 16 Task 16.4.0 alongside the real `AccumulatorOp` /
+    /// `AddRaw` types and the shared streaming-merge module.
+    Streaming(StreamingAggregator<AddRaw>),
 }
 
 impl AggregateStream {
@@ -855,6 +876,7 @@ impl AggregateStream {
         spill_dir: Option<PathBuf>,
         transform_name: String,
     ) -> Result<Self, PipelineError> {
+        let _ = (&spill_schema, &spill_sort_fields, memory_budget, &spill_dir);
         match strategy {
             AggregateStrategy::Hash => Ok(Self::Hash(HashAggregator::new(
                 compiled,
@@ -866,11 +888,12 @@ impl AggregateStream {
                 spill_dir,
                 transform_name,
             ))),
-            AggregateStrategy::Streaming => Err(PipelineError::Internal {
-                op: "aggregation",
-                node: transform_name,
-                detail: "streaming aggregation not yet implemented (Task 16.4)".to_string(),
-            }),
+            AggregateStrategy::Streaming => Ok(Self::Streaming(StreamingAggregator::new_for_raw(
+                compiled,
+                evaluator,
+                output_schema,
+                transform_name,
+            ))),
         }
     }
 
@@ -884,12 +907,14 @@ impl AggregateStream {
     ) -> Result<(), HashAggError> {
         match self {
             Self::Hash(h) => h.add_record(record, row_num, emitted, accumulated, ctx),
+            Self::Streaming(s) => s.add_record(record, row_num, emitted, accumulated, ctx),
         }
     }
 
     pub fn finalize(self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
         match self {
             Self::Hash(h) => h.finalize(ctx),
+            Self::Streaming(s) => s.finalize(ctx),
         }
     }
 }
@@ -1244,70 +1269,22 @@ impl HashAggregator {
         }
     }
 
-    /// Finalize one group into an output [`Record`].
-    ///
-    /// Shared by the in-memory fast path and the spill-merge path so
-    /// both produce identical results:
-    ///
-    /// 1. Finalize each accumulator in `state.row` into a slot vector.
-    /// 2. Build an [`AggregateEvalScope`] and evaluate every
-    ///    [`CompiledEmit`] residual. `is_meta` emits collect into
-    ///    `user_meta`; data emits populate `values` by output-schema
-    ///    column name.
-    /// 3. Merge the auto-tracked common metadata (D11 revised) — user
-    ///    explicit emits win on conflict, tracker fills only keys the
-    ///    user did not supply.
-    /// 4. Construct the output `Record` and install metadata.
+    /// Finalize one group into an output [`Record`]. Thin wrapper that
+    /// delegates to the free [`finalize_group_inner`] so the streaming
+    /// aggregator can share byte-identical emission logic.
     fn finalize_group(
         &self,
         key: &[GroupByKey],
         state: &AggregatorGroupState,
         _ctx: &EvalContext,
     ) -> Result<Record, HashAggError> {
-        // 1. Finalize accumulator slots.
-        let bindings = self.factory.bindings();
-        let mut slots: Vec<Value> = Vec::with_capacity(state.row.len());
-        for (i, acc) in state.row.iter().enumerate() {
-            let v = acc.finalize().map_err(|e| HashAggError::Accumulator {
-                transform: self.transform_name.clone(),
-                binding: bindings[i].output_name.to_string(),
-                source: e,
-            })?;
-            slots.push(v);
-        }
-
-        // 2. Evaluate emit residuals in aggregate scope.
-        let scope = AggregateEvalScope { key, slots: &slots };
-        let compiled = self.factory.compiled();
-        let mut values: Vec<Value> = vec![Value::Null; self.output_schema.column_count()];
-        let mut user_meta: IndexMap<Box<str>, Value> = IndexMap::new();
-        for emit in &compiled.emits {
-            let v =
-                eval_expr_in_agg_scope(&emit.residual, &scope).map_err(HashAggError::Residual)?;
-            if emit.is_meta {
-                user_meta.insert(emit.output_name.clone(), v);
-            } else if let Some(idx) = self.output_schema.index(&emit.output_name) {
-                values[idx] = v;
-            }
-        }
-
-        // 3. Auto-propagate common metadata. User explicit emits win.
-        let auto_pairs = state.meta_tracker.clone().finalize();
-        for (k, v) in auto_pairs {
-            if !user_meta.contains_key(&k) {
-                user_meta.insert(k, v);
-            }
-        }
-
-        // 4. Build the output record.
-        let mut record = Record::new(Arc::clone(&self.output_schema), values);
-        for (k, v) in user_meta {
-            // Best-effort: ignore MAX_METADATA_KEYS overflow here (the
-            // executor dispatch arm in 16.3.13 can surface it as a
-            // dedicated error if needed).
-            let _ = record.set_meta(&k, v);
-        }
-        Ok(record)
+        finalize_group_inner(
+            &self.factory,
+            &self.output_schema,
+            &self.transform_name,
+            key,
+            state,
+        )
     }
 
     /// Spill-recovery finalize path. Flushes remaining in-memory state
@@ -1361,15 +1338,18 @@ impl HashAggregator {
         let gb_count = self.group_by_indices.len();
         // FALLBACK per drill-pass-7 Option (b): the spill envelope does
         // NOT carry the D57 sidecars (row_num / emitted / accumulated).
-        // For spill-recovered groups we emit `(row_num=0, emitted=empty,
-        // accumulated=empty)` because the per-record sidecars were lost
-        // when the group was serialized as an `AccumulatorRow` +
-        // `MetadataCommonTracker` blob in `spill()`. Plumbing the
-        // sidecars through the spill format is tracked as a 16.4.0
-        // follow-up. This fallback is the documented compromise that
-        // keeps 16.3.13 atomic.
+        // For spill-recovered groups we push identity sidecars into the
+        // shared [`GroupBoundary`] detector — the same state machine now
+        // drives both the spill-merge path and the streaming-raw path
+        // (DataFusion #4301 pattern, Phase 16 Task 16.4.0).
+        let factory = &self.factory;
+        let output_schema = &self.output_schema;
+        let transform_name = self.transform_name.clone();
+        let finalize = |k: &[GroupByKey], s: &AggregatorGroupState| {
+            finalize_group_inner(factory, output_schema, &transform_name, k, s)
+        };
         let mut out: Vec<SortRow> = Vec::new();
-        let mut current: Option<(Vec<GroupByKey>, AggregatorGroupState)> = None;
+        let mut boundary = crate::pipeline::streaming_merge::GroupBoundary::new();
 
         while tree.winner().is_some() {
             let stream_idx = tree.winner_index();
@@ -1377,19 +1357,10 @@ impl HashAggregator {
 
             let (key, state) = decode_spill_record(&record, &self.group_by_fields, gb_count)?;
 
-            let matches_current = matches!(current.as_ref(), Some((cur_key, _)) if *cur_key == key);
-            if matches_current {
-                let (_, cur_state) = current.as_mut().unwrap();
-                for (a, b) in cur_state.row.iter_mut().zip(state.row.iter()) {
-                    a.merge(b);
-                }
-                cur_state.meta_tracker.merge(state.meta_tracker);
-            } else {
-                if let Some((k, s)) = current.take() {
-                    let record = self.finalize_group(&k, &s, ctx)?;
-                    out.push((record, 0, IndexMap::new(), IndexMap::new()));
-                }
-                current = Some((key, state));
+            if let Some(row) =
+                boundary.push(key, state, (0, IndexMap::new(), IndexMap::new()), &finalize)?
+            {
+                out.push(row);
             }
 
             // Advance the winning stream.
@@ -1404,13 +1375,69 @@ impl HashAggregator {
             tree.replace_winner(next);
         }
 
-        if let Some((k, s)) = current {
-            let record = self.finalize_group(&k, &s, ctx)?;
-            out.push((record, 0, IndexMap::new(), IndexMap::new()));
+        if let Some(row) = boundary.flush(&finalize)? {
+            out.push(row);
         }
-
+        let _ = ctx; // reserved for future per-group eval scope
         Ok(out)
     }
+}
+
+/// Finalize one group into an output [`Record`]. Shared by the in-memory
+/// fast path, the spill-recovery path, and `StreamingAggregator<AddRaw>`
+/// so all three produce byte-identical results.
+///
+/// 1. Finalize each accumulator in `state.row` into a slot vector.
+/// 2. Evaluate every compiled emit residual in an [`AggregateEvalScope`];
+///    `is_meta` emits collect into `user_meta`, data emits populate
+///    `values` by output-schema column name.
+/// 3. Merge the auto-tracked common metadata (D11 revised) — user
+///    explicit emits win on conflict, the tracker fills only keys the
+///    user did not supply.
+/// 4. Build the output `Record` and install metadata.
+pub(crate) fn finalize_group_inner(
+    factory: &AccumulatorFactory,
+    output_schema: &Arc<Schema>,
+    transform_name: &str,
+    key: &[GroupByKey],
+    state: &AggregatorGroupState,
+) -> Result<Record, HashAggError> {
+    let bindings = factory.bindings();
+    let mut slots: Vec<Value> = Vec::with_capacity(state.row.len());
+    for (i, acc) in state.row.iter().enumerate() {
+        let v = acc.finalize().map_err(|e| HashAggError::Accumulator {
+            transform: transform_name.to_string(),
+            binding: bindings[i].output_name.to_string(),
+            source: e,
+        })?;
+        slots.push(v);
+    }
+
+    let scope = AggregateEvalScope { key, slots: &slots };
+    let compiled = factory.compiled();
+    let mut values: Vec<Value> = vec![Value::Null; output_schema.column_count()];
+    let mut user_meta: IndexMap<Box<str>, Value> = IndexMap::new();
+    for emit in &compiled.emits {
+        let v = eval_expr_in_agg_scope(&emit.residual, &scope).map_err(HashAggError::Residual)?;
+        if emit.is_meta {
+            user_meta.insert(emit.output_name.clone(), v);
+        } else if let Some(idx) = output_schema.index(&emit.output_name) {
+            values[idx] = v;
+        }
+    }
+
+    let auto_pairs = state.meta_tracker.clone().finalize();
+    for (k, v) in auto_pairs {
+        if !user_meta.contains_key(&k) {
+            user_meta.insert(k, v);
+        }
+    }
+
+    let mut record = Record::new(Arc::clone(output_schema), values);
+    for (k, v) in user_meta {
+        let _ = record.set_meta(&k, v);
+    }
+    Ok(record)
 }
 
 /// Decode one spill record produced by [`HashAggregator::spill`] back
@@ -1589,94 +1616,267 @@ fn eval_binding_arg_value(
 }
 
 // ---------------------------------------------------------------------------
-// StreamingAggregator<MergeState> — spill-recovery stub (Task 16.3.11)
+// StreamingAggregator<Op: AccumulatorOp> — raw + merge modes (Task 16.4.0)
 // ---------------------------------------------------------------------------
-//
-// Minimal stub per the Task 16.3.11 plan entry: enough type surface for
-// `HashAggregator::finalize` (16.3.12) to drive the spill-merge loop
-// against a concrete API. The full monomorphized
-// `StreamingAggregator<Op: AccumulatorOp>` — including the `AddRaw`
-// mode, the `AccumulatorOp` trait, sort-order verification, and the
-// mid-stream boundary-emission fast path — lands in Task 16.4. 16.3
-// only needs the `MergeState` path to complete the spill recovery loop,
-// and the concrete emission logic (finalize residual + metadata merge +
-// Record construction) is wired alongside `HashAggregator::finalize` in
-// Task 16.3.12.
 
-/// Marker type selecting the spill-recovery merge mode.
-///
-/// In Task 16.4 this will gain a sibling `AddRaw` marker and an
-/// `AccumulatorOp` trait impl. For 16.3 it exists purely so the
-/// `StreamingAggregator<MergeState>` type name matches the one called
-/// out in the decisions log (D13) and is stable for 16.3.12's
-/// `merge_spilled` caller.
+/// Marker type selecting the spill-recovery merge mode. `AddRaw` is
+/// re-exported from `clinker-record`; `MergeState` remains local because
+/// it is only ever referenced by the (now unused outside tests) spill
+/// recovery stub.
 #[derive(Debug, Default)]
 pub struct MergeState;
 
-/// Boundary-merging aggregator over a pre-sorted stream of spilled
-/// per-group `AggregatorGroupState` partials.
+impl AccumulatorOp for MergeState {}
+
+/// Boundary-merging aggregator monomorphized over an `AccumulatorOp`.
 ///
-/// The hash path's spill loop (16.3.12) feeds this in sorted group-key
-/// order — LoserTree guarantees monotonic keys across all spill files.
-/// On every key boundary the previous group is finalized and pushed
-/// into the caller's output buffer; `flush` drains the final open
-/// group.
+/// * `StreamingAggregator<AddRaw>` consumes raw upstream records that
+///   arrive in verified sorted order on the group-by prefix, folds
+///   each record into a per-group `AccumulatorEnum` row via the same
+///   `dispatch_binding` hot loop used by `HashAggregator`, and emits a
+///   finalized `SortRow` every time the group-key boundary advances.
+/// * `StreamingAggregator<MergeState>` is retained as a forward-looking
+///   stub for the out-of-core spill-recovery path that may consume
+///   pre-aggregated partials. The spill-recovery path currently lives
+///   in `HashAggregator::finalize_with_spill`, which is what the
+///   executor actually uses; the `MergeState` inherent impl exists so
+///   the decisions-log type surface survives for Phase 17+ work.
 ///
-/// 16.3.11 lands the type + method surface; the bodies are filled in by
-/// Task 16.3.12 together with the shared finalize path so the merge
-/// and in-memory paths agree byte-for-byte on residual evaluation and
-/// metadata emission.
-pub struct StreamingAggregator<Op> {
-    #[allow(dead_code)]
+/// Both variants share the [`GroupBoundary`](crate::pipeline::streaming_merge::GroupBoundary)
+/// state machine (DataFusion PR #4301 pattern), guaranteeing that all
+/// three finalize paths — in-memory, spill-merge, and raw-streaming —
+/// emit byte-identical `SortRow` values on identical inputs.
+pub struct StreamingAggregator<Op: AccumulatorOp> {
     factory: AccumulatorFactory,
-    #[allow(dead_code)]
     output_schema: Arc<Schema>,
-    /// Currently open group being merged. `None` before the first
-    /// `process_spilled` call and after every boundary emission.
-    #[allow(dead_code)]
-    current: Option<(Vec<GroupByKey>, AggregatorGroupState)>,
+    group_by_indices: Vec<u32>,
+    group_by_fields: Vec<String>,
+    pre_agg_filter: Option<Expr>,
+    evaluator: ProgramEvaluator,
+    transform_name: String,
+    explicit_meta_keys: HashSet<Box<str>>,
+    meta_conflict_logged: HashSet<Box<str>>,
+    rows_seen: u64,
+    boundary: crate::pipeline::streaming_merge::GroupBoundary,
+    /// Output buffer — `push` emits into this on every boundary; the
+    /// executor drains it at `finalize`.
+    pending: Vec<SortRow>,
     _mode: std::marker::PhantomData<Op>,
 }
 
-impl StreamingAggregator<MergeState> {
-    /// Construct a merge-mode streaming aggregator for spill recovery.
+impl StreamingAggregator<AddRaw> {
+    /// Construct a raw-mode streaming aggregator.
     ///
-    /// `factory` clones fresh `AccumulatorRow` prototypes when the
-    /// merge path needs to fall back to a fresh state (unused in
-    /// practice — merge always starts from a spilled row). The
-    /// `output_schema` is the finalized post-aggregation record schema
-    /// produced by `HashAggregator::finalize`.
-    pub fn new_for_merge(factory: AccumulatorFactory, output_schema: Arc<Schema>) -> Self {
+    /// Accepts the same knobs as `HashAggregator::new` minus the spill
+    /// plumbing (`StreamingAggregator<AddRaw>` never materializes a
+    /// hash table, so no budget / spill-dir / spill schema is needed).
+    pub fn new_for_raw(
+        compiled: Arc<CompiledAggregate>,
+        evaluator: ProgramEvaluator,
+        output_schema: Arc<Schema>,
+        transform_name: impl Into<String>,
+    ) -> Self {
+        let group_by_indices = compiled.group_by_indices.clone();
+        let group_by_fields = compiled.group_by_fields.clone();
+        let pre_agg_filter = compiled.pre_agg_filter.clone();
+        let explicit_meta_keys: HashSet<Box<str>> = compiled
+            .emits
+            .iter()
+            .filter(|e| e.is_meta)
+            .map(|e| e.output_name.clone())
+            .collect();
+        let factory = AccumulatorFactory::new(compiled);
         Self {
             factory,
             output_schema,
-            current: None,
+            group_by_indices,
+            group_by_fields,
+            pre_agg_filter,
+            evaluator,
+            transform_name: transform_name.into(),
+            explicit_meta_keys,
+            meta_conflict_logged: HashSet::new(),
+            rows_seen: 0,
+            boundary: crate::pipeline::streaming_merge::GroupBoundary::new(),
+            pending: Vec::new(),
             _mode: std::marker::PhantomData,
         }
     }
 
-    /// Feed one spilled per-group partial into the merge stream.
+    /// Drive one input record through the streaming aggregator.
     ///
-    /// Contract (implemented in 16.3.12):
-    ///   * If `key` matches the currently open group: merge `state`
-    ///     into the open state via `AccumulatorEnum::merge` and
-    ///     `MetadataCommonTracker::merge`.
-    ///   * Otherwise: finalize the open group, push the resulting
-    ///     `Record` onto `output_records`, and install `(key, state)`
-    ///     as the new open group.
-    pub fn process_spilled(
+    /// 1. Apply the pre-aggregation filter (D9).
+    /// 2. Extract the group-key tuple (D10).
+    /// 3. Build a fresh per-group state seeded with a clone of the
+    ///    factory prototype.
+    /// 4. Fold each binding via `dispatch_binding` into that state.
+    /// 5. Populate the D57 sidecar fields from the per-record
+    ///    `row_num` / `emitted` / `accumulated` inputs.
+    /// 6. Push into the shared `GroupBoundary` detector; on a key
+    ///    boundary the previous group's finalized `SortRow` lands in
+    ///    `self.pending`. A strictly lesser key is routed through
+    ///    `HashAggError::SortOrderViolation` → hard abort.
+    pub fn add_record(
         &mut self,
-        _key: Vec<GroupByKey>,
-        _state: AggregatorGroupState,
-        _output_records: &mut Vec<Record>,
+        record: &Record,
+        row_num: u64,
+        emitted: &IndexMap<String, Value>,
+        accumulated: &IndexMap<String, Value>,
+        ctx: &EvalContext,
     ) -> Result<(), HashAggError> {
-        // Filled in by Task 16.3.12 alongside the shared finalize path.
-        todo!("StreamingAggregator<MergeState>::process_spilled — lands in 16.3.12")
+        if let Some(filter) = &self.pre_agg_filter {
+            let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+            let v = eval_expr::<NullStorage>(
+                filter,
+                self.evaluator.typed(),
+                ctx,
+                record,
+                None,
+                &env,
+                &meta,
+            )?;
+            if v != Value::Bool(true) {
+                return Ok(());
+            }
+        }
+        self.rows_seen = self.rows_seen.saturating_add(1);
+
+        let mut key: Vec<GroupByKey> = Vec::with_capacity(self.group_by_indices.len());
+        for (i, idx) in self.group_by_indices.iter().enumerate() {
+            let field_name = self
+                .group_by_fields
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("");
+            let val = record
+                .values()
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            match value_to_group_key(&val, field_name, None, ctx.source_row as u32) {
+                Ok(Some(gk)) => key.push(gk),
+                Ok(None) => key.push(GroupByKey::Null),
+                Err(e) => {
+                    return Err(HashAggError::GroupKey {
+                        field: field_name.to_string(),
+                        row: ctx.source_row as u32,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Seed a fresh per-group state for this record. `GroupBoundary`
+        // merges peer states if the key matches the currently-open
+        // group, so we always construct a singleton and let the state
+        // machine collapse it.
+        let mut state = AggregatorGroupState::new(self.factory.create_accumulators());
+        let bindings = self.factory.compiled().bindings.clone();
+        for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
+            dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
+        }
+
+        // D11 revised: walk record metadata into the fresh tracker.
+        if record.has_meta() {
+            let observations: Vec<(Box<str>, Value)> = record
+                .iter_meta()
+                .filter(|(k, _)| !self.explicit_meta_keys.contains(*k))
+                .map(|(k, v)| (Box::<str>::from(k), v.clone()))
+                .collect();
+            for (k, v) in observations {
+                let r = state.meta_tracker.observe(&k, &v);
+                if r.became_conflict && self.meta_conflict_logged.insert(k.clone()) {
+                    tracing::warn!(
+                        transform = %self.transform_name,
+                        meta_key = %k,
+                        "streaming aggregate dropped $meta.{} for at least one group: \
+                         conflicting values across input records",
+                        k
+                    );
+                }
+            }
+        }
+
+        // D57 sidecar seed — single-record values feed directly into
+        // the freshly-constructed per-group state. `GroupBoundary`'s
+        // `push` merges these in per-group once the key is installed.
+        state.min_row_num = row_num;
+        if !emitted.is_empty() {
+            state.common_emitted = Some(emitted.clone());
+        } else {
+            state.common_emitted = Some(IndexMap::new());
+        }
+        state.union_accumulated = accumulated.clone();
+
+        let factory = &self.factory;
+        let output_schema = &self.output_schema;
+        let transform_name = self.transform_name.clone();
+        let finalize = |k: &[GroupByKey], s: &AggregatorGroupState| {
+            finalize_group_inner(factory, output_schema, &transform_name, k, s)
+        };
+        if let Some(row) = self.boundary.push(
+            key,
+            state,
+            (row_num, emitted.clone(), accumulated.clone()),
+            &finalize,
+        )? {
+            self.pending.push(row);
+        }
+        Ok(())
     }
 
-    /// Finalize and emit the last open group, if any.
-    pub fn flush(&mut self, _output_records: &mut Vec<Record>) -> Result<(), HashAggError> {
-        // Filled in by Task 16.3.12 alongside the shared finalize path.
-        todo!("StreamingAggregator<MergeState>::flush — lands in 16.3.12")
+    /// Drain all emitted boundary rows plus the final open group.
+    pub fn finalize(mut self, _ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
+        let factory = self.factory;
+        let output_schema = self.output_schema;
+        let transform_name = self.transform_name;
+        let finalize = |k: &[GroupByKey], s: &AggregatorGroupState| {
+            finalize_group_inner(&factory, &output_schema, &transform_name, k, s)
+        };
+        let mut out = std::mem::take(&mut self.pending);
+        if let Some(last) = self.boundary.flush(&finalize)? {
+            out.push(last);
+        }
+        Ok(out)
+    }
+}
+
+impl StreamingAggregator<MergeState> {
+    /// Construct a merge-mode streaming aggregator. Retained as a
+    /// forward-compat stub for Phase 17+ out-of-core merge recovery;
+    /// the executor's spill-recovery path currently lives inside
+    /// `HashAggregator::finalize_with_spill`.
+    pub fn new_for_merge(
+        compiled: Arc<CompiledAggregate>,
+        evaluator: ProgramEvaluator,
+        output_schema: Arc<Schema>,
+        transform_name: impl Into<String>,
+    ) -> Self {
+        let group_by_indices = compiled.group_by_indices.clone();
+        let group_by_fields = compiled.group_by_fields.clone();
+        let pre_agg_filter = compiled.pre_agg_filter.clone();
+        let explicit_meta_keys: HashSet<Box<str>> = compiled
+            .emits
+            .iter()
+            .filter(|e| e.is_meta)
+            .map(|e| e.output_name.clone())
+            .collect();
+        let factory = AccumulatorFactory::new(compiled);
+        Self {
+            factory,
+            output_schema,
+            group_by_indices,
+            group_by_fields,
+            pre_agg_filter,
+            evaluator,
+            transform_name: transform_name.into(),
+            explicit_meta_keys,
+            meta_conflict_logged: HashSet::new(),
+            rows_seen: 0,
+            boundary: crate::pipeline::streaming_merge::GroupBoundary::new(),
+            pending: Vec::new(),
+            _mode: std::marker::PhantomData,
+        }
     }
 }
