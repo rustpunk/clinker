@@ -695,6 +695,28 @@ pub enum ParallelismOverride {
     Sequential,
 }
 
+/// User-supplied hint for aggregation execution strategy.
+///
+/// `Auto` (default) lets the optimizer pick Hash vs Streaming based on
+/// upstream `OrderingProvenance` and the `qualifies_for_streaming` rules
+/// (see Task 16.4.6 / 16.4.9). `Hash` and `Streaming` are user overrides
+/// modeled on Informatica's `sorted_input` flag — `Streaming` is a
+/// declared performance contract: if the input is not provably sorted
+/// for the group-by keys, the planner hard-errors at compile time
+/// rather than silently inserting a sort (D78).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateStrategyHint {
+    /// Optimizer chooses based on upstream ordering (default).
+    #[default]
+    Auto,
+    /// Force hash aggregation regardless of input ordering.
+    Hash,
+    /// Require streaming aggregation; compile-time error if input is
+    /// not provably sorted for the group-by keys.
+    Streaming,
+}
+
 /// Configuration for GROUP BY aggregation on a transform.
 ///
 /// Research: RESEARCH-aggregate-yaml-config.md — nested block is universal ETL
@@ -707,6 +729,11 @@ pub struct AggregateConfig {
     pub group_by: Vec<String>,
     /// CXL source with aggregate function calls.
     pub cxl: String,
+    /// User-supplied execution strategy hint. Defaults to `Auto`.
+    /// Resolved to a concrete `AggregateStrategy` by the
+    /// `select_aggregation_strategies` post-pass in 16.4.9.
+    #[serde(default)]
+    pub strategy: AggregateStrategyHint,
 }
 
 /// Per-transform configuration block.
@@ -3007,5 +3034,94 @@ aggregate:
 name: bad
 "#;
         assert!(parse_transform(yaml).is_err());
+    }
+
+    // ── Phase 16 Task 16.4.8 — AggregateStrategyHint tests ─────────────────
+
+    #[test]
+    fn test_aggregate_config_default_strategy_is_auto() {
+        let yaml = r#"
+name: t
+aggregate:
+  group_by: [d]
+  cxl: emit s = sum(x)
+"#;
+        let t = parse_transform(yaml).expect("should parse");
+        let agg = t.aggregate.as_ref().unwrap();
+        assert_eq!(agg.strategy, AggregateStrategyHint::Auto);
+    }
+
+    #[test]
+    fn test_aggregate_config_strategy_explicit_hash() {
+        let yaml = r#"
+name: t
+aggregate:
+  group_by: [d]
+  cxl: emit s = sum(x)
+  strategy: hash
+"#;
+        let t = parse_transform(yaml).expect("should parse");
+        assert_eq!(
+            t.aggregate.as_ref().unwrap().strategy,
+            AggregateStrategyHint::Hash
+        );
+    }
+
+    #[test]
+    fn test_aggregate_config_strategy_explicit_streaming() {
+        let yaml = r#"
+name: t
+aggregate:
+  group_by: [d]
+  cxl: emit s = sum(x)
+  strategy: streaming
+"#;
+        let t = parse_transform(yaml).expect("should parse");
+        assert_eq!(
+            t.aggregate.as_ref().unwrap().strategy,
+            AggregateStrategyHint::Streaming
+        );
+    }
+
+    #[test]
+    fn test_aggregate_config_strategy_invalid_string_errors() {
+        let yaml = r#"
+name: t
+aggregate:
+  group_by: [d]
+  cxl: emit s = sum(x)
+  strategy: bogus
+"#;
+        assert!(parse_transform(yaml).is_err());
+    }
+
+    #[test]
+    fn test_aggregate_config_strategy_serializes_in_json() {
+        // D79: AggregateConfig participates in derived Serialize, so
+        // `--explain` JSON for an aggregation node naturally surfaces
+        // `config.strategy`. Snapshot the three Auto/Hash/Streaming
+        // shapes via direct serde_json round-trip on AggregateConfig.
+        let auto = AggregateConfig {
+            group_by: vec!["d".to_string()],
+            cxl: "emit s = sum(x)".to_string(),
+            strategy: AggregateStrategyHint::Auto,
+        };
+        let json = serde_json::to_value(&auto).unwrap();
+        assert_eq!(json["strategy"], "auto");
+
+        let hash = AggregateConfig {
+            strategy: AggregateStrategyHint::Hash,
+            ..auto.clone()
+        };
+        assert_eq!(serde_json::to_value(&hash).unwrap()["strategy"], "hash");
+
+        let streaming = AggregateConfig {
+            strategy: AggregateStrategyHint::Streaming,
+            ..auto
+        };
+        assert_eq!(
+            serde_json::to_value(&streaming).unwrap()["strategy"],
+            "streaming"
+        );
     }
 }
