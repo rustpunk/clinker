@@ -25,6 +25,28 @@ pub enum GroupByKey {
     Null,
 }
 
+impl GroupByKey {
+    /// Convert a group-by key back into a `Value` for finalize-time
+    /// residual evaluation in aggregation scope.
+    ///
+    /// `Float(bits)` is unpacked via `f64::from_bits`. The conversion is
+    /// lossless against `value_to_group_key` *modulo* the int→float
+    /// widening that path performs by default — i.e. an integer key
+    /// produced via the default (un-pinned) path round-trips back as
+    /// `Value::Float`, matching the canonicalization of equality.
+    pub fn to_value(&self) -> Value {
+        match self {
+            GroupByKey::Null => Value::Null,
+            GroupByKey::Int(n) => Value::Integer(*n),
+            GroupByKey::Str(s) => Value::String(s.clone()),
+            GroupByKey::Bool(b) => Value::Bool(*b),
+            GroupByKey::Date(d) => Value::Date(*d),
+            GroupByKey::DateTime(dt) => Value::DateTime(*dt),
+            GroupByKey::Float(bits) => Value::Float(f64::from_bits(*bits)),
+        }
+    }
+}
+
 /// Errors from group key conversion.
 #[derive(Debug)]
 pub enum GroupKeyError {
@@ -255,6 +277,31 @@ mod tests {
             value_to_group_key(&Value::DateTime(dt), "f", None, 0).unwrap(),
             Some(GroupByKey::DateTime(_))
         ));
+    }
+
+    #[test]
+    fn test_group_by_key_to_value_all_variants() {
+        use chrono::NaiveDate;
+
+        assert_eq!(GroupByKey::Null.to_value(), Value::Null);
+        assert_eq!(GroupByKey::Int(42).to_value(), Value::Integer(42));
+        assert_eq!(
+            GroupByKey::Str("hi".into()).to_value(),
+            Value::String("hi".into())
+        );
+        assert_eq!(GroupByKey::Bool(true).to_value(), Value::Bool(true));
+
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        assert_eq!(GroupByKey::Date(d).to_value(), Value::Date(d));
+
+        let dt = d.and_hms_opt(10, 0, 0).unwrap();
+        assert_eq!(GroupByKey::DateTime(dt).to_value(), Value::DateTime(dt));
+
+        // Float round-trips via f64::from_bits, including NaN-canonical
+        // groupings (we just check finite values here — NaN can't enter
+        // the key in the first place).
+        let f = 3.14_f64;
+        assert_eq!(GroupByKey::Float(f.to_bits()).to_value(), Value::Float(f));
     }
 
     #[test]

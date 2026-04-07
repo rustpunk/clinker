@@ -178,12 +178,14 @@ pub fn eval_expr_in_agg_scope(
                     slot_count: scope.slots.len(),
                 })
         }
-        Expr::GroupKey { slot, .. } => scope.key.get(*slot as usize).map(group_key_to_value).ok_or(
-            AggregateEvalError::GroupKeyOutOfRange {
+        Expr::GroupKey { slot, .. } => scope
+            .key
+            .get(*slot as usize)
+            .map(GroupByKey::to_value)
+            .ok_or(AggregateEvalError::GroupKeyOutOfRange {
                 slot: *slot,
                 key_count: scope.key.len(),
-            },
-        ),
+            }),
         Expr::Literal { value, .. } => Ok(literal_to_value(value)),
         Expr::Binary { op, lhs, rhs, .. } => {
             let l = eval_expr_in_agg_scope(lhs, scope)?;
@@ -250,18 +252,6 @@ fn literal_to_value(lit: &LiteralValue) -> Value {
         LiteralValue::Bool(b) => Value::Bool(*b),
         LiteralValue::Date(d) => Value::Date(*d),
         LiteralValue::Null => Value::Null,
-    }
-}
-
-fn group_key_to_value(k: &GroupByKey) -> Value {
-    match k {
-        GroupByKey::Null => Value::Null,
-        GroupByKey::Int(n) => Value::Integer(*n),
-        GroupByKey::Str(s) => Value::String(s.clone()),
-        GroupByKey::Bool(b) => Value::Bool(*b),
-        GroupByKey::Date(d) => Value::Date(*d),
-        GroupByKey::DateTime(dt) => Value::DateTime(*dt),
-        GroupByKey::Float(bits) => Value::Float(f64::from_bits(*bits)),
     }
 }
 
