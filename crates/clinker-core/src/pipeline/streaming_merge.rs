@@ -22,7 +22,7 @@
 //! (PR #9662) + Polars streaming sorted group-by pattern, validated by
 //! the drill pass 9 audit (`RESEARCH-phase-16.4.3-spill-write-unification.md`).
 
-use clinker_record::{Value, accumulator::AccumulatorEnum};
+use clinker_record::{Record, Value, accumulator::AccumulatorEnum};
 use indexmap::IndexMap;
 
 use crate::aggregation::{AggregatorGroupState, HashAggError, SortRow};
@@ -58,6 +58,10 @@ pub(crate) struct GroupBoundary {
     last: Vec<u8>,
     /// Currently-open per-group state. `None` when no group is open.
     open_state: Option<AggregatorGroupState>,
+    /// Record that opened the currently-open group. Held so the finalize
+    /// closure can receive it (for semantic group-key extraction) without
+    /// the caller needing a parallel `RefCell` shadow of the key.
+    open_record: Option<Record>,
     mode: StreamingErrorMode,
 }
 
@@ -68,6 +72,7 @@ impl GroupBoundary {
             current: Vec::new(),
             last: Vec::new(),
             open_state: None,
+            open_record: None,
             mode,
         }
     }
@@ -91,12 +96,13 @@ impl GroupBoundary {
     pub(crate) fn push<F>(
         &mut self,
         state: AggregatorGroupState,
+        record: Record,
         sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
         finalize: &F,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError>
     where
-        F: Fn(&AggregatorGroupState) -> Result<clinker_record::Record, HashAggError>,
+        F: Fn(&Record, &AggregatorGroupState) -> Result<Record, HashAggError>,
     {
         use std::cmp::Ordering;
 
@@ -105,6 +111,7 @@ impl GroupBoundary {
             let mut new_state = state;
             seed_sidecars(&mut new_state, sidecar);
             self.open_state = Some(new_state);
+            self.open_record = Some(record);
             std::mem::swap(&mut self.last, &mut self.current);
             self.current.clear();
             return Ok(());
@@ -122,12 +129,17 @@ impl GroupBoundary {
                 src.row.clear(); // already merged above
                 crate::aggregation::merge_group_sidecars(cur_state, src);
                 self.current.clear();
+                let _ = record; // same group — incoming record not retained
                 Ok(())
             }
             Ordering::Greater => {
                 // Boundary: finalize the open group.
                 let prev_state = self.open_state.take().unwrap();
-                let record = finalize(&prev_state)?;
+                let prev_record = self
+                    .open_record
+                    .take()
+                    .expect("open_record must be Some whenever open_state is Some");
+                let out_record = finalize(&prev_record, &prev_state)?;
                 let row_num = if prev_state.min_row_num == u64::MAX {
                     0
                 } else {
@@ -135,12 +147,13 @@ impl GroupBoundary {
                 };
                 let emitted = prev_state.common_emitted.unwrap_or_default();
                 let accumulated = prev_state.union_accumulated;
-                out.push((record, row_num, emitted, accumulated));
+                out.push((out_record, row_num, emitted, accumulated));
 
                 // Install the new open group.
                 let mut new_state = state;
                 seed_sidecars(&mut new_state, sidecar);
                 self.open_state = Some(new_state);
+                self.open_record = Some(record);
                 std::mem::swap(&mut self.last, &mut self.current);
                 self.current.clear();
                 Ok(())
@@ -170,10 +183,14 @@ impl GroupBoundary {
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError>
     where
-        F: Fn(&AggregatorGroupState) -> Result<clinker_record::Record, HashAggError>,
+        F: Fn(&Record, &AggregatorGroupState) -> Result<Record, HashAggError>,
     {
         if let Some(state) = self.open_state.take() {
-            let record = finalize(&state)?;
+            let prev_record = self
+                .open_record
+                .take()
+                .expect("open_record must be Some whenever open_state is Some");
+            let out_record = finalize(&prev_record, &state)?;
             let row_num = if state.min_row_num == u64::MAX {
                 0
             } else {
@@ -181,7 +198,7 @@ impl GroupBoundary {
             };
             let emitted = state.common_emitted.unwrap_or_default();
             let accumulated = state.union_accumulated;
-            out.push((record, row_num, emitted, accumulated));
+            out.push((out_record, row_num, emitted, accumulated));
         }
         Ok(())
     }

@@ -1415,23 +1415,22 @@ impl HashAggregator {
             crate::pipeline::streaming_merge::StreamingErrorMode::SpillMerge,
         );
 
-        // Track the currently-open group key alongside the boundary.
-        // The boundary itself is byte-keyed and doesn't carry the
-        // semantic key, but `finalize_group_inner` needs it to evaluate
-        // residuals over GroupKey slots.
-        let open_key: std::cell::RefCell<Option<Vec<GroupByKey>>> = std::cell::RefCell::new(None);
-
-        let finalize_closure = |s: &AggregatorGroupState| -> Result<Record, HashAggError> {
-            let borrow = open_key.borrow();
-            let k = borrow.as_deref().unwrap_or(&[]);
-            finalize_group_inner(factory, output_schema, &transform_name, k, s)
-        };
+        // The finalize closure receives the previously-open record (held
+        // by `GroupBoundary::open_record`) and re-derives the semantic
+        // group key from it via `decode_spill_record`. No `RefCell`
+        // shadow of the key needed.
+        let gb_fields = self.group_by_fields.clone();
+        let finalize_closure =
+            |rec: &Record, s: &AggregatorGroupState| -> Result<Record, HashAggError> {
+                let (key, _state) = decode_spill_record(rec, &gb_fields, gb_count)?;
+                finalize_group_inner(factory, output_schema, &transform_name, &key, s)
+            };
 
         while tree.winner().is_some() {
             let stream_idx = tree.winner_index();
             let record = tree.winner().unwrap().record.clone();
 
-            let (key, state) = decode_spill_record(&record, &self.group_by_fields, gb_count)?;
+            let (_key, state) = decode_spill_record(&record, &self.group_by_fields, gb_count)?;
 
             // Encode the spilled record's group-by columns into
             // boundary.current via the owned encoder.
@@ -1439,18 +1438,15 @@ impl HashAggregator {
             boundary.encoder().encode_into(&record, &mut scratch);
             boundary.current = scratch;
 
-            // The finalize closure needs the PREVIOUSLY open key (the
-            // one being closed out, not the new one being installed).
-            // It's already in `open_key` at this point.
+            // The boundary stores `record` as the new open_record so the
+            // finalize closure receives it on the *next* boundary.
             boundary.push(
                 state,
+                record,
                 (0, IndexMap::new(), IndexMap::new()),
                 &finalize_closure,
                 out,
             )?;
-
-            // After push, update open_key to the just-installed group.
-            *open_key.borrow_mut() = Some(key);
 
             // Advance the winning stream.
             let next = match readers[stream_idx].next() {
@@ -1894,11 +1890,6 @@ pub struct StreamingAggregator<Op: AccumulatorOp> {
     /// caller-owned `out` vec. Retained as a field for the legacy
     /// `pending` fast-path code path.
     pending: Vec<SortRow>,
-    /// Semantic group key of the currently-open group. The byte-keyed
-    /// `GroupBoundary` only knows the encoded key bytes; the semantic
-    /// key is needed by `finalize_group_inner` to evaluate residuals
-    /// over `Expr::GroupKey { slot }`. Phase 16 Task 16.4.3.
-    last_open_key: Option<Vec<GroupByKey>>,
     _mode: std::marker::PhantomData<Op>,
 }
 
@@ -1943,7 +1934,6 @@ impl StreamingAggregator<AddRaw> {
             rows_seen: 0,
             boundary,
             pending: Vec::new(),
-            last_open_key: None,
             _mode: std::marker::PhantomData,
         }
     }
@@ -2062,17 +2052,40 @@ impl StreamingAggregator<AddRaw> {
         self.boundary.encoder().encode_into(record, &mut scratch);
         self.boundary.current = scratch;
 
-        // Capture the open group's key for finalize. The byte-keyed
-        // boundary doesn't carry the semantic key, so we stash it
-        // alongside via a per-call closure capture.
+        // The finalize closure receives the previously-open input record
+        // (held inside `GroupBoundary::open_record`) and re-extracts the
+        // semantic group key from it via the same group-by indices used
+        // above. No external shadow of the key is needed.
         let factory = &self.factory;
         let output_schema = &self.output_schema;
         let transform_name = self.transform_name.clone();
-        let captured_key = self.last_open_key.clone();
-        let finalize_closure = |s: &AggregatorGroupState| -> Result<Record, HashAggError> {
-            let k = captured_key.as_deref().unwrap_or(&[]);
-            finalize_group_inner(factory, output_schema, &transform_name, k, s)
-        };
+        let group_by_indices = self.group_by_indices.clone();
+        let group_by_fields = self.group_by_fields.clone();
+        let source_row = ctx.source_row as u32;
+        let finalize_closure =
+            |rec: &Record, s: &AggregatorGroupState| -> Result<Record, HashAggError> {
+                let mut k: Vec<GroupByKey> = Vec::with_capacity(group_by_indices.len());
+                for (i, idx) in group_by_indices.iter().enumerate() {
+                    let field_name = group_by_fields.get(i).map(String::as_str).unwrap_or("");
+                    let val = rec
+                        .values()
+                        .get(*idx as usize)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    match value_to_group_key(&val, field_name, None, source_row) {
+                        Ok(Some(gk)) => k.push(gk),
+                        Ok(None) => k.push(GroupByKey::Null),
+                        Err(e) => {
+                            return Err(HashAggError::GroupKey {
+                                field: field_name.to_string(),
+                                row: source_row,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                finalize_group_inner(factory, output_schema, &transform_name, &k, s)
+            };
 
         // Push pending rows from the boundary directly into the
         // caller-owned `out` vec, then drain any pre-existing pending
@@ -2080,15 +2093,15 @@ impl StreamingAggregator<AddRaw> {
         if !self.pending.is_empty() {
             out.append(&mut self.pending);
         }
+        let _ = key;
         self.boundary.push(
             state,
+            record.clone(),
             (row_num, emitted.clone(), accumulated.clone()),
             &finalize_closure,
             out,
         )?;
 
-        // After push, the boundary's open group is now the new key.
-        self.last_open_key = Some(key);
         let _ = ctx; // ctx already used above
         Ok(())
     }
@@ -2110,11 +2123,32 @@ impl StreamingAggregator<AddRaw> {
         let factory = self.factory;
         let output_schema = self.output_schema;
         let transform_name = self.transform_name;
-        let captured_key = self.last_open_key.clone();
-        let finalize_closure = move |s: &AggregatorGroupState| -> Result<Record, HashAggError> {
-            let k = captured_key.as_deref().unwrap_or(&[]);
-            finalize_group_inner(&factory, &output_schema, &transform_name, k, s)
-        };
+        let group_by_indices = self.group_by_indices.clone();
+        let group_by_fields = self.group_by_fields.clone();
+        let finalize_closure =
+            move |rec: &Record, s: &AggregatorGroupState| -> Result<Record, HashAggError> {
+                let mut k: Vec<GroupByKey> = Vec::with_capacity(group_by_indices.len());
+                for (i, idx) in group_by_indices.iter().enumerate() {
+                    let field_name = group_by_fields.get(i).map(String::as_str).unwrap_or("");
+                    let val = rec
+                        .values()
+                        .get(*idx as usize)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    match value_to_group_key(&val, field_name, None, 0) {
+                        Ok(Some(gk)) => k.push(gk),
+                        Ok(None) => k.push(GroupByKey::Null),
+                        Err(e) => {
+                            return Err(HashAggError::GroupKey {
+                                field: field_name.to_string(),
+                                row: 0,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                finalize_group_inner(&factory, &output_schema, &transform_name, &k, s)
+            };
         self.boundary.flush(&finalize_closure, out)?;
         Ok(())
     }
@@ -2160,7 +2194,6 @@ impl StreamingAggregator<MergeState> {
             rows_seen: 0,
             boundary,
             pending: Vec::new(),
-            last_open_key: None,
             _mode: std::marker::PhantomData,
         }
     }

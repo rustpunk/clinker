@@ -922,7 +922,7 @@ mod task_16_4_3 {
         AggregatorGroupState::new(Vec::new())
     }
 
-    fn finalize_noop(_s: &AggregatorGroupState) -> Result<Record, HashAggError> {
+    fn finalize_noop(_r: &Record, _s: &AggregatorGroupState) -> Result<Record, HashAggError> {
         Ok(rec(&schema(&["x"]), vec![Value::Null]))
     }
 
@@ -946,9 +946,11 @@ mod task_16_4_3 {
         let mut b = make_boundary(StreamingErrorMode::UserInput);
         let mut out = Vec::new();
         // Push key "a"
-        encode_key(&mut b, &rec(&s, vec![Value::String("a".into())]));
+        let r1 = rec(&s, vec![Value::String("a".into())]);
+        encode_key(&mut b, &r1);
         b.push(
             dummy_state(),
+            r1,
             (1, IndexMap::new(), IndexMap::new()),
             &finalize_noop,
             &mut out,
@@ -962,9 +964,11 @@ mod task_16_4_3 {
         assert!(out.is_empty(), "no emission on first push");
 
         // Push key "b" — boundary transition; out gains 1 row.
-        encode_key(&mut b, &rec(&s, vec![Value::String("b".into())]));
+        let r2 = rec(&s, vec![Value::String("b".into())]);
+        encode_key(&mut b, &r2);
         b.push(
             dummy_state(),
+            r2,
             (2, IndexMap::new(), IndexMap::new()),
             &finalize_noop,
             &mut out,
@@ -979,18 +983,22 @@ mod task_16_4_3 {
         let s = schema(&["k"]);
         let mut b = make_boundary(StreamingErrorMode::UserInput);
         let mut out = Vec::new();
-        encode_key(&mut b, &rec(&s, vec![Value::String("b".into())]));
+        let r1 = rec(&s, vec![Value::String("b".into())]);
+        encode_key(&mut b, &r1);
         b.push(
             dummy_state(),
+            r1,
             (1, IndexMap::new(), IndexMap::new()),
             &finalize_noop,
             &mut out,
         )
         .unwrap();
-        encode_key(&mut b, &rec(&s, vec![Value::String("a".into())]));
+        let r2 = rec(&s, vec![Value::String("a".into())]);
+        encode_key(&mut b, &r2);
         let err = b
             .push(
                 dummy_state(),
+                r2,
                 (2, IndexMap::new(), IndexMap::new()),
                 &finalize_noop,
                 &mut out,
@@ -1013,18 +1021,22 @@ mod task_16_4_3 {
         let s = schema(&["k"]);
         let mut b = make_boundary(StreamingErrorMode::SpillMerge);
         let mut out = Vec::new();
-        encode_key(&mut b, &rec(&s, vec![Value::String("b".into())]));
+        let r1 = rec(&s, vec![Value::String("b".into())]);
+        encode_key(&mut b, &r1);
         b.push(
             dummy_state(),
+            r1,
             (0, IndexMap::new(), IndexMap::new()),
             &finalize_noop,
             &mut out,
         )
         .unwrap();
-        encode_key(&mut b, &rec(&s, vec![Value::String("a".into())]));
+        let r2 = rec(&s, vec![Value::String("a".into())]);
+        encode_key(&mut b, &r2);
         let err = b
             .push(
                 dummy_state(),
+                r2,
                 (0, IndexMap::new(), IndexMap::new()),
                 &finalize_noop,
                 &mut out,
@@ -1083,10 +1095,12 @@ mod task_16_4_3 {
         let s = schema(&["k"]);
         let mut b = make_boundary(StreamingErrorMode::UserInput);
         let mut out = Vec::new();
-        encode_key(&mut b, &rec(&s, vec![Value::String("aaaaaa".into())]));
+        let r0 = rec(&s, vec![Value::String("aaaaaa".into())]);
+        encode_key(&mut b, &r0);
         let cap_before = b.current.capacity();
         b.push(
             dummy_state(),
+            r0,
             (1, IndexMap::new(), IndexMap::new()),
             &finalize_noop,
             &mut out,
@@ -1094,9 +1108,11 @@ mod task_16_4_3 {
         .unwrap();
         for i in 0..100u64 {
             let k = format!("bbbbbb{i:03}");
-            encode_key(&mut b, &rec(&s, vec![Value::String(k.into())]));
+            let ri = rec(&s, vec![Value::String(k.into())]);
+            encode_key(&mut b, &ri);
             b.push(
                 dummy_state(),
+                ri,
                 (i, IndexMap::new(), IndexMap::new()),
                 &finalize_noop,
                 &mut out,
@@ -1108,5 +1124,486 @@ mod task_16_4_3 {
             cap_after <= cap_before.max(64),
             "current cap exploded: before={cap_before} after={cap_after}"
         );
+    }
+
+    // ----- Oracle: SortKeyEncoder byte-order vs deleted compare_group_keys -----
+
+    // Reconstructed inline from the deleted `compare_group_keys`
+    // (commit 8a14c19^). Used as the oracle for the byte-encoder test
+    // below; do NOT export — this exists solely so the test owns its
+    // own ground truth and is robust to future encoder churn.
+    fn semantic_compare(
+        a: &[clinker_record::GroupByKey],
+        b: &[clinker_record::GroupByKey],
+    ) -> std::cmp::Ordering {
+        use clinker_record::GroupByKey as G;
+        use std::cmp::Ordering;
+        fn variant_tag(k: &G) -> u8 {
+            match k {
+                G::Null => 0,
+                G::Bool(_) => 1,
+                G::Int(_) => 2,
+                G::Float(_) => 3,
+                G::Str(_) => 4,
+                G::Date(_) => 5,
+                G::DateTime(_) => 6,
+            }
+        }
+        for (x, y) in a.iter().zip(b.iter()) {
+            let ord = match (x, y) {
+                (G::Null, G::Null) => Ordering::Equal,
+                (G::Str(a), G::Str(b)) => a.cmp(b),
+                (G::Int(a), G::Int(b)) => a.cmp(b),
+                (G::Float(a), G::Float(b)) => {
+                    // Float keys are compared by IEEE total order on the
+                    // underlying f64s — same as the encoder's branch on
+                    // sign bit. f64::total_cmp matches.
+                    let af = f64::from_bits(*a);
+                    let bf = f64::from_bits(*b);
+                    af.total_cmp(&bf)
+                }
+                (G::Bool(a), G::Bool(b)) => a.cmp(b),
+                (G::Date(a), G::Date(b)) => a.cmp(b),
+                (G::DateTime(a), G::DateTime(b)) => a.cmp(b),
+                _ => variant_tag(x).cmp(&variant_tag(y)),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        a.len().cmp(&b.len())
+    }
+
+    /// Per-column generator type. Ensures all records in one test
+    /// schema share consistent column types so the encoder produces
+    /// memcomparable bytes across rows.
+    #[derive(Copy, Clone)]
+    enum ColType {
+        Str,
+        Float,
+        Bool,
+        // Null-only column — emits Null for every row.
+        Null,
+    }
+
+    // Tiny xorshift64 for determinism — no external rand crate.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn gen_range(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    fn gen_value(rng: &mut Rng, ct: ColType) -> (Value, clinker_record::GroupByKey) {
+        use clinker_record::GroupByKey as G;
+        match ct {
+            ColType::Null => (Value::Null, G::Null),
+            ColType::Bool => {
+                let b = rng.gen_range(2) == 1;
+                (Value::Bool(b), G::Bool(b))
+            }
+            ColType::Float => {
+                // Pick from a small pool so collisions exercise the
+                // tie-breaker arms. Note: -0.0 is excluded — production
+                // routes group keys through `value_to_group_key` which
+                // canonicalizes -0.0 → 0.0, but `SortKeyEncoder` operates
+                // on raw `Value::Float` without that canonicalization.
+                // The two paths agree only because the spill writer
+                // re-materializes via `GroupByKey::to_value()` which
+                // unpacks the canonicalized bits. Skipping -0.0 here
+                // keeps the oracle scoped to "behaviors that production
+                // can actually exercise."
+                let pool = [-1.5_f64, 0.0, 1.0, 2.5, 100.0, -100.0];
+                let f = pool[(rng.gen_range(pool.len() as u64)) as usize];
+                (Value::Float(f), G::Float(f.to_bits()))
+            }
+            ColType::Str => {
+                let pool = ["", "a", "ab", "b", "ba", "z", "zz"];
+                let s = pool[(rng.gen_range(pool.len() as u64)) as usize];
+                (Value::String(s.into()), G::Str(s.into()))
+            }
+        }
+    }
+
+    fn col_name(i: usize) -> String {
+        format!("c{i}")
+    }
+
+    #[test]
+    fn test_sort_key_encoder_byte_order_matches_semantic_compare_oracle() {
+        // Multiple "schemas" of varying width and column-type mix. For
+        // each schema we generate ~25 records and compare all pairs.
+        let schemas: Vec<Vec<ColType>> = vec![
+            vec![ColType::Str],
+            vec![ColType::Float],
+            vec![ColType::Bool],
+            vec![ColType::Str, ColType::Float],
+            vec![ColType::Float, ColType::Str],
+            vec![ColType::Str, ColType::Float, ColType::Bool],
+            vec![ColType::Str, ColType::Null, ColType::Float],
+            vec![ColType::Float, ColType::Float, ColType::Str, ColType::Bool],
+        ];
+
+        let mut rng = Rng::new(0xC0FFEE);
+
+        for schema_types in &schemas {
+            let col_names: Vec<Box<str>> = (0..schema_types.len())
+                .map(|i| col_name(i).into())
+                .collect();
+            let s = Arc::new(Schema::new(col_names));
+            let group_by: Vec<String> = (0..schema_types.len()).map(col_name).collect();
+            let fields = group_by_sort_fields(&group_by, &s);
+            let encoder = SortKeyEncoder::new(fields);
+
+            // Generate ~25 records per schema → ~600 pairs per schema,
+            // ~5000 pairs across all schemas. Comfortably above the 200
+            // floor in the spec.
+            let n = 25;
+            let mut rows: Vec<(Vec<Value>, Vec<clinker_record::GroupByKey>)> =
+                Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut vals = Vec::with_capacity(schema_types.len());
+                let mut keys = Vec::with_capacity(schema_types.len());
+                for ct in schema_types {
+                    let (v, k) = gen_value(&mut rng, *ct);
+                    vals.push(v);
+                    keys.push(k);
+                }
+                rows.push((vals, keys));
+            }
+
+            let encoded: Vec<Vec<u8>> = rows
+                .iter()
+                .map(|(v, _)| {
+                    let r = Record::new(Arc::clone(&s), v.clone());
+                    let mut buf = Vec::new();
+                    encoder.encode_into(&r, &mut buf);
+                    buf
+                })
+                .collect();
+
+            for i in 0..rows.len() {
+                for j in 0..rows.len() {
+                    let semantic = semantic_compare(&rows[i].1, &rows[j].1);
+                    let byte = encoded[i].cmp(&encoded[j]);
+                    assert_eq!(
+                        semantic, byte,
+                        "encoder byte order disagrees with oracle: \
+                         a_keys={:?} b_keys={:?} \
+                         a_bytes={:?} b_bytes={:?}",
+                        rows[i].1, rows[j].1, encoded[i], encoded[j],
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Phase 16 Task 16.4.3 — spill round-trip backfills
+// ===========================================================================
+
+mod task_16_4_3_spill {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use clinker_record::{Record, Schema, Value};
+    use cxl::eval::{EvalContext, ProgramEvaluator, StableEvalContext};
+    use cxl::parser::Parser;
+    use cxl::plan::extract_aggregates;
+    use cxl::resolve::pass::resolve_program;
+    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use cxl::typecheck::types::Type;
+    use indexmap::IndexMap;
+
+    use crate::aggregation::{HashAggregator, group_by_sort_fields};
+    use crate::pipeline::sort_key::SortKeyEncoder;
+
+    /// Compile a CXL aggregate snippet with a configurable memory budget
+    /// so callers can force or suppress spilling. Mirror of
+    /// `dispatch::build_aggregator` modulo the budget knob.
+    fn build_aggregator_with_budget(
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+        transform_name: &str,
+        memory_budget: usize,
+    ) -> HashAggregator {
+        let parsed = Parser::parse(cxl_src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
+        let resolved =
+            resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
+        let schema_map: HashMap<String, Type> = input_fields
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .collect();
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let typed = type_check_with_mode(resolved, &schema_map, mode).expect("typecheck");
+        let schema_names: Vec<String> =
+            input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
+        let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
+        let compiled =
+            extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates");
+
+        let output_columns: Vec<Box<str>> = compiled
+            .emits
+            .iter()
+            .filter(|e| !e.is_meta)
+            .map(|e| e.output_name.clone())
+            .collect();
+        let output_schema = Arc::new(Schema::new(output_columns));
+
+        let mut spill_cols: Vec<Box<str>> = group_by_owned
+            .iter()
+            .map(|s| Box::<str>::from(s.as_str()))
+            .collect();
+        spill_cols.push("__acc_state".into());
+        spill_cols.push("__meta_tracker".into());
+        let spill_schema = Arc::new(Schema::new(spill_cols));
+
+        let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+
+        HashAggregator::new(
+            Arc::new(compiled),
+            evaluator,
+            output_schema,
+            spill_schema,
+            Vec::new(),
+            memory_budget,
+            None,
+            transform_name.to_string(),
+        )
+    }
+
+    fn make_input_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec!["k".into()]))
+    }
+
+    fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
+        EvalContext {
+            stable,
+            source_file: file,
+            source_row: row,
+        }
+    }
+
+    fn dataset() -> Vec<&'static str> {
+        // 50 strings in deliberately scrambled order so a hash table
+        // walk would emit them out of memcomparable order.
+        vec![
+            "zebra",
+            "apple",
+            "mango",
+            "cherry",
+            "banana",
+            "kiwi",
+            "fig",
+            "grape",
+            "lemon",
+            "orange",
+            "peach",
+            "plum",
+            "berry",
+            "date",
+            "elderberry",
+            "guava",
+            "honeydew",
+            "kumquat",
+            "lime",
+            "nectarine",
+            "papaya",
+            "quince",
+            "raspberry",
+            "strawberry",
+            "tangerine",
+            "ugli",
+            "vanilla",
+            "watermelon",
+            "xigua",
+            "yam",
+            "apricot",
+            "blueberry",
+            "coconut",
+            "durian",
+            "feijoa",
+            "gooseberry",
+            "huckleberry",
+            "imbe",
+            "jackfruit",
+            "lychee",
+            "mulberry",
+            "olive",
+            "persimmon",
+            "rambutan",
+            "soursop",
+            "tamarind",
+            "voavanga",
+            "wolfberry",
+            "ximenia",
+            "yuzu",
+        ]
+    }
+
+    fn drive_aggregator(agg: &mut HashAggregator) {
+        let s = make_input_schema();
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("test.csv");
+        for (i, k) in dataset().into_iter().enumerate() {
+            let r = Record::new(Arc::clone(&s), vec![Value::String(k.into())]);
+            agg.add_record(
+                &r,
+                i as u64,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i as u64),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Test A — the spill writer must serialize records in memcomparable
+    /// byte order of their encoded group-by columns.
+    #[test]
+    fn test_spill_write_side_sorts_by_encoded_bytes() {
+        // memory_budget = 1 forces a spill on every add_record call
+        // beyond the first (table_alloc * 3 > 1 - 0).
+        let mut agg = build_aggregator_with_budget(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit c = count(*)",
+            "agg_spill_sort",
+            1,
+        );
+        drive_aggregator(&mut agg);
+
+        // At this point at least one spill file should exist.
+        assert!(
+            !agg.spill_files().is_empty(),
+            "expected at least one spill file with memory_budget=1"
+        );
+
+        // Build the SortKeyEncoder the same way the spill path does.
+        let group_by = vec!["k".to_string()];
+        // Use the spill schema (which is what the spill writer wrote).
+        let spill_schema = agg.spill_files()[0].schema().clone();
+        let fields = group_by_sort_fields(&group_by, &spill_schema);
+        let encoder = SortKeyEncoder::new(fields);
+
+        // Read each spill file and assert per-file monotonicity.
+        for sf in agg.spill_files() {
+            let reader = sf.reader().expect("reader open");
+            let mut prev: Option<Vec<u8>> = None;
+            for entry in reader {
+                let (record, _payload) = entry.expect("read");
+                let mut buf = Vec::new();
+                encoder.encode_into(&record, &mut buf);
+                if let Some(p) = &prev {
+                    assert!(
+                        p.as_slice() <= buf.as_slice(),
+                        "spill file is not in memcomparable order: prev={p:?} next={buf:?}"
+                    );
+                }
+                prev = Some(buf);
+            }
+        }
+    }
+
+    /// Test B — in-memory and spilled paths must produce byte-identical
+    /// finalized output (after sorting, since neither path guarantees a
+    /// stable iteration order across runs).
+    #[test]
+    fn test_spill_write_read_round_trip_byte_identical() {
+        let cxl_src = "emit k = k\nemit c = count(*)";
+
+        // Run 1: in-memory only.
+        let mut agg_mem = build_aggregator_with_budget(
+            &[("k", Type::String)],
+            &["k"],
+            cxl_src,
+            "agg_mem",
+            64 * 1024 * 1024,
+        );
+        drive_aggregator(&mut agg_mem);
+        assert!(
+            agg_mem.spill_files().is_empty(),
+            "in-memory run should not spill"
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("test.csv");
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out_mem = Vec::new();
+        agg_mem.finalize(&ctx, &mut out_mem).expect("finalize mem");
+
+        // Run 2: forced spill.
+        let mut agg_spill = build_aggregator_with_budget(
+            &[("k", Type::String)],
+            &["k"],
+            cxl_src,
+            "agg_mem", // same transform name → byte-identical metadata
+            1,
+        );
+        drive_aggregator(&mut agg_spill);
+        assert!(
+            !agg_spill.spill_files().is_empty(),
+            "spill run should produce at least one spill file"
+        );
+        let mut out_spill = Vec::new();
+        agg_spill
+            .finalize(&ctx, &mut out_spill)
+            .expect("finalize spill");
+
+        assert_eq!(
+            out_mem.len(),
+            out_spill.len(),
+            "row count differs: mem={} spill={}",
+            out_mem.len(),
+            out_spill.len()
+        );
+
+        // Sort both by encoded group-by key for stable comparison.
+        let group_by = vec!["k".to_string()];
+        let mut sort_for = |rows: &mut Vec<crate::aggregation::SortRow>| {
+            // Use the output record's schema to derive sort fields.
+            if let Some((rec, _, _, _)) = rows.first() {
+                let sch = rec.schema().clone();
+                let fields = group_by_sort_fields(&group_by, &sch);
+                let encoder = SortKeyEncoder::new(fields);
+                rows.sort_by_cached_key(|(r, _, _, _)| {
+                    let mut b = Vec::new();
+                    encoder.encode_into(r, &mut b);
+                    b
+                });
+            }
+        };
+        sort_for(&mut out_mem);
+        sort_for(&mut out_spill);
+
+        for (i, (a, b)) in out_mem.iter().zip(out_spill.iter()).enumerate() {
+            assert_eq!(
+                a.0.values(),
+                b.0.values(),
+                "record values differ at row {i}: mem={:?} spill={:?}",
+                a.0.values(),
+                b.0.values()
+            );
+        }
     }
 }
