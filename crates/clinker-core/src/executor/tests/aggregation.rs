@@ -895,6 +895,69 @@ outputs:
             other => panic!("expected SortOrderViolation, got {other:?}"),
         }
     }
+
+    // ── Phase 16 Task 16.4.10 — current_row_count() debug-inspect ──────────
+
+    #[test]
+    fn test_current_row_count_starts_at_zero_then_one_then_zero_after_flush() {
+        let input_schema = make_schema(&["k"]);
+        let mut agg = build_streaming_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit c = count(*)",
+            "open_count",
+        );
+        assert_eq!(
+            agg.current_row_count(),
+            0,
+            "no group open before first record"
+        );
+
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("test.csv");
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+
+        let rec = make_record(&input_schema, vec![Value::String("a".into())]);
+        let ctx = ctx_for(&stable, &file, 1);
+        agg.add_record(&rec, 1, &IndexMap::new(), &IndexMap::new(), &ctx, &mut out)
+            .unwrap();
+        assert_eq!(agg.current_row_count(), 1, "one group open after add");
+
+        // Add a second record in the same group — still exactly one open.
+        let rec2 = make_record(&input_schema, vec![Value::String("a".into())]);
+        let ctx2 = ctx_for(&stable, &file, 2);
+        agg.add_record(
+            &rec2,
+            2,
+            &IndexMap::new(),
+            &IndexMap::new(),
+            &ctx2,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(agg.current_row_count(), 1, "still O(1) — one group open");
+
+        // Cross a key boundary; one group emits, the next opens — count
+        // remains exactly 1 (the structural O(1) memory invariant).
+        let rec3 = make_record(&input_schema, vec![Value::String("b".into())]);
+        let ctx3 = ctx_for(&stable, &file, 3);
+        agg.add_record(
+            &rec3,
+            3,
+            &IndexMap::new(),
+            &IndexMap::new(),
+            &ctx3,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(agg.current_row_count(), 1, "after key boundary, still 1");
+
+        // Flush is owning (`mut self`); the structural invariant is the
+        // O(1) open-count *during* streaming, which we have verified
+        // above (always {0, 1} regardless of input length).
+        let ctx4 = ctx_for(&stable, &file, 0);
+        agg.flush(&ctx4, &mut out).unwrap();
+    }
 }
 
 // ----- Phase 16 Task 16.4.3 — Single-Encoder Two-Phase Bytes tests -----

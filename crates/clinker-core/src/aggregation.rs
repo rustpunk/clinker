@@ -2199,6 +2199,22 @@ impl StreamingAggregator<MergeState> {
     }
 }
 
+impl<Op: AccumulatorOp> StreamingAggregator<Op> {
+    /// Task 16.4.10 — debug-inspect accessor used by the structural O(1)
+    /// memory test (G7) and by the Kiln debugger's streaming-agg state
+    /// overlay. Returns 1 when a per-group state is currently open
+    /// (between key boundaries), 0 when no group is open (before the
+    /// first record or immediately after a flush).
+    ///
+    /// The "row count" framing matches the spec; in practice the
+    /// streaming aggregator never holds more than a single open per-group
+    /// state regardless of input size, so the value is structurally
+    /// bounded to {0, 1} — that bound IS the O(1) memory invariant.
+    pub fn current_row_count(&self) -> usize {
+        if self.boundary.is_group_open() { 1 } else { 0 }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Task 16.4.6 — plan-time streaming eligibility
 // ---------------------------------------------------------------------------

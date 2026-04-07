@@ -83,6 +83,13 @@ impl GroupBoundary {
         &self.encoder
     }
 
+    /// Whether a per-group state is currently open (i.e. at least one
+    /// record has been pushed and the group has not yet been flushed).
+    /// Powers `StreamingAggregator::current_row_count()` (Task 16.4.10).
+    pub(crate) fn is_group_open(&self) -> bool {
+        self.open_state.is_some()
+    }
+
     /// Push one `(state)` partial. The caller has already populated
     /// `self.current` with the encoded group key for the incoming
     /// record. On a key boundary the previous group is finalized via
