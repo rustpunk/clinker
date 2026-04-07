@@ -12,13 +12,20 @@ use petgraph::visit::{Control, DfsEvent, EdgeRef, Topo, depth_first_search};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
-use crate::config::{InputConfig, PipelineConfig, RouteMode, SortField, TransformInput};
+use std::sync::Arc;
+
+use crate::aggregation::AggregateStrategy;
+use crate::config::{
+    AggregateConfig, InputConfig, PipelineConfig, RouteMode, SortField, TransformInput,
+};
 use crate::error::PipelineError;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
     PartitioningProvenance,
 };
+use clinker_record::Schema;
+use cxl::plan::CompiledAggregate;
 
 use cxl::analyzer::{self, ParallelismHint};
 use cxl::ast::Statement;
@@ -101,6 +108,22 @@ pub enum PlanNode {
         name: String,
         sort_fields: Vec<SortField>,
     },
+    /// Hash / streaming GROUP BY transform (Phase 16, Task 16.3.5).
+    ///
+    /// Constructed by `ExecutionPlanDag::compile()` when a `TransformConfig`
+    /// has its `aggregate` block set. The plan-time extraction artifact
+    /// (`compiled`) and the realized output schema are not serializable —
+    /// they live behind `Arc` and are reconstructed by the runtime, not
+    /// shipped through the JSON `--explain` channel.
+    Aggregation {
+        name: String,
+        config: AggregateConfig,
+        #[serde(skip)]
+        compiled: Arc<CompiledAggregate>,
+        strategy: AggregateStrategy,
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
+    },
 }
 
 impl PlanNode {
@@ -112,7 +135,8 @@ impl PlanNode {
             | PlanNode::Route { name, .. }
             | PlanNode::Merge { name }
             | PlanNode::Output { name }
-            | PlanNode::Sort { name, .. } => name,
+            | PlanNode::Sort { name, .. }
+            | PlanNode::Aggregation { name, .. } => name,
         }
     }
 
@@ -125,6 +149,7 @@ impl PlanNode {
             PlanNode::Merge { .. } => "merge",
             PlanNode::Output { .. } => "output",
             PlanNode::Sort { .. } => "sort",
+            PlanNode::Aggregation { .. } => "aggregation",
         }
     }
 
@@ -148,6 +173,13 @@ impl PlanNode {
             PlanNode::Merge { name } => format!("[merge] {name}"),
             PlanNode::Output { name } => format!("[output] {name}"),
             PlanNode::Sort { name, .. } => format!("[sort] {name}"),
+            PlanNode::Aggregation { name, strategy, .. } => {
+                let s = match strategy {
+                    AggregateStrategy::Hash => "hash",
+                    AggregateStrategy::Streaming => "streaming",
+                };
+                format!("[aggregation:{s}] {name}")
+            }
         }
     }
 }
@@ -485,6 +517,70 @@ impl ExecutionPlanDag {
             let write_set = extract_write_set(compiled[i].1);
             let has_distinct = extract_has_distinct(compiled[i].1);
 
+            // ── Phase 16 Task 16.3.6: route aggregate transforms to
+            //    `PlanNode::Aggregation` instead of `PlanNode::Transform`.
+            //    D4: aggregates use a single dedicated plan node. D6:
+            //    routes and multi-input merges are forbidden on aggregates.
+            if let Some(agg_cfg) = tc.aggregate.as_ref() {
+                if tc.route.is_some() {
+                    return Err(PlanError::AggregateWithRoute {
+                        transform: tc.name.clone(),
+                    });
+                }
+                if matches!(tc.input, Some(TransformInput::Multiple(_))) {
+                    return Err(PlanError::AggregateWithMultipleInputs {
+                        transform: tc.name.clone(),
+                    });
+                }
+
+                let typed = compiled[i].1;
+                // Synthetic input schema: deterministic ordering of every
+                // field referenced by the CXL program. Task 16.3.13 will
+                // reconcile this with the upstream node's true schema; for
+                // unit-test scope the projection is the identity since the
+                // executor projects records into this same order before
+                // passing them into the hash aggregator.
+                let input_schema: Vec<String> = typed.field_types.keys().cloned().collect();
+
+                let compiled_agg =
+                    cxl::plan::extract_aggregates(typed, &agg_cfg.group_by, &input_schema)
+                        .map_err(|diags| PlanError::AggregateExtractionFailed {
+                            transform: tc.name.clone(),
+                            diagnostics: diags.into_iter().map(|d| d.message).collect(),
+                        })?;
+
+                // Output schema: non-meta emit names in declaration order.
+                let output_columns: Vec<Box<str>> = typed
+                    .program
+                    .statements
+                    .iter()
+                    .filter_map(|s| match s {
+                        Statement::Emit {
+                            name,
+                            is_meta: false,
+                            ..
+                        } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let output_schema = Arc::new(Schema::new(output_columns));
+
+                add_node(
+                    &mut graph,
+                    PlanNode::Aggregation {
+                        name: tc.name.clone(),
+                        config: agg_cfg.clone(),
+                        compiled: Arc::new(compiled_agg),
+                        strategy: AggregateStrategy::Hash,
+                        output_schema,
+                    },
+                    &mut node_by_name,
+                    &mut slug_set,
+                )?;
+
+                continue;
+            }
+
             add_node(
                 &mut graph,
                 PlanNode::Transform {
@@ -546,7 +642,13 @@ impl ExecutionPlanDag {
 
         for (i, tc) in resolved_transforms.iter().enumerate() {
             let wc = &window_configs[i];
-            let transform_key = format!("transform.{}", tc.name);
+            // Aggregate transforms register under `aggregation.{name}` instead
+            // of `transform.{name}` (Phase 16 Task 16.3.6).
+            let transform_key = if tc.aggregate.is_some() {
+                format!("aggregation.{}", tc.name)
+            } else {
+                format!("transform.{}", tc.name)
+            };
             let transform_idx = node_by_name[&transform_key];
 
             // Wire edges from input: or implicit linear chain
@@ -974,7 +1076,8 @@ impl ExecutionPlanDag {
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
-                | PlanNode::Sort { .. } => {
+                | PlanNode::Sort { .. }
+                | PlanNode::Aggregation { .. } => {
                     let deps: Vec<String> = self
                         .graph
                         .neighbors_directed(idx, petgraph::Direction::Incoming)
@@ -1103,6 +1206,12 @@ fn resolve_input_reference(
     // Try plain transform reference first
     let transform_key = format!("transform.{}", reference);
     if let Some(&idx) = node_by_name.get(&transform_key) {
+        return Ok(idx);
+    }
+
+    // Try aggregate transform reference (Phase 16 Task 16.3.6)
+    let aggregation_key = format!("aggregation.{}", reference);
+    if let Some(&idx) = node_by_name.get(&aggregation_key) {
         return Ok(idx);
     }
 
@@ -1844,6 +1953,22 @@ fn compute_one(
             }
         }
 
+        PlanNode::Aggregation { name, .. } => {
+            // Hash aggregation destroys input ordering and produces a
+            // single stream of one record per group key. The streaming
+            // variant (16.4) preserves the prefix; until that lands the
+            // conservative answer is "no ordering, single stream".
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: None,
+                    provenance: OrderingProvenance::Preserved {
+                        from_node: name.clone(),
+                    },
+                },
+                partitioning: single_stream_partitioning(),
+            }
+        }
+
         PlanNode::Output { name } => {
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
@@ -1988,6 +2113,19 @@ pub enum PlanError {
     },
     /// Enforcer-insertion or property-derivation pass failure.
     PropertyDerivation(String),
+    /// `cxl::plan::extract_aggregates` rejected the typed program (Phase 16).
+    AggregateExtractionFailed {
+        transform: String,
+        diagnostics: Vec<String>,
+    },
+    /// Aggregate transforms cannot have a `route:` block (D6).
+    AggregateWithRoute {
+        transform: String,
+    },
+    /// Aggregate transforms cannot have a multi-input merge (D6).
+    AggregateWithMultipleInputs {
+        transform: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -2036,6 +2174,31 @@ impl std::fmt::Display for PlanError {
             }
             PlanError::PropertyDerivation(msg) => {
                 write!(f, "property derivation failed: {}", msg)
+            }
+            PlanError::AggregateExtractionFailed {
+                transform,
+                diagnostics,
+            } => {
+                write!(
+                    f,
+                    "aggregate extraction failed for transform '{}': {}",
+                    transform,
+                    diagnostics.join("; ")
+                )
+            }
+            PlanError::AggregateWithRoute { transform } => {
+                write!(
+                    f,
+                    "aggregate transform '{}' cannot also declare a `route:` block",
+                    transform
+                )
+            }
+            PlanError::AggregateWithMultipleInputs { transform } => {
+                write!(
+                    f,
+                    "aggregate transform '{}' cannot consume multiple inputs",
+                    transform
+                )
             }
         }
     }

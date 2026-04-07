@@ -2751,6 +2751,17 @@ impl PipelineExecutor {
                     node_buffers.insert(node_idx, out);
                 }
 
+                PlanNode::Aggregation { ref name, .. } => {
+                    // Task 16.3.13 wires the real hash-aggregation dispatch.
+                    // Until then no `PlanNode::Aggregation` is constructed
+                    // (16.3.6 plan-compile routing not yet landed), so this
+                    // arm is unreachable in shipped plans.
+                    unreachable!(
+                        "PlanNode::Aggregation `{name}` reached executor before \
+                         Task 16.3.13 dispatch implementation landed"
+                    );
+                }
+
                 PlanNode::Output { ref name } => {
                     // Get input records from predecessor
                     let predecessors: Vec<NodeIndex> = plan
