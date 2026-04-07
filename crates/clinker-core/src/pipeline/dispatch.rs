@@ -514,7 +514,8 @@ mod tests {
         let typed = cxl::typecheck::pass::type_check(resolved, &schema).unwrap();
 
         let resolver = TestResolver;
-        let ctx = eval::EvalContext::test_default();
+        let stable = eval::StableEvalContext::test_default();
+        let ctx = eval::EvalContext::test_default_borrowed(&stable);
         let result =
             eval::eval_program::<crate::pipeline::arena::Arena>(&typed, &ctx, &resolver, None)
                 .unwrap();

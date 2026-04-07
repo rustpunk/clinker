@@ -35,7 +35,9 @@ use clinker_format::xml::reader::{
 };
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use cxl::ast::Statement;
-use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, WallClock};
+use cxl::eval::{
+    EvalContext, EvalResult, ProgramEvaluator, SkipReason, StableEvalContext, WallClock,
+};
 use cxl::typecheck::{Type, TypedProgram};
 use petgraph::Direction;
 
@@ -545,11 +547,12 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         primary_output: &OutputConfig,
         input: &crate::config::InputConfig,
-        pipeline_start_time: chrono::NaiveDateTime,
+        _pipeline_start_time: chrono::NaiveDateTime,
+        stable: &StableEvalContext,
         transform_names: &[&str],
         evaluators: &mut [ProgramEvaluator],
         mut compiled_route: Option<&mut CompiledRoute>,
-        params: &PipelineRunParams,
+        _params: &PipelineRunParams,
         strategy: ErrorStrategy,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
@@ -559,6 +562,7 @@ impl PipelineExecutor {
         if buffer.is_empty() {
             return;
         }
+        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
 
         // Evaluate all records in the group, collect results
         #[allow(clippy::type_complexity)]
@@ -571,15 +575,11 @@ impl PipelineExecutor {
         let mut first_failure_message: Option<String> = None;
 
         for (record, rn) in buffer.drain(..) {
-            let ctx = build_eval_context(
-                config,
-                &input.path,
-                rn,
-                pipeline_start_time,
-                &params.execution_id,
-                &params.batch_id,
-                &params.pipeline_vars,
-            );
+            let ctx = EvalContext {
+                stable,
+                source_file: &source_file_arc,
+                source_row: rn,
+            };
             let result = evaluate_record(&record, transform_names, evaluators, &ctx);
             if result.is_err() && !any_failed {
                 any_failed = true;
@@ -623,15 +623,11 @@ impl PipelineExecutor {
                         metadata,
                     }) => {
                         if let Some(ref mut route) = compiled_route {
-                            let ctx = build_eval_context(
-                                config,
-                                &input.path,
-                                rn,
-                                pipeline_start_time,
-                                &params.execution_id,
-                                &params.batch_id,
-                                &params.pipeline_vars,
-                            );
+                            let ctx = EvalContext {
+                                stable,
+                                source_file: &source_file_arc,
+                                source_row: rn,
+                            };
                             match route.evaluate(&emitted, &metadata, &ctx) {
                                 Ok(targets) => {
                                     for target in &targets {
@@ -706,13 +702,14 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     fn flush_correlated_group_single_output(
         buffer: &mut Vec<(Record, u64)>,
-        config: &PipelineConfig,
+        _config: &PipelineConfig,
         primary_output: &OutputConfig,
         input: &crate::config::InputConfig,
-        pipeline_start_time: chrono::NaiveDateTime,
+        _pipeline_start_time: chrono::NaiveDateTime,
+        stable: &StableEvalContext,
         transform_names: &[&str],
         evaluators: &mut [ProgramEvaluator],
-        params: &PipelineRunParams,
+        _params: &PipelineRunParams,
         _strategy: ErrorStrategy,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
@@ -722,6 +719,7 @@ impl PipelineExecutor {
         if buffer.is_empty() {
             return Ok(());
         }
+        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
 
         #[allow(clippy::type_complexity)]
         let mut results: Vec<(
@@ -733,15 +731,11 @@ impl PipelineExecutor {
         let mut first_failure_message: Option<String> = None;
 
         for (record, rn) in buffer.drain(..) {
-            let ctx = build_eval_context(
-                config,
-                &input.path,
-                rn,
-                pipeline_start_time,
-                &params.execution_id,
-                &params.batch_id,
-                &params.pipeline_vars,
-            );
+            let ctx = EvalContext {
+                stable,
+                source_file: &source_file_arc,
+                source_row: rn,
+            };
             let result = evaluate_record(&record, transform_names, evaluators, &ctx);
             if result.is_err() && !any_failed {
                 any_failed = true;
@@ -881,6 +875,17 @@ impl PipelineExecutor {
         let primary_output = &config.outputs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
+        // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
+        // here, reused (via borrow) at every per-record dispatch site below.
+        let stable = build_stable_eval_context(
+            config,
+            pipeline_start_time,
+            &params.execution_id,
+            &params.batch_id,
+            &params.pipeline_vars,
+        );
+        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
+
         let mut counters = PipelineCounters::default();
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
         let strategy = config.error_handling.strategy;
@@ -992,15 +997,11 @@ impl PipelineExecutor {
             for pos in 0..record_count {
                 records_scanned += 1;
                 let record = build_record_from_arena(pos);
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    pos as u64 + 1,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
+                let ctx = EvalContext {
+                    stable: &stable,
+                    source_file: &source_file_arc,
+                    source_row: pos as u64 + 1,
+                };
                 let result = evaluate_record_with_window(
                     &record,
                     &transform_names,
@@ -1075,15 +1076,11 @@ impl PipelineExecutor {
                                 stage_metrics::ChunkTimers::default,
                                 |mut timers, (pos, record, result)| {
                                     let start = std::time::Instant::now();
-                                    let ctx = build_eval_context(
-                                        config,
-                                        &input.path,
-                                        *pos as u64 + 1,
-                                        pipeline_start_time,
-                                        &params.execution_id,
-                                        &params.batch_id,
-                                        &params.pipeline_vars,
-                                    );
+                                    let ctx = EvalContext {
+                                        stable: &stable,
+                                        source_file: &source_file_arc,
+                                        source_row: *pos as u64 + 1,
+                                    };
                                     let mut local_evals = build_evaluators(transforms);
                                     *result = Some(evaluate_record_with_window(
                                         record,
@@ -1106,15 +1103,11 @@ impl PipelineExecutor {
                     let mut elapsed = std::time::Duration::ZERO;
                     for (pos, record, result) in chunk.iter_mut() {
                         let start = std::time::Instant::now();
-                        let ctx = build_eval_context(
-                            config,
-                            &input.path,
-                            *pos as u64 + 1,
-                            pipeline_start_time,
-                            &params.execution_id,
-                            &params.batch_id,
-                            &params.pipeline_vars,
-                        );
+                        let ctx = EvalContext {
+                            stable: &stable,
+                            source_file: &source_file_arc,
+                            source_row: *pos as u64 + 1,
+                        };
                         *result = Some(evaluate_record_with_window(
                             record,
                             &transform_names,
@@ -1144,15 +1137,11 @@ impl PipelineExecutor {
                 // Dispatch first emitted record
                 if let Some((record, emitted, metadata)) = first_emitted {
                     let route = compiled_route.as_mut().unwrap();
-                    let ctx = build_eval_context(
-                        config,
-                        &input.path,
-                        first_emit_pos.unwrap() as u64 + 1,
-                        pipeline_start_time,
-                        &params.execution_id,
-                        &params.batch_id,
-                        &params.pipeline_vars,
-                    );
+                    let ctx = EvalContext {
+                        stable: &stable,
+                        source_file: &source_file_arc,
+                        source_row: first_emit_pos.unwrap() as u64 + 1,
+                    };
                     match route.evaluate(&emitted, &metadata, &ctx) {
                         Ok(targets) => {
                             let mut per_output_batches: HashMap<String, Vec<Record>> =
@@ -1223,15 +1212,11 @@ impl PipelineExecutor {
                                 fields: emitted,
                                 metadata,
                             }) => {
-                                let ctx = build_eval_context(
-                                    config,
-                                    &input.path,
-                                    row_num,
-                                    pipeline_start_time,
-                                    &params.execution_id,
-                                    &params.batch_id,
-                                    &params.pipeline_vars,
-                                );
+                                let ctx = EvalContext {
+                                    stable: &stable,
+                                    source_file: &source_file_arc,
+                                    source_row: row_num,
+                                };
                                 let route_result = {
                                     let _guard = route_timer.guard();
                                     route.evaluate(emitted, metadata, &ctx)
@@ -1509,15 +1494,11 @@ impl PipelineExecutor {
             let mut records_scanned: u64 = 0;
             for (record, rn) in &all_records {
                 records_scanned += 1;
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    *rn,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
+                let ctx = EvalContext {
+                    stable: &stable,
+                    source_file: &source_file_arc,
+                    source_row: *rn,
+                };
                 if let Ok(EvalResult::Emit {
                     fields: emitted, ..
                 }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
@@ -1567,15 +1548,11 @@ impl PipelineExecutor {
                     let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
 
                     if is_null_key {
-                        let ctx = build_eval_context(
-                            config,
-                            &input.path,
-                            rn,
-                            pipeline_start_time,
-                            &params.execution_id,
-                            &params.batch_id,
-                            &params.pipeline_vars,
-                        );
+                        let ctx = EvalContext {
+                            stable: &stable,
+                            source_file: &source_file_arc,
+                            source_row: rn,
+                        };
                         let result = {
                             let _guard = transform_timer.guard();
                             evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
@@ -1645,6 +1622,7 @@ impl PipelineExecutor {
                                 primary_output,
                                 input,
                                 pipeline_start_time,
+                                &stable,
                                 &transform_names,
                                 &mut evaluators,
                                 compiled_route.as_mut(),
@@ -1694,6 +1672,7 @@ impl PipelineExecutor {
                         primary_output,
                         input,
                         pipeline_start_time,
+                        &stable,
                         &transform_names,
                         &mut evaluators,
                         compiled_route.as_mut(),
@@ -1765,15 +1744,11 @@ impl PipelineExecutor {
                     let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
 
                     if is_null_key {
-                        let ctx = build_eval_context(
-                            config,
-                            &input.path,
-                            rn,
-                            pipeline_start_time,
-                            &params.execution_id,
-                            &params.batch_id,
-                            &params.pipeline_vars,
-                        );
+                        let ctx = EvalContext {
+                            stable: &stable,
+                            source_file: &source_file_arc,
+                            source_row: rn,
+                        };
                         let result = {
                             let _guard = transform_timer.guard();
                             evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
@@ -1832,6 +1807,7 @@ impl PipelineExecutor {
                                 primary_output,
                                 input,
                                 pipeline_start_time,
+                                &stable,
                                 &transform_names,
                                 &mut evaluators,
                                 params,
@@ -1879,6 +1855,7 @@ impl PipelineExecutor {
                         primary_output,
                         input,
                         pipeline_start_time,
+                        &stable,
                         &transform_names,
                         &mut evaluators,
                         params,
@@ -1942,15 +1919,11 @@ impl PipelineExecutor {
         for (record, rn) in &all_records {
             scan_idx += 1;
             records_scanned += 1;
-            let ctx = build_eval_context(
-                config,
-                &input.path,
-                *rn,
-                pipeline_start_time,
-                &params.execution_id,
-                &params.batch_id,
-                &params.pipeline_vars,
-            );
+            let ctx = EvalContext {
+                stable: &stable,
+                source_file: &source_file_arc,
+                source_row: *rn,
+            };
             let result = evaluate_record(record, &transform_names, &mut evaluators, &ctx);
             match &result {
                 Ok(EvalResult::Emit {
@@ -2019,15 +1992,11 @@ impl PipelineExecutor {
             let first_emitted_was_some = first_emitted.is_some();
             if let Some((record, emitted, metadata)) = first_emitted {
                 let route = compiled_route.as_mut().unwrap();
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    1,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
+                let ctx = EvalContext {
+                    stable: &stable,
+                    source_file: &source_file_arc,
+                    source_row: 1,
+                };
                 match route.evaluate(&emitted, &metadata, &ctx) {
                     Ok(targets) => {
                         let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
@@ -2077,15 +2046,11 @@ impl PipelineExecutor {
             let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
 
             for (record, rn) in all_records.into_iter().skip(scan_idx) {
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    rn,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
+                let ctx = EvalContext {
+                    stable: &stable,
+                    source_file: &source_file_arc,
+                    source_row: rn,
+                };
                 let result = {
                     let _guard = transform_timer.guard();
                     evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
@@ -2252,15 +2217,11 @@ impl PipelineExecutor {
             let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
 
             for (record, rn) in all_records.into_iter().skip(scan_idx) {
-                let ctx = build_eval_context(
-                    config,
-                    &input.path,
-                    rn,
-                    pipeline_start_time,
-                    &params.execution_id,
-                    &params.batch_id,
-                    &params.pipeline_vars,
-                );
+                let ctx = EvalContext {
+                    stable: &stable,
+                    source_file: &source_file_arc,
+                    source_row: rn,
+                };
                 let result = {
                     let _guard = transform_timer.guard();
                     evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
@@ -2360,6 +2321,18 @@ impl PipelineExecutor {
         let input = &config.inputs[0];
         let primary_output = &config.outputs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
+
+        // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
+        // here, reused (via borrow) at every per-record dispatch site below.
+        let stable = build_stable_eval_context(
+            config,
+            pipeline_start_time,
+            &params.execution_id,
+            &params.batch_id,
+            &params.pipeline_vars,
+        );
+        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
+
         let strategy = config.error_handling.strategy;
         let mut compiled_route = compiled_route;
         let mut transform_timer = stage_metrics::CumulativeTimer::new();
@@ -2440,15 +2413,11 @@ impl PipelineExecutor {
                     let mut output_records = Vec::with_capacity(input_records.len());
 
                     for (record, rn, mut all_emitted, mut all_metadata) in input_records {
-                        let ctx = build_eval_context(
-                            config,
-                            &input.path,
-                            rn,
-                            pipeline_start_time,
-                            &params.execution_id,
-                            &params.batch_id,
-                            &params.pipeline_vars,
-                        );
+                        let ctx = EvalContext {
+                            stable: &stable,
+                            source_file: &source_file_arc,
+                            source_row: rn,
+                        };
 
                         let eval_result = {
                             let _guard = transform_timer.guard();
@@ -2547,15 +2516,11 @@ impl PipelineExecutor {
                     // Use compiled_route to evaluate conditions
                     if let Some(ref mut route) = compiled_route {
                         for (record, rn, all_emitted, all_metadata) in input_records {
-                            let ctx = build_eval_context(
-                                config,
-                                &input.path,
-                                rn,
-                                pipeline_start_time,
-                                &params.execution_id,
-                                &params.batch_id,
-                                &params.pipeline_vars,
-                            );
+                            let ctx = EvalContext {
+                                stable: &stable,
+                                source_file: &source_file_arc,
+                                source_row: rn,
+                            };
 
                             let route_result = {
                                 let _guard = route_timer.guard();
@@ -3550,31 +3515,30 @@ fn can_parallelize(plan: &ExecutionPlanDag) -> bool {
     })
 }
 
-/// Build an EvalContext for a given record.
+/// Build the pipeline-stable evaluation context (D59 / Task 16.3.13a).
 ///
-/// `pipeline_start_time` must be frozen once at pipeline start and reused for all
-/// records. This ensures `$pipeline.start_time` is deterministic within a run.
-/// The `now` keyword uses `ctx.clock.now()` (wall-clock) and is intentionally
-/// non-deterministic — users who reference `now` opt into time-varying output.
-fn build_eval_context(
+/// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
+/// returned `StableEvalContext` is reused (via borrow) at every per-record
+/// dispatch site, killing the prior `String::clone` + `IndexMap::clone`
+/// per-record allocation profile. `pipeline_start_time` must be frozen at
+/// pipeline start so `$pipeline.start_time` is deterministic within a run.
+/// The `now` keyword uses `ctx.stable.clock.now()` (wall-clock) and is
+/// intentionally non-deterministic.
+fn build_stable_eval_context(
     config: &PipelineConfig,
-    source_file: &str,
-    source_row: u64,
     pipeline_start_time: chrono::NaiveDateTime,
     execution_id: &str,
     batch_id: &str,
     pipeline_vars: &IndexMap<String, Value>,
-) -> EvalContext {
-    EvalContext {
+) -> StableEvalContext {
+    StableEvalContext {
         clock: Box::new(WallClock),
         pipeline_start_time,
-        pipeline_name: config.pipeline.name.clone(),
-        pipeline_execution_id: execution_id.to_string(),
-        pipeline_batch_id: batch_id.to_string(),
+        pipeline_name: Arc::from(config.pipeline.name.as_str()),
+        pipeline_execution_id: Arc::from(execution_id),
+        pipeline_batch_id: Arc::from(batch_id),
         pipeline_counters: PipelineCounters::default(),
-        source_file: source_file.into(),
-        source_row,
-        pipeline_vars: pipeline_vars.clone(),
+        pipeline_vars: Arc::new(pipeline_vars.clone()),
     }
 }
 

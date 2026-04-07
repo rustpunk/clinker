@@ -16,7 +16,7 @@ pub fn dispatch_method(
     args: &[Value],
     regex: Option<&Regex>,
     span: Span,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
 ) -> Result<Option<Value>, EvalError> {
     // Null propagation: nullable receiver → Null for most methods
     if receiver.is_null() && !matches!(method, "is_null" | "type_of" | "is_empty" | "catch") {

@@ -2,7 +2,7 @@ use clinker_bench_support::{CxlComplexity, MEDIUM, RecordFactory, SMALL};
 use clinker_record::{RecordStorage, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use cxl::eval::ProgramEvaluator;
-use cxl::eval::context::EvalContext;
+use cxl::eval::context::{EvalContext, StableEvalContext};
 use cxl::parser::Parser;
 use cxl::resolve::{HashMapResolver, resolve_program};
 use cxl::typecheck::type_check;
@@ -61,7 +61,8 @@ fn bench_eval_simple_emit(c: &mut Criterion) {
         let mut factory = RecordFactory::new(10, 16, 0.0, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -91,7 +92,8 @@ emit out = f1.upper().trim().replace("A", "X")
         let mut factory = RecordFactory::new(10, 32, 0.0, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -122,7 +124,8 @@ emit out = x.to_float().round(2).abs()
         let mut factory = RecordFactory::new(10, 16, 0.0, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -152,7 +155,8 @@ emit out = if f0 > 500000 then "high" else if f0 > 250000 then "medium" else "lo
         let mut factory = RecordFactory::new(10, 16, 0.0, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -189,7 +193,8 @@ emit out = match f1 {
         let mut factory = RecordFactory::new(10, 16, 0.0, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -220,7 +225,8 @@ emit out = f1 ?? f3 ?? f5 ?? "default"
         let mut factory = RecordFactory::new(10, 16, null_ratio, 42);
         let records = factory.generate(SMALL);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(SMALL as u64));
         group.bench_with_input(BenchmarkId::new("null_pct", null_pct), &null_pct, |b, _| {
@@ -256,7 +262,8 @@ fn bench_eval_filter(c: &mut Criterion) {
         let mut factory = RecordFactory::new(10, 16, 0.0, 42);
         let records = factory.generate(SMALL);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(SMALL as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &label, |b, _| {
@@ -284,7 +291,8 @@ fn bench_eval_full_transform(c: &mut Criterion) {
         let mut factory = RecordFactory::new(20, 32, 0.05, 42);
         let records = factory.generate(count);
         let schema = factory.schema().clone();
-        let ctx = EvalContext::test_default();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {

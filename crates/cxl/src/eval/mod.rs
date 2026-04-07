@@ -15,7 +15,7 @@ use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
-pub use context::{Clock, EvalContext, FixedClock, WallClock};
+pub use context::{Clock, EvalContext, FixedClock, StableEvalContext, WallClock};
 pub use error::{EvalError, EvalErrorKind};
 
 /// Row disposition signal from CXL evaluation.
@@ -118,7 +118,7 @@ impl ProgramEvaluator {
     /// Evaluate a record through the full program, returning Emit or Skip.
     pub fn eval_record<'w, S: RecordStorage + 'w>(
         &mut self,
-        ctx: &EvalContext,
+        ctx: &EvalContext<'_>,
         resolver: &dyn FieldResolver,
         window: Option<&dyn WindowContext<'w, S>>,
     ) -> Result<EvalResult, EvalError> {
@@ -296,7 +296,7 @@ fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
 /// Evaluate a full CXL program against a record. Returns the output field map.
 pub fn eval_program<'w, S: RecordStorage + 'w>(
     typed: &TypedProgram,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
 ) -> Result<indexmap::IndexMap<String, Value>, EvalError> {
@@ -381,7 +381,7 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
 pub fn eval_expr<'w, S: RecordStorage + 'w>(
     expr: &Expr,
     typed: &TypedProgram,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
@@ -431,7 +431,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 .unwrap_or(Value::Null))
         }
 
-        Expr::Now { .. } => Ok(Value::DateTime(ctx.clock.now())),
+        Expr::Now { .. } => Ok(Value::DateTime(ctx.stable.clock.now())),
 
         Expr::Wildcard { .. } => Ok(Value::Bool(true)), // Wildcard in match = always matches
 
@@ -701,7 +701,7 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
     rhs: &Expr,
     span: Span,
     typed: &TypedProgram,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,

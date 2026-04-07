@@ -270,16 +270,20 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         }
     };
 
-    let ctx = EvalContext {
+    let stable = cxl::eval::StableEvalContext {
         clock: Box::new(WallClock),
         pipeline_start_time: chrono::Utc::now().naive_utc(),
-        pipeline_name: "cxl-eval".into(),
-        pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
-        pipeline_batch_id: "00000000-0000-0000-0000-000000000000".into(),
+        pipeline_name: std::sync::Arc::from("cxl-eval"),
+        pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
+        pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
         pipeline_counters: clinker_record::PipelineCounters::default(),
-        source_file: std::sync::Arc::from(source_name),
+        pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+    };
+    let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
+    let ctx = EvalContext {
+        stable: &stable,
+        source_file: &source_file_arc,
         source_row: 1,
-        pipeline_vars: indexmap::IndexMap::new(),
     };
 
     let resolver = HashMapResolver::new(record_map);
@@ -663,16 +667,20 @@ mod tests {
         let resolved = cxl::resolve::resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
         let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
 
-        let ctx = EvalContext {
+        let stable = cxl::eval::StableEvalContext {
             clock: Box::new(WallClock),
             pipeline_start_time: chrono::Utc::now().naive_utc(),
-            pipeline_name: "test".into(),
-            pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
-            pipeline_batch_id: "00000000-0000-0000-0000-000000000000".into(),
+            pipeline_name: std::sync::Arc::from("test"),
+            pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
+            pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            source_file: std::sync::Arc::from("test"),
+            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+        };
+        let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let ctx = EvalContext {
+            stable: &stable,
+            source_file: &source_file_arc,
             source_row: 1,
-            pipeline_vars: indexmap::IndexMap::new(),
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
@@ -697,16 +705,20 @@ mod tests {
             cxl::resolve::resolve_program(parsed.ast, &field_refs, parsed.node_count).unwrap();
         let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
 
-        let ctx = EvalContext {
+        let stable = cxl::eval::StableEvalContext {
             clock: Box::new(WallClock),
             pipeline_start_time: chrono::Utc::now().naive_utc(),
-            pipeline_name: "test".into(),
-            pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
-            pipeline_batch_id: "00000000-0000-0000-0000-000000000000".into(),
+            pipeline_name: std::sync::Arc::from("test"),
+            pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
+            pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            source_file: std::sync::Arc::from("test"),
+            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+        };
+        let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let ctx = EvalContext {
+            stable: &stable,
+            source_file: &source_file_arc,
             source_row: 1,
-            pipeline_vars: indexmap::IndexMap::new(),
         };
 
         let resolver = HashMapResolver::new(fields);

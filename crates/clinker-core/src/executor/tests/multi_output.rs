@@ -47,8 +47,15 @@ fn compile_test_route(route_yaml: &str, fields: &[&str]) -> CompiledRoute {
 }
 
 /// Helper: build an EvalContext for route evaluation tests.
-fn test_eval_context() -> cxl::eval::EvalContext {
-    cxl::eval::EvalContext::test_default()
+fn test_eval_context() -> cxl::eval::EvalContext<'static> {
+    use std::sync::{Arc, OnceLock};
+    static STABLE: OnceLock<cxl::eval::StableEvalContext> = OnceLock::new();
+    static SOURCE_FILE: OnceLock<Arc<str>> = OnceLock::new();
+    cxl::eval::EvalContext {
+        stable: STABLE.get_or_init(cxl::eval::StableEvalContext::test_default),
+        source_file: SOURCE_FILE.get_or_init(|| Arc::from("test.csv")),
+        source_row: 1,
+    }
 }
 
 // --- Route evaluation unit tests ---
