@@ -20,6 +20,7 @@
 //! and executor dispatch arm land in Tasks 16.3.8–16.3.13 as part of
 //! the same atomic 16.3 commit.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -305,4 +306,292 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, AggregateEvalError> {
             });
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// MetadataCommonTracker (Task 16.3.8a, Decision D11 revised)
+// ---------------------------------------------------------------------------
+
+/// Per-key state inside a [`MetadataCommonTracker`].
+///
+/// `value` holds the common value seen for this key as long as every
+/// observation has agreed; once a conflicting observation arrives the
+/// slot transitions to `conflicting = true` and `value` is cleared. The
+/// slot itself is retained so the merge path remains associative across
+/// spill recovery — clearing the slot would otherwise let a
+/// later-merged partial revive a value that an earlier observation had
+/// already invalidated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommonState {
+    pub value: Option<Value>,
+    pub conflicting: bool,
+}
+
+/// Per-group "Keep Only Common Attributes" metadata tracker (NiFi
+/// MergeContent default semantics).
+///
+/// The hash aggregator carries one of these per group-key. On every
+/// input record it walks the record's metadata map and calls
+/// [`MetadataCommonTracker::observe`] for every key that the user has
+/// not explicitly emitted via `emit $meta.X = ...`. At finalize time,
+/// keys whose `CommonState` is `!conflicting && value.is_some()` are
+/// emitted; everything else is dropped (visible by absence).
+///
+/// The tracker is serde-derived because it travels with the per-group
+/// `AccumulatorRow` through the spill path — see Task 16.3.10.
+/// Recovery merges partial trackers via [`MetadataCommonTracker::merge`]
+/// which is associative: any disagreement on either side, or any
+/// already-`conflicting` slot, transitions the merged slot to
+/// conflicting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetadataCommonTracker {
+    pub keys: HashMap<Box<str>, CommonState>,
+}
+
+/// Outcome of a single [`MetadataCommonTracker::observe`] call.
+///
+/// Both pieces of information are needed by the hash aggregator hot
+/// loop: `heap_delta` is folded into `value_heap_bytes` for memory
+/// accounting, while `became_conflict` triggers a one-shot structured
+/// WARN log via `meta_conflict_logged`. The phase-16 spec quotes both
+/// behaviors but is internally inconsistent on a single return type;
+/// the struct surfaces them together to satisfy both call sites without
+/// a hidden second lookup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObserveResult {
+    /// Bytes added to `value_heap_bytes` by this observation. Always
+    /// non-negative — when an equal-value observation transitions a key
+    /// to conflicting, the slot is retained (so its `CommonState`
+    /// footprint stays charged) and the cleared `Value`'s heap bytes
+    /// are reported as `0` rather than as a negative delta. The hash
+    /// aggregator's spill trigger watches the totals through a separate
+    /// resize-aware check; precise reclamation is unnecessary here.
+    pub heap_delta: usize,
+    /// `true` iff this observation flipped the key's `CommonState` from
+    /// non-conflicting to conflicting. The aggregator emits one
+    /// structured WARN per (transform, key) on the first such flip.
+    pub became_conflict: bool,
+}
+
+impl MetadataCommonTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one `(key, value)` pair from an input record's metadata.
+    pub fn observe(&mut self, key: &str, value: &Value) -> ObserveResult {
+        match self.keys.get_mut(key) {
+            None => {
+                let delta = key.len()
+                    + std::mem::size_of::<CommonState>()
+                    + std::mem::size_of::<Value>()
+                    + value.heap_size();
+                self.keys.insert(
+                    key.into(),
+                    CommonState {
+                        value: Some(value.clone()),
+                        conflicting: false,
+                    },
+                );
+                ObserveResult {
+                    heap_delta: delta,
+                    became_conflict: false,
+                }
+            }
+            Some(state) if state.conflicting => ObserveResult::default(),
+            Some(state) => {
+                // Non-conflicting slot. Compare against the stored value.
+                let agrees = matches!(state.value.as_ref(), Some(v) if v == value);
+                if agrees {
+                    ObserveResult::default()
+                } else {
+                    state.value = None;
+                    state.conflicting = true;
+                    ObserveResult {
+                        heap_delta: 0,
+                        became_conflict: true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Associative merge for spill recovery.
+    pub fn merge(&mut self, other: MetadataCommonTracker) {
+        for (k, other_state) in other.keys {
+            match self.keys.get_mut(k.as_ref()) {
+                None => {
+                    self.keys.insert(k, other_state);
+                }
+                Some(self_state) => {
+                    if self_state.conflicting || other_state.conflicting {
+                        self_state.value = None;
+                        self_state.conflicting = true;
+                    } else {
+                        let agrees = matches!(
+                            (self_state.value.as_ref(), other_state.value.as_ref()),
+                            (Some(a), Some(b)) if a == b
+                        );
+                        if !agrees {
+                            self_state.value = None;
+                            self_state.conflicting = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Heap footprint of every retained key + every retained `Value`.
+    /// Charged into `HashAggregator::value_heap_bytes` for spill-trigger
+    /// accounting (parity with `CollectState::heap_size`).
+    pub fn heap_size(&self) -> usize {
+        self.keys
+            .iter()
+            .map(|(k, s)| {
+                k.len()
+                    + std::mem::size_of::<CommonState>()
+                    + std::mem::size_of::<Value>()
+                    + s.value.as_ref().map(Value::heap_size).unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Drain non-conflicting key/value pairs at finalize time. Conflicting
+    /// or empty slots are filtered out (visible-by-absence semantics).
+    pub fn finalize(self) -> Vec<(Box<str>, Value)> {
+        self.keys
+            .into_iter()
+            .filter_map(|(k, s)| match (s.conflicting, s.value) {
+                (false, Some(v)) => Some((k, v)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tracker_tests {
+    use super::*;
+
+    fn s(v: &str) -> Value {
+        Value::String(v.into())
+    }
+
+    #[test]
+    fn first_observation_inserts_with_positive_delta() {
+        let mut t = MetadataCommonTracker::new();
+        let r = t.observe("source_file", &s("a.csv"));
+        assert!(r.heap_delta > 0);
+        assert!(!r.became_conflict);
+        assert_eq!(t.keys.len(), 1);
+        assert_eq!(t.keys["source_file"].value.as_ref(), Some(&s("a.csv")));
+        assert!(!t.keys["source_file"].conflicting);
+    }
+
+    #[test]
+    fn equal_observation_is_noop() {
+        let mut t = MetadataCommonTracker::new();
+        t.observe("k", &s("v"));
+        let r = t.observe("k", &s("v"));
+        assert_eq!(r.heap_delta, 0);
+        assert!(!r.became_conflict);
+        assert!(!t.keys["k"].conflicting);
+    }
+
+    #[test]
+    fn conflict_transitions_clear_value_and_flag() {
+        let mut t = MetadataCommonTracker::new();
+        t.observe("k", &s("a"));
+        let r = t.observe("k", &s("b"));
+        assert_eq!(r.heap_delta, 0);
+        assert!(r.became_conflict);
+        assert!(t.keys["k"].conflicting);
+        assert!(t.keys["k"].value.is_none());
+        // A subsequent observation on a conflicting slot is a no-op and
+        // does NOT re-flag.
+        let r2 = t.observe("k", &s("c"));
+        assert_eq!(r2.heap_delta, 0);
+        assert!(!r2.became_conflict);
+    }
+
+    #[test]
+    fn finalize_drops_conflicting_keys() {
+        let mut t = MetadataCommonTracker::new();
+        t.observe("keep", &s("v"));
+        t.observe("keep", &s("v"));
+        t.observe("drop", &s("a"));
+        t.observe("drop", &s("b"));
+        let mut out = t.finalize();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(out, vec![("keep".into(), s("v"))]);
+    }
+
+    #[test]
+    fn test_metadata_common_tracker_serde_roundtrip() {
+        let mut t = MetadataCommonTracker::new();
+        t.observe("source", &s("a.csv"));
+        t.observe("clash", &s("x"));
+        t.observe("clash", &s("y"));
+        let json = serde_json::to_string(&t).unwrap();
+        let back: MetadataCommonTracker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.keys["source"].value.as_ref(), Some(&s("a.csv")));
+        assert!(!back.keys["source"].conflicting);
+        assert!(back.keys["clash"].conflicting);
+        assert!(back.keys["clash"].value.is_none());
+    }
+
+    #[test]
+    fn test_metadata_common_tracker_merge_associative() {
+        // Build three partials A, B, C and verify (A∪B)∪C == A∪(B∪C)
+        // both structurally and that any conflict in any operand
+        // propagates to the result.
+        let build = |pairs: &[(&str, &str)]| -> MetadataCommonTracker {
+            let mut t = MetadataCommonTracker::new();
+            for (k, v) in pairs {
+                t.observe(k, &s(v));
+            }
+            t
+        };
+
+        // A: {src=a, region=us}
+        // B: {src=a, env=prod}        — agrees with A on src
+        // C: {src=b, region=us}       — disagrees with A on src
+        let a = build(&[("src", "a"), ("region", "us")]);
+        let b = build(&[("src", "a"), ("env", "prod")]);
+        let c = build(&[("src", "b"), ("region", "us")]);
+
+        let mut left = a.clone();
+        left.merge(b.clone());
+        left.merge(c.clone());
+
+        let mut right_inner = b;
+        right_inner.merge(c);
+        let mut right = a;
+        right.merge(right_inner);
+
+        // src must be conflicting on both sides; region kept; env kept.
+        for t in [&left, &right] {
+            assert!(t.keys["src"].conflicting, "src should be conflicting");
+            assert!(t.keys["src"].value.is_none());
+            assert_eq!(t.keys["region"].value.as_ref(), Some(&s("us")));
+            assert!(!t.keys["region"].conflicting);
+            assert_eq!(t.keys["env"].value.as_ref(), Some(&s("prod")));
+            assert!(!t.keys["env"].conflicting);
+        }
+    }
+
+    #[test]
+    fn heap_size_grows_with_inserted_keys() {
+        let mut t = MetadataCommonTracker::new();
+        let h0 = t.heap_size();
+        t.observe("k1", &s("hello"));
+        let h1 = t.heap_size();
+        assert!(h1 > h0);
+        // Conflict transition retains the slot but clears the value:
+        // size should not exceed the post-insertion size.
+        t.observe("k1", &s("world"));
+        let h2 = t.heap_size();
+        assert!(h2 <= h1);
+    }
 }
