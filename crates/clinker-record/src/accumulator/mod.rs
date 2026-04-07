@@ -23,6 +23,11 @@ use crate::value::Value;
 pub mod error;
 pub use error::AccumulatorError;
 
+/// One row of accumulators — one entry per `AggregateBinding` in the
+/// owning `CompiledAggregate`. Cloned from a prototype on group
+/// insertion. Phase 16 Task 16.3.7 / 16.3.2.
+pub type AccumulatorRow = Vec<AccumulatorEnum>;
+
 #[cfg(test)]
 mod tests;
 
@@ -477,6 +482,51 @@ impl WeightedAvgState {
 
 /// Enum-dispatched accumulator with 7 built-in variants.
 ///
+/// SQL `ANY_VALUE` / `arbitrary()` accumulator: first-wins semantics.
+///
+/// Used as the explicit escape hatch for metadata propagation when the user
+/// knows the value is constant within a group and wants to skip the
+/// `MetadataCommonTracker` conflict-detection overhead (D11 revised).
+/// Merge is first-wins stable: if `self.value` is already `Some`, it is
+/// preserved; otherwise `other.value` is taken.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnyState {
+    pub value: Option<Value>,
+}
+
+impl AnyState {
+    fn add(&mut self, value: &Value) {
+        if self.value.is_none() && !value.is_null() {
+            self.value = Some(value.clone());
+        }
+    }
+
+    fn merge(&mut self, other: &AnyState) {
+        if self.value.is_none() {
+            self.value.clone_from(&other.value);
+        }
+    }
+
+    fn finalize(&self) -> Value {
+        self.value.clone().unwrap_or(Value::Null)
+    }
+}
+
+/// Tag enum mirroring `AccumulatorEnum` variants. Used by `AggregateBinding`
+/// and the `AccumulatorEnum::for_type()` factory to construct empty
+/// accumulators from the plan-time binding description (D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggregateType {
+    Sum,
+    Count { count_all: bool },
+    Avg,
+    Min,
+    Max,
+    Collect,
+    WeightedAvg,
+    Any,
+}
+
 /// Per-group heap allocation cost: one `AccumulatorEnum` in the group's row.
 /// No `Box<dyn>` indirection. Serde derive enables spill-to-disk via JSON/NDJSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,6 +538,7 @@ pub enum AccumulatorEnum {
     Max(MinMaxState),
     Collect(CollectState),
     WeightedAvg(WeightedAvgState),
+    Any(AnyState),
 }
 
 impl AccumulatorEnum {
@@ -523,6 +574,27 @@ impl AccumulatorEnum {
                 debug_assert!(false, "WeightedAvg requires add_weighted, not add");
                 0
             }
+            Self::Any(s) => {
+                s.add(value);
+                0
+            }
+        }
+    }
+
+    /// Factory: build a default-initialized accumulator from an `AggregateType` tag.
+    /// Used by `AccumulatorFactory` to materialize per-group prototype rows
+    /// from a `CompiledAggregate`'s bindings (D5).
+    pub fn for_type(t: &AggregateType) -> Self {
+        match t {
+            AggregateType::Sum => Self::Sum(SumState::default()),
+            AggregateType::Count { count_all: true } => Self::Count(CountState::new_count_all()),
+            AggregateType::Count { count_all: false } => Self::Count(CountState::new_count_field()),
+            AggregateType::Avg => Self::Avg(AvgState::default()),
+            AggregateType::Min => Self::Min(MinMaxState::default()),
+            AggregateType::Max => Self::Max(MinMaxState::default()),
+            AggregateType::Collect => Self::Collect(CollectState::default()),
+            AggregateType::WeightedAvg => Self::WeightedAvg(WeightedAvgState::default()),
+            AggregateType::Any => Self::Any(AnyState::default()),
         }
     }
 
@@ -546,6 +618,7 @@ impl AccumulatorEnum {
             (Self::Max(a), Self::Max(b)) => a.merge_with(b, Ordering::Greater),
             (Self::Collect(a), Self::Collect(b)) => a.merge(b),
             (Self::WeightedAvg(a), Self::WeightedAvg(b)) => a.merge(b),
+            (Self::Any(a), Self::Any(b)) => a.merge(b),
             _ => debug_assert!(false, "AccumulatorEnum::merge variant mismatch"),
         }
     }
@@ -563,6 +636,7 @@ impl AccumulatorEnum {
             Self::Max(s) => Ok(s.finalize()),
             Self::Collect(s) => Ok(s.finalize()),
             Self::WeightedAvg(s) => Ok(s.finalize()),
+            Self::Any(s) => Ok(s.finalize()),
         }
     }
 
@@ -575,6 +649,9 @@ impl AccumulatorEnum {
     pub fn heap_size(&self) -> usize {
         match self {
             Self::Collect(s) => s.heap_size(),
+            Self::Any(s) => {
+                std::mem::size_of::<Self>() + s.value.as_ref().map(Value::heap_size).unwrap_or(0)
+            }
             _ => std::mem::size_of::<Self>(),
         }
     }

@@ -26,6 +26,9 @@ fn collect() -> AccumulatorEnum {
 fn weighted_avg() -> AccumulatorEnum {
     AccumulatorEnum::WeightedAvg(WeightedAvgState::default())
 }
+fn any() -> AccumulatorEnum {
+    AccumulatorEnum::Any(AnyState::default())
+}
 
 fn add_all(acc: &mut AccumulatorEnum, values: &[Value]) {
     for v in values {
@@ -380,7 +383,11 @@ fn test_accumulator_serde_roundtrip() {
     let mut wa = weighted_avg();
     wa.add_weighted(&Value::Integer(2), &Value::Integer(3));
 
-    for acc in [s, ca, av, mi, mx, co, wa] {
+    let mut an = any();
+    an.add(&Value::String("first".into()));
+    an.add(&Value::String("second".into()));
+
+    for acc in [s, ca, av, mi, mx, co, wa, an] {
         let json = serde_json::to_string(&acc).expect("serialize");
         let recovered: AccumulatorEnum = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(acc, recovered, "round-trip failed for {acc:?}");
@@ -408,4 +415,94 @@ fn test_accumulator_heap_size_fixed() {
     let c = collect();
     // Empty collect: capacity 0 → heap 0.
     assert_eq!(c.heap_size(), 0);
+}
+
+// ---------- Any (D11 explicit escape hatch) ----------
+
+#[test]
+fn test_any_add_basic() {
+    let mut a = any();
+    a.add(&Value::String("first".into()));
+    a.add(&Value::String("second".into()));
+    a.add(&Value::Integer(3));
+    // First-wins semantics.
+    assert_eq!(a.finalize().unwrap(), Value::String("first".into()));
+}
+
+#[test]
+fn test_any_add_null_skipped() {
+    let mut a = any();
+    a.add(&Value::Null);
+    a.add(&Value::Null);
+    a.add(&Value::Integer(42));
+    a.add(&Value::Integer(99));
+    // NULLs do not occupy the slot; first non-NULL wins.
+    assert_eq!(a.finalize().unwrap(), Value::Integer(42));
+}
+
+#[test]
+fn test_any_all_null_finalize() {
+    let mut a = any();
+    a.add(&Value::Null);
+    a.add(&Value::Null);
+    assert_eq!(a.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_any_merge_commutative() {
+    // Two non-empty partials: first-wins on the receiver, so order matters
+    // for which value survives — but the *result set* of possible outcomes
+    // is stable and merge is associative. We assert the documented
+    // first-wins-on-receiver semantics.
+    let mut left = any();
+    left.add(&Value::Integer(1));
+    let mut right = any();
+    right.add(&Value::Integer(2));
+
+    let mut a = left.clone();
+    a.merge(&right);
+    assert_eq!(a.finalize().unwrap(), Value::Integer(1));
+
+    let mut b = right.clone();
+    b.merge(&left);
+    assert_eq!(b.finalize().unwrap(), Value::Integer(2));
+
+    // Empty receiver takes from other.
+    let mut empty = any();
+    empty.merge(&left);
+    assert_eq!(empty.finalize().unwrap(), Value::Integer(1));
+
+    // Both empty stays empty.
+    let mut e1 = any();
+    let e2 = any();
+    e1.merge(&e2);
+    assert_eq!(e1.finalize().unwrap(), Value::Null);
+}
+
+// ---------- AccumulatorEnum::for_type factory ----------
+
+#[test]
+fn test_for_type_roundtrip() {
+    use AggregateType as T;
+    let cases = [
+        T::Sum,
+        T::Count { count_all: true },
+        T::Count { count_all: false },
+        T::Avg,
+        T::Min,
+        T::Max,
+        T::Collect,
+        T::WeightedAvg,
+        T::Any,
+    ];
+    for t in &cases {
+        let acc = AccumulatorEnum::for_type(t);
+        // Tag round-trips through serde.
+        let json = serde_json::to_string(t).expect("serialize tag");
+        let recovered: AggregateType = serde_json::from_str(&json).expect("deserialize tag");
+        assert_eq!(*t, recovered);
+        // Factory produces a default-state accumulator that finalizes
+        // (no panic) — exact value depends on variant.
+        let _ = acc.finalize();
+    }
 }
