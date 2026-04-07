@@ -37,7 +37,7 @@ use cxl::eval::{EvalContext, EvalError, ProgramEvaluator, eval_expr};
 use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 
 use crate::config::SortField;
-use crate::pipeline::spill::SpillFile;
+use crate::pipeline::spill::{SpillFile, SpillWriter};
 
 /// Local stand-in to satisfy `eval_expr`'s `S: RecordStorage` type
 /// parameter when no window context is in play. The aggregator hot loop
@@ -709,11 +709,9 @@ pub struct HashAggregator {
     value_heap_bytes: usize,
     memory_budget: usize,
     spill_files: Vec<SpillFile<()>>,
-    #[allow(dead_code)]
     spill_schema: Arc<Schema>,
     #[allow(dead_code)]
     spill_sort_fields: Vec<SortField>,
-    #[allow(dead_code)]
     spill_dir: Option<PathBuf>,
     #[allow(dead_code)]
     output_schema: Arc<Schema>,
@@ -917,16 +915,104 @@ impl HashAggregator {
         Ok(())
     }
 
-    /// Spill the in-memory groups to disk. Stub until 16.3.10 lands the
-    /// real writer; the surrounding 16.3 sub-tasks call `spill()` from
-    /// the resize-aware trigger so the symbol must exist for the crate
-    /// to compile in the interim. Tests in 16.3.8 use a memory budget
-    /// of 0 (disabled) or a budget large enough to keep the trigger
-    /// from firing.
+    /// Spill the in-memory groups to disk (Task 16.3.10).
+    ///
+    /// 1. Drain `self.groups` into a Vec.
+    /// 2. Sort by group key via [`compare_group_keys`] so the merge
+    ///    phase (16.3.12) can do a k-way LoserTree walk.
+    /// 3. Build one [`Record`] per group matching `spill_schema`
+    ///    (group-by columns ++ `__acc_state` ++ `__meta_tracker`). The
+    ///    accumulator row and the metadata common-tracker are serialized
+    ///    as JSON strings in their respective columns.
+    /// 4. Stream through [`SpillWriter`], finish the writer, and push
+    ///    the resulting [`SpillFile`] onto `self.spill_files`.
+    /// 5. Reset `value_heap_bytes = 0` because every per-group value
+    ///    heap is now off-process.
+    ///
+    /// Per D11 revised: `MetadataCommonTracker` is serialized alongside
+    /// the accumulator row so the spill-merge path can associatively
+    /// merge partial trackers at key boundaries during recovery.
     fn spill(&mut self) -> Result<(), HashAggError> {
-        Err(HashAggError::Spill(
-            "spill path not yet implemented (Task 16.3.10)".into(),
-        ))
+        let spill_err = |e: crate::pipeline::spill::SpillError| HashAggError::Spill(e.to_string());
+        let json_err = |e: serde_json::Error| HashAggError::Spill(e.to_string());
+
+        // 1. Drain and 2. sort by group key (deterministic total order).
+        let mut entries: Vec<(Vec<GroupByKey>, AggregatorGroupState)> =
+            self.groups.drain().collect();
+        entries.sort_by(|a, b| compare_group_keys(&a.0, &b.0));
+
+        // Pre-compute how many columns precede the two synthetic trailers.
+        let gb_count = self.group_by_indices.len();
+
+        let mut writer: SpillWriter<()> =
+            SpillWriter::new(Arc::clone(&self.spill_schema), self.spill_dir.as_deref())
+                .map_err(spill_err)?;
+
+        for (key, state) in entries {
+            let acc_json = serde_json::to_string(&state.row).map_err(json_err)?;
+            let meta_json = serde_json::to_string(&state.meta_tracker).map_err(json_err)?;
+
+            let mut values: Vec<Value> = Vec::with_capacity(gb_count + 2);
+            for gk in &key {
+                values.push(gk.to_value());
+            }
+            values.push(Value::String(acc_json.into()));
+            values.push(Value::String(meta_json.into()));
+
+            let record = Record::new(Arc::clone(&self.spill_schema), values);
+            writer.write_record(&record).map_err(spill_err)?;
+        }
+
+        let spill_file = writer.finish().map_err(spill_err)?;
+        self.spill_files.push(spill_file);
+
+        // 5. All per-group value heap bytes are now off-process.
+        self.value_heap_bytes = 0;
+        Ok(())
+    }
+}
+
+/// Total ordering on group-key tuples for spill sorting.
+///
+/// GroupByKey does not implement `Ord` (its `Float` variant stores
+/// `f64::to_bits` raw, which is not a semantically meaningful integer
+/// order). For spill we only need a deterministic total order so the
+/// merge phase can walk k spill files in lockstep — the absolute
+/// ordering does not need to agree with any user-facing sort. We order
+/// tuples lexicographically and, within a variant, fall back to a
+/// stable per-variant comparator: raw `u64` bits for `Float` (Integer is
+/// excluded by default — only used when a field is int-pinned — and can
+/// use natural order). Variants themselves are ordered by their
+/// discriminant tag.
+pub(crate) fn compare_group_keys(a: &[GroupByKey], b: &[GroupByKey]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = match (x, y) {
+            (GroupByKey::Null, GroupByKey::Null) => Ordering::Equal,
+            (GroupByKey::Str(a), GroupByKey::Str(b)) => a.cmp(b),
+            (GroupByKey::Int(a), GroupByKey::Int(b)) => a.cmp(b),
+            (GroupByKey::Float(a), GroupByKey::Float(b)) => a.cmp(b),
+            (GroupByKey::Bool(a), GroupByKey::Bool(b)) => a.cmp(b),
+            (GroupByKey::Date(a), GroupByKey::Date(b)) => a.cmp(b),
+            (GroupByKey::DateTime(a), GroupByKey::DateTime(b)) => a.cmp(b),
+            _ => variant_tag(x).cmp(&variant_tag(y)),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn variant_tag(k: &GroupByKey) -> u8 {
+    match k {
+        GroupByKey::Null => 0,
+        GroupByKey::Bool(_) => 1,
+        GroupByKey::Int(_) => 2,
+        GroupByKey::Float(_) => 3,
+        GroupByKey::Str(_) => 4,
+        GroupByKey::Date(_) => 5,
+        GroupByKey::DateTime(_) => 6,
     }
 }
 
