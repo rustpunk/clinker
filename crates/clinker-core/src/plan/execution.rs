@@ -1838,6 +1838,7 @@ fn compute_one(
                         sort_order: None,
                         provenance: OrderingProvenance::DestroyedByDistinct {
                             at_node: name.clone(),
+                            confidence: crate::plan::properties::Confidence::Proven,
                         },
                     },
                     partitioning,
@@ -1885,6 +1886,7 @@ fn compute_one(
                             at_node: name.clone(),
                             fields_written: write_set.iter().cloned().collect(),
                             sort_fields_lost: lost,
+                            confidence: crate::plan::properties::Confidence::Proven,
                         },
                     },
                     partitioning,
@@ -1957,6 +1959,7 @@ fn compute_one(
                                 .iter()
                                 .map(|p| p.ordering.sort_order.clone())
                                 .collect(),
+                            confidence: crate::plan::properties::Confidence::Proven,
                         },
                     },
                     partitioning,
@@ -3356,6 +3359,7 @@ mod tests {
                 at_node,
                 fields_written,
                 sort_fields_lost,
+                ..
             } => {
                 assert_eq!(at_node, "t");
                 assert!(fields_written.contains(&"k".to_string()));
@@ -3402,7 +3406,7 @@ mod tests {
         dag.compute_node_properties(&inputs).unwrap();
         let props = dag.node_properties.get(&idxs[1]).unwrap();
         match &props.ordering.provenance {
-            OrderingProvenance::DestroyedByDistinct { at_node } => {
+            OrderingProvenance::DestroyedByDistinct { at_node, .. } => {
                 assert_eq!(at_node, "t");
             }
             other => panic!("expected DestroyedByDistinct, got {other:?}"),
@@ -3532,6 +3536,7 @@ mod tests {
             OrderingProvenance::DestroyedByMergeMismatch {
                 at_node,
                 parent_orderings,
+                ..
             } => {
                 assert_eq!(at_node, "m");
                 assert_eq!(parent_orderings.len(), 2);

@@ -2347,10 +2347,10 @@ fn ordering_provenance_summary(p: &crate::plan::properties::OrderingProvenance) 
             "destroyed by transform `{}` writing {:?}",
             at_node, sort_fields_lost
         ),
-        OP::DestroyedByDistinct { at_node } => {
+        OP::DestroyedByDistinct { at_node, .. } => {
             format!("destroyed by `distinct` in transform `{}`", at_node)
         }
-        OP::DestroyedByHashAggregate { at_node } => {
+        OP::DestroyedByHashAggregate { at_node, .. } => {
             format!("destroyed by hash aggregate `{}`", at_node)
         }
         OP::DestroyedByMergeMismatch { at_node, .. } => {
