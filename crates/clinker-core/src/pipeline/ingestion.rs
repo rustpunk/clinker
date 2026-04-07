@@ -121,7 +121,7 @@ where
     let mut reader = open_reader(&input.path)?;
 
     // Build Arena
-    let arena = Arena::build(reader.as_mut(), &arena_fields, memory_limit).map_err(|e| {
+    let arena = Arena::build(reader.as_mut(), &arena_fields, memory_limit, None).map_err(|e| {
         PipelineError::Compilation {
             transform_name: String::new(),
             messages: vec![e.to_string()],
@@ -280,8 +280,8 @@ mod tests {
         );
         let resolved =
             cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema: std::collections::HashMap<String, cxl::typecheck::types::Type> =
-            std::collections::HashMap::new();
+        let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> =
+            indexmap::IndexMap::new();
         cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
     }
 
@@ -513,32 +513,25 @@ mod tests {
 
     #[test]
     fn test_signal_during_phase1_ingestion() {
-        // Set shutdown flag, verify Arena::build respects it
-        let config = test_config(
-            vec![("primary", "data.csv")],
-            vec![(
-                "agg",
-                "emit total = $window.sum(amount)",
-                Some(serde_json::json!({"group_by": ["dept"]})),
-            )],
+        // With per-token shutdown, the only meaningful unit-level assertion
+        // is that `Arena::build` checks the token it was handed and returns
+        // `ArenaError::ShutdownRequested` once the chunk-boundary check
+        // window (4096 records) is crossed.
+        use crate::pipeline::arena::{Arena, ArenaError};
+        let token = shutdown::ShutdownToken::detached();
+        token.request();
+
+        let mut csv = String::from("dept,amount\n");
+        for i in 0..5000 {
+            csv.push_str(&format!("D{},{}\n", i % 10, i));
+        }
+        let mut reader = csv_reader_from_str(&csv);
+        let result = Arena::build(
+            reader.as_mut(),
+            &["dept".into(), "amount".into()],
+            512 * 1024 * 1024,
+            Some(&token),
         );
-        let fields = &["dept", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
-        let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
-
-        // Request shutdown before ingestion
-        shutdown::request_shutdown();
-
-        let csv_data = "dept,amount\nA,100\nB,200\nA,150\n";
-        let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |_path| {
-            Ok(csv_reader_from_str(csv_data))
-        });
-
-        // Should either succeed with partial data or return an error — must not panic
-        // The key invariant: no panic, clean return
-        assert!(result.is_ok() || result.is_err());
-
-        shutdown::reset_shutdown_flag();
+        assert!(matches!(result, Err(ArenaError::ShutdownRequested)));
     }
 }

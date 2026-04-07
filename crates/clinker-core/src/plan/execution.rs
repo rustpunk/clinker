@@ -2508,7 +2508,7 @@ mod tests {
             parsed.errors
         );
         let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema: HashMap<String, cxl::typecheck::types::Type> = HashMap::new();
+        let schema: IndexMap<String, cxl::typecheck::types::Type> = IndexMap::new();
         type_check(resolved, &schema).unwrap()
     }
 

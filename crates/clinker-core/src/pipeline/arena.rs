@@ -42,6 +42,7 @@ impl Arena {
         reader: &mut dyn FormatReader,
         fields: &[String],
         memory_limit: usize,
+        shutdown: Option<&super::shutdown::ShutdownToken>,
     ) -> Result<Self, ArenaError> {
         let source_schema = reader.schema()?;
 
@@ -63,7 +64,7 @@ impl Arena {
             records_since_check += 1;
             if records_since_check >= 4096 {
                 records_since_check = 0;
-                if super::shutdown::shutdown_requested() {
+                if shutdown.is_some_and(|t| t.is_requested()) {
                     return Err(ArenaError::ShutdownRequested);
                 }
             }
@@ -204,8 +205,13 @@ mod tests {
             big_csv.push_str(&format!("D{},{},Name{}\n", i % 3, i * 10, i));
         }
         let mut reader = make_csv_reader(&big_csv);
-        let arena =
-            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+        )
+        .unwrap();
         assert_eq!(arena.record_count(), 100);
     }
 
@@ -213,8 +219,13 @@ mod tests {
     fn test_arena_field_projection() {
         let csv = "dept,amount,name,extra\nA,100,Alice,X\nB,200,Bob,Y\n";
         let mut reader = make_csv_reader(csv);
-        let arena =
-            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+        )
+        .unwrap();
 
         // Schema has only projected fields
         assert_eq!(arena.schema().column_count(), 2);
@@ -236,8 +247,13 @@ mod tests {
     fn test_arena_record_view_resolve() {
         let csv = "dept,amount\nA,100\nB,200\nC,300\nD,400\nE,500\nF,600\n";
         let mut reader = make_csv_reader(csv);
-        let arena =
-            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+        )
+        .unwrap();
 
         let view = RecordView::new(&arena, 5);
         assert_eq!(view.resolve("dept"), Some(Value::String("F".into())));
@@ -248,8 +264,13 @@ mod tests {
     fn test_arena_record_view_missing_field() {
         let csv = "dept,amount\nA,100\n";
         let mut reader = make_csv_reader(csv);
-        let arena =
-            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+        )
+        .unwrap();
 
         let view = RecordView::new(&arena, 0);
         assert_eq!(view.resolve("nonexistent"), None);
@@ -274,8 +295,13 @@ mod tests {
     fn test_arena_empty_input() {
         let csv = "dept,amount\n";
         let mut reader = make_csv_reader(csv);
-        let arena =
-            Arena::build(&mut reader, &["dept".into(), "amount".into()], usize::MAX).unwrap();
+        let arena = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+        )
+        .unwrap();
         assert_eq!(arena.record_count(), 0);
         assert_eq!(arena.schema().column_count(), 2);
     }
@@ -287,7 +313,7 @@ mod tests {
             csv.push_str(&format!("Department_{},{}00\n", i, i));
         }
         let mut reader = make_csv_reader(&csv);
-        let result = Arena::build(&mut reader, &["dept".into(), "amount".into()], 100);
+        let result = Arena::build(&mut reader, &["dept".into(), "amount".into()], 100, None);
         assert!(result.is_err());
         match result.unwrap_err() {
             ArenaError::MemoryBudgetExceeded { used, limit } => {

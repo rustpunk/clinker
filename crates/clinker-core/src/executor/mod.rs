@@ -49,6 +49,12 @@ pub struct PipelineRunParams {
     pub batch_id: String,
     /// Converted pipeline.vars (already validated and converted from serde_json).
     pub pipeline_vars: IndexMap<String, Value>,
+    /// Per-run shutdown handle. The executor checks this at chunk boundaries
+    /// and inside `Arena::build`. `None` disables shutdown signaling for this
+    /// run; production callers typically construct one via
+    /// `crate::pipeline::shutdown::ShutdownToken::new()` so SIGINT/SIGTERM
+    /// can trip it.
+    pub shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
 }
 
 /// Summary returned after a pipeline execution completes (success or partial).
@@ -903,13 +909,16 @@ impl PipelineExecutor {
                 crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
             let memory_limit = parse_memory_limit(config);
             let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
-            let arena =
-                Arena::build(&mut *format_reader, &arena_fields, memory_limit).map_err(|e| {
-                    PipelineError::Compilation {
-                        transform_name: String::new(),
-                        messages: vec![e.to_string()],
-                    }
-                })?;
+            let arena = Arena::build(
+                &mut *format_reader,
+                &arena_fields,
+                memory_limit,
+                params.shutdown_token.as_ref(),
+            )
+            .map_err(|e| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: vec![e.to_string()],
+            })?;
             let arena_len = arena.record_count() as u64;
             collector.record(arena_timer.finish(arena_len, arena_len));
 
@@ -2990,7 +2999,7 @@ impl PipelineExecutor {
         // CSV fields are all strings at the data level, but CXL allows
         // polymorphic usage (e.g. `+` for concat, `.to_int()` for coercion).
         // Declare as Any so the type checker doesn't reject valid CXL.
-        let mut type_schema: HashMap<String, Type> =
+        let mut type_schema: IndexMap<String, Type> =
             fields.iter().map(|f| (f.clone(), Type::Any)).collect();
 
         let mut compiled = Vec::with_capacity(transforms.len());
@@ -3071,7 +3080,7 @@ impl PipelineExecutor {
             if t.aggregate.is_some() {
                 let agg = t.aggregate.as_ref().unwrap();
                 let mut new_fields: Vec<String> = agg.group_by.clone();
-                let mut new_type_schema: HashMap<String, Type> = agg
+                let mut new_type_schema: IndexMap<String, Type> = agg
                     .group_by
                     .iter()
                     .map(|g| (g.clone(), Type::Any))
@@ -3114,7 +3123,7 @@ impl PipelineExecutor {
         route_config: &crate::config::RouteConfig,
         emitted_fields: &[String],
     ) -> Result<CompiledRoute, PipelineError> {
-        let type_schema: HashMap<String, Type> = emitted_fields
+        let type_schema: IndexMap<String, Type> = emitted_fields
             .iter()
             .map(|f| (f.clone(), Type::Any))
             .collect();
@@ -4115,6 +4124,7 @@ mod tests {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
+            shutdown_token: None,
         };
 
         let report =
@@ -4152,6 +4162,7 @@ mod tests {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
+            shutdown_token: None,
         };
 
         let report =
@@ -4311,6 +4322,7 @@ transformations:
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
+            shutdown_token: None,
         };
 
         let report =
@@ -4493,6 +4505,7 @@ transformations:
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
+            shutdown_token: None,
         };
 
         let report =
@@ -5129,6 +5142,7 @@ transformations:
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
+            shutdown_token: None,
         };
         let report =
             PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
@@ -5343,11 +5357,14 @@ transformations:
 
     #[test]
     fn test_graceful_shutdown_flushes_output() {
-        // Set shutdown flag before running pipeline.
-        // Pipeline should process at least the first record (schema probe),
-        // then detect shutdown at the first chunk boundary and stop cleanly.
-        use crate::pipeline::shutdown;
-        shutdown::request_shutdown();
+        // Construct a per-run shutdown token, trip it, and pass it through
+        // PipelineRunParams. Pipeline should run without panic — with a
+        // pre-tripped token a window/aggregation pipeline returns cleanly
+        // (Arena::build observes the token at the next chunk-boundary
+        // check). This is now isolated from any other test's tokens.
+        use crate::pipeline::shutdown::ShutdownToken;
+        let token = ShutdownToken::detached();
+        token.request();
 
         let yaml = r#"
 pipeline:
@@ -5371,20 +5388,33 @@ transformations:
             csv.push_str(&format!("person_{i}\n"));
         }
 
-        // Pipeline should run without panic. Output may be partial or complete
-        // depending on when shutdown is detected, but must be valid.
-        let result = run_test(yaml, &csv);
+        let config = crate::config::parse_config(yaml).unwrap();
+        let output_buf = crate::test_helpers::SharedBuffer::new();
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            config.inputs[0].name.clone(),
+            Box::new(std::io::Cursor::new(csv.into_bytes())) as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            config.outputs[0].name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars: IndexMap::new(),
+            shutdown_token: Some(token),
+        };
+        let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
         assert!(result.is_ok(), "Pipeline should not panic on shutdown");
-        let (counters, _, output) = result.unwrap();
-        // At minimum, the output should contain the header
+        let report = result.unwrap();
+        let output = output_buf.as_string();
         assert!(
             output.contains("name") || output.contains("doubled"),
             "Output should contain at least the header"
         );
-        // Counters should be consistent
-        assert!(counters.ok_count + counters.dlq_count <= counters.total_count);
-
-        shutdown::reset_shutdown_flag();
+        assert!(
+            report.counters.ok_count + report.counters.dlq_count <= report.counters.total_count
+        );
     }
 
     #[test]

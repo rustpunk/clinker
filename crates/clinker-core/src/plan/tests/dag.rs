@@ -99,8 +99,7 @@ fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProg
     );
     let resolved =
         cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let schema: std::collections::HashMap<String, cxl::typecheck::types::Type> =
-        std::collections::HashMap::new();
+    let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> = indexmap::IndexMap::new();
     cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
 }
 

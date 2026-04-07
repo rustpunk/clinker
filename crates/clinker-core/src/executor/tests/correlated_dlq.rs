@@ -24,6 +24,7 @@ fn run_correlated_pipeline(
             .as_ref()
             .map(|v| crate::config::convert_pipeline_vars(v))
             .unwrap_or_default(),
+        shutdown_token: None,
     };
 
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(

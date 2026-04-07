@@ -55,7 +55,7 @@ fn bench_typecheck(c: &mut Criterion) {
         );
         let resolved =
             resolve_program(parsed.ast, &fields, parsed.node_count).expect("resolve failed");
-        type_check(resolved, &HashMap::new()).expect("typecheck failed");
+        type_check(resolved, &indexmap::IndexMap::new()).expect("typecheck failed");
 
         // Benchmark: resolve + typecheck (since ResolvedProgram isn't Clone,
         // we include resolve in the measured path)
@@ -63,7 +63,7 @@ fn bench_typecheck(c: &mut Criterion) {
             b.iter(|| {
                 let parsed = Parser::parse(src);
                 let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-                type_check(resolved, &HashMap::new()).unwrap()
+                type_check(resolved, &indexmap::IndexMap::new()).unwrap()
             });
         });
     }
@@ -83,7 +83,7 @@ fn bench_full_compile(c: &mut Criterion) {
             b.iter(|| {
                 let parsed = Parser::parse(src);
                 let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-                type_check(resolved, &HashMap::new()).unwrap()
+                type_check(resolved, &indexmap::IndexMap::new()).unwrap()
             });
         });
     }

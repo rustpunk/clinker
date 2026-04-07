@@ -230,6 +230,7 @@ mod tests {
             &mut reader,
             &fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             usize::MAX,
+            None,
         )
         .unwrap()
     }

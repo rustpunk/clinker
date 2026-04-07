@@ -450,6 +450,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
         pipeline_vars,
+        shutdown_token: None,
     };
 
     // Run the pipeline using file-based I/O

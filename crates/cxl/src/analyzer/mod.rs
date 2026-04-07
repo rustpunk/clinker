@@ -321,7 +321,8 @@ mod tests {
         );
         let fields: Vec<&str> = vec!["dept", "amount", "name", "region", "score", "date"];
         let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-        let schema: HashMap<String, crate::typecheck::types::Type> = HashMap::new();
+        let schema: indexmap::IndexMap<String, crate::typecheck::types::Type> =
+            indexmap::IndexMap::new();
         type_check(resolved, &schema).unwrap()
     }
 

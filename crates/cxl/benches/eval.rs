@@ -36,7 +36,7 @@ fn compile(source: &str, fields: &[&str]) -> cxl::typecheck::TypedProgram {
         parsed.errors
     );
     let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    type_check(resolved, &HashMap::new()).unwrap()
+    type_check(resolved, &indexmap::IndexMap::new()).unwrap()
 }
 
 /// Build a HashMapResolver from a Record.

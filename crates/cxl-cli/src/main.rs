@@ -162,7 +162,7 @@ fn cmd_check(file: &str) {
         }
     };
 
-    match cxl::typecheck::type_check(resolved, &HashMap::new()) {
+    match cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()) {
         Ok(_) => {
             eprintln!("ok: {} is valid", file);
             process::exit(0);
@@ -258,7 +258,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         }
     };
 
-    let typed = match cxl::typecheck::type_check(resolved, &HashMap::new()) {
+    let typed = match cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()) {
         Ok(t) => t,
         Err(diags) => {
             for d in &diags {
@@ -665,7 +665,7 @@ mod tests {
         assert!(parsed.errors.is_empty());
 
         let resolved = cxl::resolve::resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
-        let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
+        let typed = cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()).unwrap();
 
         let stable = cxl::eval::StableEvalContext {
             clock: Box::new(WallClock),
@@ -703,7 +703,7 @@ mod tests {
 
         let resolved =
             cxl::resolve::resolve_program(parsed.ast, &field_refs, parsed.node_count).unwrap();
-        let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
+        let typed = cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()).unwrap();
 
         let stable = cxl::eval::StableEvalContext {
             clock: Box::new(WallClock),

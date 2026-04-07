@@ -510,7 +510,8 @@ mod tests {
         let fields: &[&str] = &[];
         let resolved =
             cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema = std::collections::HashMap::new();
+        let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> =
+            indexmap::IndexMap::new();
         let typed = cxl::typecheck::pass::type_check(resolved, &schema).unwrap();
 
         let resolver = TestResolver;

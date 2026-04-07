@@ -83,6 +83,7 @@ fn test_params() -> PipelineRunParams {
         execution_id: "test-exec-001".into(),
         batch_id: "test-batch-001".into(),
         pipeline_vars: Default::default(),
+        shutdown_token: None,
     }
 }
 

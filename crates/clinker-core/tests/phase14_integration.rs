@@ -46,6 +46,7 @@ fn test_params(config: &clinker_core::config::PipelineConfig) -> PipelineRunPara
         execution_id: "integration-test".to_string(),
         batch_id: "batch-001".to_string(),
         pipeline_vars,
+        shutdown_token: None,
     }
 }
 

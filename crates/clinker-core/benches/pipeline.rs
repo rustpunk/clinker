@@ -34,6 +34,7 @@ fn test_params() -> PipelineRunParams {
         execution_id: "bench-exec".to_string(),
         batch_id: "bench-batch".to_string(),
         pipeline_vars: IndexMap::new(),
+        shutdown_token: None,
     }
 }
 

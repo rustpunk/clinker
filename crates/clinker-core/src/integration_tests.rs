@@ -35,6 +35,7 @@ mod tests {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars,
+            shutdown_token: None,
         };
 
         let report =
@@ -289,23 +290,13 @@ transformations:
 
     #[test]
     fn test_exit_code_130_interrupted() {
-        // Simulate SIGINT by setting the shutdown flag via AtomicBool
-        use crate::pipeline::shutdown;
-
-        // Set the shutdown flag
-        shutdown::request_shutdown();
-
-        // The shutdown flag being set means the executor would return interrupted.
-        // We verify the flag is correctly set and the exit code mapping works.
-        assert!(shutdown::shutdown_requested());
-
-        // Reset for other tests
-        shutdown::reset_shutdown_flag();
-        assert!(!shutdown::shutdown_requested());
-
-        // Verify exit code mapping: interrupted maps to 130
-        // (The executor checks shutdown_requested() at chunk boundaries and returns
-        // an appropriate error. The CLI maps this to exit code 130.)
+        // Per-token shutdown: a token round-trips request/observe in
+        // isolation, and the CLI maps an interrupted run to exit code 130.
+        use crate::pipeline::shutdown::ShutdownToken;
+        let token = ShutdownToken::detached();
+        assert!(!token.is_requested());
+        token.request();
+        assert!(token.is_requested());
         assert_eq!(crate::exit_codes::EXIT_INTERRUPTED, 130);
     }
 

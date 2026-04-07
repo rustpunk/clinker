@@ -97,7 +97,7 @@ pub struct TypedProgram {
 /// AggregateMode::Row)`. Most call sites use this entry point.
 pub fn type_check(
     resolved: ResolvedProgram,
-    schema: &HashMap<String, Type>,
+    schema: &IndexMap<String, Type>,
 ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
     type_check_with_mode(resolved, schema, AggregateMode::Row)
 }
@@ -107,7 +107,7 @@ pub fn type_check(
 /// `AggregateMode`.
 pub fn type_check_with_mode(
     resolved: ResolvedProgram,
-    schema: &HashMap<String, Type>,
+    schema: &IndexMap<String, Type>,
     aggregate_mode: AggregateMode,
 ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
     let registry = BuiltinRegistry::new();
@@ -168,7 +168,7 @@ pub fn type_check_with_mode(
 
 struct TypeChecker<'a> {
     bindings: &'a [Option<ResolvedBinding>],
-    schema: &'a HashMap<String, Type>,
+    schema: &'a IndexMap<String, Type>,
     registry: &'a BuiltinRegistry,
     types: Vec<Option<Type>>,
     regexes: Vec<Option<Regex>>,
@@ -1076,7 +1076,7 @@ mod tests {
     use crate::parser::Parser;
     use crate::resolve::pass::resolve_program;
 
-    fn typecheck_ok(src: &str, fields: &[&str], schema: &HashMap<String, Type>) -> TypedProgram {
+    fn typecheck_ok(src: &str, fields: &[&str], schema: &IndexMap<String, Type>) -> TypedProgram {
         let parsed = Parser::parse(src);
         assert!(
             parsed.errors.is_empty(),
@@ -1100,7 +1100,7 @@ mod tests {
     fn typecheck_err(
         src: &str,
         fields: &[&str],
-        schema: &HashMap<String, Type>,
+        schema: &IndexMap<String, Type>,
     ) -> Vec<TypeDiagnostic> {
         let parsed = Parser::parse(src);
         assert!(parsed.errors.is_empty());
@@ -1127,18 +1127,18 @@ mod tests {
     #[test]
     fn test_typecheck_arithmetic_int() {
         // 1 + 2 infers Int
-        let typed = typecheck_ok("emit a = 1 + 2", &[], &HashMap::new());
+        let typed = typecheck_ok("emit a = 1 + 2", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::Int);
 
         // 1 + 2.0 infers Float (promotion)
-        let typed2 = typecheck_ok("emit b = 1 + 2.0", &[], &HashMap::new());
+        let typed2 = typecheck_ok("emit b = 1 + 2.0", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed2), Type::Float);
     }
 
     #[test]
     fn test_typecheck_null_propagation() {
         // nullable_field + 1 → Nullable(Int) when field is declared Nullable(Int)
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("nullable_field".into(), Type::Nullable(Box::new(Type::Int)));
         let typed = typecheck_ok(
             "emit val = nullable_field + 1",
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_typecheck_coalesce_strips_nullable() {
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("nullable_field".into(), Type::Nullable(Box::new(Type::Int)));
         let typed = typecheck_ok(
             "emit val = nullable_field ?? 0",
@@ -1167,7 +1167,7 @@ mod tests {
         let diags = typecheck_err(
             "emit val = match status { \"A\" => 1 }",
             &["status"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         assert!(
             diags
@@ -1183,7 +1183,7 @@ mod tests {
         let diags = typecheck_err(
             "emit val = $window.any($window.sum(it) > 0)",
             &["amount"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         assert!(
             diags
@@ -1197,7 +1197,7 @@ mod tests {
     #[test]
     fn test_typecheck_sum_requires_numeric() {
         // window.sum() on a String field should produce an error
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("name".into(), Type::String);
         let diags = typecheck_err("emit val = $window.sum(name)", &["name"], &schema);
         assert!(
@@ -1213,7 +1213,7 @@ mod tests {
         let diags = typecheck_err(
             "emit a = status == \"active\"\nemit b = status + 1",
             &["status"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         // Should have a diagnostic about conflicting types
         let conflict = diags.iter().find(|d| d.message.contains("used as"));
@@ -1231,7 +1231,7 @@ mod tests {
 
     #[test]
     fn test_typecheck_schema_override_conflict() {
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("age".into(), Type::Int);
         let diags = typecheck_err("emit val = age == \"old\"", &["age"], &schema);
         assert!(
@@ -1246,7 +1246,7 @@ mod tests {
     #[test]
     fn test_typecheck_zero_emit_warning() {
         // Program with no emit → warning (not error, so type_check succeeds)
-        let typed = typecheck_ok("let x = 1", &[], &HashMap::new());
+        let typed = typecheck_ok("let x = 1", &[], &indexmap::IndexMap::new());
         // The program should have been created successfully (warnings don't block)
         assert!(typed.program.statements.len() == 1);
     }
@@ -1256,7 +1256,7 @@ mod tests {
         let typed = typecheck_ok(
             "emit a = amount + 1\nemit b = name == \"test\"",
             &["amount", "name"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         // amount should be inferred as Numeric, name as String
         assert!(
@@ -1273,13 +1273,13 @@ mod tests {
 
     #[test]
     fn test_typecheck_equality_always_bool() {
-        let typed = typecheck_ok("emit val = 1 == 2", &[], &HashMap::new());
+        let typed = typecheck_ok("emit val = 1 == 2", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::Bool);
     }
 
     #[test]
     fn test_typecheck_if_missing_else_nullable() {
-        let typed = typecheck_ok("emit val = if true then 1", &[], &HashMap::new());
+        let typed = typecheck_ok("emit val = if true then 1", &[], &indexmap::IndexMap::new());
         let ty = first_emit_expr_type(&typed);
         assert!(
             ty.is_nullable(),
@@ -1290,16 +1290,24 @@ mod tests {
 
     #[test]
     fn test_typecheck_now_is_datetime() {
-        let typed = typecheck_ok("emit ts = now", &[], &HashMap::new());
+        let typed = typecheck_ok("emit ts = now", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::DateTime);
     }
 
     #[test]
     fn test_typecheck_pipeline_access_types() {
-        let typed = typecheck_ok("emit ts = $pipeline.start_time", &[], &HashMap::new());
+        let typed = typecheck_ok(
+            "emit ts = $pipeline.start_time",
+            &[],
+            &indexmap::IndexMap::new(),
+        );
         assert_eq!(first_emit_expr_type(&typed), Type::DateTime);
 
-        let typed2 = typecheck_ok("emit n = $pipeline.total_count", &[], &HashMap::new());
+        let typed2 = typecheck_ok(
+            "emit n = $pipeline.total_count",
+            &[],
+            &indexmap::IndexMap::new(),
+        );
         assert_eq!(first_emit_expr_type(&typed2), Type::Int);
     }
 
@@ -1308,7 +1316,7 @@ mod tests {
         let typed = typecheck_ok(
             "emit val = name.matches(\"\\\\d+\")",
             &["name"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         // The regex should be pre-compiled and stored
         let has_regex = typed.regexes.iter().any(|r| r.is_some());
@@ -1339,7 +1347,7 @@ mod tests {
         );
         let resolved =
             resolve_program(parsed.ast, fields, parsed.node_count).expect("resolve failed");
-        type_check_with_mode(resolved, &HashMap::new(), mode)
+        type_check_with_mode(resolved, &indexmap::IndexMap::new(), mode)
     }
 
     fn agg_ok(src: &str, fields: &[&str], keys: &[&str]) -> TypedProgram {
@@ -1670,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_typecheck_sum_returns_same_type() {
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("amount".into(), Type::Int);
         let parsed = Parser::parse("emit t = sum(amount)");
         let resolved = resolve_program(parsed.ast, &["amount", "dept"], parsed.node_count).unwrap();

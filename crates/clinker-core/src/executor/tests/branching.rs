@@ -33,6 +33,7 @@ fn run_branch_test(
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
         pipeline_vars,
+        shutdown_token: None,
     };
 
     let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
