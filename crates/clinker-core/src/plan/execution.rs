@@ -27,6 +27,10 @@ use crate::plan::properties::{
 use clinker_record::Schema;
 use cxl::plan::CompiledAggregate;
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 use cxl::analyzer::{self, ParallelismHint};
 use cxl::ast::Statement;
 use cxl::typecheck::pass::TypedProgram;
@@ -123,6 +127,21 @@ pub enum PlanNode {
         strategy: AggregateStrategy,
         #[serde(skip)]
         output_schema: Arc<Schema>,
+        /// Reason streaming was not selected, populated by the
+        /// `select_aggregation_strategies` post-pass (Task 16.4.9) when
+        /// `config.strategy == Auto` and eligibility was `HashFallback`.
+        /// `None` for explicit Hash, explicit Streaming, or Auto-that-qualified.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fallback_reason: Option<String>,
+        /// `true` when `config.strategy == Hash` AND eligibility was
+        /// `Streaming` — surfaces in `--explain` so users notice missed
+        /// performance opportunities at their own request.
+        #[serde(default, skip_serializing_if = "is_false")]
+        skipped_streaming_available: bool,
+        /// Qualified sort order used for runtime `SortKeyEncoder`
+        /// construction. `Some` iff resolved strategy is Streaming.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        qualified_sort_order: Option<Vec<SortField>>,
     },
 }
 
@@ -584,6 +603,9 @@ impl ExecutionPlanDag {
                         compiled: Arc::new(compiled_agg),
                         strategy: AggregateStrategy::Hash,
                         output_schema,
+                        fallback_reason: None,
+                        skipped_streaming_available: false,
+                        qualified_sort_order: None,
                     },
                     &mut node_by_name,
                     &mut slug_set,
@@ -845,6 +867,14 @@ impl ExecutionPlanDag {
         })?;
         assign_tiers(&mut dag.graph, &dag.topo_order);
         dag.compute_node_properties(&inputs_map)
+            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
+        // Task 16.4.9: post-pass that resolves the user `strategy` hint on
+        // each `PlanNode::Aggregation` against upstream `OrderingProvenance`
+        // and rewrites the node's stored ordering provenance accordingly.
+        // DataFusion `PhysicalOptimizerRule` pattern: a frozen-plan walk
+        // that mutates only the strategy + side-table ordering, never the
+        // graph topology.
+        dag.select_aggregation_strategies()
             .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
 
         Ok(dag)
@@ -1764,6 +1794,167 @@ impl ExecutionPlanDag {
 
         Ok(())
     }
+
+    /// Task 16.4.9 — resolve `AggregateStrategyHint` on every
+    /// `PlanNode::Aggregation` against upstream `OrderingProvenance`,
+    /// rewrite the node's `strategy` field, populate the auxiliary
+    /// `fallback_reason` / `skipped_streaming_available` /
+    /// `qualified_sort_order` fields, and overwrite the side-table
+    /// `node_properties[idx].ordering` to reflect the resolved strategy.
+    ///
+    /// Runs as a separate post-pass inside `compile()` immediately after
+    /// `compute_node_properties()` (D75). Hard-errors at compile time
+    /// when a user explicitly requests `strategy: streaming` on an
+    /// ineligible input (D78), via the rustc-shaped walker
+    /// `render_unordered_streaming_error` shipped in 16.4.9a.
+    pub(crate) fn select_aggregation_strategies(&mut self) -> Result<(), PipelineError> {
+        use crate::aggregation::{
+            AggregateStrategy, StreamingEligibility, qualifies_for_streaming,
+        };
+        use crate::config::AggregateStrategyHint;
+        use crate::plan::properties::{Confidence, render_unordered_streaming_error};
+
+        // Collect target indices first to avoid holding a borrow on `graph`
+        // while mutating `node_properties`.
+        let agg_indices: Vec<NodeIndex> = self
+            .topo_order
+            .iter()
+            .copied()
+            .filter(|idx| matches!(self.graph[*idx], PlanNode::Aggregation { .. }))
+            .collect();
+
+        for idx in agg_indices {
+            let (name, hint, group_by) = match &self.graph[idx] {
+                PlanNode::Aggregation { name, config, .. } => {
+                    (name.clone(), config.strategy, config.group_by.clone())
+                }
+                _ => unreachable!(),
+            };
+
+            let parent_idx = crate::executor::single_predecessor(self, idx, "aggregation", &name)?;
+            let parent_props = self
+                .node_properties
+                .get(&parent_idx)
+                .cloned()
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "aggregation",
+                    node: name.clone(),
+                    detail: "parent node has no computed NodeProperties".to_string(),
+                })?;
+
+            let eligibility = qualifies_for_streaming(&parent_props, &group_by);
+
+            // Resolve hint → (strategy, fallback_reason, skipped_streaming_available,
+            // qualified_sort_order). On explicit Streaming + ineligible, hard-error.
+            let resolved: ResolvedStrategy = match hint {
+                AggregateStrategyHint::Auto => match &eligibility {
+                    StreamingEligibility::Streaming {
+                        qualified_sort_order,
+                        ..
+                    } => ResolvedStrategy {
+                        strategy: AggregateStrategy::Streaming,
+                        fallback_reason: None,
+                        skipped_streaming_available: false,
+                        qualified_sort_order: Some(qualified_sort_order.clone()),
+                    },
+                    StreamingEligibility::HashFallback { reason } => ResolvedStrategy {
+                        strategy: AggregateStrategy::Hash,
+                        fallback_reason: Some(reason.clone()),
+                        skipped_streaming_available: false,
+                        qualified_sort_order: None,
+                    },
+                },
+                AggregateStrategyHint::Hash => ResolvedStrategy {
+                    strategy: AggregateStrategy::Hash,
+                    fallback_reason: None,
+                    skipped_streaming_available: matches!(
+                        eligibility,
+                        StreamingEligibility::Streaming { .. }
+                    ),
+                    qualified_sort_order: None,
+                },
+                AggregateStrategyHint::Streaming => match &eligibility {
+                    StreamingEligibility::Streaming {
+                        qualified_sort_order,
+                        ..
+                    } => ResolvedStrategy {
+                        strategy: AggregateStrategy::Streaming,
+                        fallback_reason: None,
+                        skipped_streaming_available: false,
+                        qualified_sort_order: Some(qualified_sort_order.clone()),
+                    },
+                    StreamingEligibility::HashFallback { .. } => {
+                        let msg = render_unordered_streaming_error(&parent_props, &group_by, &name);
+                        return Err(PipelineError::Compilation {
+                            transform_name: name.clone(),
+                            messages: vec![msg],
+                        });
+                    }
+                },
+            };
+
+            // Capture parent provenance before mutating self.graph for the
+            // streaming-output ordering chain.
+            let parent_provenance = parent_props.ordering.provenance.clone();
+
+            // Mutate the PlanNode in place.
+            if let PlanNode::Aggregation {
+                strategy,
+                fallback_reason,
+                skipped_streaming_available,
+                qualified_sort_order,
+                ..
+            } = &mut self.graph[idx]
+            {
+                *strategy = resolved.strategy;
+                *fallback_reason = resolved.fallback_reason.clone();
+                *skipped_streaming_available = resolved.skipped_streaming_available;
+                *qualified_sort_order = resolved.qualified_sort_order.clone();
+            }
+
+            // Overwrite the side-table ordering for this aggregation node
+            // (D77 — single source of truth for aggregation ordering).
+            let new_props = match resolved.strategy {
+                AggregateStrategy::Streaming => NodeProperties {
+                    ordering: Ordering {
+                        sort_order: resolved.qualified_sort_order.clone(),
+                        provenance: OrderingProvenance::IntroducedByStreamingAggregate {
+                            at_node: name.clone(),
+                            enabled_by: Box::new(parent_provenance),
+                        },
+                    },
+                    partitioning: Partitioning {
+                        kind: PartitioningKind::Single,
+                        provenance: PartitioningProvenance::SingleStream,
+                    },
+                },
+                AggregateStrategy::Hash => NodeProperties {
+                    ordering: Ordering {
+                        sort_order: None,
+                        provenance: OrderingProvenance::DestroyedByHashAggregate {
+                            at_node: name.clone(),
+                            confidence: Confidence::Proven,
+                        },
+                    },
+                    partitioning: Partitioning {
+                        kind: PartitioningKind::Single,
+                        provenance: PartitioningProvenance::SingleStream,
+                    },
+                },
+            };
+            self.node_properties.insert(idx, new_props);
+        }
+
+        Ok(())
+    }
+}
+
+/// Internal carrier for `select_aggregation_strategies` resolution result.
+struct ResolvedStrategy {
+    strategy: crate::aggregation::AggregateStrategy,
+    fallback_reason: Option<String>,
+    skipped_streaming_available: bool,
+    qualified_sort_order: Option<Vec<SortField>>,
 }
 
 /// Per-node property derivation rule. Pure function over the node and its
@@ -1967,17 +2158,19 @@ fn compute_one(
             }
         }
 
-        PlanNode::Aggregation { name, .. } => {
-            // Hash aggregation destroys input ordering and produces a
-            // single stream of one record per group key. The streaming
-            // variant (16.4) preserves the prefix; until that lands the
-            // conservative answer is "no ordering, single stream".
+        PlanNode::Aggregation { .. } => {
+            // D77: aggregation node ordering is the sole responsibility of
+            // the `select_aggregation_strategies` post-pass (Task 16.4.9),
+            // which runs immediately after `compute_node_properties` and
+            // overwrites this entry based on the resolved strategy. The
+            // defensive default is "no ordering, single stream" so any
+            // bug that bypasses the post-pass produces conservative
+            // (correct-but-suboptimal) downstream eligibility decisions
+            // rather than silently asserting a false ordering.
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
-                    provenance: OrderingProvenance::Preserved {
-                        from_node: name.clone(),
-                    },
+                    provenance: OrderingProvenance::NoOrdering,
                 },
                 partitioning: single_stream_partitioning(),
             }
@@ -3665,5 +3858,241 @@ mod tests {
             .expect("sort node ordering.sort_order must be present");
         assert_eq!(order.len(), 1);
         assert_eq!(order[0]["field"], "k");
+    }
+
+    // ── Phase 16 Task 16.4.9 — select_aggregation_strategies tests ─────────
+
+    fn make_aggregation(
+        name: &str,
+        group_by: Vec<&str>,
+        hint: crate::config::AggregateStrategyHint,
+    ) -> PlanNode {
+        use cxl::plan::CompiledAggregate;
+        PlanNode::Aggregation {
+            name: name.into(),
+            config: AggregateConfig {
+                group_by: group_by.into_iter().map(String::from).collect(),
+                cxl: "emit n = count()".to_string(),
+                strategy: hint,
+            },
+            compiled: Arc::new(CompiledAggregate {
+                bindings: vec![],
+                group_by_indices: vec![],
+                group_by_fields: vec![],
+                pre_agg_filter: None,
+                emits: vec![],
+            }),
+            strategy: AggregateStrategy::Hash,
+            output_schema: Arc::new(Schema::new(vec![])),
+            fallback_reason: None,
+            skipped_streaming_available: false,
+            qualified_sort_order: None,
+        }
+    }
+
+    /// Build a fixture: Source(sort? optional) -> Aggregation(group_by, hint).
+    fn agg_fixture(
+        sort_field: Option<&str>,
+        group_by: Vec<&str>,
+        hint: crate::config::AggregateStrategyHint,
+    ) -> (ExecutionPlanDag, NodeIndex) {
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                make_aggregation("agg", group_by, hint),
+            ],
+            &[(0, 1)],
+        );
+        let so = sort_field.map(|f| vec![sf(f, SortOrder::Asc, None)]);
+        let inputs = HashMap::from([("src".to_string(), input_with_sort("src", so))]);
+        dag.compute_node_properties(&inputs).unwrap();
+        (dag, idxs[1])
+    }
+
+    #[test]
+    fn test_select_strategies_auto_qualifies_flips_to_streaming() {
+        let (mut dag, agg_idx) = agg_fixture(
+            Some("dept"),
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Auto,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        match &dag.graph[agg_idx] {
+            PlanNode::Aggregation {
+                strategy,
+                fallback_reason,
+                qualified_sort_order,
+                ..
+            } => {
+                assert!(matches!(strategy, AggregateStrategy::Streaming));
+                assert!(fallback_reason.is_none());
+                assert!(qualified_sort_order.is_some());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_select_strategies_auto_ineligible_stays_hash_with_reason() {
+        let (mut dag, agg_idx) = agg_fixture(
+            None, // unsorted
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Auto,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        match &dag.graph[agg_idx] {
+            PlanNode::Aggregation {
+                strategy,
+                fallback_reason,
+                ..
+            } => {
+                assert!(matches!(strategy, AggregateStrategy::Hash));
+                assert!(fallback_reason.is_some());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_select_strategies_explicit_streaming_eligible_ok() {
+        let (mut dag, agg_idx) = agg_fixture(
+            Some("dept"),
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Streaming,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        match &dag.graph[agg_idx] {
+            PlanNode::Aggregation { strategy, .. } => {
+                assert!(matches!(strategy, AggregateStrategy::Streaming));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_select_strategies_explicit_streaming_ineligible_compile_error_message_quotes_reason() {
+        let (mut dag, _) = agg_fixture(
+            None,
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Streaming,
+        );
+        let err = dag.select_aggregation_strategies().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("CXL0419") || msg.contains("agg"));
+        // Compilation variant carries the rendered walker output.
+        match err {
+            PipelineError::Compilation { messages, .. } => {
+                let joined = messages.join("\n");
+                assert!(joined.contains("CXL0419"));
+                assert!(joined.contains("strategy: streaming"));
+                assert!(joined.contains("help:"));
+            }
+            other => panic!("expected Compilation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_strategies_explicit_hash_skips_streaming_path_records_annotation() {
+        let (mut dag, agg_idx) = agg_fixture(
+            Some("dept"),
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Hash,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        match &dag.graph[agg_idx] {
+            PlanNode::Aggregation {
+                strategy,
+                skipped_streaming_available,
+                ..
+            } => {
+                assert!(matches!(strategy, AggregateStrategy::Hash));
+                assert!(*skipped_streaming_available);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_select_strategies_streaming_node_ordering_provenance_is_introduced() {
+        let (mut dag, agg_idx) = agg_fixture(
+            Some("dept"),
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Auto,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        let props = dag.node_properties.get(&agg_idx).unwrap();
+        assert!(props.ordering.sort_order.is_some());
+        assert!(matches!(
+            props.ordering.provenance,
+            OrderingProvenance::IntroducedByStreamingAggregate { .. }
+        ));
+    }
+
+    #[test]
+    fn test_select_strategies_streaming_node_provenance_enabled_by_points_to_upstream() {
+        let (mut dag, agg_idx) = agg_fixture(
+            Some("dept"),
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Auto,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        let props = dag.node_properties.get(&agg_idx).unwrap();
+        match &props.ordering.provenance {
+            OrderingProvenance::IntroducedByStreamingAggregate { enabled_by, .. } => {
+                // Source declared the input directly.
+                assert!(matches!(
+                    **enabled_by,
+                    OrderingProvenance::DeclaredOnInput { .. }
+                ));
+            }
+            other => panic!("expected IntroducedByStreamingAggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_strategies_hash_node_ordering_provenance_is_destroyed() {
+        let (mut dag, agg_idx) = agg_fixture(
+            None,
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Auto,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        let props = dag.node_properties.get(&agg_idx).unwrap();
+        assert!(props.ordering.sort_order.is_none());
+        assert!(matches!(
+            props.ordering.provenance,
+            OrderingProvenance::DestroyedByHashAggregate { .. }
+        ));
+    }
+
+    #[test]
+    fn test_select_strategies_global_fold_always_streams() {
+        // Empty group_by → always Streaming, even with no upstream sort.
+        let (mut dag, agg_idx) =
+            agg_fixture(None, vec![], crate::config::AggregateStrategyHint::Auto);
+        dag.select_aggregation_strategies().unwrap();
+        match &dag.graph[agg_idx] {
+            PlanNode::Aggregation { strategy, .. } => {
+                assert!(matches!(strategy, AggregateStrategy::Streaming));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_explain_renders_strategy_hint_and_resolved_strategy_distinctly() {
+        // After post-pass: config.strategy (hint) and PlanNode.strategy (resolved)
+        // both appear in JSON, distinctly.
+        let (mut dag, agg_idx) = agg_fixture(
+            Some("dept"),
+            vec!["dept"],
+            crate::config::AggregateStrategyHint::Auto,
+        );
+        dag.select_aggregation_strategies().unwrap();
+        let json = serde_json::to_value(&dag.graph[agg_idx]).unwrap();
+        // Hint surfaces under config.strategy.
+        assert_eq!(json["config"]["strategy"], "auto");
+        // Resolved strategy is the top-level field.
+        assert_eq!(json["strategy"], "streaming");
     }
 }
