@@ -59,9 +59,11 @@ mod tests {
             Err(
                 PipelineError::Config(_)
                 | PipelineError::Schema(_)
-                | PipelineError::Compilation { .. },
+                | PipelineError::Compilation { .. }
+                | PipelineError::Internal { .. }
+                | PipelineError::SortOrderViolation { .. },
             ) => 1,
-            Err(PipelineError::Eval(_)) => 3,
+            Err(PipelineError::Eval(_) | PipelineError::Accumulator { .. }) => 3,
             Err(
                 PipelineError::Io(_)
                 | PipelineError::Format(_)

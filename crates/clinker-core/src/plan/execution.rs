@@ -326,6 +326,17 @@ impl ExecutionPlanDag {
         {
             return true;
         }
+        // Aggregation nodes require the DAG walk path so the dispatch arm
+        // (Task 16.3.13) handles them; the legacy streaming path would
+        // otherwise row-evaluate the aggregate program and raise
+        // "row-level expression, got aggregate function call".
+        if self
+            .graph
+            .node_weights()
+            .any(|n| matches!(n, PlanNode::Aggregation { .. }))
+        {
+            return true;
+        }
         // Check for Route nodes with outgoing edges (in-pipeline branching)
         for idx in self.graph.node_indices() {
             if matches!(self.graph[idx], PlanNode::Route { .. }) {

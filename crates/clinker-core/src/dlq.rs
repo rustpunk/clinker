@@ -17,6 +17,10 @@ pub enum DlqErrorCategory {
     NanInOutputField,
     AggregateTypeError,
     ValidationFailure,
+    /// Aggregate finalize-time failure (e.g. SumOverflow during finalize()).
+    /// Distinct from `AggregateTypeError`, which fires during the per-record
+    /// add path. Routed by the Phase 16 executor dispatch arm (Task 16.3.13).
+    AggregateFinalize,
 }
 
 impl DlqErrorCategory {
@@ -28,8 +32,14 @@ impl DlqErrorCategory {
             Self::NanInOutputField => "nan_in_output_field",
             Self::AggregateTypeError => "aggregate_type_error",
             Self::ValidationFailure => "validation_failure",
+            Self::AggregateFinalize => "aggregate_finalize",
         }
     }
+}
+
+/// Stage label helper for aggregate-transform DLQ entries (Task 16.3.13).
+pub fn stage_aggregate(transform: &str) -> String {
+    format!("aggregate:{transform}")
 }
 
 /// DLQ column names per spec §10.4.

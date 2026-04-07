@@ -16,6 +16,32 @@ pub enum PipelineError {
     /// Multiple errors collected from parallel writer threads.
     /// DataFusion `Collection` pattern (PR #14439).
     Multiple(Vec<PipelineError>),
+    /// Plan-time invariant violated at runtime — Clinker bug, not a data
+    /// error. ALWAYS aborts the run regardless of `ErrorStrategy::Continue`.
+    /// Mirrors DataFusion's `internal_err!` macro and PR #9241 / #12086
+    /// post-mortem on unreachable-arm panics in long-lived executors.
+    Internal {
+        op: &'static str,
+        node: String,
+        detail: String,
+    },
+    /// Finalize-time accumulator failure (overflow, type mismatch, etc.).
+    /// Wraps `AccumulatorError` with the failing transform + binding for
+    /// diagnostics. Routed to the DLQ under `Continue`, propagated under
+    /// `FailFast`.
+    Accumulator {
+        transform: String,
+        binding: String,
+        source: clinker_record::accumulator::AccumulatorError,
+    },
+    /// Streaming aggregation detected an out-of-order group key. ALWAYS
+    /// hard-aborts regardless of error strategy — this is an invariant
+    /// violation, not a data error. Producer wiring lands in Task 16.4;
+    /// the variant ships in 16.3.13 per the DataFusion / Arrow / Vector
+    /// "forward error variants are normal" pattern.
+    SortOrderViolation {
+        message: String,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -46,6 +72,20 @@ impl fmt::Display for PipelineError {
                     write!(f, "\n  - {e}")?;
                 }
                 Ok(())
+            }
+            Self::Internal { op, node, detail } => {
+                write!(f, "internal error in {op} '{node}': {detail}")
+            }
+            Self::Accumulator {
+                transform,
+                binding,
+                source,
+            } => write!(
+                f,
+                "accumulator finalize failed for {transform}.{binding}: {source:?}"
+            ),
+            Self::SortOrderViolation { message } => {
+                write!(f, "sort-order violation: {message}")
             }
         }
     }

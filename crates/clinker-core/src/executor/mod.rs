@@ -1455,7 +1455,11 @@ impl PipelineExecutor {
             all_records.push((record, row_num));
         }
 
-        if all_records.is_empty() {
+        // D12: a global-fold aggregate (group_by: []) must still emit one
+        // row over empty input, so we cannot early-return when the plan
+        // contains an Aggregation node — the DAG walk needs to fire the
+        // aggregator's empty-input special case.
+        if all_records.is_empty() && !plan.has_branching() {
             return Ok((counters, dlq_entries, rss_bytes()));
         }
 
@@ -2716,15 +2720,165 @@ impl PipelineExecutor {
                     node_buffers.insert(node_idx, out);
                 }
 
-                PlanNode::Aggregation { ref name, .. } => {
-                    // Task 16.3.13 wires the real hash-aggregation dispatch.
-                    // Until then no `PlanNode::Aggregation` is constructed
-                    // (16.3.6 plan-compile routing not yet landed), so this
-                    // arm is unreachable in shipped plans.
-                    unreachable!(
-                        "PlanNode::Aggregation `{name}` reached executor before \
-                         Task 16.3.13 dispatch implementation landed"
-                    );
+                PlanNode::Aggregation {
+                    ref name,
+                    ref compiled,
+                    strategy: agg_strategy,
+                    ref output_schema,
+                    ..
+                } => {
+                    // Task 16.3.13 — hash-aggregation dispatch arm.
+                    //
+                    // DataFusion PR #9241 / #12086 lesson: any
+                    // `PipelineError::Internal` raised here (e.g. via
+                    // `single_predecessor`, or via the wrapper enum's
+                    // Streaming-not-yet-implemented arm) MUST hard-abort
+                    // regardless of `error_strategy`. We achieve this
+                    // structurally by propagating those errors via `?`
+                    // before reaching the per-record FailFast/Continue
+                    // match — internal invariants always abort.
+                    use crate::aggregation::{
+                        AggregateStream, HashAggError, SortRow as AggSortRow,
+                    };
+
+                    let pred = single_predecessor(plan, node_idx, "aggregation", name)?;
+                    let input = node_buffers.remove(&pred).unwrap_or_default();
+
+                    // Build the per-aggregation runtime artifacts. The
+                    // executor owns the evaluator + spill metadata; the
+                    // wrapper enum owns the engine.
+                    let transform_idx = transform_by_name.get(name.as_str()).copied();
+                    let evaluator = match transform_idx {
+                        Some(idx) => ProgramEvaluator::new(
+                            Arc::clone(&transforms[idx].typed),
+                            transforms[idx].has_distinct(),
+                        ),
+                        None => {
+                            return Err(PipelineError::Internal {
+                                op: "aggregation",
+                                node: name.clone(),
+                                detail: "no compiled transform found for aggregate node"
+                                    .to_string(),
+                            });
+                        }
+                    };
+
+                    // Spill schema follows the format used by
+                    // `HashAggregator::spill`: group-by columns ++
+                    // `__acc_state` ++ `__meta_tracker`.
+                    let mut spill_columns: Vec<Box<str>> = compiled
+                        .group_by_fields
+                        .iter()
+                        .map(|s| Box::<str>::from(s.as_str()))
+                        .collect();
+                    spill_columns.push(Box::<str>::from("__acc_state"));
+                    spill_columns.push(Box::<str>::from("__meta_tracker"));
+                    let spill_schema = Arc::new(Schema::new(spill_columns));
+
+                    let spill_sort_fields: Vec<crate::config::SortField> = compiled
+                        .group_by_fields
+                        .iter()
+                        .map(|name| crate::config::SortField {
+                            field: name.clone(),
+                            order: crate::config::SortOrder::Asc,
+                            null_order: Some(crate::config::NullOrder::First),
+                        })
+                        .collect();
+
+                    let memory_limit = parse_memory_limit(config);
+
+                    let mut stream = AggregateStream::for_node(
+                        Arc::clone(compiled),
+                        evaluator,
+                        agg_strategy,
+                        Arc::clone(output_schema),
+                        spill_schema,
+                        spill_sort_fields,
+                        memory_limit,
+                        None,
+                        name.clone(),
+                    )?;
+
+                    let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+                    let input_count = input.len() as u64;
+
+                    for (record, row_num, emitted, accumulated) in &input {
+                        let ctx = EvalContext {
+                            stable: &stable,
+                            source_file: &source_file_arc,
+                            source_row: *row_num,
+                        };
+                        if let Err(e) =
+                            stream.add_record(record, *row_num, emitted, accumulated, &ctx)
+                        {
+                            match config.error_handling.strategy {
+                                ErrorStrategy::FailFast => return Err(e.into()),
+                                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                    counters.dlq_count += 1;
+                                    dlq_entries.push(DlqEntry {
+                                        source_row: *row_num,
+                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                        error_message: format!("aggregate {name}: {e}"),
+                                        original_record: record.clone(),
+                                        stage: Some(crate::dlq::stage_aggregate(name)),
+                                        route: None,
+                                        trigger: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Finalize. Accumulator finalize errors get the
+                    // typed `PipelineError::Accumulator` mapping; under
+                    // `Continue` we route to the DLQ and emit zero rows
+                    // for the failed group. All other engine errors
+                    // propagate (Internal/Spill/Residual always abort).
+                    let ctx = EvalContext {
+                        stable: &stable,
+                        source_file: &source_file_arc,
+                        source_row: 0,
+                    };
+                    let out_rows: Vec<AggSortRow> = match stream.finalize(&ctx) {
+                        Ok(rows) => rows,
+                        Err(HashAggError::Accumulator {
+                            transform,
+                            binding,
+                            source,
+                        }) => match config.error_handling.strategy {
+                            ErrorStrategy::FailFast => {
+                                return Err(PipelineError::Accumulator {
+                                    transform,
+                                    binding,
+                                    source,
+                                });
+                            }
+                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                                counters.dlq_count += 1;
+                                let synthetic = if let Some((rec, _, _, _)) = input.first() {
+                                    rec.clone()
+                                } else {
+                                    Record::new(Arc::clone(output_schema), Vec::new())
+                                };
+                                dlq_entries.push(DlqEntry {
+                                    source_row: 0,
+                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                    error_message: format!(
+                                        "aggregate {transform}.{binding}: {source:?}"
+                                    ),
+                                    original_record: synthetic,
+                                    stage: Some(crate::dlq::stage_aggregate(name)),
+                                    route: None,
+                                    trigger: true,
+                                });
+                                Vec::new()
+                            }
+                        },
+                        Err(other) => return Err(other.into()),
+                    };
+
+                    collector.record(agg_timer.finish(input_count, out_rows.len() as u64));
+                    node_buffers.insert(node_idx, out_rows);
                 }
 
                 PlanNode::Output { ref name } => {
@@ -3729,6 +3883,30 @@ fn evaluate_single_transform(
 }
 
 /// Parse memory limit from config (default 512MB).
+/// Plan-invariant predecessor lookup for nodes that require exactly one
+/// upstream input (currently `PlanNode::Aggregation`). Returns
+/// `PipelineError::Internal` on misshapen plans — never panics. Mirrors
+/// DataFusion's `internal_err!` macro per drill pass 7 D58.
+pub(crate) fn single_predecessor(
+    plan: &ExecutionPlanDag,
+    node_idx: petgraph::graph::NodeIndex,
+    op: &'static str,
+    node_name: &str,
+) -> Result<petgraph::graph::NodeIndex, PipelineError> {
+    let preds: Vec<_> = plan
+        .graph
+        .neighbors_directed(node_idx, Direction::Incoming)
+        .collect();
+    match preds.as_slice() {
+        [p] => Ok(*p),
+        _ => Err(PipelineError::Internal {
+            op,
+            node: node_name.to_string(),
+            detail: format!("expected exactly 1 predecessor, got {}", preds.len()),
+        }),
+    }
+}
+
 fn parse_memory_limit(config: &PipelineConfig) -> usize {
     config
         .pipeline

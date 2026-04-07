@@ -38,6 +38,7 @@ use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
 use indexmap::IndexMap;
 
 use crate::config::{NullOrder, SortField, SortOrder};
+use crate::error::PipelineError;
 use crate::pipeline::loser_tree::{LoserTree, MergeEntry};
 use crate::pipeline::sort_key::encode_sort_key;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
@@ -643,7 +644,74 @@ mod tracker_tests {
 pub struct AggregatorGroupState {
     pub row: AccumulatorRow,
     pub meta_tracker: MetadataCommonTracker,
+    /// D57 sidecar — minimum `row_num` across every input record folded
+    /// into this group. Initialized to `u64::MAX`; the executor stores the
+    /// reduced value into the SortRow tuple at finalize time. The
+    /// global-fold empty-input case (D12) emits `0` because no record
+    /// ever updates this field.
+    pub min_row_num: u64,
+    /// D57 sidecar — intersection of every record's `emitted` IndexMap
+    /// (the executor's per-record "accumulated emitted" sidecar). `None`
+    /// before the first record; `Some(...)` after, narrowing on each
+    /// add. Empty IndexMap means "no common keys".
+    pub common_emitted: Option<IndexMap<String, Value>>,
+    /// D57 sidecar — union of every record's `accumulated` IndexMap
+    /// (the executor's per-record "accumulated metadata" sidecar). On
+    /// key conflicts the **first** value wins (insertion order); this
+    /// matches the existing `MetadataCommonTracker` first-seen semantics.
+    pub union_accumulated: IndexMap<String, Value>,
 }
+
+impl AggregatorGroupState {
+    fn new(row: AccumulatorRow) -> Self {
+        Self {
+            row,
+            meta_tracker: MetadataCommonTracker::new(),
+            min_row_num: u64::MAX,
+            common_emitted: None,
+            union_accumulated: IndexMap::new(),
+        }
+    }
+}
+
+/// D57 helper — narrow `prev` to keys present in `incoming` whose values
+/// match. Used to fold the per-record `emitted` sidecar into a per-group
+/// intersection.
+fn intersect_emitted(
+    prev: IndexMap<String, Value>,
+    incoming: &IndexMap<String, Value>,
+) -> IndexMap<String, Value> {
+    let mut out = IndexMap::with_capacity(prev.len().min(incoming.len()));
+    for (k, v) in prev {
+        if let Some(other) = incoming.get(&k)
+            && other == &v
+        {
+            out.insert(k, v);
+        }
+    }
+    out
+}
+
+/// D57 helper — first-seen union: keep `dst` values where they exist,
+/// insert from `src` only when the key is missing. Mirrors the
+/// `MetadataCommonTracker` first-seen-wins precedent.
+fn union_accumulated_into(dst: &mut IndexMap<String, Value>, src: &IndexMap<String, Value>) {
+    for (k, v) in src {
+        if !dst.contains_key(k) {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// Per-node-buffer row produced by every executor node that emits into
+/// `node_buffers`. Mirrors the local 4-tuple type alias used by
+/// `PlanNode::Sort` and `execute_dag_branching`.
+pub type SortRow = (
+    Record,
+    u64,
+    IndexMap<String, Value>,
+    IndexMap<String, Value>,
+);
 
 /// Errors raised by the hash aggregator hot loop. The 16.3.13 dispatch
 /// arm wraps these into `PipelineError` for DLQ routing; until then the
@@ -708,6 +776,121 @@ impl std::error::Error for HashAggError {}
 impl From<EvalError> for HashAggError {
     fn from(e: EvalError) -> Self {
         HashAggError::EvalFailed(e)
+    }
+}
+
+/// Map a `HashAggError` to a `PipelineError` for the executor dispatch
+/// arm. Accumulator-finalize errors get a dedicated typed variant; the
+/// remaining cases are wrapped in `PipelineError::Eval` (data errors) or
+/// `PipelineError::Internal` (engine bugs / unsupported residuals).
+impl From<HashAggError> for PipelineError {
+    fn from(e: HashAggError) -> Self {
+        match e {
+            HashAggError::EvalFailed(eval) => PipelineError::Eval(eval),
+            HashAggError::GroupKey {
+                field,
+                row,
+                message,
+            } => PipelineError::Internal {
+                op: "aggregation",
+                node: String::new(),
+                detail: format!("group-key field `{field}` at row {row}: {message}"),
+            },
+            HashAggError::Spill(msg) => PipelineError::Internal {
+                op: "aggregation",
+                node: String::new(),
+                detail: format!("spill failed: {msg}"),
+            },
+            HashAggError::Accumulator {
+                transform,
+                binding,
+                source,
+            } => PipelineError::Accumulator {
+                transform,
+                binding,
+                source,
+            },
+            HashAggError::Residual(r) => PipelineError::Internal {
+                op: "aggregation",
+                node: String::new(),
+                detail: format!("aggregate residual eval failed: {r}"),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AggregateStream wrapper enum (Task 16.3.13)
+// ---------------------------------------------------------------------------
+
+/// Executor-facing aggregation dispatch wrapper.
+///
+/// Single variant in 16.3.13. The `#[non_exhaustive]` attribute lets
+/// Task 16.4 add a `Streaming(StreamingAggregator<AddRaw>)` variant
+/// non-breakingly, in the same commit that introduces the real
+/// `AccumulatorOp` / `AddRaw` types — avoiding the DataFusion #12086
+/// failure mode of placeholder generic parameters in dispatch enums.
+#[non_exhaustive]
+pub enum AggregateStream {
+    Hash(HashAggregator),
+}
+
+impl AggregateStream {
+    /// Construct the stream for a single `PlanNode::Aggregation` node.
+    ///
+    /// Streaming strategy is rejected with a fallible
+    /// `PipelineError::Internal` (NOT `todo!()` / `unreachable!()`) per
+    /// the DataFusion #12086 lesson on unreachable arms in long-lived
+    /// executor dispatch tables. The real `Streaming` arm lands in Task
+    /// 16.4 alongside its inner `StreamingAggregator<AddRaw>`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_node(
+        compiled: Arc<CompiledAggregate>,
+        evaluator: ProgramEvaluator,
+        strategy: AggregateStrategy,
+        output_schema: Arc<Schema>,
+        spill_schema: Arc<Schema>,
+        spill_sort_fields: Vec<SortField>,
+        memory_budget: usize,
+        spill_dir: Option<PathBuf>,
+        transform_name: String,
+    ) -> Result<Self, PipelineError> {
+        match strategy {
+            AggregateStrategy::Hash => Ok(Self::Hash(HashAggregator::new(
+                compiled,
+                evaluator,
+                output_schema,
+                spill_schema,
+                spill_sort_fields,
+                memory_budget,
+                spill_dir,
+                transform_name,
+            ))),
+            AggregateStrategy::Streaming => Err(PipelineError::Internal {
+                op: "aggregation",
+                node: transform_name,
+                detail: "streaming aggregation not yet implemented (Task 16.4)".to_string(),
+            }),
+        }
+    }
+
+    pub fn add_record(
+        &mut self,
+        record: &Record,
+        row_num: u64,
+        emitted: &IndexMap<String, Value>,
+        accumulated: &IndexMap<String, Value>,
+        ctx: &EvalContext,
+    ) -> Result<(), HashAggError> {
+        match self {
+            Self::Hash(h) => h.add_record(record, row_num, emitted, accumulated, ctx),
+        }
+    }
+
+    pub fn finalize(self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
+        match self {
+            Self::Hash(h) => h.finalize(ctx),
+        }
     }
 }
 
@@ -835,7 +1018,14 @@ impl HashAggregator {
     /// 6. Walk record metadata into the per-group `MetadataCommonTracker`,
     ///    skipping keys the user has explicitly emitted.
     /// 7. Resize-aware spill trigger.
-    pub fn add_record(&mut self, record: &Record, ctx: &EvalContext) -> Result<(), HashAggError> {
+    pub fn add_record(
+        &mut self,
+        record: &Record,
+        row_num: u64,
+        emitted: &IndexMap<String, Value>,
+        accumulated: &IndexMap<String, Value>,
+        ctx: &EvalContext,
+    ) -> Result<(), HashAggError> {
         // 1. Pre-aggregation filter (D9).
         if let Some(filter) = &self.pre_agg_filter {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
@@ -887,10 +1077,19 @@ impl HashAggregator {
         let group_state = self
             .groups
             .entry(key)
-            .or_insert_with(|| AggregatorGroupState {
-                row: self.factory.create_accumulators(),
-                meta_tracker: MetadataCommonTracker::new(),
-            });
+            .or_insert_with(|| AggregatorGroupState::new(self.factory.create_accumulators()));
+
+        // D57 sidecar reductions — fold the per-record (row_num, emitted,
+        // accumulated) triple into the per-group state. These three values
+        // become the SortRow tuple's last three slots at finalize time.
+        if row_num < group_state.min_row_num {
+            group_state.min_row_num = row_num;
+        }
+        group_state.common_emitted = Some(match group_state.common_emitted.take() {
+            None => emitted.clone(),
+            Some(prev) => intersect_emitted(prev, emitted),
+        });
+        union_accumulated_into(&mut group_state.union_accumulated, accumulated);
 
         // 5. BindingArg dispatch hot loop (D1).
         let bindings = self.factory.compiled().bindings.clone();
@@ -1011,24 +1210,33 @@ impl HashAggregator {
     ///    `MetadataCommonTracker` partials at each key boundary, and
     ///    route each finalized group through the same
     ///    `finalize_group` helper so both paths agree byte-for-byte.
-    pub fn finalize(mut self, ctx: &EvalContext) -> Result<Vec<Record>, HashAggError> {
-        // D12: global-fold empty-input special case.
+    pub fn finalize(mut self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
+        // D12: global-fold empty-input special case. No record was ever
+        // observed, so the per-group sidecar reductions are at their
+        // identity values: row_num=0 (the only legitimate use of zero —
+        // every real per-record row_num is 1-based), emitted=empty,
+        // accumulated=empty. Documented inline so future readers do not
+        // mistake the zero for a missing-data sentinel.
         if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
             let empty_key: Vec<GroupByKey> = Vec::new();
-            let state = AggregatorGroupState {
-                row: self.factory.create_accumulators(),
-                meta_tracker: MetadataCommonTracker::new(),
-            };
+            let state = AggregatorGroupState::new(self.factory.create_accumulators());
             let record = self.finalize_group(&empty_key, &state, ctx)?;
-            return Ok(vec![record]);
+            return Ok(vec![(record, 0, IndexMap::new(), IndexMap::new())]);
         }
 
         if self.spill_files.is_empty() {
             let entries: Vec<(Vec<GroupByKey>, AggregatorGroupState)> =
                 self.groups.drain().collect();
-            let mut out = Vec::with_capacity(entries.len());
+            let mut out: Vec<SortRow> = Vec::with_capacity(entries.len());
             for (key, state) in entries {
-                out.push(self.finalize_group(&key, &state, ctx)?);
+                let record = self.finalize_group(&key, &state, ctx)?;
+                let row_num = if state.min_row_num == u64::MAX {
+                    0
+                } else {
+                    state.min_row_num
+                };
+                let emitted = state.common_emitted.unwrap_or_default();
+                out.push((record, row_num, emitted, state.union_accumulated));
             }
             Ok(out)
         } else {
@@ -1109,7 +1317,7 @@ impl HashAggregator {
     /// `MetadataCommonTracker::merge` combine partial states
     /// associatively — conflicts propagate correctly because both
     /// merges are associative per D11 revised.
-    fn finalize_with_spill(mut self, ctx: &EvalContext) -> Result<Vec<Record>, HashAggError> {
+    fn finalize_with_spill(mut self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
         if !self.groups.is_empty() {
             self.spill()?;
         }
@@ -1151,7 +1359,16 @@ impl HashAggregator {
         let mut tree = LoserTree::new(initial);
 
         let gb_count = self.group_by_indices.len();
-        let mut out: Vec<Record> = Vec::new();
+        // FALLBACK per drill-pass-7 Option (b): the spill envelope does
+        // NOT carry the D57 sidecars (row_num / emitted / accumulated).
+        // For spill-recovered groups we emit `(row_num=0, emitted=empty,
+        // accumulated=empty)` because the per-record sidecars were lost
+        // when the group was serialized as an `AccumulatorRow` +
+        // `MetadataCommonTracker` blob in `spill()`. Plumbing the
+        // sidecars through the spill format is tracked as a 16.4.0
+        // follow-up. This fallback is the documented compromise that
+        // keeps 16.3.13 atomic.
+        let mut out: Vec<SortRow> = Vec::new();
         let mut current: Option<(Vec<GroupByKey>, AggregatorGroupState)> = None;
 
         while tree.winner().is_some() {
@@ -1169,7 +1386,8 @@ impl HashAggregator {
                 cur_state.meta_tracker.merge(state.meta_tracker);
             } else {
                 if let Some((k, s)) = current.take() {
-                    out.push(self.finalize_group(&k, &s, ctx)?);
+                    let record = self.finalize_group(&k, &s, ctx)?;
+                    out.push((record, 0, IndexMap::new(), IndexMap::new()));
                 }
                 current = Some((key, state));
             }
@@ -1187,7 +1405,8 @@ impl HashAggregator {
         }
 
         if let Some((k, s)) = current {
-            out.push(self.finalize_group(&k, &s, ctx)?);
+            let record = self.finalize_group(&k, &s, ctx)?;
+            out.push((record, 0, IndexMap::new(), IndexMap::new()));
         }
 
         Ok(out)
@@ -1247,7 +1466,11 @@ fn decode_spill_record(
     let meta_tracker: MetadataCommonTracker = serde_json::from_str(meta_json)
         .map_err(|e| HashAggError::Spill(format!("__meta_tracker decode: {e}")))?;
 
-    Ok((key, AggregatorGroupState { row, meta_tracker }))
+    // Spill-recovered state has no D57 sidecars (see Option (b) fallback
+    // comment in `finalize_with_spill`). Sidecars stay at identity values.
+    let mut state = AggregatorGroupState::new(row);
+    state.meta_tracker = meta_tracker;
+    Ok((key, state))
 }
 
 /// Total ordering on group-key tuples for spill sorting.

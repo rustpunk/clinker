@@ -269,9 +269,13 @@ fn main() -> ExitCode {
                     match &e {
                         PipelineError::Config(_)
                         | PipelineError::Schema(_)
-                        | PipelineError::Compilation { .. } => ExitCode::from(1),
+                        | PipelineError::Compilation { .. }
+                        | PipelineError::Internal { .. }
+                        | PipelineError::SortOrderViolation { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
-                        PipelineError::Eval(_) => ExitCode::from(3),
+                        PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
+                            ExitCode::from(3)
+                        }
                         PipelineError::Format(_)
                         | PipelineError::ThreadPool(_)
                         | PipelineError::Multiple(_) => ExitCode::from(4),
