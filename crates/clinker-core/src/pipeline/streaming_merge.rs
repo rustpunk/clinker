@@ -93,6 +93,16 @@ impl GroupBoundary {
     /// input record's SortRow; for the spill-recovery path the sidecars
     /// were lost at spill time and the caller supplies identity values
     /// (`0`, empty, empty).
+    ///
+    /// **Sort-order verification is always on in release builds (Task
+    /// 16.4.5).** The `Ordering::Less` arm below uses an unconditional
+    /// `Err` return, NOT `debug_assert!`. A user whose declared sort
+    /// order is wrong, or a Clinker bug that produces an out-of-order
+    /// LoserTree, will hard-abort with `SortOrderViolation` /
+    /// `MergeSortOrderViolation` regardless of build profile. The cost
+    /// is one `Vec<u8>::cmp` per group boundary (memcmp on the encoded
+    /// key bytes) — O(group_count), not O(record_count) — so the
+    /// always-on contract is free in steady state.
     pub(crate) fn push<F>(
         &mut self,
         state: AggregatorGroupState,

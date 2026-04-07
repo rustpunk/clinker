@@ -1601,3 +1601,108 @@ mod task_16_4_3_spill {
         }
     }
 }
+
+mod task_16_4_5 {
+    //! Task 16.4.5 — prove that sort-order verification in
+    //! `GroupBoundary::push` is unconditional, not gated on
+    //! `debug_assertions`. The verification mechanism itself landed
+    //! structurally as sub-change 6 of Task 16.4.3; this test gates
+    //! the always-on contract so a future refactor can't quietly
+    //! demote it to `debug_assert!` without turning red.
+    use std::sync::Arc;
+
+    use clinker_record::{Record, Schema, Value};
+    use indexmap::IndexMap;
+
+    use crate::aggregation::{AggregatorGroupState, HashAggError, group_by_sort_fields};
+    use crate::pipeline::sort_key::SortKeyEncoder;
+    use crate::pipeline::streaming_merge::{GroupBoundary, StreamingErrorMode};
+
+    fn schema(cols: &[&str]) -> Arc<Schema> {
+        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    }
+
+    fn rec(s: &Arc<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(Arc::clone(s), vals)
+    }
+
+    fn finalize_noop(_r: &Record, _s: &AggregatorGroupState) -> Result<Record, HashAggError> {
+        Ok(rec(&schema(&["x"]), vec![Value::Null]))
+    }
+
+    fn make_boundary(mode: StreamingErrorMode) -> GroupBoundary {
+        let fields = group_by_sort_fields(&["k".to_string()], &Schema::new(vec!["k".into()]));
+        GroupBoundary::new(SortKeyEncoder::new(fields), mode)
+    }
+
+    fn encode_key(b: &mut GroupBoundary, r: &Record) {
+        let mut buf = std::mem::take(&mut b.current);
+        b.encoder().encode_into(r, &mut buf);
+        b.current = buf;
+    }
+
+    /// The verification arm must fire regardless of `cfg!(debug_assertions)`.
+    /// We can't directly toggle the cfg in a unit test, but the structural
+    /// guarantee is: the same input that errors in debug must also error if
+    /// `debug_assertions` were off. Asserting the error fires unconditionally
+    /// here — combined with the doc contract on `GroupBoundary::push` and the
+    /// fact that the source uses `Err(...)` not `debug_assert!` — pins the
+    /// behavior. If anyone replaces the `Err` with `debug_assert!`, this
+    /// test still passes in debug but the doc-comment lie becomes load-bearing,
+    /// and the next reviewer catches it. We also assert via grep-style source
+    /// inspection that no `debug_assert` macro guards the comparison.
+    #[test]
+    fn test_verify_key_order_is_always_on_release_builds() {
+        let s = schema(&["k"]);
+        let mut b = make_boundary(StreamingErrorMode::UserInput);
+        let mut out = Vec::new();
+
+        // Install "b" first, then push "a" — strictly less, must error.
+        let rb = rec(&s, vec![Value::String("b".into())]);
+        encode_key(&mut b, &rb);
+        b.push(
+            AggregatorGroupState::new(Vec::new()),
+            rb,
+            (1, IndexMap::new(), IndexMap::new()),
+            &finalize_noop,
+            &mut out,
+        )
+        .expect("install");
+
+        let ra = rec(&s, vec![Value::String("a".into())]);
+        encode_key(&mut b, &ra);
+        let err = b
+            .push(
+                AggregatorGroupState::new(Vec::new()),
+                ra,
+                (2, IndexMap::new(), IndexMap::new()),
+                &finalize_noop,
+                &mut out,
+            )
+            .expect_err("must error on out-of-order key");
+        assert!(matches!(err, HashAggError::SortOrderViolation { .. }));
+    }
+
+    /// Source-level guard: assert the streaming_merge module body does not
+    /// contain `debug_assert` anywhere. This catches a future refactor that
+    /// would silently degrade verification to debug-only.
+    #[test]
+    fn test_streaming_merge_source_contains_no_debug_assert() {
+        let src = include_str!("../../pipeline/streaming_merge.rs");
+        // Strip line comments before scanning so the doc-contract that
+        // mentions `debug_assert!` by name doesn't trip the guard.
+        let code: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("debug_assert"),
+            "GroupBoundary verification must not be gated on debug_assertions \
+             (Task 16.4.5 always-on contract)"
+        );
+    }
+}
