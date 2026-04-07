@@ -1086,3 +1086,96 @@ fn eval_binding_arg_value(
         })),
     }
 }
+
+// ---------------------------------------------------------------------------
+// StreamingAggregator<MergeState> — spill-recovery stub (Task 16.3.11)
+// ---------------------------------------------------------------------------
+//
+// Minimal stub per the Task 16.3.11 plan entry: enough type surface for
+// `HashAggregator::finalize` (16.3.12) to drive the spill-merge loop
+// against a concrete API. The full monomorphized
+// `StreamingAggregator<Op: AccumulatorOp>` — including the `AddRaw`
+// mode, the `AccumulatorOp` trait, sort-order verification, and the
+// mid-stream boundary-emission fast path — lands in Task 16.4. 16.3
+// only needs the `MergeState` path to complete the spill recovery loop,
+// and the concrete emission logic (finalize residual + metadata merge +
+// Record construction) is wired alongside `HashAggregator::finalize` in
+// Task 16.3.12.
+
+/// Marker type selecting the spill-recovery merge mode.
+///
+/// In Task 16.4 this will gain a sibling `AddRaw` marker and an
+/// `AccumulatorOp` trait impl. For 16.3 it exists purely so the
+/// `StreamingAggregator<MergeState>` type name matches the one called
+/// out in the decisions log (D13) and is stable for 16.3.12's
+/// `merge_spilled` caller.
+#[derive(Debug, Default)]
+pub struct MergeState;
+
+/// Boundary-merging aggregator over a pre-sorted stream of spilled
+/// per-group `AggregatorGroupState` partials.
+///
+/// The hash path's spill loop (16.3.12) feeds this in sorted group-key
+/// order — LoserTree guarantees monotonic keys across all spill files.
+/// On every key boundary the previous group is finalized and pushed
+/// into the caller's output buffer; `flush` drains the final open
+/// group.
+///
+/// 16.3.11 lands the type + method surface; the bodies are filled in by
+/// Task 16.3.12 together with the shared finalize path so the merge
+/// and in-memory paths agree byte-for-byte on residual evaluation and
+/// metadata emission.
+pub struct StreamingAggregator<Op> {
+    #[allow(dead_code)]
+    factory: AccumulatorFactory,
+    #[allow(dead_code)]
+    output_schema: Arc<Schema>,
+    /// Currently open group being merged. `None` before the first
+    /// `process_spilled` call and after every boundary emission.
+    #[allow(dead_code)]
+    current: Option<(Vec<GroupByKey>, AggregatorGroupState)>,
+    _mode: std::marker::PhantomData<Op>,
+}
+
+impl StreamingAggregator<MergeState> {
+    /// Construct a merge-mode streaming aggregator for spill recovery.
+    ///
+    /// `factory` clones fresh `AccumulatorRow` prototypes when the
+    /// merge path needs to fall back to a fresh state (unused in
+    /// practice — merge always starts from a spilled row). The
+    /// `output_schema` is the finalized post-aggregation record schema
+    /// produced by `HashAggregator::finalize`.
+    pub fn new_for_merge(factory: AccumulatorFactory, output_schema: Arc<Schema>) -> Self {
+        Self {
+            factory,
+            output_schema,
+            current: None,
+            _mode: std::marker::PhantomData,
+        }
+    }
+
+    /// Feed one spilled per-group partial into the merge stream.
+    ///
+    /// Contract (implemented in 16.3.12):
+    ///   * If `key` matches the currently open group: merge `state`
+    ///     into the open state via `AccumulatorEnum::merge` and
+    ///     `MetadataCommonTracker::merge`.
+    ///   * Otherwise: finalize the open group, push the resulting
+    ///     `Record` onto `output_records`, and install `(key, state)`
+    ///     as the new open group.
+    pub fn process_spilled(
+        &mut self,
+        _key: Vec<GroupByKey>,
+        _state: AggregatorGroupState,
+        _output_records: &mut Vec<Record>,
+    ) -> Result<(), HashAggError> {
+        // Filled in by Task 16.3.12 alongside the shared finalize path.
+        todo!("StreamingAggregator<MergeState>::process_spilled — lands in 16.3.12")
+    }
+
+    /// Finalize and emit the last open group, if any.
+    pub fn flush(&mut self, _output_records: &mut Vec<Record>) -> Result<(), HashAggError> {
+        // Filled in by Task 16.3.12 alongside the shared finalize path.
+        todo!("StreamingAggregator<MergeState>::flush — lands in 16.3.12")
+    }
+}
