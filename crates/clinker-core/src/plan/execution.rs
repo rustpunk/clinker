@@ -4080,6 +4080,51 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_transforms_preserve_order_for_streaming_agg() {
+        // Task 16.4.11 — D3 structural guard. Phase 6 `par_iter_mut`
+        // preserves input order in-place because chunks are mutated at
+        // their original positions; workers share one Vec. Therefore a
+        // `Stateless` (parallel) upstream transform that does NOT write
+        // sort-key fields must still let the downstream aggregation
+        // qualify for streaming. If this ever fails, the whole D3 design
+        // assumption is wrong.
+        let mut ws = BTreeSet::new();
+        ws.insert("x".to_string()); // disjoint from sort key `k`
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![
+                PlanNode::Source { name: "src".into() },
+                PlanNode::Transform {
+                    name: "t".into(),
+                    parallelism_class: ParallelismClass::Stateless,
+                    tier: 0,
+                    execution_reqs: NodeExecutionReqs::Streaming,
+                    window_index: None,
+                    partition_lookup: None,
+                    write_set: ws,
+                    has_distinct: false,
+                },
+                make_aggregation("agg", vec!["k"], crate::config::AggregateStrategyHint::Auto),
+            ],
+            &[(0, 1), (1, 2)],
+        );
+        let inputs = HashMap::from([(
+            "src".to_string(),
+            input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
+        )]);
+        dag.compute_node_properties(&inputs).unwrap();
+        dag.select_aggregation_strategies().unwrap();
+        match &dag.graph[idxs[2]] {
+            PlanNode::Aggregation { strategy, .. } => {
+                assert!(
+                    matches!(strategy, AggregateStrategy::Streaming),
+                    "parallel stateless transform must not destroy sort-key ordering"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn test_explain_renders_strategy_hint_and_resolved_strategy_distinctly() {
         // After post-pass: config.strategy (hint) and PlanNode.strategy (resolved)
         // both appear in JSON, distinctly.
