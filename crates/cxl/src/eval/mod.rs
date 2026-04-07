@@ -108,6 +108,13 @@ impl ProgramEvaluator {
         self.has_distinct
     }
 
+    /// Borrow the underlying typed program. Used by the aggregation
+    /// engine to evaluate `BindingArg::Expr` arguments through the free
+    /// `eval_expr` entry point during the hash aggregator hot loop.
+    pub fn typed(&self) -> &Arc<TypedProgram> {
+        &self.typed
+    }
+
     /// Evaluate a record through the full program, returning Emit or Skip.
     pub fn eval_record<'w, S: RecordStorage + 'w>(
         &mut self,

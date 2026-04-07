@@ -25,10 +25,39 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use clinker_record::accumulator::{AccumulatorEnum, AccumulatorRow};
-use clinker_record::{GroupByKey, Record, Value};
+use clinker_record::group_key::value_to_group_key;
+use clinker_record::schema::Schema;
+use clinker_record::{GroupByKey, Record, RecordStorage, Value};
 use cxl::ast::{BinOp, Expr, LiteralValue, UnaryOp};
-use cxl::plan::{AggregateBinding, CompiledAggregate};
+use cxl::eval::{EvalContext, EvalError, ProgramEvaluator, eval_expr};
+use cxl::plan::{AggregateBinding, BindingArg, CompiledAggregate};
+
+use crate::config::SortField;
+use crate::pipeline::spill::SpillFile;
+
+/// Local stand-in to satisfy `eval_expr`'s `S: RecordStorage` type
+/// parameter when no window context is in play. The aggregator hot loop
+/// resolves field references through the input `Record` (which
+/// implements `FieldResolver`); the storage parameter is unused.
+struct NullStorage;
+impl RecordStorage for NullStorage {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+        None
+    }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+        None
+    }
+    fn available_fields(&self, _: u32) -> Vec<&str> {
+        Vec::new()
+    }
+    fn record_count(&self) -> u32 {
+        0
+    }
+}
 
 /// Aggregation strategy selected at plan-compile time.
 ///
@@ -593,5 +622,381 @@ mod tracker_tests {
         t.observe("k1", &s("world"));
         let h2 = t.heap_size();
         assert!(h2 <= h1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashAggregator (Task 16.3.8)
+// ---------------------------------------------------------------------------
+
+/// Per-group state held inside the hash table.
+///
+/// `row` is the row of accumulators (one slot per `AggregateBinding`)
+/// being driven by the hot loop. `meta_tracker` is the per-group
+/// "Keep Only Common Attributes" propagator (D11 revised) that
+/// observes every input record's metadata so finalize can emit
+/// non-conflicting keys without per-key user wiring.
+#[derive(Debug, Clone)]
+pub struct AggregatorGroupState {
+    pub row: AccumulatorRow,
+    pub meta_tracker: MetadataCommonTracker,
+}
+
+/// Errors raised by the hash aggregator hot loop. The 16.3.13 dispatch
+/// arm wraps these into `PipelineError` for DLQ routing; until then the
+/// engine surfaces them via this dedicated enum so the runtime stays
+/// decoupled from the executor's error taxonomy.
+#[derive(Debug)]
+pub enum HashAggError {
+    /// A `BindingArg::Expr` failed to evaluate against the input record.
+    EvalFailed(EvalError),
+    /// `value_to_group_key` rejected an input value (NaN, unsupported
+    /// type, etc.). Carries the field name and row number for routing
+    /// in the executor dispatch path.
+    GroupKey {
+        field: String,
+        row: u32,
+        message: String,
+    },
+    /// Spill path raised an I/O error. Stub until 16.3.10 lands the
+    /// real spill writer integration.
+    Spill(String),
+}
+
+impl std::fmt::Display for HashAggError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HashAggError::EvalFailed(e) => write!(f, "binding expression eval failed: {e:?}"),
+            HashAggError::GroupKey {
+                field,
+                row,
+                message,
+            } => write!(
+                f,
+                "group-key extraction failed for `{field}` at row {row}: {message}"
+            ),
+            HashAggError::Spill(msg) => write!(f, "spill failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for HashAggError {}
+
+impl From<EvalError> for HashAggError {
+    fn from(e: EvalError) -> Self {
+        HashAggError::EvalFailed(e)
+    }
+}
+
+/// Hash aggregation engine — D1 default strategy.
+///
+/// Holds the per-group hash table, the prototype clone factory from
+/// 16.3.7, the pre-aggregation row filter (D9), the residual evaluator
+/// (16.3.12), and the bookkeeping needed for the resize-aware spill
+/// trigger (D1) and the metadata common-only propagation (D11 revised).
+///
+/// The 16.3.8 commit lands `new` + `add_record` + memory accounting and
+/// the spill-trigger check. `spill`, `finalize`, and `merge_spilled`
+/// arrive in 16.3.10–16.3.12 as part of the same atomic 16.3 commit
+/// (interim sub-tasks compile because the executor dispatch arm in
+/// `PlanNode::Aggregation` is still an `unreachable!` stub until 16.3.13).
+pub struct HashAggregator {
+    groups: hashbrown::HashMap<Vec<GroupByKey>, AggregatorGroupState>,
+    factory: AccumulatorFactory,
+    group_by_indices: Vec<u32>,
+    group_by_fields: Vec<String>,
+    pre_agg_filter: Option<Expr>,
+    value_heap_bytes: usize,
+    memory_budget: usize,
+    spill_files: Vec<SpillFile<()>>,
+    #[allow(dead_code)]
+    spill_schema: Arc<Schema>,
+    #[allow(dead_code)]
+    spill_sort_fields: Vec<SortField>,
+    #[allow(dead_code)]
+    spill_dir: Option<PathBuf>,
+    #[allow(dead_code)]
+    output_schema: Arc<Schema>,
+    transform_name: String,
+    evaluator: ProgramEvaluator,
+    /// User-emitted `$meta.X` keys — these are skipped by the auto
+    /// common-only tracker because the user has taken explicit control
+    /// (D11 revised). Built once at construction from `compiled.emits`.
+    explicit_meta_keys: HashSet<Box<str>>,
+    /// One-shot WARN dedup for metadata conflict logging. Per-pipeline-run
+    /// scope (D11 revised).
+    meta_conflict_logged: HashSet<Box<str>>,
+    /// Source-row counter — incremented after the pre-agg filter accepts
+    /// a record. Used by the global-fold empty-input special case in
+    /// `finalize` (D12, D44).
+    rows_seen: u64,
+}
+
+impl HashAggregator {
+    /// Construct a new aggregator from a compiled aggregate plan.
+    ///
+    /// `spill_schema`, `spill_sort_fields`, and `spill_dir` are wired
+    /// for the spill path that lands in 16.3.10. The 16.3.8 hot loop
+    /// only touches them through the `value_heap_bytes` budget check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        compiled: Arc<CompiledAggregate>,
+        evaluator: ProgramEvaluator,
+        output_schema: Arc<Schema>,
+        spill_schema: Arc<Schema>,
+        spill_sort_fields: Vec<SortField>,
+        memory_budget: usize,
+        spill_dir: Option<PathBuf>,
+        transform_name: impl Into<String>,
+    ) -> Self {
+        let group_by_indices = compiled.group_by_indices.clone();
+        let group_by_fields = compiled.group_by_fields.clone();
+        let pre_agg_filter = compiled.pre_agg_filter.clone();
+        let explicit_meta_keys: HashSet<Box<str>> = compiled
+            .emits
+            .iter()
+            .filter(|e| e.is_meta)
+            .map(|e| e.output_name.clone())
+            .collect();
+        let factory = AccumulatorFactory::new(compiled);
+        Self {
+            groups: hashbrown::HashMap::new(),
+            factory,
+            group_by_indices,
+            group_by_fields,
+            pre_agg_filter,
+            value_heap_bytes: 0,
+            memory_budget,
+            spill_files: Vec::new(),
+            spill_schema,
+            spill_sort_fields,
+            spill_dir,
+            output_schema,
+            transform_name: transform_name.into(),
+            evaluator,
+            explicit_meta_keys,
+            meta_conflict_logged: HashSet::new(),
+            rows_seen: 0,
+        }
+    }
+
+    /// Borrow the in-memory group table. Public for finalize and tests.
+    pub fn groups(&self) -> &hashbrown::HashMap<Vec<GroupByKey>, AggregatorGroupState> {
+        &self.groups
+    }
+
+    /// Total bytes currently charged into the per-group value heap. Used
+    /// by the spill trigger and by tests verifying memory accounting.
+    pub fn value_heap_bytes(&self) -> usize {
+        self.value_heap_bytes
+    }
+
+    /// Number of input records that have passed the pre-aggregation
+    /// filter (D44). Drives the global-fold empty-input special case.
+    pub fn rows_seen(&self) -> u64 {
+        self.rows_seen
+    }
+
+    /// Borrow the spill file vector. Empty until 16.3.10 wires the
+    /// spill writer.
+    pub fn spill_files(&self) -> &[SpillFile<()>] {
+        &self.spill_files
+    }
+
+    /// Drive one input record through the aggregator (D1, D9, D10, D11
+    /// revised, D44). Order:
+    ///
+    /// 1. Pre-aggregation filter — skip on `false`.
+    /// 2. `rows_seen += 1` (post-filter, per D44).
+    /// 3. Extract the group-key tuple.
+    /// 4. Look up / insert per-group state via the prototype factory.
+    /// 5. Dispatch each `BindingArg` to its accumulator slot.
+    /// 6. Walk record metadata into the per-group `MetadataCommonTracker`,
+    ///    skipping keys the user has explicitly emitted.
+    /// 7. Resize-aware spill trigger.
+    pub fn add_record(&mut self, record: &Record, ctx: &EvalContext) -> Result<(), HashAggError> {
+        // 1. Pre-aggregation filter (D9).
+        if let Some(filter) = &self.pre_agg_filter {
+            let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+            let v = eval_expr::<NullStorage>(
+                filter,
+                self.evaluator.typed(),
+                ctx,
+                record,
+                None,
+                &env,
+                &meta,
+            )?;
+            if v != Value::Bool(true) {
+                return Ok(());
+            }
+        }
+
+        // 2. Post-filter row counter (D44).
+        self.rows_seen = self.rows_seen.saturating_add(1);
+
+        // 3. Group key extraction (D10 — no schema pin).
+        let mut key: Vec<GroupByKey> = Vec::with_capacity(self.group_by_indices.len());
+        for (i, idx) in self.group_by_indices.iter().enumerate() {
+            let field_name = self
+                .group_by_fields
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("");
+            let val = record
+                .values()
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            match value_to_group_key(&val, field_name, None, ctx.source_row as u32) {
+                Ok(Some(gk)) => key.push(gk),
+                Ok(None) => key.push(GroupByKey::Null),
+                Err(e) => {
+                    return Err(HashAggError::GroupKey {
+                        field: field_name.to_string(),
+                        row: ctx.source_row as u32,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // 4. Look up / insert per-group state.
+        let group_state = self
+            .groups
+            .entry(key)
+            .or_insert_with(|| AggregatorGroupState {
+                row: self.factory.create_accumulators(),
+                meta_tracker: MetadataCommonTracker::new(),
+            });
+
+        // 5. BindingArg dispatch hot loop (D1).
+        let bindings = self.factory.compiled().bindings.clone();
+        let mut delta: usize = 0;
+        for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
+            delta += dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
+        }
+        self.value_heap_bytes = self.value_heap_bytes.saturating_add(delta);
+
+        // 6. Metadata common-only propagation (D11 revised).
+        if record.has_meta() {
+            // Snapshot to a small Vec so we can mutate trackers without
+            // borrowing record metadata across the observe call.
+            let observations: Vec<(Box<str>, Value)> = record
+                .iter_meta()
+                .filter(|(k, _)| !self.explicit_meta_keys.contains(*k))
+                .map(|(k, v)| (Box::<str>::from(k), v.clone()))
+                .collect();
+            for (k, v) in observations {
+                let r = group_state.meta_tracker.observe(&k, &v);
+                self.value_heap_bytes = self.value_heap_bytes.saturating_add(r.heap_delta);
+                if r.became_conflict && self.meta_conflict_logged.insert(k.clone()) {
+                    tracing::warn!(
+                        transform = %self.transform_name,
+                        meta_key = %k,
+                        "aggregate dropped $meta.{} for at least one group: \
+                         conflicting values across input records (use `emit $meta.{} = any($meta.{})` \
+                         to keep the first-seen value)",
+                        k,
+                        k,
+                        k
+                    );
+                }
+            }
+        }
+
+        // 7. Resize-aware spill trigger (D1). Uses hashbrown's
+        // `allocation_size` so the trigger fires before the next resize
+        // doubles the table footprint.
+        let table_alloc = self.groups.allocation_size();
+        let headroom = self.memory_budget.saturating_sub(self.value_heap_bytes);
+        if table_alloc.saturating_mul(3) > headroom && self.memory_budget > 0 {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Spill the in-memory groups to disk. Stub until 16.3.10 lands the
+    /// real writer; the surrounding 16.3 sub-tasks call `spill()` from
+    /// the resize-aware trigger so the symbol must exist for the crate
+    /// to compile in the interim. Tests in 16.3.8 use a memory budget
+    /// of 0 (disabled) or a budget large enough to keep the trigger
+    /// from firing.
+    fn spill(&mut self) -> Result<(), HashAggError> {
+        Err(HashAggError::Spill(
+            "spill path not yet implemented (Task 16.3.10)".into(),
+        ))
+    }
+}
+
+/// Dispatch one `BindingArg` to its accumulator. Returns the heap-byte
+/// delta produced by the accumulator's `add` call so the hash aggregator
+/// can fold it into `value_heap_bytes`.
+fn dispatch_binding(
+    arg: &BindingArg,
+    acc: &mut AccumulatorEnum,
+    record: &Record,
+    ctx: &EvalContext,
+    evaluator: &ProgramEvaluator,
+) -> Result<usize, HashAggError> {
+    match arg {
+        BindingArg::Field(idx) => {
+            let v = record
+                .values()
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(acc.add(&v))
+        }
+        BindingArg::Wildcard => Ok(acc.add(&Value::Null)),
+        BindingArg::Expr(e) => {
+            let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+            let v = eval_expr::<NullStorage>(e, evaluator.typed(), ctx, record, None, &env, &meta)?;
+            Ok(acc.add(&v))
+        }
+        BindingArg::Pair(a, b) => {
+            let va = eval_binding_arg_value(a, record, ctx, evaluator)?;
+            let vb = eval_binding_arg_value(b, record, ctx, evaluator)?;
+            acc.add_weighted(&va, &vb);
+            Ok(0)
+        }
+    }
+}
+
+fn eval_binding_arg_value(
+    arg: &BindingArg,
+    record: &Record,
+    ctx: &EvalContext,
+    evaluator: &ProgramEvaluator,
+) -> Result<Value, HashAggError> {
+    match arg {
+        BindingArg::Field(idx) => Ok(record
+            .values()
+            .get(*idx as usize)
+            .cloned()
+            .unwrap_or(Value::Null)),
+        BindingArg::Wildcard => Ok(Value::Null),
+        BindingArg::Expr(e) => {
+            let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+            Ok(eval_expr::<NullStorage>(
+                e,
+                evaluator.typed(),
+                ctx,
+                record,
+                None,
+                &env,
+                &meta,
+            )?)
+        }
+        BindingArg::Pair(_, _) => Err(HashAggError::EvalFailed(EvalError {
+            kind: cxl::eval::EvalErrorKind::TypeMismatch {
+                expected: "scalar binding arg",
+                got: "nested Pair",
+            },
+            span: cxl::lexer::Span::new(0, 0),
+        })),
     }
 }
