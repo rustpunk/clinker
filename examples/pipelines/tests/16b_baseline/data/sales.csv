@@ -1,0 +1,8 @@
+id,dept,amount,status
+1,eng,100,active
+2,eng,200,active
+3,sales,150,active
+4,sales,300,inactive
+5,ops,50,active
+1,eng,100,active
+6,sales,250,active

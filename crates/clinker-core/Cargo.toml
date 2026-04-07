@@ -52,6 +52,7 @@ criterion = { workspace = true }
 clinker-bench-support = { workspace = true, features = [] }
 rayon = "1"
 fastrand = { workspace = true }
+insta = "1"
 
 [[bench]]
 name = "sort"

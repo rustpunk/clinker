@@ -1,0 +1,31 @@
+pipeline:
+  name: aggregate_windowed
+
+inputs:
+  - name: sales
+    type: csv
+    path: ./data/sales.csv
+    options:
+      has_header: true
+
+outputs:
+  - name: dept_totals
+    type: csv
+    path: ./output/dept_totals.csv
+
+transformations:
+  - name: active_only
+    cxl: |
+      filter status == "active"
+      distinct by id
+      emit id = id
+      emit dept = dept
+      emit amount = amount
+      emit status = status
+
+  - name: by_dept
+    aggregate:
+      group_by: []
+      cxl: |
+        emit total = sum(amount.to_int())
+        emit n = count(*)

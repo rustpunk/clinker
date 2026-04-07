@@ -1,0 +1,62 @@
+---
+source: crates/clinker-core/tests/pre_lift_baselines.rs
+expression: text
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 1
+Output projections: 1
+DAG nodes: 3
+
+Source DAG:
+  Tier 0: employees
+
+Transform 'tier_flag':
+  Parallelism: Stateless
+  Window index: None
+  Partition lookup: None
+
+=== Physical Properties ===
+
+source.employees:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+transform.tier_flag:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+output.results:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+=== CXL Expressions ===
+
+Transform 'tier_flag':
+  emit id = id
+  emit name = name
+  emit salary = salary
+  emit tier = if salary.to_int() >= 90000 then "senior" else "junior"
+
+=== Type Annotations ===
+
+Transform 'tier_flag': (types inferred at compile time)
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [source] employees
+  │ [transform] tier_flag
+  │ [output] results
