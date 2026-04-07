@@ -28,9 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use clinker_record::accumulator::{
-    AccumulatorEnum, AccumulatorError, AccumulatorOp, AccumulatorRow, AddRaw,
-};
+use clinker_record::accumulator::{AccumulatorEnum, AccumulatorError, AccumulatorRow};
 use clinker_record::group_key::value_to_group_key;
 use clinker_record::schema::Schema;
 use clinker_record::{GroupByKey, Record, RecordStorage, Value};
@@ -1619,14 +1617,167 @@ fn eval_binding_arg_value(
 // StreamingAggregator<Op: AccumulatorOp> — raw + merge modes (Task 16.4.0)
 // ---------------------------------------------------------------------------
 
-/// Marker type selecting the spill-recovery merge mode. `AddRaw` is
-/// re-exported from `clinker-record`; `MergeState` remains local because
-/// it is only ever referenced by the (now unused outside tests) spill
-/// recovery stub.
+// ---------------------------------------------------------------------------
+// AccumulatorOp trait + AddRaw / MergeState impls (Task 16.4.2)
+// ---------------------------------------------------------------------------
+//
+// The trait lives here in `clinker-core/src/aggregation.rs` (NOT
+// `clinker-record`) because `MergeState::Input` references
+// `AggregatorGroupState`, which in turn holds a `MetadataCommonTracker`
+// defined alongside the hash aggregator. `clinker-record` has no
+// dependency on `cxl`, so the `apply_row` signature — which takes
+// `&[AggregateBinding]` — would also be unexpressible there. Phase 16
+// Task 16.4.2 explicitly specifies `aggregation.rs` as the location.
+
+/// Monomorphization marker trait for the streaming aggregator's
+/// ingestion hot loop.
+///
+/// Each implementation pins an `Input` type and an `apply_row` fast
+/// path. The streaming aggregator is generic over `Op: AccumulatorOp`
+/// so rustc compiles one specialized loop per mode with no runtime
+/// dispatch cost.
+///
+/// * [`AddRaw`] — `Input = Record`. One incoming raw record per call;
+///   `apply_row` indexes `record.values[binding.input_field_index]`
+///   for the fast `BindingArg::Field` case. The `BindingArg::Expr` /
+///   `BindingArg::Pair` general paths cannot be expressed through this
+///   narrow signature (no `EvalContext` / `ProgramEvaluator`); the
+///   streaming aggregator's full `add_record` continues to fall back
+///   to the general `dispatch_binding` path for those, and `apply_row`
+///   debug-asserts in that case to surface any future caller that
+///   wired the fast path to a non-trivial binding arg.
+/// * [`MergeState`] — `Input = (Vec<u8>, AggregatorGroupState)`. Each
+///   call carries an encoded sort key (read by the LoserTree
+///   comparator) plus the FULL per-group state: the `AccumulatorRow`,
+///   the three D57 sidecar fields (`min_row_num`, `common_emitted`,
+///   `union_accumulated`), and the `MetadataCommonTracker`. `apply_row`
+///   folds the incoming state into the currently-open per-group
+///   `row` via `AccumulatorEnum::merge`. The sidecar / tracker merges
+///   live on `GroupBoundary::push` because they operate on the open
+///   group's full `AggregatorGroupState`, not on the `row` alone.
+///
+/// **Audit fix Gap B:** pre-drill-pass-6 wording had
+/// `MergeState::Input = (Vec<u8>, AccumulatorRow)`, which silently
+/// dropped the D57 sidecar fields on the spill-recovery path. That
+/// would have produced a different `min_row_num` than the in-memory
+/// path and violated the very invariant D68 was created to enforce.
+/// Widening to the full `AggregatorGroupState` is the minimum-surface
+/// fix.
+pub trait AccumulatorOp: Default + 'static {
+    /// Per-call input payload. Monomorphized per implementation.
+    type Input;
+
+    /// Fold one input into a per-group `AccumulatorRow`.
+    ///
+    /// `bindings` is the compiled binding list owned by the
+    /// `AccumulatorFactory`; `row` is the currently-open group's
+    /// accumulator row; `input` is the op-specific payload.
+    fn apply_row(row: &mut AccumulatorRow, bindings: &[AggregateBinding], input: &Self::Input);
+}
+
+/// Ingestion mode: raw upstream `Record` values arriving in verified
+/// pre-sorted order on the group-by prefix. Phase 16 Task 16.4.2.
+#[derive(Debug, Default)]
+pub struct AddRaw;
+
+impl AccumulatorOp for AddRaw {
+    type Input = Record;
+
+    #[inline(always)]
+    fn apply_row(row: &mut AccumulatorRow, bindings: &[AggregateBinding], input: &Self::Input) {
+        // Fast path: index the record's value column per binding and
+        // dispatch the accumulator's `add` directly. The
+        // `BindingArg::Expr` / `BindingArg::Pair` general paths need
+        // an `EvalContext` + `ProgramEvaluator`, which this narrow
+        // trait signature intentionally does not plumb — callers that
+        // hit those variants drop to the general `dispatch_binding`
+        // path. This fast-path specialization is what Task 16.4.2
+        // reserves for future hot-loop optimization (DataFusion
+        // blog 2023-08-05 per-record allocation pattern).
+        for (binding, acc) in bindings.iter().zip(row.iter_mut()) {
+            match &binding.arg {
+                BindingArg::Field(idx) => {
+                    let v = input
+                        .values()
+                        .get(*idx as usize)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    acc.add(&v);
+                }
+                BindingArg::Wildcard => {
+                    acc.add(&Value::Null);
+                }
+                BindingArg::Expr(_) | BindingArg::Pair(_, _) => {
+                    debug_assert!(
+                        false,
+                        "AddRaw::apply_row reached an Expr/Pair binding; \
+                         streaming aggregator must dispatch these through \
+                         the general `dispatch_binding` path"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Ingestion mode: merge pre-aggregated per-group state coming from a
+/// spill file (or any upstream that already folded rows into an
+/// `AggregatorGroupState`). Phase 16 Task 16.4.2.
+///
+/// `Input` carries the **full** state so sidecar reductions (D57) and
+/// the metadata common tracker (D11 revised) survive spill recovery
+/// with byte-identical semantics to the in-memory path.
 #[derive(Debug, Default)]
 pub struct MergeState;
 
-impl AccumulatorOp for MergeState {}
+impl AccumulatorOp for MergeState {
+    /// Encoded sort key (read by the LoserTree comparator) + the full
+    /// per-group state. The sort key is produced by `SortKeyEncoder`
+    /// (Task 16.4.1) and matches the declared sort-order direction.
+    type Input = (Vec<u8>, AggregatorGroupState);
+
+    #[inline(always)]
+    fn apply_row(row: &mut AccumulatorRow, _bindings: &[AggregateBinding], input: &Self::Input) {
+        // Merge the incoming `AccumulatorRow` into the currently-open
+        // group's row slot-by-slot via `AccumulatorEnum::merge`. The
+        // sidecar fields (`min_row_num`, `common_emitted`,
+        // `union_accumulated`) and the `MetadataCommonTracker` live on
+        // `AggregatorGroupState` and are merged by
+        // [`crate::pipeline::streaming_merge::GroupBoundary::push`]
+        // when it installs / folds the open group — `apply_row` stays
+        // focused on accumulator-row reduction so the two merge
+        // surfaces stay decoupled.
+        let (_encoded_key, other_state) = input;
+        for (a, b) in row.iter_mut().zip(other_state.row.iter()) {
+            AccumulatorEnum::merge(a, b);
+        }
+    }
+}
+
+/// Associative merge of the three D57 sidecar fields plus the
+/// metadata common tracker. Operates on a currently-open group's
+/// `AggregatorGroupState` and folds another state's sidecars in.
+///
+/// Separated out so both the `GroupBoundary` state machine (for the
+/// raw-streaming path) and the spill-recovery path can call the
+/// identical reduction logic. Exposed at crate scope for tests.
+pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: AggregatorGroupState) {
+    // `min_row_num`: monotonic min. `u64::MAX` is the identity.
+    if src.min_row_num < dst.min_row_num {
+        dst.min_row_num = src.min_row_num;
+    }
+    // `common_emitted`: set-intersection of keys where values agree.
+    dst.common_emitted = Some(match (dst.common_emitted.take(), src.common_emitted) {
+        (None, None) => IndexMap::new(),
+        (Some(prev), None) => prev,
+        (None, Some(s)) => s,
+        (Some(prev), Some(s)) => intersect_emitted(prev, &s),
+    });
+    // `union_accumulated`: first-seen-wins union.
+    union_accumulated_into(&mut dst.union_accumulated, &src.union_accumulated);
+    // `MetadataCommonTracker`: associative merge per D11 revised.
+    dst.meta_tracker.merge(src.meta_tracker);
+}
 
 /// Boundary-merging aggregator monomorphized over an `AccumulatorOp`.
 ///
@@ -1878,5 +2029,164 @@ impl StreamingAggregator<MergeState> {
             pending: Vec::new(),
             _mode: std::marker::PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod accumulator_op_tests {
+    use super::*;
+    use clinker_record::accumulator::{AccumulatorEnum, AggregateType};
+
+    fn sv(s: &str) -> Value {
+        Value::String(s.into())
+    }
+
+    fn state_with_row(row: AccumulatorRow) -> AggregatorGroupState {
+        AggregatorGroupState::new(row)
+    }
+
+    // ----- merge_group_sidecars -----
+
+    #[test]
+    fn test_merge_sidecars_min_row_num_is_min() {
+        let mut dst = state_with_row(Vec::new());
+        dst.min_row_num = 10;
+        let mut src = state_with_row(Vec::new());
+        src.min_row_num = 3;
+        merge_group_sidecars(&mut dst, src);
+        assert_eq!(dst.min_row_num, 3);
+    }
+
+    #[test]
+    fn test_merge_sidecars_min_row_num_identity_is_u64_max() {
+        let mut dst = state_with_row(Vec::new());
+        dst.min_row_num = 7;
+        let src = state_with_row(Vec::new()); // min_row_num = u64::MAX
+        merge_group_sidecars(&mut dst, src);
+        assert_eq!(dst.min_row_num, 7, "u64::MAX must act as identity");
+    }
+
+    #[test]
+    fn test_merge_sidecars_emitted_intersect_keeps_agreeing_keys() {
+        let mut dst = state_with_row(Vec::new());
+        let mut a = IndexMap::new();
+        a.insert("k1".to_string(), sv("v1"));
+        a.insert("k2".to_string(), sv("v2"));
+        dst.common_emitted = Some(a);
+
+        let mut src = state_with_row(Vec::new());
+        let mut b = IndexMap::new();
+        b.insert("k1".to_string(), sv("v1")); // agrees
+        b.insert("k2".to_string(), sv("DIFFERENT")); // conflicts → dropped
+        b.insert("k3".to_string(), sv("v3")); // not in dst → dropped
+        src.common_emitted = Some(b);
+
+        merge_group_sidecars(&mut dst, src);
+        let out = dst.common_emitted.expect("present");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("k1"), Some(&sv("v1")));
+    }
+
+    #[test]
+    fn test_merge_sidecars_accumulated_union_first_seen_wins() {
+        let mut dst = state_with_row(Vec::new());
+        dst.union_accumulated.insert("k1".to_string(), sv("first"));
+
+        let mut src = state_with_row(Vec::new());
+        src.union_accumulated
+            .insert("k1".to_string(), sv("SHOULD_NOT_WIN"));
+        src.union_accumulated.insert("k2".to_string(), sv("new"));
+
+        merge_group_sidecars(&mut dst, src);
+        assert_eq!(dst.union_accumulated.get("k1"), Some(&sv("first")));
+        assert_eq!(dst.union_accumulated.get("k2"), Some(&sv("new")));
+    }
+
+    #[test]
+    fn test_merge_sidecars_metadata_tracker_associative() {
+        // dst sees {source_file: a.csv}; src sees {source_file: a.csv,
+        // other: x}. After merge dst must retain source_file and pick
+        // up `other` as common-only (both trackers saw it consistently).
+        let mut dst = state_with_row(Vec::new());
+        let _ = dst.meta_tracker.observe("source_file", &sv("a.csv"));
+
+        let mut src = state_with_row(Vec::new());
+        let _ = src.meta_tracker.observe("source_file", &sv("a.csv"));
+        let _ = src.meta_tracker.observe("other", &sv("x"));
+
+        merge_group_sidecars(&mut dst, src);
+        let finalized = dst.meta_tracker.finalize();
+        let keys: Vec<&str> = finalized.iter().map(|(k, _)| k.as_ref()).collect();
+        assert!(
+            keys.contains(&"source_file"),
+            "source_file missing: {keys:?}"
+        );
+    }
+
+    // ----- AccumulatorOp::apply_row: AddRaw -----
+
+    #[test]
+    fn test_addraw_apply_row_field_binding_sums_values() {
+        // Build a single-binding row: sum(values[0]).
+        let bindings = vec![AggregateBinding {
+            output_name: "sum_x".into(),
+            arg: BindingArg::Field(0),
+            acc_type: AggregateType::Sum,
+        }];
+        let mut row: AccumulatorRow = vec![AccumulatorEnum::for_type(&AggregateType::Sum)];
+
+        let schema = Arc::new(clinker_record::Schema::new(vec!["x".into()]));
+        let r1 = Record::new(Arc::clone(&schema), vec![Value::Integer(10)]);
+        let r2 = Record::new(Arc::clone(&schema), vec![Value::Integer(32)]);
+
+        <AddRaw as AccumulatorOp>::apply_row(&mut row, &bindings, &r1);
+        <AddRaw as AccumulatorOp>::apply_row(&mut row, &bindings, &r2);
+
+        let v = row[0].finalize().expect("finalize");
+        assert_eq!(v, Value::Integer(42));
+    }
+
+    // ----- AccumulatorOp::apply_row: MergeState -----
+
+    #[test]
+    fn test_mergestate_apply_row_merges_accumulator_rows() {
+        // Two Sum accumulators, one pre-loaded with 10 and the other
+        // with 32. MergeState::apply_row must merge slot-by-slot so
+        // the destination holds 42. The D57 sidecars travel on the
+        // `AggregatorGroupState` and are exercised separately via
+        // `merge_group_sidecars`.
+        let mut dst_acc = AccumulatorEnum::for_type(&AggregateType::Sum);
+        dst_acc.add(&Value::Integer(10));
+        let mut row_dst: AccumulatorRow = vec![dst_acc];
+
+        let mut src_acc = AccumulatorEnum::for_type(&AggregateType::Sum);
+        src_acc.add(&Value::Integer(32));
+        let src_row: AccumulatorRow = vec![src_acc];
+        let src_state = state_with_row(src_row);
+
+        let input: (Vec<u8>, AggregatorGroupState) = (vec![0xAA, 0xBB], src_state);
+        <MergeState as AccumulatorOp>::apply_row(&mut row_dst, &[], &input);
+
+        let v = row_dst[0].finalize().expect("finalize");
+        assert_eq!(v, Value::Integer(42));
+    }
+
+    #[test]
+    fn test_mergestate_input_type_carries_full_group_state() {
+        // Compile-time proof that the `Input` associated type is the
+        // full `(Vec<u8>, AggregatorGroupState)` (audit fix Gap B).
+        // If Task 16.4.2 ever regresses to `(Vec<u8>, AccumulatorRow)`
+        // this test stops compiling.
+        fn assert_input_is_full_state(_: &<MergeState as AccumulatorOp>::Input) {}
+        let st = state_with_row(Vec::new());
+        let input: (Vec<u8>, AggregatorGroupState) = (Vec::new(), st);
+        assert_input_is_full_state(&input);
+        // And confirm sidecar + tracker fields are addressable on the
+        // `Input` type — if they are missing this line fails to
+        // compile.
+        let _ = input.1.min_row_num;
+        let _ = &input.1.common_emitted;
+        let _ = &input.1.union_accumulated;
+        let _ = &input.1.meta_tracker;
     }
 }

@@ -765,7 +765,7 @@ outputs:
         group_by: &[&str],
         cxl_src: &str,
         transform_name: &str,
-    ) -> crate::aggregation::StreamingAggregator<clinker_record::accumulator::AddRaw> {
+    ) -> crate::aggregation::StreamingAggregator<crate::aggregation::AddRaw> {
         let parsed = Parser::parse(cxl_src);
         assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();

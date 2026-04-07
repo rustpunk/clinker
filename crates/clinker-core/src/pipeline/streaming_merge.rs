@@ -71,14 +71,37 @@ impl GroupBoundary {
         if let Some((cur_key, cur_state)) = self.current.as_mut() {
             match crate::aggregation::compare_group_keys(cur_key, &key) {
                 Ordering::Equal => {
+                    // Row-by-row accumulator merge. Sidecars + tracker
+                    // fold via the shared `merge_group_sidecars` helper
+                    // so the raw-streaming path and the spill-recovery
+                    // path produce byte-identical reductions (Task
+                    // 16.4.2 audit fix Gap B).
                     for (a, b) in cur_state.row.iter_mut().zip(state.row.iter()) {
                         AccumulatorEnum::merge(a, b);
                     }
-                    cur_state.meta_tracker.merge(state.meta_tracker);
-                    // D57 sidecar reductions fold over merges as well.
-                    if sidecar.0 < cur_state.min_row_num {
-                        cur_state.min_row_num = sidecar.0;
+                    // Ensure `state` carries the current call's sidecar
+                    // triple in its own fields — the AddRaw path seeds
+                    // these from the per-record sidecar, the spill-merge
+                    // path has them populated from the spilled envelope
+                    // (or at identity values in the 16.3.13 fallback).
+                    let mut src = state;
+                    if src.min_row_num == u64::MAX {
+                        src.min_row_num = sidecar.0;
                     }
+                    if src.common_emitted.is_none() && !sidecar.1.is_empty() {
+                        src.common_emitted = Some(sidecar.1.clone());
+                    }
+                    if src.union_accumulated.is_empty() {
+                        src.union_accumulated = sidecar.2.clone();
+                    }
+                    // Accumulator rows were already merged above; zero
+                    // `src.row` so `merge_group_sidecars` does not
+                    // double-count anything (the helper only touches
+                    // sidecars + tracker, but keeping `src.row` empty
+                    // makes that contract obvious to future readers).
+                    src.row.clear();
+                    crate::aggregation::merge_group_sidecars(cur_state, src);
+                    let _ = &sidecar; // consumed into src above
                     Ok(None)
                 }
                 Ordering::Less => {

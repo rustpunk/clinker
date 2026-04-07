@@ -28,29 +28,6 @@ pub use error::AccumulatorError;
 /// insertion. Phase 16 Task 16.3.7 / 16.3.2.
 pub type AccumulatorRow = Vec<AccumulatorEnum>;
 
-/// Marker trait selecting the ingestion mode of a `StreamingAggregator`.
-///
-/// The streaming aggregator is monomorphized over this trait so the two
-/// call sites — raw-record ingestion from a pre-sorted upstream input
-/// (`AddRaw`) and spill-recovery merge of already-aggregated per-group
-/// partials (`MergeState`) — share a single type but compile to two
-/// specialized hot loops with no runtime branching.
-///
-/// This is a compile-time dispatch marker only; it has no methods. The
-/// streaming aggregator dispatches on the concrete mode via inherent
-/// `impl StreamingAggregator<AddRaw>` / `impl StreamingAggregator<MergeState>`
-/// blocks. Phase 16 Task 16.4.0.
-pub trait AccumulatorOp: Default + 'static {}
-
-/// Ingestion mode: accept raw upstream `Record` values that arrive in a
-/// verified pre-sorted order on the group-by prefix, and fold them into
-/// per-group `AccumulatorEnum` state on the fly. Emits each group as its
-/// boundary is crossed in the input stream. Phase 16 Task 16.4.0.
-#[derive(Debug, Default)]
-pub struct AddRaw;
-
-impl AccumulatorOp for AddRaw {}
-
 #[cfg(test)]
 mod tests;
 
