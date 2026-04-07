@@ -1,169 +1,179 @@
-//! Shared streaming-merge boundary detector (Phase 16 Task 16.4.0).
+//! Shared streaming-merge boundary detector — "Single-Encoder Two-Phase
+//! Bytes" architecture (Phase 16 Task 16.4.3).
 //!
-//! Factors out the group-boundary emission loop that was previously
-//! inlined inside `HashAggregator::finalize_with_spill` and was about to
-//! be duplicated inside `StreamingAggregator<AddRaw>`. Both call sites
-//! consume a monotonically non-decreasing stream of
-//! `(key, AggregatorGroupState)` pairs and need to:
+//! The boundary detector owns one [`SortKeyEncoder`] and two scratch
+//! `Vec<u8>` buffers (`current`, `last`). On every call to
+//! [`GroupBoundary::push`] the caller has already encoded the incoming
+//! record's group-by columns into `boundary.current` (via
+//! `SortKeyEncoder::encode_into`). The boundary then memcmps `current`
+//! against `last`:
 //!
-//! 1. Keep exactly one "currently open" group.
-//! 2. Merge incoming state into the open state when keys are equal.
-//! 3. Finalize the open group and yield one `SortRow` when a strictly
-//!    greater key arrives.
-//! 4. Flush the last open group on end-of-stream.
+//! * `current == last` → merge incoming partial state into the open group.
+//! * `current >  last` → finalize the open group, install the incoming
+//!   group as the new open group, swap `last <- current` (so the next
+//!   call's `current` reuses what was previously `last`'s capacity).
+//! * `current <  last` → caller violated the monotonic contract.
+//!   `mode == UserInput` → `HashAggError::SortOrderViolation`;
+//!   `mode == SpillMerge` → `HashAggError::MergeSortOrderViolation`.
 //!
-//! The two call sites differ in how they derive `(key, state)` —
-//! `finalize_with_spill` decodes a spilled `Record`, whereas
-//! `StreamingAggregator<AddRaw>` folds a raw upstream `Record` into a
-//! fresh prototype state. The boundary-detection state machine is
-//! identical. Per DataFusion PR #4301, centralizing this loop avoids
-//! subtle merge/emission skew between the two paths.
+//! Steady-state allocation is zero: `encode_into` clears+reuses the
+//! incoming buffer's capacity, and `mem::swap` rotates the two buffers
+//! without copying. This is the DataFusion `GroupValuesFullyOrdered`
+//! (PR #9662) + Polars streaming sorted group-by pattern, validated by
+//! the drill pass 9 audit (`RESEARCH-phase-16.4.3-spill-write-unification.md`).
 
-use clinker_record::{GroupByKey, Value, accumulator::AccumulatorEnum};
+use clinker_record::{Value, accumulator::AccumulatorEnum};
 use indexmap::IndexMap;
 
 use crate::aggregation::{AggregatorGroupState, HashAggError, SortRow};
+use crate::pipeline::sort_key::SortKeyEncoder;
 
-/// Group-boundary emission state machine.
+/// Whether the boundary is being driven from the user-input path
+/// (`StreamingAggregator<AddRaw>`) or the spill-merge recovery path
+/// (`HashAggregator::finalize_with_spill`). Determines which error
+/// variant is produced when the monotonic contract is violated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamingErrorMode {
+    /// User-supplied input was not actually sorted on the declared
+    /// group-by prefix → user-visible DLQ-styled error.
+    UserInput,
+    /// LoserTree produced out-of-order keys → internal Clinker bug.
+    SpillMerge,
+}
+
+/// Group-boundary emission state machine, byte-keyed.
 ///
-/// Holds the currently open `(key, state)` pair and, on each call to
-/// [`GroupBoundary::push`], either merges the incoming partial into the
-/// open group (equal keys) or finalizes the open group into a `SortRow`
-/// and replaces it with the new one (strictly greater key). Strictly
-/// lesser keys violate the caller's monotonic contract and are reported
-/// as [`HashAggError::SortOrderViolation`].
-///
-/// The emission closure `F` is injected by the caller so this module
-/// stays decoupled from the aggregation finalize path's compiled-emits
-/// machinery.
+/// Owns the [`SortKeyEncoder`], the two scratch byte buffers, and the
+/// currently-open `AggregatorGroupState`. Callers encode each incoming
+/// record's group-by columns directly into [`Self::current`] via
+/// [`SortKeyEncoder::encode_into`] and then call [`Self::push`].
 pub(crate) struct GroupBoundary {
-    current: Option<(Vec<GroupByKey>, AggregatorGroupState)>,
+    encoder: SortKeyEncoder,
+    /// Scratch buffer for the incoming record's encoded group key.
+    /// Caller writes into this via `boundary.encoder.encode_into(rec, &mut boundary.current)`
+    /// before calling `push`.
+    pub(crate) current: Vec<u8>,
+    /// Encoded group key of the currently-open group. Empty when no
+    /// group is open.
+    last: Vec<u8>,
+    /// Currently-open per-group state. `None` when no group is open.
+    open_state: Option<AggregatorGroupState>,
+    mode: StreamingErrorMode,
 }
 
 impl GroupBoundary {
-    pub(crate) fn new() -> Self {
-        Self { current: None }
+    pub(crate) fn new(encoder: SortKeyEncoder, mode: StreamingErrorMode) -> Self {
+        Self {
+            encoder,
+            current: Vec::new(),
+            last: Vec::new(),
+            open_state: None,
+            mode,
+        }
     }
 
-    /// Push one `(key, state)` partial. On a key boundary the previous
-    /// group is finalized via `finalize` and returned as a `SortRow`. On
-    /// an equal key the two per-group states are merged. On a strictly
-    /// lesser key an error is returned — callers treat this as a hard
-    /// abort (`PipelineError::SortOrderViolation` / `Internal`).
+    /// Borrow the owned encoder. Used by callers that need to encode a
+    /// record into [`Self::current`] before calling [`Self::push`].
+    pub(crate) fn encoder(&self) -> &SortKeyEncoder {
+        &self.encoder
+    }
+
+    /// Push one `(state)` partial. The caller has already populated
+    /// `self.current` with the encoded group key for the incoming
+    /// record. On a key boundary the previous group is finalized via
+    /// `finalize` and pushed into `out`.
     ///
-    /// The `sidecar` triple — `(row_num, emitted, accumulated)` — is
-    /// the executor's per-record metadata. For the in-memory and
-    /// streaming-raw paths it comes from the input record's SortRow; for
-    /// the spill-recovery path the sidecars were lost at spill time and
-    /// the caller supplies identity values (`0`, empty, empty).
+    /// `sidecar` — `(row_num, emitted, accumulated)` — is the executor's
+    /// per-record metadata. For the streaming-raw path it comes from the
+    /// input record's SortRow; for the spill-recovery path the sidecars
+    /// were lost at spill time and the caller supplies identity values
+    /// (`0`, empty, empty).
     pub(crate) fn push<F>(
         &mut self,
-        key: Vec<GroupByKey>,
         state: AggregatorGroupState,
         sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
         finalize: &F,
-    ) -> Result<Option<SortRow>, HashAggError>
+        out: &mut Vec<SortRow>,
+    ) -> Result<(), HashAggError>
     where
-        F: Fn(&[GroupByKey], &AggregatorGroupState) -> Result<clinker_record::Record, HashAggError>,
+        F: Fn(&AggregatorGroupState) -> Result<clinker_record::Record, HashAggError>,
     {
         use std::cmp::Ordering;
 
-        if let Some((cur_key, cur_state)) = self.current.as_mut() {
-            match crate::aggregation::compare_group_keys(cur_key, &key) {
-                Ordering::Equal => {
-                    // Row-by-row accumulator merge. Sidecars + tracker
-                    // fold via the shared `merge_group_sidecars` helper
-                    // so the raw-streaming path and the spill-recovery
-                    // path produce byte-identical reductions (Task
-                    // 16.4.2 audit fix Gap B).
-                    for (a, b) in cur_state.row.iter_mut().zip(state.row.iter()) {
-                        AccumulatorEnum::merge(a, b);
-                    }
-                    // Ensure `state` carries the current call's sidecar
-                    // triple in its own fields — the AddRaw path seeds
-                    // these from the per-record sidecar, the spill-merge
-                    // path has them populated from the spilled envelope
-                    // (or at identity values in the 16.3.13 fallback).
-                    let mut src = state;
-                    if src.min_row_num == u64::MAX {
-                        src.min_row_num = sidecar.0;
-                    }
-                    if src.common_emitted.is_none() && !sidecar.1.is_empty() {
-                        src.common_emitted = Some(sidecar.1.clone());
-                    }
-                    if src.union_accumulated.is_empty() {
-                        src.union_accumulated = sidecar.2.clone();
-                    }
-                    // Accumulator rows were already merged above; zero
-                    // `src.row` so `merge_group_sidecars` does not
-                    // double-count anything (the helper only touches
-                    // sidecars + tracker, but keeping `src.row` empty
-                    // makes that contract obvious to future readers).
-                    src.row.clear();
-                    crate::aggregation::merge_group_sidecars(cur_state, src);
-                    let _ = &sidecar; // consumed into src above
-                    Ok(None)
-                }
-                Ordering::Less => {
-                    // cur_key < incoming key → boundary; finalize cur.
-                    let (prev_key, prev_state) = self.current.take().unwrap();
-                    let record = finalize(&prev_key, &prev_state)?;
-                    let row_num = if prev_state.min_row_num == u64::MAX {
-                        0
-                    } else {
-                        prev_state.min_row_num
-                    };
-                    let emitted = prev_state.common_emitted.unwrap_or_default();
-                    let accumulated = prev_state.union_accumulated;
-                    // Install the new open group with its sidecar triple
-                    // already seeded (the caller passes the incoming
-                    // per-record sidecars; for spill-recovery they are
-                    // identity values).
-                    let mut new_state = state;
-                    if new_state.min_row_num == u64::MAX {
-                        new_state.min_row_num = sidecar.0;
-                    }
-                    if new_state.common_emitted.is_none() && !sidecar.1.is_empty() {
-                        new_state.common_emitted = Some(sidecar.1);
-                    }
-                    if new_state.union_accumulated.is_empty() {
-                        new_state.union_accumulated = sidecar.2;
-                    }
-                    self.current = Some((key, new_state));
-                    Ok(Some((record, row_num, emitted, accumulated)))
-                }
-                // cur_key > incoming → caller violated monotonic
-                // contract (upstream sort is wrong).
-                Ordering::Greater => Err(HashAggError::SortOrderViolation {
-                    message: format!(
-                        "streaming-merge received key that sorts before the currently-open group \
-                         (cur={cur_key:?}, incoming={key:?}); upstream ordering contract violated"
-                    ),
-                }),
-            }
-        } else {
+        if self.open_state.is_none() {
+            // First record — install as the open group and swap buffers.
             let mut new_state = state;
-            if new_state.min_row_num == u64::MAX {
-                new_state.min_row_num = sidecar.0;
+            seed_sidecars(&mut new_state, sidecar);
+            self.open_state = Some(new_state);
+            std::mem::swap(&mut self.last, &mut self.current);
+            self.current.clear();
+            return Ok(());
+        }
+
+        match self.current.as_slice().cmp(self.last.as_slice()) {
+            Ordering::Equal => {
+                let cur_state = self.open_state.as_mut().unwrap();
+                // Row-by-row accumulator merge.
+                for (a, b) in cur_state.row.iter_mut().zip(state.row.iter()) {
+                    AccumulatorEnum::merge(a, b);
+                }
+                let mut src = state;
+                seed_sidecars(&mut src, sidecar);
+                src.row.clear(); // already merged above
+                crate::aggregation::merge_group_sidecars(cur_state, src);
+                self.current.clear();
+                Ok(())
             }
-            if new_state.common_emitted.is_none() && !sidecar.1.is_empty() {
-                new_state.common_emitted = Some(sidecar.1);
+            Ordering::Greater => {
+                // Boundary: finalize the open group.
+                let prev_state = self.open_state.take().unwrap();
+                let record = finalize(&prev_state)?;
+                let row_num = if prev_state.min_row_num == u64::MAX {
+                    0
+                } else {
+                    prev_state.min_row_num
+                };
+                let emitted = prev_state.common_emitted.unwrap_or_default();
+                let accumulated = prev_state.union_accumulated;
+                out.push((record, row_num, emitted, accumulated));
+
+                // Install the new open group.
+                let mut new_state = state;
+                seed_sidecars(&mut new_state, sidecar);
+                self.open_state = Some(new_state);
+                std::mem::swap(&mut self.last, &mut self.current);
+                self.current.clear();
+                Ok(())
             }
-            if new_state.union_accumulated.is_empty() {
-                new_state.union_accumulated = sidecar.2;
+            Ordering::Less => {
+                let msg = self.encoder.debug_decode_pair(&self.last, &self.current);
+                let prev = format!("0x{}", hex(&self.last));
+                let next = format!("0x{}", hex(&self.current));
+                match self.mode {
+                    StreamingErrorMode::UserInput => Err(HashAggError::SortOrderViolation {
+                        prev_key_debug: prev,
+                        next_key_debug: format!("{next} ({msg})"),
+                    }),
+                    StreamingErrorMode::SpillMerge => Err(HashAggError::MergeSortOrderViolation {
+                        prev_key_debug: prev,
+                        next_key_debug: format!("{next} ({msg})"),
+                    }),
+                }
             }
-            self.current = Some((key, new_state));
-            Ok(None)
         }
     }
 
     /// Finalize and emit the last open group, if any.
-    pub(crate) fn flush<F>(mut self, finalize: &F) -> Result<Option<SortRow>, HashAggError>
+    pub(crate) fn flush<F>(
+        mut self,
+        finalize: &F,
+        out: &mut Vec<SortRow>,
+    ) -> Result<(), HashAggError>
     where
-        F: Fn(&[GroupByKey], &AggregatorGroupState) -> Result<clinker_record::Record, HashAggError>,
+        F: Fn(&AggregatorGroupState) -> Result<clinker_record::Record, HashAggError>,
     {
-        if let Some((key, state)) = self.current.take() {
-            let record = finalize(&key, &state)?;
+        if let Some(state) = self.open_state.take() {
+            let record = finalize(&state)?;
             let row_num = if state.min_row_num == u64::MAX {
                 0
             } else {
@@ -171,9 +181,34 @@ impl GroupBoundary {
             };
             let emitted = state.common_emitted.unwrap_or_default();
             let accumulated = state.union_accumulated;
-            Ok(Some((record, row_num, emitted, accumulated)))
-        } else {
-            Ok(None)
+            out.push((record, row_num, emitted, accumulated));
         }
+        Ok(())
     }
+}
+
+fn seed_sidecars(
+    state: &mut AggregatorGroupState,
+    sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
+) {
+    if state.min_row_num == u64::MAX {
+        state.min_row_num = sidecar.0;
+    }
+    if state.common_emitted.is_none() && !sidecar.1.is_empty() {
+        state.common_emitted = Some(sidecar.1);
+    } else if state.common_emitted.is_none() {
+        state.common_emitted = Some(IndexMap::new());
+    }
+    if state.union_accumulated.is_empty() {
+        state.union_accumulated = sidecar.2;
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

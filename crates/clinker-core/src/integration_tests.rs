@@ -61,7 +61,8 @@ mod tests {
                 | PipelineError::Schema(_)
                 | PipelineError::Compilation { .. }
                 | PipelineError::Internal { .. }
-                | PipelineError::SortOrderViolation { .. },
+                | PipelineError::SortOrderViolation { .. }
+                | PipelineError::MergeSortOrderViolation { .. },
             ) => 1,
             Err(PipelineError::Eval(_) | PipelineError::Accumulator { .. }) => 3,
             Err(

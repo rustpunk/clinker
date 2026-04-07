@@ -2802,15 +2802,21 @@ impl PipelineExecutor {
                     let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
                     let input_count = input.len() as u64;
 
+                    let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
                     for (record, row_num, emitted, accumulated) in &input {
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
                             source_row: *row_num,
                         };
-                        if let Err(e) =
-                            stream.add_record(record, *row_num, emitted, accumulated, &ctx)
-                        {
+                        if let Err(e) = stream.add_record(
+                            record,
+                            *row_num,
+                            emitted,
+                            accumulated,
+                            &ctx,
+                            &mut emitted_rows,
+                        ) {
                             match config.error_handling.strategy {
                                 ErrorStrategy::FailFast => return Err(e.into()),
                                 ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
@@ -2839,8 +2845,8 @@ impl PipelineExecutor {
                         source_file: &source_file_arc,
                         source_row: 0,
                     };
-                    let out_rows: Vec<AggSortRow> = match stream.finalize(&ctx) {
-                        Ok(rows) => rows,
+                    let out_rows: Vec<AggSortRow> = match stream.finalize(&ctx, &mut emitted_rows) {
+                        Ok(()) => emitted_rows,
                         Err(HashAggError::Accumulator {
                             transform,
                             binding,

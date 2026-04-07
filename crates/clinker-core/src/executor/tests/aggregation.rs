@@ -705,7 +705,8 @@ outputs:
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("test.csv");
         let ctx = ctx_for(&stable, &file, 0);
-        let result = agg.finalize(&ctx);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        let result = agg.finalize(&ctx, &mut out);
         // Under Continue, the dispatch arm matches HashAggError::Accumulator
         // and routes to the DLQ. Here we assert the engine surfaces the
         // typed error variant the dispatch arm relies on.
@@ -719,7 +720,7 @@ outputs:
                     "binding label includes the aggregate name; got {binding}"
                 );
             }
-            Ok(_) => panic!("expected Accumulator overflow error"),
+            Ok(()) => panic!("expected Accumulator overflow error"),
             Err(other) => panic!("expected Accumulator, got {other:?}"),
         }
         // Sanity: verify that ErrorStrategy::Continue is the variant the
@@ -733,7 +734,8 @@ outputs:
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("test.csv");
         let ctx = ctx_for(&stable, &file, 0);
-        let result = agg.finalize(&ctx);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        let result = agg.finalize(&ctx, &mut out);
         // Under FailFast, the dispatch arm propagates as
         // PipelineError::Accumulator. Verify the From conversion.
         match result {
@@ -823,15 +825,23 @@ outputs:
             ("b", 20u64),
             ("b", 21u64),
         ];
+        let mut rows: Vec<crate::aggregation::SortRow> = Vec::new();
         for (k, row_num) in records {
             let rec = make_record(&input_schema, vec![Value::String(k.into())]);
             let ctx = ctx_for(&stable, &file, row_num);
-            agg.add_record(&rec, row_num, &IndexMap::new(), &IndexMap::new(), &ctx)
-                .expect("add_record");
+            agg.add_record(
+                &rec,
+                row_num,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx,
+                &mut rows,
+            )
+            .expect("add_record");
         }
 
         let ctx = ctx_for(&stable, &file, 0);
-        let rows = agg.finalize(&ctx).expect("finalize");
+        agg.flush(&ctx, &mut rows).expect("flush");
         assert_eq!(rows.len(), 2, "two groups: {rows:?}");
 
         // Expect (k, row_num, c) = (a, 10, 3) and (b, 20, 2) in sorted
@@ -865,18 +875,238 @@ outputs:
         let r1 = make_record(&input_schema, vec![Value::String("b".into())]);
         let r2 = make_record(&input_schema, vec![Value::String("a".into())]);
         let ctx = ctx_for(&stable, &file, 1);
-        agg.add_record(&r1, 1, &IndexMap::new(), &IndexMap::new(), &ctx)
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.add_record(&r1, 1, &IndexMap::new(), &IndexMap::new(), &ctx, &mut out)
             .expect("first ok");
         let ctx = ctx_for(&stable, &file, 2);
         let err = agg
-            .add_record(&r2, 2, &IndexMap::new(), &IndexMap::new(), &ctx)
+            .add_record(&r2, 2, &IndexMap::new(), &IndexMap::new(), &ctx, &mut out)
             .expect_err("out-of-order must fail");
         let pe: PipelineError = err.into();
         match pe {
             PipelineError::SortOrderViolation { message } => {
-                assert!(message.contains("sorts before"), "msg = {message}");
+                assert!(
+                    message.contains("requires sorted input")
+                        || message.contains("prev=")
+                        || message.contains("next="),
+                    "msg = {message}"
+                );
             }
             other => panic!("expected SortOrderViolation, got {other:?}"),
         }
+    }
+}
+
+// ----- Phase 16 Task 16.4.3 — Single-Encoder Two-Phase Bytes tests -----
+
+mod task_16_4_3 {
+    use std::sync::Arc;
+
+    use clinker_record::{Record, Schema, Value};
+    use indexmap::IndexMap;
+
+    use crate::aggregation::{AggregatorGroupState, HashAggError, group_by_sort_fields};
+    use crate::error::PipelineError;
+    use crate::pipeline::sort_key::SortKeyEncoder;
+    use crate::pipeline::streaming_merge::{GroupBoundary, StreamingErrorMode};
+
+    fn schema(cols: &[&str]) -> Arc<Schema> {
+        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    }
+
+    fn rec(s: &Arc<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(Arc::clone(s), vals)
+    }
+
+    fn dummy_state() -> AggregatorGroupState {
+        AggregatorGroupState::new(Vec::new())
+    }
+
+    fn finalize_noop(_s: &AggregatorGroupState) -> Result<Record, HashAggError> {
+        Ok(rec(&schema(&["x"]), vec![Value::Null]))
+    }
+
+    fn make_boundary(mode: StreamingErrorMode) -> GroupBoundary {
+        let fields = group_by_sort_fields(&["k".to_string()], &Schema::new(vec!["k".into()]));
+        let encoder = SortKeyEncoder::new(fields);
+        GroupBoundary::new(encoder, mode)
+    }
+
+    /// Encode a record into the boundary's `current` buffer via a
+    /// take/swap dance to dodge the double-borrow on `&mut b`.
+    fn encode_key(b: &mut GroupBoundary, r: &Record) {
+        let mut buf = std::mem::take(&mut b.current);
+        b.encoder().encode_into(r, &mut buf);
+        b.current = buf;
+    }
+
+    #[test]
+    fn test_group_boundary_two_buffer_swap_cycle() {
+        let s = schema(&["k"]);
+        let mut b = make_boundary(StreamingErrorMode::UserInput);
+        let mut out = Vec::new();
+        // Push key "a"
+        encode_key(&mut b, &rec(&s, vec![Value::String("a".into())]));
+        b.push(
+            dummy_state(),
+            (1, IndexMap::new(), IndexMap::new()),
+            &finalize_noop,
+            &mut out,
+        )
+        .expect("ok");
+        // After install, current must be cleared
+        assert!(
+            b.current.is_empty(),
+            "current should be cleared after install"
+        );
+        assert!(out.is_empty(), "no emission on first push");
+
+        // Push key "b" — boundary transition; out gains 1 row.
+        encode_key(&mut b, &rec(&s, vec![Value::String("b".into())]));
+        b.push(
+            dummy_state(),
+            (2, IndexMap::new(), IndexMap::new()),
+            &finalize_noop,
+            &mut out,
+        )
+        .expect("ok");
+        assert_eq!(out.len(), 1, "one boundary emission");
+        assert!(b.current.is_empty(), "current cleared after boundary");
+    }
+
+    #[test]
+    fn test_group_boundary_sort_order_violation_user_input_mode() {
+        let s = schema(&["k"]);
+        let mut b = make_boundary(StreamingErrorMode::UserInput);
+        let mut out = Vec::new();
+        encode_key(&mut b, &rec(&s, vec![Value::String("b".into())]));
+        b.push(
+            dummy_state(),
+            (1, IndexMap::new(), IndexMap::new()),
+            &finalize_noop,
+            &mut out,
+        )
+        .unwrap();
+        encode_key(&mut b, &rec(&s, vec![Value::String("a".into())]));
+        let err = b
+            .push(
+                dummy_state(),
+                (2, IndexMap::new(), IndexMap::new()),
+                &finalize_noop,
+                &mut out,
+            )
+            .unwrap_err();
+        match err {
+            HashAggError::SortOrderViolation {
+                prev_key_debug,
+                next_key_debug,
+            } => {
+                assert!(!prev_key_debug.is_empty());
+                assert!(!next_key_debug.is_empty());
+            }
+            other => panic!("expected SortOrderViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_group_boundary_sort_order_violation_spill_merge_mode() {
+        let s = schema(&["k"]);
+        let mut b = make_boundary(StreamingErrorMode::SpillMerge);
+        let mut out = Vec::new();
+        encode_key(&mut b, &rec(&s, vec![Value::String("b".into())]));
+        b.push(
+            dummy_state(),
+            (0, IndexMap::new(), IndexMap::new()),
+            &finalize_noop,
+            &mut out,
+        )
+        .unwrap();
+        encode_key(&mut b, &rec(&s, vec![Value::String("a".into())]));
+        let err = b
+            .push(
+                dummy_state(),
+                (0, IndexMap::new(), IndexMap::new()),
+                &finalize_noop,
+                &mut out,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, HashAggError::MergeSortOrderViolation { .. }),
+            "expected MergeSortOrderViolation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_group_by_sort_fields_helper_deterministic() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let sch = Schema::new(vec!["a".into(), "b".into()]);
+        let v1 = group_by_sort_fields(&names, &sch);
+        let v2 = group_by_sort_fields(&names, &sch);
+        assert_eq!(v1.len(), 2);
+        assert_eq!(v1[0].field, "a");
+        assert_eq!(v1[1].field, "b");
+        assert_eq!(v1.len(), v2.len());
+        for (a, b) in v1.iter().zip(v2.iter()) {
+            assert_eq!(a.field, b.field);
+            assert_eq!(a.order, b.order);
+        }
+    }
+
+    #[test]
+    fn test_hash_agg_error_sort_order_violation_has_debug_fields() {
+        let e = HashAggError::SortOrderViolation {
+            prev_key_debug: "a".to_string(),
+            next_key_debug: "b".to_string(),
+        };
+        let s = format!("{e}");
+        assert!(s.contains("prev=a"), "{s}");
+        assert!(s.contains("next=b"), "{s}");
+    }
+
+    #[test]
+    fn test_pipeline_error_merge_sort_order_violation_routes_through_from_impl() {
+        let e = HashAggError::MergeSortOrderViolation {
+            prev_key_debug: "a".to_string(),
+            next_key_debug: "b".to_string(),
+        };
+        let pe: PipelineError = e.into();
+        match pe {
+            PipelineError::MergeSortOrderViolation { message } => {
+                assert!(message.contains("internal Clinker bug"), "{message}");
+            }
+            other => panic!("expected MergeSortOrderViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_group_boundary_capacity_preserved_across_pushes() {
+        let s = schema(&["k"]);
+        let mut b = make_boundary(StreamingErrorMode::UserInput);
+        let mut out = Vec::new();
+        encode_key(&mut b, &rec(&s, vec![Value::String("aaaaaa".into())]));
+        let cap_before = b.current.capacity();
+        b.push(
+            dummy_state(),
+            (1, IndexMap::new(), IndexMap::new()),
+            &finalize_noop,
+            &mut out,
+        )
+        .unwrap();
+        for i in 0..100u64 {
+            let k = format!("bbbbbb{i:03}");
+            encode_key(&mut b, &rec(&s, vec![Value::String(k.into())]));
+            b.push(
+                dummy_state(),
+                (i, IndexMap::new(), IndexMap::new()),
+                &finalize_noop,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let cap_after = b.current.capacity();
+        assert!(
+            cap_after <= cap_before.max(64),
+            "current cap exploded: before={cap_before} after={cap_after}"
+        );
     }
 }

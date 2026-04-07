@@ -663,7 +663,7 @@ pub struct AggregatorGroupState {
 }
 
 impl AggregatorGroupState {
-    fn new(row: AccumulatorRow) -> Self {
+    pub(crate) fn new(row: AccumulatorRow) -> Self {
         Self {
             row,
             meta_tracker: MetadataCommonTracker::new(),
@@ -750,8 +750,21 @@ pub enum HashAggError {
     /// either the upstream ordering contract was wrong or the plan
     /// property pass qualified streaming aggregation on a node whose
     /// output was not actually sorted (DataFusion #12086-class bug).
-    /// Phase 16 Task 16.4.0.
-    SortOrderViolation { message: String },
+    /// Phase 16 Task 16.4.3 — widened from `{ message: String }` so the
+    /// `GroupBoundary` can hand the executor both pre/next encoded keys
+    /// for diagnostics. The user-input vs spill-merge distinction is
+    /// captured in two separate variants because the two cases route
+    /// differently through `From<HashAggError> for PipelineError`.
+    SortOrderViolation {
+        prev_key_debug: String,
+        next_key_debug: String,
+    },
+    /// Spill-merge produced an out-of-order key — Clinker bug, not a
+    /// user data error. Always hard-aborts. Phase 16 Task 16.4.3.
+    MergeSortOrderViolation {
+        prev_key_debug: String,
+        next_key_debug: String,
+    },
 }
 
 impl std::fmt::Display for HashAggError {
@@ -776,9 +789,20 @@ impl std::fmt::Display for HashAggError {
                 "aggregate {transform}.{binding}: accumulator finalize failed: {source:?}"
             ),
             HashAggError::Residual(e) => write!(f, "aggregate residual eval failed: {e}"),
-            HashAggError::SortOrderViolation { message } => {
-                write!(f, "streaming aggregate sort-order violation: {message}")
-            }
+            HashAggError::SortOrderViolation {
+                prev_key_debug,
+                next_key_debug,
+            } => write!(
+                f,
+                "streaming aggregate sort-order violation: prev={prev_key_debug} next={next_key_debug}"
+            ),
+            HashAggError::MergeSortOrderViolation {
+                prev_key_debug,
+                next_key_debug,
+            } => write!(
+                f,
+                "spill-merge sort-order violation (Clinker bug): prev={prev_key_debug} next={next_key_debug}"
+            ),
         }
     }
 }
@@ -827,9 +851,22 @@ impl From<HashAggError> for PipelineError {
                 node: String::new(),
                 detail: format!("aggregate residual eval failed: {r}"),
             },
-            HashAggError::SortOrderViolation { message } => {
-                PipelineError::SortOrderViolation { message }
-            }
+            HashAggError::SortOrderViolation {
+                prev_key_debug,
+                next_key_debug,
+            } => PipelineError::SortOrderViolation {
+                message: format!(
+                    "streaming aggregation requires sorted input; prev={prev_key_debug} next={next_key_debug}"
+                ),
+            },
+            HashAggError::MergeSortOrderViolation {
+                prev_key_debug,
+                next_key_debug,
+            } => PipelineError::MergeSortOrderViolation {
+                message: format!(
+                    "internal Clinker bug — LoserTree produced out-of-order keys: prev={prev_key_debug} next={next_key_debug}"
+                ),
+            },
         }
     }
 }
@@ -847,11 +884,11 @@ impl From<HashAggError> for PipelineError {
 /// failure mode of placeholder generic parameters in dispatch enums.
 #[non_exhaustive]
 pub enum AggregateStream {
-    Hash(HashAggregator),
+    Hash(Box<HashAggregator>),
     /// Streaming aggregation over a pre-sorted upstream. Landed in
     /// Phase 16 Task 16.4.0 alongside the real `AccumulatorOp` /
     /// `AddRaw` types and the shared streaming-merge module.
-    Streaming(StreamingAggregator<AddRaw>),
+    Streaming(Box<StreamingAggregator<AddRaw>>),
 }
 
 impl AggregateStream {
@@ -876,7 +913,7 @@ impl AggregateStream {
     ) -> Result<Self, PipelineError> {
         let _ = (&spill_schema, &spill_sort_fields, memory_budget, &spill_dir);
         match strategy {
-            AggregateStrategy::Hash => Ok(Self::Hash(HashAggregator::new(
+            AggregateStrategy::Hash => Ok(Self::Hash(Box::new(HashAggregator::new(
                 compiled,
                 evaluator,
                 output_schema,
@@ -885,16 +922,23 @@ impl AggregateStream {
                 memory_budget,
                 spill_dir,
                 transform_name,
-            ))),
-            AggregateStrategy::Streaming => Ok(Self::Streaming(StreamingAggregator::new_for_raw(
-                compiled,
-                evaluator,
-                output_schema,
-                transform_name,
-            ))),
+            )))),
+            AggregateStrategy::Streaming => {
+                Ok(Self::Streaming(Box::new(StreamingAggregator::new_for_raw(
+                    compiled,
+                    evaluator,
+                    output_schema,
+                    transform_name,
+                ))))
+            }
         }
     }
 
+    /// Drive one input record through the wrapper. The Hash arm ignores
+    /// `out` (it defers all emission to `finalize`). The Streaming arm
+    /// pushes one finalized `SortRow` into `out` for every key boundary
+    /// crossed by this record. Phase 16 Task 16.4.3 (D-α/D-γ debt).
+    #[allow(clippy::too_many_arguments)]
     pub fn add_record(
         &mut self,
         record: &Record,
@@ -902,17 +946,23 @@ impl AggregateStream {
         emitted: &IndexMap<String, Value>,
         accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
+        out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
         match self {
-            Self::Hash(h) => h.add_record(record, row_num, emitted, accumulated, ctx),
-            Self::Streaming(s) => s.add_record(record, row_num, emitted, accumulated, ctx),
+            Self::Hash(h) => {
+                let _ = &out; // Hash defers emission to finalize.
+                h.add_record(record, row_num, emitted, accumulated, ctx)
+            }
+            Self::Streaming(s) => s.add_record(record, row_num, emitted, accumulated, ctx, out),
         }
     }
 
-    pub fn finalize(self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
+    /// Drain the wrapper into `out`. Both arms append into the existing
+    /// vector — the executor's drain loop is shape-uniform across arms.
+    pub fn finalize(self, ctx: &EvalContext, out: &mut Vec<SortRow>) -> Result<(), HashAggError> {
         match self {
-            Self::Hash(h) => h.finalize(ctx),
-            Self::Streaming(s) => s.finalize(ctx),
+            Self::Hash(h) => h.finalize(ctx, out),
+            Self::Streaming(s) => s.flush(ctx, out),
         }
     }
 }
@@ -1181,24 +1231,45 @@ impl HashAggregator {
         let spill_err = |e: crate::pipeline::spill::SpillError| HashAggError::Spill(e.to_string());
         let json_err = |e: serde_json::Error| HashAggError::Spill(e.to_string());
 
-        // 1. Drain and 2. sort by group key (deterministic total order).
-        let mut entries: Vec<(Vec<GroupByKey>, AggregatorGroupState)> =
-            self.groups.drain().collect();
-        entries.sort_by(|a, b| compare_group_keys(&a.0, &b.0));
+        // 1. Drain.
+        let drained: Vec<(Vec<GroupByKey>, AggregatorGroupState)> = self.groups.drain().collect();
 
-        // Pre-compute how many columns precede the two synthetic trailers.
+        // 2. Encode each group's key into bytes via the same
+        //    `SortKeyEncoder` configuration the read side will use, then
+        //    sort by raw `Vec<u8>` (memcmp). The encoded buffers are
+        //    transient — they drop at end of scope. Phase 16 Task 16.4.3.
+        let sort_fields = group_by_sort_fields(&self.group_by_fields, &self.spill_schema);
+        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
+
+        // Pre-build synthetic records once so we can encode them via
+        // the same `Record`-based encoder both write and read sides use.
         let gb_count = self.group_by_indices.len();
+        let mut prepared: Vec<(Vec<u8>, usize)> = Vec::with_capacity(drained.len());
+        for (idx, (key, _state)) in drained.iter().enumerate() {
+            let mut values: Vec<Value> = Vec::with_capacity(gb_count + 2);
+            for gk in key {
+                values.push(gk.to_value());
+            }
+            values.push(Value::Null);
+            values.push(Value::Null);
+            let synth = Record::new(Arc::clone(&self.spill_schema), values);
+            let mut buf = Vec::new();
+            encoder.encode_into(&synth, &mut buf);
+            prepared.push((buf, idx));
+        }
+        prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let mut writer: SpillWriter<()> =
             SpillWriter::new(Arc::clone(&self.spill_schema), self.spill_dir.as_deref())
                 .map_err(spill_err)?;
 
-        for (key, state) in entries {
+        for (_encoded, idx) in &prepared {
+            let (key, state) = &drained[*idx];
             let acc_json = serde_json::to_string(&state.row).map_err(json_err)?;
             let meta_json = serde_json::to_string(&state.meta_tracker).map_err(json_err)?;
 
             let mut values: Vec<Value> = Vec::with_capacity(gb_count + 2);
-            for gk in &key {
+            for gk in key {
                 values.push(gk.to_value());
             }
             values.push(Value::String(acc_json.into()));
@@ -1233,24 +1304,25 @@ impl HashAggregator {
     ///    `MetadataCommonTracker` partials at each key boundary, and
     ///    route each finalized group through the same
     ///    `finalize_group` helper so both paths agree byte-for-byte.
-    pub fn finalize(mut self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
-        // D12: global-fold empty-input special case. No record was ever
-        // observed, so the per-group sidecar reductions are at their
-        // identity values: row_num=0 (the only legitimate use of zero —
-        // every real per-record row_num is 1-based), emitted=empty,
-        // accumulated=empty. Documented inline so future readers do not
-        // mistake the zero for a missing-data sentinel.
+    pub fn finalize(
+        mut self,
+        ctx: &EvalContext,
+        out: &mut Vec<SortRow>,
+    ) -> Result<(), HashAggError> {
+        // D12: global-fold empty-input special case. Delegated to the
+        // shared `empty_global_fold_row` helper so the streaming path
+        // produces a byte-identical record (Phase 16 Task 16.4.3).
         if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
-            let empty_key: Vec<GroupByKey> = Vec::new();
-            let state = AggregatorGroupState::new(self.factory.create_accumulators());
-            let record = self.finalize_group(&empty_key, &state, ctx)?;
-            return Ok(vec![(record, 0, IndexMap::new(), IndexMap::new())]);
+            let record =
+                empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
+            out.push((record, 0, IndexMap::new(), IndexMap::new()));
+            return Ok(());
         }
 
         if self.spill_files.is_empty() {
             let entries: Vec<(Vec<GroupByKey>, AggregatorGroupState)> =
                 self.groups.drain().collect();
-            let mut out: Vec<SortRow> = Vec::with_capacity(entries.len());
+            out.reserve(entries.len());
             for (key, state) in entries {
                 let record = self.finalize_group(&key, &state, ctx)?;
                 let row_num = if state.min_row_num == u64::MAX {
@@ -1261,9 +1333,9 @@ impl HashAggregator {
                 let emitted = state.common_emitted.unwrap_or_default();
                 out.push((record, row_num, emitted, state.union_accumulated));
             }
-            Ok(out)
+            Ok(())
         } else {
-            self.finalize_with_spill(ctx)
+            self.finalize_with_spill(ctx, out)
         }
     }
 
@@ -1292,7 +1364,11 @@ impl HashAggregator {
     /// `MetadataCommonTracker::merge` combine partial states
     /// associatively — conflicts propagate correctly because both
     /// merges are associative per D11 revised.
-    fn finalize_with_spill(mut self, ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
+    fn finalize_with_spill(
+        mut self,
+        ctx: &EvalContext,
+        out: &mut Vec<SortRow>,
+    ) -> Result<(), HashAggError> {
         if !self.groups.is_empty() {
             self.spill()?;
         }
@@ -1305,19 +1381,9 @@ impl HashAggregator {
             .map(|f| f.reader().map_err(spill_err))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Sort fields for the memcomparable merge encoder. Group-by
-        // columns are always ASC nulls-first in the spill sort order —
-        // matches the ordering produced by `spill()` via
-        // `compare_group_keys` (nulls sort as the lowest variant tag).
-        let sort_fields: Vec<SortField> = self
-            .group_by_fields
-            .iter()
-            .map(|name| SortField {
-                field: name.clone(),
-                order: SortOrder::Asc,
-                null_order: Some(NullOrder::First),
-            })
-            .collect();
+        // Sort fields for both the LoserTree's own ordering key and the
+        // GroupBoundary's encoder. Single source of truth.
+        let sort_fields = group_by_sort_fields(&self.group_by_fields, &self.spill_schema);
 
         // Prime the loser tree with one entry per reader.
         let mut initial: Vec<Option<MergeEntry>> = Vec::with_capacity(readers.len());
@@ -1335,19 +1401,31 @@ impl HashAggregator {
 
         let gb_count = self.group_by_indices.len();
         // FALLBACK per drill-pass-7 Option (b): the spill envelope does
-        // NOT carry the D57 sidecars (row_num / emitted / accumulated).
-        // For spill-recovered groups we push identity sidecars into the
-        // shared [`GroupBoundary`] detector — the same state machine now
-        // drives both the spill-merge path and the streaming-raw path
-        // (DataFusion #4301 pattern, Phase 16 Task 16.4.0).
+        // NOT carry the D57 sidecars. For spill-recovered groups we push
+        // identity sidecars into the shared `GroupBoundary` detector,
+        // now byte-keyed (Phase 16 Task 16.4.3 — "Single-Encoder
+        // Two-Phase Bytes").
         let factory = &self.factory;
         let output_schema = &self.output_schema;
         let transform_name = self.transform_name.clone();
-        let finalize = |k: &[GroupByKey], s: &AggregatorGroupState| {
+
+        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields.clone());
+        let mut boundary = crate::pipeline::streaming_merge::GroupBoundary::new(
+            encoder,
+            crate::pipeline::streaming_merge::StreamingErrorMode::SpillMerge,
+        );
+
+        // Track the currently-open group key alongside the boundary.
+        // The boundary itself is byte-keyed and doesn't carry the
+        // semantic key, but `finalize_group_inner` needs it to evaluate
+        // residuals over GroupKey slots.
+        let open_key: std::cell::RefCell<Option<Vec<GroupByKey>>> = std::cell::RefCell::new(None);
+
+        let finalize_closure = |s: &AggregatorGroupState| -> Result<Record, HashAggError> {
+            let borrow = open_key.borrow();
+            let k = borrow.as_deref().unwrap_or(&[]);
             finalize_group_inner(factory, output_schema, &transform_name, k, s)
         };
-        let mut out: Vec<SortRow> = Vec::new();
-        let mut boundary = crate::pipeline::streaming_merge::GroupBoundary::new();
 
         while tree.winner().is_some() {
             let stream_idx = tree.winner_index();
@@ -1355,11 +1433,24 @@ impl HashAggregator {
 
             let (key, state) = decode_spill_record(&record, &self.group_by_fields, gb_count)?;
 
-            if let Some(row) =
-                boundary.push(key, state, (0, IndexMap::new(), IndexMap::new()), &finalize)?
-            {
-                out.push(row);
-            }
+            // Encode the spilled record's group-by columns into
+            // boundary.current via the owned encoder.
+            let mut scratch = std::mem::take(&mut boundary.current);
+            boundary.encoder().encode_into(&record, &mut scratch);
+            boundary.current = scratch;
+
+            // The finalize closure needs the PREVIOUSLY open key (the
+            // one being closed out, not the new one being installed).
+            // It's already in `open_key` at this point.
+            boundary.push(
+                state,
+                (0, IndexMap::new(), IndexMap::new()),
+                &finalize_closure,
+                out,
+            )?;
+
+            // After push, update open_key to the just-installed group.
+            *open_key.borrow_mut() = Some(key);
 
             // Advance the winning stream.
             let next = match readers[stream_idx].next() {
@@ -1373,11 +1464,9 @@ impl HashAggregator {
             tree.replace_winner(next);
         }
 
-        if let Some(row) = boundary.flush(&finalize)? {
-            out.push(row);
-        }
+        boundary.flush(&finalize_closure, out)?;
         let _ = ctx; // reserved for future per-group eval scope
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1498,48 +1587,40 @@ fn decode_spill_record(
     Ok((key, state))
 }
 
-/// Total ordering on group-key tuples for spill sorting.
+/// Single source of truth for the `Vec<SortField>` configuration used
+/// to encode group-by columns for the streaming aggregator and the
+/// spill write/read paths. Phase 16 Task 16.4.3 (D74).
 ///
-/// GroupByKey does not implement `Ord` (its `Float` variant stores
-/// `f64::to_bits` raw, which is not a semantically meaningful integer
-/// order). For spill we only need a deterministic total order so the
-/// merge phase can walk k spill files in lockstep — the absolute
-/// ordering does not need to agree with any user-facing sort. We order
-/// tuples lexicographically and, within a variant, fall back to a
-/// stable per-variant comparator: raw `u64` bits for `Float` (Integer is
-/// excluded by default — only used when a field is int-pinned — and can
-/// use natural order). Variants themselves are ordered by their
-/// discriminant tag.
-pub(crate) fn compare_group_keys(a: &[GroupByKey], b: &[GroupByKey]) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let ord = match (x, y) {
-            (GroupByKey::Null, GroupByKey::Null) => Ordering::Equal,
-            (GroupByKey::Str(a), GroupByKey::Str(b)) => a.cmp(b),
-            (GroupByKey::Int(a), GroupByKey::Int(b)) => a.cmp(b),
-            (GroupByKey::Float(a), GroupByKey::Float(b)) => a.cmp(b),
-            (GroupByKey::Bool(a), GroupByKey::Bool(b)) => a.cmp(b),
-            (GroupByKey::Date(a), GroupByKey::Date(b)) => a.cmp(b),
-            (GroupByKey::DateTime(a), GroupByKey::DateTime(b)) => a.cmp(b),
-            _ => variant_tag(x).cmp(&variant_tag(y)),
-        };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    a.len().cmp(&b.len())
+/// Returns one ASC nulls-first `SortField` per group-by column. The
+/// schema parameter is currently unused but is plumbed so a future
+/// type-aware encoding (e.g. dict/binary) can read column types
+/// without changing the call sites.
+pub(crate) fn group_by_sort_fields(group_by_fields: &[String], _schema: &Schema) -> Vec<SortField> {
+    group_by_fields
+        .iter()
+        .map(|name| SortField {
+            field: name.clone(),
+            order: SortOrder::Asc,
+            null_order: Some(NullOrder::First),
+        })
+        .collect()
 }
 
-fn variant_tag(k: &GroupByKey) -> u8 {
-    match k {
-        GroupByKey::Null => 0,
-        GroupByKey::Bool(_) => 1,
-        GroupByKey::Int(_) => 2,
-        GroupByKey::Float(_) => 3,
-        GroupByKey::Str(_) => 4,
-        GroupByKey::Date(_) => 5,
-        GroupByKey::DateTime(_) => 6,
-    }
+/// Single source of truth for the empty-input global-fold record (D12).
+///
+/// Both the hash path (`HashAggregator::finalize`) and the streaming
+/// path (`StreamingAggregator::flush`) call this to produce one
+/// defaulted output record when an empty stream and an empty group-by
+/// would otherwise yield zero rows. Mirrors DataFusion's
+/// `AggregateStream` empty-input branch. Phase 16 Task 16.4.3 (D73).
+pub(crate) fn empty_global_fold_row(
+    factory: &AccumulatorFactory,
+    output_schema: &Arc<Schema>,
+    transform_name: &str,
+) -> Result<Record, HashAggError> {
+    let empty_key: Vec<GroupByKey> = Vec::new();
+    let state = AggregatorGroupState::new(factory.create_accumulators());
+    finalize_group_inner(factory, output_schema, transform_name, &empty_key, &state)
 }
 
 /// Dispatch one `BindingArg` to its accumulator. Returns the heap-byte
@@ -1809,9 +1890,15 @@ pub struct StreamingAggregator<Op: AccumulatorOp> {
     meta_conflict_logged: HashSet<Box<str>>,
     rows_seen: u64,
     boundary: crate::pipeline::streaming_merge::GroupBoundary,
-    /// Output buffer — `push` emits into this on every boundary; the
-    /// executor drains it at `finalize`.
+    /// Output buffer — drained on every `add_record` call into the
+    /// caller-owned `out` vec. Retained as a field for the legacy
+    /// `pending` fast-path code path.
     pending: Vec<SortRow>,
+    /// Semantic group key of the currently-open group. The byte-keyed
+    /// `GroupBoundary` only knows the encoded key bytes; the semantic
+    /// key is needed by `finalize_group_inner` to evaluate residuals
+    /// over `Expr::GroupKey { slot }`. Phase 16 Task 16.4.3.
+    last_open_key: Option<Vec<GroupByKey>>,
     _mode: std::marker::PhantomData<Op>,
 }
 
@@ -1837,6 +1924,12 @@ impl StreamingAggregator<AddRaw> {
             .map(|e| e.output_name.clone())
             .collect();
         let factory = AccumulatorFactory::new(compiled);
+        let sort_fields = group_by_sort_fields(&group_by_fields, &output_schema);
+        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
+        let boundary = crate::pipeline::streaming_merge::GroupBoundary::new(
+            encoder,
+            crate::pipeline::streaming_merge::StreamingErrorMode::UserInput,
+        );
         Self {
             factory,
             output_schema,
@@ -1848,8 +1941,9 @@ impl StreamingAggregator<AddRaw> {
             explicit_meta_keys,
             meta_conflict_logged: HashSet::new(),
             rows_seen: 0,
-            boundary: crate::pipeline::streaming_merge::GroupBoundary::new(),
+            boundary,
             pending: Vec::new(),
+            last_open_key: None,
             _mode: std::marker::PhantomData,
         }
     }
@@ -1867,6 +1961,7 @@ impl StreamingAggregator<AddRaw> {
     ///    boundary the previous group's finalized `SortRow` lands in
     ///    `self.pending`. A strictly lesser key is routed through
     ///    `HashAggError::SortOrderViolation` → hard abort.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_record(
         &mut self,
         record: &Record,
@@ -1874,6 +1969,7 @@ impl StreamingAggregator<AddRaw> {
         emitted: &IndexMap<String, Value>,
         accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
+        out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
         if let Some(filter) = &self.pre_agg_filter {
             let env: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
@@ -1960,36 +2056,67 @@ impl StreamingAggregator<AddRaw> {
         }
         state.union_accumulated = accumulated.clone();
 
+        // Encode the group-by columns into boundary.current via the
+        // owned encoder. We feed it the input record directly.
+        let mut scratch = std::mem::take(&mut self.boundary.current);
+        self.boundary.encoder().encode_into(record, &mut scratch);
+        self.boundary.current = scratch;
+
+        // Capture the open group's key for finalize. The byte-keyed
+        // boundary doesn't carry the semantic key, so we stash it
+        // alongside via a per-call closure capture.
         let factory = &self.factory;
         let output_schema = &self.output_schema;
         let transform_name = self.transform_name.clone();
-        let finalize = |k: &[GroupByKey], s: &AggregatorGroupState| {
+        let captured_key = self.last_open_key.clone();
+        let finalize_closure = |s: &AggregatorGroupState| -> Result<Record, HashAggError> {
+            let k = captured_key.as_deref().unwrap_or(&[]);
             finalize_group_inner(factory, output_schema, &transform_name, k, s)
         };
-        if let Some(row) = self.boundary.push(
-            key,
+
+        // Push pending rows from the boundary directly into the
+        // caller-owned `out` vec, then drain any pre-existing pending
+        // rows from `self.pending` into `out` as well to preserve order.
+        if !self.pending.is_empty() {
+            out.append(&mut self.pending);
+        }
+        self.boundary.push(
             state,
             (row_num, emitted.clone(), accumulated.clone()),
-            &finalize,
-        )? {
-            self.pending.push(row);
-        }
+            &finalize_closure,
+            out,
+        )?;
+
+        // After push, the boundary's open group is now the new key.
+        self.last_open_key = Some(key);
+        let _ = ctx; // ctx already used above
         Ok(())
     }
 
     /// Drain all emitted boundary rows plus the final open group.
-    pub fn finalize(mut self, _ctx: &EvalContext) -> Result<Vec<SortRow>, HashAggError> {
+    /// Phase 16 Task 16.4.3 — D12 special case.
+    pub fn flush(mut self, _ctx: &EvalContext, out: &mut Vec<SortRow>) -> Result<(), HashAggError> {
+        // D12 special case: empty input + empty group_by → emit one
+        // defaulted global-fold row.
+        if self.rows_seen == 0 && self.group_by_indices.is_empty() {
+            let record =
+                empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
+            out.push((record, 0, IndexMap::new(), IndexMap::new()));
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            out.append(&mut self.pending);
+        }
         let factory = self.factory;
         let output_schema = self.output_schema;
         let transform_name = self.transform_name;
-        let finalize = |k: &[GroupByKey], s: &AggregatorGroupState| {
+        let captured_key = self.last_open_key.clone();
+        let finalize_closure = move |s: &AggregatorGroupState| -> Result<Record, HashAggError> {
+            let k = captured_key.as_deref().unwrap_or(&[]);
             finalize_group_inner(&factory, &output_schema, &transform_name, k, s)
         };
-        let mut out = std::mem::take(&mut self.pending);
-        if let Some(last) = self.boundary.flush(&finalize)? {
-            out.push(last);
-        }
-        Ok(out)
+        self.boundary.flush(&finalize_closure, out)?;
+        Ok(())
     }
 }
 
@@ -2014,6 +2141,12 @@ impl StreamingAggregator<MergeState> {
             .map(|e| e.output_name.clone())
             .collect();
         let factory = AccumulatorFactory::new(compiled);
+        let sort_fields = group_by_sort_fields(&group_by_fields, &output_schema);
+        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
+        let boundary = crate::pipeline::streaming_merge::GroupBoundary::new(
+            encoder,
+            crate::pipeline::streaming_merge::StreamingErrorMode::SpillMerge,
+        );
         Self {
             factory,
             output_schema,
@@ -2025,8 +2158,9 @@ impl StreamingAggregator<MergeState> {
             explicit_meta_keys,
             meta_conflict_logged: HashSet::new(),
             rows_seen: 0,
-            boundary: crate::pipeline::streaming_merge::GroupBoundary::new(),
+            boundary,
             pending: Vec::new(),
+            last_open_key: None,
             _mode: std::marker::PhantomData,
         }
     }

@@ -34,12 +34,20 @@ pub enum PipelineError {
         binding: String,
         source: clinker_record::accumulator::AccumulatorError,
     },
-    /// Streaming aggregation detected an out-of-order group key. ALWAYS
-    /// hard-aborts regardless of error strategy — this is an invariant
-    /// violation, not a data error. Producer wiring lands in Task 16.4;
-    /// the variant ships in 16.3.13 per the DataFusion / Arrow / Vector
-    /// "forward error variants are normal" pattern.
+    /// Streaming aggregation detected an out-of-order group key on the
+    /// USER-INPUT path (`StreamingAggregator<AddRaw>`). ALWAYS hard-aborts
+    /// regardless of error strategy — the user's declared sort order was
+    /// wrong. Surfaced to the user as a DLQ-styled error. Phase 16 Task
+    /// 16.4.3.
     SortOrderViolation {
+        message: String,
+    },
+    /// Spill-merge produced an out-of-order group key. This is a
+    /// **Clinker bug** because the LoserTree should never produce
+    /// out-of-order keys; the only way to reach this variant is an
+    /// internal invariant violation in the spill-recovery path. ALWAYS
+    /// hard-aborts. Phase 16 Task 16.4.3 (D70/D72).
+    MergeSortOrderViolation {
         message: String,
     },
 }
@@ -86,6 +94,9 @@ impl fmt::Display for PipelineError {
             ),
             Self::SortOrderViolation { message } => {
                 write!(f, "sort-order violation: {message}")
+            }
+            Self::MergeSortOrderViolation { message } => {
+                write!(f, "spill-merge sort-order violation: {message}")
             }
         }
     }

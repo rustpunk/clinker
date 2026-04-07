@@ -271,7 +271,8 @@ fn main() -> ExitCode {
                         | PipelineError::Schema(_)
                         | PipelineError::Compilation { .. }
                         | PipelineError::Internal { .. }
-                        | PipelineError::SortOrderViolation { .. } => ExitCode::from(1),
+                        | PipelineError::SortOrderViolation { .. }
+                        | PipelineError::MergeSortOrderViolation { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
                         PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
                             ExitCode::from(3)
