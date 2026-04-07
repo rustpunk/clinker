@@ -9,17 +9,14 @@
 /// Navigation uses a two-level model:
 /// - `NavigationContext` — top-level activity (Pipeline, Channels, Git, Docs, Runs)
 /// - `PipelineLayoutMode` — view within Pipeline context only (Canvas, Hybrid, Editor)
-use std::collections::HashSet;
 use std::path::PathBuf;
 
-use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 use clinker_core::partial::PartialPipelineConfig;
 use clinker_git::RepoStatus;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::composition_index::CompositionIndex;
 use crate::recent_files::RecentFileEntry;
 use crate::sync::EditSource;
 use crate::tab::{TabEntry, TabId};
@@ -231,15 +228,7 @@ pub struct AppState {
     pub yaml_text: Signal<String>,
     /// Parsed pipeline config (None if YAML is invalid).
     pub pipeline: Signal<Option<PipelineConfig>>,
-    /// Raw pipeline config preserving `_import` directives (for serialization).
-    #[allow(dead_code)]
-    pub raw_pipeline: Signal<Option<RawPipelineConfig>>,
-    /// Resolved composition metadata (for canvas rendering and override editing).
-    pub compositions: Signal<Vec<ResolvedComposition>>,
-    /// Contract validation warnings from composition imports.
-    #[allow(dead_code)]
-    pub contract_warnings: Signal<Vec<ContractWarning>>,
-    /// Partial pipeline from graceful degradation (set when full parse fails but YAML syntax is valid).
+    /// Partial pipeline from graceful degradation.
     pub partial_pipeline: Signal<Option<PartialPipelineConfig>>,
     /// Parse error messages (empty when YAML is valid).
     pub parse_errors: Signal<Vec<String>>,
@@ -247,23 +236,6 @@ pub struct AppState {
     pub edit_source: Signal<EditSource>,
     /// Schema validation warnings for the current pipeline.
     pub schema_warnings: Signal<Vec<SchemaWarning>>,
-    /// Channel-resolved pipeline (None when no channel is active).
-    pub channel_pipeline: Signal<Option<crate::channel_resolve::ChannelResolution>>,
-    /// Current view mode when a channel is active (Base/Resolved/Diff).
-    pub channel_view_mode: Signal<ChannelViewMode>,
-    /// Composition paths that are currently inline-expanded on the canvas.
-    pub expanded_compositions: Signal<HashSet<String>>,
-    /// Drill-in stack for navigating into large compositions (5+ transforms).
-    pub composition_drill_stack: Signal<Vec<DrillInEntry>>,
-}
-
-/// An entry in the composition drill-in navigation stack.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DrillInEntry {
-    /// Path to the `.comp.yaml` file.
-    pub path: String,
-    /// Display name of the composition.
-    pub name: String,
 }
 
 /// Read the current `AppState` from context.
@@ -294,8 +266,6 @@ pub struct TabManagerState {
     pub git_state: Signal<Option<RepoStatus>>,
     /// Whether the command palette overlay is visible.
     pub show_command_palette: Signal<bool>,
-    /// Workspace composition index — populated on workspace load, refreshed on file changes.
-    pub composition_index: Signal<CompositionIndex>,
     /// Whether the settings overlay is visible.
     pub show_settings: Signal<bool>,
     /// Whether the activity bar is visible (focus mode toggle).
@@ -339,37 +309,6 @@ pub struct ChannelState {
     pub recent_channels: Vec<String>,
 }
 
-impl ChannelState {
-    /// Get the summary for the active channel, if any.
-    pub fn active_summary(&self) -> Option<&ChannelSummary> {
-        self.active_channel
-            .as_ref()
-            .and_then(|id| self.channels.iter().find(|c| c.id == *id))
-    }
-
-    /// All unique tier names across discovered channels.
-    pub fn tier_names(&self) -> Vec<String> {
-        let mut tiers: Vec<String> = self
-            .channels
-            .iter()
-            .filter_map(|c| c.tier.clone())
-            .collect();
-        tiers.sort();
-        tiers.dedup();
-        tiers
-    }
-
-    /// Set active channel and push to recent list (max 10, deduped).
-    pub fn select_channel(&mut self, id: Option<String>) {
-        if let Some(ref channel_id) = id {
-            self.recent_channels.retain(|r| r != channel_id);
-            self.recent_channels.insert(0, channel_id.clone());
-            self.recent_channels.truncate(10);
-        }
-        self.active_channel = id;
-    }
-}
-
 /// Summary of a discovered channel (extracted from `ChannelManifest`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelSummary {
@@ -396,28 +335,4 @@ pub struct GroupSummary {
     pub override_count: usize,
     /// Channel IDs that inherit from this group.
     pub inheritor_ids: Vec<String>,
-}
-
-/// Which view mode to show when a channel is active in Pipeline context.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum ChannelViewMode {
-    /// Show the base pipeline (no overrides applied).
-    #[default]
-    Base,
-    /// Show the resolved pipeline (base + channel overrides merged).
-    Resolved,
-    /// Show/edit the channel override `.channel.yaml` file.
-    Channel,
-}
-
-impl ChannelViewMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Base => "Base",
-            Self::Resolved => "Resolved",
-            Self::Channel => "Channel",
-        }
-    }
-
-    pub const ALL: [ChannelViewMode; 3] = [Self::Base, Self::Resolved, Self::Channel];
 }

@@ -934,46 +934,32 @@ pub enum LogLevel {
     Error,
 }
 
-/// A transformation list entry: either an inline transform or an `_import` directive.
-///
-/// Uses custom `Deserialize` (not `#[serde(untagged)]`) for clear error messages.
-/// Consistent with `SortFieldSpec` and `SchemaSource` (Phase 9 decision #40).
+/// A transformation list entry. Post-Phase-16b: only inline transforms.
 #[derive(Debug, Clone, Serialize)]
-#[allow(clippy::large_enum_variant)]
 pub enum TransformEntry {
-    Import { _import: String },
     Transform(TransformConfig),
+}
+
+impl From<TransformConfig> for TransformEntry {
+    fn from(t: TransformConfig) -> Self {
+        TransformEntry::Transform(t)
+    }
 }
 
 impl<'de> Deserialize<'de> for TransformEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
-        if value.get("_import").is_some() {
-            #[derive(Deserialize)]
-            struct ImportRef {
-                _import: String,
-            }
-            let import: ImportRef = serde_json::from_value(value).map_err(de::Error::custom)?;
-            Ok(TransformEntry::Import {
-                _import: import._import,
-            })
-        } else {
-            let transform: TransformConfig =
-                serde_json::from_value(value).map_err(de::Error::custom)?;
-            Ok(TransformEntry::Transform(transform))
-        }
+        let transform: TransformConfig =
+            serde_json::from_value(value).map_err(de::Error::custom)?;
+        Ok(TransformEntry::Transform(transform))
     }
 }
 
 impl PipelineConfig {
-    /// Returns resolved transforms. Panics if called before import resolution.
-    /// Cargo `InheritableField::normalized()` pattern.
+    /// Returns resolved transforms.
     pub fn transforms(&self) -> impl Iterator<Item = &TransformConfig> + '_ {
         self.transformations.iter().map(|entry| match entry {
             TransformEntry::Transform(t) => t,
-            TransformEntry::Import { _import } => {
-                panic!("unresolved _import '{_import}' — call resolve_compositions() first")
-            }
         })
     }
 }
@@ -1289,9 +1275,11 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
 
     // Validate log directives (iterate raw entries to avoid panic on unresolved imports)
     for entry in &config.transformations {
-        if let TransformEntry::Transform(t) = entry
-            && let Some(ref directives) = t.log
-        {
+        #[allow(irrefutable_let_patterns)]
+        let TransformEntry::Transform(t) = entry else {
+            continue;
+        };
+        if let Some(ref directives) = t.log {
             for (i, d) in directives.iter().enumerate() {
                 if let Some(every) = d.every {
                     if every == 0 {

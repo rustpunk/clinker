@@ -1,9 +1,9 @@
 use dioxus::prelude::*;
 
-use crate::autodoc::{ChannelDocContext, generate_stage_doc};
+use crate::autodoc::generate_stage_doc;
 use crate::notes::parse_notes;
 use crate::pipeline_view::{derive_partial_pipeline_view, derive_pipeline_view};
-use crate::state::{ChannelViewMode, use_app_state};
+use crate::state::use_app_state;
 
 use super::flow_bar::FlowBar;
 use super::stage_card::StageCard;
@@ -94,33 +94,10 @@ pub fn SchematicsPanel() -> Element {
         };
     }
 
-    let base_config = base_config.unwrap();
-    let compositions_read = (state.compositions).read();
+    let config = base_config.unwrap();
+    let channel_banner: Option<String> = None;
 
-    // Channel-aware pipeline selection
-    let channel_view = (state.channel_view_mode)();
-    let channel_res = (state.channel_pipeline)();
-
-    let (config, channel_doc_ctx, channel_banner) = match (channel_view, channel_res.as_ref()) {
-        (ChannelViewMode::Resolved, Some(cr)) => {
-            // Get active channel ID from channel state
-            let tab_mgr = use_context::<crate::state::TabManagerState>();
-            let channel_id = (tab_mgr.channel_state)()
-                .as_ref()
-                .and_then(|cs| cs.active_channel.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let ctx = ChannelDocContext {
-                channel_id: channel_id.clone(),
-                overrides_applied: cr.overrides_applied.clone(),
-            };
-            (&cr.resolved_config, Some(ctx), Some(channel_id))
-        }
-        _ => (base_config, None, None),
-    };
-
-    let expanded = (state.expanded_compositions).read();
-    let pipeline_view = derive_pipeline_view(config, &compositions_read, &expanded);
+    let pipeline_view = derive_pipeline_view(config);
     let stages = pipeline_view.stages;
     let pipeline_name = config.pipeline.name.clone();
 
@@ -129,13 +106,7 @@ pub fn SchematicsPanel() -> Element {
         .iter()
         .enumerate()
         .map(|(i, stage)| {
-            let doc = generate_stage_doc(
-                config,
-                &compositions_read,
-                channel_doc_ctx.as_ref(),
-                &stage.id,
-            )
-            .unwrap_or_default();
+            let doc = generate_stage_doc(config, &stage.id).unwrap_or_default();
 
             let notes_value = config
                 .inputs

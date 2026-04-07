@@ -1,7 +1,6 @@
 use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 
-use crate::components::channel_mode::ChannelSwitcher;
 use crate::keyboard;
 use crate::state::{NavigationContext, PipelineLayoutMode, TabManagerState, use_app_state};
 use crate::tab::TabEntry;
@@ -54,14 +53,6 @@ pub fn TitleBar() -> Element {
 
     // Git state for Git context title bar
     let git_branch = (tab_mgr.git_state)().as_ref().map(|gs| gs.branch.clone());
-
-    // Channel state for badge
-    let channel_badge_info = (tab_mgr.channel_state)().as_ref().map(|cs| {
-        let label = cs.active_channel.as_deref().unwrap_or("NO CHANNEL");
-        let tier = cs.active_summary().and_then(|s| s.tier.clone());
-        let has_channel = cs.active_channel.is_some();
-        (label.to_uppercase(), tier, has_channel)
-    });
 
     rsx! {
         div {
@@ -144,28 +135,6 @@ pub fn TitleBar() -> Element {
                 span { class: "kiln-title-divider" }
             }
 
-            // Channel badge + switcher dropdown (all contexts, when channels configured)
-            if let Some((ref label, ref tier, has_channel)) = channel_badge_info {
-                {
-                    let tier_class = tier
-                        .as_deref()
-                        .map(|t| format!("kiln-channel-badge--{t}"))
-                        .unwrap_or_default();
-                    let label = label.clone();
-                    rsx! {
-                        div {
-                            onmousedown: move |e| e.stop_propagation(),
-                            ChannelSwitcher {
-                                badge_label: label,
-                                tier_class,
-                                has_channel,
-                            }
-                        }
-                        span { class: "kiln-title-divider" }
-                    }
-                }
-            }
-
             // Pipeline context: filename with dirty indicator
             if current_ctx == NavigationContext::Pipeline {
                 span {
@@ -207,40 +176,6 @@ pub fn TitleBar() -> Element {
                                         pipeline_layout.set(mode);
                                     },
                                     "{mode.label()}"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Base/Resolved/Diff toggle — visible when channel is active in Pipeline context
-            if current_ctx == NavigationContext::Pipeline
-                && has_active_tab
-                && channel_badge_info.is_some()
-                && (tab_mgr.channel_state)()
-                    .as_ref()
-                    .and_then(|cs| cs.active_channel.as_ref())
-                    .is_some()
-            {
-                {
-                    let mut view_mode = state.channel_view_mode;
-                    rsx! {
-                        div {
-                            class: "kiln-channel-view-toggle",
-                            onmousedown: move |e| e.stop_propagation(),
-                            for mode in crate::state::ChannelViewMode::ALL {
-                                {
-                                    let is_active = (state.channel_view_mode)() == mode;
-                                    rsx! {
-                                        button {
-                                            key: "{mode.label()}",
-                                            class: "kiln-layout-btn",
-                                            "data-active": if is_active { "true" } else { "false" },
-                                            onclick: move |_| view_mode.set(mode),
-                                            "{mode.label()}"
-                                        }
-                                    }
                                 }
                             }
                         }

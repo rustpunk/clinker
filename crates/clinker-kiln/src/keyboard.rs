@@ -19,7 +19,7 @@ use crate::components::confirm_dialog::PendingConfirm;
 use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::file_ops;
 use crate::state::{AppState, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState};
-use crate::sync::serialize_raw_yaml;
+use crate::sync::serialize_yaml;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -87,26 +87,6 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
     if ctrl && alt && !shift && matches!(key, Key::ArrowLeft) {
         navigate_back(&app, tab_mgr);
         return true;
-    }
-
-    // ── Backspace/Escape — drill-in navigation (Pipeline context only) ───
-    if !ctrl && !alt && !shift && current_context == NavigationContext::Pipeline {
-        let mut drill_sig = app.composition_drill_stack;
-        let drill_stack = drill_sig.read();
-        if !drill_stack.is_empty() {
-            drop(drill_stack);
-            match key {
-                Key::Backspace => {
-                    drill_sig.write().pop();
-                    return true;
-                }
-                Key::Escape => {
-                    drill_sig.write().clear();
-                    return true;
-                }
-                _ => {}
-            }
-        }
     }
 
     // ── All remaining shortcuts require Ctrl ─────────────────────────────
@@ -424,8 +404,8 @@ fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: b
             return;
         };
 
-        let yaml = match tab.snapshot.raw_pipeline {
-            Some(ref config) => serialize_raw_yaml(config),
+        let yaml = match tab.snapshot.pipeline {
+            Some(ref config) => serialize_yaml(config),
             None => tab.snapshot.yaml_text.clone(),
         };
 

@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 
-use crate::autodoc::{ChannelDocContext, ConfigCategory, StageDoc, generate_stage_doc};
+use crate::autodoc::{ConfigCategory, StageDoc, generate_stage_doc};
 use crate::notes::parse_notes;
-use crate::state::{ChannelViewMode, use_app_state};
+use crate::state::use_app_state;
 
 /// Docs drawer — full stage documentation with Blueprint sub-aesthetic.
 ///
@@ -20,7 +20,7 @@ pub fn DrawerDocs(stage_id: String) -> Element {
     let state = use_app_state();
 
     let pipeline_guard = (state.pipeline).read();
-    let base_config = match pipeline_guard.as_ref() {
+    let config = match pipeline_guard.as_ref() {
         Some(c) => c,
         None => {
             return rsx! {
@@ -32,35 +32,7 @@ pub fn DrawerDocs(stage_id: String) -> Element {
         }
     };
 
-    let compositions_read = (state.compositions).read();
-
-    // Channel-aware pipeline selection
-    let channel_view = (state.channel_view_mode)();
-    let channel_res = (state.channel_pipeline)();
-
-    let (config, channel_doc_ctx) = match (channel_view, channel_res.as_ref()) {
-        (ChannelViewMode::Resolved, Some(cr)) => {
-            let tab_mgr = use_context::<crate::state::TabManagerState>();
-            let channel_id = (tab_mgr.channel_state)()
-                .as_ref()
-                .and_then(|cs| cs.active_channel.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let ctx = ChannelDocContext {
-                channel_id,
-                overrides_applied: cr.overrides_applied.clone(),
-            };
-            (&cr.resolved_config, Some(ctx))
-        }
-        _ => (base_config, None),
-    };
-
-    let Some(doc) = generate_stage_doc(
-        config,
-        &compositions_read,
-        channel_doc_ctx.as_ref(),
-        &stage_id,
-    ) else {
+    let Some(doc) = generate_stage_doc(config, &stage_id) else {
         return rsx! {
             div {
                 class: "kiln-drawer-content kiln-drawer-content--docs",

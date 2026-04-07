@@ -8,9 +8,9 @@
 /// Items that parse successfully become `PartialItem::Ok(T)`, failures become
 /// `PartialItem::Err` with the error message. The canvas can then render
 /// error nodes at the failure positions.
-use crate::composition::RawTransformEntry;
 use crate::config::{
-    ErrorHandlingConfig, InputConfig, OutputConfig, PipelineMeta, interpolate_env_vars,
+    ErrorHandlingConfig, InputConfig, OutputConfig, PipelineMeta, TransformConfig,
+    interpolate_env_vars,
 };
 
 /// An item that was either successfully parsed or failed with an error.
@@ -33,7 +33,7 @@ pub enum PartialItem<T> {
 pub struct PartialPipelineConfig {
     pub pipeline: Result<PipelineMeta, String>,
     pub inputs: Vec<PartialItem<InputConfig>>,
-    pub transformations: Vec<PartialItem<RawTransformEntry>>,
+    pub transformations: Vec<PartialItem<TransformConfig>>,
     pub outputs: Vec<PartialItem<OutputConfig>>,
     pub error_handling: Result<ErrorHandlingConfig, String>,
     pub notes: Option<serde_json::Value>,
@@ -75,9 +75,9 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
     // Inputs array
     let inputs = parse_array_section::<InputConfig>(obj, "inputs", &mut errors);
 
-    // Transformations array (uses RawTransformEntry for _import support)
+    // Transformations array (uses TransformConfig for _import support)
     let transformations =
-        parse_array_section::<RawTransformEntry>(obj, "transformations", &mut errors);
+        parse_array_section::<TransformConfig>(obj, "transformations", &mut errors);
 
     // Outputs array
     let outputs = parse_array_section::<OutputConfig>(obj, "outputs", &mut errors);

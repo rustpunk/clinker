@@ -1,8 +1,6 @@
 pub mod activity_bar;
 pub mod canvas;
-pub mod channel_mode;
 pub mod command_palette;
-pub mod composition_panel;
 pub mod confirm_dialog;
 pub mod inspector;
 pub mod placeholder_page;

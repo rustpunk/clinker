@@ -432,56 +432,7 @@ pub fn structural_search(
             }
         }
 
-        // Check composition-level tags (import:, composition:, override:)
-        // Parse as raw config to see _import directives
-        if tags
-            .iter()
-            .any(|t| matches!(t.key.as_str(), "import" | "composition" | "override"))
-            && let Ok(raw) = clinker_core::composition::parse_raw_config(&content)
-        {
-            for entry in &raw.transformations {
-                if let clinker_core::composition::RawTransformEntry::Import(directive) = entry {
-                    let path_lower = directive.path.to_lowercase();
-                    let override_names: Vec<String> = directive.overrides.keys().cloned().collect();
-
-                    for tag in tags {
-                        let val_lower = tag.value.to_lowercase();
-                        match tag.key.as_str() {
-                            "import" | "composition" => {
-                                if path_lower.contains(&val_lower) {
-                                    results.push(StructuralSearchMatch {
-                                        pipeline_path: relative.clone(),
-                                        stage_name: directive.path.clone(),
-                                        stage_type: "import".to_string(),
-                                        matched_detail: format!(
-                                            "imports {} ({} override(s))",
-                                            directive.path,
-                                            directive.overrides.len()
-                                        ),
-                                    });
-                                }
-                            }
-                            "override" => {
-                                for ovr_name in &override_names {
-                                    if ovr_name.to_lowercase().contains(&val_lower) {
-                                        results.push(StructuralSearchMatch {
-                                            pipeline_path: relative.clone(),
-                                            stage_name: ovr_name.clone(),
-                                            stage_type: "override".to_string(),
-                                            matched_detail: format!(
-                                                "overrides '{}' in {}",
-                                                ovr_name, directive.path
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        // Composition/import/override tags removed in Phase 16b.
 
         // Check inputs
         for input in &config.inputs {

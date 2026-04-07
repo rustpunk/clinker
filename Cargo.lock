@@ -740,6 +740,7 @@ dependencies = [
  "clinker-format",
  "miette",
  "num_cpus",
+ "serde-saphyr",
  "serde_json",
  "tracing",
  "tracing-subscriber",

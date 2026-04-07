@@ -17,8 +17,7 @@ use dioxus::prelude::*;
 use crate::components::confirm_dialog::{ConfirmAction, ConfirmDialog, PendingConfirm};
 use crate::components::toast::ToastState;
 use crate::components::{
-    activity_bar::ActivityBar, canvas::CanvasPanel, channel_mode::ChannelMode,
-    command_palette::CommandPalette, composition_panel::CompositionPanel,
+    activity_bar::ActivityBar, canvas::CanvasPanel, command_palette::CommandPalette,
     inspector::InspectorPanel, placeholder_page::PlaceholderPage, run_log::RunLogDrawer,
     schema_panel::SchemaPanel, schematics::SchematicsPanel, search_panel::SearchPanel,
     status_bar::StatusBar, tab_bar::TabBar, template_gallery::TemplateGallery, title_bar::TitleBar,
@@ -33,7 +32,7 @@ use crate::state::{
     AppState, KilnTheme, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState,
     use_app_state,
 };
-use crate::sync::{EditSource, ParseResult, serialize_raw_yaml, try_parse_yaml};
+use crate::sync::{EditSource, ParseResult, serialize_yaml, try_parse_yaml};
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -50,15 +49,7 @@ pub fn AppShell() -> Element {
     let mut edit_source = use_signal(|| EditSource::None);
     let mut selected_stage = use_signal(|| None::<String>);
     let mut schema_warnings = use_signal(Vec::new);
-    let raw_pipeline = use_signal(|| None);
-    let compositions = use_signal(Vec::new);
-    let contract_warnings = use_signal(Vec::new);
     let mut partial_pipeline = use_signal(|| None);
-    let mut channel_pipeline: Signal<Option<crate::channel_resolve::ChannelResolution>> =
-        use_signal(|| None);
-    let channel_view_mode = use_signal(crate::state::ChannelViewMode::default);
-    let expanded_compositions = use_signal(std::collections::HashSet::new);
-    let composition_drill_stack = use_signal(Vec::new);
 
     // ── Session restore (single call on first mount per use_signal) ─────
     // restore_session() is called in the first use_signal closure. The result
@@ -109,8 +100,6 @@ pub fn AppShell() -> Element {
     let show_template_gallery: Signal<bool> = use_signal(|| false);
     let mut git_state: Signal<Option<clinker_git::RepoStatus>> = use_signal(|| None);
     let show_command_palette: Signal<bool> = use_signal(|| false);
-    let mut composition_index: Signal<crate::composition_index::CompositionIndex> =
-        use_signal(crate::composition_index::CompositionIndex::default);
     let show_settings: Signal<bool> = use_signal(|| false);
     let mut channel_state: Signal<Option<crate::state::ChannelState>> = use_signal(|| None);
     let theme: Signal<KilnTheme> = use_signal(|| {
@@ -149,19 +138,6 @@ pub fn AppShell() -> Element {
                 schema_index.set(index);
             } else {
                 schema_index.set(SchemaIndex::default());
-            }
-        });
-    }
-
-    // ── Composition index: rebuild when workspace changes ─────────────
-    {
-        use_effect(move || {
-            let ws = (workspace)();
-            if let Some(ref ws) = ws {
-                let index = crate::composition_index::build_composition_index(ws);
-                composition_index.set(index);
-            } else {
-                composition_index.set(crate::composition_index::CompositionIndex::default());
             }
         });
     }
@@ -369,13 +345,6 @@ pub fn AppShell() -> Element {
         parse_errors,
         edit_source,
         schema_warnings,
-        raw_pipeline,
-        compositions,
-        contract_warnings,
-        channel_pipeline,
-        channel_view_mode,
-        expanded_compositions,
-        composition_drill_stack,
     };
 
     let mut app_state_signal = use_signal(|| current_app_state);
@@ -393,7 +362,6 @@ pub fn AppShell() -> Element {
         show_template_gallery,
         git_state,
         show_command_palette,
-        composition_index,
         show_settings,
         activity_bar_visible,
         nav_history,
@@ -446,7 +414,6 @@ pub fn AppShell() -> Element {
         show_template_gallery,
         git_state,
         show_command_palette,
-        composition_index,
         show_settings,
         activity_bar_visible,
         nav_history,
@@ -457,8 +424,6 @@ pub fn AppShell() -> Element {
     // ── Sync effects: YAML ↔ pipeline model ──────────────────────────────
     {
         let mut pipeline = pipeline;
-        let mut raw_pipeline = raw_pipeline;
-        let mut compositions = compositions;
         let mut partial_pipeline = partial_pipeline;
         let mut parse_errors = parse_errors;
 
@@ -475,8 +440,6 @@ pub fn AppShell() -> Element {
             match try_parse_yaml(&text, ws_root.as_deref()) {
                 ParseResult::Complete(resolved) => {
                     pipeline.set(Some(resolved.resolved));
-                    raw_pipeline.set(Some(resolved.raw));
-                    compositions.set(resolved.compositions);
                     partial_pipeline.set(None);
                     parse_errors.set(Vec::new());
                 }
@@ -499,53 +462,16 @@ pub fn AppShell() -> Element {
 
         use_effect(move || {
             let source = (edit_source)();
-            let raw_val = (raw_pipeline)();
+            let pl_val = (pipeline)();
 
             if source != EditSource::Inspector {
                 return;
             }
 
-            if let Some(ref config) = raw_val {
-                let yaml = serialize_raw_yaml(config);
+            if let Some(ref config) = pl_val {
+                let yaml = serialize_yaml(config);
                 yaml_text.set(yaml);
                 parse_errors.set(Vec::new());
-            }
-        });
-    }
-
-    // ── Channel resolution: resolve pipeline through channel overrides ────
-    {
-        use_effect(move || {
-            let pl = (pipeline)();
-            let cs = (channel_state)();
-
-            let active_id = cs.as_ref().and_then(|s| s.active_channel.clone());
-
-            match (pl.as_ref(), active_id, cs.as_ref()) {
-                (Some(config), Some(channel_id), Some(cs_ref)) => {
-                    // Derive pipeline path from active tab
-                    let pl_path = (active_tab_id)().and_then(|id| {
-                        tabs.read()
-                            .iter()
-                            .find(|t| t.id == id)
-                            .and_then(|t| t.file_path.clone())
-                    });
-
-                    match crate::channel_resolve::resolve_pipeline_for_channel(
-                        config,
-                        &channel_id,
-                        cs_ref,
-                        pl_path.as_deref(),
-                    ) {
-                        Ok(resolution) => channel_pipeline.set(Some(resolution)),
-                        Err(_e) => {
-                            channel_pipeline.set(None);
-                        }
-                    }
-                }
-                _ => {
-                    channel_pipeline.set(None);
-                }
             }
         });
     }
@@ -647,7 +573,12 @@ pub fn AppShell() -> Element {
                                     description: "Kiln user guide, CXL reference, and pipeline authoring documentation.",
                                 }
                             },
-                            NavigationContext::Channels => rsx! { ChannelMode {} },
+                            NavigationContext::Channels => rsx! {
+                                PlaceholderPage {
+                                    name: "Channels",
+                                    description: "Channel system removed in Phase 16b. Phase 16c will reintroduce composition support.",
+                                }
+                            },
                             NavigationContext::Runs => rsx! {
                                 PlaceholderPage {
                                     name: "Run History",
@@ -739,9 +670,7 @@ fn ActiveTabContent() -> Element {
                 LeftPanel::Schemas => rsx! {
                     SchemaPanel {}
                 },
-                LeftPanel::Compositions => rsx! {
-                    CompositionPanel {}
-                },
+                LeftPanel::Compositions => rsx! {},
                 LeftPanel::None => rsx! {},
             }
 
@@ -756,11 +685,7 @@ fn ActiveTabContent() -> Element {
                 }
             }
 
-            // YAML sidebar hidden during drill-in (editing YAML while viewing a
-            // composition slice would be confusing).
-            if (state.composition_drill_stack)().is_empty() {
-                YamlSidebar {}
-            }
+            YamlSidebar {}
         }
     }
 }

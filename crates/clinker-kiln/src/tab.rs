@@ -8,7 +8,6 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 use clinker_core::partial::PartialPipelineConfig;
 use uuid::Uuid;
@@ -47,14 +46,6 @@ impl fmt::Display for TabId {
 pub struct TabSnapshot {
     pub yaml_text: String,
     pub pipeline: Option<PipelineConfig>,
-    /// Raw pipeline config preserving `_import` directives (for serialization).
-    pub raw_pipeline: Option<RawPipelineConfig>,
-    /// Resolved composition metadata (for canvas rendering).
-    #[allow(dead_code)]
-    pub compositions: Vec<ResolvedComposition>,
-    /// Contract validation warnings from composition imports.
-    #[allow(dead_code)]
-    pub contract_warnings: Vec<ContractWarning>,
     /// Partial pipeline from graceful degradation (when full parse fails).
     pub partial_pipeline: Option<PartialPipelineConfig>,
     pub parse_errors: Vec<String>,
@@ -99,9 +90,6 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: SCAFFOLD_YAML.to_string(),
                 pipeline: parse_yaml_raw_path(SCAFFOLD_YAML).ok(),
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: Vec::new(),
                 edit_source: EditSource::None,
@@ -127,9 +115,6 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml,
                 pipeline: config,
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
@@ -168,9 +153,6 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml,
                 pipeline: config,
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
@@ -196,9 +178,6 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml.to_string(),
                 pipeline: config,
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
