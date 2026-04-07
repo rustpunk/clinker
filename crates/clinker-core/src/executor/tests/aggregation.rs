@@ -1214,19 +1214,13 @@ mod task_16_4_3 {
                 (Value::Bool(b), G::Bool(b))
             }
             ColType::Float => {
-                // Pick from a small pool so collisions exercise the
-                // tie-breaker arms. Note: -0.0 is excluded — production
-                // routes group keys through `value_to_group_key` which
-                // canonicalizes -0.0 → 0.0, but `SortKeyEncoder` operates
-                // on raw `Value::Float` without that canonicalization.
-                // The two paths agree only because the spill writer
-                // re-materializes via `GroupByKey::to_value()` which
-                // unpacks the canonicalized bits. Skipping -0.0 here
-                // keeps the oracle scoped to "behaviors that production
-                // can actually exercise."
-                let pool = [-1.5_f64, 0.0, 1.0, 2.5, 100.0, -100.0];
+                // Pool includes -0.0 — `SortKeyEncoder` canonicalizes
+                // -0.0 → 0.0 to match `value_to_group_key`, so the byte
+                // order agrees with semantic equality.
+                let pool = [-1.5_f64, -0.0, 0.0, 1.0, 2.5, 100.0, -100.0];
                 let f = pool[(rng.gen_range(pool.len() as u64)) as usize];
-                (Value::Float(f), G::Float(f.to_bits()))
+                let canon = if f == 0.0 { 0.0 } else { f };
+                (Value::Float(f), G::Float(canon.to_bits()))
             }
             ColType::Str => {
                 let pool = ["", "a", "ab", "b", "ba", "z", "zz"];

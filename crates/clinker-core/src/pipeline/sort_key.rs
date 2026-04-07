@@ -64,6 +64,9 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
                 !f.is_nan(),
                 "NaN should be DLQ'd before reaching sort encoder"
             );
+            // Canonicalize -0.0 → 0.0 so byte order agrees with semantic
+            // equality (`-0.0 == 0.0` per IEEE). Matches `value_to_group_key`.
+            let f = if *f == 0.0 { 0.0 } else { *f };
             let bits = f.to_bits();
             let encoded = if bits >> 63 == 1 {
                 bits ^ u64::MAX // negative: flip all bits
