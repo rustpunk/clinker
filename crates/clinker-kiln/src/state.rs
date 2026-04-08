@@ -17,7 +17,6 @@ use clinker_git::RepoStatus;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::recent_files::RecentFileEntry;
 use crate::sync::EditSource;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace::Workspace;
@@ -40,15 +39,6 @@ impl KilnTheme {
         match self {
             Self::Oxide => "oxide",
             Self::Enamel => "enamel",
-        }
-    }
-
-    /// Human-readable display label.
-    #[allow(dead_code)]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Oxide => "Oxide (Dark)",
-            Self::Enamel => "Enamel (Light)",
         }
     }
 
@@ -222,8 +212,6 @@ pub struct AppState {
     pub pipeline_layout: Signal<PipelineLayoutMode>,
     pub run_log_expanded: Signal<bool>,
     pub selected_stage: Signal<Option<String>>,
-    #[allow(dead_code)]
-    pub inspector_width: Signal<f32>,
     /// Raw YAML text shown in the sidebar editor.
     pub yaml_text: Signal<String>,
     /// Parsed pipeline config (None if YAML is invalid).
@@ -253,8 +241,6 @@ pub fn use_app_state() -> AppState {
 pub struct TabManagerState {
     pub tabs: Signal<Vec<TabEntry>>,
     pub active_tab_id: Signal<Option<TabId>>,
-    #[allow(dead_code)]
-    pub recent_files: Signal<Vec<RecentFileEntry>>,
     pub workspace: Signal<Option<Workspace>>,
     /// Which left panel is currently open (Search or Schemas).
     pub left_panel: Signal<LeftPanel>,

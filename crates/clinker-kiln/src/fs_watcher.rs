@@ -65,13 +65,3 @@ pub fn has_git_relevant_changes(paths: &[PathBuf]) -> bool {
         !p.components().any(|c| c.as_os_str() == ".git") && name != ".kiln-state.json"
     })
 }
-
-/// Check if any of the changed paths are schema files.
-#[allow(dead_code)]
-pub fn has_schema_changes(paths: &[PathBuf]) -> bool {
-    paths.iter().any(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with(".schema.yaml") || name.ends_with(".schema.yml"))
-    })
-}

@@ -21,7 +21,6 @@ pub fn CxlDiagnostics(diagnostics: Vec<CxlDiagnostic>) -> Element {
                     key: "diag-{i}",
                     class: match diag.severity {
                         DiagSeverity::Error => "kiln-cxl-diag kiln-cxl-diag--error",
-                        DiagSeverity::Warning => "kiln-cxl-diag kiln-cxl-diag--warning",
                     },
                     span { class: "kiln-cxl-diag-msg", "{diag.message}" }
                     if !diag.how_to_fix.is_empty() {

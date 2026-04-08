@@ -51,8 +51,6 @@ pub struct TabSnapshot {
     pub parse_errors: Vec<String>,
     pub edit_source: EditSource,
     pub selected_stage: Option<String>,
-    /// Guide annotations from template instantiation (session-only, not persisted).
-    pub guide_annotations: Vec<crate::template::GuideAnnotation>,
 }
 
 /// One open pipeline tab with its file info and state snapshot.
@@ -94,7 +92,6 @@ impl TabEntry {
                 parse_errors: Vec::new(),
                 edit_source: EditSource::None,
                 selected_stage: None,
-                guide_annotations: Vec::new(),
             },
         }
     }
@@ -119,7 +116,6 @@ impl TabEntry {
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
-                guide_annotations: Vec::new(),
             },
         }
     }
@@ -157,32 +153,6 @@ impl TabEntry {
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
-                guide_annotations: Vec::new(),
-            },
-        }
-    }
-
-    /// Create a tab pre-loaded with demo YAML.
-    #[allow(dead_code)]
-    pub fn new_demo(yaml: &str) -> Self {
-        let (config, errors) = match parse_yaml_raw_path(yaml) {
-            Ok(c) => (Some(c), Vec::new()),
-            Err(e) => (None, e),
-        };
-
-        Self {
-            id: TabId::new(),
-            file_path: None,
-            untitled_name: Some("demo.yaml".to_string()),
-            content_hash: None,
-            snapshot: TabSnapshot {
-                yaml_text: yaml.to_string(),
-                pipeline: config,
-                partial_pipeline: None,
-                parse_errors: errors,
-                edit_source: EditSource::None,
-                selected_stage: None,
-                guide_annotations: Vec::new(),
             },
         }
     }
@@ -193,16 +163,6 @@ impl TabEntry {
             return true;
         };
         let current = compute_hash(&self.snapshot.yaml_text);
-        current != saved_hash
-    }
-
-    /// Check dirty against live signal values (for the active tab).
-    #[allow(dead_code)]
-    pub fn is_dirty_with_yaml(&self, current_yaml: &str) -> bool {
-        let Some(saved_hash) = self.content_hash else {
-            return true;
-        };
-        let current = compute_hash(current_yaml);
         current != saved_hash
     }
 

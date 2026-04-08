@@ -5,14 +5,11 @@ use crate::state::use_app_state;
 /// Severity level of a run-log line.
 /// All variants used in Phase 5 live log streaming; Phase 1 demo uses a subset.
 #[derive(Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 enum Level {
     Cmd,
     Info,
     Stat,
     Ok,
-    Warn,
-    Err,
 }
 
 impl Level {
@@ -22,8 +19,6 @@ impl Level {
             Level::Info => "INF",
             Level::Stat => "DAT",
             Level::Ok => " OK",
-            Level::Warn => "WRN",
-            Level::Err => "ERR",
         }
     }
 
@@ -33,8 +28,6 @@ impl Level {
             Level::Info => "info",
             Level::Stat => "stat",
             Level::Ok => "ok",
-            Level::Warn => "warn",
-            Level::Err => "err",
         }
     }
 }

@@ -67,7 +67,10 @@ pub fn SettingsOverlay() -> Element {
                                                 "kiln-settings-theme-btn"
                                             },
                                             onclick: move |_| tab_mgr.theme.set(variant),
-                                            "{variant.label()}"
+                                            {match variant {
+                                                KilnTheme::Oxide => "Oxide (Dark)",
+                                                KilnTheme::Enamel => "Enamel (Light)",
+                                            }}
                                         }
                                     }
                                 }

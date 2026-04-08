@@ -11,14 +11,11 @@ use clinker_core::config::{PipelineConfig, parse_config};
 pub enum EditSource {
     Yaml,
     Inspector,
-    #[allow(dead_code)]
-    Canvas,
     #[default]
     None,
 }
 
 /// Parse a YAML string into a `PipelineConfig`.
-#[allow(dead_code)]
 pub fn parse_yaml(yaml: &str) -> Result<PipelineConfig, Vec<String>> {
     parse_config(yaml).map_err(|e| vec![e.to_string()])
 }

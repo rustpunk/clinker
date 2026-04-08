@@ -38,20 +38,6 @@ impl StageKind {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn accent_color(&self) -> &'static str {
-        match self {
-            StageKind::Source => "#43B3AE",
-            StageKind::Transform => "#C75B2A",
-            StageKind::Aggregate => "#E8A524",
-            StageKind::Route => "#A0B8E8",
-            StageKind::Merge => "#7AB87A",
-            StageKind::Output => "#B7410E",
-            StageKind::Composition => "#7AAFC4",
-            StageKind::Error => "#CC3333",
-        }
-    }
-
     pub fn badge_label(&self) -> &'static str {
         match self {
             StageKind::Source => "SOURCE",

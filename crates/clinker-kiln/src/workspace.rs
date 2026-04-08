@@ -258,15 +258,6 @@ impl Workspace {
         })
     }
 
-    /// Make a path relative to the workspace root.
-    #[allow(dead_code)]
-    pub fn relative_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
-    }
-
     /// Schema directory path, resolved from manifest or default.
     pub fn schema_dir(&self) -> String {
         self.manifest

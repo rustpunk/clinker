@@ -30,8 +30,6 @@ pub struct CxlDiagnostic {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DiagSeverity {
     Error,
-    #[allow(dead_code)]
-    Warning,
 }
 
 /// Parse a CXL expression and return UI-friendly validation diagnostics.

@@ -27,7 +27,6 @@ use crate::components::{
 use clinker_schema::SchemaIndex;
 
 use crate::keyboard::handle_keyboard;
-use crate::recent_files::load_recent_files;
 use crate::state::{
     AppState, KilnTheme, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState,
     use_app_state,
@@ -40,7 +39,6 @@ use crate::workspace;
 pub fn AppShell() -> Element {
     // ── Global signals (shared across all tabs) ──────────────────────────
     let run_log_expanded = use_signal(|| false);
-    let inspector_width = use_signal(|| 340.0_f32);
 
     // ── Per-tab signals (owned here, swapped on tab switch) ──────────────
     let mut yaml_text = use_signal(String::new);
@@ -86,7 +84,6 @@ pub fn AppShell() -> Element {
     let active_tab_id: Signal<Option<TabId>> =
         use_signal(|| session_data.peek().as_ref().and_then(|s| s.active_tab_id));
     let mut prev_tab_id: Signal<Option<TabId>> = use_signal(|| None);
-    let recent_files = use_signal(load_recent_files);
     let workspace: Signal<Option<workspace::Workspace>> = use_signal(|| {
         session_data
             .write()
@@ -338,7 +335,6 @@ pub fn AppShell() -> Element {
         pipeline_layout,
         run_log_expanded,
         selected_stage,
-        inspector_width,
         yaml_text,
         pipeline,
         partial_pipeline,
@@ -355,7 +351,6 @@ pub fn AppShell() -> Element {
     use_context_provider(|| TabManagerState {
         tabs,
         active_tab_id,
-        recent_files,
         workspace,
         left_panel,
         schema_index,
@@ -407,7 +402,6 @@ pub fn AppShell() -> Element {
     let mut kb_tab_mgr = TabManagerState {
         tabs,
         active_tab_id,
-        recent_files,
         workspace,
         left_panel,
         schema_index,
