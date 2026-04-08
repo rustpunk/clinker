@@ -2,7 +2,7 @@
 ///
 /// Phase 16b: composition system removed. The canvas renders simple
 /// source/transform/output nodes laid out horizontally.
-use clinker_core::config::PipelineConfig;
+use clinker_core::config::{NodeHeader, PipelineConfig, PipelineNode, TransformBody};
 
 pub const NODE_HEIGHT: f32 = 92.0;
 pub const NODE_WIDTH: f32 = 160.0;
@@ -85,7 +85,17 @@ pub struct PipelineView {
 }
 
 pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
-    let transforms: Vec<_> = config.transforms().collect();
+    let transforms: Vec<(&NodeHeader, &TransformBody)> = config
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.value {
+            PipelineNode::Transform {
+                header,
+                config: body,
+            } => Some((header, body)),
+            _ => None,
+        })
+        .collect();
     let input_count = config.inputs.len();
     let transform_count = transforms.len();
     let output_count = config.outputs.len();
@@ -97,18 +107,19 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
     };
 
     let mut transform_stages = Vec::new();
-    for (idx, t) in transforms.iter().enumerate() {
+    for (idx, (header, body)) in transforms.iter().enumerate() {
         let x = transform_x_start + (idx as f32) * (NODE_WIDTH + NODE_GAP);
         let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
+        let cxl_src: &str = body.cxl.as_ref();
         transform_stages.push(StageView {
-            id: t.name.clone(),
-            label: t.name.clone(),
+            id: header.name.clone(),
+            label: header.name.clone(),
             kind: StageKind::Transform,
-            subtitle: cxl_subtitle(t.cxl_source()),
+            subtitle: cxl_subtitle(cxl_src),
             canvas_x: x,
             canvas_y: y,
-            cxl_source: Some(t.cxl_source().to_string()),
-            description: t.description.clone(),
+            cxl_source: Some(cxl_src.to_string()),
+            description: header.description.clone(),
             error_message: None,
         });
     }
@@ -188,7 +199,7 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
 
 fn map_inputs_to_transforms(
     config: &PipelineConfig,
-    transforms: &[&clinker_core::config::TransformConfig],
+    transforms: &[(&NodeHeader, &TransformBody)],
 ) -> Vec<usize> {
     config
         .inputs
@@ -200,8 +211,8 @@ fn map_inputs_to_transforms(
             }
             transforms
                 .iter()
-                .position(|t| {
-                    t.local_window
+                .position(|(_, body)| {
+                    body.analytic_window
                         .as_ref()
                         .and_then(|lw| lw.get("source"))
                         .and_then(|v| v.as_str())

@@ -239,8 +239,15 @@ pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<S
         return Some(generate_input_doc(config, input));
     }
 
-    if let Some(transform) = config.transforms().find(|t| t.name == stage_name) {
-        return Some(generate_transform_doc(config, transform));
+    for node in &config.nodes {
+        if let clinker_core::config::PipelineNode::Transform {
+            header,
+            config: body,
+        } = &node.value
+            && header.name == stage_name
+        {
+            return Some(generate_transform_doc(config, header, body));
+        }
     }
 
     if let Some(output) = config.outputs.iter().find(|o| o.name == stage_name) {
@@ -406,10 +413,12 @@ fn generate_input_doc(
 
 fn generate_transform_doc(
     _config: &PipelineConfig,
-    transform: &clinker_core::config::TransformConfig,
+    header: &clinker_core::config::NodeHeader,
+    body: &clinker_core::config::TransformBody,
 ) -> StageDoc {
     // Analyze CXL statements
-    let analysis = analyze_cxl(transform.cxl_source());
+    let cxl_src: &str = body.cxl.as_ref();
+    let analysis = analyze_cxl(cxl_src);
 
     let emit_stmts: Vec<_> = analysis
         .statements
@@ -430,7 +439,7 @@ fn generate_transform_doc(
         .collect();
 
     // Build intent-aware summary
-    let summary = if let Some(ref desc) = transform.description {
+    let summary = if let Some(ref desc) = header.description {
         desc.clone()
     } else {
         let filter_fields: Vec<_> = filter_stmts
@@ -505,14 +514,14 @@ fn generate_transform_doc(
         value: if has_filters { "conditional" } else { "yes" }.to_string(),
     });
 
-    if transform.local_window.is_some() {
+    if body.analytic_window.is_some() {
         entries.push(ConfigEntry {
             category: ConfigCategory::Window,
             key: "LOCAL WINDOW".to_string(),
             value: "configured".to_string(),
         });
     }
-    if transform.validations.is_some() {
+    if body.validations.is_some() {
         entries.push(ConfigEntry {
             category: ConfigCategory::Validation,
             key: "VALIDATIONS".to_string(),
@@ -523,14 +532,14 @@ fn generate_transform_doc(
     StageDoc {
         kind: StageKindDoc::Transform,
         summary,
-        user_description: transform.description.clone(),
+        user_description: header.description.clone(),
         schema: None,
         cxl_analysis,
         contract,
         config: ConfigSection { entries },
         provenance,
         channel_override: None,
-        cxl_source: Some(transform.cxl_source().to_string()),
+        cxl_source: Some(cxl_src.to_string()),
         sub_stages: vec![],
     }
 }

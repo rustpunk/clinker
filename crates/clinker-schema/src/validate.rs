@@ -9,9 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::model::{SchemaIndex, SourceSchema};
-use clinker_core::config::{
-    InputFormat, PipelineConfig, SchemaSource, SourceConfig, TransformConfig,
-};
+use clinker_core::config::{InputFormat, PipelineConfig, PipelineNode, SchemaSource, SourceConfig};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -67,11 +65,18 @@ pub fn validate_pipeline(
     }
 
     // Validate transformations against accumulated fields
-    for transform in config.transforms() {
-        validate_transform(transform, &available_fields, &mut warnings);
-        // Add emitted fields to available set
-        for emitted in extract_emit_fields(transform.cxl_source()) {
-            available_fields.insert(emitted);
+    for node in &config.nodes {
+        if let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &node.value
+        {
+            let cxl_src: &str = body.cxl.as_ref();
+            validate_transform(&header.name, cxl_src, &available_fields, &mut warnings);
+            // Add emitted fields to available set
+            for emitted in extract_emit_fields(cxl_src) {
+                available_fields.insert(emitted);
+            }
         }
     }
 
@@ -142,7 +147,8 @@ fn validate_input(
 
 /// Validate a transformation's CXL against available fields.
 fn validate_transform(
-    transform: &TransformConfig,
+    stage_name: &str,
+    cxl: &str,
     available_fields: &HashSet<String>,
     warnings: &mut Vec<SchemaWarning>,
 ) {
@@ -151,14 +157,14 @@ fn validate_transform(
     }
 
     // Extract field references from CXL (simple heuristic)
-    let referenced = extract_referenced_fields(transform.cxl_source());
+    let referenced = extract_referenced_fields(cxl);
     let schema_fields: Vec<&str> = available_fields.iter().map(|s| s.as_str()).collect();
 
     for field in referenced {
         if !available_fields.contains(&field) {
             let suggestion = find_closest_field(&field, &schema_fields);
             warnings.push(SchemaWarning {
-                stage_name: transform.name.clone(),
+                stage_name: stage_name.to_string(),
                 message: format!("Field '{field}' not found in upstream schema"),
                 suggestion,
                 kind: WarningKind::FieldNotFound,
