@@ -263,32 +263,163 @@ pub(crate) enum ResolvedInput {
     Multi(Vec<String>),
 }
 
-impl PlanTransformSpec {
-    /// Wave 4ab bridge: build a `PlanTransformSpec` directly from a
-    /// legacy `TransformConfig`. Used by `ExecutionPlanDag::compile`'s
-    /// thin wrapper that the executor still calls during the cutover;
-    /// will be deleted with `TransformConfig` in the final commit of
-    /// the wave.
-    pub(crate) fn from_legacy(tc: &crate::config::TransformConfig) -> Self {
-        let input = match &tc.input {
-            None => ResolvedInput::Chain,
-            Some(TransformInput::Single(s)) => ResolvedInput::Single(s.clone()),
-            Some(TransformInput::Multiple(v)) => ResolvedInput::Multi(v.clone()),
+/// Phase 16b Wave 4ab Checkpoint C: construct the planner's
+/// `Vec<PlanTransformSpec>` from a `PipelineConfig`. Prefers the unified
+/// `nodes:` enum when non-empty (walking Transform/Aggregate/Route
+/// variants directly). Falls back to the legacy `config.transforms()`
+/// projection when the config was authored under the legacy
+/// `transformations:` schema — which is the path the legacy test
+/// fixtures exercise. When the legacy types are deleted in a later
+/// checkpoint, the fallback branch dies with them.
+fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
+    use crate::config::PipelineNode;
+
+    // New-shape authorship wins when `nodes:` carries at least one
+    // Transform/Aggregate/Route variant. Fixtures that only populate
+    // `PipelineNode::Source` (e.g. the ingestion tests) still go through
+    // the legacy fallback for their transform list.
+    let has_new_shape_transforms = config.nodes.iter().any(|n| {
+        matches!(
+            &n.value,
+            PipelineNode::Transform { .. }
+                | PipelineNode::Aggregate { .. }
+                | PipelineNode::Route { .. }
+        )
+    });
+    if has_new_shape_transforms {
+        // Source names: header inputs that resolve to a source must be
+        // projected as `ResolvedInput::Chain` so the legacy wire-up
+        // hooks them into the primary source, matching the behaviour
+        // of `lower_nodes_into_legacy_fields::project_input`.
+        let source_names: std::collections::HashSet<String> = config
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.value {
+                PipelineNode::Source { header, .. } => Some(header.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let resolve_header_input = |n: &crate::config::node_header::NodeInput| -> ResolvedInput {
+            use crate::config::node_header::NodeInput;
+            let flat = match n {
+                NodeInput::Single(s) => s.clone(),
+                NodeInput::Port { node, port } => format!("{node}.{port}"),
+            };
+            let bare = flat.split('.').next().unwrap_or(&flat);
+            if source_names.contains(bare) {
+                ResolvedInput::Chain
+            } else {
+                ResolvedInput::Single(flat)
+            }
         };
-        Self {
-            name: tc.name.clone(),
-            cxl_source: tc.cxl.clone(),
-            aggregate: tc.aggregate.clone(),
-            route: tc.route.clone(),
-            analytic_window: tc.local_window.clone(),
-            log: tc.log.clone().unwrap_or_default(),
-            validations: tc.validations.clone().unwrap_or_default(),
-            input,
-            input_span: Span::SYNTHETIC,
-            body_span: Span::SYNTHETIC,
+        let mut specs = Vec::with_capacity(config.nodes.len());
+        for spanned in &config.nodes {
+            match &spanned.value {
+                PipelineNode::Transform {
+                    header,
+                    config: body,
+                } => {
+                    specs.push(PlanTransformSpec {
+                        name: header.name.clone(),
+                        cxl_source: Some(body.cxl.source.as_str().to_string()),
+                        aggregate: None,
+                        route: None,
+                        analytic_window: body.analytic_window.clone(),
+                        log: body.log.clone().unwrap_or_default(),
+                        validations: body.validations.clone().unwrap_or_default(),
+                        input: resolve_header_input(&header.input),
+                        input_span: Span::SYNTHETIC,
+                        body_span: Span::SYNTHETIC,
+                    });
+                }
+                PipelineNode::Aggregate {
+                    header,
+                    config: body,
+                } => {
+                    let agg = AggregateConfig {
+                        group_by: body.group_by.clone(),
+                        cxl: body.cxl.source.as_str().to_string(),
+                        strategy: body.strategy,
+                    };
+                    specs.push(PlanTransformSpec {
+                        name: header.name.clone(),
+                        cxl_source: None,
+                        aggregate: Some(agg),
+                        route: None,
+                        analytic_window: None,
+                        log: Vec::new(),
+                        validations: Vec::new(),
+                        input: resolve_header_input(&header.input),
+                        input_span: Span::SYNTHETIC,
+                        body_span: Span::SYNTHETIC,
+                    });
+                }
+                PipelineNode::Route {
+                    header,
+                    config: body,
+                } => {
+                    let branches: Vec<crate::config::RouteBranch> = body
+                        .conditions
+                        .iter()
+                        .map(|(name, cxl)| crate::config::RouteBranch {
+                            name: name.clone(),
+                            condition: cxl.source.as_str().to_string(),
+                        })
+                        .collect();
+                    let route = crate::config::RouteConfig {
+                        mode: body.mode,
+                        branches,
+                        default: body.default.clone(),
+                    };
+                    specs.push(PlanTransformSpec {
+                        name: header.name.clone(),
+                        cxl_source: Some(String::new()),
+                        aggregate: None,
+                        route: Some(route),
+                        analytic_window: None,
+                        log: Vec::new(),
+                        validations: Vec::new(),
+                        input: resolve_header_input(&header.input),
+                        input_span: Span::SYNTHETIC,
+                        body_span: Span::SYNTHETIC,
+                    });
+                }
+                PipelineNode::Source { .. }
+                | PipelineNode::Output { .. }
+                | PipelineNode::Merge { .. }
+                | PipelineNode::Composition { .. } => {}
+            }
         }
+        return specs;
     }
 
+    // Legacy fallback: fixtures that still populate `config.transformations`
+    // directly. Inlined what used to be `PlanTransformSpec::from_legacy`.
+    config
+        .transforms()
+        .map(|tc| {
+            let input = match &tc.input {
+                None => ResolvedInput::Chain,
+                Some(TransformInput::Single(s)) => ResolvedInput::Single(s.clone()),
+                Some(TransformInput::Multiple(v)) => ResolvedInput::Multi(v.clone()),
+            };
+            PlanTransformSpec {
+                name: tc.name.clone(),
+                cxl_source: tc.cxl.clone(),
+                aggregate: tc.aggregate.clone(),
+                route: tc.route.clone(),
+                analytic_window: tc.local_window.clone(),
+                log: tc.log.clone().unwrap_or_default(),
+                validations: tc.validations.clone().unwrap_or_default(),
+                input,
+                input_span: Span::SYNTHETIC,
+                body_span: Span::SYNTHETIC,
+            }
+        })
+        .collect()
+}
+
+impl PlanTransformSpec {
     /// CXL source text. For row-level transforms this is the top-level
     /// `cxl` field; for aggregates it is the nested `aggregate.cxl`.
     pub(crate) fn cxl_source(&self) -> &str {
@@ -577,13 +708,12 @@ impl ExecutionPlanDag {
         // Phase D: analyze all transforms
         let report = analyzer::analyze_all(compiled);
 
-        // Phase 16b Wave 4ab Milestone 2: lower TransformConfig to PlanTransformSpec.
-        // The spec list is the new post-lowering intermediate; helpers are
-        // being migrated to consume it incrementally.
-        let specs: Vec<PlanTransformSpec> = config
-            .transforms()
-            .map(PlanTransformSpec::from_legacy)
-            .collect();
+        // Phase 16b Wave 4ab Checkpoint C: build `PlanTransformSpec` directly
+        // from the unified `nodes:` enum when present; fall back to the
+        // legacy `config.transforms()` projection otherwise. The helpers
+        // below consume `&[PlanTransformSpec]` exclusively, so the planner
+        // body is agnostic to authorship shape.
+        let specs: Vec<PlanTransformSpec> = build_specs(config);
 
         // Parse analytic_window configs via the spec-taking helper.
         let window_configs: Vec<Option<LocalWindowConfig>> = specs
@@ -710,8 +840,7 @@ impl ExecutionPlanDag {
         }
 
         // Transform nodes in declaration order (deterministic toposort per V-7-2)
-        let resolved_transforms: Vec<_> = config.transforms().collect();
-        for (i, tc) in resolved_transforms.iter().enumerate() {
+        for (i, tc) in specs.iter().enumerate() {
             let analysis = &report.transforms[i];
             let wc = &window_configs[i];
             let parallelism_class = derive_parallelism_class(analysis, wc, &primary_source);
@@ -756,7 +885,7 @@ impl ExecutionPlanDag {
                         transform: tc.name.clone(),
                     });
                 }
-                if matches!(tc.input, Some(TransformInput::Multiple(_))) {
+                if matches!(tc.input, ResolvedInput::Multi(_)) {
                     return Err(PlanError::AggregateWithMultipleInputs {
                         transform: tc.name.clone(),
                     });
@@ -849,7 +978,7 @@ impl ExecutionPlanDag {
             }
 
             // Merge node for multiple inputs
-            if let Some(TransformInput::Multiple(_)) = &tc.input {
+            if let ResolvedInput::Multi(_) = &tc.input {
                 add_node(
                     &mut graph,
                     PlanNode::Merge {
@@ -879,7 +1008,7 @@ impl ExecutionPlanDag {
         // --- Phase 2: Wire all edges ---
         let mut prev_transform_key: Option<String> = None;
 
-        for (i, tc) in resolved_transforms.iter().enumerate() {
+        for (i, tc) in specs.iter().enumerate() {
             let wc = &window_configs[i];
             // Aggregate transforms register under `aggregation.{name}` instead
             // of `transform.{name}` (Phase 16 Task 16.3.6).
@@ -892,7 +1021,7 @@ impl ExecutionPlanDag {
 
             // Wire edges from input: or implicit linear chain
             match &tc.input {
-                Some(TransformInput::Single(upstream)) => {
+                ResolvedInput::Single(upstream) => {
                     let upstream_idx =
                         resolve_input_reference(upstream, &node_by_name, &tc.name, &specs)?;
                     graph.add_edge(
@@ -903,7 +1032,7 @@ impl ExecutionPlanDag {
                         },
                     );
                 }
-                Some(TransformInput::Multiple(upstreams)) => {
+                ResolvedInput::Multi(upstreams) => {
                     let merge_key = format!("merge.merge_{}", tc.name);
                     let merge_idx = node_by_name[&merge_key];
                     for upstream in upstreams {
@@ -925,7 +1054,7 @@ impl ExecutionPlanDag {
                         },
                     );
                 }
-                None => {
+                ResolvedInput::Chain => {
                     // Implicit linear chain: wire to previous transform or source
                     if let Some(ref prev_key) = prev_transform_key
                         && let Some(&prev_idx) = node_by_name.get(prev_key)
