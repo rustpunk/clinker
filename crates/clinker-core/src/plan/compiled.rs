@@ -115,4 +115,43 @@ impl CompiledPlan {
     pub(crate) fn compiled_transforms(&self) -> &[CompiledTransform] {
         &self.compiled_transforms
     }
+
+    /// Phase 16b Wave 4ab M4 — two-phase CXL typecheck hook.
+    ///
+    /// `PipelineConfig::compile()` builds topology without CXL
+    /// typechecking because schema is a runtime artifact (reader-derived).
+    /// The executor calls this method after opening readers to populate
+    /// `compiled_transforms` and fill `PlanTransformPayload::typed` on
+    /// every Transform node in the DAG.
+    ///
+    /// Idempotent: re-binding replaces prior state.
+    #[allow(dead_code)] // M5 wires live executor consumption; M4 ships the hook + unit test
+    pub(crate) fn bind_schema(
+        &mut self,
+        schema: &std::sync::Arc<clinker_record::Schema>,
+    ) -> Result<(), crate::error::PipelineError> {
+        let transforms: Vec<&crate::config::TransformConfig> = self.config.transforms().collect();
+        let compiled = crate::executor::PipelineExecutor::compile_transforms(&transforms, schema)?;
+
+        // Fill PlanTransformPayload::typed on every Transform node whose
+        // name matches a compiled transform. The DAG may be empty (for
+        // `from_config_for_run` bridge callers), in which case this loop
+        // is a no-op and only `compiled_transforms` is populated.
+        {
+            use crate::plan::execution::PlanNode;
+            let by_name: std::collections::HashMap<&str, &CompiledTransform> =
+                compiled.iter().map(|ct| (ct.name.as_str(), ct)).collect();
+            for idx in self.dag.graph.node_indices().collect::<Vec<_>>() {
+                if let PlanNode::Transform { name, resolved, .. } = &mut self.dag.graph[idx]
+                    && let Some(payload) = resolved.as_mut()
+                    && let Some(ct) = by_name.get(name.as_str())
+                {
+                    payload.typed = Some(std::sync::Arc::clone(&ct.typed));
+                }
+            }
+        }
+
+        self.compiled_transforms = compiled;
+        Ok(())
+    }
 }

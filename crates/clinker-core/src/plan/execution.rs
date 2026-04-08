@@ -193,9 +193,11 @@ pub struct PlanSourcePayload {
 /// the validations sidebar, and the DLQ NodeId for downstream wiring.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
-    /// Type-checked CXL program. Wave 2 leaves this `None` because the
-    /// new `compile()` lowering path runs ahead of CXL type-checking;
-    /// Wave 3 plumbs in `cxl::typecheck::check` invocations and fills it.
+    /// Type-checked CXL program. Two-phase contract (Phase 16b Wave 4ab,
+    /// M4): `None` after `PipelineConfig::compile()`, populated by
+    /// `CompiledPlan::bind_schema()` which the executor invokes on entry
+    /// once readers have produced a `Schema`. Schema is a runtime artifact
+    /// (reader-derived), so CXL typecheck cannot run at compile() time.
     pub typed: Option<Arc<cxl::typecheck::pass::TypedProgram>>,
     pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
     pub log: Vec<crate::config::LogDirective>,

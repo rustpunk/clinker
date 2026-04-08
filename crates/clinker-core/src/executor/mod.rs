@@ -438,6 +438,12 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
+        // Phase 16b Wave 4ab M4: `bind_schema` exists on `CompiledPlan`
+        // but cannot be wired here yet because `readers` are consumed
+        // `Box<dyn Read>` handles with no peek/reopen affordance. M5
+        // threads the bound plan through by having the executor internals
+        // consume `plan.compiled_transforms()` directly, eliminating the
+        // need for a schema peek in this wrapper.
         Self::run_with_readers_writers(plan.config(), readers, writers, params)
     }
 
@@ -3023,7 +3029,7 @@ impl PipelineExecutor {
     ///
     /// Fields emitted by earlier transforms are progressively added to the
     /// available field set so that later transforms can reference them.
-    fn compile_transforms(
+    pub(crate) fn compile_transforms(
         transforms: &[&TransformConfig],
         schema: &Arc<Schema>,
     ) -> Result<Vec<CompiledTransform>, PipelineError> {
