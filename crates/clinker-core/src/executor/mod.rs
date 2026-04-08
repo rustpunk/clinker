@@ -2479,6 +2479,7 @@ impl PipelineExecutor {
                     mode,
                     branches: _,
                     default: _,
+                    ..
                 } => {
                     // Get input records from predecessor
                     let predecessors: Vec<NodeIndex> = plan
@@ -2581,7 +2582,7 @@ impl PipelineExecutor {
                     }
                 }
 
-                PlanNode::Merge { ref name } => {
+                PlanNode::Merge { ref name, .. } => {
                     // Concatenate predecessor buffers in declaration order.
                     // Declaration order = order in the `input:` array of the
                     // merge's downstream transform.
@@ -2633,6 +2634,7 @@ impl PipelineExecutor {
                 PlanNode::Sort {
                     ref name,
                     ref sort_fields,
+                    ..
                 } => {
                     // Enforcer-sort dispatch (Task 16.0.5.8). Reuses the
                     // generalized `SortBuffer<P>` carrying per-record sidecar
@@ -2896,7 +2898,7 @@ impl PipelineExecutor {
                     node_buffers.insert(node_idx, out_rows);
                 }
 
-                PlanNode::Output { ref name } => {
+                PlanNode::Output { ref name, .. } => {
                     // Get input records from predecessor
                     let predecessors: Vec<NodeIndex> = plan
                         .graph

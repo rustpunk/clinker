@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::aggregation::AggregateStrategy;
 use crate::config::{
-    AggregateConfig, PipelineConfig, RouteMode, SortField, SourceConfig, TransformInput,
+    AggregateConfig, OutputConfig, PipelineConfig, RouteMode, SortField, SourceConfig,
+    TransformInput,
 };
 use crate::error::PipelineError;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
@@ -24,6 +25,7 @@ use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
     PartitioningProvenance,
 };
+use crate::span::Span;
 use clinker_record::Schema;
 use cxl::plan::CompiledAggregate;
 
@@ -59,9 +61,26 @@ pub enum NodeExecutionReqs {
 pub enum PlanNode {
     Source {
         name: String,
+        /// Source-span of this node in the originating YAML document.
+        /// `Span::SYNTHETIC` for planner-synthesized nodes and for nodes
+        /// produced by the legacy `transformations:` planner path that
+        /// has no span info to plumb through.
+        #[serde(skip)]
+        span: Span,
+        /// Phase 16b Wave 2 enrichment: full resolved Source payload.
+        /// Populated only by the new `PipelineConfig::compile()` lowering
+        /// from the unified `nodes:` taxonomy. Legacy planner leaves it
+        /// `None`. Boxed to keep the variant small.
+        #[serde(skip)]
+        resolved: Option<Box<PlanSourcePayload>>,
     },
     Transform {
         name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Phase 16b Wave 2 enrichment: full resolved Transform payload.
+        #[serde(skip)]
+        resolved: Option<Box<PlanTransformPayload>>,
         parallelism_class: ParallelismClass,
         tier: u32,
         execution_reqs: NodeExecutionReqs,
@@ -88,15 +107,24 @@ pub enum PlanNode {
     },
     Route {
         name: String,
+        #[serde(skip)]
+        span: Span,
         mode: RouteMode,
         branches: Vec<String>,
         default: String,
     },
     Merge {
         name: String,
+        #[serde(skip)]
+        span: Span,
     },
     Output {
         name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Phase 16b Wave 2 enrichment: full resolved Output payload.
+        #[serde(skip)]
+        resolved: Option<Box<PlanOutputPayload>>,
     },
     /// Planner-synthesized sort enforcer (drill pass 3, D46/D47).
     ///
@@ -110,6 +138,8 @@ pub enum PlanNode {
     /// names starting with `__sort_for_` are rejected at compile time.
     Sort {
         name: String,
+        #[serde(skip)]
+        span: Span,
         sort_fields: Vec<SortField>,
     },
     /// Hash / streaming GROUP BY transform (Phase 16, Task 16.3.5).
@@ -121,6 +151,8 @@ pub enum PlanNode {
     /// shipped through the JSON `--explain` channel.
     Aggregation {
         name: String,
+        #[serde(skip)]
+        span: Span,
         config: AggregateConfig,
         #[serde(skip)]
         compiled: Arc<CompiledAggregate>,
@@ -145,17 +177,64 @@ pub enum PlanNode {
     },
 }
 
+/// Phase 16b Wave 2 — fully-resolved Source payload, populated by the new
+/// `PipelineConfig::compile()` lowering path. Wraps the parse-time
+/// `SourceConfig` plus the `ValidatedPath` (proof of pre-pass success).
+/// Stored behind `Box` on `PlanNode::Source` to keep the variant slim.
+#[derive(Debug, Clone)]
+pub struct PlanSourcePayload {
+    pub source: SourceConfig,
+    pub validated_path: Option<crate::security::ValidatedPath>,
+}
+
+/// Phase 16b Wave 2 — fully-resolved Transform payload. Holds the
+/// type-checked CXL program (Arc-shared with the analyzer), the optional
+/// analytic-window spec (renamed from local_window), the log directives
+/// the validations sidebar, and the DLQ NodeId for downstream wiring.
+#[derive(Debug, Clone)]
+pub struct PlanTransformPayload {
+    /// Type-checked CXL program. Wave 2 leaves this `None` because the
+    /// new `compile()` lowering path runs ahead of CXL type-checking;
+    /// Wave 3 plumbs in `cxl::typecheck::check` invocations and fills it.
+    pub typed: Option<Arc<cxl::typecheck::pass::TypedProgram>>,
+    pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
+    pub log: Vec<crate::config::LogDirective>,
+    pub validations: Vec<crate::config::ValidationEntry>,
+    pub dlq_node: Option<NodeIndex>,
+}
+
+/// Phase 16b Wave 2 — fully-resolved Output payload.
+#[derive(Debug, Clone)]
+pub struct PlanOutputPayload {
+    pub output: OutputConfig,
+    pub validated_path: Option<crate::security::ValidatedPath>,
+}
+
 impl PlanNode {
     /// Get the name of this node regardless of variant.
     pub fn name(&self) -> &str {
         match self {
-            PlanNode::Source { name }
+            PlanNode::Source { name, .. }
             | PlanNode::Transform { name, .. }
             | PlanNode::Route { name, .. }
-            | PlanNode::Merge { name }
-            | PlanNode::Output { name }
+            | PlanNode::Merge { name, .. }
+            | PlanNode::Output { name, .. }
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. } => name,
+        }
+    }
+
+    /// Source-span of this node, or `Span::SYNTHETIC` for planner-synthesized
+    /// nodes (sort enforcers, correlation sorts) and the legacy planner path.
+    pub fn span(&self) -> Span {
+        match self {
+            PlanNode::Source { span, .. }
+            | PlanNode::Transform { span, .. }
+            | PlanNode::Route { span, .. }
+            | PlanNode::Merge { span, .. }
+            | PlanNode::Output { span, .. }
+            | PlanNode::Sort { span, .. }
+            | PlanNode::Aggregation { span, .. } => *span,
         }
     }
 
@@ -180,7 +259,7 @@ impl PlanNode {
     /// Human-readable label for DOT node annotations and text display.
     pub fn display_name(&self) -> String {
         match self {
-            PlanNode::Source { name } => format!("[source] {name}"),
+            PlanNode::Source { name, .. } => format!("[source] {name}"),
             PlanNode::Transform { name, .. } => format!("[transform] {name}"),
             PlanNode::Route { name, mode, .. } => {
                 let mode_str = match mode {
@@ -189,8 +268,8 @@ impl PlanNode {
                 };
                 format!("[route:{mode_str}] {name}")
             }
-            PlanNode::Merge { name } => format!("[merge] {name}"),
-            PlanNode::Output { name } => format!("[output] {name}"),
+            PlanNode::Merge { name, .. } => format!("[merge] {name}"),
+            PlanNode::Output { name, .. } => format!("[output] {name}"),
             PlanNode::Sort { name, .. } => format!("[sort] {name}"),
             PlanNode::Aggregation { name, strategy, .. } => {
                 let s = match strategy {
@@ -290,9 +369,9 @@ impl ExecutionPlanDag {
         self.graph
             .node_indices()
             .find_map(|idx| match &self.graph[idx] {
-                PlanNode::Sort { name, sort_fields }
-                    if name.starts_with(CORRELATION_SORT_PREFIX) =>
-                {
+                PlanNode::Sort {
+                    name, sort_fields, ..
+                } if name.starts_with(CORRELATION_SORT_PREFIX) => {
                     Some((idx, sort_fields.as_slice()))
                 }
                 _ => None,
@@ -404,7 +483,7 @@ impl ExecutionPlanDag {
         // Parse local_window configs
         let window_configs: Vec<Option<LocalWindowConfig>> = config
             .transforms()
-            .map(|t| index::parse_local_window(t).map_err(PlanError::IndexPlanning))
+            .map(|t| index::parse_analytic_window(t).map_err(PlanError::IndexPlanning))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Validate: if a transform uses window.* but has no local_window, error
@@ -504,6 +583,8 @@ impl ExecutionPlanDag {
                 &mut graph,
                 PlanNode::Source {
                     name: input.name.clone(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
                 },
                 &mut node_by_name,
                 &mut slug_set,
@@ -599,6 +680,7 @@ impl ExecutionPlanDag {
                     &mut graph,
                     PlanNode::Aggregation {
                         name: tc.name.clone(),
+                        span: Span::SYNTHETIC,
                         config: agg_cfg.clone(),
                         compiled: Arc::new(compiled_agg),
                         strategy: AggregateStrategy::Hash,
@@ -618,6 +700,8 @@ impl ExecutionPlanDag {
                 &mut graph,
                 PlanNode::Transform {
                     name: tc.name.clone(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
                     parallelism_class,
                     tier: 0, // assigned later via BFS
                     execution_reqs,
@@ -636,6 +720,7 @@ impl ExecutionPlanDag {
                     &mut graph,
                     PlanNode::Route {
                         name: format!("route_{}", tc.name),
+                        span: Span::SYNTHETIC,
                         mode: rc.mode,
                         branches: rc.branches.iter().map(|b| b.name.clone()).collect(),
                         default: rc.default.clone(),
@@ -651,6 +736,7 @@ impl ExecutionPlanDag {
                     &mut graph,
                     PlanNode::Merge {
                         name: format!("merge_{}", tc.name),
+                        span: Span::SYNTHETIC,
                     },
                     &mut node_by_name,
                     &mut slug_set,
@@ -664,6 +750,8 @@ impl ExecutionPlanDag {
                 &mut graph,
                 PlanNode::Output {
                     name: output.name.clone(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
                 },
                 &mut node_by_name,
                 &mut slug_set,
@@ -948,7 +1036,10 @@ impl ExecutionPlanDag {
 
         // Show planner-synthesized Sort nodes (drill pass 3, 16.0.5.12).
         for &idx in &self.topo_order {
-            if let PlanNode::Sort { name, sort_fields } = &self.graph[idx] {
+            if let PlanNode::Sort {
+                name, sort_fields, ..
+            } = &self.graph[idx]
+            {
                 out.push_str(&format!("[sort] {name}\n"));
                 out.push_str("  sort_fields:\n");
                 for sf in sort_fields {
@@ -997,6 +1088,7 @@ impl ExecutionPlanDag {
                 mode,
                 branches,
                 default,
+                ..
             } = node
             {
                 out.push_str(&format!(
@@ -1111,7 +1203,7 @@ impl ExecutionPlanDag {
                         out.push_str(&format!("  ├──> {branch}\n"));
                     }
                 }
-                PlanNode::Merge { name } => {
+                PlanNode::Merge { name, .. } => {
                     out.push_str(&format!("  └──< MERGE '{name}'\n"));
                 }
                 PlanNode::Source { .. }
@@ -1557,7 +1649,7 @@ impl ExecutionPlanDag {
         // Locate the primary source node by name.
         let primary_name = &primary_input.name;
         let source_idx = self.graph.node_indices().find(
-            |&idx| matches!(&self.graph[idx], PlanNode::Source { name } if name == primary_name),
+            |&idx| matches!(&self.graph[idx], PlanNode::Source { name, .. } if name == primary_name),
         );
         let Some(source_idx) = source_idx else {
             return Err(PipelineError::Compilation {
@@ -1609,6 +1701,7 @@ impl ExecutionPlanDag {
 
         let sort_node = PlanNode::Sort {
             name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
+            span: Span::SYNTHETIC,
             sort_fields,
         };
         let sort_idx = self.graph.add_node(sort_node);
@@ -1731,6 +1824,7 @@ impl ExecutionPlanDag {
             let consumer_name = self.graph[consumer_idx].name().to_string();
             let sort_node = PlanNode::Sort {
                 name: format!("{ENFORCER_SORT_PREFIX}{consumer_name}"),
+                span: Span::SYNTHETIC,
                 sort_fields: required,
             };
             let sort_idx = self.graph.add_node(sort_node);
@@ -1983,7 +2077,7 @@ fn compute_one(
     };
 
     match node {
-        PlanNode::Source { name } => {
+        PlanNode::Source { name, .. } => {
             let sort_order: Option<Vec<SortField>> = inputs
                 .get(name)
                 .and_then(|ic| ic.sort_order.as_ref())
@@ -2004,7 +2098,9 @@ fn compute_one(
             }
         }
 
-        PlanNode::Sort { name, sort_fields } => NodeProperties {
+        PlanNode::Sort {
+            name, sort_fields, ..
+        } => NodeProperties {
             ordering: Ordering {
                 sort_order: Some(sort_fields.clone()),
                 provenance: OrderingProvenance::Preserved {
@@ -2109,7 +2205,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Merge { name } => {
+        PlanNode::Merge { name, .. } => {
             if parents.is_empty() {
                 return NodeProperties::unordered_single();
             }
@@ -2176,7 +2272,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Output { name } => {
+        PlanNode::Output { name, .. } => {
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
             // is non-None so explain chains through.
@@ -3082,9 +3178,13 @@ mod tests {
         let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
         let s = graph.add_node(PlanNode::Source {
             name: source_name.into(),
+            span: Span::SYNTHETIC,
+            resolved: None,
         });
         let t = graph.add_node(PlanNode::Transform {
             name: consumer_name.into(),
+            span: Span::SYNTHETIC,
+            resolved: None,
             parallelism_class: ParallelismClass::Stateless,
             tier: 0,
             execution_reqs: NodeExecutionReqs::RequiresSortedInput {
@@ -3459,6 +3559,8 @@ mod tests {
     fn make_transform(name: &str, write_set: BTreeSet<String>, has_distinct: bool) -> PlanNode {
         PlanNode::Transform {
             name: name.into(),
+            span: Span::SYNTHETIC,
+            resolved: None,
             parallelism_class: ParallelismClass::Stateless,
             tier: 0,
             execution_reqs: NodeExecutionReqs::Streaming,
@@ -3472,6 +3574,8 @@ mod tests {
     fn make_arena_transform(name: &str) -> PlanNode {
         PlanNode::Transform {
             name: name.into(),
+            span: Span::SYNTHETIC,
+            resolved: None,
             parallelism_class: ParallelismClass::Stateless,
             tier: 0,
             execution_reqs: NodeExecutionReqs::RequiresArena,
@@ -3484,7 +3588,14 @@ mod tests {
 
     #[test]
     fn test_node_properties_source_declared_input() {
-        let (mut dag, idxs) = dag_from_nodes(vec![PlanNode::Source { name: "src".into() }], &[]);
+        let (mut dag, idxs) = dag_from_nodes(
+            vec![PlanNode::Source {
+                name: "src".into(),
+                span: Span::SYNTHETIC,
+                resolved: None,
+            }],
+            &[],
+        );
         let inputs = HashMap::from([(
             "src".to_string(),
             input_with_sort("src", Some(vec![sf("k", SortOrder::Asc, None)])),
@@ -3508,7 +3619,11 @@ mod tests {
         ws.insert("x".to_string());
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_transform("t", ws, false),
             ],
             &[(0, 1)],
@@ -3535,7 +3650,11 @@ mod tests {
         ws.insert("k".to_string());
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_transform("t", ws, false),
             ],
             &[(0, 1)],
@@ -3566,7 +3685,11 @@ mod tests {
     fn test_node_properties_transform_destroys_on_distinct() {
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_transform("t", BTreeSet::new(), true),
             ],
             &[(0, 1)],
@@ -3590,7 +3713,11 @@ mod tests {
         // be `DestroyedByDistinct` (not `NoOrdering` propagated).
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_transform("t", BTreeSet::new(), true),
             ],
             &[(0, 1)],
@@ -3611,10 +3738,15 @@ mod tests {
         // Source(sort=k) -> Transform(disjoint) -> Route -> verify Route preserves.
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_transform("t", BTreeSet::new(), false),
                 PlanNode::Route {
                     name: "r".into(),
+                    span: Span::SYNTHETIC,
                     mode: RouteMode::Exclusive,
                     branches: vec![],
                     default: "x".into(),
@@ -3644,10 +3776,15 @@ mod tests {
         // both inherit `Preserved`.
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_transform("t0", BTreeSet::new(), false),
                 PlanNode::Route {
                     name: "r".into(),
+                    span: Span::SYNTHETIC,
                     mode: RouteMode::Inclusive,
                     branches: vec![],
                     default: "x".into(),
@@ -3680,9 +3817,20 @@ mod tests {
         // Two Sources with the same sort_order -> Merge -> Preserved.
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "a".into() },
-                PlanNode::Source { name: "b".into() },
-                PlanNode::Merge { name: "m".into() },
+                PlanNode::Source {
+                    name: "a".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
+                PlanNode::Source {
+                    name: "b".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
+                PlanNode::Merge {
+                    name: "m".into(),
+                    span: Span::SYNTHETIC,
+                },
             ],
             &[(0, 2), (1, 2)],
         );
@@ -3706,9 +3854,20 @@ mod tests {
         // Two Sources with different sort orders -> Merge -> destroyed.
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "a".into() },
-                PlanNode::Source { name: "b".into() },
-                PlanNode::Merge { name: "m".into() },
+                PlanNode::Source {
+                    name: "a".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
+                PlanNode::Source {
+                    name: "b".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
+                PlanNode::Merge {
+                    name: "m".into(),
+                    span: Span::SYNTHETIC,
+                },
             ],
             &[(0, 2), (1, 2)],
         );
@@ -3746,7 +3905,11 @@ mod tests {
         // materialization layer and is invisible to NodeProperties.
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_arena_transform("arena_t"),
             ],
             &[(0, 1)],
@@ -3767,6 +3930,7 @@ mod tests {
     fn test_plan_node_sort_exhaustive_matches() {
         let node = PlanNode::Sort {
             name: "x".into(),
+            span: Span::SYNTHETIC,
             sort_fields: vec![],
         };
 
@@ -3870,6 +4034,7 @@ mod tests {
         use cxl::plan::CompiledAggregate;
         PlanNode::Aggregation {
             name: name.into(),
+            span: Span::SYNTHETIC,
             config: AggregateConfig {
                 group_by: group_by.into_iter().map(String::from).collect(),
                 cxl: "emit n = count()".to_string(),
@@ -3898,7 +4063,11 @@ mod tests {
     ) -> (ExecutionPlanDag, NodeIndex) {
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 make_aggregation("agg", group_by, hint),
             ],
             &[(0, 1)],
@@ -4092,9 +4261,15 @@ mod tests {
         ws.insert("x".to_string()); // disjoint from sort key `k`
         let (mut dag, idxs) = dag_from_nodes(
             vec![
-                PlanNode::Source { name: "src".into() },
+                PlanNode::Source {
+                    name: "src".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
+                },
                 PlanNode::Transform {
                     name: "t".into(),
+                    span: Span::SYNTHETIC,
+                    resolved: None,
                     parallelism_class: ParallelismClass::Stateless,
                     tier: 0,
                     execution_reqs: NodeExecutionReqs::Streaming,

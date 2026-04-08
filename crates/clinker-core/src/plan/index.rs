@@ -24,8 +24,11 @@ pub struct LocalWindowConfig {
     pub on: Option<String>,
 }
 
-/// Parse `local_window` from the raw JSON value on a TransformConfig.
-pub fn parse_local_window(
+/// Parse the analytic-window block (formerly `local_window`) from the
+/// raw JSON value on a TransformConfig. Renamed in Phase 16b to match
+/// the `analytic_window` field on `TransformBody`; the legacy
+/// `local_window` YAML key is still accepted by the legacy planner path.
+pub fn parse_analytic_window(
     transform: &TransformConfig,
 ) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
     match &transform.local_window {

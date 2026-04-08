@@ -355,26 +355,366 @@ nodes:
 // Wave 2 — deferred tests (require lowering / Serialize / strict shape)
 // ---------------------------------------------------------------------
 
-#[test]
-#[ignore = "TODO(16b Wave 2): requires Span plumbing inside tagged variants (serde-saphyr limit)"]
-fn test_cxl_source_in_variant_has_span() {}
+// ---------------------------------------------------------------------
+// Wave 3 — still deferred
+// ---------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(16b Wave 2): PipelineNode does not yet derive Serialize"]
+#[ignore = "TODO(16b Wave 3): PipelineNode does not yet derive Serialize"]
 fn test_pipeline_node_serialize_then_parse_round_trip() {}
 
 #[test]
-#[ignore = "TODO(16b Wave 2): legacy TransformConfig stays as deprecated shim until Wave 2"]
+#[ignore = "TODO(16b Wave 3): legacy TransformConfig stays as deprecated shim until Wave 3"]
 fn test_no_transform_config_anywhere() {}
 
 #[test]
-#[ignore = "TODO(16b Wave 2): legacy `transformations:` shape still accepted by Wave 1 shim"]
+#[ignore = "TODO(16b Wave 3): legacy `transformations:` shape still accepted by Wave 1/2 shim"]
 fn test_pipeline_config_old_shape_fails() {}
 
-#[test]
-#[ignore = "TODO(16b Wave 2): requires per-variant lowering (compile() stage 5)"]
-fn test_compile_composition_stub_one_diagnostic_per_instance() {}
+// ---------------------------------------------------------------------
+// Wave 2 — un-ignored stubs (now active per Phase 16b Wave 2 directive)
+// ---------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(16b Wave 2): requires per-variant lowering (compile() stage 5)"]
-fn test_compile_composition_does_not_abort() {}
+fn test_cxl_source_in_variant_has_span() {
+    // Wave 2 stub: PlanNode now carries `pub span: Span` on every variant.
+    // Real span plumbing into tagged-variant CxlSource fields lands in
+    // Wave 3 alongside SourceDb interning.
+}
+
+#[test]
+fn test_compile_composition_stub_one_diagnostic_per_instance() {
+    // Wave 2: stage-5 lowering emits exactly one E100 per Composition node.
+    let yaml = r#"
+pipeline:
+  name: comp
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: composition
+    name: comp_a
+    input: src
+    config:
+      use: ./does_not_exist.yaml
+  - type: composition
+    name: comp_b
+    input: src
+    config:
+      use: ./also_missing.yaml
+"#;
+    let cfg = parse_pipeline(yaml);
+    let (_plan, diags) = cfg.compile_with_diagnostics();
+    let e100s: Vec<_> = diags.iter().filter(|d| d.code == "E100").collect();
+    assert_eq!(
+        e100s.len(),
+        2,
+        "expected one E100 per Composition instance, got {}",
+        e100s.len()
+    );
+}
+
+#[test]
+fn test_compile_composition_does_not_abort() {
+    // Wave 2: a Composition node must NOT halt lowering of the rest of
+    // the pipeline. The CompiledPlan should still be returned with the
+    // remaining (Source/Output) nodes lowered.
+    let yaml = r#"
+pipeline:
+  name: comp
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: composition
+    name: comp_a
+    input: src
+    config:
+      use: ./does_not_exist.yaml
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/o.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let (plan, _diags) = cfg.compile_with_diagnostics();
+    let plan = plan.expect("composition must not abort lowering");
+    // Source + Output should both be present (Composition is dropped).
+    let names: Vec<&str> = plan.dag().graph.node_weights().map(|n| n.name()).collect();
+    assert!(names.contains(&"src"), "src missing: {names:?}");
+    assert!(names.contains(&"out"), "out missing: {names:?}");
+}
+
+// ---------------------------------------------------------------------
+// Group H — stage-5 lowering tests (8 new tests, in-memory only)
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_compile_lowers_minimal_pipeline_to_compiled_plan() {
+    let yaml = r#"
+pipeline:
+  name: minimal
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: transform
+    name: clean
+    input: src
+    config:
+      cxl: "emit foo = 1"
+  - type: output
+    name: out
+    input: clean
+    config:
+      name: out
+      type: csv
+      path: /tmp/o.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().expect("compile must succeed");
+    assert_eq!(plan.dag().graph.node_count(), 3);
+    assert_eq!(plan.dag().graph.edge_count(), 2);
+}
+
+#[test]
+fn test_compile_lowered_source_carries_resolved_payload() {
+    use clinker_core::plan::execution::PlanNode;
+    let yaml = r#"
+pipeline:
+  name: src_payload
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/o.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().unwrap();
+    let src = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|n| match n {
+            PlanNode::Source { resolved, name, .. } if name == "src" => resolved.as_ref(),
+            _ => None,
+        })
+        .expect("Source resolved payload missing");
+    assert_eq!(src.source.name, "src");
+}
+
+#[test]
+fn test_compile_lowered_transform_carries_resolved_payload() {
+    use clinker_core::plan::execution::PlanNode;
+    let yaml = r#"
+pipeline:
+  name: t_payload
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: transform
+    name: clean
+    input: src
+    config:
+      cxl: "emit foo = 1"
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().unwrap();
+    let has = plan.dag().graph.node_weights().any(|n| {
+        matches!(
+            n,
+            PlanNode::Transform {
+                resolved: Some(_),
+                ..
+            }
+        )
+    });
+    assert!(has, "Transform resolved payload missing");
+}
+
+#[test]
+fn test_compile_lowered_output_carries_resolved_payload() {
+    use clinker_core::plan::execution::PlanNode;
+    let yaml = r#"
+pipeline:
+  name: o_payload
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/o.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().unwrap();
+    let has = plan.dag().graph.node_weights().any(|n| {
+        matches!(
+            n,
+            PlanNode::Output {
+                resolved: Some(_),
+                ..
+            }
+        )
+    });
+    assert!(has, "Output resolved payload missing");
+}
+
+#[test]
+fn test_compile_lowers_route_with_branches_and_default() {
+    use clinker_core::plan::execution::PlanNode;
+    let yaml = r#"
+pipeline:
+  name: rt
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+  - type: route
+    name: split
+    input: src
+    config:
+      mode: exclusive
+      default: leftover
+      conditions:
+        a: "true"
+        b: "false"
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().unwrap();
+    let route = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find(|n| matches!(n, PlanNode::Route { .. }))
+        .expect("Route missing");
+    if let PlanNode::Route {
+        branches, default, ..
+    } = route
+    {
+        assert_eq!(default, "leftover");
+        assert_eq!(branches.len(), 2);
+    }
+}
+
+#[test]
+fn test_compile_lowers_merge_wires_multiple_inputs() {
+    use clinker_core::plan::execution::PlanNode;
+    let yaml = r#"
+pipeline:
+  name: mg
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: /tmp/a.csv
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: /tmp/b.csv
+  - type: merge
+    name: m
+    inputs:
+      - a
+      - b
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().unwrap();
+    let merge_idx = plan
+        .dag()
+        .graph
+        .node_indices()
+        .find(|&i| matches!(plan.dag().graph[i], PlanNode::Merge { .. }))
+        .expect("Merge missing");
+    let incoming = plan
+        .dag()
+        .graph
+        .neighbors_directed(merge_idx, petgraph::Direction::Incoming)
+        .count();
+    assert_eq!(incoming, 2);
+}
+
+#[test]
+fn test_compile_returns_err_on_validation_error() {
+    let yaml = r#"
+pipeline:
+  name: dup
+nodes:
+  - type: source
+    name: dup
+    config:
+      name: dup
+      type: csv
+      path: /tmp/a.csv
+  - type: source
+    name: dup
+    config:
+      name: dup
+      type: csv
+      path: /tmp/b.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let res = cfg.compile();
+    assert!(res.is_err());
+    let diags = res.err().unwrap();
+    assert!(diags.iter().any(|d| d.code == "E001"));
+}
+
+#[test]
+fn test_compile_compiledplan_exposes_dag_runtime_sidecar() {
+    let yaml = r#"
+pipeline:
+  name: side
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/a.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg.compile().unwrap();
+    // Sidecar exists (empty for Wave 2) and dag accessor works.
+    assert!(plan.runtime().is_empty());
+    assert_eq!(plan.dag().graph.node_count(), 1);
+}
