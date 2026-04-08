@@ -57,13 +57,13 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::Execution
     let params = test_params(&config);
 
     let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
-        config.inputs[0].name.clone(),
+        config.source_configs().next().unwrap().name.clone(),
         Box::new(Cursor::new(csv_input.as_bytes().to_vec())) as Box<dyn Read + Send>,
     )]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        config.outputs[0].name.clone(),
+        config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 

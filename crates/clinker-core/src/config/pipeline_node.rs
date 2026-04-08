@@ -12,7 +12,7 @@
 //! serde-saphyr limitation).
 //!
 //! Per-variant body structs use the `*Body` family suffix to avoid
-//! shadowing the legacy `TransformConfig`/`SourceConfig`/`OutputConfig`
+//! shadowing the legacy `LegacyTransformsBlock`/`SourceConfig`/`OutputConfig`
 //! types in `config/mod.rs` that the executor still consumes during
 //! Phase 16b Wave 1. Wave 2 deletes the legacy types and these `*Body`
 //! structs become the operator-facing config layer.
@@ -109,7 +109,7 @@ impl PipelineNode {
 //
 // These exist as the parse-time shape for the new `nodes:` YAML schema.
 // During Phase 16b Wave 1 they coexist with the legacy
-// `SourceConfig`/`TransformConfig`/`OutputConfig` types in
+// `SourceConfig`/`LegacyTransformsBlock`/`OutputConfig` types in
 // `config/mod.rs`; the legacy types still carry the operator-specific
 // payloads (formats, mappings, etc) that the executor consumes. Wave 2
 // inlines those payloads here and deletes the legacy types outright.

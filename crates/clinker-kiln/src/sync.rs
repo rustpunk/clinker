@@ -72,13 +72,13 @@ pub fn compute_yaml_ranges(yaml: &str, config: &PipelineConfig) -> HashMap<Strin
     let lines: Vec<&str> = yaml.lines().collect();
 
     let mut stage_names: Vec<String> = Vec::new();
-    for input in &config.inputs {
+    for input in config.source_configs() {
         stage_names.push(input.name.clone());
     }
-    for transform in config.transforms() {
-        stage_names.push(transform.name.clone());
+    for transform in config.transform_views() {
+        stage_names.push(transform.name.to_string());
     }
-    for output in &config.outputs {
+    for output in config.output_configs() {
         stage_names.push(output.name.clone());
     }
 

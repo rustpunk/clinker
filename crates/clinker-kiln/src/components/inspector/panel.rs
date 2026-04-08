@@ -27,9 +27,9 @@ pub fn InspectorPanel(stage_id: String) -> Element {
     };
 
     // Determine stage kind and extract data
-    let input = config.inputs.iter().find(|i| i.name == stage_id);
-    let transform = config.transforms().find(|t| t.name == stage_id);
-    let output = config.outputs.iter().find(|o| o.name == stage_id);
+    let input = config.source_configs().find(|i| i.name == stage_id);
+    let transform = config.transform_views().find(|t| t.name == stage_id);
+    let output = config.output_configs().find(|o| o.name == stage_id);
 
     let (kind_label, kind_attr, subtitle) = if input.is_some() {
         ("SOURCE", "source", input.unwrap().path.clone())
@@ -37,7 +37,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         (
             "TRANSFORM",
             "transform",
-            t.description.clone().unwrap_or_default(),
+            t.description.map(|s| s.to_string()).unwrap_or_default(),
         )
     } else if output.is_some() {
         ("OUTPUT", "output", output.unwrap().path.clone())

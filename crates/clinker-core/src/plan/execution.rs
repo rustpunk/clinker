@@ -144,7 +144,7 @@ pub enum PlanNode {
     },
     /// Hash / streaming GROUP BY transform (Phase 16, Task 16.3.5).
     ///
-    /// Constructed by `ExecutionPlanDag::compile()` when a `TransformConfig`
+    /// Constructed by `ExecutionPlanDag::compile()` when a `LegacyTransformsBlock`
     /// has its `aggregate` block set. The plan-time extraction artifact
     /// (`compiled`) and the realized output schema are not serializable —
     /// they live behind `Arc` and are reconstructed by the runtime, not
@@ -215,12 +215,12 @@ pub struct PlanOutputPayload {
 /// Phase 16b Wave 4ab — post-lowering intermediate representation of a
 /// single transform/aggregate/route node, fed into
 /// [`build_plan_from_nodes`]. Decouples the planner from the legacy
-/// `TransformConfig`/`PipelineConfig` shape so the executor public
+/// `LegacyTransformsBlock`/`PipelineConfig` shape so the executor public
 /// surface can be cut over without dragging the legacy types into the
 /// plan body.
 ///
 /// The shape mirrors the field set the planner actually reads off
-/// `TransformConfig` (cxl source, aggregate sidecar, route sidecar, log
+/// `LegacyTransformsBlock` (cxl source, aggregate sidecar, route sidecar, log
 /// directives, validations, analytic-window block, input wiring) plus a
 /// promoted [`ResolvedInput`] enum that distinguishes the three wiring
 /// modes that the legacy `Option<TransformInput>` encoded implicitly
@@ -229,7 +229,7 @@ pub struct PlanOutputPayload {
 /// them with `Span::SYNTHETIC` from the legacy bridge constructor.
 // Wave 4ab M2 WIP: remaining fields (route, log, validations, input_span,
 // body_span) are consumed as Milestones 3-6 migrate the helpers off
-// TransformConfig. Keeping the full field set live avoids a second structural
+// LegacyTransformsBlock. Keeping the full field set live avoids a second structural
 // churn when those milestones land.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -2794,7 +2794,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Identity helper retained to keep test callsites compact.
-    fn t(entry: &TransformConfig) -> &TransformConfig {
+    fn t(entry: &LegacyTransformsBlock) -> &LegacyTransformsBlock {
         entry
     }
 
@@ -2847,7 +2847,7 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| TransformConfig {
+                .map(|(name, cxl, local_window)| LegacyTransformsBlock {
                     name: name.into(),
                     description: None,
                     cxl: Some(cxl.into()),
@@ -3168,7 +3168,7 @@ mod tests {
                 format: OutputFormat::Csv(None),
                 notes: None,
             }],
-            transformations: vec![TransformConfig {
+            transformations: vec![LegacyTransformsBlock {
                 name: "router".into(),
                 description: None,
                 cxl: Some(cxl.into()),

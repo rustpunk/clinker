@@ -235,7 +235,7 @@ pub struct ChannelOverrideSection {
 
 /// Generate documentation for the stage with the given name.
 pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<StageDoc> {
-    if let Some(input) = config.inputs.iter().find(|i| i.name == stage_name) {
+    if let Some(input) = config.source_configs().find(|i| i.name == stage_name) {
         return Some(generate_input_doc(config, input));
     }
 
@@ -250,7 +250,7 @@ pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<S
         }
     }
 
-    if let Some(output) = config.outputs.iter().find(|o| o.name == stage_name) {
+    if let Some(output) = config.output_configs().find(|o| o.name == stage_name) {
         return Some(generate_output_doc(config, output));
     }
 

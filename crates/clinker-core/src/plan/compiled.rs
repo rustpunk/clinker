@@ -9,7 +9,7 @@
 //! [`CompiledPlan::config`].
 //!
 //! Wave 4ab: executor public surface flipped from `&PipelineConfig` to
-//! `&CompiledPlan`. Legacy-type deletion (`TransformConfig` and the
+//! `&CompiledPlan`. Legacy-type deletion (`LegacyTransformsBlock` and the
 //! free-function rewrite of `ExecutionPlanDag::compile`) is deferred;
 //! the shim path via `config()` keeps the executor's internal helpers
 //! unchanged while the boundary at the top is strict.
@@ -137,7 +137,8 @@ impl CompiledPlan {
         &mut self,
         schema: &std::sync::Arc<clinker_record::Schema>,
     ) -> Result<(), crate::error::PipelineError> {
-        let transforms: Vec<&crate::config::TransformConfig> = self.config.transforms().collect();
+        let transforms: Vec<&crate::config::LegacyTransformsBlock> =
+            self.config.transforms().collect();
         let compiled = crate::executor::PipelineExecutor::compile_transforms(&transforms, schema)?;
 
         // Fill PlanTransformPayload::typed on every Transform node whose

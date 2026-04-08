@@ -435,7 +435,7 @@ pub fn structural_search(
         // Composition/import/override tags removed in Phase 16b.
 
         // Check inputs
-        for input in &config.inputs {
+        for input in config.source_configs() {
             if stage_matches_tags(tags, "input", &input.name, &content_for_input(input)) {
                 let detail = format!("type: {}, path: {}", input.format.format_name(), input.path);
                 results.push(StructuralSearchMatch {
@@ -448,19 +448,22 @@ pub fn structural_search(
         }
 
         // Check transformations
-        for transform in config.transforms() {
-            if stage_matches_tags(tags, "transform", &transform.name, transform.cxl_source()) {
-                let detail = transform.description.clone().unwrap_or_else(|| {
-                    transform
-                        .cxl_source()
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
-                });
+        for transform in config.transform_views() {
+            if stage_matches_tags(tags, "transform", transform.name, transform.cxl_source()) {
+                let detail = transform
+                    .description
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        transform
+                            .cxl_source()
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    });
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
-                    stage_name: transform.name.clone(),
+                    stage_name: transform.name.to_string(),
                     stage_type: "transform".to_string(),
                     matched_detail: detail,
                 });
@@ -468,7 +471,7 @@ pub fn structural_search(
         }
 
         // Check outputs
-        for output in &config.outputs {
+        for output in config.output_configs() {
             if stage_matches_tags(
                 tags,
                 "output",

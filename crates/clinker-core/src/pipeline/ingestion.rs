@@ -211,7 +211,7 @@ mod tests {
 
     /// Identity helper retained to keep test callsites compact.
     #[allow(dead_code)]
-    fn t(entry: &TransformConfig) -> &TransformConfig {
+    fn t(entry: &LegacyTransformsBlock) -> &LegacyTransformsBlock {
         entry
     }
 
@@ -294,7 +294,7 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| TransformConfig {
+                .map(|(name, cxl, local_window)| LegacyTransformsBlock {
                     name: name.into(),
                     description: None,
                     cxl: Some(cxl.into()),

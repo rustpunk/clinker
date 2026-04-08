@@ -50,13 +50,13 @@ pub fn validate_pipeline(
 ) -> Vec<SchemaWarning> {
     let mut warnings = Vec::new();
 
-    for input in &config.inputs {
+    for input in config.source_configs() {
         validate_input(input, index, workspace_root, &mut warnings);
     }
 
     // Collect known fields from all inputs for CXL validation
     let mut available_fields: HashSet<String> = HashSet::new();
-    for input in &config.inputs {
+    for input in config.source_configs() {
         if let Some(schema) = resolve_input_schema(input, index, workspace_root) {
             for field_name in schema.all_field_names() {
                 available_fields.insert(field_name);
@@ -480,35 +480,17 @@ distinct by customer_id
     #[test]
     fn test_validate_pipeline_no_schema() {
         // Pipeline without schema references should produce no warnings
-        let config = PipelineConfig {
-            pipeline: clinker_core::config::PipelineMeta {
-                name: "test".to_string(),
-                memory_limit: None,
-                vars: None,
-                date_formats: None,
-                rules_path: None,
-                concurrency: None,
-                date_locale: None,
-                log_rules: None,
-                include_provenance: None,
-                metrics: None,
-            },
-            nodes: Vec::new(),
-            inputs: vec![SourceConfig {
-                name: "src".to_string(),
-                path: "./data.csv".to_string(),
-                schema: None,
-                schema_overrides: None,
-                array_paths: None,
-                sort_order: None,
-                format: InputFormat::Csv(None),
-                notes: None,
-            }],
-            outputs: vec![],
-            transformations: vec![],
-            error_handling: Default::default(),
-            notes: None,
-        };
+        let yaml = r#"
+pipeline:
+  name: test
+inputs:
+  - name: src
+    path: ./data.csv
+    type: csv
+outputs: []
+transformations: []
+"#;
+        let config = clinker_core::config::parse_config(yaml).unwrap();
 
         let index = SchemaIndex::default();
         let warnings = validate_pipeline(&config, &index, Path::new("/tmp"));

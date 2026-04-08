@@ -17,33 +17,33 @@ use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
 ///
-/// Phase 16b: the YAML schema is now `nodes:` (a `Vec<Spanned<PipelineNode>>`)
-/// instead of the old `inputs:`/`outputs:`/`transformations:` triad. The
-/// derived `inputs`, `outputs`, and `transformations` fields below are
-/// populated post-deserialize by [`project_nodes`] (called from
-/// [`parse_config`]) and are NOT part of the YAML schema. They preserve
-/// downstream consumer compatibility with the executor, plan, kiln,
-/// schema, and tests crates.
+/// Phase 16b Wave 4ab D3a: the YAML schema is `nodes:` (a
+/// `Vec<Spanned<PipelineNode>>`). The `inputs`/`outputs`/`transformations`
+/// fields are now `pub(crate)` parser-private scratch buffers consumed by
+/// [`lift_legacy_fields_into_nodes`] and the inline parser tests in this
+/// module. External consumers walk [`PipelineConfig::nodes`] or use the
+/// iterator accessors ([`PipelineConfig::source_configs`],
+/// [`PipelineConfig::output_configs`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
-    /// Unified pipeline node taxonomy (Phase 16b Wave 1). Each node carries
-    /// its YAML source span via the [`Spanned`] outer wrap. Currently
-    /// optional; Wave 2 makes it the sole topology source and deletes the
-    /// legacy fields below.
+    /// Unified pipeline node taxonomy (Phase 16b). Each node carries its
+    /// YAML source span via the [`Spanned`] outer wrap.
     #[serde(default, skip_serializing)]
     pub nodes: Vec<Spanned<PipelineNode>>,
-    /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.** Kept
-    /// during Wave 1 so existing fixtures and tests continue to parse.
+    /// Parser-private legacy YAML scratch. External consumers walk
+    /// [`PipelineConfig::nodes`] or use [`PipelineConfig::source_configs`].
     #[serde(default)]
-    pub inputs: Vec<SourceConfig>,
-    /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.**
+    pub(crate) inputs: Vec<SourceConfig>,
+    /// Parser-private legacy YAML scratch. External consumers use
+    /// [`PipelineConfig::output_configs`].
     #[serde(default)]
-    pub outputs: Vec<OutputConfig>,
-    /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.**
+    pub(crate) outputs: Vec<OutputConfig>,
+    /// Parser-private legacy YAML scratch. External consumers walk
+    /// [`PipelineConfig::nodes`] and match `PipelineNode::Transform`.
     #[serde(default)]
-    pub transformations: Vec<TransformConfig>,
+    pub(crate) transformations: Vec<LegacyTransformsBlock>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
     /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
@@ -760,8 +760,14 @@ pub struct AggregateConfig {
 /// `#[deprecated]` attribute is intentionally NOT applied — it would
 /// generate ~80 warnings across the workspace before Wave 2's atomic
 /// rip; per Option B the type is structurally intact and dead-code-only.
+/// Parser-private legacy YAML deserialization target. External consumers
+/// walk `PipelineConfig::nodes` and match `PipelineNode::Transform`. This
+/// type exists only so the legacy YAML shape (`transformations:` at the
+/// top level) continues to parse — [`lift_legacy_fields_into_nodes`]
+/// immediately consumes it into `PipelineNode::Transform`/`Aggregate`/
+/// `Route`/`Merge` variants.
 #[derive(Debug, Clone, Serialize)]
-pub struct TransformConfig {
+pub struct LegacyTransformsBlock {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -787,7 +793,7 @@ pub struct TransformConfig {
     pub notes: Option<serde_json::Value>,
 }
 
-impl TransformConfig {
+impl LegacyTransformsBlock {
     /// Return the CXL source text for this transform.
     ///
     /// For row-level transforms this is the top-level `cxl` field; for
@@ -809,7 +815,7 @@ impl TransformConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for TransformConfig {
+impl<'de> Deserialize<'de> for LegacyTransformsBlock {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -855,7 +861,7 @@ impl<'de> Deserialize<'de> for TransformConfig {
             _ => {}
         }
 
-        Ok(TransformConfig {
+        Ok(LegacyTransformsBlock {
             name: raw.name,
             description: raw.description,
             cxl: raw.cxl,
@@ -947,10 +953,166 @@ pub enum LogLevel {
     Error,
 }
 
+/// Phase 16b Wave 4ab D3a — lightweight read-only view over a
+/// transform-like node (`Transform`, `Aggregate`, `Route`) yielded by
+/// [`PipelineConfig::transform_views`]. Carries the fields the Kiln IDE
+/// and schema-validation passes need; callers that need variant-specific
+/// bodies (`TransformBody`, `AggregateBody`, etc.) should walk
+/// [`PipelineConfig::nodes`] directly.
+#[derive(Debug, Clone, Copy)]
+pub struct TransformView<'a> {
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub cxl_source: &'a str,
+    pub notes: Option<&'a serde_json::Value>,
+    pub kind: TransformViewKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformViewKind {
+    Transform,
+    Aggregate,
+    Route,
+}
+
+impl<'a> TransformView<'a> {
+    pub fn cxl_source(&self) -> &'a str {
+        self.cxl_source
+    }
+}
+
 impl PipelineConfig {
-    /// Returns resolved transforms.
-    pub fn transforms(&self) -> impl Iterator<Item = &TransformConfig> + '_ {
+    /// Parser-private iterator over the legacy transforms scratch buffer.
+    /// Used by the inline deserializer tests in this module and by the
+    /// compiled-plan M4 schema-bind hook until D3b retires it.
+    pub(crate) fn transforms(&self) -> impl Iterator<Item = &LegacyTransformsBlock> + '_ {
         self.transformations.iter()
+    }
+
+    /// Phase 16b Wave 4ab D3a — public iterator over source nodes.
+    pub fn source_configs(&self) -> impl Iterator<Item = &SourceConfig> + '_ {
+        self.nodes.iter().filter_map(|n| match &n.value {
+            PipelineNode::Source { config: body, .. } => Some(&body.source),
+            _ => None,
+        })
+    }
+
+    /// Phase 16b Wave 4ab D3a — public iterator over output nodes.
+    pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
+        self.nodes.iter().filter_map(|n| match &n.value {
+            PipelineNode::Output { config: body, .. } => Some(&body.output),
+            _ => None,
+        })
+    }
+
+    /// Public iterator over transform-like nodes (Transform + Aggregate +
+    /// Route), yielding a lightweight [`TransformView`] with the minimum
+    /// surface the Kiln IDE + schema validation need. Merge nodes are
+    /// deliberately excluded — they have no CXL body or description.
+    pub fn transform_views(&self) -> impl Iterator<Item = TransformView<'_>> + '_ {
+        self.nodes.iter().filter_map(|n| match &n.value {
+            PipelineNode::Transform {
+                header,
+                config: body,
+            } => Some(TransformView {
+                name: &header.name,
+                description: header.description.as_deref(),
+                cxl_source: body.cxl.as_ref(),
+                notes: header.notes.as_ref(),
+                kind: TransformViewKind::Transform,
+            }),
+            PipelineNode::Aggregate {
+                header,
+                config: body,
+            } => Some(TransformView {
+                name: &header.name,
+                description: header.description.as_deref(),
+                cxl_source: body.cxl.as_ref(),
+                notes: header.notes.as_ref(),
+                kind: TransformViewKind::Aggregate,
+            }),
+            PipelineNode::Route { header, .. } => Some(TransformView {
+                name: &header.name,
+                description: header.description.as_deref(),
+                cxl_source: "",
+                notes: header.notes.as_ref(),
+                kind: TransformViewKind::Route,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Look up the `_notes` field for a stage by name, reading from
+    /// whichever node variant hosts it. Returns `None` if no node with
+    /// that name exists (or the node type has no notes slot).
+    pub fn stage_notes(&self, stage_name: &str) -> Option<&serde_json::Value> {
+        self.nodes.iter().find_map(|n| match &n.value {
+            PipelineNode::Source { config: body, .. } if body.source.name == stage_name => {
+                body.source.notes.as_ref()
+            }
+            PipelineNode::Output { config: body, .. } if body.output.name == stage_name => {
+                body.output.notes.as_ref()
+            }
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Composition { header, .. }
+                if header.name == stage_name =>
+            {
+                header.notes.as_ref()
+            }
+            PipelineNode::Merge { header, .. } if header.name == stage_name => {
+                header.notes.as_ref()
+            }
+            _ => None,
+        })
+    }
+
+    /// Set the `_notes` field for a stage by name. No-op if no such
+    /// stage exists.
+    pub fn set_stage_notes(&mut self, stage_name: &str, notes: Option<serde_json::Value>) {
+        for spanned in self.nodes.iter_mut() {
+            match &mut spanned.value {
+                PipelineNode::Source { config: body, .. } if body.source.name == stage_name => {
+                    body.source.notes = notes;
+                    return;
+                }
+                PipelineNode::Output { config: body, .. } if body.output.name == stage_name => {
+                    body.output.notes = notes;
+                    return;
+                }
+                PipelineNode::Transform { header, .. }
+                | PipelineNode::Aggregate { header, .. }
+                | PipelineNode::Route { header, .. }
+                | PipelineNode::Composition { header, .. }
+                    if header.name == stage_name =>
+                {
+                    header.notes = notes;
+                    return;
+                }
+                PipelineNode::Merge { header, .. } if header.name == stage_name => {
+                    header.notes = notes;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Count of Transform-ish nodes (Transform + Aggregate + Route + Merge).
+    pub fn transform_node_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    &n.value,
+                    PipelineNode::Transform { .. }
+                        | PipelineNode::Aggregate { .. }
+                        | PipelineNode::Route { .. }
+                        | PipelineNode::Merge { .. }
+                )
+            })
+            .count()
     }
 
     /// Phase 16b Wave 1: validation pre-pass over the unified `nodes:`
@@ -1693,7 +1855,7 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
 /// implicit linear-chain wiring: the first transform wires to the
 /// primary source, subsequent transforms wire to the preceding
 /// transform/aggregate/route node. Explicit `input:` references on
-/// legacy `TransformConfig` override the implicit chain.
+/// legacy `LegacyTransformsBlock` override the implicit chain.
 fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
     use crate::yaml::{Location, Spanned};
 
@@ -1950,7 +2112,7 @@ fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
                 header,
                 config: body,
             } => {
-                let tc = TransformConfig {
+                let tc = LegacyTransformsBlock {
                     name: header.name.clone(),
                     description: header.description.clone(),
                     cxl: Some(body.cxl.source.as_str().to_string()),
@@ -1973,7 +2135,7 @@ fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
                     cxl: body.cxl.source.as_str().to_string(),
                     strategy: body.strategy,
                 };
-                let tc = TransformConfig {
+                let tc = LegacyTransformsBlock {
                     name: header.name.clone(),
                     description: header.description.clone(),
                     cxl: None,
@@ -2007,7 +2169,7 @@ fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
                     branches,
                     default: body.default.clone(),
                 };
-                let tc = TransformConfig {
+                let tc = LegacyTransformsBlock {
                     name: header.name.clone(),
                     description: header.description.clone(),
                     cxl: Some(String::new()),
@@ -3721,8 +3883,8 @@ transformations:
 
     // ── Phase 16 Task 16.2 — AggregateConfig tests ─────────────────
 
-    fn parse_transform(yaml: &str) -> Result<TransformConfig, crate::yaml::YamlError> {
-        crate::yaml::from_str::<TransformConfig>(yaml)
+    fn parse_transform(yaml: &str) -> Result<LegacyTransformsBlock, crate::yaml::YamlError> {
+        crate::yaml::from_str::<LegacyTransformsBlock>(yaml)
     }
 
     #[test]

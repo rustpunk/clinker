@@ -105,7 +105,7 @@ fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProg
 
 /// Identity helper retained to keep test callsites compact.
 #[allow(dead_code)]
-fn t(entry: &TransformConfig) -> &TransformConfig {
+fn t(entry: &LegacyTransformsBlock) -> &LegacyTransformsBlock {
     entry
 }
 

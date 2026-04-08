@@ -337,9 +337,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         // Config-validation-only mode (no -n)
         tracing::info!(
             "Dry run: config valid, {} inputs, {} outputs, {} transforms",
-            pipeline_config.inputs.len(),
-            pipeline_config.outputs.len(),
-            pipeline_config.transformations.len(),
+            pipeline_config.source_configs().count(),
+            pipeline_config.output_configs().count(),
+            pipeline_config.transform_node_count(),
         );
         return Ok(0);
     }
@@ -369,16 +369,24 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     };
 
     // Run the pipeline using file-based I/O
-    let input_path = &pipeline_config.inputs[0].path;
-    let output_path = &pipeline_config.outputs[0].path;
+    let first_source = pipeline_config
+        .source_configs()
+        .next()
+        .expect("pipeline has at least one source");
+    let first_output = pipeline_config
+        .output_configs()
+        .next()
+        .expect("pipeline has at least one output");
+    let input_path = first_source.path.clone();
+    let output_path = first_output.path.clone();
+    let input_name = first_source.name.clone();
+    let output_name = first_output.name.clone();
 
-    let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(input_path)?);
-    let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(output_path)?);
+    let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&input_path)?);
+    let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output_path)?);
 
-    let readers =
-        std::collections::HashMap::from([(pipeline_config.inputs[0].name.clone(), reader)]);
-    let writers =
-        std::collections::HashMap::from([(pipeline_config.outputs[0].name.clone(), writer)]);
+    let readers = std::collections::HashMap::from([(input_name, reader)]);
+    let writers = std::collections::HashMap::from([(output_name, writer)]);
 
     let compiled_plan =
         clinker_core::plan::CompiledPlan::from_config_for_run(pipeline_config.clone());
@@ -398,7 +406,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         && let Some(ref dlq_path) = dlq_config.path
     {
         let input_schema = {
-            let f = std::fs::File::open(input_path)?;
+            let f = std::fs::File::open(&input_path)?;
             let mut r = clinker_format::csv::reader::CsvReader::from_reader(
                 f,
                 clinker_format::csv::reader::CsvReaderConfig::default(),
@@ -412,7 +420,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             dlq_writer,
             dlq_entries,
             &input_schema,
-            input_path,
+            &input_path,
             include_reason,
             include_source_row,
         )
@@ -457,13 +465,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             peak_rss_bytes: report.peak_rss_bytes,
             thread_count: num_threads(args),
             input_files: pipeline_config
-                .inputs
-                .iter()
+                .source_configs()
                 .map(|i| i.path.clone())
                 .collect(),
             output_files: pipeline_config
-                .outputs
-                .iter()
+                .output_configs()
                 .map(|o| o.path.clone())
                 .collect(),
             dlq_path,

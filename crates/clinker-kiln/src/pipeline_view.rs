@@ -96,9 +96,11 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             _ => None,
         })
         .collect();
-    let input_count = config.inputs.len();
+    let source_configs: Vec<_> = config.source_configs().collect();
+    let output_configs: Vec<_> = config.output_configs().collect();
+    let input_count = source_configs.len();
     let transform_count = transforms.len();
-    let output_count = config.outputs.len();
+    let output_count = output_configs.len();
 
     let transform_x_start = if input_count == 0 {
         LEFT_MARGIN
@@ -124,12 +126,12 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
         });
     }
 
-    let input_targets = map_inputs_to_transforms(config, &transforms);
+    let input_targets = map_inputs_to_transforms(&source_configs, &transforms);
 
     let mut input_stages = Vec::new();
     let mut secondary_stack_count: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
-    for (input_idx, input) in config.inputs.iter().enumerate() {
+    for (input_idx, input) in source_configs.iter().enumerate() {
         let target_t_idx = input_targets[input_idx];
         let (ix, iy) = if input_idx == 0 && !transform_stages.is_empty() {
             (LEFT_MARGIN, transform_stages[0].canvas_y)
@@ -170,7 +172,7 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
     };
     let center_y = BASE_Y + NODE_HEIGHT / 2.0 + STAGGER_Y / 2.0;
     let output_ys = stack_y_positions(output_count, center_y);
-    for (i, output) in config.outputs.iter().enumerate() {
+    for (i, output) in output_configs.iter().enumerate() {
         output_stages.push(StageView {
             id: output.name.clone(),
             label: output.name.clone(),
@@ -198,11 +200,10 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
 }
 
 fn map_inputs_to_transforms(
-    config: &PipelineConfig,
+    source_configs: &[&clinker_core::config::SourceConfig],
     transforms: &[(&NodeHeader, &TransformBody)],
 ) -> Vec<usize> {
-    config
-        .inputs
+    source_configs
         .iter()
         .enumerate()
         .map(|(i, input)| {

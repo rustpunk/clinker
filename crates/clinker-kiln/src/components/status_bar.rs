@@ -127,7 +127,7 @@ pub fn StatusBar() -> Element {
                 if let Some(ref config) = (state.pipeline)() {
                     div {
                         class: "kiln-status-segment",
-                        "{config.transformations.len()} stages"
+                        "{config.transform_node_count()} stages"
                     }
                 }
             }

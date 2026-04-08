@@ -9,7 +9,7 @@
 /// `PartialItem::Err` with the error message. The canvas can then render
 /// error nodes at the failure positions.
 use crate::config::{
-    ErrorHandlingConfig, OutputConfig, PipelineMeta, SourceConfig, TransformConfig,
+    ErrorHandlingConfig, LegacyTransformsBlock, OutputConfig, PipelineMeta, SourceConfig,
     interpolate_env_vars,
 };
 
@@ -33,7 +33,7 @@ pub enum PartialItem<T> {
 pub struct PartialPipelineConfig {
     pub pipeline: Result<PipelineMeta, String>,
     pub inputs: Vec<PartialItem<SourceConfig>>,
-    pub transformations: Vec<PartialItem<TransformConfig>>,
+    pub transformations: Vec<PartialItem<LegacyTransformsBlock>>,
     pub outputs: Vec<PartialItem<OutputConfig>>,
     pub error_handling: Result<ErrorHandlingConfig, String>,
     pub notes: Option<serde_json::Value>,
@@ -78,7 +78,7 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
     // consulted here; the full parser still accepts them via the lift shim
     // but the partial path walks nodes only.
     let mut inputs: Vec<PartialItem<SourceConfig>> = Vec::new();
-    let mut transformations: Vec<PartialItem<TransformConfig>> = Vec::new();
+    let mut transformations: Vec<PartialItem<LegacyTransformsBlock>> = Vec::new();
     let mut outputs: Vec<PartialItem<OutputConfig>> = Vec::new();
 
     if let Some(nodes_value) = obj.get("nodes")
@@ -129,7 +129,7 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
 fn project_partial_nodes(
     nodes_arr: &[serde_json::Value],
     inputs: &mut Vec<PartialItem<SourceConfig>>,
-    transformations: &mut Vec<PartialItem<TransformConfig>>,
+    transformations: &mut Vec<PartialItem<LegacyTransformsBlock>>,
     outputs: &mut Vec<PartialItem<OutputConfig>>,
     errors: &mut Vec<String>,
 ) {
@@ -174,7 +174,7 @@ fn project_partial_nodes(
                 }
             },
             "transform" | "aggregate" | "route" => {
-                // Synthesize a minimally-valid TransformConfig JSON view
+                // Synthesize a minimally-valid LegacyTransformsBlock JSON view
                 // and push it through serde so notes/log/etc. round-trip.
                 let mut synth = serde_json::Map::new();
                 synth.insert("name".into(), serde_json::Value::String(name.clone()));
@@ -249,7 +249,7 @@ fn project_partial_nodes(
                     _ => unreachable!(),
                 }
                 let synth_val = serde_json::Value::Object(synth);
-                match serde_json::from_value::<TransformConfig>(synth_val) {
+                match serde_json::from_value::<LegacyTransformsBlock>(synth_val) {
                     Ok(t) => transformations.push(PartialItem::Ok(t)),
                     Err(e) => {
                         let msg = format!("nodes[{i}] ({name}): {e}");

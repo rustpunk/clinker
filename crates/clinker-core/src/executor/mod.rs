@@ -10,7 +10,7 @@ use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
 use indexmap::IndexMap;
 use rayon::prelude::*;
 
-use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig, TransformConfig};
+use crate::config::{ErrorStrategy, LegacyTransformsBlock, OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
@@ -3035,7 +3035,7 @@ impl PipelineExecutor {
     /// Fields emitted by earlier transforms are progressively added to the
     /// available field set so that later transforms can reference them.
     pub(crate) fn compile_transforms(
-        transforms: &[&TransformConfig],
+        transforms: &[&LegacyTransformsBlock],
         schema: &Arc<Schema>,
     ) -> Result<Vec<CompiledTransform>, PipelineError> {
         let mut fields: Vec<String> = schema.columns().iter().map(|c| c.to_string()).collect();
@@ -5358,7 +5358,7 @@ transformations:
 "#;
         let config = crate::config::parse_config(yaml).unwrap();
         let schema = Arc::new(Schema::new(vec!["amount".into()]));
-        let transforms: Vec<&crate::config::TransformConfig> = config.transforms().collect();
+        let transforms: Vec<&crate::config::LegacyTransformsBlock> = config.transforms().collect();
         let compiled = PipelineExecutor::compile_transforms(&transforms, &schema).unwrap();
         // Each compiled transform holds one Arc<TypedProgram>
         for ct in &compiled {
