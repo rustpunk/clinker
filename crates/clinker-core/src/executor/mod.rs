@@ -552,7 +552,7 @@ impl PipelineExecutor {
         buffer: &mut Vec<(Record, u64)>,
         config: &PipelineConfig,
         primary_output: &OutputConfig,
-        input: &crate::config::InputConfig,
+        input: &crate::config::SourceConfig,
         _pipeline_start_time: chrono::NaiveDateTime,
         stable: &StableEvalContext,
         transform_names: &[&str],
@@ -710,7 +710,7 @@ impl PipelineExecutor {
         buffer: &mut Vec<(Record, u64)>,
         _config: &PipelineConfig,
         primary_output: &OutputConfig,
-        input: &crate::config::InputConfig,
+        input: &crate::config::SourceConfig,
         _pipeline_start_time: chrono::NaiveDateTime,
         stable: &StableEvalContext,
         transform_names: &[&str],
@@ -3240,7 +3240,7 @@ impl PipelineExecutor {
 /// Returns `Box<dyn FormatReader>` — all downstream code uses trait methods
 /// (`schema()`, `next_record()`).
 fn build_format_reader(
-    input: &crate::config::InputConfig,
+    input: &crate::config::SourceConfig,
     reader: Box<dyn Read + Send>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     match &input.format {
@@ -3265,13 +3265,13 @@ fn build_format_reader(
     }
 }
 
-/// Extract `Vec<FieldDef>` from `InputConfig.schema` for fixed-width format.
+/// Extract `Vec<FieldDef>` from `SourceConfig.schema` for fixed-width format.
 ///
 /// Resolves `SchemaSource::Inline` or `SchemaSource::FilePath` to `Vec<FieldDef>`.
 /// Returns a config validation error if schema is `None` (fixed-width requires
 /// explicit schema with field definitions).
 fn extract_field_defs(
-    input: &crate::config::InputConfig,
+    input: &crate::config::SourceConfig,
 ) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
     let schema_source = input.schema.as_ref().ok_or_else(|| {
         PipelineError::Config(crate::config::ConfigError::Validation(

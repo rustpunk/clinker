@@ -252,7 +252,7 @@ pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<S
 
 fn generate_input_doc(
     config: &PipelineConfig,
-    input: &clinker_core::config::InputConfig,
+    input: &clinker_core::config::SourceConfig,
 ) -> StageDoc {
     let format_name = input.format.format_name();
 
@@ -678,7 +678,7 @@ fn generate_output_doc(
 
 // ── Helper: build input schema ──────────────────────────────────────────────
 
-fn build_input_schema(input: &clinker_core::config::InputConfig) -> Option<SchemaSection> {
+fn build_input_schema(input: &clinker_core::config::SourceConfig) -> Option<SchemaSection> {
     let mut fields = Vec::new();
     let source;
 

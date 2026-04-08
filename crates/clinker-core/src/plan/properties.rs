@@ -62,7 +62,7 @@ pub enum Confidence {
 /// canvas can render an intelligible chain back to the input declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderingProvenance {
-    /// Declared on `InputConfig.sort_order` — the root of any propagation chain.
+    /// Declared on `SourceConfig.sort_order` — the root of any propagation chain.
     DeclaredOnInput { input_name: String },
     /// Inherited unchanged from parent.
     Preserved { from_node: String },

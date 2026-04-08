@@ -71,6 +71,19 @@ impl Span {
     pub const fn end(&self) -> u32 {
         self.start + self.len
     }
+
+    /// Convert a [`serde_saphyr::Span`] to a [`Span`] under a given [`FileId`].
+    ///
+    /// If the saphyr span has no byte-info attached (`byte_info == (0, 0)`,
+    /// e.g. it came from a non-string source or a tagged-enum / flatten
+    /// context), returns a zero-length span at offset 0 — equivalent to
+    /// "we know the file but not the byte position." Real byte ranges
+    /// flow through unchanged.
+    pub fn from_saphyr(file: FileId, span: serde_saphyr::Span) -> Self {
+        let start = span.byte_offset().unwrap_or(0) as u32;
+        let len = span.byte_len().unwrap_or(0) as u32;
+        Self { file, start, len }
+    }
 }
 
 /// Owns loaded YAML files (and in-memory buffers) keyed by [`FileId`].

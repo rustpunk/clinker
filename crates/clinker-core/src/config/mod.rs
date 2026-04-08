@@ -1,7 +1,13 @@
 pub mod node_header;
+pub mod pipeline_node;
 
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
+pub use pipeline_node::{
+    AggregateBody, AnalyticWindowSpec, CompositionBody, MergeBody, OutputBody, PipelineNode,
+    RouteBody, SourceBody, TransformBody,
+};
 
+use crate::yaml::Spanned;
 use clinker_record::schema_def::{FieldDef, LineSeparator, SchemaDefinition};
 use indexmap::IndexMap;
 use regex::Regex;
@@ -10,12 +16,33 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
+///
+/// Phase 16b: the YAML schema is now `nodes:` (a `Vec<Spanned<PipelineNode>>`)
+/// instead of the old `inputs:`/`outputs:`/`transformations:` triad. The
+/// derived `inputs`, `outputs`, and `transformations` fields below are
+/// populated post-deserialize by [`project_nodes`] (called from
+/// [`parse_config`]) and are NOT part of the YAML schema. They preserve
+/// downstream consumer compatibility with the executor, plan, kiln,
+/// schema, and tests crates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
-    pub inputs: Vec<InputConfig>,
+    /// Unified pipeline node taxonomy (Phase 16b Wave 1). Each node carries
+    /// its YAML source span via the [`Spanned`] outer wrap. Currently
+    /// optional; Wave 2 makes it the sole topology source and deletes the
+    /// legacy fields below.
+    #[serde(default, skip_serializing)]
+    pub nodes: Vec<Spanned<PipelineNode>>,
+    /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.** Kept
+    /// during Wave 1 so existing fixtures and tests continue to parse.
+    #[serde(default)]
+    pub inputs: Vec<SourceConfig>,
+    /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.**
+    #[serde(default)]
     pub outputs: Vec<OutputConfig>,
+    /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.**
+    #[serde(default)]
     pub transformations: Vec<TransformEntry>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
@@ -79,7 +106,7 @@ pub struct ConcurrencyConfig {
 
 /// Input source configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputConfig {
+pub struct SourceConfig {
     pub name: String,
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,7 +241,7 @@ pub enum ArrayMode {
     Join,
 }
 
-impl InputConfig {
+impl SourceConfig {
     /// Get CSV input options, if this is a CSV input.
     pub fn csv_options(&self) -> Option<&CsvInputOptions> {
         match &self.format {
@@ -684,21 +711,6 @@ impl<'de> Deserialize<'de> for TransformInput {
     }
 }
 
-/// Per-transform parallelism override.
-///
-/// Allows pipeline authors to override the auto-detected parallelism class
-/// for a specific transform.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParallelismOverride {
-    /// Let the engine decide based on CXL analysis.
-    Auto,
-    /// Force stateless (no shared state, fully parallelizable).
-    Stateless,
-    /// Force sequential (single-threaded execution).
-    Sequential,
-}
-
 /// User-supplied hint for aggregation execution strategy.
 ///
 /// `Auto` (default) lets the optimizer pick Hash vs Streaming based on
@@ -742,8 +754,12 @@ pub struct AggregateConfig {
 
 /// Per-transform configuration block.
 ///
-/// Exactly one of `cxl` (row-level transform) or `aggregate` (GROUP BY) must be
-/// set. Mutual exclusivity is enforced in the custom `Deserialize` impl.
+/// **Phase 16b Wave 1 — LEGACY SHIM. Wave 2 deletes this type** along
+/// with the legacy YAML `transformations:` schema. New code must consume
+/// `PipelineNode::{Transform, Aggregate, Route, Merge}`. The
+/// `#[deprecated]` attribute is intentionally NOT applied — it would
+/// generate ~80 warnings across the workspace before Wave 2's atomic
+/// rip; per Option B the type is structurally intact and dead-code-only.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformConfig {
     pub name: String,
@@ -766,9 +782,6 @@ pub struct TransformConfig {
     /// declaration order (implicit linear chain). Some = explicit DAG wiring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<TransformInput>,
-    /// Optional parallelism override for this transform.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallelism: Option<ParallelismOverride>,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
@@ -813,14 +826,12 @@ impl<'de> Deserialize<'de> for TransformConfig {
             validations: Option<Vec<ValidationEntry>>,
             route: Option<RouteConfig>,
             input: Option<TransformInput>,
-            parallelism: Option<ParallelismOverride>,
             #[serde(default, rename = "_notes")]
             notes: Option<serde_json::Value>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
 
-        // Dot-ban: transform names must not contain '.' (reserved for branch references).
         if raw.name.contains('.') {
             return Err(de::Error::custom(format!(
                 "transform name '{}' is invalid: '.' is reserved for branch references (use underscores or hyphens)",
@@ -828,7 +839,6 @@ impl<'de> Deserialize<'de> for TransformConfig {
             )));
         }
 
-        // Mutual exclusivity: exactly one of `cxl` or `aggregate` must be set.
         match (&raw.cxl, &raw.aggregate) {
             (Some(_), Some(_)) => {
                 return Err(de::Error::custom(format!(
@@ -855,7 +865,6 @@ impl<'de> Deserialize<'de> for TransformConfig {
             validations: raw.validations,
             route: raw.route,
             input: raw.input,
-            parallelism: raw.parallelism,
             notes: raw.notes,
         })
     }
@@ -965,6 +974,155 @@ impl PipelineConfig {
         self.transformations.iter().map(|entry| match entry {
             TransformEntry::Transform(t) => t,
         })
+    }
+
+    /// Phase 16b Wave 1: validation pre-pass over the unified `nodes:`
+    /// taxonomy. Runs the four name/topology stages in fixed order,
+    /// accumulating diagnostics:
+    ///
+    ///   1. Duplicate names (`E001` exact dup, `W002` case-only dup)
+    ///   2. Self-loops (`E002`)
+    ///   3. General cycles (`E003` via `tarjan_scc`)
+    ///   4. Path validation (delegates to `security::validate_all_config_paths`)
+    ///
+    /// Stage 5 (per-variant lowering to `PlanNode`) is Wave 2 work and
+    /// is intentionally omitted here. This method returns either an
+    /// empty diagnostics vector (the unified topology is consistent)
+    /// or a populated one (caller decides whether to abort).
+    ///
+    /// Stages run to completion and append rather than short-circuit,
+    /// matching the rustc `Session::has_errors` pattern. Self-loops
+    /// are routed to the dedicated E002 check before general cycle
+    /// detection so the diagnostic message is more actionable.
+    pub fn compile_validate(&self) -> Vec<crate::error::Diagnostic> {
+        use crate::error::{Diagnostic, LabeledSpan};
+        use crate::graph::NameGraph;
+        use crate::span::Span;
+        use std::collections::BTreeMap;
+
+        let mut diags = Vec::new();
+        let synth = || LabeledSpan::primary(Span::SYNTHETIC, String::new());
+
+        // ── Stage 1: duplicate names ────────────────────────────────
+        // Names are case-sensitive (matches Unix FS, Airflow, Beam).
+        // Exact duplicates → E001 error. Case-only duplicates → W002.
+        // Wave 1 carries `Span::SYNTHETIC` on every diagnostic; Wave 2
+        // plumbs real spans via the `Spanned<PipelineNode>` outer wrap.
+        let mut seen_exact: BTreeMap<String, ()> = BTreeMap::new();
+        let mut by_name_lower: BTreeMap<String, String> = BTreeMap::new();
+        for spanned in &self.nodes {
+            let node = &spanned.value;
+            let name = node.name();
+            if seen_exact.contains_key(name) {
+                diags.push(Diagnostic::error(
+                    "E001",
+                    format!("duplicate node name: {name:?}"),
+                    synth(),
+                ));
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if let Some(prev_name) = by_name_lower.get(&lower) {
+                diags.push(Diagnostic::warning(
+                    "W002",
+                    format!(
+                        "node names differ only in case ({prev_name:?} vs {name:?}); \
+                         this is allowed but discouraged"
+                    ),
+                    synth(),
+                ));
+            } else {
+                by_name_lower.insert(lower, name.to_string());
+            }
+            seen_exact.insert(name.to_string(), ());
+        }
+
+        // ── Stage 2: self-loops (E002) ──────────────────────────────
+        for spanned in &self.nodes {
+            let node = &spanned.value;
+            let name = node.name();
+            let mut self_ref = false;
+            match node {
+                PipelineNode::Source { .. } => {}
+                PipelineNode::Transform { header, .. }
+                | PipelineNode::Aggregate { header, .. }
+                | PipelineNode::Route { header, .. }
+                | PipelineNode::Output { header, .. }
+                | PipelineNode::Composition { header, .. } => {
+                    if input_target(&header.input) == name {
+                        self_ref = true;
+                    }
+                }
+                PipelineNode::Merge { header, .. } => {
+                    if header.inputs.iter().any(|i| input_target(i) == name) {
+                        self_ref = true;
+                    }
+                }
+            }
+            if self_ref {
+                diags.push(Diagnostic::error(
+                    "E002",
+                    format!("node {name:?} lists itself as an input"),
+                    synth(),
+                ));
+            }
+        }
+
+        // ── Stage 3: general cycles (E003) ──────────────────────────
+        let mut graph = NameGraph::new();
+        for spanned in &self.nodes {
+            graph.add_node(spanned.value.name());
+        }
+        for spanned in &self.nodes {
+            let node = &spanned.value;
+            let consumer = node.name();
+            match node {
+                PipelineNode::Source { .. } => {}
+                PipelineNode::Transform { header, .. }
+                | PipelineNode::Aggregate { header, .. }
+                | PipelineNode::Route { header, .. }
+                | PipelineNode::Output { header, .. }
+                | PipelineNode::Composition { header, .. } => {
+                    let producer = input_target(&header.input);
+                    if producer != consumer && graph.index_of(producer).is_some() {
+                        graph.add_edge(producer, consumer);
+                    }
+                }
+                PipelineNode::Merge { header, .. } => {
+                    for i in &header.inputs {
+                        let producer = input_target(i);
+                        if producer != consumer && graph.index_of(producer).is_some() {
+                            graph.add_edge(producer, consumer);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cycle) = graph.detect_cycle() {
+            let path = cycle.join(" → ");
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("cycle detected: {path} → {}", cycle[0]),
+                synth(),
+            ));
+        }
+
+        // ── Stage 4: path validation ────────────────────────────────
+        // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
+        // the legacy projection. Wave 2 walks `nodes:` directly.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        diags.extend(crate::security::validate_all_config_paths(
+            self, &cwd, false,
+        ));
+
+        diags
+    }
+}
+
+fn input_target(input: &node_header::NodeInput) -> &str {
+    match input {
+        node_header::NodeInput::Single(s) => s.as_str(),
+        node_header::NodeInput::Port { node, .. } => node.as_str(),
     }
 }
 

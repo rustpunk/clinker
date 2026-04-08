@@ -519,7 +519,7 @@ fn stage_matches_tags(tags: &[StructuralTag], stage_type: &str, name: &str, cont
 }
 
 /// Build searchable content string for an input stage.
-fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
+fn content_for_input(input: &clinker_core::config::SourceConfig) -> String {
     let mut content = format!(
         "{} {} {}",
         input.name,

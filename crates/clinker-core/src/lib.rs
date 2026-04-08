@@ -4,6 +4,7 @@ pub mod dlq;
 pub mod error;
 pub mod executor;
 pub mod exit_codes;
+pub mod graph;
 mod integration_tests;
 pub mod log_dispatch;
 pub mod log_rules;

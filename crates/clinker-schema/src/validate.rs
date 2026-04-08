@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::model::{SchemaIndex, SourceSchema};
 use clinker_core::config::{
-    InputConfig, InputFormat, PipelineConfig, SchemaSource, TransformConfig,
+    InputFormat, PipelineConfig, SchemaSource, SourceConfig, TransformConfig,
 };
 
 /// A schema validation warning.
@@ -80,7 +80,7 @@ pub fn validate_pipeline(
 
 /// Validate an input stage against its linked schema.
 fn validate_input(
-    input: &InputConfig,
+    input: &SourceConfig,
     index: &SchemaIndex,
     workspace_root: &Path,
     warnings: &mut Vec<SchemaWarning>,
@@ -169,7 +169,7 @@ fn validate_transform(
 
 /// Resolve the schema for an input stage.
 fn resolve_input_schema<'a>(
-    input: &InputConfig,
+    input: &SourceConfig,
     index: &'a SchemaIndex,
     workspace_root: &Path,
 ) -> Option<&'a SourceSchema> {
@@ -487,7 +487,8 @@ distinct by customer_id
                 include_provenance: None,
                 metrics: None,
             },
-            inputs: vec![InputConfig {
+            nodes: Vec::new(),
+            inputs: vec![SourceConfig {
                 name: "src".to_string(),
                 path: "./data.csv".to_string(),
                 schema: None,

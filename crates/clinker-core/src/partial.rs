@@ -9,7 +9,7 @@
 /// `PartialItem::Err` with the error message. The canvas can then render
 /// error nodes at the failure positions.
 use crate::config::{
-    ErrorHandlingConfig, InputConfig, OutputConfig, PipelineMeta, TransformConfig,
+    ErrorHandlingConfig, OutputConfig, PipelineMeta, SourceConfig, TransformConfig,
     interpolate_env_vars,
 };
 
@@ -32,7 +32,7 @@ pub enum PartialItem<T> {
 #[derive(Debug, Clone)]
 pub struct PartialPipelineConfig {
     pub pipeline: Result<PipelineMeta, String>,
-    pub inputs: Vec<PartialItem<InputConfig>>,
+    pub inputs: Vec<PartialItem<SourceConfig>>,
     pub transformations: Vec<PartialItem<TransformConfig>>,
     pub outputs: Vec<PartialItem<OutputConfig>>,
     pub error_handling: Result<ErrorHandlingConfig, String>,
@@ -73,7 +73,7 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
     };
 
     // Inputs array
-    let inputs = parse_array_section::<InputConfig>(obj, "inputs", &mut errors);
+    let inputs = parse_array_section::<SourceConfig>(obj, "inputs", &mut errors);
 
     // Transformations array (uses TransformConfig for _import support)
     let transformations =

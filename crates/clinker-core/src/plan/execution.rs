@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::aggregation::AggregateStrategy;
 use crate::config::{
-    AggregateConfig, InputConfig, PipelineConfig, RouteMode, SortField, TransformInput,
+    AggregateConfig, PipelineConfig, RouteMode, SortField, SourceConfig, TransformInput,
 };
 use crate::error::PipelineError;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
@@ -846,7 +846,7 @@ impl ExecutionPlanDag {
         // its own double-call guard, so this pair is safe but must run in
         // order: properties derived from a DAG missing enforcer Sorts would
         // mis-attribute ordering provenance.
-        let inputs_map: HashMap<String, InputConfig> = config
+        let inputs_map: HashMap<String, SourceConfig> = config
             .inputs
             .iter()
             .map(|i| (i.name.clone(), i.clone()))
@@ -1660,7 +1660,7 @@ impl ExecutionPlanDag {
     /// [`PlanNode::Source`] direct parents.
     pub fn insert_enforcer_sorts(
         &mut self,
-        inputs: &HashMap<String, InputConfig>,
+        inputs: &HashMap<String, SourceConfig>,
     ) -> Result<(), PipelineError> {
         // Reserved-prefix guard: validate up-front so insertions cannot
         // collide with a user-declared name.
@@ -1757,7 +1757,7 @@ impl ExecutionPlanDag {
     ///
     /// Computes [`NodeProperties`] for every node in the DAG, derived from
     /// already-populated parent properties plus declared per-node data
-    /// (`InputConfig.sort_order` for sources, `sort_fields` on
+    /// (`SourceConfig.sort_order` for sources, `sort_fields` on
     /// [`PlanNode::Sort`], `write_set` and `has_distinct` on
     /// [`PlanNode::Transform`]). The pass never inspects operator
     /// implementations — it reads only what the plan node already declares,
@@ -1772,7 +1772,7 @@ impl ExecutionPlanDag {
     /// rule fails (currently infallible).
     pub fn compute_node_properties(
         &mut self,
-        inputs: &HashMap<String, InputConfig>,
+        inputs: &HashMap<String, SourceConfig>,
     ) -> Result<(), PipelineError> {
         assert!(
             self.node_properties.is_empty(),
@@ -1969,7 +1969,7 @@ struct ResolvedStrategy {
 fn compute_one(
     node: &PlanNode,
     parents: &[&NodeProperties],
-    inputs: &HashMap<String, InputConfig>,
+    inputs: &HashMap<String, SourceConfig>,
 ) -> NodeProperties {
     let single_stream_partitioning = || Partitioning {
         kind: PartitioningKind::Single,
@@ -2284,7 +2284,7 @@ fn extract_has_distinct(typed: &TypedProgram) -> bool {
 
 /// Check if a source's declared sort_order matches the window's sort_by.
 fn check_already_sorted(_config: &PipelineConfig, _source: &str, _sort_by: &[SortField]) -> bool {
-    // InputConfig doesn't have sort_order yet (to be added in Task 5.4.1)
+    // SourceConfig doesn't have sort_order yet (to be added in Task 5.4.1)
     // For now, always return false — runtime pre-sorted detection is the fallback
     false
 }
@@ -2448,9 +2448,10 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
+            nodes: Vec::new(),
             inputs: inputs
                 .into_iter()
-                .map(|(name, path)| InputConfig {
+                .map(|(name, path)| SourceConfig {
                     name: name.into(),
                     path: path.into(),
                     schema: None,
@@ -2489,7 +2490,6 @@ mod tests {
                         validations: None,
                         route: None,
                         input: None,
-                        parallelism: None,
                         notes: None,
                     })
                 })
@@ -2776,7 +2776,8 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
-            inputs: vec![InputConfig {
+            nodes: Vec::new(),
+            inputs: vec![SourceConfig {
                 name: "src".into(),
                 path: "data.csv".into(),
                 schema: None,
@@ -2811,7 +2812,6 @@ mod tests {
                 validations: None,
                 route: Some(route),
                 input: None,
-                parallelism: None,
                 notes: None,
             })],
             error_handling: ErrorHandlingConfig::default(),
@@ -3118,8 +3118,8 @@ mod tests {
         }
     }
 
-    fn input_with_sort(name: &str, sort: Option<Vec<SortField>>) -> InputConfig {
-        InputConfig {
+    fn input_with_sort(name: &str, sort: Option<Vec<SortField>>) -> SourceConfig {
+        SourceConfig {
             name: name.into(),
             path: "x.csv".into(),
             schema: None,

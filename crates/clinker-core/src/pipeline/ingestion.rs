@@ -219,9 +219,10 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
+            nodes: Vec::new(),
             inputs: inputs
                 .into_iter()
-                .map(|(name, path)| InputConfig {
+                .map(|(name, path)| SourceConfig {
                     name: name.into(),
                     format: InputFormat::Csv(None),
                     path: path.into(),
@@ -260,7 +261,6 @@ mod tests {
                         validations: None,
                         route: None,
                         input: None,
-                        parallelism: None,
                         notes: None,
                     })
                 })
