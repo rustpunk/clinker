@@ -1250,7 +1250,6 @@ impl PipelineConfig {
                     name: name.clone(),
                     span,
                     resolved: Some(Box::new(PlanTransformPayload {
-                        typed: None,
                         analytic_window: config.analytic_window.clone(),
                         log: config.log.clone().unwrap_or_default(),
                         validations: config.validations.clone().unwrap_or_default(),
@@ -1423,7 +1422,7 @@ impl PipelineConfig {
             let _ = any_errors;
         }
 
-        Ok(CompiledPlan::new(dag, self.clone(), Vec::new()))
+        Ok(CompiledPlan::new(dag, self.clone()))
     }
 }
 

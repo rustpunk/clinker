@@ -2,29 +2,26 @@
 //!
 //! `CompiledPlan` is the typed-handle output of the new
 //! [`crate::config::PipelineConfig::compile`] lowering path.
+//!
+//! Task 16b.8 — the two-phase `bind_schema` scaffold and the dead
+//! `compiled_transforms` storage field were deleted: the executor now
+//! calls [`crate::executor::PipelineExecutor::compile_transforms_from_config`]
+//! directly against the reader-derived schema after the readers open.
+//! `CompiledPlan` is now a thin wrapper around a validated
+//! `PipelineConfig` plus its lowered DAG.
 
 use super::execution::ExecutionPlanDag;
 use crate::config::PipelineConfig;
-use crate::executor::CompiledTransform;
 
 #[derive(Debug)]
 pub struct CompiledPlan {
     dag: ExecutionPlanDag,
     config: PipelineConfig,
-    compiled_transforms: Vec<CompiledTransform>,
 }
 
 impl CompiledPlan {
-    pub(crate) fn new(
-        dag: ExecutionPlanDag,
-        config: PipelineConfig,
-        compiled_transforms: Vec<CompiledTransform>,
-    ) -> Self {
-        Self {
-            dag,
-            config,
-            compiled_transforms,
-        }
+    pub(crate) fn new(dag: ExecutionPlanDag, config: PipelineConfig) -> Self {
+        Self { dag, config }
     }
 
     pub fn dag(&self) -> &ExecutionPlanDag {
@@ -33,38 +30,5 @@ impl CompiledPlan {
 
     pub(crate) fn config(&self) -> &PipelineConfig {
         &self.config
-    }
-
-    pub(crate) fn take_compiled_transforms(&mut self) -> Vec<CompiledTransform> {
-        std::mem::take(&mut self.compiled_transforms)
-    }
-
-    /// Two-phase CXL typecheck hook. Called by the executor after opening
-    /// readers so reader-derived schema is available for CXL typechecking.
-    pub(crate) fn bind_schema(
-        &mut self,
-        schema: &std::sync::Arc<clinker_record::Schema>,
-    ) -> Result<(), crate::error::PipelineError> {
-        let compiled = crate::executor::PipelineExecutor::compile_transforms_from_config(
-            &self.config,
-            schema,
-        )?;
-
-        {
-            use crate::plan::execution::PlanNode;
-            let by_name: std::collections::HashMap<&str, &CompiledTransform> =
-                compiled.iter().map(|ct| (ct.name.as_str(), ct)).collect();
-            for idx in self.dag.graph.node_indices().collect::<Vec<_>>() {
-                if let PlanNode::Transform { name, resolved, .. } = &mut self.dag.graph[idx]
-                    && let Some(payload) = resolved.as_mut()
-                    && let Some(ct) = by_name.get(name.as_str())
-                {
-                    payload.typed = Some(std::sync::Arc::clone(&ct.typed));
-                }
-            }
-        }
-
-        self.compiled_transforms = compiled;
-        Ok(())
     }
 }

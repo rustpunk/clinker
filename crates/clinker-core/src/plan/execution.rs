@@ -187,17 +187,17 @@ pub struct PlanSourcePayload {
 }
 
 /// Phase 16b Wave 2 — fully-resolved Transform payload. Holds the
-/// type-checked CXL program (Arc-shared with the analyzer), the optional
-/// analytic-window spec (renamed from local_window), the log directives
-/// the validations sidebar, and the DLQ NodeId for downstream wiring.
+/// optional analytic-window spec (renamed from local_window), the log
+/// directives, the validations sidebar, and the DLQ NodeId for
+/// downstream wiring.
+///
+/// Task 16b.8 — the `typed` field (and the two-phase `bind_schema`
+/// populator) was deleted after it was found to have zero readers
+/// workspace-wide. CXL typecheck results live on
+/// `executor::CompiledTransform.typed`, which the executor builds
+/// directly via `compile_transforms_from_config` after readers open.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
-    /// Type-checked CXL program. Two-phase contract (Phase 16b Wave 4ab,
-    /// M4): `None` after `PipelineConfig::compile()`, populated by
-    /// `CompiledPlan::bind_schema()` which the executor invokes on entry
-    /// once readers have produced a `Schema`. Schema is a runtime artifact
-    /// (reader-derived), so CXL typecheck cannot run at compile() time.
-    pub typed: Option<Arc<cxl::typecheck::pass::TypedProgram>>,
     pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
     pub log: Vec<crate::config::LogDirective>,
     pub validations: Vec<crate::config::ValidationEntry>,

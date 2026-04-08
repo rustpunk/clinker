@@ -588,12 +588,11 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        // Phase 16b Wave 4ab M4: `bind_schema` exists on `CompiledPlan`
-        // but cannot be wired here yet because `readers` are consumed
-        // `Box<dyn Read>` handles with no peek/reopen affordance. M5
-        // threads the bound plan through by having the executor internals
-        // consume `plan.compiled_transforms()` directly, eliminating the
-        // need for a schema peek in this wrapper.
+        // Task 16b.8: the two-phase `bind_schema` scaffold was deleted
+        // after a grep showed zero readers of `PlanTransformPayload.typed`.
+        // The executor builds CXL `CompiledTransform`s directly against
+        // the reader-derived schema inside `run_with_readers_writers`,
+        // bypassing the plan handle entirely for that payload.
         Self::run_with_readers_writers(plan.config(), readers, writers, params)
     }
 
@@ -641,20 +640,19 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Compile CXL transforms via CompiledPlan::bind_schema (Phase 16b
-        // Wave 4ab M5). The two-phase plan entry point owns the CXL
-        // typecheck side-effects now; the executor consumes the result
-        // by moving it out of the locally-bound plan.
+        // Task 16b.8: run the config `compile()` validation pre-pass,
+        // then build CXL `CompiledTransform`s directly from the
+        // reader-derived schema. The previous two-phase `bind_schema`
+        // scaffold populated a field nothing read; deleted.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let resolved_transforms = crate::executor::build_transform_specs(config);
-        let mut local_plan = config
+        let _validated_plan = config
             .compile()
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),
             })?;
-        local_plan.bind_schema(&schema)?;
-        let compiled_transforms = local_plan.take_compiled_transforms();
+        let compiled_transforms = Self::compile_transforms_from_config(config, &schema)?;
 
         // Compile route conditions if any transform has a route config.
         // Collect all emitted field names for route condition resolution.
@@ -3180,7 +3178,8 @@ impl PipelineExecutor {
     }
 
     /// Convenience wrapper: build transform specs from a PipelineConfig and
-    /// compile them. Used by `CompiledPlan::bind_schema`.
+    /// compile them against the reader-derived schema. Called directly
+    /// from `run_with_readers_writers` after the readers have opened.
     pub(crate) fn compile_transforms_from_config(
         config: &PipelineConfig,
         schema: &Arc<Schema>,
