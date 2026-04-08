@@ -1323,8 +1323,23 @@ impl HashAggregator {
                 } else {
                     state.min_row_num
                 };
-                let emitted = state.common_emitted.unwrap_or_default();
-                out.push((record, row_num, emitted, state.union_accumulated));
+                // Phase 16b.8: the downstream output stage consumes
+                // `emitted` as the per-record field map (merged with the
+                // raw record under `include_unmapped`). Upstream
+                // `common_emitted` leaks pre-aggregation transform fields
+                // into the post-aggregate output, which is a hash-order-
+                // dependent flake (columns present or absent depending on
+                // whether the first-iterated group's intersection retained
+                // them). Downstream from an aggregate, the aggregate's
+                // output record IS the authoritative emitted field set.
+                let emitted: IndexMap<String, Value> = record
+                    .schema()
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.to_string(), record.values()[i].clone()))
+                    .collect();
+                out.push((record, row_num, emitted, IndexMap::new()));
             }
             Ok(())
         } else {

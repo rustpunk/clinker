@@ -162,9 +162,18 @@ impl GroupBoundary {
                 } else {
                     prev_state.min_row_num
                 };
-                let emitted = prev_state.common_emitted.unwrap_or_default();
-                let accumulated = prev_state.union_accumulated;
-                out.push((out_record, row_num, emitted, accumulated));
+                // Phase 16b.8: emit post-aggregate record fields, not the
+                // upstream transform's common_emitted (which leaks
+                // pre-aggregation columns via include_unmapped). See
+                // `HashAggregator::finalize` for the rationale.
+                let emitted: IndexMap<String, Value> = out_record
+                    .schema()
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.to_string(), out_record.values()[i].clone()))
+                    .collect();
+                out.push((out_record, row_num, emitted, IndexMap::new()));
 
                 // Install the new open group.
                 let mut new_state = state;
@@ -213,9 +222,15 @@ impl GroupBoundary {
             } else {
                 state.min_row_num
             };
-            let emitted = state.common_emitted.unwrap_or_default();
-            let accumulated = state.union_accumulated;
-            out.push((out_record, row_num, emitted, accumulated));
+            // Phase 16b.8: see the boundary-emit site above for rationale.
+            let emitted: IndexMap<String, Value> = out_record
+                .schema()
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.to_string(), out_record.values()[i].clone()))
+                .collect();
+            out.push((out_record, row_num, emitted, IndexMap::new()));
         }
         Ok(())
     }

@@ -414,13 +414,6 @@ nodes:
 }
 
 #[test]
-#[ignore = "TODO(16b.5): parallel-test-layout-dependent flake surfaced by Wave 4ab \
-            test migration to CompiledPlan::from_config_for_run. Passes in isolation \
-            and with --test-threads=1; fails only under the default parallel runner \
-            when test binary layout puts it beside certain siblings. Root cause is a \
-            pre-existing shared-state leak in the aggregate schema pipeline — see \
-            output columns `eng,,320 / sales,60,60` which carry a stale `comp` column \
-            from a sibling test's transform. Not introduced by Wave 4ab itself."]
 fn test_e2e_aggregate_chained_with_transform() {
     // Transform → Aggregate: a row-level transform projects a field, then
     // an aggregate consumes it. Verifies schema flows from a non-aggregate
