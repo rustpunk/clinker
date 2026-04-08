@@ -476,7 +476,9 @@ impl PipelineExecutor {
         let started_at = Utc::now();
 
         // Extract the primary reader from the registry
-        let input = &config.inputs[0];
+        let source_configs: Vec<_> = config.source_configs().cloned().collect();
+        let output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let input = &source_configs[0];
         let reader = readers.remove(&input.name).ok_or_else(|| {
             PipelineError::Config(crate::config::ConfigError::Validation(format!(
                 "no reader registered for input '{}'",
@@ -544,7 +546,7 @@ impl PipelineExecutor {
         let required_sorted_input = plan.required_sorted_input();
 
         // Validate that all configured outputs have registered writers.
-        for output in &config.outputs {
+        for output in &output_configs {
             if !writers.contains_key(&output.name) {
                 return Err(PipelineError::Config(
                     crate::config::ConfigError::Validation(format!(
@@ -918,8 +920,10 @@ impl PipelineExecutor {
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let input = &config.inputs[0];
-        let primary_output = &config.outputs[0];
+        let source_configs: Vec<_> = config.source_configs().cloned().collect();
+        let output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let input = &source_configs[0];
+        let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
         // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
@@ -1180,7 +1184,7 @@ impl PipelineExecutor {
             if is_multi_output {
                 let output_channels = spawn_writer_threads(
                     writers,
-                    &config.outputs,
+                    &output_configs,
                     Arc::clone(&final_output_schema),
                 );
 
@@ -1582,7 +1586,7 @@ impl PipelineExecutor {
 
             if is_multi_output {
                 let output_channels =
-                    spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
+                    spawn_writer_threads(writers, &output_configs, Arc::clone(&output_schema));
 
                 let mut group_buffer: Vec<(Record, u64)> = Vec::new();
                 let mut current_key: Option<Vec<GroupByKey>> = None;
@@ -2008,7 +2012,7 @@ impl PipelineExecutor {
         if is_multi_output {
             // Multi-output streaming path
             let output_channels =
-                spawn_writer_threads(writers, &config.outputs, Arc::clone(&output_schema));
+                spawn_writer_threads(writers, &output_configs, Arc::clone(&output_schema));
 
             // Process pending skips/errors
             for (_rn, _record, result) in &pending_skips_and_errors {
@@ -2372,8 +2376,10 @@ impl PipelineExecutor {
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
-        let input = &config.inputs[0];
-        let primary_output = &config.outputs[0];
+        let source_configs: Vec<_> = config.source_configs().cloned().collect();
+        let output_configs: Vec<_> = config.output_configs().cloned().collect();
+        let input = &source_configs[0];
+        let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
         // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once

@@ -1856,7 +1856,7 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
 /// primary source, subsequent transforms wire to the preceding
 /// transform/aggregate/route node. Explicit `input:` references on
 /// legacy `LegacyTransformsBlock` override the implicit chain.
-fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
+pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
     use crate::yaml::{Location, Spanned};
 
     // No-op if either (a) the authored shape was new-shape (nodes
@@ -2058,6 +2058,10 @@ fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
 ///   * Route variants project to a legacy transform carrying
 ///     `route: Some(RouteConfig { .. })`; the transform's `cxl` is
 ///     left blank — the route body itself drives dispatch.
+// dead-code-after-D3b: tests still read legacy fields via this projection.
+// Production paths are already off `config.{inputs,outputs,transformations}`
+// as of D3a part 2; this shim exists solely to keep cfg(test) call sites
+// and `partial.rs` working until D3b migrates them.
 fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
     use crate::config::node_header::NodeInput;
 

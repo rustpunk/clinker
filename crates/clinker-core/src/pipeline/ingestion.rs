@@ -220,7 +220,7 @@ mod tests {
         inputs: Vec<(&str, &str)>,
         transforms: Vec<(&str, &str, Option<serde_json::Value>)>,
     ) -> PipelineConfig {
-        PipelineConfig {
+        let mut cfg = PipelineConfig {
             pipeline: PipelineMeta {
                 name: "test".into(),
                 memory_limit: None,
@@ -233,37 +233,7 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
-            nodes: inputs
-                .iter()
-                .map(|(name, path)| {
-                    use crate::config::node_header::SourceHeader;
-                    use crate::config::pipeline_node::{PipelineNode, SourceBody};
-                    use crate::yaml::{Location, Spanned};
-                    Spanned::new(
-                        PipelineNode::Source {
-                            header: SourceHeader {
-                                name: (*name).to_string(),
-                                description: None,
-                                notes: None,
-                            },
-                            config: SourceBody {
-                                source: SourceConfig {
-                                    name: (*name).to_string(),
-                                    format: InputFormat::Csv(None),
-                                    path: (*path).to_string(),
-                                    schema: None,
-                                    schema_overrides: None,
-                                    array_paths: None,
-                                    sort_order: None,
-                                    notes: None,
-                                },
-                            },
-                        },
-                        Location::UNKNOWN,
-                        Location::UNKNOWN,
-                    )
-                })
-                .collect(),
+            nodes: Vec::new(),
             inputs: inputs
                 .into_iter()
                 .map(|(name, path)| SourceConfig {
@@ -309,7 +279,9 @@ mod tests {
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
-        }
+        };
+        crate::config::lift_legacy_fields_into_nodes(&mut cfg);
+        cfg
     }
 
     /// Helper: compile CXL source.

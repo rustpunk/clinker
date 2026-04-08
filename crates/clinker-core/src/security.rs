@@ -167,13 +167,13 @@ pub fn validate_all_config_paths(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    for input in &config.inputs {
+    for input in config.source_configs() {
         if let Err(d) = validate_path(Path::new(&input.path), base_dir, allow_absolute) {
             diags.push(d);
         }
     }
 
-    for output in &config.outputs {
+    for output in config.output_configs() {
         if let Err(d) = validate_path(Path::new(&output.path), base_dir, allow_absolute) {
             diags.push(d);
         }

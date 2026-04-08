@@ -17,7 +17,6 @@ use std::sync::Arc;
 use crate::aggregation::AggregateStrategy;
 use crate::config::{
     AggregateConfig, OutputConfig, PipelineConfig, RouteMode, SortField, SourceConfig,
-    TransformInput,
 };
 use crate::error::PipelineError;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
@@ -420,30 +419,11 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
         return specs;
     }
 
-    // Legacy fallback: fixtures that still populate `config.transformations`
-    // directly. Inlined what used to be `PlanTransformSpec::from_legacy`.
-    config
-        .transforms()
-        .map(|tc| {
-            let input = match &tc.input {
-                None => ResolvedInput::Chain,
-                Some(TransformInput::Single(s)) => ResolvedInput::Single(s.clone()),
-                Some(TransformInput::Multiple(v)) => ResolvedInput::Multi(v.clone()),
-            };
-            PlanTransformSpec {
-                name: tc.name.clone(),
-                cxl_source: tc.cxl.clone(),
-                aggregate: tc.aggregate.clone(),
-                route: tc.route.clone(),
-                analytic_window: tc.local_window.clone(),
-                log: tc.log.clone().unwrap_or_default(),
-                validations: tc.validations.clone().unwrap_or_default(),
-                input,
-                input_span: Span::SYNTHETIC,
-                body_span: Span::SYNTHETIC,
-            }
-        })
-        .collect()
+    // D3a part2: the legacy fallback is dead. `lift_legacy_fields_into_nodes`
+    // populates `config.nodes` from any authored legacy shape before the
+    // planner runs, so reaching here means the pipeline has no
+    // transform-like nodes at all — return an empty spec list.
+    Vec::new()
 }
 
 impl PlanTransformSpec {
@@ -726,8 +706,14 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
     ) -> Result<Self, PlanError> {
-        let primary_source = config
-            .inputs
+        // D3a part2: collect source/output configs from the unified
+        // `nodes:` topology once, then use the owned Vecs throughout.
+        // Walking `config.nodes` repeatedly would work but wastes
+        // allocation on every helper call that takes a slice.
+        let source_configs: Vec<SourceConfig> = config.source_configs().cloned().collect();
+        let output_configs_owned: Vec<OutputConfig> = config.output_configs().cloned().collect();
+
+        let primary_source = source_configs
             .first()
             .map(|i| i.name.clone())
             .unwrap_or_default();
@@ -777,7 +763,7 @@ impl ExecutionPlanDag {
                 let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
 
                 // Validate source exists
-                if !config.inputs.iter().any(|inp| inp.name == source) {
+                if !source_configs.iter().any(|inp| inp.name == source) {
                     return Err(PlanError::UnknownSource {
                         name: source,
                         transform: report.transforms[i].name.clone(),
@@ -797,7 +783,7 @@ impl ExecutionPlanDag {
                 }
 
                 // Check pre-sorted optimization
-                let already_sorted = check_already_sorted(&config.inputs, &source, &wc.sort_by);
+                let already_sorted = check_already_sorted(&source_configs, &source, &wc.sort_by);
 
                 raw_requests.push(RawIndexRequest {
                     source,
@@ -813,7 +799,7 @@ impl ExecutionPlanDag {
         let indices = index::deduplicate_indices(raw_requests.clone());
 
         // Build source DAG
-        let source_dag = build_source_dag(&config.inputs, &window_configs, &primary_source)?;
+        let source_dag = build_source_dag(&source_configs, &window_configs, &primary_source)?;
 
         // Build output projections
         let output_projections = config
@@ -853,7 +839,7 @@ impl ExecutionPlanDag {
         // --- Phase 1: Add all nodes ---
 
         // Source nodes
-        for input in &config.inputs {
+        for input in &source_configs {
             add_node(
                 &mut graph,
                 PlanNode::Source {
@@ -1019,7 +1005,7 @@ impl ExecutionPlanDag {
         }
 
         // Output nodes
-        for output in &config.outputs {
+        for output in &output_configs_owned {
             add_node(
                 &mut graph,
                 PlanNode::Output {
@@ -1143,7 +1129,7 @@ impl ExecutionPlanDag {
         }
 
         // Wire output nodes to last transform
-        for output in &config.outputs {
+        for output in &output_configs_owned {
             let output_key = format!("output.{}", output.name);
             let output_idx = node_by_name[&output_key];
 
@@ -1208,8 +1194,7 @@ impl ExecutionPlanDag {
         // its own double-call guard, so this pair is safe but must run in
         // order: properties derived from a DAG missing enforcer Sorts would
         // mis-attribute ordering provenance.
-        let inputs_map: HashMap<String, SourceConfig> = config
-            .inputs
+        let inputs_map: HashMap<String, SourceConfig> = source_configs
             .iter()
             .map(|i| (i.name.clone(), i.clone()))
             .collect();
@@ -1217,7 +1202,7 @@ impl ExecutionPlanDag {
         // DLQ batching) runs first: it materializes a `PlanNode::Sort` from
         // declared config, distinct from per-operator algorithm requirements.
         // See docs/research/RESEARCH-pipeline-correlation-key-placement.md.
-        dag.inject_correlation_sort(&config.error_handling, &config.inputs)
+        dag.inject_correlation_sort(&config.error_handling, &source_configs)
             .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
         dag.insert_enforcer_sorts(&inputs_map)
             .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
@@ -2803,7 +2788,7 @@ mod tests {
         inputs: Vec<(&str, &str)>,
         transforms: Vec<(&str, &str, Option<serde_json::Value>)>,
     ) -> PipelineConfig {
-        PipelineConfig {
+        let mut cfg = PipelineConfig {
             pipeline: PipelineMeta {
                 name: "test".into(),
                 memory_limit: None,
@@ -2862,7 +2847,11 @@ mod tests {
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
-        }
+        };
+        // D3a part2: production paths now read from `nodes`. Lift the
+        // legacy literal so the test config has both shapes populated.
+        crate::config::lift_legacy_fields_into_nodes(&mut cfg);
+        cfg
     }
 
     /// Compile CXL source to TypedProgram for a given set of field names.
@@ -3129,7 +3118,7 @@ mod tests {
 
     /// Build a config with route configuration on the first transform.
     fn test_config_with_route(cxl: &str, route: crate::config::RouteConfig) -> PipelineConfig {
-        PipelineConfig {
+        let mut cfg = PipelineConfig {
             pipeline: PipelineMeta {
                 name: "route-explain-test".into(),
                 memory_limit: None,
@@ -3182,7 +3171,9 @@ mod tests {
             }],
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
-        }
+        };
+        crate::config::lift_legacy_fields_into_nodes(&mut cfg);
+        cfg
     }
 
     #[test]

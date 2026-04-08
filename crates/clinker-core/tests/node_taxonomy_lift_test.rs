@@ -192,7 +192,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/in.csv
+      path: data/in.csv
   - type: transform
     name: clean
     input: src
@@ -204,7 +204,7 @@ nodes:
     config:
       name: out
       type: csv
-      path: /tmp/out.csv
+      path: data/out.csv
 "#;
     let cfg = parse_pipeline(yaml);
     assert_eq!(cfg.nodes.len(), 3);
@@ -221,7 +221,7 @@ nodes:
     config:
       name: dup
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: transform
     name: dup
     input: dup
@@ -248,7 +248,7 @@ nodes:
     config:
       name: clean
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: transform
     name: Clean
     input: clean
@@ -277,7 +277,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: transform
     name: loop
     input: loop
@@ -303,7 +303,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: merge
     name: combo
     inputs:
@@ -332,13 +332,13 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: source
     name: src
     config:
       name: src
       type: csv
-      path: /tmp/b.csv
+      path: data/b.csv
   - type: transform
     name: loop
     input: loop
@@ -412,7 +412,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: composition
     name: comp_a
     input: src
@@ -449,7 +449,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: composition
     name: comp_a
     input: src
@@ -461,7 +461,7 @@ nodes:
     config:
       name: out
       type: csv
-      path: /tmp/o.csv
+      path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
     let (plan, _diags) = cfg.compile_with_diagnostics();
@@ -487,7 +487,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: transform
     name: clean
     input: src
@@ -499,7 +499,7 @@ nodes:
     config:
       name: out
       type: csv
-      path: /tmp/o.csv
+      path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg.compile().expect("compile must succeed");
@@ -519,14 +519,14 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: output
     name: out
     input: src
     config:
       name: out
       type: csv
-      path: /tmp/o.csv
+      path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg.compile().unwrap();
@@ -554,7 +554,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: transform
     name: clean
     input: src
@@ -587,14 +587,14 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: output
     name: out
     input: src
     config:
       name: out
       type: csv
-      path: /tmp/o.csv
+      path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg.compile().unwrap();
@@ -622,7 +622,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: route
     name: split
     input: src
@@ -662,13 +662,13 @@ nodes:
     config:
       name: a
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: source
     name: b
     config:
       name: b
       type: csv
-      path: /tmp/b.csv
+      path: data/b.csv
   - type: merge
     name: m
     inputs:
@@ -702,13 +702,13 @@ nodes:
     config:
       name: dup
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
   - type: source
     name: dup
     config:
       name: dup
       type: csv
-      path: /tmp/b.csv
+      path: data/b.csv
 "#;
     let cfg = parse_pipeline(yaml);
     let res = cfg.compile();
@@ -728,7 +728,7 @@ nodes:
     config:
       name: src
       type: csv
-      path: /tmp/a.csv
+      path: data/a.csv
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg.compile().unwrap();
