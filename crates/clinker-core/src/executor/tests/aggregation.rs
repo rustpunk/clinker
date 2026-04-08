@@ -145,20 +145,31 @@ mod dispatch {
         let yaml = r#"
 pipeline:
   name: agg_basic
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: in.csv
     type: csv
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit total = sum(salary)
-        emit n = count(*)
-outputs:
-  - name: out
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(salary)
+
+      emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -197,19 +208,29 @@ outputs:
         let yaml = r#"
 pipeline:
   name: agg_two_preds
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: in.csv
     type: csv
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit n = count(*)
-outputs:
-  - name: out
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -415,18 +436,26 @@ outputs:
         let yaml = r#"
 pipeline:
   name: agg_global_empty
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: in.csv
     type: csv
-transformations:
-  - name: total
-    aggregate:
-      group_by: []
-      cxl: |
-        emit n = count(*)
-outputs:
-  - name: out
+- type: aggregate
+  name: total
+  input: src
+  config:
+    group_by: []
+    cxl: 'emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: total
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true

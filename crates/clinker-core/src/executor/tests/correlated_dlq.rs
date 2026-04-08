@@ -48,20 +48,31 @@ fn base_yaml(correlation_key: &str) -> String {
         r#"
 pipeline:
   name: correlated_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
 error_handling:
   strategy: continue
-  correlation_key: {correlation_key}
-transformations:
-  - name: validate
-    cxl: |
-      emit emp_id = employee_id
+  correlation_key:
+    correlation_key: null
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit emp_id = employee_id
+
       emit val = value.to_int()
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
     include_unmapped: true
@@ -163,21 +174,34 @@ fn test_correlated_dlq_compound_key() {
         r#"
 pipeline:
   name: compound_key_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
 error_handling:
   strategy: continue
-  correlation_key: [employee_id, dept]
-transformations:
-  - name: validate
-    cxl: |
-      emit emp = employee_id
+  correlation_key:
+  - employee_id
+  - dept
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit emp = employee_id
+
       emit d = dept
+
       emit val = value.to_int()
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
     include_unmapped: true
@@ -204,23 +228,34 @@ fn test_correlated_dlq_auto_sort_prepend() {
     let yaml = r#"
 pipeline:
   name: auto_sort_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
-    sort_order:
-      - timestamp
 error_handling:
   strategy: continue
   correlation_key: employee_id
-transformations:
-  - name: validate
-    cxl: |
-      emit emp = employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    sort_order:
+    - timestamp
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit emp = employee_id
+
       emit ts = timestamp
+
       emit val = value.to_int()
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
     include_unmapped: true
@@ -245,23 +280,33 @@ fn test_correlated_dlq_auto_sort_already_sorted() {
     let yaml = r#"
 pipeline:
   name: already_sorted_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
-    sort_order:
-      - employee_id
-      - timestamp
 error_handling:
   strategy: continue
   correlation_key: employee_id
-transformations:
-  - name: validate
-    cxl: |
-      emit emp = employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    sort_order:
+    - employee_id
+    - timestamp
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit emp = employee_id
+
       emit val = value.to_int()
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
     include_unmapped: true
@@ -283,19 +328,28 @@ fn test_correlated_dlq_explain_shows_sort() {
     let yaml = r#"
 pipeline:
   name: explain_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
 error_handling:
   strategy: continue
   correlation_key: employee_id
-transformations:
-  - name: validate
-    cxl: |
-      emit val = value.to_int()
-outputs:
-  - name: out
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit val = value.to_int()
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
 "#;
@@ -421,21 +475,31 @@ fn test_correlated_dlq_group_exceeds_buffer() {
     let yaml = r#"
 pipeline:
   name: buffer_overflow_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
 error_handling:
   strategy: continue
   correlation_key: employee_id
   max_group_buffer: 3
-transformations:
-  - name: validate
-    cxl: |
-      emit emp = employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit emp = employee_id
+
       emit val = value.to_int()
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
     include_unmapped: true

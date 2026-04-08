@@ -101,23 +101,34 @@ fn test_e2e_group_by_sum_count() {
     let yaml = r#"
 pipeline:
   name: agg_sum_count
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: integer
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit total = sum(salary.to_int())
-        emit n = count(*)
-outputs:
-  - name: out
+    - name: salary
+      type: integer
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(salary.to_int())
+
+      emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -137,24 +148,36 @@ fn test_e2e_aggregate_avg_min_max() {
     let yaml = r#"
 pipeline:
   name: agg_avg_min_max
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: integer
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit lo = min(salary.to_int())
-        emit hi = max(salary.to_int())
-        emit mean = avg(salary.to_int())
-outputs:
-  - name: out
+    - name: salary
+      type: integer
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit lo = min(salary.to_int())
+
+      emit hi = max(salary.to_int())
+
+      emit mean = avg(salary.to_int())
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -180,19 +203,29 @@ fn test_e2e_aggregate_collect() {
     let yaml = r#"
 pipeline:
   name: agg_collect
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit names = collect(name)
-outputs:
-  - name: out
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit names = collect(name)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -226,24 +259,34 @@ fn test_e2e_aggregate_weighted_avg() {
     let yaml = r#"
 pipeline:
   name: agg_weighted
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: float
-      - name: hours
-        type: float
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit wavg = weighted_avg(salary.to_float(), hours.to_float())
-outputs:
-  - name: out
+    - name: salary
+      type: float
+    - name: hours
+      type: float
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit wavg = weighted_avg(salary.to_float(), hours.to_float())
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -280,22 +323,31 @@ fn test_e2e_global_fold_no_group_by() {
     let yaml = r#"
 pipeline:
   name: agg_global
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: amount
-        type: integer
-transformations:
-  - name: globals
-    aggregate:
-      group_by: []
-      cxl: |
-        emit total = sum(amount.to_int())
-        emit rows = count(*)
-outputs:
-  - name: out
+    - name: amount
+      type: integer
+- type: aggregate
+  name: globals
+  input: src
+  config:
+    group_by: []
+    cxl: 'emit total = sum(amount.to_int())
+
+      emit rows = count(*)
+
+      '
+- type: output
+  name: out
+  input: globals
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -315,25 +367,38 @@ fn test_e2e_aggregate_null_handling() {
     let yaml = r#"
 pipeline:
   name: agg_nulls
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: integer
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        let salary_int = if salary == "" then null else salary.to_int()
-        emit dept = dept
-        emit total = sum(salary_int)
-        emit n_nonnull = count(salary_int)
-        emit n_all = count(*)
-outputs:
-  - name: out
+    - name: salary
+      type: integer
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'let salary_int = if salary == "" then null else salary.to_int()
+
+      emit dept = dept
+
+      emit total = sum(salary_int)
+
+      emit n_nonnull = count(salary_int)
+
+      emit n_all = count(*)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -364,26 +429,41 @@ fn test_e2e_aggregate_chained_with_transform() {
     let yaml = r#"
 pipeline:
   name: agg_chained
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: integer
-transformations:
-  - name: bonus
-    cxl: |
-      emit dept = dept
+    - name: salary
+      type: integer
+- type: transform
+  name: bonus
+  input: src
+  config:
+    cxl: 'emit dept = dept
+
       emit comp = salary.to_int() + 10
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit total = sum(comp.to_int())
-outputs:
-  - name: out
+
+      '
+- type: aggregate
+  name: by_dept
+  input: bonus
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(comp.to_int())
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -410,23 +490,34 @@ fn test_e2e_streaming_vs_hash_identical() {
     let yaml_hash = r#"
 pipeline:
   name: agg_hash
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: integer
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit total = sum(salary.to_int())
-        emit n = count(*)
-outputs:
-  - name: out
+    - name: salary
+      type: integer
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(salary.to_int())
+
+      emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true
@@ -437,27 +528,38 @@ outputs:
     let yaml_streaming = r#"
 pipeline:
   name: agg_streaming
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: in.csv
     schema_overrides:
-      - name: salary
-        type: integer
+    - name: salary
+      type: integer
     sort_order:
-      - field: dept
-        order: asc
-        null_order: first
-transformations:
-  - name: by_dept
-    aggregate:
-      group_by: [dept]
-      cxl: |
-        emit dept = dept
-        emit total = sum(salary.to_int())
-        emit n = count(*)
-outputs:
-  - name: out
+    - field: dept
+      order: asc
+      null_order: first
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(salary.to_int())
+
+      emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
     type: csv
     path: out.csv
     include_unmapped: true

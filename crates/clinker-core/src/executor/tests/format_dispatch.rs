@@ -127,21 +127,23 @@ fn test_format_dispatch_json_ndjson_input_produces_records() {
     let yaml = r#"
 pipeline:
   name: json-input-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: json
     path: input.json
     options:
       format: ndjson
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations: []
 "#;
     let input_data = ndjson_input(&[
         serde_json::json!({"name": "Alice", "age": "30"}),
@@ -165,21 +167,23 @@ fn test_format_dispatch_xml_input_produces_records() {
     let yaml = r#"
 pipeline:
   name: xml-input-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: xml
     path: input.xml
     options:
       record_path: records/record
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations: []
 "#;
     let input_data = xml_input(
         "records",
@@ -205,21 +209,23 @@ fn test_format_dispatch_json_output_produces_valid_ndjson() {
     let yaml = r#"
 pipeline:
   name: json-output-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: json
     path: output.json
     options:
       format: ndjson
     include_unmapped: true
-
-transformations: []
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -247,22 +253,24 @@ fn test_format_dispatch_xml_output_produces_valid_xml() {
     let yaml = r#"
 pipeline:
   name: xml-output-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: xml
     path: output.xml
     options:
       root_element: records
       record_element: record
     include_unmapped: true
-
-transformations: []
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -297,21 +305,23 @@ fn test_format_dispatch_csv_to_json_cross_format() {
     let yaml = r#"
 pipeline:
   name: csv-to-json-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: json
     path: output.json
     options:
       format: ndjson
     include_unmapped: true
-
-transformations: []
 "#;
     let csv_input = "id,value\n1,alpha\n2,beta\n3,gamma\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -336,19 +346,21 @@ fn test_format_dispatch_csv_input_backward_compat() {
     let yaml = r#"
 pipeline:
   name: csv-compat-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations: []
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -372,29 +384,31 @@ fn test_format_dispatch_fixed_width_input_with_schema() {
     let yaml = r#"
 pipeline:
   name: fw-input-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: fixed_width
     path: input.dat
     schema:
       fields:
-        - name: name
-          type: string
-          start: 0
-          width: 10
-        - name: age
-          type: integer
-          start: 10
-          width: 5
-
-outputs:
-  - name: dest
+      - name: name
+        type: string
+        start: 0
+        width: 10
+      - name: age
+        type: integer
+        start: 10
+        width: 5
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations: []
 "#;
     let input_data = fixed_width_input(&["Alice     00030", "Bob       00025"]);
     let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
@@ -414,27 +428,29 @@ fn test_format_dispatch_fixed_width_output_produces_valid_data() {
     let yaml = r#"
 pipeline:
   name: fw-output-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: fixed_width
     path: output.dat
     schema:
       fields:
-        - name: name
-          type: string
-          width: 10
-        - name: age
-          type: integer
-          width: 5
+      - name: name
+        type: string
+        width: 10
+      - name: age
+        type: integer
+        width: 5
     include_unmapped: true
-
-transformations: []
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
@@ -477,18 +493,20 @@ fn test_format_dispatch_fixed_width_missing_schema_errors() {
     let yaml = r#"
 pipeline:
   name: fw-no-schema-test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: fixed_width
     path: input.dat
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: csv
     path: output.csv
-
-transformations: []
 "#;
     let input_data = fixed_width_input(&["Alice     00030"]);
     let result = run_format_test(yaml, "src", input_data);

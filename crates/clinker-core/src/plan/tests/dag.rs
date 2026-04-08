@@ -22,6 +22,7 @@ nodes:
   - type: source
     name: primary
     config:
+      name: primary
       type: csv
       path: data.csv
   - type: transform
@@ -64,6 +65,7 @@ nodes:
     name: output
     input: finalize
     config:
+      name: output
       type: csv
       path: out.csv
       include_unmapped: true
@@ -79,6 +81,7 @@ nodes:
   - type: source
     name: primary
     config:
+      name: primary
       type: csv
       path: data.csv
   - type: transform
@@ -97,6 +100,7 @@ nodes:
     name: output
     input: step_two
     config:
+      name: output
       type: csv
       path: out.csv
       include_unmapped: true
@@ -185,24 +189,35 @@ fn test_dag_cycle_detection() {
     let yaml = r#"
 pipeline:
   name: cycle-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: alpha
+  input: beta
+  config:
+    cxl: 'emit x = amount
+
+      '
+- type: transform
+  name: beta
+  input: alpha
+  config:
+    cxl: 'emit y = amount
+
+      '
+- type: output
+  name: output
+  input: beta
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: alpha
-    cxl: |
-      emit x = amount
-    input: beta
-  - name: beta
-    cxl: |
-      emit y = amount
-    input: alpha
 "#;
     let config = parse_fixture(yaml);
     let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
@@ -269,29 +284,38 @@ fn test_dag_multiple_outputs() {
     let yaml = r#"
 pipeline:
   name: multi-out-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: router_emit
+  input: primary
+  config:
+    cxl: 'emit x = amount
+
+      '
+- type: route
+  name: router
+  input: router_emit
+  config:
+    conditions:
+      a: amount > 100
+      b: amount > 50
+      c: amount > 0
+    default: output
+    mode: exclusive
+- type: output
+  name: output
+  input: router
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: router
-    cxl: |
-      emit x = amount
-    route:
-      mode: exclusive
-      branches:
-        - name: a
-          condition: "amount > 100"
-        - name: b
-          condition: "amount > 50"
-        - name: c
-          condition: "amount > 0"
-      default: output
 "#;
     let config = parse_fixture(yaml);
     let plan = compile_fixture(&config, &["amount"]);
@@ -313,26 +337,47 @@ fn test_dag_merge_multiple_inputs() {
     let yaml = r#"
 pipeline:
   name: merge-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: branch_a
+  input: primary
+  config:
+    cxl: 'emit x = amount + 1
+
+      '
+- type: transform
+  name: branch_b
+  input: branch_a
+  config:
+    cxl: 'emit y = amount + 2
+
+      '
+- type: merge
+  name: merged__merge
+  inputs:
+  - branch_a
+  - branch_b
+- type: transform
+  name: merged
+  input: merged__merge
+  config:
+    cxl: 'emit z = amount
+
+      '
+- type: output
+  name: output
+  input: merged
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: branch_a
-    cxl: |
-      emit x = amount + 1
-  - name: branch_b
-    cxl: |
-      emit y = amount + 2
-  - name: merged
-    cxl: |
-      emit z = amount
-    input: [branch_a, branch_b]
 "#;
     let config = parse_fixture(yaml);
     let plan = compile_fixture(&config, &["amount"]);
@@ -366,19 +411,28 @@ fn test_dag_single_transform_backward_compat() {
     let yaml = r#"
 pipeline:
   name: single-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: only
+  input: primary
+  config:
+    cxl: 'emit x = amount
+
+      '
+- type: output
+  name: output
+  input: only
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: only
-    cxl: |
-      emit x = amount
 "#;
     let config = parse_fixture(yaml);
     let plan = compile_fixture(&config, &["amount"]);
@@ -422,20 +476,28 @@ fn test_dag_invalid_input_reference_error_message() {
     let yaml = r#"
 pipeline:
   name: bad-ref-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: step
+  input: nonexistent
+  config:
+    cxl: 'emit x = amount
+
+      '
+- type: output
+  name: output
+  input: step
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: step
-    cxl: |
-      emit x = amount
-    input: nonexistent
 "#;
     let config = parse_fixture(yaml);
     let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
@@ -484,21 +546,31 @@ fn test_dag_execution_reqs_from_analyzer() {
     let yaml = r#"
 pipeline:
   name: arena-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: agg
+  input: primary
+  config:
+    cxl: 'emit total = $window.sum(amount)
+
+      '
+    analytic_window:
+      group_by:
+      - dept
+- type: output
+  name: output
+  input: agg
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: agg
-    cxl: |
-      emit total = $window.sum(amount)
-    local_window:
-      group_by: [dept]
 "#;
     let config = parse_fixture(yaml);
     let plan = compile_fixture(&config, &["dept", "amount"]);
@@ -614,20 +686,28 @@ fn test_dag_self_reference_rejected() {
     let yaml = r#"
 pipeline:
   name: self-ref-test
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
-outputs:
-  - name: output
+- type: transform
+  name: loopy
+  input: loopy
+  config:
+    cxl: 'emit x = amount
+
+      '
+- type: output
+  name: output
+  input: loopy
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-transformations:
-  - name: loopy
-    cxl: |
-      emit x = amount
-    input: loopy
 "#;
     let config = parse_fixture(yaml);
     let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
@@ -657,45 +737,63 @@ fn wired_diamond_yaml() -> &'static str {
     r#"
 pipeline:
   name: wired-diamond
-
-inputs:
-  - name: primary
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
     path: data.csv
     type: csv
+- type: transform
+  name: categorize_emit
+  input: primary
+  config:
+    cxl: 'emit value = amount
 
-outputs:
-  - name: output
+      '
+- type: route
+  name: categorize
+  input: categorize_emit
+  config:
+    conditions:
+      high_value: amount > 100
+      low_value: amount <= 100
+    default: output
+    mode: exclusive
+- type: transform
+  name: enrich_high
+  input: categorize.high_value
+  config:
+    cxl: 'emit tier = "premium"
+
+      '
+- type: transform
+  name: enrich_low
+  input: categorize.low_value
+  config:
+    cxl: 'emit tier = "standard"
+
+      '
+- type: merge
+  name: finalize__merge
+  inputs:
+  - enrich_high
+  - enrich_low
+- type: transform
+  name: finalize
+  input: finalize__merge
+  config:
+    cxl: 'emit done = true
+
+      '
+- type: output
+  name: output
+  input: finalize
+  config:
+    name: output
     path: out.csv
     include_unmapped: true
     type: csv
-
-transformations:
-  - name: categorize
-    cxl: |
-      emit value = amount
-    route:
-      mode: exclusive
-      branches:
-        - name: high_value
-          condition: "amount > 100"
-        - name: low_value
-          condition: "amount <= 100"
-      default: output
-
-  - name: enrich_high
-    input: categorize.high_value
-    cxl: |
-      emit tier = "premium"
-
-  - name: enrich_low
-    input: categorize.low_value
-    cxl: |
-      emit tier = "standard"
-
-  - name: finalize
-    input: [enrich_high, enrich_low]
-    cxl: |
-      emit done = true
 "#
 }
 

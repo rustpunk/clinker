@@ -48,39 +48,61 @@ fn test_branch_diamond_dag() {
     let yaml = r#"
 pipeline:
   name: diamond
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: transform
+  name: enrich_high
+  input: classify.high
+  config:
+    cxl: 'emit tag = "HIGH"
+
+      '
+- type: transform
+  name: enrich_low
+  input: classify.low
+  config:
+    cxl: 'emit tag = "LOW"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - enrich_high
+  - enrich_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tag
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-  - name: enrich_high
-    input: "classify.high"
-    cxl: |
-      emit tag = "HIGH"
-  - name: enrich_low
-    input: "classify.low"
-    cxl: |
-      emit tag = "LOW"
-  - name: combine
-    input: ["enrich_high", "enrich_low"]
-    cxl: |
-      emit final = tag
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -106,40 +128,62 @@ fn test_branch_exclusive_conservation() {
     let yaml = r#"
 pipeline:
   name: exclusive_conservation
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+    mode: exclusive
+- type: transform
+  name: enrich_high
+  input: classify.high
+  config:
+    cxl: 'emit tag = "HIGH"
+
+      '
+- type: transform
+  name: enrich_low
+  input: classify.low
+  config:
+    cxl: 'emit tag = "LOW"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - enrich_high
+  - enrich_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tag
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      mode: exclusive
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-  - name: enrich_high
-    input: "classify.high"
-    cxl: |
-      emit tag = "HIGH"
-  - name: enrich_low
-    input: "classify.low"
-    cxl: |
-      emit tag = "LOW"
-  - name: combine
-    input: ["enrich_high", "enrich_low"]
-    cxl: |
-      emit final = tag
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
@@ -158,46 +202,71 @@ fn test_branch_inclusive_duplication() {
     let yaml = r#"
 pipeline:
   name: inclusive_dup
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      over_50: amount_val > 50
+      over_100: amount_val > 100
+    default: low
+    mode: inclusive
+- type: transform
+  name: tag_over50
+  input: classify.over_50
+  config:
+    cxl: 'emit tag = "OVER50"
+
+      '
+- type: transform
+  name: tag_over100
+  input: classify.over_100
+  config:
+    cxl: 'emit tag = "OVER100"
+
+      '
+- type: transform
+  name: tag_low
+  input: classify.low
+  config:
+    cxl: 'emit tag = "LOW"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - tag_over50
+  - tag_over100
+  - tag_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tag
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      mode: inclusive
-      branches:
-        - name: over_50
-          condition: "amount_val > 50"
-        - name: over_100
-          condition: "amount_val > 100"
-      default: low
-  - name: tag_over50
-    input: "classify.over_50"
-    cxl: |
-      emit tag = "OVER50"
-  - name: tag_over100
-    input: "classify.over_100"
-    cxl: |
-      emit tag = "OVER100"
-  - name: tag_low
-    input: "classify.low"
-    cxl: |
-      emit tag = "LOW"
-  - name: combine
-    input: ["tag_over50", "tag_over100", "tag_low"]
-    cxl: |
-      emit final = tag
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
@@ -219,39 +288,61 @@ fn test_branch_order_within_branch() {
     let yaml = r#"
 pipeline:
   name: order_test
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: transform
+  name: enrich_high
+  input: classify.high
+  config:
+    cxl: 'emit tag = "H"
+
+      '
+- type: transform
+  name: enrich_low
+  input: classify.low
+  config:
+    cxl: 'emit tag = "L"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - enrich_high
+  - enrich_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tag
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-  - name: enrich_high
-    input: "classify.high"
-    cxl: |
-      emit tag = "H"
-  - name: enrich_low
-    input: "classify.low"
-    cxl: |
-      emit tag = "L"
-  - name: combine
-    input: ["enrich_high", "enrich_low"]
-    cxl: |
-      emit final = tag
 "#;
 
     // High records: 1(200), 3(300), 5(500) -- should maintain order
@@ -287,39 +378,61 @@ fn test_branch_merge_concatenation_order() {
     let yaml = r#"
 pipeline:
   name: merge_order
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: transform
+  name: enrich_high
+  input: classify.high
+  config:
+    cxl: 'emit tag = "H"
+
+      '
+- type: transform
+  name: enrich_low
+  input: classify.low
+  config:
+    cxl: 'emit tag = "L"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - enrich_high
+  - enrich_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tag
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-  - name: enrich_high
-    input: "classify.high"
-    cxl: |
-      emit tag = "H"
-  - name: enrich_low
-    input: "classify.low"
-    cxl: |
-      emit tag = "L"
-  - name: combine
-    input: ["enrich_high", "enrich_low"]
-    cxl: |
-      emit final = tag
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
@@ -347,39 +460,61 @@ fn test_branch_empty_branch_no_error() {
     let yaml = r#"
 pipeline:
   name: empty_branch
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      impossible: amount_val > 999999
+    default: normal
+- type: transform
+  name: tag_impossible
+  input: classify.impossible
+  config:
+    cxl: 'emit tag = "IMPOSSIBLE"
+
+      '
+- type: transform
+  name: tag_normal
+  input: classify.normal
+  config:
+    cxl: 'emit tag = "NORMAL"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - tag_impossible
+  - tag_normal
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tag
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: impossible
-          condition: "amount_val > 999999"
-      default: normal
-  - name: tag_impossible
-    input: "classify.impossible"
-    cxl: |
-      emit tag = "IMPOSSIBLE"
-  - name: tag_normal
-    input: "classify.normal"
-    cxl: |
-      emit tag = "NORMAL"
-  - name: combine
-    input: ["tag_impossible", "tag_normal"]
-    cxl: |
-      emit final = tag
 "#;
 
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
@@ -398,45 +533,70 @@ fn test_branch_three_way_fork() {
     let yaml = r#"
 pipeline:
   name: three_way
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 200
+      medium: amount_val > 50
+    default: low
+- type: transform
+  name: tag_high
+  input: classify.high
+  config:
+    cxl: 'emit tier = "HIGH"
+
+      '
+- type: transform
+  name: tag_medium
+  input: classify.medium
+  config:
+    cxl: 'emit tier = "MEDIUM"
+
+      '
+- type: transform
+  name: tag_low
+  input: classify.low
+  config:
+    cxl: 'emit tier = "LOW"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - tag_high
+  - tag_medium
+  - tag_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tier
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 200"
-        - name: medium
-          condition: "amount_val > 50"
-      default: low
-  - name: tag_high
-    input: "classify.high"
-    cxl: |
-      emit tier = "HIGH"
-  - name: tag_medium
-    input: "classify.medium"
-    cxl: |
-      emit tier = "MEDIUM"
-  - name: tag_low
-    input: "classify.low"
-    cxl: |
-      emit tier = "LOW"
-  - name: combine
-    input: ["tag_high", "tag_medium", "tag_low"]
-    cxl: |
-      emit final = tier
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
@@ -463,39 +623,61 @@ fn test_branch_different_transforms_per_branch() {
     let yaml = r#"
 pipeline:
   name: different_transforms
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: transform
+  name: enrich_high
+  input: classify.high
+  config:
+    cxl: 'emit enriched = id + "_premium"
+
+      '
+- type: transform
+  name: enrich_low
+  input: classify.low
+  config:
+    cxl: 'emit enriched = id + "_standard"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - enrich_high
+  - enrich_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = enriched
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-  - name: enrich_high
-    input: "classify.high"
-    cxl: |
-      emit enriched = id + "_premium"
-  - name: enrich_low
-    input: "classify.low"
-    cxl: |
-      emit enriched = id + "_standard"
-  - name: combine
-    input: ["enrich_high", "enrich_low"]
-    cxl: |
-      emit final = enriched
 "#;
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n";
@@ -524,22 +706,28 @@ fn test_dag_linear_execution_no_regression() {
     let yaml = r#"
 pipeline:
   name: linear
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: calc
+  input: src
+  config:
+    cxl: 'emit doubled = name + "_doubled"
 
-outputs:
-  - name: dest
+      '
+- type: output
+  name: dest
+  input: calc
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: calc
-    cxl: |
-      emit doubled = name + "_doubled"
 "#;
 
     let csv = "name,age\nAlice,30\nBob,25\nCarol,35\n";
@@ -562,27 +750,38 @@ fn test_dag_mixed_execution_reqs() {
     let yaml = r#"
 pipeline:
   name: mixed_reqs
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: stateless_calc
+  input: src
+  config:
+    cxl: 'emit label = dept + "_label"
 
-outputs:
-  - name: dest
+      '
+- type: transform
+  name: window_calc
+  input: stateless_calc
+  config:
+    cxl: 'emit cnt = $window.count()
+
+      '
+    analytic_window:
+      group_by:
+      - dept
+- type: output
+  name: dest
+  input: window_calc
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: stateless_calc
-    cxl: |
-      emit label = dept + "_label"
-  - name: window_calc
-    cxl: |
-      emit cnt = $window.count()
-    local_window:
-      group_by: [dept]
 "#;
 
     let csv = "dept,amount\nA,10\nB,20\nA,30\n";
@@ -606,45 +805,70 @@ fn test_branch_rayon_scope_deterministic_order() {
     let yaml = r#"
 pipeline:
   name: deterministic
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 200
+      medium: amount_val > 50
+    default: low
+- type: transform
+  name: tag_high
+  input: classify.high
+  config:
+    cxl: 'emit tier = "HIGH"
+
+      '
+- type: transform
+  name: tag_medium
+  input: classify.medium
+  config:
+    cxl: 'emit tier = "MEDIUM"
+
+      '
+- type: transform
+  name: tag_low
+  input: classify.low
+  config:
+    cxl: 'emit tier = "LOW"
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - tag_high
+  - tag_medium
+  - tag_low
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = tier
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 200"
-        - name: medium
-          condition: "amount_val > 50"
-      default: low
-  - name: tag_high
-    input: "classify.high"
-    cxl: |
-      emit tier = "HIGH"
-  - name: tag_medium
-    input: "classify.medium"
-    cxl: |
-      emit tier = "MEDIUM"
-  - name: tag_low
-    input: "classify.low"
-    cxl: |
-      emit tier = "LOW"
-  - name: combine
-    input: ["tag_high", "tag_medium", "tag_low"]
-    cxl: |
-      emit final = tier
 "#;
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
@@ -664,42 +888,63 @@ fn test_branch_inclusive_isolation() {
     let yaml = r#"
 pipeline:
   name: inclusive_isolation
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
 
-outputs:
-  - name: dest
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      branch_a: amount_val > 50
+      branch_b: amount_val > 50
+    default: low
+    mode: inclusive
+- type: transform
+  name: mutate_a
+  input: classify.branch_a
+  config:
+    cxl: 'emit marker = "A_" + id
+
+      '
+- type: transform
+  name: mutate_b
+  input: classify.branch_b
+  config:
+    cxl: 'emit marker = "B_" + id
+
+      '
+- type: merge
+  name: combine__merge
+  inputs:
+  - mutate_a
+  - mutate_b
+- type: transform
+  name: combine
+  input: combine__merge
+  config:
+    cxl: 'emit final = marker
+
+      '
+- type: output
+  name: dest
+  input: combine
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      mode: inclusive
-      branches:
-        - name: branch_a
-          condition: "amount_val > 50"
-        - name: branch_b
-          condition: "amount_val > 50"
-      default: low
-  - name: mutate_a
-    input: "classify.branch_a"
-    cxl: |
-      emit marker = "A_" + id
-  - name: mutate_b
-    input: "classify.branch_b"
-    cxl: |
-      emit marker = "B_" + id
-  - name: combine
-    input: ["mutate_a", "mutate_b"]
-    cxl: |
-      emit final = marker
 "#;
 
     let csv = "id,amount\n1,100\n";

@@ -50,30 +50,49 @@ fn bench_scaling_streaming(c: &mut Criterion) {
 pipeline:
   name: bench_scaling
   concurrency:
-    threads: {threads}
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
-transformations:
-  - name: heavy_transform
-    cxl: |
-      let base = f0.to_int() + f2.to_int()
-      emit out0 = base * 2
-      emit out1 = f1.upper()
-      emit out2 = f3.trim()
-      emit out3 = if f0.to_int() > 500000 then "high" else "low"
-      emit out4 = f5 ?? f3 ?? "default"
-      emit out5 = f0.to_float().round(2)
-      emit out6 = f7.lower()
-      emit out7 = base + f4.to_int()
-      emit out8 = f0.to_string()
-outputs:
-  - name: out
-    path: output.csv
-    type: csv
+    threads:
+      threads: null
 error_handling:
   strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: heavy_transform
+  input: src
+  config:
+    cxl: 'let base = f0.to_int() + f2.to_int()
+
+      emit out0 = base * 2
+
+      emit out1 = f1.upper()
+
+      emit out2 = f3.trim()
+
+      emit out3 = if f0.to_int() > 500000 then "high" else "low"
+
+      emit out4 = f5 ?? f3 ?? "default"
+
+      emit out5 = f0.to_float().round(2)
+
+      emit out6 = f7.lower()
+
+      emit out7 = base + f4.to_int()
+
+      emit out8 = f0.to_string()
+
+      '
+- type: output
+  name: out
+  input: heavy_transform
+  config:
+    name: out
+    path: output.csv
+    type: csv
 "#
         );
         let config = parse_config(&yaml).unwrap();
@@ -127,28 +146,42 @@ fn bench_scaling_two_pass(c: &mut Criterion) {
 pipeline:
   name: bench_scaling_2pass
   concurrency:
-    threads: {threads}
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
-transformations:
-  - name: windowed
-    cxl: |
-      emit amount = f0.to_int()
-      emit group = f1
-      emit total = $window.count()
-      emit first_val = $window.first().f0
-    local_window:
-      group_by: [f1]
-      sort_by:
-        - field: f0
-outputs:
-  - name: out
-    path: output.csv
-    type: csv
+    threads:
+      threads: null
 error_handling:
   strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: windowed
+  input: src
+  config:
+    cxl: 'emit amount = f0.to_int()
+
+      emit group = f1
+
+      emit total = $window.count()
+
+      emit first_val = $window.first().f0
+
+      '
+    analytic_window:
+      group_by:
+      - f1
+      sort_by:
+      - field: f0
+- type: output
+  name: out
+  input: windowed
+  config:
+    name: out
+    path: output.csv
+    type: csv
 "#
         );
         let config = parse_config(&yaml).unwrap();

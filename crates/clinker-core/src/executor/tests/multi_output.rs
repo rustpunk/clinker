@@ -340,25 +340,40 @@ fn test_multi_output_two_writers() {
     let yaml = r#"
 pipeline:
   name: test_two_outputs
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-outputs:
-  - name: high
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: output
+  name: high
+  input: classify
+  config:
+    name: high
     path: high.csv
     type: csv
     include_unmapped: true
-  - name: low
+- type: output
+  name: low
+  input: classify
+  config:
+    name: low
     path: low.csv
     type: csv
     include_unmapped: true
@@ -390,31 +405,49 @@ fn test_multi_output_three_writers() {
     let yaml = r#"
 pipeline:
   name: test_three_outputs
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 1000"
-        - name: medium
-          condition: "amount_val > 100"
-      default: low
-outputs:
-  - name: high
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 1000
+      medium: amount_val > 100
+    default: low
+- type: output
+  name: high
+  input: classify
+  config:
+    name: high
     path: high.csv
     type: csv
     include_unmapped: true
-  - name: medium
+- type: output
+  name: medium
+  input: classify
+  config:
+    name: medium
     path: medium.csv
     type: csv
     include_unmapped: true
-  - name: low
+- type: output
+  name: low
+  input: classify
+  config:
+    name: low
     path: low.csv
     type: csv
     include_unmapped: true
@@ -434,25 +467,40 @@ fn test_multi_output_record_counts() {
     let yaml = r#"
 pipeline:
   name: test_record_counts
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: big
-          condition: "amount_val > 50"
-      default: small
-outputs:
-  - name: big
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      big: amount_val > 50
+    default: small
+- type: output
+  name: big
+  input: classify
+  config:
+    name: big
     path: big.csv
     type: csv
     include_unmapped: true
-  - name: small
+- type: output
+  name: small
+  input: classify
+  config:
+    name: small
     path: small.csv
     type: csv
     include_unmapped: true
@@ -477,25 +525,40 @@ fn test_multi_output_order_preserved() {
     let yaml = r#"
 pipeline:
   name: test_order
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: big
-          condition: "amount_val > 50"
-      default: small
-outputs:
-  - name: big
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      big: amount_val > 50
+    default: small
+- type: output
+  name: big
+  input: classify
+  config:
+    name: big
     path: big.csv
     type: csv
     include_unmapped: true
-  - name: small
+- type: output
+  name: small
+  input: classify
+  config:
+    name: small
     path: small.csv
     type: csv
     include_unmapped: true
@@ -558,25 +621,40 @@ fn test_multi_output_writer_error_propagated() {
     let yaml = r#"
 pipeline:
   name: test_writer_error
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: good
-          condition: "amount_val > 50"
-      default: bad
-outputs:
-  - name: good
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      good: amount_val > 50
+    default: bad
+- type: output
+  name: good
+  input: classify
+  config:
+    name: good
     path: good.csv
     type: csv
     include_unmapped: true
-  - name: bad
+- type: output
+  name: bad
+  input: classify
+  config:
+    name: bad
     path: bad.csv
     type: csv
     include_unmapped: true
@@ -612,32 +690,50 @@ fn test_multi_output_inclusive_duplicate() {
     let yaml = r#"
 pipeline:
   name: test_inclusive
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      mode: inclusive
-      branches:
-        - name: audit
-          condition: "amount_val > 100"
-        - name: report
-          condition: "amount_val > 50"
-      default: standard
-outputs:
-  - name: audit
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      audit: amount_val > 100
+      report: amount_val > 50
+    default: standard
+    mode: inclusive
+- type: output
+  name: audit
+  input: classify
+  config:
+    name: audit
     path: audit.csv
     type: csv
     include_unmapped: true
-  - name: report
+- type: output
+  name: report
+  input: classify
+  config:
+    name: report
     path: report.csv
     type: csv
     include_unmapped: true
-  - name: standard
+- type: output
+  name: standard
+  input: classify
+  config:
+    name: standard
     path: standard.csv
     type: csv
     include_unmapped: true
@@ -662,16 +758,25 @@ fn test_single_output_no_channel_overhead() {
     let yaml = r#"
 pipeline:
   name: test_single
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: passthrough
-    cxl: |
-      emit val = id
-outputs:
-  - name: out
+- type: transform
+  name: passthrough
+  input: src
+  config:
+    cxl: 'emit val = id
+
+      '
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
     path: out.csv
     type: csv
     include_unmapped: true
@@ -691,25 +796,40 @@ fn test_multi_output_empty_route() {
     let yaml = r#"
 pipeline:
   name: test_empty_route
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: special
-          condition: "amount_val > 99999"
-      default: normal
-outputs:
-  - name: special
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      special: amount_val > 99999
+    default: normal
+- type: output
+  name: special
+  input: classify
+  config:
+    name: special
     path: special.csv
     type: csv
     include_unmapped: true
-  - name: normal
+- type: output
+  name: normal
+  input: classify
+  config:
+    name: normal
     path: normal.csv
     type: csv
     include_unmapped: true
@@ -765,25 +885,40 @@ fn test_multi_output_writer_panic_propagated() {
     let yaml = r#"
 pipeline:
   name: test_panic
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: good
-          condition: "amount_val > 50"
-      default: bad
-outputs:
-  - name: good
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      good: amount_val > 50
+    default: bad
+- type: output
+  name: good
+  input: classify
+  config:
+    name: good
     path: good.csv
     type: csv
     include_unmapped: true
-  - name: bad
+- type: output
+  name: bad
+  input: classify
+  config:
+    name: bad
     path: bad.csv
     type: csv
     include_unmapped: true
@@ -833,25 +968,40 @@ pipeline:
   name: test_cancel
 error_handling:
   strategy: continue
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: big
-          condition: "amount_val > 50"
-      default: small
-outputs:
-  - name: big
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      big: amount_val > 50
+    default: small
+- type: output
+  name: big
+  input: classify
+  config:
+    name: big
     path: big.csv
     type: csv
     include_unmapped: true
-  - name: small
+- type: output
+  name: small
+  input: classify
+  config:
+    name: small
     path: small.csv
     type: csv
     include_unmapped: true
@@ -898,25 +1048,40 @@ fn test_multi_output_send_error_disconnected() {
     let yaml = r#"
 pipeline:
   name: test_disconnected
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: a
-          condition: "amount_val > 50"
-      default: b
-outputs:
-  - name: a
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      a: amount_val > 50
+    default: b
+- type: output
+  name: a
+  input: classify
+  config:
+    name: a
     path: a.csv
     type: csv
     include_unmapped: true
-  - name: b
+- type: output
+  name: b
+  input: classify
+  config:
+    name: b
     path: b.csv
     type: csv
     include_unmapped: true
@@ -971,25 +1136,40 @@ fn test_multi_output_multiple_errors_collected() {
     let yaml = r#"
 pipeline:
   name: test_multiple_errors
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: a
-          condition: "amount_val > 50"
-      default: b
-outputs:
-  - name: a
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      a: amount_val > 50
+    default: b
+- type: output
+  name: a
+  input: classify
+  config:
+    name: a
     path: a.csv
     type: csv
     include_unmapped: true
-  - name: b
+- type: output
+  name: b
+  input: classify
+  config:
+    name: b
     path: b.csv
     type: csv
     include_unmapped: true
@@ -1057,25 +1237,40 @@ pipeline:
   name: test_dlq_transform
 error_handling:
   strategy: continue
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-outputs:
-  - name: high
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: output
+  name: high
+  input: classify
+  config:
+    name: high
     path: high.csv
     type: csv
     include_unmapped: true
-  - name: low
+- type: output
+  name: low
+  input: classify
+  config:
+    name: low
     path: low.csv
     type: csv
     include_unmapped: true
@@ -1106,26 +1301,42 @@ pipeline:
   name: test_dlq_route_eval
 error_handling:
   strategy: continue
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: calc
-    cxl: |
-      emit amount_val = amount.to_int()
+- type: transform
+  name: calc_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
       emit divisor = zero.to_int()
-    route:
-      branches:
-        - name: special
-          condition: "amount_val / divisor > 0"
-      default: normal
-outputs:
-  - name: special
+
+      '
+- type: route
+  name: calc
+  input: calc_emit
+  config:
+    conditions:
+      special: amount_val / divisor > 0
+    default: normal
+- type: output
+  name: special
+  input: calc
+  config:
+    name: special
     path: special.csv
     type: csv
     include_unmapped: true
-  - name: normal
+- type: output
+  name: normal
+  input: calc
+  config:
+    name: normal
     path: normal.csv
     type: csv
     include_unmapped: true
@@ -1174,25 +1385,40 @@ pipeline:
   name: test_dlq_pre_routing
 error_handling:
   strategy: continue
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-outputs:
-  - name: high
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit amount_val = amount.to_int()
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: output
+  name: high
+  input: classify
+  config:
+    name: high
     path: high.csv
     type: csv
     include_unmapped: true
-  - name: low
+- type: output
+  name: low
+  input: classify
+  config:
+    name: low
     path: low.csv
     type: csv
     include_unmapped: true
@@ -1259,16 +1485,25 @@ pipeline:
   name: test_dlq_compat
 error_handling:
   strategy: continue
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: calc
-    cxl: |
-      emit val = amount.to_int()
-outputs:
-  - name: out
+- type: transform
+  name: calc
+  input: src
+  config:
+    cxl: 'emit val = amount.to_int()
+
+      '
+- type: output
+  name: out
+  input: calc
+  config:
+    name: out
     path: out.csv
     type: csv
     include_unmapped: true
@@ -1308,19 +1543,28 @@ fn test_single_writer_hashmap_backward_compat() {
     let yaml = r#"
 pipeline:
   name: backward_compat_writer
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-outputs:
-  - name: dest
+- type: transform
+  name: identity
+  input: src
+  config:
+    cxl: 'emit id_val = id
+
+      '
+- type: output
+  name: dest
+  input: identity
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-transformations:
-  - name: identity
-    cxl: |
-      emit id_val = id
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params(&config);
@@ -1359,19 +1603,28 @@ fn test_reader_hashmap_backward_compat() {
     let yaml = r#"
 pipeline:
   name: backward_compat_reader
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-outputs:
-  - name: dest
+- type: transform
+  name: identity
+  input: src
+  config:
+    cxl: 'emit x_val = x
+
+      '
+- type: output
+  name: dest
+  input: identity
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-transformations:
-  - name: identity
-    cxl: |
-      emit x_val = x
 "#;
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params(&config);

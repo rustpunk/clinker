@@ -82,19 +82,21 @@ mod tests {
         let yaml = r#"
 pipeline:
   name: success
-
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-
-outputs:
-  - name: dest
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations: []
 "#;
         let csv = "name,age\nAlice,30\nBob,25\n";
         let result = run_pipeline(yaml, csv);
@@ -121,25 +123,30 @@ transformations: []
         let yaml = r#"
 pipeline:
   name: partial
-
-inputs:
-  - name: src
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: will_fail_some
+  input: src
+  config:
+    cxl: 'emit result = value.to_int() * 2
 
-outputs:
-  - name: dest
+      '
+- type: output
+  name: dest
+  input: will_fail_some
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: will_fail_some
-    cxl: |
-      emit result = value.to_int() * 2
-
-error_handling:
-  strategy: continue
 "#;
         let csv = "value\n10\nbad\n20\n";
         let result = run_pipeline(yaml, csv);
@@ -151,25 +158,30 @@ error_handling:
         let yaml = r#"
 pipeline:
   name: fatal
-
-inputs:
-  - name: src
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
+- type: transform
+  name: will_fail
+  input: src
+  config:
+    cxl: 'emit result = value.to_int() + 1
 
-outputs:
-  - name: dest
+      '
+- type: output
+  name: dest
+  input: will_fail
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-
-transformations:
-  - name: will_fail
-    cxl: |
-      emit result = value.to_int() + 1
-
-error_handling:
-  strategy: fail_fast
 "#;
         let csv = "value\n10\nbad\n20\n";
         let result = run_pipeline(yaml, csv);
@@ -181,29 +193,39 @@ error_handling:
         let yaml = r#"
 pipeline:
   name: end-to-end
-
-inputs:
-  - name: employees
+nodes:
+- type: source
+  name: employees
+  config:
+    name: employees
     type: csv
     path: input.csv
+- type: transform
+  name: compute_full_name
+  input: employees
+  config:
+    cxl: 'emit full_name = first_name + " " + last_name
 
-outputs:
-  - name: transformed
+      '
+- type: transform
+  name: compute_upper_dept
+  input: compute_full_name
+  config:
+    cxl: 'emit dept_upper = department.upper()
+
+      '
+- type: output
+  name: transformed
+  input: compute_upper_dept
+  config:
+    name: transformed
     type: csv
     path: output.csv
     include_unmapped: true
     exclude:
-      - internal_id
+    - internal_id
     mapping:
       full_name: employee_name
-
-transformations:
-  - name: compute_full_name
-    cxl: |
-      emit full_name = first_name + " " + last_name
-  - name: compute_upper_dept
-    cxl: |
-      emit dept_upper = department.upper()
 "#;
         let csv = "first_name,last_name,department,internal_id\n\
                     Alice,Smith,Engineering,12345\n\
@@ -274,17 +296,25 @@ transformations:
         let yaml = r#"
 pipeline:
   name: io-test
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: /nonexistent/path/that/does/not/exist.csv
-outputs:
-  - name: dest
+- type: transform
+  name: t1
+  input: src
+  config:
+    cxl: emit x = 1
+- type: output
+  name: dest
+  input: t1
+  config:
+    name: dest
     type: csv
     path: /tmp/clinker_test_out.csv
-transformations:
-  - name: t1
-    cxl: "emit x = 1"
 "#;
         let config = config::parse_config(yaml).unwrap();
         let result: Result<_, PipelineError> = Err(PipelineError::Io(std::io::Error::new(
@@ -313,11 +343,11 @@ transformations:
     fn filter_yaml(cxl: &str) -> String {
         let indented: String = cxl
             .lines()
-            .map(|l| format!("      {l}"))
+            .map(|l| format!("        {l}"))
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "pipeline:\n  name: filter_test\ninputs:\n  - name: src\n    type: csv\n    path: input.csv\noutputs:\n  - name: dest\n    type: csv\n    path: output.csv\ntransformations:\n  - name: t1\n    cxl: |\n{indented}\n"
+            "pipeline:\n  name: filter_test\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n  - type: transform\n    name: t1\n    input: src\n    config:\n      cxl: |\n{indented}\n  - type: output\n    name: dest\n    input: t1\n    config:\n      name: dest\n      type: csv\n      path: output.csv\n"
         )
     }
 
@@ -669,20 +699,30 @@ pipeline:
   name: filter_err
 error_handling:
   strategy: continue
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     type: csv
     path: input.csv
-outputs:
-  - name: dest
+- type: transform
+  name: t1
+  input: src
+  config:
+    cxl: 'filter amount.to_int() > 0
+
+      emit out_name = name
+
+      '
+- type: output
+  name: dest
+  input: t1
+  config:
+    name: dest
     type: csv
     path: output.csv
     include_unmapped: true
-transformations:
-  - name: t1
-    cxl: |
-      filter amount.to_int() > 0
-      emit out_name = name
 "#;
         let csv = "name,amount\nAlice,10\nBob,bad\nCharlie,5\n";
         let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();

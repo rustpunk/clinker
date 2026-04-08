@@ -127,23 +127,40 @@ fn test_e2e_meta_cross_transform() {
     let yaml = r#"
 pipeline:
   name: meta_cross_transform
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: tag
-    cxl: |
-      emit $meta.tier = "high"
+- type: transform
+  name: tag
+  input: src
+  config:
+    cxl: 'emit $meta.tier = "high"
+
       emit name = name
+
       emit value = value
-  - name: use_meta
-    cxl: |
-      emit name = name
+
+      '
+- type: transform
+  name: use_meta
+  input: tag
+  config:
+    cxl: 'emit name = name
+
       emit value = value
+
       emit tier_copy = $meta.tier
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: use_meta
+  config:
+    name: out
     path: output.csv
     type: csv
 "#;
@@ -179,19 +196,31 @@ fn test_e2e_meta_include_in_output() {
     let yaml = r#"
 pipeline:
   name: meta_include_output
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: tag
-    cxl: |
-      emit $meta.tier = "gold"
+- type: transform
+  name: tag
+  input: src
+  config:
+    cxl: 'emit $meta.tier = "gold"
+
       emit $meta.region = "US"
+
       emit name = name
+
       emit value = value
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: tag
+  config:
+    name: out
     path: output.csv
     type: csv
     include_metadata: all
@@ -238,18 +267,28 @@ fn test_e2e_split_by_count() {
         r#"
 pipeline:
   name: split_by_count
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: passthrough
-    cxl: |
-      emit id = id
+- type: transform
+  name: passthrough
+  input: src
+  config:
+    cxl: 'emit id = id
+
       emit value = value
-outputs:
-  - name: out
-    path: "{}"
+
+      '
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
+    path: '{}'
     type: csv
     split:
       max_records: 30
@@ -337,20 +376,30 @@ fn test_e2e_split_preserves_groups() {
         r#"
 pipeline:
   name: split_groups
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
     sort_order:
-      - employee_id
-transformations:
-  - name: passthrough
-    cxl: |
-      emit emp = employee_id
+    - employee_id
+- type: transform
+  name: passthrough
+  input: src
+  config:
+    cxl: 'emit emp = employee_id
+
       emit val = value
-outputs:
-  - name: out
-    path: "{}"
+
+      '
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
+    path: '{}'
     type: csv
     split:
       max_records: 5
@@ -456,20 +505,30 @@ fn test_e2e_correlated_dlq() {
     let yaml = r#"
 pipeline:
   name: correlated_dlq_e2e
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
 error_handling:
   strategy: continue
   correlation_key: employee_id
-transformations:
-  - name: validate
-    cxl: |
-      emit emp = employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit emp = employee_id
+
       emit val = value.to_int()
-outputs:
-  - name: out
+
+      '
+- type: output
+  name: out
+  input: validate
+  config:
+    name: out
     path: output.csv
     type: csv
     include_unmapped: true
@@ -550,28 +609,44 @@ fn test_e2e_multi_output_split() {
         r#"
 pipeline:
   name: multi_output_split
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: classify
-    cxl: |
-      emit id = id
+- type: transform
+  name: classify_emit
+  input: src
+  config:
+    cxl: 'emit id = id
+
       emit amount_val = amount.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "amount_val > 100"
-      default: low
-outputs:
-  - name: high
-    path: "{}"
+
+      '
+- type: route
+  name: classify
+  input: classify_emit
+  config:
+    conditions:
+      high: amount_val > 100
+    default: low
+- type: output
+  name: high
+  input: classify
+  config:
+    name: high
+    path: '{}'
     type: csv
     split:
       max_records: 3
-  - name: low
-    path: "{}"
+- type: output
+  name: low
+  input: classify
+  config:
+    name: low
+    path: '{}'
     type: csv
     split:
       max_records: 4
@@ -637,27 +712,45 @@ fn test_e2e_meta_in_route_condition() {
     let yaml = r#"
 pipeline:
   name: meta_route
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: input.csv
     type: csv
-transformations:
-  - name: tag_tier
-    cxl: |
-      let amt = amount.to_int()
+- type: transform
+  name: tag_tier_emit
+  input: src
+  config:
+    cxl: 'let amt = amount.to_int()
+
       emit $meta.tier = if amt > 1000 then "high" else "low"
+
       emit name = name
+
       emit amount = amount
-    route:
-      branches:
-        - name: premium
-          condition: "$meta.tier == 'high'"
-      default: standard
-outputs:
-  - name: premium
+
+      '
+- type: route
+  name: tag_tier
+  input: tag_tier_emit
+  config:
+    conditions:
+      premium: $meta.tier == 'high'
+    default: standard
+- type: output
+  name: premium
+  input: tag_tier
+  config:
+    name: premium
     path: premium.csv
     type: csv
-  - name: standard
+- type: output
+  name: standard
+  input: tag_tier
+  config:
+    name: standard
     path: standard.csv
     type: csv
 "#;
