@@ -57,6 +57,6 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [source] employees
-  │ [transform] tier_flag
-  │ [output] results
+  ● [source] employees (line:5)
+  │ [transform] tier_flag (line:14)
+  │ [output] results (line:24)

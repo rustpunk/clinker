@@ -232,6 +232,13 @@ pub(crate) struct PlanTransformSpec {
     pub route: Option<crate::config::RouteConfig>,
     pub analytic_window: Option<serde_json::Value>,
     pub input: ResolvedInput,
+    /// Task 16b.8 — 1-based source line of this node's YAML
+    /// declaration, threaded off `Spanned<PipelineNode>::referenced`.
+    /// Zero = unknown (legacy fallback path or a saphyr location
+    /// lost inside a tagged-enum/flatten edge case). Consumed by
+    /// `ExecutionPlanDag::compile` to populate `PlanNode::*.span` via
+    /// `crate::span::Span::line_only`.
+    pub line: u32,
 }
 
 /// Resolved upstream wiring for a [`PlanTransformSpec`]. The legacy
@@ -329,6 +336,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
         };
         let mut specs = Vec::with_capacity(config.nodes.len());
         for spanned in &config.nodes {
+            let line = spanned.referenced.line() as u32;
             match &spanned.value {
                 PipelineNode::Transform {
                     header,
@@ -341,6 +349,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         route: None,
                         analytic_window: body.analytic_window.clone(),
                         input: resolve_header_input(&header.input),
+                        line,
                     });
                 }
                 PipelineNode::Aggregate {
@@ -359,6 +368,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         route: None,
                         analytic_window: None,
                         input: resolve_header_input(&header.input),
+                        line,
                     });
                 }
                 PipelineNode::Route {
@@ -385,6 +395,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         route: Some(route),
                         analytic_window: None,
                         input: resolve_header_input(&header.input),
+                        line,
                     });
                 }
                 PipelineNode::Source { .. }
@@ -814,13 +825,32 @@ impl ExecutionPlanDag {
 
         // --- Phase 1: Add all nodes ---
 
+        // Task 16b.8 — map node name → 1-based YAML source line, used
+        // to populate `PlanNode.span` via `Span::line_only`. Built once
+        // per compile() from `config.nodes`, which carries
+        // `Spanned<PipelineNode>` entries whose `referenced.line()`
+        // is the saphyr-reported source line.
+        let line_by_name: HashMap<String, u32> = config
+            .nodes
+            .iter()
+            .map(|s| (s.value.name().to_string(), s.referenced.line() as u32))
+            .collect();
+        let span_for = |name: &str| -> Span {
+            line_by_name
+                .get(name)
+                .copied()
+                .filter(|l| *l > 0)
+                .map(Span::line_only)
+                .unwrap_or(Span::SYNTHETIC)
+        };
+
         // Source nodes
         for input in &source_configs {
             add_node(
                 &mut graph,
                 PlanNode::Source {
                     name: input.name.clone(),
-                    span: Span::SYNTHETIC,
+                    span: span_for(&input.name),
                     resolved: None,
                 },
                 &mut node_by_name,
@@ -868,6 +898,15 @@ impl ExecutionPlanDag {
             //    `PlanNode::Aggregation` instead of `PlanNode::Transform`.
             //    D4: aggregates use a single dedicated plan node. D6:
             //    routes and multi-input merges are forbidden on aggregates.
+            // Task 16b.8 — convert the spec's 1-based source line to a
+            // `Span::line_only` so `--explain`'s annotation pass can
+            // render `(line:N)` against this node. Zero line = legacy
+            // path with no span info, which maps to `Span::SYNTHETIC`.
+            let spec_span = if tc.line > 0 {
+                Span::line_only(tc.line)
+            } else {
+                Span::SYNTHETIC
+            };
             if let Some(agg_cfg) = tc.aggregate.as_ref() {
                 if tc.route.is_some() {
                     return Err(PlanError::AggregateWithRoute {
@@ -916,7 +955,7 @@ impl ExecutionPlanDag {
                     &mut graph,
                     PlanNode::Aggregation {
                         name: tc.name.clone(),
-                        span: Span::SYNTHETIC,
+                        span: spec_span,
                         config: agg_cfg.clone(),
                         compiled: Arc::new(compiled_agg),
                         strategy: AggregateStrategy::Hash,
@@ -936,7 +975,7 @@ impl ExecutionPlanDag {
                 &mut graph,
                 PlanNode::Transform {
                     name: tc.name.clone(),
-                    span: Span::SYNTHETIC,
+                    span: spec_span,
                     resolved: None,
                     parallelism_class,
                     tier: 0, // assigned later via BFS
@@ -956,7 +995,7 @@ impl ExecutionPlanDag {
                     &mut graph,
                     PlanNode::Route {
                         name: format!("route_{}", tc.name),
-                        span: Span::SYNTHETIC,
+                        span: spec_span,
                         mode: rc.mode,
                         branches: rc.branches.iter().map(|b| b.name.clone()).collect(),
                         default: rc.default.clone(),
@@ -966,13 +1005,18 @@ impl ExecutionPlanDag {
                 )?;
             }
 
-            // Merge node for multiple inputs
+            // Merge node for multiple inputs. Planner-synthesized:
+            // the merge PlanNode is emitted from the downstream
+            // consumer's span, since there is no source-level Merge
+            // declaration in this legacy code path (the `Multi`
+            // `ResolvedInput` was derived from the consumer's
+            // `inputs:` list upstream).
             if let ResolvedInput::Multi(_) = &tc.input {
                 add_node(
                     &mut graph,
                     PlanNode::Merge {
                         name: format!("merge_{}", tc.name),
-                        span: Span::SYNTHETIC,
+                        span: spec_span,
                     },
                     &mut node_by_name,
                     &mut slug_set,
@@ -986,7 +1030,7 @@ impl ExecutionPlanDag {
                 &mut graph,
                 PlanNode::Output {
                     name: output.name.clone(),
-                    span: Span::SYNTHETIC,
+                    span: span_for(&output.name),
                     resolved: None,
                 },
                 &mut node_by_name,
@@ -1416,45 +1460,67 @@ impl ExecutionPlanDag {
     ///
     /// Fork points show `├──>` per branch, merge points show `└──<`.
     /// Linear nodes show `│` continuation.
+    ///
+    /// Task 16b.8 polish:
+    ///   - Route and Aggregation both render as their own sibling line
+    ///     at their topo position (no visual nesting).
+    ///   - Each line is annotated with `(line:N)` when the underlying
+    ///     `PlanNode.span` carries a known source line (via
+    ///     [`crate::span::Span::synthetic_line_number`]).
+    ///   - Route forks emit one `├──> branch → target` line per branch
+    ///     (branch name is the `RouteBody.conditions` key, which is
+    ///     also the downstream consumer node name).
     pub fn explain_text(&self, config: &PipelineConfig) -> String {
         let mut out = self.explain_full(config);
 
         out.push_str("=== DAG Topology ===\n\n");
         for &idx in &self.topo_order {
             let node = &self.graph[idx];
+            let line_suffix = match node.span().synthetic_line_number() {
+                Some(line) => format!(" (line:{line})"),
+                None => String::new(),
+            };
             match node {
                 PlanNode::Route {
                     name,
                     mode,
                     branches,
+                    default,
                     ..
                 } => {
                     let mode_str = match mode {
                         RouteMode::Exclusive => "exclusive",
                         RouteMode::Inclusive => "inclusive",
                     };
-                    out.push_str(&format!("  ◆ FORK [{mode_str}] '{name}'\n"));
+                    out.push_str(&format!(
+                        "  ◆ FORK [route:{mode_str}] '{name}'{line_suffix}\n"
+                    ));
                     for branch in branches {
-                        out.push_str(&format!("  ├──> {branch}\n"));
+                        out.push_str(&format!("  ├──> {branch} → {branch}\n"));
                     }
+                    out.push_str(&format!("  ├──> default → {default}\n"));
                 }
                 PlanNode::Merge { name, .. } => {
-                    out.push_str(&format!("  └──< MERGE '{name}'\n"));
+                    out.push_str(&format!("  └──< MERGE '{name}'{line_suffix}\n"));
+                }
+                PlanNode::Aggregation { .. } => {
+                    // Sibling rendering: Aggregation gets its own topo
+                    // line, not nested inside an upstream Transform.
+                    out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
                 }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
-                | PlanNode::Sort { .. }
-                | PlanNode::Aggregation { .. } => {
+                | PlanNode::Sort { .. } => {
                     let deps: Vec<String> = self
                         .graph
                         .neighbors_directed(idx, petgraph::Direction::Incoming)
                         .map(|pred| self.graph[pred].name().to_string())
                         .collect();
                     if deps.is_empty() {
-                        out.push_str(&format!("  ● {}\n", node.display_name()));
+                        out.push_str(&format!("  ● {}{line_suffix}\n", node.display_name()));
                     } else {
-                        out.push_str(&format!("  │ {}\n", node.display_name()));
+                        out.push_str(&format!("  │ {}{line_suffix}\n", node.display_name()));
                     }
                 }
             }
@@ -1935,6 +2001,11 @@ impl ExecutionPlanDag {
             return Ok(());
         }
 
+        // Task 16b.8 — planner-synthesized correlation sort enforcer.
+        // This node has no source-level declaration; it is derived
+        // from the primary source's correlation key and inserted on
+        // every outgoing edge. `Span::SYNTHETIC` is the correct span
+        // here because no YAML node exists for it.
         let sort_node = PlanNode::Sort {
             name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
             span: Span::SYNTHETIC,
@@ -2057,6 +2128,11 @@ impl ExecutionPlanDag {
             let dep_type = self.graph[edge_id].dependency_type;
             self.graph.remove_edge(edge_id);
 
+            // Task 16b.8 — planner-synthesized sort enforcer (D46/D47).
+            // No YAML node exists for it; it is derived from the
+            // consumer's `RequiresSortedInput` requirement and
+            // inserted on the edge from the upstream source.
+            // `Span::SYNTHETIC` is correct.
             let consumer_name = self.graph[consumer_idx].name().to_string();
             let sort_node = PlanNode::Sort {
                 name: format!("{ENFORCER_SORT_PREFIX}{consumer_name}"),

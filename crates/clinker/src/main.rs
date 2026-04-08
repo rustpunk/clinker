@@ -245,7 +245,7 @@ fn main() -> ExitCode {
             match run(args) {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
-                    tracing::error!("{e}");
+                    render_pipeline_error(&e, &args.config);
                     match &e {
                         PipelineError::Config(_)
                         | PipelineError::Schema(_)
@@ -277,6 +277,72 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Task 16b.8 — render a `PipelineError` via miette with the YAML
+/// source attached as a `NamedSource`, falling back to plain-text
+/// output when the config file is unreadable.
+///
+/// Every rendered diagnostic carries the source filename so CLI
+/// output contains the `.yaml` path as part of the message or the
+/// attached `NamedSource` header. The regression test
+/// `test_diagnostic_renders_via_miette_in_cli` asserts that stderr
+/// contains the config filename when a bad YAML is passed.
+fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
+    use miette::{Diagnostic, NamedSource, Report, Severity};
+    use std::fmt;
+
+    // Best-effort source attach. If the config file is unreadable
+    // we still render the raw error via miette's graphical handler
+    // so the user sees consistent formatting.
+    let source_text = std::fs::read_to_string(config_path).ok();
+    let filename = config_path.to_string_lossy().into_owned();
+
+    /// Hand-rolled `Error + Diagnostic` wrapper so we can attach a
+    /// `NamedSource` without pulling in a new `thiserror` dependency
+    /// in the binary crate.
+    struct WrappedPipelineError {
+        filename: String,
+        message: String,
+        src: Option<NamedSource<String>>,
+    }
+
+    impl fmt::Debug for WrappedPipelineError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}: {}", self.filename, self.message)
+        }
+    }
+
+    impl fmt::Display for WrappedPipelineError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "pipeline error in {}: {}", self.filename, self.message)
+        }
+    }
+
+    impl std::error::Error for WrappedPipelineError {}
+
+    impl Diagnostic for WrappedPipelineError {
+        fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+            Some(Box::new("clinker::pipeline_error"))
+        }
+        fn severity(&self) -> Option<Severity> {
+            Some(Severity::Error)
+        }
+        fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+            self.src.as_ref().map(|s| s as &dyn miette::SourceCode)
+        }
+    }
+
+    let wrapped = WrappedPipelineError {
+        filename: filename.clone(),
+        message: err.to_string(),
+        src: source_text
+            .as_ref()
+            .map(|s| NamedSource::new(filename.clone(), s.clone())),
+    };
+
+    let report = Report::new(wrapped);
+    eprintln!("{report:?}");
 }
 
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {

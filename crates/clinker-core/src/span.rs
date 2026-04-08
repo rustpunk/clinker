@@ -67,6 +67,38 @@ impl Span {
         }
     }
 
+    /// Task 16b.8 — synthetic span carrying a known 1-based source line
+    /// but no interned `SourceDb`/byte-offset. Used by
+    /// `PipelineConfig::compile()` stage 5 so `--explain` can render
+    /// `(line:N)` annotations against each lowered node without
+    /// requiring a `SourceDb` to be threaded through the compile path.
+    ///
+    /// Encoded as: `file = SYNTHETIC_FILE_ID` (u32::MAX), `start = line`,
+    /// `len = 0`. Callers that want the embedded line number use
+    /// [`Span::synthetic_line_number`].
+    pub const fn line_only(line: u32) -> Self {
+        Self {
+            file: FileId(match NonZeroU32::new(u32::MAX) {
+                Some(v) => v,
+                None => unreachable!(),
+            }),
+            start: line,
+            len: 0,
+        }
+    }
+
+    /// If this span is a [`Span::line_only`]-flavored synthetic span,
+    /// return the embedded 1-based line number. Returns `None` for
+    /// real (file-backed) spans, for `Span::SYNTHETIC`, and for any
+    /// other non-line-only synthetic.
+    pub fn synthetic_line_number(self) -> Option<u32> {
+        if self.file.get() == u32::MAX && self.len == 0 && self.start > 0 {
+            Some(self.start)
+        } else {
+            None
+        }
+    }
+
     /// Exclusive end byte offset.
     pub const fn end(&self) -> u32 {
         self.start + self.len

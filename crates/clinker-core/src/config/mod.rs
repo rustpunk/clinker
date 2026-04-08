@@ -993,13 +993,27 @@ impl PipelineConfig {
         use std::collections::BTreeMap;
 
         let mut diags = Vec::new();
+        // Task 16b.8 — span_for(spanned) converts a per-node saphyr
+        // `Spanned<PipelineNode>` into a `LabeledSpan` carrying a
+        // `Span::line_only` synthetic span with the real source line,
+        // or `Span::SYNTHETIC` when saphyr could not capture a
+        // location (the documented tagged-enum / flatten edge case).
+        let span_for = |spanned: &Spanned<PipelineNode>| -> LabeledSpan {
+            let line = spanned.referenced.line() as u32;
+            let s = if line > 0 {
+                Span::line_only(line)
+            } else {
+                Span::SYNTHETIC
+            };
+            LabeledSpan::primary(s, String::new())
+        };
+        // Fallback for diagnostics with no per-node context (stage 3
+        // cycle detection emits one diagnostic for the whole DAG).
         let synth = || LabeledSpan::primary(Span::SYNTHETIC, String::new());
 
         // ── Stage 1: duplicate names ────────────────────────────────
         // Names are case-sensitive (matches Unix FS, Airflow, Beam).
         // Exact duplicates → E001 error. Case-only duplicates → W002.
-        // Wave 1 carries `Span::SYNTHETIC` on every diagnostic; Wave 2
-        // plumbs real spans via the `Spanned<PipelineNode>` outer wrap.
         let mut seen_exact: BTreeMap<String, ()> = BTreeMap::new();
         let mut by_name_lower: BTreeMap<String, String> = BTreeMap::new();
         for spanned in &self.nodes {
@@ -1009,7 +1023,7 @@ impl PipelineConfig {
                 diags.push(Diagnostic::error(
                     "E001",
                     format!("duplicate node name: {name:?}"),
-                    synth(),
+                    span_for(spanned),
                 ));
                 continue;
             }
@@ -1021,7 +1035,7 @@ impl PipelineConfig {
                         "node names differ only in case ({prev_name:?} vs {name:?}); \
                          this is allowed but discouraged"
                     ),
-                    synth(),
+                    span_for(spanned),
                 ));
             } else {
                 by_name_lower.insert(lower, name.to_string());
@@ -1055,7 +1069,7 @@ impl PipelineConfig {
                 diags.push(Diagnostic::error(
                     "E002",
                     format!("node {name:?} lists itself as an input"),
-                    synth(),
+                    span_for(spanned),
                 ));
             }
         }
@@ -1130,7 +1144,7 @@ impl PipelineConfig {
                         "transform name {name:?} is invalid: '.' is reserved \
                          for branch references (use underscores or hyphens)"
                     ),
-                    synth(),
+                    span_for(spanned),
                 ));
             }
         }
@@ -1155,7 +1169,7 @@ impl PipelineConfig {
                                 "transform {name:?}: log directive #{}: every must be >= 1",
                                 i + 1
                             ),
-                            synth(),
+                            span_for(spanned),
                         ));
                     }
                     if d.when != LogTiming::PerRecord {
@@ -1165,7 +1179,7 @@ impl PipelineConfig {
                                 "transform {name:?}: log directive #{}: 'every' is only valid with when: per_record",
                                 i + 1
                             ),
-                            synth(),
+                            span_for(spanned),
                         ));
                     }
                 }
@@ -1227,14 +1241,23 @@ impl PipelineConfig {
         // Aggregate variants are deferred to Wave 3 (require CXL
         // type-checking) — they emit a TODO diagnostic and are skipped.
         for spanned in &self.nodes {
-            // Wave 2: serde-saphyr `Spanned<PipelineNode>::referenced` is a
-            // `Location` keyed off the parser's offset table, but our
-            // `crate::span::Span` carries a `FileId` interned by `SourceDb`
-            // and there is no `SourceDb` plumbed through `compile()` yet
-            // (Wave 3 wires the file-id during the YAML parse). For now
-            // every lowered node carries `Span::SYNTHETIC`; the field
-            // exists, the plumbing hook lands here.
-            let span = Span::SYNTHETIC;
+            // Task 16b.8 — thread the real source line number off the
+            // saphyr `Spanned<PipelineNode>::referenced` Location. We do
+            // not yet have a `SourceDb`/`FileId` threaded through
+            // `compile()` (that lands when the CLI parses via a helper
+            // that interns into a SourceDb, Phase 16c), so we encode
+            // the line via `Span::line_only` — a synthetic span whose
+            // `start` field carries the 1-based line number. `--explain`
+            // renders `(line:N)` from it. If saphyr did not capture a
+            // line (e.g. the `defined` location is UNKNOWN in a
+            // serde-saphyr tagged-enum/flatten edge case), fall back to
+            // `Span::SYNTHETIC`.
+            let saphyr_line = spanned.referenced.line();
+            let span = if saphyr_line > 0 {
+                Span::line_only(saphyr_line as u32)
+            } else {
+                Span::SYNTHETIC
+            };
             let node = &spanned.value;
             let name = node.name().to_string();
             let plan_node = match node {

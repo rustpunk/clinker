@@ -69,7 +69,7 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [source] sales
-  │ [transform] active_only
-  │ [aggregation:streaming] by_dept
-  │ [output] dept_totals
+  ● [source] sales (line:5)
+  │ [transform] active_only (line:14)
+  ◇ [aggregation:streaming] by_dept (line:26)
+  │ [output] dept_totals (line:35)
