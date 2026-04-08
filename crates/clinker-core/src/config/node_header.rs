@@ -4,7 +4,7 @@
 //! will wire them into the enum itself; for now they stand alone so the
 //! foundation tests can lock their shapes in.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A reference to a producer node from a consumer's `input:` field.
 ///
@@ -15,6 +15,16 @@ use serde::Deserialize;
 pub enum NodeInput {
     Single(String),
     Port { node: String, port: String },
+}
+
+impl Serialize for NodeInput {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let rendered = match self {
+            NodeInput::Single(name) => name.clone(),
+            NodeInput::Port { node, port } => format!("{node}.{port}"),
+        };
+        s.serialize_str(&rendered)
+    }
 }
 
 impl<'de> Deserialize<'de> for NodeInput {
@@ -45,7 +55,7 @@ fn parse_node_input(s: &str) -> Result<NodeInput, String> {
 /// Header shared by every consumer variant (transform, route, aggregate,
 /// output). Every field is validated via `deny_unknown_fields` so typos like
 /// `inputs:` on a consumer node surface as parse errors.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeHeader {
     pub name: String,
@@ -57,7 +67,7 @@ pub struct NodeHeader {
 }
 
 /// Header for source nodes — no `input:` field.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceHeader {
     pub name: String,
@@ -68,7 +78,7 @@ pub struct SourceHeader {
 }
 
 /// Header for merge nodes — takes a list of `inputs:` instead of a single `input:`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MergeHeader {
     pub name: String,

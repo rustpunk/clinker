@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::node_header::{MergeHeader, NodeHeader, SourceHeader};
 use crate::yaml::CxlSource;
@@ -31,7 +31,7 @@ use crate::yaml::CxlSource;
 /// deserializes to a [`PipelineNode`] variant. The variant tag is the
 /// YAML `type:` field; per-variant fields are split between a header
 /// (flattened to top level) and a `config:` block.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PipelineNode {
     Source {
@@ -116,7 +116,7 @@ impl PipelineNode {
 
 /// Source variant body. Wraps the existing source-format configuration
 /// (formats, schemas, sort orders) — see `crate::config::SourceConfig`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBody {
     #[serde(flatten)]
     pub source: crate::config::SourceConfig,
@@ -130,7 +130,7 @@ pub struct SourceBody {
 /// The `analytic_window` field is the Phase 16b rename of the legacy
 /// `local_window` field. The CXL `$window.*` namespace is unrelated and
 /// is preserved unchanged in the cxl crate.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransformBody {
     pub cxl: CxlSource,
@@ -150,7 +150,7 @@ pub struct TransformBody {
 pub type AnalyticWindowSpec = serde_json::Value;
 
 /// Aggregate variant body. Peer to Transform (no longer nested).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregateBody {
     pub group_by: Vec<String>,
@@ -163,7 +163,7 @@ pub struct AggregateBody {
 /// `BTreeMap<String, CxlSource>` for `conditions:`. We accept that
 /// shape via [`Deserialize`] and re-flatten it to the executor's
 /// existing branch-list shape during projection.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBody {
     #[serde(default)]
@@ -174,19 +174,19 @@ pub struct RouteBody {
 
 /// Merge variant body. The plan-specified shape is empty: `inputs:` lives
 /// on `MergeHeader`, not in the body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MergeBody {}
 
 /// Output variant body. Wraps the existing sink config.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputBody {
     #[serde(flatten)]
     pub output: crate::config::OutputConfig,
 }
 
 /// Composition stub body (Phase 16c placeholder).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionBody {
     #[serde(rename = "use")]

@@ -1,22 +1,30 @@
 pipeline:
   name: csv_transform_sink
 
-inputs:
-  - name: employees
-    type: csv
-    path: ./data/employees.csv
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: ./data/employees.csv
+      options:
+        has_header: true
 
-outputs:
-  - name: results
-    type: csv
-    path: ./output/csv_transform_sink.csv
+  - type: transform
+    name: tier_flag
+    input: employees
+    config:
+      cxl: |
+        emit id = id
+        emit name = name
+        emit salary = salary
+        emit tier = if salary.to_int() >= 90000 then "senior" else "junior"
 
-transformations:
-  - name: tier_flag
-    cxl: |
-      emit id = id
-      emit name = name
-      emit salary = salary
-      emit tier = if salary.to_int() >= 90000 then "senior" else "junior"
+  - type: output
+    name: results
+    input: tier_flag
+    config:
+      name: results
+      type: csv
+      path: ./output/csv_transform_sink.csv

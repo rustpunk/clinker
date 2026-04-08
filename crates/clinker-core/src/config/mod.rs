@@ -1695,9 +1695,170 @@ pub fn interpolate_env_vars(
 /// chokepoint that owns the DoS-defense [`Budget`].
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml, &[])?;
-    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    project_nodes_to_legacy(&mut config);
     validate_config(&config)?;
     Ok(config)
+}
+
+/// Phase 16b Wave 3 — projection shim (Path 3A).
+///
+/// If the pipeline was authored under the new `nodes:` taxonomy, walk
+/// the node list and synthesize the equivalent entries in the legacy
+/// `inputs:`/`outputs:`/`transformations:` vectors. This keeps the
+/// legacy executor / planner / tests on their current code paths while
+/// fixture files have migrated to the unified shape. Wave 4 cuts the
+/// executor over to `&CompiledPlan` and deletes this shim entirely.
+///
+/// Behaviour rules:
+///   * If `nodes` is empty, this is a no-op (legacy fixture).
+///   * If any of `inputs`/`outputs`/`transformations` is already
+///     populated, projection is skipped — legacy authorship wins, new
+///     authorship was never triggered.
+///   * Merge variants have no legacy analogue and are elided (no
+///     projection). Fixtures using Merge can only be exercised by the
+///     new `compile()` path / Wave 4 executor.
+///   * Composition variants are also elided (Phase 16c).
+///   * Aggregate variants project to a legacy transform carrying
+///     `aggregate: Some(AggregateConfig { .. })`.
+///   * Route variants project to a legacy transform carrying
+///     `route: Some(RouteConfig { .. })`; the transform's `cxl` is
+///     left blank — the route body itself drives dispatch.
+pub fn project_nodes_to_legacy(config: &mut PipelineConfig) {
+    use crate::config::node_header::NodeInput;
+
+    if config.nodes.is_empty() {
+        return;
+    }
+    if !config.inputs.is_empty() || !config.outputs.is_empty() || !config.transformations.is_empty()
+    {
+        return;
+    }
+
+    fn flatten_input(n: &NodeInput) -> String {
+        match n {
+            NodeInput::Single(s) => s.clone(),
+            NodeInput::Port { node, port } => format!("{node}.{port}"),
+        }
+    }
+
+    // Collect source names up-front so that any transform whose `input:`
+    // points at a source projects to `None` (legacy implicit-chain-from-
+    // previous-source/transform), bypassing `resolve_input_reference`
+    // which only understands transform/aggregate/route targets.
+    let source_names: std::collections::HashSet<String> = config
+        .nodes
+        .iter()
+        .filter_map(|s| match &s.value {
+            PipelineNode::Source { header, .. } => Some(header.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let project_input = |hdr_input: &NodeInput| -> Option<TransformInput> {
+        let flat = flatten_input(hdr_input);
+        let bare = flat.split('.').next().unwrap_or(&flat);
+        if source_names.contains(bare) {
+            // Let legacy implicit linear chain wire this up.
+            None
+        } else {
+            Some(TransformInput::Single(flat))
+        }
+    };
+
+    for spanned in &config.nodes {
+        match &spanned.value {
+            PipelineNode::Source { config: body, .. } => {
+                config.inputs.push(body.source.clone());
+            }
+            PipelineNode::Output { config: body, .. } => {
+                config.outputs.push(body.output.clone());
+            }
+            PipelineNode::Transform {
+                header,
+                config: body,
+            } => {
+                let tc = TransformConfig {
+                    name: header.name.clone(),
+                    description: header.description.clone(),
+                    cxl: Some(body.cxl.source.as_str().to_string()),
+                    aggregate: None,
+                    local_window: body.analytic_window.clone(),
+                    log: body.log.clone(),
+                    validations: body.validations.clone(),
+                    route: None,
+                    input: project_input(&header.input),
+                    notes: header.notes.clone(),
+                };
+                config.transformations.push(TransformEntry::Transform(tc));
+            }
+            PipelineNode::Aggregate {
+                header,
+                config: body,
+            } => {
+                let agg = AggregateConfig {
+                    group_by: body.group_by.clone(),
+                    cxl: body.cxl.source.as_str().to_string(),
+                    strategy: body.strategy,
+                };
+                let tc = TransformConfig {
+                    name: header.name.clone(),
+                    description: header.description.clone(),
+                    cxl: None,
+                    aggregate: Some(agg),
+                    local_window: None,
+                    log: None,
+                    validations: None,
+                    route: None,
+                    input: project_input(&header.input),
+                    notes: header.notes.clone(),
+                };
+                config.transformations.push(TransformEntry::Transform(tc));
+            }
+            PipelineNode::Route {
+                header,
+                config: body,
+            } => {
+                // Project BTreeMap<String, CxlSource> → Vec<RouteBranch>.
+                // BTreeMap iteration is lexicographic; legacy route
+                // evaluation is first-match-wins in declaration order,
+                // so callers that need ordering must stick to the
+                // lexicographic contract until Wave 4 plumbs the new
+                // evaluator through.
+                let branches: Vec<RouteBranch> = body
+                    .conditions
+                    .iter()
+                    .map(|(name, cxl)| RouteBranch {
+                        name: name.clone(),
+                        condition: cxl.source.as_str().to_string(),
+                    })
+                    .collect();
+                let route = RouteConfig {
+                    mode: body.mode,
+                    branches,
+                    default: body.default.clone(),
+                };
+                let tc = TransformConfig {
+                    name: header.name.clone(),
+                    description: header.description.clone(),
+                    cxl: Some(String::new()),
+                    aggregate: None,
+                    local_window: None,
+                    log: None,
+                    validations: None,
+                    route: Some(route),
+                    input: project_input(&header.input),
+                    notes: header.notes.clone(),
+                };
+                config.transformations.push(TransformEntry::Transform(tc));
+            }
+            PipelineNode::Merge { .. } | PipelineNode::Composition { .. } => {
+                // No legacy analogue — intentionally elided. Wave 4
+                // cuts executor over to `&CompiledPlan` and this shim
+                // disappears entirely.
+            }
+        }
+    }
 }
 
 /// Reserved pipeline member names that cannot be used as user variable names.
@@ -1837,7 +1998,8 @@ pub fn load_config_with_vars(
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
-    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    project_nodes_to_legacy(&mut config);
     validate_config(&config)?;
     Ok(config)
 }

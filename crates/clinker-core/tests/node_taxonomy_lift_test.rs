@@ -360,15 +360,33 @@ nodes:
 // ---------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(16b Wave 3): PipelineNode does not yet derive Serialize"]
-fn test_pipeline_node_serialize_then_parse_round_trip() {}
+fn test_pipeline_node_serialize_then_parse_round_trip() {
+    // Proves PipelineNode: Serialize + Deserialize are symmetric.
+    // Wave 3 landed the Serialize derive on every variant body and
+    // on the NodeHeader family; this round-trips through serde_json
+    // so the YAML-layer span plumbing is not exercised here.
+    let yaml = r#"
+type: transform
+name: clean
+input: input_csv
+config:
+  cxl: |
+    emit foo = "bar"
+"#;
+    let parsed = parse_node(yaml);
+    let json = serde_json::to_string(&parsed.value).expect("serialize");
+    let round_tripped: clinker_core::config::PipelineNode =
+        serde_json::from_str(&json).expect("round-trip deserialize");
+    assert_eq!(round_tripped.name(), "clean");
+    assert_eq!(round_tripped.type_tag(), "transform");
+}
 
 #[test]
-#[ignore = "TODO(16b Wave 3): legacy TransformConfig stays as deprecated shim until Wave 3"]
+#[ignore = "TODO(16b Wave 4): legacy TransformConfig stays as projection-shim type until executor cutover"]
 fn test_no_transform_config_anywhere() {}
 
 #[test]
-#[ignore = "TODO(16b Wave 3): legacy `transformations:` shape still accepted by Wave 1/2 shim"]
+#[ignore = "TODO(16b Wave 4): legacy `transformations:` shape still accepted by Wave 3 projection shim"]
 fn test_pipeline_config_old_shape_fails() {}
 
 // ---------------------------------------------------------------------

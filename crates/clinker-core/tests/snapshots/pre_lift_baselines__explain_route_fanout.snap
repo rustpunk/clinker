@@ -6,14 +6,19 @@ expression: text
 
 Mode: Streaming
 Indices to build: 0
-Transforms: 1
+Transforms: 2
 Output projections: 2
-DAG nodes: 5
+DAG nodes: 6
 
 Source DAG:
   Tier 0: orders
 
 Transform 'classify':
+  Parallelism: Stateless
+  Window index: None
+  Partition lookup: None
+
+Transform 'classify_route':
   Parallelism: Stateless
   Window index: None
   Partition lookup: None
@@ -32,6 +37,12 @@ transform.classify:
   partitioning: Single
   partitioning_provenance: SingleStream
 
+transform.classify_route:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
 output.low:
   ordering: <none>
   ordering_provenance: NoOrdering
@@ -44,13 +55,13 @@ output.high:
   partitioning: Single
   partitioning_provenance: SingleStream
 
-route.route_classify:
+route.route_classify_route:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
 
-Route 'route_classify' (mode: exclusive):
+Route 'route_classify_route' (mode: exclusive):
   Branch 'high' → output 'high'
   Default: 'low' → output 'low'
 
@@ -60,9 +71,12 @@ Transform 'classify':
   emit id = id
   emit amount = amount
 
+Transform 'classify_route':
+
 === Type Annotations ===
 
 Transform 'classify': (types inferred at compile time)
+Transform 'classify_route': (types inferred at compile time)
 
 === Memory Budget ===
 
@@ -73,7 +87,8 @@ Worker threads: 4
 
   ● [source] orders
   │ [transform] classify
+  │ [transform] classify_route
   │ [output] low
   │ [output] high
-  ◆ FORK [exclusive] 'route_classify'
+  ◆ FORK [exclusive] 'route_classify_route'
   ├──> high
