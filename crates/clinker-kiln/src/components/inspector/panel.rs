@@ -26,26 +26,65 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         return rsx! {};
     };
 
-    // Determine stage kind and extract data
-    let input = config.source_configs().find(|i| i.name == stage_id);
-    let transform = config.transform_views().find(|t| t.name == stage_id);
-    let output = config.output_configs().find(|o| o.name == stage_id);
-
-    let (kind_label, kind_attr, subtitle) = if input.is_some() {
-        ("SOURCE", "source", input.unwrap().path.clone())
-    } else if let Some(t) = transform {
-        (
-            "TRANSFORM",
-            "transform",
-            t.description.map(|s| s.to_string()).unwrap_or_default(),
-        )
-    } else if output.is_some() {
-        ("OUTPUT", "output", output.unwrap().path.clone())
-    } else {
+    // Phase 16b Task 16b.5: dispatch inspector content on the
+    // `PipelineNode` variant tag. Every variant is handled explicitly so
+    // adding a new one is a compile break here.
+    use clinker_core::config::PipelineNode;
+    let Some(node_spanned) = config.nodes.iter().find(|n| n.value.name() == stage_id) else {
         return rsx! {};
     };
-
-    let cxl_source = transform.map(|t| t.cxl_source().to_string());
+    let (kind_label, kind_attr, subtitle, cxl_source) = match &node_spanned.value {
+        PipelineNode::Source { config: body, .. } => {
+            ("SOURCE", "source", body.source.path.clone(), None)
+        }
+        PipelineNode::Transform { config: body, .. } => (
+            "TRANSFORM",
+            "transform",
+            String::new(),
+            Some(body.cxl.as_ref().to_string()),
+        ),
+        PipelineNode::Aggregate { config: body, .. } => {
+            let subtitle = if body.group_by.is_empty() {
+                String::new()
+            } else {
+                format!("group_by: {}", body.group_by.join(", "))
+            };
+            (
+                "AGGREGATE",
+                "aggregate",
+                subtitle,
+                Some(body.cxl.as_ref().to_string()),
+            )
+        }
+        PipelineNode::Route { config: body, .. } => {
+            let subtitle = format!(
+                "{} branch{} → {}",
+                body.conditions.len(),
+                if body.conditions.len() == 1 { "" } else { "es" },
+                body.default
+            );
+            ("ROUTE", "route", subtitle, None)
+        }
+        PipelineNode::Merge { header, .. } => (
+            "MERGE",
+            "merge",
+            format!("{} inputs", header.inputs.len()),
+            None,
+        ),
+        PipelineNode::Output { config: body, .. } => {
+            ("OUTPUT", "output", body.output.path.clone(), None)
+        }
+        PipelineNode::Composition { config: body, .. } => (
+            "COMPOSITION",
+            "composition",
+            format!("use: {} (Phase 16c)", body.r#use.display()),
+            None,
+        ),
+    };
+    let is_source_or_output = matches!(
+        &node_spanned.value,
+        PipelineNode::Source { .. } | PipelineNode::Output { .. }
+    );
     let drawer_open = (active_drawer)() != ActiveDrawer::None;
 
     rsx! {
@@ -80,7 +119,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
                         div {
                             class: "kiln-cxl-field",
                             label { class: "kiln-cxl-label",
-                                if input.is_some() || output.is_some() { "PATH" } else { "DESCRIPTION" }
+                                if is_source_or_output { "PATH" } else { "DESCRIPTION" }
                             }
                             div {
                                 class: "kiln-inspector-value",
