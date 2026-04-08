@@ -1707,23 +1707,21 @@ fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
         return;
     }
 
-    // Skip the reverse lift for legacy configs whose shape has no
-    // clean equivalent in the unified `nodes:` taxonomy yet:
-    //   * Multi-input transforms — `NodeHeader::input` is a single
-    //     `NodeInput`, not a list. Legacy `TransformInput::Multiple`
-    //     has no single-header peer; Checkpoint D2 will synthesize a
-    //     Merge node upstream. Leave multi-input configs on the legacy
-    //     path until then.
-    //
-    // Routes are now liftable: `RouteBody::conditions` is an
-    // `IndexMap` (Checkpoint D1), preserving declaration order.
-    let has_unsupported_shape = config
-        .transformations
+    // All legacy shapes are now liftable:
+    //   * Routes — `RouteBody::conditions` is an `IndexMap`
+    //     preserving declaration order (Checkpoint D1).
+    //   * Multi-input transforms — synthesized as a `Merge` node
+    //     upstream of the transform, wired via its name (D2).
+
+    // Pre-collect all existing node names (sources, transforms,
+    // outputs) so synthesized Merge names can avoid collisions.
+    let mut taken_names: std::collections::HashSet<String> = config
+        .inputs
         .iter()
-        .any(|tc| matches!(tc.input, Some(TransformInput::Multiple(_))));
-    if has_unsupported_shape {
-        return;
-    }
+        .map(|s| s.name.clone())
+        .chain(config.transformations.iter().map(|t| t.name.clone()))
+        .chain(config.outputs.iter().map(|o| o.name.clone()))
+        .collect();
 
     let mut synthesized: Vec<Spanned<PipelineNode>> = Vec::with_capacity(
         config.inputs.len() + config.transformations.len() + config.outputs.len(),
@@ -1755,17 +1753,41 @@ fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
         let header_input = match &tc.input {
             Some(TransformInput::Single(s)) => NodeInput::Single(s.clone()),
             Some(TransformInput::Multiple(list)) => {
-                // Multi-input legacy transforms have no direct peer in
-                // the new header shape (which carries a single
-                // NodeInput). The planner's compile() constructs a
-                // synthesized Merge node upstream of a Multi
-                // transform; until the planner cutover consumes
-                // merges directly, we fall back to the first upstream
-                // as the header input and let the legacy projection
-                // continue handling the rest.
-                list.first()
-                    .map(|s| NodeInput::Single(s.clone()))
-                    .unwrap_or_else(|| NodeInput::Single(String::new()))
+                // Synthesize a Merge node upstream of this transform.
+                // The Merge name is `<T>__merge`, disambiguated with a
+                // numeric suffix if the base name collides with any
+                // existing node name.
+                let base = format!("{}__merge", tc.name);
+                let merge_name = if !taken_names.contains(&base) {
+                    base
+                } else {
+                    let mut n = 2usize;
+                    loop {
+                        let candidate = format!("{base}{n}");
+                        if !taken_names.contains(&candidate) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                };
+                taken_names.insert(merge_name.clone());
+
+                let merge_node = PipelineNode::Merge {
+                    header: MergeHeader {
+                        name: merge_name.clone(),
+                        description: None,
+                        inputs: list.iter().map(|s| NodeInput::Single(s.clone())).collect(),
+                        notes: None,
+                    },
+                    config: MergeBody::default(),
+                };
+                synthesized.push(Spanned::new(
+                    merge_node,
+                    Location::UNKNOWN,
+                    Location::UNKNOWN,
+                ));
+
+                NodeInput::Single(merge_name)
             }
             None => match prev_transform_name
                 .as_ref()

@@ -299,6 +299,31 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                 _ => None,
             })
             .collect();
+        // Pre-index Merge nodes by name so a downstream transform
+        // whose `input:` points at a synthesized merge resolves to
+        // `ResolvedInput::Multi(merge.inputs)` — the planner's merge-
+        // aware path then materializes the merge PlanNode from the
+        // downstream spec exactly as in the legacy path.
+        let merge_inputs_by_name: std::collections::HashMap<String, Vec<String>> = config
+            .nodes
+            .iter()
+            .filter_map(|s| match &s.value {
+                PipelineNode::Merge { header, .. } => {
+                    let inputs = header
+                        .inputs
+                        .iter()
+                        .map(|n| match n {
+                            crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                            crate::config::node_header::NodeInput::Port { node, port } => {
+                                format!("{node}.{port}")
+                            }
+                        })
+                        .collect();
+                    Some((header.name.clone(), inputs))
+                }
+                _ => None,
+            })
+            .collect();
         let resolve_header_input = |n: &crate::config::node_header::NodeInput| -> ResolvedInput {
             use crate::config::node_header::NodeInput;
             let flat = match n {
@@ -308,6 +333,8 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
             let bare = flat.split('.').next().unwrap_or(&flat);
             if source_names.contains(bare) {
                 ResolvedInput::Chain
+            } else if let Some(upstreams) = merge_inputs_by_name.get(&flat) {
+                ResolvedInput::Multi(upstreams.clone())
             } else {
                 ResolvedInput::Single(flat)
             }
