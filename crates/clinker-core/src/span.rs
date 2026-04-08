@@ -41,6 +41,23 @@ pub struct Span {
 }
 
 impl Span {
+    /// Synthetic placeholder span for diagnostics produced *before* a file
+    /// has been loaded into a [`SourceDb`] (e.g. path-validation errors
+    /// reported against a raw `PathBuf`). Uses [`u32::MAX`] as the file id
+    /// so it cannot collide with any real [`FileId`] assigned by
+    /// `SourceDb::insert`.
+    ///
+    /// Callers that later learn the owning file and byte range should
+    /// replace the diagnostic's primary span with a real one.
+    pub const SYNTHETIC: Self = Self {
+        file: FileId(match NonZeroU32::new(u32::MAX) {
+            Some(v) => v,
+            None => unreachable!(),
+        }),
+        start: 0,
+        len: 0,
+    };
+
     /// A zero-length span at `offset`.
     pub const fn point(file: FileId, offset: u32) -> Self {
         Self {
@@ -79,9 +96,20 @@ impl SourceDb {
     /// Load a file from disk and intern its contents. Returns the assigned
     /// [`FileId`].
     ///
-    /// This takes a raw [`PathBuf`] for now; Task 16b.1.5 will replace this
-    /// with a `ValidatedPath` newtype.
-    pub fn load(&mut self, path: PathBuf) -> std::io::Result<FileId> {
+    /// Takes a [`crate::security::ValidatedPath`] — the type-level proof that
+    /// the path has been through [`crate::security::validate_path`]. This
+    /// makes it impossible to `load` an unvalidated, potentially adversarial
+    /// path:
+    ///
+    /// ```compile_fail
+    /// use clinker_core::span::SourceDb;
+    /// use std::path::PathBuf;
+    /// let mut db = SourceDb::new();
+    /// // Rejected: `load` will not accept a raw `PathBuf`.
+    /// let _ = db.load(PathBuf::from("/etc/passwd"));
+    /// ```
+    pub fn load(&mut self, path: crate::security::ValidatedPath) -> std::io::Result<FileId> {
+        let path = path.into_inner();
         let contents = std::fs::read_to_string(&path)?;
         Ok(self.insert(path, contents))
     }
