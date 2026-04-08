@@ -1366,7 +1366,7 @@ impl PipelineConfig {
             let _ = any_errors;
         }
 
-        Ok(CompiledPlan::new(dag))
+        Ok(CompiledPlan::new(dag, self.clone(), Vec::new()))
     }
 
     /// Test-only twin of [`compile`] that returns the lowered plan AND

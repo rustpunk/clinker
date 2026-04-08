@@ -138,10 +138,11 @@ impl RecordStorage for NullStorage {
 }
 
 /// Compiled transform: CXL source compiled once, evaluated per record.
-struct CompiledTransform {
+#[derive(Debug)]
+pub struct CompiledTransform {
     #[allow(dead_code)]
-    name: String,
-    typed: Arc<TypedProgram>,
+    pub(crate) name: String,
+    pub(crate) typed: Arc<TypedProgram>,
 }
 
 impl CompiledTransform {
@@ -423,6 +424,23 @@ fn extract_correlation_key(
 pub struct PipelineExecutor;
 
 impl PipelineExecutor {
+    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming public entry point.
+    ///
+    /// Accepts the typed `CompiledPlan` handle returned by
+    /// [`crate::config::PipelineConfig::compile`] and forwards to
+    /// [`Self::run_with_readers_writers`] using the plan's embedded
+    /// [`PipelineConfig`]. This is the forward-compatible entry point;
+    /// the legacy `&PipelineConfig`-consuming variant is retained
+    /// pending the full executor-internal cutover in a follow-up.
+    pub fn run_plan_with_readers_writers(
+        plan: &crate::plan::CompiledPlan,
+        readers: HashMap<String, Box<dyn Read + Send>>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
+        params: &PipelineRunParams,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers(plan.config(), readers, writers, params)
+    }
+
     /// Run with explicit reader/writer registries.
     ///
     /// `readers` and `writers` are keyed by the input/output `name` fields from
