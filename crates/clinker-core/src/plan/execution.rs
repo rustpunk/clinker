@@ -578,8 +578,10 @@ impl ExecutionPlanDag {
         // Phase 16b Wave 4ab Milestone 2: lower TransformConfig to PlanTransformSpec.
         // The spec list is the new post-lowering intermediate; helpers are
         // being migrated to consume it incrementally.
-        let specs: Vec<PlanTransformSpec> =
-            config.transforms().map(PlanTransformSpec::from_legacy).collect();
+        let specs: Vec<PlanTransformSpec> = config
+            .transforms()
+            .map(PlanTransformSpec::from_legacy)
+            .collect();
 
         // Parse analytic_window configs via the spec-taking helper.
         let window_configs: Vec<Option<LocalWindowConfig>> = specs
@@ -636,7 +638,7 @@ impl ExecutionPlanDag {
                 }
 
                 // Check pre-sorted optimization
-                let already_sorted = check_already_sorted(config, &source, &wc.sort_by);
+                let already_sorted = check_already_sorted(&config.inputs, &source, &wc.sort_by);
 
                 raw_requests.push(RawIndexRequest {
                     source,
@@ -652,7 +654,7 @@ impl ExecutionPlanDag {
         let indices = index::deduplicate_indices(raw_requests.clone());
 
         // Build source DAG
-        let source_dag = build_source_dag(config, &window_configs, &primary_source)?;
+        let source_dag = build_source_dag(&config.inputs, &window_configs, &primary_source)?;
 
         // Build output projections
         let output_projections = config
@@ -890,7 +892,7 @@ impl ExecutionPlanDag {
             match &tc.input {
                 Some(TransformInput::Single(upstream)) => {
                     let upstream_idx =
-                        resolve_input_reference(upstream, &node_by_name, &tc.name, config)?;
+                        resolve_input_reference(upstream, &node_by_name, &tc.name, &specs)?;
                     graph.add_edge(
                         upstream_idx,
                         transform_idx,
@@ -904,7 +906,7 @@ impl ExecutionPlanDag {
                     let merge_idx = node_by_name[&merge_key];
                     for upstream in upstreams {
                         let upstream_idx =
-                            resolve_input_reference(upstream, &node_by_name, &tc.name, config)?;
+                            resolve_input_reference(upstream, &node_by_name, &tc.name, &specs)?;
                         graph.add_edge(
                             upstream_idx,
                             merge_idx,
@@ -1057,7 +1059,7 @@ impl ExecutionPlanDag {
         // DLQ batching) runs first: it materializes a `PlanNode::Sort` from
         // declared config, distinct from per-operator algorithm requirements.
         // See docs/research/RESEARCH-pipeline-correlation-key-placement.md.
-        dag.inject_correlation_sort(config)
+        dag.inject_correlation_sort(&config.error_handling, &config.inputs)
             .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
         dag.insert_enforcer_sorts(&inputs_map)
             .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
@@ -1441,7 +1443,7 @@ fn resolve_input_reference(
     reference: &str,
     node_by_name: &HashMap<String, NodeIndex>,
     current_transform: &str,
-    config: &PipelineConfig,
+    transforms: &[PlanTransformSpec],
 ) -> Result<NodeIndex, PlanError> {
     // Self-reference check
     if reference == current_transform {
@@ -1472,7 +1474,7 @@ fn resolve_input_reference(
     }
 
     // Collect available transforms and branches for error message
-    let available: Vec<String> = config.transforms().map(|t| t.name.clone()).collect();
+    let available: Vec<String> = transforms.iter().map(|t| t.name.clone()).collect();
 
     Err(PlanError::InvalidInputReference {
         reference: reference.to_string(),
@@ -1630,11 +1632,11 @@ pub struct ParallelismProfile {
 /// Reference sources (those targeted by cross-source windows) must be in
 /// earlier tiers than the transforms that depend on them.
 fn build_source_dag(
-    config: &PipelineConfig,
+    sources: &[SourceConfig],
     window_configs: &[Option<LocalWindowConfig>],
     primary_source: &str,
 ) -> Result<Vec<SourceTier>, PlanError> {
-    let all_sources: Vec<String> = config.inputs.iter().map(|i| i.name.clone()).collect();
+    let all_sources: Vec<String> = sources.iter().map(|i| i.name.clone()).collect();
 
     if all_sources.len() <= 1 {
         // Single source — trivial DAG
@@ -1726,12 +1728,13 @@ impl ExecutionPlanDag {
     /// pass; treated as an internal invariant violation).
     pub fn inject_correlation_sort(
         &mut self,
-        config: &PipelineConfig,
+        error_handling: &crate::config::ErrorHandlingConfig,
+        sources: &[SourceConfig],
     ) -> Result<(), PipelineError> {
-        let Some(correlation_key) = config.error_handling.correlation_key.as_ref() else {
+        let Some(correlation_key) = error_handling.correlation_key.as_ref() else {
             return Ok(());
         };
-        let Some(primary_input) = config.inputs.first() else {
+        let Some(primary_input) = sources.first() else {
             return Ok(());
         };
 
@@ -2493,7 +2496,7 @@ fn extract_has_distinct(typed: &TypedProgram) -> bool {
 }
 
 /// Check if a source's declared sort_order matches the window's sort_by.
-fn check_already_sorted(_config: &PipelineConfig, _source: &str, _sort_by: &[SortField]) -> bool {
+fn check_already_sorted(_sources: &[SourceConfig], _source: &str, _sort_by: &[SortField]) -> bool {
     // SourceConfig doesn't have sort_order yet (to be added in Task 5.4.1)
     // For now, always return false — runtime pre-sorted detection is the fallback
     false
