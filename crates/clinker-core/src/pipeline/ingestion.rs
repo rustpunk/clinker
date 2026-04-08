@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::PipelineConfig;
+use crate::config::{PipelineConfig, PipelineNode, SourceConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::SecondaryIndex;
@@ -26,6 +26,21 @@ use clinker_format::traits::FormatReader;
 pub struct IngestionOutput {
     pub arenas: HashMap<String, Arena>,
     pub indices: HashMap<String, Vec<SecondaryIndex>>,
+}
+
+/// Collect all `Source` nodes from the unified `config.nodes` list.
+///
+/// Phase 16b Wave 4ab Checkpoint B: readers source from `nodes:` instead
+/// of the legacy top-level `inputs:` field.
+fn collect_source_nodes(config: &PipelineConfig) -> Vec<&SourceConfig> {
+    config
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.value {
+            PipelineNode::Source { config: body, .. } => Some(&body.source),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Run Phase 1 ingestion across all sources, respecting the SourceTier DAG.
@@ -45,7 +60,8 @@ pub fn ingest_sources<F>(
 where
     F: Fn(&str) -> Result<Box<dyn FormatReader + Send>, PipelineError> + Sync,
 {
-    if config.inputs.len() <= 1 {
+    let source_nodes = collect_source_nodes(config);
+    if source_nodes.len() <= 1 {
         return ingest_single_source(plan, config, memory_limit, &open_reader);
     }
 
@@ -98,9 +114,8 @@ fn ingest_one_source<F>(
 where
     F: Fn(&str) -> Result<Box<dyn FormatReader + Send>, PipelineError>,
 {
-    let input = config
-        .inputs
-        .iter()
+    let input = collect_source_nodes(config)
+        .into_iter()
         .find(|i| i.name == source_name)
         .ok_or_else(|| PipelineError::Compilation {
             transform_name: String::new(),
@@ -166,14 +181,15 @@ fn ingest_single_source<F>(
 where
     F: Fn(&str) -> Result<Box<dyn FormatReader + Send>, PipelineError>,
 {
-    let source_name = config
-        .inputs
+    let source_nodes = collect_source_nodes(config);
+    let source_name = source_nodes
         .first()
         .map(|i| i.name.as_str())
-        .unwrap_or("primary");
+        .unwrap_or("primary")
+        .to_string();
 
     let (name, arena, idxs) =
-        ingest_one_source(source_name, plan, config, memory_limit, open_reader)?;
+        ingest_one_source(&source_name, plan, config, memory_limit, open_reader)?;
 
     let mut arenas = HashMap::new();
     let mut indices = HashMap::new();
@@ -217,7 +233,37 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
-            nodes: Vec::new(),
+            nodes: inputs
+                .iter()
+                .map(|(name, path)| {
+                    use crate::config::node_header::SourceHeader;
+                    use crate::config::pipeline_node::{PipelineNode, SourceBody};
+                    use crate::yaml::{Location, Spanned};
+                    Spanned::new(
+                        PipelineNode::Source {
+                            header: SourceHeader {
+                                name: (*name).to_string(),
+                                description: None,
+                                notes: None,
+                            },
+                            config: SourceBody {
+                                source: SourceConfig {
+                                    name: (*name).to_string(),
+                                    format: InputFormat::Csv(None),
+                                    path: (*path).to_string(),
+                                    schema: None,
+                                    schema_overrides: None,
+                                    array_paths: None,
+                                    sort_order: None,
+                                    notes: None,
+                                },
+                            },
+                        },
+                        Location::UNKNOWN,
+                        Location::UNKNOWN,
+                    )
+                })
+                .collect(),
             inputs: inputs
                 .into_iter()
                 .map(|(name, path)| SourceConfig {

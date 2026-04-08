@@ -72,22 +72,15 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
         }
     };
 
-    // Inputs array
-    let mut inputs = parse_array_section::<SourceConfig>(obj, "inputs", &mut errors);
+    // Phase 16b Wave 4ab Checkpoint B: partial config is sourced exclusively
+    // from the unified `nodes:` array. The legacy top-level
+    // `inputs:`/`transformations:`/`outputs:` YAML sections are no longer
+    // consulted here; the full parser still accepts them via the lift shim
+    // but the partial path walks nodes only.
+    let mut inputs: Vec<PartialItem<SourceConfig>> = Vec::new();
+    let mut transformations: Vec<PartialItem<TransformConfig>> = Vec::new();
+    let mut outputs: Vec<PartialItem<OutputConfig>> = Vec::new();
 
-    // Transformations array (uses TransformConfig for _import support)
-    let mut transformations =
-        parse_array_section::<TransformConfig>(obj, "transformations", &mut errors);
-
-    // Outputs array
-    let mut outputs = parse_array_section::<OutputConfig>(obj, "outputs", &mut errors);
-
-    // Phase 16b Wave 3: also walk the unified `nodes:` array and project
-    // each node into the legacy partial vectors. This keeps Kiln's
-    // pipeline_view (which reads `partial.{inputs,transformations,outputs}`)
-    // rendering correctly against migrated fixtures. Wave 4 rewrites
-    // PartialPipelineConfig to the IndexMap+PartialItem shape from the
-    // phase plan; this shim keeps the Kiln UI green in the meantime.
     if let Some(nodes_value) = obj.get("nodes")
         && let Some(nodes_arr) = nodes_value.as_array()
     {
@@ -122,43 +115,6 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
         notes,
         errors,
     })
-}
-
-/// Parse an array section with per-item fallback.
-fn parse_array_section<T: serde::de::DeserializeOwned + Clone>(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    errors: &mut Vec<String>,
-) -> Vec<PartialItem<T>> {
-    let Some(value) = obj.get(key) else {
-        return Vec::new();
-    };
-
-    let Some(arr) = value.as_array() else {
-        let msg = format!("{key}: expected array");
-        errors.push(msg.clone());
-        return vec![PartialItem::Err {
-            index: 0,
-            message: msg,
-        }];
-    };
-
-    arr.iter()
-        .enumerate()
-        .map(
-            |(i, item)| match serde_json::from_value::<T>(item.clone()) {
-                Ok(v) => PartialItem::Ok(v),
-                Err(e) => {
-                    let msg = format!("{key}[{i}]: {e}");
-                    errors.push(msg.clone());
-                    PartialItem::Err {
-                        index: i,
-                        message: msg,
-                    }
-                }
-            },
-        )
-        .collect()
 }
 
 /// Phase 16b Wave 3 — per-node partial projection shim.
