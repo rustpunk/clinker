@@ -17,8 +17,7 @@ fn multi_output_fixture(
 ) -> (crate::config::PipelineConfig, HashMap<String, SharedBuffer>) {
     let config = crate::config::parse_config(yaml).unwrap();
     let buffers: HashMap<String, SharedBuffer> = config
-        .outputs
-        .iter()
+        .output_configs()
         .map(|o| (o.name.clone(), SharedBuffer::new()))
         .collect();
     (config, buffers)

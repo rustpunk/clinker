@@ -24,31 +24,63 @@ use std::sync::LazyLock;
 /// module. External consumers walk [`PipelineConfig::nodes`] or use the
 /// iterator accessors ([`PipelineConfig::source_configs`],
 /// [`PipelineConfig::output_configs`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
     /// Unified pipeline node taxonomy (Phase 16b). Each node carries its
     /// YAML source span via the [`Spanned`] outer wrap.
-    #[serde(default, skip_serializing)]
+    #[serde(skip_serializing)]
     pub nodes: Vec<Spanned<PipelineNode>>,
-    /// Parser-private legacy YAML scratch. External consumers walk
-    /// [`PipelineConfig::nodes`] or use [`PipelineConfig::source_configs`].
-    #[serde(default)]
-    pub(crate) inputs: Vec<SourceConfig>,
-    /// Parser-private legacy YAML scratch. External consumers use
-    /// [`PipelineConfig::output_configs`].
-    #[serde(default)]
-    pub(crate) outputs: Vec<OutputConfig>,
-    /// Parser-private legacy YAML scratch. External consumers walk
-    /// [`PipelineConfig::nodes`] and match `PipelineNode::Transform`.
-    #[serde(default)]
-    pub(crate) transformations: Vec<LegacyTransformsBlock>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
     /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
-    #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+/// Private wire shape for YAML deserialization.
+///
+/// Phase 16b Wave 4ab D3b — the legacy top-level YAML sections
+/// (`inputs:`, `outputs:`, `transformations:`) live only here.
+/// `PipelineConfig`'s custom `Deserialize` parses into this type,
+/// then calls [`lift_legacy_fields_into_nodes`] to project into the
+/// unified `nodes` taxonomy.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPipelineConfig {
+    pipeline: PipelineMeta,
+    #[serde(default)]
+    nodes: Vec<Spanned<PipelineNode>>,
+    #[serde(default)]
+    inputs: Vec<SourceConfig>,
+    #[serde(default)]
+    outputs: Vec<OutputConfig>,
+    #[serde(default)]
+    transformations: Vec<LegacyTransformsBlock>,
+    #[serde(default)]
+    error_handling: ErrorHandlingConfig,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for PipelineConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawPipelineConfig::deserialize(deserializer)?;
+        let nodes = if !raw.nodes.is_empty() {
+            raw.nodes
+        } else {
+            lift_legacy_fields_into_nodes(&raw.inputs, &raw.transformations, &raw.outputs)
+        };
+        Ok(PipelineConfig {
+            pipeline: raw.pipeline,
+            nodes,
+            error_handling: raw.error_handling,
+            notes: raw.notes,
+        })
+    }
 }
 
 /// Pipeline-level metadata and global settings.
@@ -982,11 +1014,137 @@ impl<'a> TransformView<'a> {
 }
 
 impl PipelineConfig {
-    /// Parser-private iterator over the legacy transforms scratch buffer.
-    /// Used by the inline deserializer tests in this module and by the
-    /// compiled-plan M4 schema-bind hook until D3b retires it.
-    pub(crate) fn transforms(&self) -> impl Iterator<Item = &LegacyTransformsBlock> + '_ {
-        self.transformations.iter()
+    /// Phase 16b Wave 4ab D3b — synthesis read-model.
+    ///
+    /// Walks `self.nodes` and materializes an owned `Vec<LegacyTransformsBlock>`
+    /// from the `PipelineNode::{Transform, Aggregate, Route}` variants in
+    /// declaration order. The executor + planner + tests still consume this
+    /// shape as a single flat list; once they are migrated to match on
+    /// `PipelineNode` variants directly (Phase 16c or later), this function
+    /// and the `LegacyTransformsBlock` type can both be deleted.
+    ///
+    /// `NodeInput::Single(name)` pointing at an upstream `PipelineNode::Merge`
+    /// is expanded back into the merge's own upstreams as
+    /// `TransformInput::Multiple(list)` to preserve the legacy wire-shape
+    /// the executor expects.
+    pub fn transforms(&self) -> Vec<LegacyTransformsBlock> {
+        use crate::config::node_header::NodeInput;
+
+        // Pre-index merge nodes so we can expand `NodeInput::Single(merge_name)`
+        // back into the equivalent `TransformInput::Multiple(list)`.
+        let merge_by_name: std::collections::HashMap<&str, Vec<String>> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.value {
+                PipelineNode::Merge { header, .. } => {
+                    let upstreams: Vec<String> = header
+                        .inputs
+                        .iter()
+                        .map(|ni| match ni {
+                            NodeInput::Single(s) => s.clone(),
+                            NodeInput::Port { node, port } => format!("{node}.{port}"),
+                        })
+                        .collect();
+                    Some((header.name.as_str(), upstreams))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let project_input = |ni: &NodeInput| -> Option<TransformInput> {
+            match ni {
+                NodeInput::Single(s) => {
+                    if let Some(upstreams) = merge_by_name.get(s.as_str()) {
+                        Some(TransformInput::Multiple(upstreams.clone()))
+                    } else {
+                        Some(TransformInput::Single(s.clone()))
+                    }
+                }
+                NodeInput::Port { node, port } => {
+                    Some(TransformInput::Single(format!("{node}.{port}")))
+                }
+            }
+        };
+
+        let mut out = Vec::new();
+        for spanned in &self.nodes {
+            match &spanned.value {
+                PipelineNode::Transform {
+                    header,
+                    config: body,
+                } => {
+                    out.push(LegacyTransformsBlock {
+                        name: header.name.clone(),
+                        description: header.description.clone(),
+                        cxl: Some(body.cxl.as_ref().to_string()),
+                        aggregate: None,
+                        local_window: body.analytic_window.clone(),
+                        log: body.log.clone(),
+                        validations: body.validations.clone(),
+                        route: None,
+                        input: project_input(&header.input),
+                        notes: header.notes.clone(),
+                    });
+                }
+                PipelineNode::Aggregate {
+                    header,
+                    config: body,
+                } => {
+                    out.push(LegacyTransformsBlock {
+                        name: header.name.clone(),
+                        description: header.description.clone(),
+                        cxl: None,
+                        aggregate: Some(AggregateConfig {
+                            group_by: body.group_by.clone(),
+                            cxl: body.cxl.as_ref().to_string(),
+                            strategy: body.strategy,
+                        }),
+                        local_window: None,
+                        log: None,
+                        validations: None,
+                        route: None,
+                        input: project_input(&header.input),
+                        notes: header.notes.clone(),
+                    });
+                }
+                PipelineNode::Route {
+                    header,
+                    config: body,
+                } => {
+                    let branches: Vec<RouteBranch> = body
+                        .conditions
+                        .iter()
+                        .map(|(name, cxl)| RouteBranch {
+                            name: name.clone(),
+                            condition: cxl.as_ref().to_string(),
+                        })
+                        .collect();
+                    out.push(LegacyTransformsBlock {
+                        name: header.name.clone(),
+                        description: header.description.clone(),
+                        cxl: Some(
+                            body.cxl
+                                .as_ref()
+                                .map(|s| s.as_ref().to_string())
+                                .unwrap_or_default(),
+                        ),
+                        aggregate: None,
+                        local_window: None,
+                        log: None,
+                        validations: None,
+                        route: Some(RouteConfig {
+                            mode: body.mode,
+                            branches,
+                            default: body.default.clone(),
+                        }),
+                        input: project_input(&header.input),
+                        notes: header.notes.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Phase 16b Wave 4ab D3a — public iterator over source nodes.
@@ -1253,6 +1411,68 @@ impl PipelineConfig {
         diags.extend(crate::security::validate_all_config_paths(
             self, &cwd, false,
         ));
+
+        // ── Stage 5: D3b — dotted-name check ────────────────────────
+        // `.` is reserved for branch references (e.g. "route.high").
+        // Previously enforced inside `LegacyTransformsBlock`'s custom
+        // Deserialize; with nodes: YAML bypassing that path, enforce
+        // structurally here.
+        for spanned in &self.nodes {
+            let name = spanned.value.name();
+            if matches!(
+                spanned.value,
+                PipelineNode::Transform { .. }
+                    | PipelineNode::Aggregate { .. }
+                    | PipelineNode::Route { .. }
+            ) && name.contains('.')
+            {
+                diags.push(Diagnostic::error(
+                    "E010",
+                    format!(
+                        "transform name {name:?} is invalid: '.' is reserved \
+                         for branch references (use underscores or hyphens)"
+                    ),
+                    synth(),
+                ));
+            }
+        }
+
+        // ── Stage 6: D3b — log directive sanity ─────────────────────
+        // Mirrors the `validate_config` pass but against the nodes:
+        // taxonomy directly (so new-shape YAML is covered too).
+        for spanned in &self.nodes {
+            let (name, log) = match &spanned.value {
+                PipelineNode::Transform { header, config } => {
+                    (header.name.as_str(), config.log.as_ref())
+                }
+                _ => continue,
+            };
+            let Some(directives) = log else { continue };
+            for (i, d) in directives.iter().enumerate() {
+                if let Some(every) = d.every {
+                    if every == 0 {
+                        diags.push(Diagnostic::error(
+                            "E011",
+                            format!(
+                                "transform {name:?}: log directive #{}: every must be >= 1",
+                                i + 1
+                            ),
+                            synth(),
+                        ));
+                    }
+                    if d.when != LogTiming::PerRecord {
+                        diags.push(Diagnostic::error(
+                            "E011",
+                            format!(
+                                "transform {name:?}: log directive #{}: 'every' is only valid with when: per_record",
+                                i + 1
+                            ),
+                            synth(),
+                        ));
+                    }
+                }
+            }
+        }
 
         diags
     }
@@ -1834,15 +2054,13 @@ pub fn interpolate_env_vars(
 /// chokepoint that owns the DoS-defense [`Budget`].
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml, &[])?;
-    let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
-    lift_legacy_fields_into_nodes(&mut config);
-    lower_nodes_into_legacy_fields(&mut config);
+    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
 }
 
-/// Phase 16b Wave 4ab Checkpoint D preparatory shim — the **inverse** of
-/// [`lower_nodes_into_legacy_fields`]. When a config was authored under
+/// Phase 16b Wave 4ab Checkpoint D preparatory shim — synthesizes
+/// `PipelineNode` entries from legacy flat fields. When a config was authored under
 /// the legacy `inputs:`/`outputs:`/`transformations:` YAML schema (so
 /// `nodes` is empty but the legacy vectors are populated), synthesize
 /// equivalent `PipelineNode` entries in `config.nodes`. After this pass
@@ -1856,17 +2074,15 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
 /// primary source, subsequent transforms wire to the preceding
 /// transform/aggregate/route node. Explicit `input:` references on
 /// legacy `LegacyTransformsBlock` override the implicit chain.
-pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
+pub(crate) fn lift_legacy_fields_into_nodes(
+    inputs: &[SourceConfig],
+    transformations: &[LegacyTransformsBlock],
+    outputs: &[OutputConfig],
+) -> Vec<Spanned<PipelineNode>> {
     use crate::yaml::{Location, Spanned};
 
-    // No-op if either (a) the authored shape was new-shape (nodes
-    // already populated) or (b) there's nothing to lift (both the
-    // nodes vector and the legacy vectors are empty).
-    if !config.nodes.is_empty() {
-        return;
-    }
-    if config.inputs.is_empty() && config.outputs.is_empty() && config.transformations.is_empty() {
-        return;
+    if inputs.is_empty() && outputs.is_empty() && transformations.is_empty() {
+        return Vec::new();
     }
 
     // All legacy shapes are now liftable:
@@ -1875,24 +2091,20 @@ pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
     //   * Multi-input transforms — synthesized as a `Merge` node
     //     upstream of the transform, wired via its name (D2).
 
-    // Pre-collect all existing node names (sources, transforms,
-    // outputs) so synthesized Merge names can avoid collisions.
-    let mut taken_names: std::collections::HashSet<String> = config
-        .inputs
+    // Pre-collect all existing node names so synthesized Merge names
+    // can avoid collisions.
+    let mut taken_names: std::collections::HashSet<String> = inputs
         .iter()
         .map(|s| s.name.clone())
-        .chain(config.transformations.iter().map(|t| t.name.clone()))
-        .chain(config.outputs.iter().map(|o| o.name.clone()))
+        .chain(transformations.iter().map(|t| t.name.clone()))
+        .chain(outputs.iter().map(|o| o.name.clone()))
         .collect();
 
-    let mut synthesized: Vec<Spanned<PipelineNode>> = Vec::with_capacity(
-        config.source_configs().count()
-            + config.transform_views().count()
-            + config.output_configs().count(),
-    );
+    let mut synthesized: Vec<Spanned<PipelineNode>> =
+        Vec::with_capacity(inputs.len() + transformations.len() + outputs.len());
 
     // Source nodes first, in declaration order.
-    for src in &config.inputs {
+    for src in inputs {
         let node = PipelineNode::Source {
             header: SourceHeader {
                 name: src.name.clone(),
@@ -1909,10 +2121,10 @@ pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
     // Transform/Aggregate/Route variants from the legacy list. The
     // implicit-chain rule: `tc.input == None` means "wire to previous
     // transform, or to the primary source if this is the first one".
-    let primary_source_name: Option<String> = config.inputs.first().map(|s| s.name.clone());
+    let primary_source_name: Option<String> = inputs.first().map(|s| s.name.clone());
     let mut prev_transform_name: Option<String> = None;
 
-    for tc in &config.transformations {
+    for tc in transformations {
         // Resolve the header's input: field.
         let header_input = match &tc.input {
             Some(TransformInput::Single(s)) => NodeInput::Single(s.clone()),
@@ -1995,6 +2207,7 @@ pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
                     mode: rt.mode,
                     conditions,
                     default: rt.default.clone(),
+                    cxl: tc.cxl.clone().map(crate::yaml::CxlSource::unspanned),
                 },
             }
         } else {
@@ -2018,7 +2231,7 @@ pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
     let output_upstream: Option<String> = prev_transform_name
         .clone()
         .or_else(|| primary_source_name.clone());
-    for out in &config.outputs {
+    for out in outputs {
         let header = NodeHeader {
             name: out.name.clone(),
             description: None,
@@ -2034,168 +2247,7 @@ pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
         synthesized.push(Spanned::new(node, Location::UNKNOWN, Location::UNKNOWN));
     }
 
-    config.nodes = synthesized;
-}
-
-/// Phase 16b Wave 3 — projection shim (Path 3A).
-///
-/// If the pipeline was authored under the new `nodes:` taxonomy, walk
-/// the node list and synthesize the equivalent entries in the legacy
-/// `inputs:`/`outputs:`/`transformations:` vectors. This keeps the
-/// legacy executor / planner / tests on their current code paths while
-/// fixture files have migrated to the unified shape. Wave 4 cuts the
-/// executor over to `&CompiledPlan` and deletes this shim entirely.
-///
-/// Behaviour rules:
-///   * If `nodes` is empty, this is a no-op (legacy fixture).
-///   * If any of `inputs`/`outputs`/`transformations` is already
-///     populated, projection is skipped — legacy authorship wins, new
-///     authorship was never triggered.
-///   * Merge variants have no legacy analogue and are elided (no
-///     projection). Fixtures using Merge can only be exercised by the
-///     new `compile()` path / Wave 4 executor.
-///   * Composition variants are also elided (Phase 16c).
-///   * Aggregate variants project to a legacy transform carrying
-///     `aggregate: Some(AggregateConfig { .. })`.
-///   * Route variants project to a legacy transform carrying
-///     `route: Some(RouteConfig { .. })`; the transform's `cxl` is
-///     left blank — the route body itself drives dispatch.
-// dead-code-after-D3b: tests still read legacy fields via this projection.
-// Production paths are already off `config.{inputs,outputs,transformations}`
-// as of D3a part 2; this shim exists solely to keep cfg(test) call sites
-// and `partial.rs` working until D3b migrates them.
-fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
-    use crate::config::node_header::NodeInput;
-
-    if config.nodes.is_empty() {
-        return;
-    }
-    if !config.inputs.is_empty() || !config.outputs.is_empty() || !config.transformations.is_empty()
-    {
-        return;
-    }
-
-    fn flatten_input(n: &NodeInput) -> String {
-        match n {
-            NodeInput::Single(s) => s.clone(),
-            NodeInput::Port { node, port } => format!("{node}.{port}"),
-        }
-    }
-
-    // Collect source names up-front so that any transform whose `input:`
-    // points at a source projects to `None` (legacy implicit-chain-from-
-    // previous-source/transform), bypassing `resolve_input_reference`
-    // which only understands transform/aggregate/route targets.
-    let source_names: std::collections::HashSet<String> = config
-        .nodes
-        .iter()
-        .filter_map(|s| match &s.value {
-            PipelineNode::Source { header, .. } => Some(header.name.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let project_input = |hdr_input: &NodeInput| -> Option<TransformInput> {
-        let flat = flatten_input(hdr_input);
-        let bare = flat.split('.').next().unwrap_or(&flat);
-        if source_names.contains(bare) {
-            // Let legacy implicit linear chain wire this up.
-            None
-        } else {
-            Some(TransformInput::Single(flat))
-        }
-    };
-
-    for spanned in &config.nodes {
-        match &spanned.value {
-            PipelineNode::Source { config: body, .. } => {
-                config.inputs.push(body.source.clone());
-            }
-            PipelineNode::Output { config: body, .. } => {
-                config.outputs.push(body.output.clone());
-            }
-            PipelineNode::Transform {
-                header,
-                config: body,
-            } => {
-                let tc = LegacyTransformsBlock {
-                    name: header.name.clone(),
-                    description: header.description.clone(),
-                    cxl: Some(body.cxl.source.as_str().to_string()),
-                    aggregate: None,
-                    local_window: body.analytic_window.clone(),
-                    log: body.log.clone(),
-                    validations: body.validations.clone(),
-                    route: None,
-                    input: project_input(&header.input),
-                    notes: header.notes.clone(),
-                };
-                config.transformations.push(tc);
-            }
-            PipelineNode::Aggregate {
-                header,
-                config: body,
-            } => {
-                let agg = AggregateConfig {
-                    group_by: body.group_by.clone(),
-                    cxl: body.cxl.source.as_str().to_string(),
-                    strategy: body.strategy,
-                };
-                let tc = LegacyTransformsBlock {
-                    name: header.name.clone(),
-                    description: header.description.clone(),
-                    cxl: None,
-                    aggregate: Some(agg),
-                    local_window: None,
-                    log: None,
-                    validations: None,
-                    route: None,
-                    input: project_input(&header.input),
-                    notes: header.notes.clone(),
-                };
-                config.transformations.push(tc);
-            }
-            PipelineNode::Route {
-                header,
-                config: body,
-            } => {
-                // Project IndexMap<String, CxlSource> → Vec<RouteBranch>.
-                // IndexMap preserves declaration order, matching legacy
-                // first-match-wins semantics exactly.
-                let branches: Vec<RouteBranch> = body
-                    .conditions
-                    .iter()
-                    .map(|(name, cxl)| RouteBranch {
-                        name: name.clone(),
-                        condition: cxl.source.as_str().to_string(),
-                    })
-                    .collect();
-                let route = RouteConfig {
-                    mode: body.mode,
-                    branches,
-                    default: body.default.clone(),
-                };
-                let tc = LegacyTransformsBlock {
-                    name: header.name.clone(),
-                    description: header.description.clone(),
-                    cxl: Some(String::new()),
-                    aggregate: None,
-                    local_window: None,
-                    log: None,
-                    validations: None,
-                    route: Some(route),
-                    input: project_input(&header.input),
-                    notes: header.notes.clone(),
-                };
-                config.transformations.push(tc);
-            }
-            PipelineNode::Merge { .. } | PipelineNode::Composition { .. } => {
-                // No legacy analogue — intentionally elided. Wave 4
-                // cuts executor over to `&CompiledPlan` and this shim
-                // disappears entirely.
-            }
-        }
-    }
+    synthesized
 }
 
 /// Reserved pipeline member names that cannot be used as user variable names.
@@ -2213,7 +2265,7 @@ const RESERVED_PIPELINE_NAMES: &[&str] = &[
 
 /// Post-deserialization validation.
 fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
-    for input in &config.inputs {
+    for input in config.source_configs() {
         // Fail-fast: inline schema + schema_overrides is a conflict.
         // Overrides only apply to externally referenced schemas.
         if let Some(SchemaSource::Inline(_)) = &input.schema
@@ -2233,7 +2285,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     }
 
     // Validate log directives (iterate raw entries to avoid panic on unresolved imports)
-    for t in &config.transformations {
+    for t in &config.transforms() {
         if let Some(ref directives) = t.log {
             for (i, d) in directives.iter().enumerate() {
                 if let Some(every) = d.every {
@@ -2331,8 +2383,7 @@ pub fn load_config_with_vars(
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
-    let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
-    lower_nodes_into_legacy_fields(&mut config);
+    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
 }
@@ -2385,7 +2436,7 @@ transformations:
         assert!(
             config
                 .transforms()
-                .next()
+                .first()
                 .unwrap()
                 .cxl_source()
                 .contains("emit full_name")
@@ -2731,7 +2782,8 @@ error_handling:
 
         // Transforms
         assert_eq!(config.transform_views().count(), 2);
-        let t0 = config.transforms().next().unwrap();
+        let ts = config.transforms();
+        let t0 = &ts[0];
         assert!(t0.cxl_source().contains("emit full_name"));
         assert!(t0.description.is_some());
 
@@ -3350,7 +3402,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let t = config.transforms().next().unwrap();
+        let ts = config.transforms();
+        let t = &ts[0];
         let directives = t.log.as_ref().unwrap();
         assert_eq!(directives.len(), 1);
         assert_eq!(directives[0].level, LogLevel::Info);
@@ -3369,7 +3422,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
+        let ts = config.transforms();
+        let d = &ts[0].log.as_ref().unwrap()[0];
         assert_eq!(d.condition.as_deref(), Some("Amount > 1000"));
     }
 
@@ -3384,7 +3438,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
+        let ts = config.transforms();
+        let d = &ts[0].log.as_ref().unwrap()[0];
         assert_eq!(d.fields.as_ref().unwrap(), &["name", "amount"]);
     }
 
@@ -3434,7 +3489,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let d = &config.transforms().next().unwrap().log.as_ref().unwrap()[0];
+        let ts = config.transforms();
+        let d = &ts[0].log.as_ref().unwrap()[0];
         assert_eq!(d.when, LogTiming::OnError);
     }
 
@@ -3472,7 +3528,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let t = config.transforms().next().unwrap();
+        let ts = config.transforms();
+        let t = &ts[0];
         let validations = t.validations.as_ref().unwrap();
         assert_eq!(validations.len(), 1);
         assert_eq!(validations[0].check, "Amount > 0");
@@ -3490,13 +3547,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let v = &config
-            .transforms()
-            .next()
-            .unwrap()
-            .validations
-            .as_ref()
-            .unwrap()[0];
+        let ts = config.transforms();
+        let v = &ts[0].validations.as_ref().unwrap()[0];
         assert_eq!(v.field.as_deref(), Some("Email"));
         assert_eq!(
             v.message.as_deref(),
@@ -3512,13 +3564,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let v = &config
-            .transforms()
-            .next()
-            .unwrap()
-            .validations
-            .as_ref()
-            .unwrap()[0];
+        let ts = config.transforms();
+        let v = &ts[0].validations.as_ref().unwrap()[0];
         assert_eq!(v.severity, ValidationSeverity::Error); // default
     }
 
@@ -3534,13 +3581,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let v = &config
-            .transforms()
-            .next()
-            .unwrap()
-            .validations
-            .as_ref()
-            .unwrap()[0];
+        let ts = config.transforms();
+        let v = &ts[0].validations.as_ref().unwrap()[0];
         let args = v.args.as_ref().unwrap();
         assert_eq!(args["max"], serde_json::json!(500000));
         assert_eq!(args["min"], serde_json::json!(0));
@@ -3558,13 +3600,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let vs = config
-            .transforms()
-            .next()
-            .unwrap()
-            .validations
-            .as_ref()
-            .unwrap();
+        let ts = config.transforms();
+        let vs = ts[0].validations.as_ref().unwrap();
         assert_eq!(vs.len(), 2);
         assert_eq!(vs[0].check, "Amount > 0");
         assert_eq!(vs[1].check, "Amount < 1000000");
@@ -3580,13 +3617,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let v = &config
-            .transforms()
-            .next()
-            .unwrap()
-            .validations
-            .as_ref()
-            .unwrap()[0];
+        let ts = config.transforms();
+        let v = &ts[0].validations.as_ref().unwrap()[0];
         assert_eq!(v.check, "validators.is_positive");
     }
 
@@ -3602,13 +3634,8 @@ transformations:
 "#,
         );
         let config = parse_config(&yaml).unwrap();
-        let v = &config
-            .transforms()
-            .next()
-            .unwrap()
-            .validations
-            .as_ref()
-            .unwrap()[0];
+        let ts = config.transforms();
+        let v = &ts[0].validations.as_ref().unwrap()[0];
         assert_eq!(v.check, "validators.in_range");
         assert!(v.args.is_some());
     }
@@ -3837,7 +3864,7 @@ transformations:
       emit *
 "#;
         let config = parse_config(yaml).unwrap();
-        let transforms: Vec<_> = config.transforms().collect();
+        let transforms: Vec<_> = config.transforms();
         assert!(transforms[0].route.is_none());
     }
 

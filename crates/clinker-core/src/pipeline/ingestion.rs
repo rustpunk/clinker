@@ -219,7 +219,50 @@ mod tests {
         inputs: Vec<(&str, &str)>,
         transforms: Vec<(&str, &str, Option<serde_json::Value>)>,
     ) -> PipelineConfig {
-        let mut cfg = PipelineConfig {
+        let input_vec: Vec<SourceConfig> = inputs
+            .into_iter()
+            .map(|(name, path)| SourceConfig {
+                name: name.into(),
+                format: InputFormat::Csv(None),
+                path: path.into(),
+                schema: None,
+                schema_overrides: None,
+                array_paths: None,
+                sort_order: None,
+                notes: None,
+            })
+            .collect();
+        let output_vec = vec![OutputConfig {
+            name: "output".into(),
+            path: "out.csv".into(),
+            include_unmapped: true,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_metadata: Default::default(),
+            schema: None,
+            split: None,
+            format: OutputFormat::Csv(None),
+            notes: None,
+        }];
+        let transform_vec: Vec<LegacyTransformsBlock> = transforms
+            .into_iter()
+            .map(|(name, cxl, local_window)| LegacyTransformsBlock {
+                name: name.into(),
+                description: None,
+                cxl: Some(cxl.into()),
+                aggregate: None,
+                local_window,
+                log: None,
+                validations: None,
+                route: None,
+                input: None,
+                notes: None,
+            })
+            .collect();
+        PipelineConfig {
             pipeline: PipelineMeta {
                 name: "test".into(),
                 memory_limit: None,
@@ -232,55 +275,14 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
-            nodes: Vec::new(),
-            inputs: inputs
-                .into_iter()
-                .map(|(name, path)| SourceConfig {
-                    name: name.into(),
-                    format: InputFormat::Csv(None),
-                    path: path.into(),
-                    schema: None,
-                    schema_overrides: None,
-                    array_paths: None,
-                    sort_order: None,
-                    notes: None,
-                })
-                .collect(),
-            outputs: vec![OutputConfig {
-                name: "output".into(),
-                path: "out.csv".into(),
-                include_unmapped: true,
-                include_header: None,
-                mapping: None,
-                exclude: None,
-                sort_order: None,
-                preserve_nulls: None,
-                include_metadata: Default::default(),
-                schema: None,
-                split: None,
-                format: OutputFormat::Csv(None),
-                notes: None,
-            }],
-            transformations: transforms
-                .into_iter()
-                .map(|(name, cxl, local_window)| LegacyTransformsBlock {
-                    name: name.into(),
-                    description: None,
-                    cxl: Some(cxl.into()),
-                    aggregate: None,
-                    local_window,
-                    log: None,
-                    validations: None,
-                    route: None,
-                    input: None,
-                    notes: None,
-                })
-                .collect(),
+            nodes: crate::config::lift_legacy_fields_into_nodes(
+                &input_vec,
+                &transform_vec,
+                &output_vec,
+            ),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
-        };
-        crate::config::lift_legacy_fields_into_nodes(&mut cfg);
-        cfg
+        }
     }
 
     /// Helper: compile CXL source.

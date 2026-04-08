@@ -137,8 +137,9 @@ impl CompiledPlan {
         &mut self,
         schema: &std::sync::Arc<clinker_record::Schema>,
     ) -> Result<(), crate::error::PipelineError> {
+        let transforms_owned = self.config.transforms();
         let transforms: Vec<&crate::config::LegacyTransformsBlock> =
-            self.config.transforms().collect();
+            transforms_owned.iter().collect();
         let compiled = crate::executor::PipelineExecutor::compile_transforms(&transforms, schema)?;
 
         // Fill PlanTransformPayload::typed on every Transform node whose

@@ -432,6 +432,22 @@ impl PipelineExecutor {
     /// [`PipelineConfig`]. This is the forward-compatible entry point;
     /// the legacy `&PipelineConfig`-consuming variant is retained
     /// pending the full executor-internal cutover in a follow-up.
+    ///
+    /// D3b compile-fail guarantee — `&PipelineConfig` is NOT accepted:
+    ///
+    /// ```compile_fail
+    /// use clinker_core::executor::PipelineExecutor;
+    /// use clinker_core::config::PipelineConfig;
+    /// use std::collections::HashMap;
+    /// fn _demo(cfg: &PipelineConfig, params: &clinker_core::executor::PipelineRunParams) {
+    ///     let _ = PipelineExecutor::run_plan_with_readers_writers(
+    ///         cfg, // ← should be &CompiledPlan, not &PipelineConfig
+    ///         HashMap::new(),
+    ///         HashMap::new(),
+    ///         params,
+    ///     );
+    /// }
+    /// ```
     pub fn run_plan_with_readers_writers(
         plan: &crate::plan::CompiledPlan,
         readers: HashMap<String, Box<dyn Read + Send>>,
@@ -496,7 +512,7 @@ impl PipelineExecutor {
         // typecheck side-effects now; the executor consumes the result
         // by moving it out of the locally-bound plan.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        let resolved_transforms: Vec<_> = config.transforms().collect();
+        let resolved_transforms = config.transforms();
         let mut local_plan = crate::plan::CompiledPlan::from_config_for_run(config.clone());
         local_plan.bind_schema(&schema)?;
         let compiled_transforms = local_plan.take_compiled_transforms();
@@ -593,7 +609,8 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     fn flush_correlated_group(
         buffer: &mut Vec<(Record, u64)>,
-        config: &PipelineConfig,
+        _config: &PipelineConfig,
+        output_configs: &[OutputConfig],
         primary_output: &OutputConfig,
         input: &crate::config::SourceConfig,
         _pipeline_start_time: chrono::NaiveDateTime,
@@ -680,8 +697,7 @@ impl PipelineExecutor {
                             match route.evaluate(&emitted, &metadata, &ctx) {
                                 Ok(targets) => {
                                     for target in &targets {
-                                        let out_cfg = config
-                                            .outputs
+                                        let out_cfg = output_configs
                                             .iter()
                                             .find(|o| o.name == *target)
                                             .unwrap_or(primary_output);
@@ -848,7 +864,8 @@ impl PipelineExecutor {
         record: &Record,
         emitted: &IndexMap<String, Value>,
         metadata: &IndexMap<String, Value>,
-        config: &PipelineConfig,
+        _config: &PipelineConfig,
+        output_configs: &[OutputConfig],
         primary_output: &OutputConfig,
         compiled_route: Option<&mut CompiledRoute>,
         ctx: &EvalContext,
@@ -862,8 +879,7 @@ impl PipelineExecutor {
             match route.evaluate(emitted, metadata, ctx) {
                 Ok(targets) => {
                     for target in &targets {
-                        let out_cfg = config
-                            .outputs
+                        let out_cfg = output_configs
                             .iter()
                             .find(|o| o.name == *target)
                             .unwrap_or(primary_output);
@@ -1201,8 +1217,7 @@ impl PipelineExecutor {
                             let mut per_output_batches: HashMap<String, Vec<Record>> =
                                 HashMap::new();
                             for target in &targets {
-                                let out_cfg = config
-                                    .outputs
+                                let out_cfg = output_configs
                                     .iter()
                                     .find(|o| o.name == *target)
                                     .unwrap_or(primary_output);
@@ -1278,8 +1293,7 @@ impl PipelineExecutor {
                                 match route_result {
                                     Ok(targets) => {
                                         for target in &targets {
-                                            let out_cfg = config
-                                                .outputs
+                                            let out_cfg = output_configs
                                                 .iter()
                                                 .find(|o| o.name == *target)
                                                 .unwrap_or(primary_output);
@@ -1628,6 +1642,7 @@ impl PipelineExecutor {
                                         &emitted,
                                         &metadata,
                                         config,
+                                        &output_configs,
                                         primary_output,
                                         compiled_route.as_mut(),
                                         &ctx,
@@ -1677,6 +1692,7 @@ impl PipelineExecutor {
                             Self::flush_correlated_group(
                                 &mut group_buffer,
                                 config,
+                                &output_configs,
                                 primary_output,
                                 input,
                                 pipeline_start_time,
@@ -1727,6 +1743,7 @@ impl PipelineExecutor {
                     Self::flush_correlated_group(
                         &mut group_buffer,
                         config,
+                        &output_configs,
                         primary_output,
                         input,
                         pipeline_start_time,
@@ -2059,8 +2076,7 @@ impl PipelineExecutor {
                     Ok(targets) => {
                         let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
                         for target in &targets {
-                            let out_cfg = config
-                                .outputs
+                            let out_cfg = output_configs
                                 .iter()
                                 .find(|o| o.name == *target)
                                 .unwrap_or(primary_output);
@@ -2125,8 +2141,7 @@ impl PipelineExecutor {
                         match route_result {
                             Ok(targets) => {
                                 for target in &targets {
-                                    let out_cfg = config
-                                        .outputs
+                                    let out_cfg = output_configs
                                         .iter()
                                         .find(|o| o.name == *target)
                                         .unwrap_or(primary_output);
@@ -2643,6 +2658,7 @@ impl PipelineExecutor {
                     let merge_transform_name = name.strip_prefix("merge_").unwrap_or(name);
                     let declaration_order: Vec<String> = config
                         .transforms()
+                        .into_iter()
                         .find(|tc| tc.name == merge_transform_name)
                         .and_then(|tc| {
                             if let Some(crate::config::TransformInput::Multiple(ref inputs)) =
@@ -2964,8 +2980,7 @@ impl PipelineExecutor {
                     // Derive output schema from first emitted record
                     let scan_timer =
                         stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
-                    let out_cfg = config
-                        .outputs
+                    let out_cfg = output_configs
                         .iter()
                         .find(|o| o.name == *name)
                         .unwrap_or(primary_output);
@@ -3267,7 +3282,9 @@ impl PipelineExecutor {
             all_fields.iter().map(|f| f.as_str().into()).collect(),
         ));
 
-        let resolved_transforms: Vec<_> = config.transforms().collect();
+        let resolved_transforms_owned = config.transforms();
+        let resolved_transforms: Vec<&LegacyTransformsBlock> =
+            resolved_transforms_owned.iter().collect();
         let compiled = Self::compile_transforms(&resolved_transforms, &schema)?;
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled
             .iter()
@@ -5364,7 +5381,9 @@ transformations:
 "#;
         let config = crate::config::parse_config(yaml).unwrap();
         let schema = Arc::new(Schema::new(vec!["amount".into()]));
-        let transforms: Vec<&crate::config::LegacyTransformsBlock> = config.transforms().collect();
+        let transforms_owned = config.transforms();
+        let transforms: Vec<&crate::config::LegacyTransformsBlock> =
+            transforms_owned.iter().collect();
         let compiled = PipelineExecutor::compile_transforms(&transforms, &schema).unwrap();
         // Each compiled transform holds one Arc<TypedProgram>
         for ct in &compiled {

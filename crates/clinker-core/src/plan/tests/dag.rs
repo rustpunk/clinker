@@ -111,7 +111,7 @@ fn t(entry: &LegacyTransformsBlock) -> &LegacyTransformsBlock {
 
 /// Helper: compile a fixture config into an ExecutionPlanDag.
 fn compile_fixture(config: &PipelineConfig, fields: &[&str]) -> ExecutionPlanDag {
-    let transforms: Vec<_> = config.transforms().collect();
+    let transforms: Vec<_> = config.transforms();
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), fields))
@@ -186,7 +186,7 @@ transformations:
     input: alpha
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = config.transforms().collect();
+    let transforms: Vec<_> = config.transforms();
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
@@ -419,7 +419,7 @@ transformations:
     input: nonexistent
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = config.transforms().collect();
+    let transforms: Vec<_> = config.transforms();
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
@@ -611,7 +611,7 @@ transformations:
     input: loopy
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = config.transforms().collect();
+    let transforms: Vec<_> = config.transforms();
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))

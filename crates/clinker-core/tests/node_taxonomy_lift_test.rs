@@ -382,8 +382,40 @@ config:
 }
 
 #[test]
-#[ignore = "TODO(16b Wave 4): legacy TransformConfig stays as projection-shim type until executor cutover"]
-fn test_no_transform_config_anywhere() {}
+fn test_no_transform_config_anywhere() {
+    // D3b gate: the legacy `TransformConf\u{0069}g` type was renamed to
+    // `LegacyTransformsBlock` in D3a and retained only as a synthesis
+    // target for `PipelineConfig::transforms()`. The old name must not
+    // reappear anywhere in the crate sources.
+    use std::path::PathBuf;
+    let crate_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders: Vec<String> = Vec::new();
+    fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, offenders);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let src = std::fs::read_to_string(&p).unwrap_or_default();
+                for (i, line) in src.lines().enumerate() {
+                    // Match the bare identifier, not substrings.
+                    let has = line
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|tok| tok == "TransformConf\u{0069}g");
+                    if has {
+                        offenders.push(format!("{}:{}: {}", p.display(), i + 1, line));
+                    }
+                }
+            }
+        }
+    }
+    walk(&crate_src, &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "legacy `TransformConf\u{0069}g` identifier still present:\n{}",
+        offenders.join("\n")
+    );
+}
 
 #[test]
 #[ignore = "TODO(16b Wave 4): legacy `transformations:` shape still accepted by Wave 3 projection shim"]

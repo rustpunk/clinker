@@ -289,7 +289,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
         // Source names: header inputs that resolve to a source must be
         // projected as `ResolvedInput::Chain` so the legacy wire-up
         // hooks them into the primary source, matching the behaviour
-        // of `lower_nodes_into_legacy_fields::project_input`.
+        // of the legacy projection used by the executor read model.
         let source_names: std::collections::HashSet<String> = config
             .nodes
             .iter()
@@ -802,8 +802,7 @@ impl ExecutionPlanDag {
         let source_dag = build_source_dag(&source_configs, &window_configs, &primary_source)?;
 
         // Build output projections
-        let output_projections = config
-            .outputs
+        let output_projections = output_configs_owned
             .iter()
             .map(|o| OutputSpec {
                 name: o.name.clone(),
@@ -2788,7 +2787,50 @@ mod tests {
         inputs: Vec<(&str, &str)>,
         transforms: Vec<(&str, &str, Option<serde_json::Value>)>,
     ) -> PipelineConfig {
-        let mut cfg = PipelineConfig {
+        let input_vec: Vec<SourceConfig> = inputs
+            .into_iter()
+            .map(|(name, path)| SourceConfig {
+                name: name.into(),
+                path: path.into(),
+                schema: None,
+                schema_overrides: None,
+                array_paths: None,
+                sort_order: None,
+                format: InputFormat::Csv(None),
+                notes: None,
+            })
+            .collect();
+        let output_vec = vec![OutputConfig {
+            name: "output".into(),
+            path: "out.csv".into(),
+            include_unmapped: true,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_metadata: Default::default(),
+            schema: None,
+            split: None,
+            format: OutputFormat::Csv(None),
+            notes: None,
+        }];
+        let transform_vec: Vec<LegacyTransformsBlock> = transforms
+            .into_iter()
+            .map(|(name, cxl, local_window)| LegacyTransformsBlock {
+                name: name.into(),
+                description: None,
+                cxl: Some(cxl.into()),
+                aggregate: None,
+                local_window,
+                log: None,
+                validations: None,
+                route: None,
+                input: None,
+                notes: None,
+            })
+            .collect();
+        PipelineConfig {
             pipeline: PipelineMeta {
                 name: "test".into(),
                 memory_limit: None,
@@ -2801,57 +2843,14 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
-            nodes: Vec::new(),
-            inputs: inputs
-                .into_iter()
-                .map(|(name, path)| SourceConfig {
-                    name: name.into(),
-                    path: path.into(),
-                    schema: None,
-                    schema_overrides: None,
-                    array_paths: None,
-                    sort_order: None,
-                    format: InputFormat::Csv(None),
-                    notes: None,
-                })
-                .collect(),
-            outputs: vec![OutputConfig {
-                name: "output".into(),
-                path: "out.csv".into(),
-                include_unmapped: true,
-                include_header: None,
-                mapping: None,
-                exclude: None,
-                sort_order: None,
-                preserve_nulls: None,
-                include_metadata: Default::default(),
-                schema: None,
-                split: None,
-                format: OutputFormat::Csv(None),
-                notes: None,
-            }],
-            transformations: transforms
-                .into_iter()
-                .map(|(name, cxl, local_window)| LegacyTransformsBlock {
-                    name: name.into(),
-                    description: None,
-                    cxl: Some(cxl.into()),
-                    aggregate: None,
-                    local_window,
-                    log: None,
-                    validations: None,
-                    route: None,
-                    input: None,
-                    notes: None,
-                })
-                .collect(),
+            nodes: crate::config::lift_legacy_fields_into_nodes(
+                &input_vec,
+                &transform_vec,
+                &output_vec,
+            ),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
-        };
-        // D3a part2: production paths now read from `nodes`. Lift the
-        // legacy literal so the test config has both shapes populated.
-        crate::config::lift_legacy_fields_into_nodes(&mut cfg);
-        cfg
+        }
     }
 
     /// Compile CXL source to TypedProgram for a given set of field names.
@@ -3118,7 +3117,44 @@ mod tests {
 
     /// Build a config with route configuration on the first transform.
     fn test_config_with_route(cxl: &str, route: crate::config::RouteConfig) -> PipelineConfig {
-        let mut cfg = PipelineConfig {
+        let input_vec = vec![SourceConfig {
+            name: "src".into(),
+            path: "data.csv".into(),
+            schema: None,
+            schema_overrides: None,
+            array_paths: None,
+            sort_order: None,
+            format: InputFormat::Csv(None),
+            notes: None,
+        }];
+        let output_vec = vec![OutputConfig {
+            name: "output".into(),
+            path: "out.csv".into(),
+            include_unmapped: true,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_metadata: Default::default(),
+            schema: None,
+            split: None,
+            format: OutputFormat::Csv(None),
+            notes: None,
+        }];
+        let transform_vec = vec![LegacyTransformsBlock {
+            name: "router".into(),
+            description: None,
+            cxl: Some(cxl.into()),
+            aggregate: None,
+            local_window: None,
+            log: None,
+            validations: None,
+            route: Some(route),
+            input: None,
+            notes: None,
+        }];
+        PipelineConfig {
             pipeline: PipelineMeta {
                 name: "route-explain-test".into(),
                 memory_limit: None,
@@ -3131,49 +3167,14 @@ mod tests {
                 include_provenance: None,
                 metrics: None,
             },
-            nodes: Vec::new(),
-            inputs: vec![SourceConfig {
-                name: "src".into(),
-                path: "data.csv".into(),
-                schema: None,
-                schema_overrides: None,
-                array_paths: None,
-                sort_order: None,
-                format: InputFormat::Csv(None),
-                notes: None,
-            }],
-            outputs: vec![OutputConfig {
-                name: "output".into(),
-                path: "out.csv".into(),
-                include_unmapped: true,
-                include_header: None,
-                mapping: None,
-                exclude: None,
-                sort_order: None,
-                preserve_nulls: None,
-                include_metadata: Default::default(),
-                schema: None,
-                split: None,
-                format: OutputFormat::Csv(None),
-                notes: None,
-            }],
-            transformations: vec![LegacyTransformsBlock {
-                name: "router".into(),
-                description: None,
-                cxl: Some(cxl.into()),
-                aggregate: None,
-                local_window: None,
-                log: None,
-                validations: None,
-                route: Some(route),
-                input: None,
-                notes: None,
-            }],
+            nodes: crate::config::lift_legacy_fields_into_nodes(
+                &input_vec,
+                &transform_vec,
+                &output_vec,
+            ),
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
-        };
-        crate::config::lift_legacy_fields_into_nodes(&mut cfg);
-        cfg
+        }
     }
 
     #[test]

@@ -224,6 +224,7 @@ outputs:
         // and rely on extract paths.
         let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> = config
             .transforms()
+            .iter()
             .map(|t| {
                 let parsed = Parser::parse(t.cxl_source());
                 let resolved = resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
