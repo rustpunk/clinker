@@ -28,14 +28,14 @@ fn run_correlated_pipeline(
     };
 
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.inputs[0].name.clone(),
+        config.source_configs().next().unwrap().name.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
 
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.outputs[0].name.clone(),
+        config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 

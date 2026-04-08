@@ -15,13 +15,15 @@ mod tests {
         let config = config::parse_config(yaml).unwrap();
         let output_buf = SharedBuffer::new();
 
+        let first_source = config.source_configs().next().unwrap().name.clone();
+        let first_output = config.output_configs().next().unwrap().name.clone();
         let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.inputs[0].name.clone(),
+            first_source,
             Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
                 as Box<dyn std::io::Read + Send>,
         )]);
         let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            config.outputs[0].name.clone(),
+            first_output,
             Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
         )]);
 

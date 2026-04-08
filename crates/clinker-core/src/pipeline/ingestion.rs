@@ -209,10 +209,9 @@ mod tests {
     use clinker_record::{RecordStorage, Schema};
     use std::sync::Arc;
 
-    /// Identity helper retained to keep test callsites compact.
-    #[allow(dead_code)]
-    fn t(entry: &LegacyTransformsBlock) -> &LegacyTransformsBlock {
-        entry
+    /// Test helper: fetch the Nth transform-like view from the nodes topology.
+    fn t(config: &PipelineConfig, idx: usize) -> TransformView<'_> {
+        config.transform_views().nth(idx).expect("transform index")
     }
 
     /// Helper: build a minimal pipeline config.
@@ -316,7 +315,7 @@ mod tests {
             )],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let typed = compile_cxl(t(&config, 0).cxl_source(), fields);
         let compiled = vec![("agg", &typed)];
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
@@ -345,7 +344,7 @@ mod tests {
             vec![("lookup", "emit ref_val = $window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let typed = compile_cxl(t(&config, 0).cxl_source(), fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
@@ -386,7 +385,7 @@ mod tests {
             vec![("lookup", "emit ref_val = $window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let typed = compile_cxl(t(&config, 0).cxl_source(), fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
@@ -423,7 +422,7 @@ mod tests {
             vec![("lookup", "emit ref_val = $window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let typed = compile_cxl(t(&config, 0).cxl_source(), fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
@@ -469,7 +468,7 @@ mod tests {
             vec![("lookup", "emit ref_val = $window.sum(amount)", Some(window))],
         );
         let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let typed = compile_cxl(t(&config, 0).cxl_source(), fields);
         let compiled = vec![("lookup", &typed)];
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 
@@ -510,7 +509,7 @@ mod tests {
             )],
         );
         let fields = &["dept", "amount"];
-        let typed = compile_cxl(t(&config.transformations[0]).cxl_source(), fields);
+        let typed = compile_cxl(t(&config, 0).cxl_source(), fields);
         let compiled = vec![("agg", &typed)];
         let plan = ExecutionPlanDag::compile(&config, &compiled).unwrap();
 

@@ -14,12 +14,12 @@ fn run_branch_test(
     let output_buf = crate::test_helpers::SharedBuffer::new();
 
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.inputs[0].name.clone(),
+        config.source_configs().next().unwrap().name.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.outputs[0].name.clone(),
+        config.output_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 

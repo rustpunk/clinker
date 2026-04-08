@@ -102,7 +102,7 @@ fn run_format_test(
         Box::new(input_data) as Box<dyn std::io::Read + Send>,
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        config.outputs[0].name.clone(),
+        config.output_configs().next().unwrap().name.clone(),
         Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 

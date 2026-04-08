@@ -1886,7 +1886,9 @@ pub(crate) fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
         .collect();
 
     let mut synthesized: Vec<Spanned<PipelineNode>> = Vec::with_capacity(
-        config.inputs.len() + config.transformations.len() + config.outputs.len(),
+        config.source_configs().count()
+            + config.transform_views().count()
+            + config.output_configs().count(),
     );
 
     // Source nodes first, in declaration order.
@@ -2368,12 +2370,18 @@ transformations:
     fn test_config_minimal_valid_yaml() {
         let config = parse_config(MINIMAL_YAML).unwrap();
         assert_eq!(config.pipeline.name, "test-pipeline");
-        assert_eq!(config.inputs.len(), 1);
-        assert_eq!(config.inputs[0].name, "source");
-        assert!(matches!(config.inputs[0].format, InputFormat::Csv(_)));
-        assert_eq!(config.inputs[0].path, "/tmp/input.csv");
-        assert_eq!(config.outputs.len(), 1);
-        assert_eq!(config.transformations.len(), 1);
+        assert_eq!(config.source_configs().count(), 1);
+        assert_eq!(config.source_configs().next().unwrap().name, "source");
+        assert!(matches!(
+            config.source_configs().next().unwrap().format,
+            InputFormat::Csv(_)
+        ));
+        assert_eq!(
+            config.source_configs().next().unwrap().path,
+            "/tmp/input.csv"
+        );
+        assert_eq!(config.output_configs().count(), 1);
+        assert_eq!(config.transform_views().count(), 1);
         assert!(
             config
                 .transforms()
@@ -2409,7 +2417,10 @@ transformations:
 "#;
         let config = parse_config(yaml).unwrap();
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(config.inputs[0].path, format!("{home}/data/input.csv"));
+        assert_eq!(
+            config.source_configs().next().unwrap().path,
+            format!("{home}/data/input.csv")
+        );
     }
 
     #[test]
@@ -2435,7 +2446,10 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        assert_eq!(config.inputs[0].path, "/tmp/input.csv");
+        assert_eq!(
+            config.source_configs().next().unwrap().path,
+            "/tmp/input.csv"
+        );
     }
 
     #[test]
@@ -2641,27 +2655,82 @@ error_handling:
         assert_eq!(config.pipeline.include_provenance, Some(true));
 
         // Input
-        assert_eq!(config.inputs[0].name, "employees");
-        assert_eq!(config.inputs[0].schema_overrides.as_ref().unwrap().len(), 1);
+        assert_eq!(config.source_configs().next().unwrap().name, "employees");
         assert_eq!(
-            config.inputs[0].csv_options().unwrap().has_header,
+            config
+                .source_configs()
+                .next()
+                .unwrap()
+                .schema_overrides
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            config
+                .source_configs()
+                .next()
+                .unwrap()
+                .csv_options()
+                .unwrap()
+                .has_header,
             Some(true)
         );
 
         // Output
-        assert!(config.outputs[0].include_unmapped);
-        assert_eq!(config.outputs[0].mapping.as_ref().unwrap().len(), 2);
-        assert_eq!(config.outputs[0].exclude.as_ref().unwrap().len(), 2);
-        assert_eq!(config.outputs[0].sort_order.as_ref().unwrap().len(), 2);
+        assert!(config.output_configs().next().unwrap().include_unmapped);
+        assert_eq!(
+            config
+                .output_configs()
+                .next()
+                .unwrap()
+                .mapping
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config
+                .output_configs()
+                .next()
+                .unwrap()
+                .exclude
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config
+                .output_configs()
+                .next()
+                .unwrap()
+                .sort_order
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
         // SortFieldSpec resolves to SortField — verify via into_sort_field()
-        let sf = config.outputs[0].sort_order.as_ref().unwrap()[0]
+        let sf = config
+            .output_configs()
+            .next()
+            .unwrap()
+            .sort_order
+            .as_ref()
+            .unwrap()[0]
             .clone()
             .into_sort_field();
         assert_eq!(sf.order, SortOrder::Asc);
-        assert_eq!(config.outputs[0].preserve_nulls, Some(false));
+        assert_eq!(
+            config.output_configs().next().unwrap().preserve_nulls,
+            Some(false)
+        );
 
         // Transforms
-        assert_eq!(config.transformations.len(), 2);
+        assert_eq!(config.transform_views().count(), 2);
         let t0 = config.transforms().next().unwrap();
         assert!(t0.cxl_source().contains("emit full_name"));
         assert!(t0.description.is_some());
@@ -2734,8 +2803,16 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        assert!(matches!(config.inputs[0].format, InputFormat::Csv(Some(_))));
-        let opts = config.inputs[0].csv_options().unwrap();
+        assert!(matches!(
+            config.source_configs().next().unwrap().format,
+            InputFormat::Csv(Some(_))
+        ));
+        let opts = config
+            .source_configs()
+            .next()
+            .unwrap()
+            .csv_options()
+            .unwrap();
         assert_eq!(opts.delimiter.as_deref(), Some("|"));
         assert_eq!(opts.has_header, Some(false));
     }
@@ -2761,7 +2838,7 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        match &config.inputs[0].format {
+        match &config.source_configs().next().unwrap().format {
             InputFormat::Json(Some(opts)) => {
                 assert!(matches!(opts.format, Some(JsonFormat::Ndjson)));
                 assert_eq!(opts.record_path.as_deref(), Some("data.results"));
@@ -2792,7 +2869,7 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        match &config.inputs[0].format {
+        match &config.source_configs().next().unwrap().format {
             InputFormat::Xml(Some(opts)) => {
                 assert_eq!(opts.record_path.as_deref(), Some("Orders/Order"));
                 assert_eq!(opts.attribute_prefix.as_deref(), Some("_"));
@@ -2856,7 +2933,13 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        let aps = config.inputs[0].array_paths.as_ref().unwrap();
+        let aps = config
+            .source_configs()
+            .next()
+            .unwrap()
+            .array_paths
+            .as_ref()
+            .unwrap();
         assert_eq!(aps.len(), 2);
         assert_eq!(aps[0].path, "orders");
         assert!(matches!(aps[0].mode, ArrayMode::Explode));
@@ -2886,7 +2969,7 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        match &config.outputs[0].format {
+        match &config.output_configs().next().unwrap().format {
             OutputFormat::Json(Some(opts)) => {
                 assert!(matches!(opts.format, Some(JsonOutputFormat::Ndjson)));
                 assert_eq!(opts.pretty, Some(true));
@@ -2916,7 +2999,7 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        match &config.outputs[0].format {
+        match &config.output_configs().next().unwrap().format {
             OutputFormat::Xml(Some(opts)) => {
                 assert_eq!(opts.root_element.as_deref(), Some("Data"));
                 assert_eq!(opts.record_element.as_deref(), Some("Row"));
@@ -2948,7 +3031,13 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        let sort = config.inputs[0].sort_order.as_ref().unwrap();
+        let sort = config
+            .source_configs()
+            .next()
+            .unwrap()
+            .sort_order
+            .as_ref()
+            .unwrap();
         assert_eq!(sort.len(), 2);
         let sf0 = sort[0].clone().into_sort_field();
         assert_eq!(sf0.field, "field_a");
@@ -2978,7 +3067,13 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        let sort = config.outputs[0].sort_order.as_ref().unwrap();
+        let sort = config
+            .output_configs()
+            .next()
+            .unwrap()
+            .sort_order
+            .as_ref()
+            .unwrap();
         assert_eq!(sort.len(), 1);
         let sf = sort[0].clone().into_sort_field();
         assert_eq!(sf.field, "name");
@@ -3008,7 +3103,13 @@ transformations:
     cxl: "emit x = a"
 "#;
         let config = parse_config(yaml).unwrap();
-        let sort = config.inputs[0].sort_order.as_ref().unwrap();
+        let sort = config
+            .source_configs()
+            .next()
+            .unwrap()
+            .sort_order
+            .as_ref()
+            .unwrap();
         assert_eq!(sort.len(), 2);
         let sf0 = sort[0].clone().into_sort_field();
         assert_eq!(sf0.field, "simple_field");
@@ -3823,8 +3924,17 @@ transformations:
       emit x = 1
 "#;
         let config = parse_config(yaml).unwrap();
-        let t = &config.transformations[0];
-        assert!(t.input.is_none());
+        // Single transform with implicit linear input → node has NodeInput::Single
+        // pointing at the preceding source.
+        let tnode = config
+            .nodes
+            .iter()
+            .find_map(|n| match &n.value {
+                PipelineNode::Transform { header, .. } => Some(header),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(&tnode.input, NodeInput::Single(_)));
     }
 
     /// Transform name containing dot is rejected.
@@ -3881,8 +3991,10 @@ transformations:
       emit x = 1
 "#;
         let config = parse_config(yaml).unwrap();
-        let t = &config.transformations[0];
-        assert_eq!(t.name, "my-transform_v2");
+        assert_eq!(
+            config.transform_views().next().unwrap().name,
+            "my-transform_v2"
+        );
     }
 
     // ── Phase 16 Task 16.2 — AggregateConfig tests ─────────────────
