@@ -303,8 +303,8 @@ outputs:
 
     // Compile transforms for plan
     let schema = clinker_record::Schema::new(vec!["employee_id".into(), "value".into()]);
-    let resolved_transforms_owned = config.transforms();
-    let resolved_transforms: Vec<&crate::config::LegacyTransformsBlock> =
+    let resolved_transforms_owned = crate::executor::build_transform_specs(&config);
+    let resolved_transforms: Vec<&crate::executor::TransformSpec> =
         resolved_transforms_owned.iter().collect();
     let compiled_transforms =
         PipelineExecutor::compile_transforms(&resolved_transforms, &std::sync::Arc::new(schema))

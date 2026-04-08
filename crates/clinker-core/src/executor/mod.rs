@@ -10,7 +10,7 @@ use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
 use indexmap::IndexMap;
 use rayon::prelude::*;
 
-use crate::config::{ErrorStrategy, LegacyTransformsBlock, OutputConfig, PipelineConfig};
+use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
@@ -40,6 +40,154 @@ use cxl::eval::{
 };
 use cxl::typecheck::{Type, TypedProgram};
 use petgraph::Direction;
+
+/// Phase 16b Task 16b.7 — executor-internal transform spec.
+///
+/// Produced by walking `PipelineConfig::nodes` directly and matching on
+/// `PipelineNode::{Transform, Aggregate, Route}` variants. Replaces the
+/// deleted `TransformSpec` for executor read paths that still
+/// consume a flat Vec-of-transforms view. The fields are the superset
+/// that executor sites read from; see `build_transform_specs`.
+#[derive(Debug, Clone)]
+pub(crate) struct TransformSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub cxl: Option<String>,
+    pub aggregate: Option<crate::config::AggregateConfig>,
+    pub local_window: Option<serde_json::Value>,
+    pub log: Option<Vec<crate::config::LogDirective>>,
+    pub validations: Option<Vec<crate::config::ValidationEntry>>,
+    pub route: Option<crate::config::RouteConfig>,
+    pub input: Option<crate::config::TransformInput>,
+    pub notes: Option<serde_json::Value>,
+}
+
+impl TransformSpec {
+    pub(crate) fn cxl_source(&self) -> &str {
+        if let Some(agg) = &self.aggregate {
+            agg.cxl.as_str()
+        } else if let Some(s) = &self.cxl {
+            s.as_str()
+        } else {
+            ""
+        }
+    }
+
+    pub(crate) fn is_aggregate(&self) -> bool {
+        self.aggregate.is_some()
+    }
+}
+
+/// Walk `PipelineConfig::nodes` and materialize a flat `Vec<TransformSpec>`
+/// from the Transform/Aggregate/Route variants in declaration order. Merge
+/// nodes referenced by a transform's input are expanded back into
+/// `TransformInput::Multiple(list)` to match the legacy executor wire shape.
+pub(crate) fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
+    use crate::config::node_header::NodeInput;
+    use crate::config::{
+        AggregateConfig, PipelineNode, RouteBranch, RouteConfig, TransformInput,
+    };
+
+    let merge_by_name: std::collections::HashMap<&str, Vec<String>> = config
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.value {
+            PipelineNode::Merge { header, .. } => {
+                let upstreams: Vec<String> = header
+                    .inputs
+                    .iter()
+                    .map(|ni| match ni {
+                        NodeInput::Single(s) => s.clone(),
+                        NodeInput::Port { node, port } => format!("{node}.{port}"),
+                    })
+                    .collect();
+                Some((header.name.as_str(), upstreams))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let project_input = |ni: &NodeInput| -> Option<TransformInput> {
+        match ni {
+            NodeInput::Single(s) => {
+                if let Some(upstreams) = merge_by_name.get(s.as_str()) {
+                    Some(TransformInput::Multiple(upstreams.clone()))
+                } else {
+                    Some(TransformInput::Single(s.clone()))
+                }
+            }
+            NodeInput::Port { node, port } => {
+                Some(TransformInput::Single(format!("{node}.{port}")))
+            }
+        }
+    };
+
+    let mut out = Vec::new();
+    for spanned in &config.nodes {
+        match &spanned.value {
+            PipelineNode::Transform { header, config: body } => {
+                out.push(TransformSpec {
+                    name: header.name.clone(),
+                    description: header.description.clone(),
+                    cxl: Some(body.cxl.as_ref().to_string()),
+                    aggregate: None,
+                    local_window: body.analytic_window.clone(),
+                    log: body.log.clone(),
+                    validations: body.validations.clone(),
+                    route: None,
+                    input: project_input(&header.input),
+                    notes: header.notes.clone(),
+                });
+            }
+            PipelineNode::Aggregate { header, config: body } => {
+                out.push(TransformSpec {
+                    name: header.name.clone(),
+                    description: header.description.clone(),
+                    cxl: None,
+                    aggregate: Some(AggregateConfig {
+                        group_by: body.group_by.clone(),
+                        cxl: body.cxl.as_ref().to_string(),
+                        strategy: body.strategy,
+                    }),
+                    local_window: None,
+                    log: None,
+                    validations: None,
+                    route: None,
+                    input: project_input(&header.input),
+                    notes: header.notes.clone(),
+                });
+            }
+            PipelineNode::Route { header, config: body } => {
+                let branches: Vec<RouteBranch> = body
+                    .conditions
+                    .iter()
+                    .map(|(name, cxl)| RouteBranch {
+                        name: name.clone(),
+                        condition: cxl.as_ref().to_string(),
+                    })
+                    .collect();
+                out.push(TransformSpec {
+                    name: header.name.clone(),
+                    description: header.description.clone(),
+                    cxl: Some(String::new()),
+                    aggregate: None,
+                    local_window: None,
+                    log: None,
+                    validations: None,
+                    route: Some(RouteConfig {
+                        mode: body.mode,
+                        branches,
+                        default: body.default.clone(),
+                    }),
+                    input: project_input(&header.input),
+                    notes: header.notes.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// Runtime parameters for a pipeline execution (not derived from config YAML).
 pub struct PipelineRunParams {
@@ -512,8 +660,11 @@ impl PipelineExecutor {
         // typecheck side-effects now; the executor consumes the result
         // by moving it out of the locally-bound plan.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        let resolved_transforms = config.transforms();
-        let mut local_plan = crate::plan::CompiledPlan::from_config_for_run(config.clone());
+        let resolved_transforms = crate::executor::build_transform_specs(config);
+        let mut local_plan = config.compile().map_err(|diags| PipelineError::Compilation {
+            transform_name: String::new(),
+            messages: diags.iter().map(|d| d.message.clone()).collect(),
+        })?;
         local_plan.bind_schema(&schema)?;
         let compiled_transforms = local_plan.take_compiled_transforms();
 
@@ -2568,7 +2719,7 @@ impl PipelineExecutor {
                     for &succ in &successors {
                         let succ_name = plan.graph[succ].name();
                         // Check config transforms for matching input reference
-                        for tc in config.transforms() {
+                        for tc in crate::executor::build_transform_specs(config) {
                             if tc.name == succ_name
                                 && let Some(crate::config::TransformInput::Single(ref input_ref)) =
                                     tc.input
@@ -2656,8 +2807,7 @@ impl PipelineExecutor {
                     // The Merge node is named "merge_{transform}". Find the
                     // transform's input: array to determine declaration order.
                     let merge_transform_name = name.strip_prefix("merge_").unwrap_or(name);
-                    let declaration_order: Vec<String> = config
-                        .transforms()
+                    let declaration_order: Vec<String> = crate::executor::build_transform_specs(config)
                         .into_iter()
                         .find(|tc| tc.name == merge_transform_name)
                         .and_then(|tc| {
@@ -3051,12 +3201,23 @@ impl PipelineExecutor {
         ))
     }
 
+    /// Convenience wrapper: build transform specs from a PipelineConfig and
+    /// compile them. Used by `CompiledPlan::bind_schema`.
+    pub(crate) fn compile_transforms_from_config(
+        config: &PipelineConfig,
+        schema: &Arc<Schema>,
+    ) -> Result<Vec<CompiledTransform>, PipelineError> {
+        let owned = crate::executor::build_transform_specs(config);
+        let refs: Vec<&TransformSpec> = owned.iter().collect();
+        Self::compile_transforms(&refs, schema)
+    }
+
     /// Compile all CXL transform blocks against the input schema.
     ///
     /// Fields emitted by earlier transforms are progressively added to the
     /// available field set so that later transforms can reference them.
     pub(crate) fn compile_transforms(
-        transforms: &[&LegacyTransformsBlock],
+        transforms: &[&TransformSpec],
         schema: &Arc<Schema>,
     ) -> Result<Vec<CompiledTransform>, PipelineError> {
         let mut fields: Vec<String> = schema.columns().iter().map(|c| c.to_string()).collect();
@@ -3265,7 +3426,7 @@ impl PipelineExecutor {
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
         // Extract field names from CXL AST to build a synthetic schema
         let mut all_fields = Vec::new();
-        for t in config.transforms() {
+        for t in crate::executor::build_transform_specs(config) {
             let parsed = cxl::parser::Parser::parse(t.cxl_source());
             if !parsed.errors.is_empty() {
                 return Err(PipelineError::Compilation {
@@ -3282,8 +3443,8 @@ impl PipelineExecutor {
             all_fields.iter().map(|f| f.as_str().into()).collect(),
         ));
 
-        let resolved_transforms_owned = config.transforms();
-        let resolved_transforms: Vec<&LegacyTransformsBlock> =
+        let resolved_transforms_owned = crate::executor::build_transform_specs(config);
+        let resolved_transforms: Vec<&TransformSpec> =
             resolved_transforms_owned.iter().collect();
         let compiled = Self::compile_transforms(&resolved_transforms, &schema)?;
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled
@@ -4154,1792 +4315,3 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    mod aggregation;
-    mod branching;
-    mod correlated_dlq;
-    mod format_dispatch;
-    mod multi_output;
-
-    use super::*;
-
-    /// Helper: run executor with in-memory CSV input/output.
-    fn run_test(
-        yaml: &str,
-        csv_input: &str,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-        let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = crate::test_helpers::SharedBuffer::new();
-
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.source_configs().next().unwrap().name.clone(),
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
-        )]);
-
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
-            shutdown_token: None,
-        };
-
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
-
-        let output = output_buf.as_string();
-        Ok((report.counters, report.dlq_entries, output))
-    }
-
-    /// Helper: run executor with in-memory CSV and return the full ExecutionReport.
-    fn run_test_report(
-        yaml: &str,
-        csv_input: &str,
-    ) -> Result<(ExecutionReport, String), PipelineError> {
-        let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = crate::test_helpers::SharedBuffer::new();
-
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.source_configs().next().unwrap().name.clone(),
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
-        )]);
-
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
-            shutdown_token: None,
-        };
-
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
-
-        let output = output_buf.as_string();
-        Ok((report, output))
-    }
-
-    #[test]
-    fn test_execution_report_has_stages_field() {
-        let yaml = r#"
-pipeline:
-  name: identity
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations: []
-"#;
-        let csv = "name,age\nAlice,30\nBob,25\n";
-        let (report, _output) = run_test_report(yaml, csv).unwrap();
-        // ReaderInit + Compile + SchemaScan present
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        assert!(names.contains(&&stage_metrics::StageName::ReaderInit));
-        assert!(names.contains(&&stage_metrics::StageName::Compile));
-        assert!(names.contains(&&stage_metrics::StageName::SchemaScan));
-    }
-
-    #[test]
-    fn test_execution_report_stages_from_collector() {
-        let mut collector = stage_metrics::StageCollector::default();
-        collector
-            .record(stage_metrics::StageTimer::new(stage_metrics::StageName::Compile).finish(0, 0));
-        let stages = collector.into_stages();
-        assert_eq!(stages.len(), 1);
-    }
-
-    #[test]
-    fn test_streaming_pipeline_has_compile_reader_schemascan_stages() {
-        let yaml = r#"
-pipeline:
-  name: passthrough
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: add_x
-    cxl: "emit x = 1"
-"#;
-        let csv = "name,age\nAlice,30\nBob,25\nCarol,28\nDave,31\nEve,22\n";
-        let (report, _output) = run_test_report(yaml, csv).unwrap();
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        assert!(
-            names.contains(&&stage_metrics::StageName::ReaderInit),
-            "Missing ReaderInit stage"
-        );
-        assert!(
-            names.contains(&&stage_metrics::StageName::Compile),
-            "Missing Compile stage"
-        );
-        assert!(
-            names.contains(&&stage_metrics::StageName::SchemaScan),
-            "Missing SchemaScan stage"
-        );
-        for stage in &report.stages {
-            assert!(
-                stage.elapsed > std::time::Duration::ZERO,
-                "Stage {:?} has zero elapsed",
-                stage.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_stage_order_matches_execution_sequence() {
-        let yaml = r#"
-pipeline:
-  name: passthrough
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: add_x
-    cxl: "emit x = 1"
-"#;
-        let csv = "name,age\nAlice,30\nBob,25\n";
-        let (report, _output) = run_test_report(yaml, csv).unwrap();
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        let ri_pos = names
-            .iter()
-            .position(|n| **n == stage_metrics::StageName::ReaderInit)
-            .expect("ReaderInit missing");
-        let c_pos = names
-            .iter()
-            .position(|n| **n == stage_metrics::StageName::Compile)
-            .expect("Compile missing");
-        let ss_pos = names
-            .iter()
-            .position(|n| **n == stage_metrics::StageName::SchemaScan)
-            .expect("SchemaScan missing");
-        assert!(ri_pos < c_pos, "ReaderInit should come before Compile");
-        assert!(c_pos < ss_pos, "Compile should come before SchemaScan");
-    }
-
-    /// Helper: run a correlated pipeline and return the full report.
-    fn run_correlated_test_report(
-        yaml: &str,
-        csv_input: &str,
-    ) -> Result<(ExecutionReport, String), PipelineError> {
-        let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = crate::test_helpers::SharedBuffer::new();
-
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.source_configs().next().unwrap().name.clone(),
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
-        )]);
-
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
-            shutdown_token: None,
-        };
-
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
-        let output = output_buf.as_string();
-        Ok((report, output))
-    }
-
-    #[test]
-    fn test_correlated_pipeline_has_schemascan() {
-        let yaml = r#"
-pipeline:
-  name: correlated_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
-error_handling:
-  strategy: continue
-  correlation_key: employee_id
-transformations:
-  - name: validate
-    cxl: |
-      emit emp_id = employee_id
-      emit val = value
-outputs:
-  - name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-        let csv = "employee_id,value\nA,10\nA,20\nB,30\nB,40\n";
-        let (report, _output) = run_correlated_test_report(yaml, csv).unwrap();
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        assert!(
-            names.contains(&&stage_metrics::StageName::SchemaScan),
-            "Missing SchemaScan stage in correlated pipeline"
-        );
-    }
-
-    #[test]
-    fn test_two_pass_pipeline_has_schemascan() {
-        let yaml = r#"
-pipeline:
-  name: two_pass_test
-inputs:
-  - name: primary
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: window_transform
-    cxl: |
-      emit dept_total = $window.sum(amount)
-    local_window:
-      group_by: [dept]
-"#;
-        let csv = "dept,amount\nA,10\nB,20\nA,30\n";
-        let (report, _output) = run_test_report(yaml, csv).unwrap();
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        assert!(
-            names.contains(&&stage_metrics::StageName::SchemaScan),
-            "Missing SchemaScan stage in two-pass pipeline"
-        );
-    }
-
-    #[test]
-    fn test_streaming_cumulative_stages_present() {
-        let yaml = r#"
-pipeline:
-  name: passthrough
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: add_x
-    cxl: "emit x = 1"
-"#;
-        let csv = "name,age\nAlice,30\nBob,25\nCarol,28\nDave,31\nEve,22\n\
-                   Frank,27\nGrace,29\nHenry,33\nIvy,24\nJack,26\n";
-        let (report, _output) = run_test_report(yaml, csv).unwrap();
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        assert!(
-            names.contains(&&stage_metrics::StageName::TransformEval),
-            "Missing TransformEval: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&&stage_metrics::StageName::Projection),
-            "Missing Projection: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&&stage_metrics::StageName::Write),
-            "Missing Write: {:?}",
-            names
-        );
-        for stage in report.stages.iter().filter(|s| {
-            matches!(
-                s.name,
-                stage_metrics::StageName::TransformEval
-                    | stage_metrics::StageName::Projection
-                    | stage_metrics::StageName::Write
-            )
-        }) {
-            assert!(
-                stage.elapsed > std::time::Duration::ZERO,
-                "Stage {:?} has zero elapsed",
-                stage.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_multi_output_has_route_eval_stage() {
-        let yaml = r#"
-pipeline:
-  name: multi_out
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: high
-    type: csv
-    path: high.csv
-    include_unmapped: true
-  - name: low
-    type: csv
-    path: low.csv
-    include_unmapped: true
-transformations:
-  - name: classify
-    cxl: |
-      emit x = age.to_int()
-    route:
-      branches:
-        - name: high
-          condition: "x > 28"
-      default: low
-"#;
-        let csv = "name,age\nAlice,30\nBob,25\n";
-        let config = crate::config::parse_config(yaml).unwrap();
-        let high_buf = crate::test_helpers::SharedBuffer::new();
-        let low_buf = crate::test_helpers::SharedBuffer::new();
-
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.source_configs().next().unwrap().name.clone(),
-            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
-            (
-                "high".to_string(),
-                Box::new(high_buf.clone()) as Box<dyn std::io::Write + Send>,
-            ),
-            (
-                "low".to_string(),
-                Box::new(low_buf.clone()) as Box<dyn std::io::Write + Send>,
-            ),
-        ]);
-
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
-            shutdown_token: None,
-        };
-
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
-        let names: Vec<_> = report.stages.iter().map(|s| &s.name).collect();
-        assert!(
-            names.contains(&&stage_metrics::StageName::RouteEval),
-            "Missing RouteEval in multi-output pipeline: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn test_executor_identity_passthrough() {
-        let yaml = r#"
-pipeline:
-  name: identity
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations: []
-"#;
-        let csv = "name,age\nAlice,30\nBob,25\n";
-        let (counters, dlq, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 2);
-        assert_eq!(counters.ok_count, 2);
-        assert_eq!(counters.dlq_count, 0);
-        assert!(dlq.is_empty());
-        assert!(output.contains("Alice"));
-        assert!(output.contains("Bob"));
-    }
-
-    #[test]
-    fn test_executor_cxl_string_concat() {
-        let yaml = r#"
-pipeline:
-  name: concat
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: concat_name
-    cxl: |
-      emit full_name = first_name + " " + last_name
-"#;
-        let csv = "first_name,last_name\nAlice,Smith\nBob,Jones\n";
-        let (counters, _, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.ok_count, 2);
-        assert!(output.contains("Alice Smith"));
-        assert!(output.contains("Bob Jones"));
-    }
-
-    #[test]
-    fn test_executor_cxl_arithmetic() {
-        let yaml = r#"
-pipeline:
-  name: arithmetic
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: calc_total
-    cxl: |
-      emit total = price.to_float() * quantity.to_float()
-"#;
-        let csv = "price,quantity\n10.5,3\n20.0,2\n";
-        let (counters, _, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.ok_count, 2);
-        assert!(output.contains("31.5"));
-        assert!(output.contains("40"));
-    }
-
-    #[test]
-    fn test_executor_cxl_conditional() {
-        let yaml = r#"
-pipeline:
-  name: conditional
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: categorize
-    cxl: |
-      emit category = if age.to_int() >= 18 then "adult" else "minor"
-"#;
-        let csv = "name,age\nAlice,30\nBob,15\n";
-        let (counters, _, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.ok_count, 2);
-        assert!(output.contains("adult"));
-        assert!(output.contains("minor"));
-    }
-
-    #[test]
-    fn test_executor_field_mapping() {
-        let yaml = r#"
-pipeline:
-  name: mapping
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-    mapping:
-      name: employee_name
-
-transformations: []
-"#;
-        let csv = "name,age\nAlice,30\n";
-        let (_, _, output) = run_test(yaml, csv).unwrap();
-        assert!(output.contains("employee_name"));
-        assert!(!output.contains("\nname")); // header should be renamed
-    }
-
-    #[test]
-    fn test_executor_exclude_fields() {
-        let yaml = r#"
-pipeline:
-  name: exclude
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-    exclude:
-      - secret
-
-transformations: []
-"#;
-        let csv = "name,secret,age\nAlice,password,30\n";
-        let (_, _, output) = run_test(yaml, csv).unwrap();
-        assert!(output.contains("name"));
-        assert!(output.contains("age"));
-        assert!(!output.contains("secret"));
-        assert!(!output.contains("password"));
-    }
-
-    #[test]
-    fn test_executor_projection_order() {
-        // Gather (include_unmapped) → exclude → mapping
-        let yaml = r#"
-pipeline:
-  name: projection
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-    exclude:
-      - secret
-    mapping:
-      name: full_name
-
-transformations: []
-"#;
-        let csv = "name,secret,age\nAlice,password,30\n";
-        let (_, _, output) = run_test(yaml, csv).unwrap();
-        // name renamed to full_name, secret excluded, age kept
-        assert!(output.contains("full_name"));
-        assert!(output.contains("age"));
-        assert!(!output.contains("secret"));
-        assert!(!output.contains("password"));
-    }
-
-    #[test]
-    fn test_executor_fail_fast_aborts() {
-        let yaml = r#"
-pipeline:
-  name: failfast
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: will_fail
-    cxl: |
-      emit result = value.to_int() + 1
-
-error_handling:
-  strategy: fail_fast
-"#;
-        // "bad" can't be converted to int
-        let csv = "value\n10\nbad\n20\n";
-        let result = run_test(yaml, csv);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_executor_continue_skips() {
-        let yaml = r#"
-pipeline:
-  name: continue_skip
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: will_fail_some
-    cxl: |
-      emit result = value.to_int() + 1
-
-error_handling:
-  strategy: continue
-"#;
-        let csv = "value\n10\nbad\n20\n";
-        let (counters, dlq, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 3);
-        assert_eq!(counters.ok_count, 2);
-        assert_eq!(counters.dlq_count, 1);
-        assert_eq!(dlq.len(), 1);
-        assert_eq!(dlq[0].source_row, 2);
-        // Output should have rows 1 and 3 but not row 2
-        assert!(output.contains("11"));
-        assert!(output.contains("21"));
-        assert!(!output.contains("bad"));
-    }
-
-    #[test]
-    fn test_executor_best_effort_preserves() {
-        let yaml = r#"
-pipeline:
-  name: best_effort
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: will_fail_some
-    cxl: |
-      emit result = value.to_int() + 1
-
-error_handling:
-  strategy: best_effort
-"#;
-        let csv = "value\n10\nbad\n20\n";
-        let (counters, dlq, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 3);
-        // best_effort: ok_count includes error rows (original values preserved)
-        assert_eq!(counters.ok_count, 3);
-        assert_eq!(counters.dlq_count, 1);
-        assert_eq!(dlq.len(), 1);
-        // "bad" row should still appear in output with original value
-        assert!(output.contains("bad"));
-    }
-
-    #[test]
-    fn test_executor_pipeline_counters() {
-        let yaml = r#"
-pipeline:
-  name: counters
-
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: will_fail_some
-    cxl: |
-      emit result = value.to_int() * 2
-
-error_handling:
-  strategy: continue
-"#;
-        // 10 rows, rows 3 and 7 have "bad" values
-        let mut rows = Vec::new();
-        rows.push("value".to_string());
-        for i in 1..=10 {
-            if i == 3 || i == 7 {
-                rows.push("bad".to_string());
-            } else {
-                rows.push(i.to_string());
-            }
-        }
-        let csv = rows.join("\n") + "\n";
-
-        let (counters, dlq, _) = run_test(yaml, &csv).unwrap();
-        assert_eq!(counters.total_count, 10);
-        assert_eq!(counters.ok_count, 8);
-        assert_eq!(counters.dlq_count, 2);
-        assert_eq!(dlq.len(), 2);
-    }
-
-    // === Task 5.5 Two-Pass Gate Tests ===
-
-    fn two_pass_yaml(cxl: &str, local_window: &str) -> String {
-        format!(
-            r#"
-pipeline:
-  name: two_pass_test
-
-inputs:
-  - name: primary
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: window_transform
-    cxl: |
-      {cxl}
-    local_window:
-      {local_window}
-"#,
-            cxl = cxl,
-            local_window = local_window
-        )
-    }
-
-    #[test]
-    fn test_two_pass_sum_by_dept() {
-        let yaml = two_pass_yaml("emit dept_total = $window.sum(amount)", "group_by: [dept]");
-        let csv = "dept,amount\nA,10\nB,20\nA,30\nB,40\nA,50\n";
-        let (counters, _, output) = run_test(&yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 5);
-        assert_eq!(counters.ok_count, 5);
-        // Arena stores CSV strings, so sum returns Null for strings.
-        // This is correct — Arena values are uncoerced strings from CSV.
-        // Full numeric window aggregation requires CXL-side coercion,
-        // which is a Phase 2 evaluator concern (not Arena's job).
-        // The test verifies the two-pass path executes without errors.
-        assert!(output.contains("dept_total"));
-    }
-
-    #[test]
-    fn test_two_pass_count_by_group() {
-        let yaml = two_pass_yaml("emit group_count = $window.count()", "group_by: [dept]");
-        let csv = "dept,amount\nA,10\nB,20\nA,30\nB,40\nA,50\n";
-        let (counters, _, output) = run_test(&yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 5);
-        assert_eq!(counters.ok_count, 5);
-        // count() returns partition size as integer
-        assert!(output.contains("group_count"), "output: {}", output);
-        // A has 3 records, B has 2
-        assert!(
-            output.contains(",3") || output.contains("3,"),
-            "expected 3 in output: {}",
-            output
-        );
-        assert!(
-            output.contains(",2") || output.contains("2,"),
-            "expected 2 in output: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_two_pass_stateless_fallback() {
-        // No local_window → streaming mode, no arena built
-        let yaml = r#"
-pipeline:
-  name: stateless
-
-inputs:
-  - name: primary
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: calc
-    cxl: |
-      emit doubled = amount + "_doubled"
-"#;
-        let csv = "amount\n10\n20\n30\n";
-        let (counters, _, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 3);
-        assert_eq!(counters.ok_count, 3);
-        assert!(output.contains("10_doubled"));
-    }
-
-    #[test]
-    fn test_two_pass_pipeline_counters() {
-        let yaml = two_pass_yaml("emit cnt = $window.count()", "group_by: [dept]");
-        let csv = "dept\nA\nB\nA\nB\nA\nB\nA\nB\nA\nB\n";
-        let (counters, dlq, _) = run_test(&yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 10);
-        assert_eq!(counters.ok_count, 10);
-        assert_eq!(counters.dlq_count, 0);
-        assert!(dlq.is_empty());
-    }
-
-    #[test]
-    fn test_two_pass_mixed_stateless_and_window() {
-        let yaml = r#"
-pipeline:
-  name: mixed
-
-inputs:
-  - name: primary
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: stateless_calc
-    cxl: |
-      emit label = dept + "_label"
-  - name: window_calc
-    cxl: |
-      emit cnt = $window.count()
-    local_window:
-      group_by: [dept]
-"#;
-        let csv = "dept,amount\nA,10\nB,20\nA,30\n";
-        let (counters, _, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 3);
-        assert_eq!(counters.ok_count, 3);
-        // Both transforms should produce output
-        assert!(output.contains("label"));
-        assert!(output.contains("cnt"));
-        assert!(output.contains("A_label"));
-    }
-
-    #[test]
-    fn test_two_pass_multiple_windows_shared_index() {
-        let yaml = r#"
-pipeline:
-  name: shared_index
-
-inputs:
-  - name: primary
-    type: csv
-    path: input.csv
-
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-
-transformations:
-  - name: win1
-    cxl: |
-      emit cnt1 = $window.count()
-    local_window:
-      group_by: [dept]
-  - name: win2
-    cxl: |
-      emit cnt2 = $window.count()
-    local_window:
-      group_by: [dept]
-"#;
-        let csv = "dept\nA\nB\nA\n";
-        let (counters, _, output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.ok_count, 3);
-        assert!(output.contains("cnt1"));
-        assert!(output.contains("cnt2"));
-    }
-
-    #[test]
-    fn test_two_pass_nan_exit_code_3() {
-        // NaN in group_by field should cause an error
-        // Since CSV reads as strings, we can't directly inject NaN.
-        // The NaN check happens in SecondaryIndex::build on Float values.
-        // With CSV input (all strings), NaN won't occur in group_by.
-        // This test verifies the error path exists by checking the error type.
-        // A true NaN test would need non-CSV input or post-coercion in Arena.
-        // For now, verify the pipeline runs without NaN errors for string data.
-        let yaml = two_pass_yaml("emit cnt = $window.count()", "group_by: [dept]");
-        let csv = "dept\nA\nB\n";
-        let result = run_test(&yaml, csv);
-        assert!(result.is_ok()); // No NaN in string data
-    }
-
-    #[test]
-    fn test_two_pass_provenance_populated() {
-        // RecordProvenance is set in EvalContext — verify source_row is sequential
-        let yaml = two_pass_yaml("emit row = $pipeline.source_row", "group_by: [dept]");
-        let csv = "dept\nA\nB\nA\n";
-        let (counters, _, output) = run_test(&yaml, csv).unwrap();
-        assert_eq!(counters.ok_count, 3);
-        // source_row should be sequential
-        // Values appear as integers in CSV output
-        assert!(
-            output.contains("row"),
-            "output missing 'row' header: {}",
-            output
-        );
-    }
-
-    // ── Phase 6 gate tests ───────────────────────────────────────────
-
-    #[test]
-    fn test_thread_pool_default_count() {
-        let expected = std::cmp::min(num_cpus::get().saturating_sub(2).max(1), 4);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(expected)
-            .thread_name(|i| format!("cxl-worker-{i}"))
-            .build()
-            .unwrap();
-        assert_eq!(pool.current_num_threads(), expected);
-    }
-
-    #[test]
-    fn test_thread_pool_cli_override() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .thread_name(|i| format!("cxl-worker-{i}"))
-            .build()
-            .unwrap();
-        assert_eq!(pool.current_num_threads(), 2);
-    }
-
-    /// Helper: run executor with specific thread count via concurrency config.
-    fn run_test_with_threads(
-        yaml: &str,
-        csv_input: &str,
-        threads: usize,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
-        // Parse config and override thread count
-        let mut config = crate::config::parse_config(yaml).unwrap();
-        config.pipeline.concurrency = Some(crate::config::ConcurrencyConfig {
-            threads: Some(threads),
-            chunk_size: Some(64), // small chunks to exercise chunking logic
-        });
-        let output_buf = crate::test_helpers::SharedBuffer::new();
-
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.source_configs().next().unwrap().name.clone(),
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
-        )]);
-
-        let pipeline_vars = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(|v| crate::config::convert_pipeline_vars(v))
-            .unwrap_or_default();
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars,
-            shutdown_token: None,
-        };
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
-        let output = output_buf.as_string();
-        Ok((report.counters, report.dlq_entries, output))
-    }
-
-    #[test]
-    fn test_par_stateless_deterministic_output() {
-        let yaml = r#"
-pipeline:
-  name: par_stateless
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: double
-    cxl: |
-      emit doubled = amount + "_doubled"
-"#;
-        // Generate 1000-record CSV
-        let mut csv = String::from("id,amount\n");
-        for i in 0..1000 {
-            csv.push_str(&format!("{i},val_{i}\n"));
-        }
-
-        let (_, _, output_1) = run_test_with_threads(yaml, &csv, 1).unwrap();
-        let (_, _, output_4) = run_test_with_threads(yaml, &csv, 4).unwrap();
-        assert_eq!(
-            output_1, output_4,
-            "Output must be byte-identical with 1 vs 4 threads"
-        );
-    }
-
-    #[test]
-    fn test_par_index_reading_deterministic_output() {
-        let yaml = r#"
-pipeline:
-  name: par_index
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: dept_total
-    cxl: |
-      emit dept_total = $window.sum(amount)
-    local_window:
-      group_by: [dept]
-"#;
-        let mut csv = String::from("dept,amount\n");
-        for i in 0..500 {
-            let dept = if i % 3 == 0 {
-                "A"
-            } else if i % 3 == 1 {
-                "B"
-            } else {
-                "C"
-            };
-            csv.push_str(&format!("{dept},{i}\n"));
-        }
-
-        let (_, _, output_1) = run_test_with_threads(yaml, &csv, 1).unwrap();
-        let (_, _, output_4) = run_test_with_threads(yaml, &csv, 4).unwrap();
-        assert_eq!(
-            output_1, output_4,
-            "Window output must be byte-identical with 1 vs 4 threads"
-        );
-    }
-
-    #[test]
-    fn test_sequential_not_parallelized() {
-        // A transform using $window.lag(1) is classified Sequential.
-        // Verify the pipeline runs correctly (sequential dispatch path).
-        let yaml = r#"
-pipeline:
-  name: seq_test
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: lagged
-    cxl: |
-      emit prev = $window.lag(1)
-    local_window:
-      group_by: [dept]
-      sort_by:
-        - field: id
-"#;
-        let csv = "dept,id\nA,1\nA,2\nA,3\nB,4\nB,5\n";
-        let (counters, _, _output) = run_test_with_threads(yaml, csv, 4).unwrap();
-        assert_eq!(counters.ok_count, 5);
-        // The key assertion: sequential transforms run without error under any thread count.
-        // The plan's `can_parallelize()` returns false, so the sequential path is used.
-    }
-
-    #[test]
-    fn test_golden_file_diff_1_vs_4_threads() {
-        // Full CSV→CXL→CSV pipeline: byte-identical output with 1 vs 4 threads.
-        // Uses only stateless transforms (no `now` keyword).
-        let yaml = r#"
-pipeline:
-  name: golden
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: transform
-    cxl: |
-      emit upper_name = name + "_UPPER"
-      emit computed = amount + "_x2"
-"#;
-        let mut csv = String::from("name,amount,dept\n");
-        for i in 0..500 {
-            csv.push_str(&format!("person_{i},{i},dept_{}\n", i % 5));
-        }
-
-        let (c1, _, out1) = run_test_with_threads(yaml, &csv, 1).unwrap();
-        let (c4, _, out4) = run_test_with_threads(yaml, &csv, 4).unwrap();
-        assert_eq!(out1, out4, "Golden file output must be byte-identical");
-        assert_eq!(c1.ok_count, c4.ok_count);
-        assert_eq!(c1.total_count, 500);
-    }
-
-    #[test]
-    fn test_arc_ast_shared_not_cloned() {
-        // Verify that Arc<TypedProgram> strong_count is 1 after compilation —
-        // the Arc is shared by reference during evaluation, not cloned per record.
-        let yaml = r#"
-pipeline:
-  name: arc_test
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: calc
-    cxl: |
-      emit doubled = amount + "_doubled"
-"#;
-        let config = crate::config::parse_config(yaml).unwrap();
-        let schema = Arc::new(Schema::new(vec!["amount".into()]));
-        let transforms_owned = config.transforms();
-        let transforms: Vec<&crate::config::LegacyTransformsBlock> =
-            transforms_owned.iter().collect();
-        let compiled = PipelineExecutor::compile_transforms(&transforms, &schema).unwrap();
-        // Each compiled transform holds one Arc<TypedProgram>
-        for ct in &compiled {
-            assert_eq!(
-                Arc::strong_count(&ct.typed),
-                1,
-                "Arc<TypedProgram> should have exactly 1 strong reference (no per-record cloning)"
-            );
-        }
-    }
-
-    #[test]
-    fn test_empty_pipeline_zero_records() {
-        let yaml = r#"
-pipeline:
-  name: empty
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: calc
-    cxl: |
-      emit doubled = name + "_x"
-"#;
-        // Header only, no data rows
-        let csv = "name\n";
-        let (counters, dlq, _output) = run_test(yaml, csv).unwrap();
-        assert_eq!(counters.total_count, 0);
-        assert_eq!(counters.ok_count, 0);
-        assert_eq!(counters.dlq_count, 0);
-        assert!(dlq.is_empty());
-    }
-
-    // ── Phase 6 Task 6.5 gate tests ─────────────────────────────────
-
-    #[test]
-    fn test_graceful_shutdown_flushes_output() {
-        // Construct a per-run shutdown token, trip it, and pass it through
-        // PipelineRunParams. Pipeline should run without panic — with a
-        // pre-tripped token a window/aggregation pipeline returns cleanly
-        // (Arena::build observes the token at the next chunk-boundary
-        // check). This is now isolated from any other test's tokens.
-        use crate::pipeline::shutdown::ShutdownToken;
-        let token = ShutdownToken::detached();
-        token.request();
-
-        let yaml = r#"
-pipeline:
-  name: shutdown_test
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: calc
-    cxl: |
-      emit doubled = name + "_x"
-"#;
-        let mut csv = String::from("name\n");
-        for i in 0..100 {
-            csv.push_str(&format!("person_{i}\n"));
-        }
-
-        let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = crate::test_helpers::SharedBuffer::new();
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            config.source_configs().next().unwrap().name.clone(),
-            Box::new(std::io::Cursor::new(csv.into_bytes())) as Box<dyn std::io::Read + Send>,
-        )]);
-        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-            config.output_configs().next().unwrap().name.clone(),
-            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
-        )]);
-        let params = PipelineRunParams {
-            execution_id: "test-exec-id".to_string(),
-            batch_id: "test-batch-id".to_string(),
-            pipeline_vars: IndexMap::new(),
-            shutdown_token: Some(token),
-        };
-        let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
-        assert!(result.is_ok(), "Pipeline should not panic on shutdown");
-        let report = result.unwrap();
-        let output = output_buf.as_string();
-        assert!(
-            output.contains("name") || output.contains("doubled"),
-            "Output should contain at least the header"
-        );
-        assert!(
-            report.counters.ok_count + report.counters.dlq_count <= report.counters.total_count
-        );
-    }
-
-    #[test]
-    fn test_shutdown_dlq_summary_to_stderr() {
-        // This tests the ErrorThreshold + DLQ interaction.
-        // With BestEffort strategy, DLQ records accumulate but pipeline continues.
-        // We verify DLQ entries are collected (the stderr summary is a CLI concern
-        // tested in Phase 8; here we test the engine produces DLQ data).
-        let yaml = r#"
-pipeline:
-  name: dlq_test
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-error_handling:
-  strategy: best_effort
-transformations:
-  - name: fail_some
-    cxl: |
-      let x = amount.to_int()
-      emit result = x * 2
-"#;
-        // Mix valid and invalid amounts — "bad" will fail to_int()
-        let csv = "name,amount\nAlice,100\nBob,bad\nCarol,200\n";
-        let result = run_test(yaml, csv);
-        assert!(result.is_ok());
-        let (counters, dlq, _output) = result.unwrap();
-        // Bob's row should go to DLQ
-        assert!(
-            counters.dlq_count >= 1,
-            "Should have at least 1 DLQ entry, got {}",
-            counters.dlq_count
-        );
-        assert!(!dlq.is_empty(), "DLQ entries should be populated");
-    }
-
-    // ── Phase 8 Task 8.3: --explain gate tests ─────────────────
-
-    fn explain_config(yaml: &str) -> PipelineConfig {
-        crate::config::parse_config(yaml).unwrap()
-    }
-
-    #[test]
-    fn test_explain_no_data_read() {
-        // Input files don't exist — explain should succeed without opening them
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /nonexistent/path/that/does/not/exist.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /nonexistent/output.csv
-transformations:
-  - name: t1
-    cxl: "emit result = 1 + 2"
-"#;
-        let config = explain_config(yaml);
-        let result = PipelineExecutor::explain(&config);
-        assert!(
-            result.is_ok(),
-            "explain should succeed without reading data: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn test_explain_prints_ast() {
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: compute
-    cxl: "emit total = Price * Qty"
-"#;
-        let config = explain_config(yaml);
-        let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(
-            output.contains("CXL Expressions"),
-            "should contain CXL section"
-        );
-        assert!(
-            output.contains("Price"),
-            "should contain field refs from CXL"
-        );
-        assert!(output.contains("Qty"), "should contain field refs from CXL");
-    }
-
-    #[test]
-    fn test_explain_prints_type_annotations() {
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: t1
-    cxl: "emit x = 1 + 2"
-"#;
-        let config = explain_config(yaml);
-        let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(
-            output.contains("Type Annotations"),
-            "should contain type annotations section"
-        );
-    }
-
-    #[test]
-    fn test_explain_prints_source_dag() {
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: primary
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: t1
-    cxl: "emit x = 1"
-"#;
-        let config = explain_config(yaml);
-        let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(output.contains("Source DAG"), "should contain source DAG");
-        assert!(output.contains("primary"), "should list source name");
-    }
-
-    #[test]
-    fn test_explain_prints_indices() {
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: t1
-    cxl: "emit total = $window.sum(amount)"
-    local_window:
-      group_by: [dept]
-      sort_by:
-        - field: amount
-          order: asc
-"#;
-        let config = explain_config(yaml);
-        let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(output.contains("Index [0]"), "should list indices");
-        assert!(output.contains("Group by"), "should show group_by");
-        assert!(output.contains("Sort by"), "should show sort_by");
-    }
-
-    #[test]
-    fn test_explain_prints_memory_budget() {
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: t1
-    cxl: "emit x = 1"
-"#;
-        let config = explain_config(yaml);
-        let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(
-            output.contains("Memory Budget"),
-            "should contain memory budget section"
-        );
-    }
-
-    #[test]
-    fn test_explain_prints_parallelism() {
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: t1
-    cxl: "emit x = 1"
-"#;
-        let config = explain_config(yaml);
-        let output = PipelineExecutor::explain(&config).unwrap();
-        assert!(
-            output.contains("Parallelism"),
-            "should contain parallelism classification"
-        );
-    }
-
-    #[test]
-    fn test_explain_invalid_config_exit_1() {
-        // Invalid CXL should produce an error
-        let yaml = r#"
-pipeline:
-  name: explain-test
-inputs:
-  - name: src
-    type: csv
-    path: /tmp/test.csv
-outputs:
-  - name: dest
-    type: csv
-    path: /tmp/out.csv
-transformations:
-  - name: t1
-    cxl: "emit x = !!invalid syntax!!"
-"#;
-        let config = explain_config(yaml);
-        let result = PipelineExecutor::explain(&config);
-        assert!(
-            result.is_err(),
-            "invalid CXL should produce compilation error"
-        );
-    }
-
-    #[test]
-    #[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; \
-                Task 16.0.5.8 deleted the legacy sort block but the new PlanNode::Sort dispatch arm \
-                is not yet driven for this pipeline."]
-    fn test_correlated_pipeline_has_sort_and_group_flush_stages() {
-        let yaml = r#"
-pipeline:
-  name: correlated_test
-inputs:
-  - name: src
-    path: input.csv
-    type: csv
-error_handling:
-  strategy: continue
-  correlation_key: employee_id
-transformations:
-  - name: validate
-    cxl: |
-      emit emp_id = employee_id
-      emit val = value
-outputs:
-  - name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-        let csv_input = "employee_id,value\nA,1\nA,2\nB,3\n";
-        let (report, _output) = run_correlated_test_report(yaml, csv_input).unwrap();
-        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
-        assert!(
-            stage_names.iter().any(|n| n == "Sort"),
-            "correlated pipeline should have Sort stage, got: {stage_names:?}"
-        );
-        assert!(
-            stage_names.iter().any(|n| n == "GroupFlush"),
-            "correlated pipeline should have GroupFlush stage, got: {stage_names:?}"
-        );
-    }
-
-    #[test]
-    fn test_stage_count_streaming_mode() {
-        let yaml = r#"
-pipeline:
-  name: streaming_test
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: passthrough
-    cxl: |
-      emit x = name
-"#;
-        let csv_input = "name\nAlice\nBob\n";
-        let (report, _output) = run_test_report(yaml, csv_input).unwrap();
-        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
-        assert_eq!(
-            stage_names.len(),
-            6,
-            "streaming pipeline should have 6 stages (ReaderInit + Compile + SchemaScan + TransformEval + Projection + Write), got: {stage_names:?}"
-        );
-    }
-
-    #[test]
-    fn test_stage_count_two_pass_mode() {
-        let yaml = r#"
-pipeline:
-  name: two_pass_test
-inputs:
-  - name: primary
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: window_transform
-    cxl: |
-      emit dept_total = $window.sum(amount)
-    local_window:
-      group_by: [dept]
-"#;
-        let csv_input = "dept,amount\nA,10\nA,20\nB,30\n";
-        let (report, _output) = run_test_report(yaml, csv_input).unwrap();
-        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
-        assert!(
-            stage_names.len() >= 8,
-            "two-pass pipeline should have >= 8 stages, got {}: {stage_names:?}",
-            stage_names.len()
-        );
-    }
-
-    #[test]
-    fn test_empty_pipeline_stages_minimal() {
-        let yaml = r#"
-pipeline:
-  name: empty_test
-inputs:
-  - name: src
-    type: csv
-    path: input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output.csv
-    include_unmapped: true
-transformations:
-  - name: passthrough
-    cxl: |
-      emit x = name
-"#;
-        let csv_input = "name\n";
-        let (report, _output) = run_test_report(yaml, csv_input).unwrap();
-        let stage_names: Vec<String> = report.stages.iter().map(|s| s.name.to_string()).collect();
-        assert!(
-            stage_names.iter().any(|n| n == "ReaderInit"),
-            "empty pipeline should have ReaderInit stage, got: {stage_names:?}"
-        );
-        assert!(
-            stage_names.iter().any(|n| n == "Compile"),
-            "empty pipeline should have Compile stage, got: {stage_names:?}"
-        );
-    }
-
-    fn synthetic_stage(
-        cpu_user: Option<u64>,
-        cpu_sys: Option<u64>,
-        io_read: Option<u64>,
-        io_write: Option<u64>,
-    ) -> stage_metrics::StageMetrics {
-        stage_metrics::StageMetrics {
-            name: stage_metrics::StageName::Compile,
-            elapsed: std::time::Duration::ZERO,
-            records_in: 0,
-            records_out: 0,
-            bytes_written: None,
-            rss_after: None,
-            cpu_user_delta_ns: cpu_user,
-            cpu_sys_delta_ns: cpu_sys,
-            io_read_delta: io_read,
-            io_write_delta: io_write,
-            heap_delta_bytes: None,
-            heap_alloc_count: None,
-        }
-    }
-
-    #[test]
-    fn execution_report_aggregates_cpu_totals() {
-        let stages = vec![
-            synthetic_stage(Some(100), Some(10), None, None),
-            synthetic_stage(Some(200), Some(20), None, None),
-            synthetic_stage(Some(50), Some(5), None, None),
-        ];
-        let (cu, cs, ir, iw) = sum_cpu_io_totals(&stages);
-        assert_eq!(cu, Some(350));
-        assert_eq!(cs, Some(35));
-        assert_eq!(ir, None);
-        assert_eq!(iw, None);
-    }
-
-    #[test]
-    fn execution_report_aggregates_io_totals() {
-        let stages = vec![
-            synthetic_stage(None, None, Some(1024), Some(2048)),
-            synthetic_stage(None, None, Some(512), Some(4096)),
-        ];
-        let (_, _, ir, iw) = sum_cpu_io_totals(&stages);
-        assert_eq!(ir, Some(1536));
-        assert_eq!(iw, Some(6144));
-    }
-
-    #[test]
-    fn execution_report_handles_partial_none() {
-        let stages = vec![
-            synthetic_stage(Some(100), Some(10), Some(1000), Some(2000)),
-            synthetic_stage(None, None, None, None), // cumulative timer
-            synthetic_stage(Some(50), Some(5), Some(500), Some(1000)),
-        ];
-        let (cu, cs, ir, iw) = sum_cpu_io_totals(&stages);
-        assert_eq!(cu, Some(150));
-        assert_eq!(cs, Some(15));
-        assert_eq!(ir, Some(1500));
-        assert_eq!(iw, Some(3000));
-
-        // All-None stages produce all-None totals (no panic).
-        let empty_stages = vec![synthetic_stage(None, None, None, None)];
-        let (cu, cs, ir, iw) = sum_cpu_io_totals(&empty_stages);
-        assert_eq!(cu, None);
-        assert_eq!(cs, None);
-        assert_eq!(ir, None);
-        assert_eq!(iw, None);
-    }
-}

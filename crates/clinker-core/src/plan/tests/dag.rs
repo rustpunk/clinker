@@ -5,6 +5,7 @@
 //! tier assignment, node counts, edge types, and JSON serialization.
 
 use crate::config::*;
+use crate::executor::TransformSpec;
 use crate::plan::execution::*;
 
 /// Build a diamond-shaped PipelineConfig for branching tests.
@@ -17,42 +18,55 @@ pub(crate) fn diamond_fixture_yaml() -> &'static str {
     r#"
 pipeline:
   name: diamond-test
-
-inputs:
-  - name: primary
-    path: data.csv
-    type: csv
-
-outputs:
-  - name: output
-    path: out.csv
-    include_unmapped: true
-    type: csv
-
-transformations:
-  - name: categorize
-    cxl: |
-      emit value = amount
-    route:
+nodes:
+  - type: source
+    name: primary
+    config:
+      type: csv
+      path: data.csv
+  - type: transform
+    name: categorize_emit
+    input: primary
+    config:
+      cxl: |
+        emit value = amount
+  - type: route
+    name: categorize
+    input: categorize_emit
+    config:
       mode: exclusive
-      branches:
-        - name: high_value
-          condition: "amount > 100"
-        - name: low_value
-          condition: "amount <= 100"
+      conditions:
+        high_value: "amount > 100"
+        low_value: "amount <= 100"
       default: output
-
-  - name: enrich_high
-    cxl: |
-      emit tier = "premium"
-
-  - name: enrich_low
-    cxl: |
-      emit tier = "standard"
-
-  - name: finalize
-    cxl: |
-      emit done = true
+  - type: transform
+    name: enrich_high
+    input: categorize.high_value
+    config:
+      cxl: |
+        emit tier = "premium"
+  - type: transform
+    name: enrich_low
+    input: categorize.low_value
+    config:
+      cxl: |
+        emit tier = "standard"
+  - type: merge
+    name: finalize_merge
+    inputs: [enrich_high, enrich_low]
+  - type: transform
+    name: finalize
+    input: finalize_merge
+    config:
+      cxl: |
+        emit done = true
+  - type: output
+    name: output
+    input: finalize
+    config:
+      type: csv
+      path: out.csv
+      include_unmapped: true
 "#
 }
 
@@ -61,26 +75,31 @@ pub(crate) fn linear_fixture_yaml() -> &'static str {
     r#"
 pipeline:
   name: linear-test
-
-inputs:
-  - name: primary
-    path: data.csv
-    type: csv
-
-outputs:
-  - name: output
-    path: out.csv
-    include_unmapped: true
-    type: csv
-
-transformations:
-  - name: step_one
-    cxl: |
-      emit x = amount + 1
-
-  - name: step_two
-    cxl: |
-      emit y = amount * 2
+nodes:
+  - type: source
+    name: primary
+    config:
+      type: csv
+      path: data.csv
+  - type: transform
+    name: step_one
+    input: primary
+    config:
+      cxl: |
+        emit x = amount + 1
+  - type: transform
+    name: step_two
+    input: step_one
+    config:
+      cxl: |
+        emit y = amount * 2
+  - type: output
+    name: output
+    input: step_two
+    config:
+      type: csv
+      path: out.csv
+      include_unmapped: true
 "#
 }
 
@@ -105,13 +124,13 @@ fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProg
 
 /// Identity helper retained to keep test callsites compact.
 #[allow(dead_code)]
-fn t(entry: &LegacyTransformsBlock) -> &LegacyTransformsBlock {
+fn t(entry: &TransformSpec) -> &TransformSpec {
     entry
 }
 
 /// Helper: compile a fixture config into an ExecutionPlanDag.
 fn compile_fixture(config: &PipelineConfig, fields: &[&str]) -> ExecutionPlanDag {
-    let transforms: Vec<_> = config.transforms();
+    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), fields))
@@ -186,7 +205,7 @@ transformations:
     input: alpha
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = config.transforms();
+    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
@@ -419,7 +438,7 @@ transformations:
     input: nonexistent
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = config.transforms();
+    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
@@ -611,7 +630,7 @@ transformations:
     input: loopy
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = config.transforms();
+    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
     let typed_programs: Vec<_> = transforms
         .iter()
         .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))

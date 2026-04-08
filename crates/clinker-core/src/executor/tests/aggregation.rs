@@ -222,8 +222,7 @@ outputs:
         // The simplest reachable path is `ExecutionPlanDag::compile`
         // with the typed-program slice; we synthesize an empty slice
         // and rely on extract paths.
-        let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> = config
-            .transforms()
+        let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> = crate::executor::build_transform_specs(&config)
             .iter()
             .map(|t| {
                 let parsed = Parser::parse(t.cxl_source());

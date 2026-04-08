@@ -193,7 +193,7 @@ fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, Str
         .collect();
 
     PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
         readers,
         writers,
         &params,
@@ -237,7 +237,7 @@ fn fixture_io(
 fn snapshot_explain(snap_name: &str, yaml: &str) {
     let config = parse_config(yaml).expect("parse_config");
     let (dag, _) = PipelineExecutor::explain_plan_dag(
-        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
     )
     .expect("explain_dag");
     let text = dag.explain_text(&config);

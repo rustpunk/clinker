@@ -303,7 +303,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // 7. Existing logic: explain / dry_run / execute
     if let Some(format) = args.explain {
         let compiled_plan =
-            clinker_core::plan::CompiledPlan::from_config_for_run(pipeline_config.clone());
+            pipeline_config.compile().expect("compile");
         let (dag, _) = PipelineExecutor::explain_plan_dag(&compiled_plan)?;
         match format {
             ExplainFormat::Text => {
@@ -389,7 +389,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let writers = std::collections::HashMap::from([(output_name, writer)]);
 
     let compiled_plan =
-        clinker_core::plan::CompiledPlan::from_config_for_run(pipeline_config.clone());
+        pipeline_config.compile().expect("compile");
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,

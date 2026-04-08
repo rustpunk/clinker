@@ -1,16 +1,17 @@
 //! Phase E: Index planning.
 //!
-//! Extracts `local_window` configs from `LegacyTransformsBlock`, combines with
+//! Extracts `local_window` configs from `TransformSpec`, combines with
 //! `AnalysisReport` field sets, deduplicates into `Vec<IndexSpec>`.
 
 use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use crate::config::{LegacyTransformsBlock, SortField};
+use crate::config::SortField;
+use crate::executor::TransformSpec;
 
 /// Typed representation of the `local_window` YAML block on a transform.
-/// Deserialized from `LegacyTransformsBlock.local_window: Option<serde_json::Value>`.
+/// Deserialized from `TransformSpec.local_window: Option<serde_json::Value>`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalWindowConfig {
     /// Reference source name. If None or same as primary input, it's a same-source window.
@@ -25,17 +26,17 @@ pub struct LocalWindowConfig {
 }
 
 /// Parse the analytic-window block (formerly `local_window`) from the
-/// raw JSON value on a LegacyTransformsBlock. Renamed in Phase 16b to match
+/// raw JSON value on a TransformSpec. Renamed in Phase 16b to match
 /// the `analytic_window` field on `TransformBody`; the legacy
 /// `local_window` YAML key is still accepted by the legacy planner path.
 pub fn parse_analytic_window(
-    transform: &LegacyTransformsBlock,
+    transform: &TransformSpec,
 ) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
     parse_analytic_window_value(&transform.local_window, &transform.name)
 }
 
 /// Phase 16b Wave 4ab — parse the analytic-window block from a
-/// `PlanTransformSpec`. Decoupled from `LegacyTransformsBlock` so the planner
+/// `PlanTransformSpec`. Decoupled from `TransformSpec` so the planner
 /// can call into index planning without dragging the legacy type in.
 pub(crate) fn parse_analytic_window_spec(
     spec: &crate::plan::execution::PlanTransformSpec,

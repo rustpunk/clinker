@@ -68,7 +68,7 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::Execution
     )]);
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
         readers,
         writers,
         &params,

@@ -99,7 +99,7 @@ error_handling:
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
                     let plan =
-                        clinker_core::plan::CompiledPlan::from_config_for_run(config.clone());
+                        clinker_core::config::PipelineConfig::compile(&config).expect("compile");
                     let report = PipelineExecutor::run_plan_with_readers_writers(
                         &plan, readers, writers, &params,
                     )
@@ -174,7 +174,7 @@ error_handling:
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
                     let plan =
-                        clinker_core::plan::CompiledPlan::from_config_for_run(config.clone());
+                        clinker_core::config::PipelineConfig::compile(&config).expect("compile");
                     let report = PipelineExecutor::run_plan_with_readers_writers(
                         &plan, readers, writers, &params,
                     )

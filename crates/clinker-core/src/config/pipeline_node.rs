@@ -171,12 +171,6 @@ pub struct RouteBody {
     pub mode: crate::config::RouteMode,
     pub conditions: IndexMap<String, CxlSource>,
     pub default: String,
-    /// Pre-route row-level CXL body. When present, evaluated before
-    /// condition matching to emit fields the conditions can reference.
-    /// Mirrors the legacy combined cxl+route shape; future Phase 16c
-    /// may model this as an explicit Transform→Route pair.
-    #[serde(default)]
-    pub cxl: Option<CxlSource>,
 }
 
 /// Merge variant body. The plan-specified shape is empty: `inputs:` lives
