@@ -906,19 +906,17 @@ impl AggregateStream {
         strategy: AggregateStrategy,
         output_schema: Arc<Schema>,
         spill_schema: Arc<Schema>,
-        spill_sort_fields: Vec<SortField>,
         memory_budget: usize,
         spill_dir: Option<PathBuf>,
         transform_name: String,
     ) -> Result<Self, PipelineError> {
-        let _ = (&spill_schema, &spill_sort_fields, memory_budget, &spill_dir);
+        let _ = (&spill_schema, memory_budget, &spill_dir);
         match strategy {
             AggregateStrategy::Hash => Ok(Self::Hash(Box::new(HashAggregator::new(
                 compiled,
                 evaluator,
                 output_schema,
                 spill_schema,
-                spill_sort_fields,
                 memory_budget,
                 spill_dir,
                 transform_name,
@@ -989,10 +987,7 @@ pub struct HashAggregator {
     memory_budget: usize,
     spill_files: Vec<SpillFile<()>>,
     spill_schema: Arc<Schema>,
-    #[allow(dead_code)]
-    spill_sort_fields: Vec<SortField>,
     spill_dir: Option<PathBuf>,
-    #[allow(dead_code)]
     output_schema: Arc<Schema>,
     transform_name: String,
     evaluator: ProgramEvaluator,
@@ -1012,16 +1007,15 @@ pub struct HashAggregator {
 impl HashAggregator {
     /// Construct a new aggregator from a compiled aggregate plan.
     ///
-    /// `spill_schema`, `spill_sort_fields`, and `spill_dir` are wired
-    /// for the spill path that lands in 16.3.10. The 16.3.8 hot loop
-    /// only touches them through the `value_heap_bytes` budget check.
+    /// `spill_schema` and `spill_dir` are wired for the spill path that
+    /// lands in 16.3.10. The 16.3.8 hot loop only touches them through
+    /// the `value_heap_bytes` budget check.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         compiled: Arc<CompiledAggregate>,
         evaluator: ProgramEvaluator,
         output_schema: Arc<Schema>,
         spill_schema: Arc<Schema>,
-        spill_sort_fields: Vec<SortField>,
         memory_budget: usize,
         spill_dir: Option<PathBuf>,
         transform_name: impl Into<String>,
@@ -1046,7 +1040,6 @@ impl HashAggregator {
             memory_budget,
             spill_files: Vec::new(),
             spill_schema,
-            spill_sort_fields,
             spill_dir,
             output_schema,
             transform_name: transform_name.into(),

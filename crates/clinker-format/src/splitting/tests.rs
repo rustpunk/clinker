@@ -79,16 +79,6 @@ impl FileRegistry {
             .map(|b| b.contents())
             .collect()
     }
-
-    #[allow(dead_code)]
-    fn file_bytes(&self) -> Vec<usize> {
-        self.files
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|b| b.byte_len())
-            .collect()
-    }
 }
 
 fn make_schema(cols: &[&str]) -> Arc<Schema> {

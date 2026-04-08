@@ -219,23 +219,6 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
-    #[allow(dead_code)]
-    fn error_with_related(
-        &mut self,
-        span: Span,
-        message: String,
-        help: Option<String>,
-        related: Span,
-    ) {
-        self.diagnostics.push(TypeDiagnostic {
-            span,
-            message,
-            help,
-            related_span: Some(related),
-            is_warning: false,
-        });
-    }
-
     fn warning(&mut self, span: Span, message: String, help: Option<String>) {
         self.diagnostics.push(TypeDiagnostic {
             span,

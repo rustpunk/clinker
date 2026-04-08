@@ -24,8 +24,6 @@ impl Default for FixedWidthWriterConfig {
 struct WriteField {
     name: String,
     width: usize,
-    #[allow(dead_code)]
-    field_type: Option<FieldType>,
     justify: Justify,
     pad_char: char,
     truncation: TruncationPolicy,
@@ -86,7 +84,6 @@ impl<W: Write> FixedWidthWriter<W> {
                 Ok(WriteField {
                     name: f.name.clone(),
                     width,
-                    field_type: f.field_type.clone(),
                     justify,
                     pad_char,
                     truncation,

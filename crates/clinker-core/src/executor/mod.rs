@@ -275,7 +275,6 @@ impl RecordStorage for NullStorage {
 /// Compiled transform: CXL source compiled once, evaluated per record.
 #[derive(Debug)]
 pub struct CompiledTransform {
-    #[allow(dead_code)]
     pub(crate) name: String,
     pub(crate) typed: Arc<TypedProgram>,
 }
@@ -2989,16 +2988,6 @@ impl PipelineExecutor {
                     spill_columns.push(Box::<str>::from("__meta_tracker"));
                     let spill_schema = Arc::new(Schema::new(spill_columns));
 
-                    let spill_sort_fields: Vec<crate::config::SortField> = compiled
-                        .group_by_fields
-                        .iter()
-                        .map(|name| crate::config::SortField {
-                            field: name.clone(),
-                            order: crate::config::SortOrder::Asc,
-                            null_order: Some(crate::config::NullOrder::First),
-                        })
-                        .collect();
-
                     let memory_limit = parse_memory_limit(config);
 
                     let mut stream = AggregateStream::for_node(
@@ -3007,7 +2996,6 @@ impl PipelineExecutor {
                         agg_strategy,
                         Arc::clone(output_schema),
                         spill_schema,
-                        spill_sort_fields,
                         memory_limit,
                         None,
                         name.clone(),

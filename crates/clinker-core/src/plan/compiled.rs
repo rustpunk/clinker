@@ -31,18 +31,8 @@ impl CompiledPlan {
         &self.dag
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn dag_mut(&mut self) -> &mut ExecutionPlanDag {
-        &mut self.dag
-    }
-
     pub(crate) fn config(&self) -> &PipelineConfig {
         &self.config
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn compiled_transforms(&self) -> &[CompiledTransform] {
-        &self.compiled_transforms
     }
 
     pub(crate) fn take_compiled_transforms(&mut self) -> Vec<CompiledTransform> {

@@ -30,7 +30,6 @@ use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 // ───────────────────────── tiered policy ─────────────────────────
 
 /// Baseline policy per fixture. See module docs.
-#[allow(dead_code)]
 enum BaselinePolicy {
     /// Pre & post-lift both parse + run. Byte-compare against committed baseline(s).
     DualRun,

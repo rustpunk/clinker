@@ -233,14 +233,8 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum SpikeNode {
-        Source {
-            #[allow(dead_code)]
-            path: String,
-        },
-        Transform {
-            #[allow(dead_code)]
-            cxl: CxlSource,
-        },
+        Source { path: String },
+        Transform { cxl: CxlSource },
     }
 
     #[derive(Deserialize)]
@@ -262,6 +256,14 @@ nodes:
 ";
         let doc: SpikeDoc = from_str(yaml).expect("parse SpikeDoc");
         assert_eq!(doc.nodes.len(), 2);
+        match &doc.nodes[0].value {
+            SpikeNode::Source { path } => assert_eq!(path, "in.csv"),
+            _ => panic!("expected Source"),
+        }
+        match &doc.nodes[1].value {
+            SpikeNode::Transform { cxl } => assert_eq!(cxl.source, "x + 1"),
+            _ => panic!("expected Transform"),
+        }
 
         let first = &doc.nodes[0];
         let second = &doc.nodes[1];

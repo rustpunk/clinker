@@ -126,12 +126,6 @@ fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProg
     cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
 }
 
-/// Identity helper retained to keep test callsites compact.
-#[allow(dead_code)]
-fn t(entry: &TransformSpec) -> &TransformSpec {
-    entry
-}
-
 /// Helper: compile a fixture config into an ExecutionPlanDag.
 fn compile_fixture(config: &PipelineConfig, fields: &[&str]) -> ExecutionPlanDag {
     let transforms: Vec<_> = crate::executor::build_transform_specs(&config);

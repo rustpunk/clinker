@@ -287,7 +287,7 @@ mod tests {
     /// let mut db = SourceDb::new();
     /// let _ = db.load(PathBuf::from("/etc/passwd"));
     /// ```
-    #[allow(dead_code)]
+    #[test]
     fn test_source_db_load_requires_validated_path() {}
 
     // ── Kiln unsaved-buffer convention ────────────────────────────

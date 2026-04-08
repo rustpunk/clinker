@@ -219,18 +219,11 @@ pub struct PlanOutputPayload {
 /// plan body.
 ///
 /// The shape mirrors the field set the planner actually reads off
-/// `TransformSpec` (cxl source, aggregate sidecar, route sidecar, log
-/// directives, validations, analytic-window block, input wiring) plus a
-/// promoted [`ResolvedInput`] enum that distinguishes the three wiring
-/// modes that the legacy `Option<TransformInput>` encoded implicitly
-/// (none = chain, single = explicit, multiple = merge). The two
-/// span fields exist for the eventual diagnostic surface; Wave 4ab fills
-/// them with `Span::SYNTHETIC` from the legacy bridge constructor.
-// Wave 4ab M2 WIP: remaining fields (route, log, validations, input_span,
-// body_span) are consumed as Milestones 3-6 migrate the helpers off
-// TransformSpec. Keeping the full field set live avoids a second structural
-// churn when those milestones land.
-#[allow(dead_code)]
+/// `TransformSpec` (cxl source, aggregate sidecar, route sidecar,
+/// analytic-window block, input wiring) plus a promoted [`ResolvedInput`]
+/// enum that distinguishes the three wiring modes that the legacy
+/// `Option<TransformInput>` encoded implicitly (none = chain, single =
+/// explicit, multiple = merge).
 #[derive(Debug, Clone)]
 pub(crate) struct PlanTransformSpec {
     pub name: String,
@@ -238,11 +231,7 @@ pub(crate) struct PlanTransformSpec {
     pub aggregate: Option<crate::config::AggregateConfig>,
     pub route: Option<crate::config::RouteConfig>,
     pub analytic_window: Option<serde_json::Value>,
-    pub log: Vec<crate::config::LogDirective>,
-    pub validations: Vec<crate::config::ValidationEntry>,
     pub input: ResolvedInput,
-    pub input_span: Span,
-    pub body_span: Span,
 }
 
 /// Resolved upstream wiring for a [`PlanTransformSpec`]. The legacy
@@ -351,11 +340,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         aggregate: None,
                         route: None,
                         analytic_window: body.analytic_window.clone(),
-                        log: body.log.clone().unwrap_or_default(),
-                        validations: body.validations.clone().unwrap_or_default(),
                         input: resolve_header_input(&header.input),
-                        input_span: Span::SYNTHETIC,
-                        body_span: Span::SYNTHETIC,
                     });
                 }
                 PipelineNode::Aggregate {
@@ -373,11 +358,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         aggregate: Some(agg),
                         route: None,
                         analytic_window: None,
-                        log: Vec::new(),
-                        validations: Vec::new(),
                         input: resolve_header_input(&header.input),
-                        input_span: Span::SYNTHETIC,
-                        body_span: Span::SYNTHETIC,
                     });
                 }
                 PipelineNode::Route {
@@ -403,11 +384,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         aggregate: None,
                         route: Some(route),
                         analytic_window: None,
-                        log: Vec::new(),
-                        validations: Vec::new(),
                         input: resolve_header_input(&header.input),
-                        input_span: Span::SYNTHETIC,
-                        body_span: Span::SYNTHETIC,
                     });
                 }
                 PipelineNode::Source { .. }
