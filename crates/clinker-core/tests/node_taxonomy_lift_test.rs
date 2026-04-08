@@ -3,8 +3,7 @@
 //! Covers parse-time correctness for the unified `nodes:` enum
 //! (`PipelineNode`) and the `compile_topology_only()` topology stages 1–4
 //! (duplicates, self-loops, cycles, path validation). Stage 5
-//! (per-variant lowering) is Wave 2 — tests that depend on it are
-//! marked `#[ignore] // TODO(16b Wave 2)` below.
+//! (per-variant lowering) is Wave 2 and is now active.
 
 use clinker_core::config::{PipelineConfig, PipelineNode};
 use clinker_core::yaml::{Spanned, from_str};
@@ -418,8 +417,32 @@ fn test_no_transform_config_anywhere() {
 }
 
 #[test]
-#[ignore = "TODO(16b Wave 4): legacy `transformations:` shape still accepted by Wave 3 projection shim"]
-fn test_pipeline_config_old_shape_fails() {}
+fn test_pipeline_config_old_shape_fails() {
+    // Phase 16b.7 deleted the legacy `inputs:` / `outputs:` / `transformations:`
+    // top-level YAML shape entirely. The only accepted shape is the unified
+    // `nodes:` taxonomy. Parsing the old shape must hard-fail.
+    let yaml = r#"
+pipeline:
+  name: legacy_shape
+inputs:
+  - name: in
+    type: csv
+    path: data/a.csv
+outputs:
+  - name: out
+    type: csv
+    path: out.csv
+transformations:
+  - name: t
+    input: in
+    cxl: "emit x = 1"
+"#;
+    let res = clinker_core::yaml::from_str::<PipelineConfig>(yaml);
+    assert!(
+        res.is_err(),
+        "legacy `transformations:` shape must no longer parse"
+    );
+}
 
 // ---------------------------------------------------------------------
 // Wave 2 — un-ignored stubs (now active per Phase 16b Wave 2 directive)

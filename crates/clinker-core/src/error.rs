@@ -1,3 +1,24 @@
+//! Diagnostic and error types.
+//!
+//! # Diagnostic code registry
+//!
+//! Every `Diagnostic::error` / `Diagnostic::warning` call site in the
+//! workspace MUST use one of the codes listed here. Adding a new code
+//! requires a new entry in this block. No orphan literals.
+//!
+//! | Code        | Severity | Meaning                                              |
+//! |-------------|----------|------------------------------------------------------|
+//! | `E000`      | error    | serde-saphyr parse error (from `from_serde_saphyr_error`) |
+//! | `E001`      | error    | Duplicate node name (exact match)                    |
+//! | `E002`      | error    | Self-referential node input                          |
+//! | `E003`      | error    | Cycle detected between nodes                         |
+//! | `E010`      | error    | Dotted-name check (`.` reserved for branch refs)     |
+//! | `E011`      | error    | Log directive sanity (`every` must be valid)         |
+//! | `E100`      | error    | Composition node not yet supported (Phase 16c stub)  |
+//! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
+//! | `W002`      | warning  | Node names differ only in case                       |
+//! | `W100`      | warning  | Aggregate lowering deferred (Phase 16b Wave 3 stub)  |
+
 use std::fmt;
 
 use crate::span::Span;
