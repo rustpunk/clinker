@@ -103,12 +103,10 @@ fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProg
     cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
 }
 
-/// Extract resolved TransformConfig from TransformEntry.
-fn t(entry: &TransformEntry) -> &TransformConfig {
-    match entry {
-        TransformEntry::Transform(t) => t,
-        _ => panic!("test expects resolved transform"),
-    }
+/// Identity helper retained to keep test callsites compact.
+#[allow(dead_code)]
+fn t(entry: &TransformConfig) -> &TransformConfig {
+    entry
 }
 
 /// Helper: compile a fixture config into an ExecutionPlanDag.

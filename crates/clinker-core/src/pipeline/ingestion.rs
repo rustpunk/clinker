@@ -193,12 +193,10 @@ mod tests {
     use clinker_record::{RecordStorage, Schema};
     use std::sync::Arc;
 
-    /// Extract resolved TransformConfig from TransformEntry (tests only).
-    fn t(entry: &TransformEntry) -> &TransformConfig {
-        match entry {
-            TransformEntry::Transform(t) => t,
-            _ => panic!("test expects resolved transform"),
-        }
+    /// Identity helper retained to keep test callsites compact.
+    #[allow(dead_code)]
+    fn t(entry: &TransformConfig) -> &TransformConfig {
+        entry
     }
 
     /// Helper: build a minimal pipeline config.
@@ -250,19 +248,17 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| {
-                    TransformEntry::Transform(TransformConfig {
-                        name: name.into(),
-                        description: None,
-                        cxl: Some(cxl.into()),
-                        aggregate: None,
-                        local_window,
-                        log: None,
-                        validations: None,
-                        route: None,
-                        input: None,
-                        notes: None,
-                    })
+                .map(|(name, cxl, local_window)| TransformConfig {
+                    name: name.into(),
+                    description: None,
+                    cxl: Some(cxl.into()),
+                    aggregate: None,
+                    local_window,
+                    log: None,
+                    validations: None,
+                    route: None,
+                    input: None,
+                    notes: None,
                 })
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),

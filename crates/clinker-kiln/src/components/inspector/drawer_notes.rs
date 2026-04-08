@@ -73,9 +73,6 @@ pub fn DrawerNotes(stage_id: String) -> Element {
                     config
                         .transformations
                         .iter_mut()
-                        .map(|entry| match entry {
-                            clinker_core::config::TransformEntry::Transform(t) => t,
-                        })
                         .find(|t| t.name == stage_id_for_save)
                         .map(|t| &mut t.notes)
                 })

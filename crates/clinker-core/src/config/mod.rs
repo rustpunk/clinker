@@ -43,7 +43,7 @@ pub struct PipelineConfig {
     pub outputs: Vec<OutputConfig>,
     /// Legacy YAML schema. **Phase 16b Wave 2 deletes this field.**
     #[serde(default)]
-    pub transformations: Vec<TransformEntry>,
+    pub transformations: Vec<TransformConfig>,
     #[serde(default)]
     pub error_handling: ErrorHandlingConfig,
     /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
@@ -947,33 +947,10 @@ pub enum LogLevel {
     Error,
 }
 
-/// A transformation list entry. Post-Phase-16b: only inline transforms.
-#[derive(Debug, Clone, Serialize)]
-pub enum TransformEntry {
-    Transform(TransformConfig),
-}
-
-impl From<TransformConfig> for TransformEntry {
-    fn from(t: TransformConfig) -> Self {
-        TransformEntry::Transform(t)
-    }
-}
-
-impl<'de> Deserialize<'de> for TransformEntry {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let transform: TransformConfig =
-            serde_json::from_value(value).map_err(de::Error::custom)?;
-        Ok(TransformEntry::Transform(transform))
-    }
-}
-
 impl PipelineConfig {
     /// Returns resolved transforms.
     pub fn transforms(&self) -> impl Iterator<Item = &TransformConfig> + '_ {
-        self.transformations.iter().map(|entry| match entry {
-            TransformEntry::Transform(t) => t,
-        })
+        self.transformations.iter()
     }
 
     /// Phase 16b Wave 1: validation pre-pass over the unified `nodes:`
@@ -1790,7 +1767,7 @@ pub fn project_nodes_to_legacy(config: &mut PipelineConfig) {
                     input: project_input(&header.input),
                     notes: header.notes.clone(),
                 };
-                config.transformations.push(TransformEntry::Transform(tc));
+                config.transformations.push(tc);
             }
             PipelineNode::Aggregate {
                 header,
@@ -1813,7 +1790,7 @@ pub fn project_nodes_to_legacy(config: &mut PipelineConfig) {
                     input: project_input(&header.input),
                     notes: header.notes.clone(),
                 };
-                config.transformations.push(TransformEntry::Transform(tc));
+                config.transformations.push(tc);
             }
             PipelineNode::Route {
                 header,
@@ -1850,7 +1827,7 @@ pub fn project_nodes_to_legacy(config: &mut PipelineConfig) {
                     input: project_input(&header.input),
                     notes: header.notes.clone(),
                 };
-                config.transformations.push(TransformEntry::Transform(tc));
+                config.transformations.push(tc);
             }
             PipelineNode::Merge { .. } | PipelineNode::Composition { .. } => {
                 // No legacy analogue — intentionally elided. Wave 4
@@ -1896,11 +1873,7 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     }
 
     // Validate log directives (iterate raw entries to avoid panic on unresolved imports)
-    for entry in &config.transformations {
-        #[allow(irrefutable_let_patterns)]
-        let TransformEntry::Transform(t) = entry else {
-            continue;
-        };
+    for t in &config.transformations {
         if let Some(ref directives) = t.log {
             for (i, d) in directives.iter().enumerate() {
                 if let Some(every) = d.every {
@@ -3492,10 +3465,7 @@ transformations:
       emit x = 1
 "#;
         let config = parse_config(yaml).unwrap();
-        let t = match &config.transformations[0] {
-            TransformEntry::Transform(t) => t,
-            _ => panic!("expected Transform"),
-        };
+        let t = &config.transformations[0];
         assert!(t.input.is_none());
     }
 
@@ -3553,10 +3523,7 @@ transformations:
       emit x = 1
 "#;
         let config = parse_config(yaml).unwrap();
-        let t = match &config.transformations[0] {
-            TransformEntry::Transform(t) => t,
-            _ => panic!("expected Transform"),
-        };
+        let t = &config.transformations[0];
         assert_eq!(t.name, "my-transform_v2");
     }
 

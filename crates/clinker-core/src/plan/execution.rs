@@ -2518,12 +2518,9 @@ mod tests {
     use cxl::typecheck::pass::type_check;
     use std::collections::HashMap;
 
-    /// Extract resolved TransformConfig from TransformEntry (tests only).
-    fn t(entry: &TransformEntry) -> &TransformConfig {
-        match entry {
-            TransformEntry::Transform(t) => t,
-            _ => panic!("test expects resolved transform"),
-        }
+    /// Identity helper retained to keep test callsites compact.
+    fn t(entry: &TransformConfig) -> &TransformConfig {
+        entry
     }
 
     /// Build a minimal PipelineConfig for testing.
@@ -2575,19 +2572,17 @@ mod tests {
             }],
             transformations: transforms
                 .into_iter()
-                .map(|(name, cxl, local_window)| {
-                    TransformEntry::Transform(TransformConfig {
-                        name: name.into(),
-                        description: None,
-                        cxl: Some(cxl.into()),
-                        aggregate: None,
-                        local_window,
-                        log: None,
-                        validations: None,
-                        route: None,
-                        input: None,
-                        notes: None,
-                    })
+                .map(|(name, cxl, local_window)| TransformConfig {
+                    name: name.into(),
+                    description: None,
+                    cxl: Some(cxl.into()),
+                    aggregate: None,
+                    local_window,
+                    log: None,
+                    validations: None,
+                    route: None,
+                    input: None,
+                    notes: None,
                 })
                 .collect(),
             error_handling: ErrorHandlingConfig::default(),
@@ -2898,7 +2893,7 @@ mod tests {
                 format: OutputFormat::Csv(None),
                 notes: None,
             }],
-            transformations: vec![TransformEntry::Transform(TransformConfig {
+            transformations: vec![TransformConfig {
                 name: "router".into(),
                 description: None,
                 cxl: Some(cxl.into()),
@@ -2909,7 +2904,7 @@ mod tests {
                 route: Some(route),
                 input: None,
                 notes: None,
-            })],
+            }],
             error_handling: ErrorHandlingConfig::default(),
             notes: None,
         }
