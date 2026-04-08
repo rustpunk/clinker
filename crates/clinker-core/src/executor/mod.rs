@@ -489,10 +489,15 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Compile CXL transforms
+        // Compile CXL transforms via CompiledPlan::bind_schema (Phase 16b
+        // Wave 4ab M5). The two-phase plan entry point owns the CXL
+        // typecheck side-effects now; the executor consumes the result
+        // by moving it out of the locally-bound plan.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let resolved_transforms: Vec<_> = config.transforms().collect();
-        let compiled_transforms = Self::compile_transforms(&resolved_transforms, &schema)?;
+        let mut local_plan = crate::plan::CompiledPlan::from_config_for_run(config.clone());
+        local_plan.bind_schema(&schema)?;
+        let compiled_transforms = local_plan.take_compiled_transforms();
 
         // Compile route conditions if any transform has a route config.
         // Collect all emitted field names for route condition resolution.

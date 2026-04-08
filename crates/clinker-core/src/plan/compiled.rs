@@ -116,6 +116,14 @@ impl CompiledPlan {
         &self.compiled_transforms
     }
 
+    /// Move the compiled CXL transforms out of the plan. Used by the
+    /// M5 executor entry point which binds schema on a locally-owned
+    /// plan, then takes ownership of the resulting transforms for the
+    /// downstream evaluator build.
+    pub(crate) fn take_compiled_transforms(&mut self) -> Vec<CompiledTransform> {
+        std::mem::take(&mut self.compiled_transforms)
+    }
+
     /// Phase 16b Wave 4ab M4 — two-phase CXL typecheck hook.
     ///
     /// `PipelineConfig::compile()` builds topology without CXL
@@ -125,7 +133,6 @@ impl CompiledPlan {
     /// every Transform node in the DAG.
     ///
     /// Idempotent: re-binding replaces prior state.
-    #[allow(dead_code)] // M5 wires live executor consumption; M4 ships the hook + unit test
     pub(crate) fn bind_schema(
         &mut self,
         schema: &std::sync::Arc<clinker_record::Schema>,
