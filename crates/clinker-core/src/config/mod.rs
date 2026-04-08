@@ -1,3 +1,7 @@
+pub mod node_header;
+
+pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
+
 use clinker_record::schema_def::{FieldDef, LineSeparator, SchemaDefinition};
 use indexmap::IndexMap;
 use regex::Regex;

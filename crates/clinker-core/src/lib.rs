@@ -17,6 +17,7 @@ pub mod progress;
 pub mod projection;
 pub mod schema;
 pub mod security;
+pub mod span;
 pub mod validation;
 pub mod yaml;
 
