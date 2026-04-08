@@ -1709,21 +1709,18 @@ fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
 
     // Skip the reverse lift for legacy configs whose shape has no
     // clean equivalent in the unified `nodes:` taxonomy yet:
-    //   * Routes — `RouteBody::conditions` is a `BTreeMap` keyed by
-    //     branch name, which loses the declaration-order-sensitive
-    //     first-match-wins evaluation contract of legacy
-    //     `RouteConfig::branches: Vec<RouteBranch>`. Until the Route
-    //     body is restructured (Checkpoint D proper), leave these
-    //     configs going through the legacy executor path.
     //   * Multi-input transforms — `NodeHeader::input` is a single
     //     `NodeInput`, not a list. Legacy `TransformInput::Multiple`
-    //     has no single-header peer; the planner synthesizes a Merge
-    //     node upstream. Leave multi-input configs on the legacy path
-    //     until the planner consumes Merge nodes directly.
+    //     has no single-header peer; Checkpoint D2 will synthesize a
+    //     Merge node upstream. Leave multi-input configs on the legacy
+    //     path until then.
+    //
+    // Routes are now liftable: `RouteBody::conditions` is an
+    // `IndexMap` (Checkpoint D1), preserving declaration order.
     let has_unsupported_shape = config
         .transformations
         .iter()
-        .any(|tc| tc.route.is_some() || matches!(tc.input, Some(TransformInput::Multiple(_))));
+        .any(|tc| matches!(tc.input, Some(TransformInput::Multiple(_))));
     if has_unsupported_shape {
         return;
     }
@@ -1796,7 +1793,7 @@ fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
                 },
             }
         } else if let Some(rt) = &tc.route {
-            let conditions: std::collections::BTreeMap<String, crate::yaml::CxlSource> = rt
+            let conditions: indexmap::IndexMap<String, crate::yaml::CxlSource> = rt
                 .branches
                 .iter()
                 .map(|b| {
@@ -1972,12 +1969,9 @@ fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
                 header,
                 config: body,
             } => {
-                // Project BTreeMap<String, CxlSource> → Vec<RouteBranch>.
-                // BTreeMap iteration is lexicographic; legacy route
-                // evaluation is first-match-wins in declaration order,
-                // so callers that need ordering must stick to the
-                // lexicographic contract until Wave 4 plumbs the new
-                // evaluator through.
+                // Project IndexMap<String, CxlSource> → Vec<RouteBranch>.
+                // IndexMap preserves declaration order, matching legacy
+                // first-match-wins semantics exactly.
                 let branches: Vec<RouteBranch> = body
                     .conditions
                     .iter()

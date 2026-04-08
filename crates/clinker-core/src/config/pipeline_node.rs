@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::node_header::{MergeHeader, NodeHeader, SourceHeader};
@@ -159,16 +160,16 @@ pub struct AggregateBody {
     pub strategy: crate::config::AggregateStrategyHint,
 }
 
-/// Route variant body. The plan-specified shape uses a
-/// `BTreeMap<String, CxlSource>` for `conditions:`. We accept that
-/// shape via [`Deserialize`] and re-flatten it to the executor's
-/// existing branch-list shape during projection.
+/// Route variant body. `conditions:` is an [`IndexMap`] so that branch
+/// declaration order is preserved — legacy `RouteConfig::branches` is a
+/// `Vec<RouteBranch>` evaluated first-match-wins, and the unified
+/// `nodes:` shape must honour the same ordering contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBody {
     #[serde(default)]
     pub mode: crate::config::RouteMode,
-    pub conditions: BTreeMap<String, CxlSource>,
+    pub conditions: IndexMap<String, CxlSource>,
     pub default: String,
 }
 
