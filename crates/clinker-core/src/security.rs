@@ -320,17 +320,25 @@ pipeline:
   name: test
   rules_path: ./rules
 
-inputs:
-  - name: src
-    type: csv
-    path: data/input.csv
-outputs:
-  - name: dest
-    type: csv
-    path: output/result.csv
-transformations:
-  - name: t1
-    cxl: "emit x = a"
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/input.csv
+  - type: transform
+    name: t1
+    input: src
+    config:
+      cxl: "emit x = a"
+  - type: output
+    name: dest
+    input: t1
+    config:
+      name: dest
+      type: csv
+      path: output/result.csv
 "#;
         let config = crate::config::parse_config(yaml).unwrap();
         let diags = validate_all_config_paths(&config, &base(), false);
