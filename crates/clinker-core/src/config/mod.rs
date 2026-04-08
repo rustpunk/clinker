@@ -1673,9 +1673,185 @@ pub fn interpolate_env_vars(
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml, &[])?;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    lift_legacy_fields_into_nodes(&mut config);
     lower_nodes_into_legacy_fields(&mut config);
     validate_config(&config)?;
     Ok(config)
+}
+
+/// Phase 16b Wave 4ab Checkpoint D preparatory shim — the **inverse** of
+/// [`lower_nodes_into_legacy_fields`]. When a config was authored under
+/// the legacy `inputs:`/`outputs:`/`transformations:` YAML schema (so
+/// `nodes` is empty but the legacy vectors are populated), synthesize
+/// equivalent `PipelineNode` entries in `config.nodes`. After this pass
+/// every successfully parsed `PipelineConfig` carries a populated
+/// `nodes` vector regardless of authorship shape, which is the
+/// precondition for deleting the legacy fields in the final Checkpoint
+/// D commit.
+///
+/// The synthesis is deterministic and mirrors the legacy executor's
+/// implicit linear-chain wiring: the first transform wires to the
+/// primary source, subsequent transforms wire to the preceding
+/// transform/aggregate/route node. Explicit `input:` references on
+/// legacy `TransformConfig` override the implicit chain.
+fn lift_legacy_fields_into_nodes(config: &mut PipelineConfig) {
+    use crate::yaml::{Location, Spanned};
+
+    // No-op if either (a) the authored shape was new-shape (nodes
+    // already populated) or (b) there's nothing to lift (both the
+    // nodes vector and the legacy vectors are empty).
+    if !config.nodes.is_empty() {
+        return;
+    }
+    if config.inputs.is_empty() && config.outputs.is_empty() && config.transformations.is_empty() {
+        return;
+    }
+
+    // Skip the reverse lift for legacy configs whose shape has no
+    // clean equivalent in the unified `nodes:` taxonomy yet:
+    //   * Routes — `RouteBody::conditions` is a `BTreeMap` keyed by
+    //     branch name, which loses the declaration-order-sensitive
+    //     first-match-wins evaluation contract of legacy
+    //     `RouteConfig::branches: Vec<RouteBranch>`. Until the Route
+    //     body is restructured (Checkpoint D proper), leave these
+    //     configs going through the legacy executor path.
+    //   * Multi-input transforms — `NodeHeader::input` is a single
+    //     `NodeInput`, not a list. Legacy `TransformInput::Multiple`
+    //     has no single-header peer; the planner synthesizes a Merge
+    //     node upstream. Leave multi-input configs on the legacy path
+    //     until the planner consumes Merge nodes directly.
+    let has_unsupported_shape = config
+        .transformations
+        .iter()
+        .any(|tc| tc.route.is_some() || matches!(tc.input, Some(TransformInput::Multiple(_))));
+    if has_unsupported_shape {
+        return;
+    }
+
+    let mut synthesized: Vec<Spanned<PipelineNode>> = Vec::with_capacity(
+        config.inputs.len() + config.transformations.len() + config.outputs.len(),
+    );
+
+    // Source nodes first, in declaration order.
+    for src in &config.inputs {
+        let node = PipelineNode::Source {
+            header: SourceHeader {
+                name: src.name.clone(),
+                description: None,
+                notes: None,
+            },
+            config: SourceBody {
+                source: src.clone(),
+            },
+        };
+        synthesized.push(Spanned::new(node, Location::UNKNOWN, Location::UNKNOWN));
+    }
+
+    // Transform/Aggregate/Route variants from the legacy list. The
+    // implicit-chain rule: `tc.input == None` means "wire to previous
+    // transform, or to the primary source if this is the first one".
+    let primary_source_name: Option<String> = config.inputs.first().map(|s| s.name.clone());
+    let mut prev_transform_name: Option<String> = None;
+
+    for tc in &config.transformations {
+        // Resolve the header's input: field.
+        let header_input = match &tc.input {
+            Some(TransformInput::Single(s)) => NodeInput::Single(s.clone()),
+            Some(TransformInput::Multiple(list)) => {
+                // Multi-input legacy transforms have no direct peer in
+                // the new header shape (which carries a single
+                // NodeInput). The planner's compile() constructs a
+                // synthesized Merge node upstream of a Multi
+                // transform; until the planner cutover consumes
+                // merges directly, we fall back to the first upstream
+                // as the header input and let the legacy projection
+                // continue handling the rest.
+                list.first()
+                    .map(|s| NodeInput::Single(s.clone()))
+                    .unwrap_or_else(|| NodeInput::Single(String::new()))
+            }
+            None => match prev_transform_name
+                .as_ref()
+                .or(primary_source_name.as_ref())
+            {
+                Some(upstream) => NodeInput::Single(upstream.clone()),
+                None => NodeInput::Single(String::new()),
+            },
+        };
+
+        let header = NodeHeader {
+            name: tc.name.clone(),
+            description: tc.description.clone(),
+            input: header_input,
+            notes: tc.notes.clone(),
+        };
+
+        let node = if let Some(agg) = &tc.aggregate {
+            PipelineNode::Aggregate {
+                header,
+                config: AggregateBody {
+                    group_by: agg.group_by.clone(),
+                    cxl: crate::yaml::CxlSource::unspanned(agg.cxl.clone()),
+                    strategy: agg.strategy,
+                },
+            }
+        } else if let Some(rt) = &tc.route {
+            let conditions: std::collections::BTreeMap<String, crate::yaml::CxlSource> = rt
+                .branches
+                .iter()
+                .map(|b| {
+                    (
+                        b.name.clone(),
+                        crate::yaml::CxlSource::unspanned(b.condition.clone()),
+                    )
+                })
+                .collect();
+            PipelineNode::Route {
+                header,
+                config: RouteBody {
+                    mode: rt.mode,
+                    conditions,
+                    default: rt.default.clone(),
+                },
+            }
+        } else {
+            PipelineNode::Transform {
+                header,
+                config: TransformBody {
+                    cxl: crate::yaml::CxlSource::unspanned(tc.cxl.clone().unwrap_or_default()),
+                    analytic_window: tc.local_window.clone(),
+                    log: tc.log.clone(),
+                    validations: tc.validations.clone(),
+                },
+            }
+        };
+        synthesized.push(Spanned::new(node, Location::UNKNOWN, Location::UNKNOWN));
+        prev_transform_name = Some(tc.name.clone());
+    }
+
+    // Output nodes last. Implicit chain: each output wires to the
+    // final transform (or, absent any transforms, to the primary
+    // source).
+    let output_upstream: Option<String> = prev_transform_name
+        .clone()
+        .or_else(|| primary_source_name.clone());
+    for out in &config.outputs {
+        let header = NodeHeader {
+            name: out.name.clone(),
+            description: None,
+            input: NodeInput::Single(output_upstream.clone().unwrap_or_default()),
+            notes: None,
+        };
+        let node = PipelineNode::Output {
+            header,
+            config: OutputBody {
+                output: out.clone(),
+            },
+        };
+        synthesized.push(Spanned::new(node, Location::UNKNOWN, Location::UNKNOWN));
+    }
+
+    config.nodes = synthesized;
 }
 
 /// Phase 16b Wave 3 — projection shim (Path 3A).
