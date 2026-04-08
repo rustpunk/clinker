@@ -9,11 +9,10 @@
 //! [`CompiledPlan::config`].
 //!
 //! Wave 4ab: executor public surface flipped from `&PipelineConfig` to
-//! `&CompiledPlan`. Legacy-type deletion (`TransformConfig`,
-//! `TransformEntry`, `project_nodes_to_legacy`, free-function rewrite of
-//! `ExecutionPlanDag::compile`) is deferred to a follow-up; the shim path
-//! via `config()` keeps the executor's internal helpers unchanged while
-//! the boundary at the top is strict.
+//! `&CompiledPlan`. Legacy-type deletion (`TransformConfig` and the
+//! free-function rewrite of `ExecutionPlanDag::compile`) is deferred;
+//! the shim path via `config()` keeps the executor's internal helpers
+//! unchanged while the boundary at the top is strict.
 
 use std::collections::HashMap;
 
@@ -60,6 +59,32 @@ impl CompiledPlan {
             runtime: HashMap::new(),
             config,
             compiled_transforms,
+        }
+    }
+
+    /// Wave 4ab test/bench helper: package a bare `PipelineConfig` into
+    /// a `CompiledPlan` without running the lowering pipeline. The
+    /// executor's internal helpers rebuild the DAG from `config()` at
+    /// run time, so this is semantically equivalent to the pre-4ab
+    /// direct `&PipelineConfig` executor entry point.
+    pub fn from_config_for_run(config: PipelineConfig) -> Self {
+        Self {
+            dag: ExecutionPlanDag {
+                graph: petgraph::graph::DiGraph::new(),
+                topo_order: Vec::new(),
+                source_dag: Vec::new(),
+                indices_to_build: Vec::new(),
+                output_projections: Vec::new(),
+                parallelism: crate::plan::execution::ParallelismProfile {
+                    per_transform: Vec::new(),
+                    worker_threads: 4,
+                },
+                correlation_sort_note: None,
+                node_properties: HashMap::new(),
+            },
+            runtime: HashMap::new(),
+            config,
+            compiled_transforms: Vec::new(),
         }
     }
 

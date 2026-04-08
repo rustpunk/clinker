@@ -66,8 +66,13 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::Execution
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        readers,
+        writers,
+        &params,
+    )
+    .unwrap();
     (report, buf.as_string())
 }
 
@@ -98,8 +103,13 @@ fn run_multi(
         .map(|(name, buf)| (name.clone(), Box::new(buf.clone()) as Box<dyn Write + Send>))
         .collect();
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        readers,
+        writers,
+        &params,
+    )
+    .unwrap();
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -270,8 +280,13 @@ outputs:
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        readers,
+        writers,
+        &params,
+    )
+    .unwrap();
     assert_eq!(report.counters.ok_count, 100);
 
     // Check split files: 30 + 30 + 30 + 10 = 4 files
@@ -370,8 +385,13 @@ outputs:
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        readers,
+        writers,
+        &params,
+    )
+    .unwrap();
     assert_eq!(report.counters.ok_count, 12);
 
     let mut split_files: Vec<_> = std::fs::read_dir(dir.path())
@@ -478,8 +498,13 @@ outputs:
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params).unwrap();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        readers,
+        writers,
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     // Group A (3) + Group C (1) = 4 DLQ'd

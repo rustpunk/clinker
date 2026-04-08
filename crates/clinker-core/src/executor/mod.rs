@@ -441,6 +441,18 @@ impl PipelineExecutor {
         Self::run_with_readers_writers(plan.config(), readers, writers, params)
     }
 
+    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` text entry.
+    pub fn explain_plan(plan: &crate::plan::CompiledPlan) -> Result<String, PipelineError> {
+        Self::explain(plan.config())
+    }
+
+    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` DAG entry.
+    pub fn explain_plan_dag(
+        plan: &crate::plan::CompiledPlan,
+    ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
+        Self::explain_dag(plan.config())
+    }
+
     /// Run with explicit reader/writer registries.
     ///
     /// `readers` and `writers` are keyed by the input/output `name` fields from
@@ -449,7 +461,7 @@ impl PipelineExecutor {
     ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
-    pub fn run_with_readers_writers(
+    pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
         mut readers: HashMap<String, Box<dyn Read + Send>>,
         writers: HashMap<String, Box<dyn Write + Send>>,
@@ -3210,13 +3222,15 @@ impl PipelineExecutor {
     ///
     /// Input files are NOT opened. Field names are extracted from CXL AST
     /// so the resolver can compile without a data-derived schema.
-    pub fn explain(config: &PipelineConfig) -> Result<String, PipelineError> {
+    pub(crate) fn explain(config: &PipelineConfig) -> Result<String, PipelineError> {
         let (plan, _) = Self::explain_dag(config)?;
         Ok(plan.explain_full(config))
     }
 
     /// Compile execution plan and return the DAG for format-specific rendering.
-    pub fn explain_dag(config: &PipelineConfig) -> Result<(ExecutionPlanDag, ()), PipelineError> {
+    pub(crate) fn explain_dag(
+        config: &PipelineConfig,
+    ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
         // Extract field names from CXL AST to build a synthetic schema
         let mut all_fields = Vec::new();
         for t in config.transforms() {

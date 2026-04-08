@@ -1673,7 +1673,7 @@ pub fn interpolate_env_vars(
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml, &[])?;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
-    project_nodes_to_legacy(&mut config);
+    lower_nodes_into_legacy_fields(&mut config);
     validate_config(&config)?;
     Ok(config)
 }
@@ -1701,7 +1701,7 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
 ///   * Route variants project to a legacy transform carrying
 ///     `route: Some(RouteConfig { .. })`; the transform's `cxl` is
 ///     left blank — the route body itself drives dispatch.
-pub fn project_nodes_to_legacy(config: &mut PipelineConfig) {
+fn lower_nodes_into_legacy_fields(config: &mut PipelineConfig) {
     use crate::config::node_header::NodeInput;
 
     if config.nodes.is_empty() {
@@ -1972,7 +1972,7 @@ pub fn load_config_with_vars(
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
-    project_nodes_to_legacy(&mut config);
+    lower_nodes_into_legacy_fields(&mut config);
     validate_config(&config)?;
     Ok(config)
 }

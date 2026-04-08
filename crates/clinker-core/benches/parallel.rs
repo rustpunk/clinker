@@ -98,8 +98,10 @@ error_handling:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    let report = PipelineExecutor::run_with_readers_writers(
-                        &config, readers, writers, &params,
+                    let plan =
+                        clinker_core::plan::CompiledPlan::from_config_for_run(config.clone());
+                    let report = PipelineExecutor::run_plan_with_readers_writers(
+                        &plan, readers, writers, &params,
                     )
                     .unwrap();
                     black_box(report);
@@ -171,8 +173,10 @@ error_handling:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    let report = PipelineExecutor::run_with_readers_writers(
-                        &config, readers, writers, &params,
+                    let plan =
+                        clinker_core::plan::CompiledPlan::from_config_for_run(config.clone());
+                    let report = PipelineExecutor::run_plan_with_readers_writers(
+                        &plan, readers, writers, &params,
                     )
                     .unwrap();
                     black_box(report);

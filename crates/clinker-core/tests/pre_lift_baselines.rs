@@ -193,8 +193,13 @@ fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, Str
         .map(|(n, b)| (n.clone(), Box::new(b.clone()) as Box<dyn Write + Send>))
         .collect();
 
-    PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)
-        .expect("pipeline run");
+    PipelineExecutor::run_plan_with_readers_writers(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+        readers,
+        writers,
+        &params,
+    )
+    .expect("pipeline run");
 
     buffers
         .into_iter()
@@ -232,7 +237,10 @@ fn fixture_io(
 
 fn snapshot_explain(snap_name: &str, yaml: &str) {
     let config = parse_config(yaml).expect("parse_config");
-    let (dag, _) = PipelineExecutor::explain_dag(&config).expect("explain_dag");
+    let (dag, _) = PipelineExecutor::explain_plan_dag(
+        &clinker_core::plan::CompiledPlan::from_config_for_run(config.clone()),
+    )
+    .expect("explain_dag");
     let text = dag.explain_text(&config);
     insta::assert_snapshot!(snap_name, text);
 }
