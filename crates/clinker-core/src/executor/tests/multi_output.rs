@@ -42,7 +42,7 @@ fn test_params(config: &crate::config::PipelineConfig) -> PipelineRunParams {
 
 /// Helper: compile a route config against a set of field names.
 fn compile_test_route(route_yaml: &str, fields: &[&str]) -> CompiledRoute {
-    let route_config: crate::config::RouteConfig = serde_saphyr::from_str(route_yaml).unwrap();
+    let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     PipelineExecutor::compile_route(&route_config, &emitted_fields).unwrap()
 }
@@ -1420,7 +1420,7 @@ branches:
     condition: "amount + 1"
 default: fallback
 "#;
-    let route_config: crate::config::RouteConfig = serde_saphyr::from_str(route_yaml).unwrap();
+    let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields = vec!["amount".to_string()];
     let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
     match result {
@@ -1445,7 +1445,7 @@ branches:
     condition: "amount > 10000"
 default: low
 "#;
-    let route_config: crate::config::RouteConfig = serde_saphyr::from_str(route_yaml).unwrap();
+    let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields = vec!["amount".to_string()];
     let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
     assert!(

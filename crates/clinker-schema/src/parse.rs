@@ -26,7 +26,7 @@ struct SchemaFile {
 /// the caller (typically during index building).
 pub fn parse_schema(yaml: &str, path: &Path) -> Result<SourceSchema, SchemaParseError> {
     let file: SchemaFile =
-        serde_saphyr::from_str(yaml).map_err(|e| SchemaParseError::Yaml(e.to_string()))?;
+        clinker_core::yaml::from_str(yaml).map_err(|e| SchemaParseError::Yaml(e.to_string()))?;
 
     Ok(SourceSchema {
         metadata: file._schema,

@@ -1090,7 +1090,7 @@ pub struct DlqConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
-    Yaml(serde_saphyr::Error),
+    Yaml(crate::yaml::YamlError),
     EnvVar { var_name: String, position: usize },
     Validation(String),
 }
@@ -1119,8 +1119,8 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
-impl From<serde_saphyr::Error> for ConfigError {
-    fn from(e: serde_saphyr::Error) -> Self {
+impl From<crate::yaml::YamlError> for ConfigError {
+    fn from(e: crate::yaml::YamlError) -> Self {
         Self::Yaml(e)
     }
 }
@@ -1211,32 +1211,15 @@ pub fn interpolate_env_vars(
     Ok(result.replace('\0', "$"))
 }
 
-/// Maximum YAML document size (10 MB).
-const MAX_YAML_SIZE: usize = 10_485_760;
-
 /// Parse a pipeline config from a YAML string (after interpolation).
+///
+/// All YAML parsing flows through `crate::yaml::from_str`, the single
+/// chokepoint that owns the DoS-defense [`Budget`].
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let interpolated = interpolate_env_vars(yaml, &[])?;
-    let config: PipelineConfig = parse_yaml_with_budget(&interpolated)?;
+    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
-}
-
-/// Parse YAML with DoS protection budgets.
-fn parse_yaml_with_budget(input: &str) -> Result<PipelineConfig, ConfigError> {
-    if input.len() > MAX_YAML_SIZE {
-        return Err(ConfigError::Validation(format!(
-            "YAML document exceeds 10MB limit ({} bytes)",
-            input.len()
-        )));
-    }
-    let options = serde_saphyr::options! {
-        budget: serde_saphyr::budget! {
-            max_depth: 64,
-            max_nodes: 10_000,
-        },
-    };
-    serde_saphyr::from_str_with_options(input, options).map_err(ConfigError::Yaml)
 }
 
 /// Reserved pipeline member names that cannot be used as user variable names.
@@ -1376,7 +1359,7 @@ pub fn load_config_with_vars(
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
-    let config: PipelineConfig = parse_yaml_with_budget(&interpolated)?;
+    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
 }
@@ -2560,34 +2543,9 @@ transformations:
 
     // ── YAML DoS budget tests ─────────────────────────────────────
 
-    #[test]
-    fn test_yaml_dos_document_size() {
-        // >10MB YAML → error
-        let huge = "a".repeat(MAX_YAML_SIZE + 1);
-        let err = parse_yaml_with_budget(&huge).unwrap_err();
-        assert!(err.to_string().contains("10MB limit"));
-    }
-
-    #[test]
-    fn test_yaml_dos_recursion_depth() {
-        // 100 levels of nesting → should exceed budget max_depth=64
-        let mut yaml = String::from("pipeline:\n");
-        for i in 0..100 {
-            yaml.push_str(&format!("{}level{}:\n", "  ".repeat(i + 1), i));
-        }
-        // This may fail as invalid pipeline config or as budget exceeded
-        assert!(parse_config(&yaml).is_err());
-    }
-
-    #[test]
-    fn test_yaml_dos_sequence_length() {
-        // >10k nodes → should exceed budget
-        let mut yaml = String::from("items:\n");
-        for i in 0..11_000 {
-            yaml.push_str(&format!("  - item{}\n", i));
-        }
-        assert!(parse_yaml_with_budget(&yaml).is_err());
-    }
+    // YAML DoS budget tests live in `crate::yaml::tests` now — that
+    // module owns the chokepoint and the canonical Budget. See
+    // `test_budget_rejects_*` there.
 
     // ── Env var name validation tests ─────────────────────────────
 
@@ -2685,7 +2643,7 @@ branches:
     condition: "amount > 1000"
 default: low
 "#;
-        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        let rc: RouteConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(rc.mode, RouteMode::Exclusive);
         assert_eq!(rc.branches.len(), 2);
         assert_eq!(rc.branches[0].name, "high");
@@ -2703,7 +2661,7 @@ branches:
     condition: "country == 'US'"
 default: standard
 "#;
-        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        let rc: RouteConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(rc.mode, RouteMode::Inclusive);
         assert_eq!(rc.branches.len(), 2);
     }
@@ -2716,7 +2674,7 @@ branches:
     condition: "amount > 10000"
 default: low
 "#;
-        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        let rc: RouteConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(rc.mode, RouteMode::Exclusive);
     }
 
@@ -2727,7 +2685,7 @@ branches:
   - name: high
     condition: "amount > 10000"
 "#;
-        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        let result: Result<RouteConfig, _> = crate::yaml::from_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2742,7 +2700,7 @@ branches:
 branches: []
 default: low
 "#;
-        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        let result: Result<RouteConfig, _> = crate::yaml::from_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2761,7 +2719,7 @@ branches:
     condition: "amount > 5000"
 default: low
 "#;
-        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        let result: Result<RouteConfig, _> = crate::yaml::from_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2778,7 +2736,7 @@ branches:
     condition: "amount > 10000"
 default: high
 "#;
-        let result: Result<RouteConfig, _> = serde_saphyr::from_str(yaml);
+        let result: Result<RouteConfig, _> = crate::yaml::from_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2819,7 +2777,7 @@ branches:
     condition: "amount > 10000 && country != 'US'"
 default: standard
 "#;
-        let rc: RouteConfig = serde_saphyr::from_str(yaml).unwrap();
+        let rc: RouteConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(
             rc.branches[0].condition,
             "amount > 10000 && country != 'US'"
@@ -2964,8 +2922,8 @@ transformations:
 
     // ── Phase 16 Task 16.2 — AggregateConfig tests ─────────────────
 
-    fn parse_transform(yaml: &str) -> Result<TransformConfig, serde_saphyr::Error> {
-        serde_saphyr::from_str::<TransformConfig>(yaml)
+    fn parse_transform(yaml: &str) -> Result<TransformConfig, crate::yaml::YamlError> {
+        crate::yaml::from_str::<TransformConfig>(yaml)
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub enum ResolvedSchema {
 #[derive(Debug)]
 pub enum SchemaError {
     Io(std::io::Error),
-    Yaml(serde_saphyr::Error),
+    Yaml(crate::yaml::YamlError),
     Validation(String),
 }
 
@@ -42,8 +42,8 @@ impl From<std::io::Error> for SchemaError {
     }
 }
 
-impl From<serde_saphyr::Error> for SchemaError {
-    fn from(e: serde_saphyr::Error) -> Self {
+impl From<crate::yaml::YamlError> for SchemaError {
+    fn from(e: crate::yaml::YamlError) -> Self {
         Self::Yaml(e)
     }
 }
@@ -51,7 +51,7 @@ impl From<serde_saphyr::Error> for SchemaError {
 /// Load a schema definition from a YAML file.
 pub fn load_schema(path: &Path) -> Result<SchemaDefinition, SchemaError> {
     let yaml = std::fs::read_to_string(path)?;
-    let def: SchemaDefinition = serde_saphyr::from_str(&yaml)?;
+    let def: SchemaDefinition = crate::yaml::from_str(&yaml)?;
     Ok(def)
 }
 
@@ -252,7 +252,7 @@ fields:
     width: 8
     format: "%Y%m%d"
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(def.fields.as_ref().unwrap().len(), 3);
         assert_eq!(def.fields.as_ref().unwrap()[0].name, "id");
     }
@@ -270,7 +270,7 @@ fields:
   - name: first_name
     inherits: base_string
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let defs = def.defs.as_ref().unwrap();
         assert!(defs.contains_key("base_string"));
         let tmpl = &defs["base_string"];
@@ -295,7 +295,7 @@ fields:
     inherits: base_string
     start: 0
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let resolved = resolve_schema(def).unwrap();
         match resolved {
             ResolvedSchema::SingleRecord { fields } => {
@@ -328,7 +328,7 @@ fields:
     type: float
     start: 0
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let resolved = resolve_schema(def).unwrap();
         match resolved {
             ResolvedSchema::SingleRecord { fields } => {
@@ -360,7 +360,7 @@ fields:
     inherits: derived
     start: 0
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let err = resolve_schema(def).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -377,7 +377,7 @@ fields:
     inherits: nonexistent
     start: 0
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let err = resolve_schema(def).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -396,7 +396,7 @@ fields:
     width: 10
     end: 10
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let err = resolve_schema(def).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -412,7 +412,7 @@ fields:
   - name: test
     colour: red
 "#;
-        let err = serde_saphyr::from_str::<SchemaDefinition>(yaml);
+        let err = crate::yaml::from_str::<SchemaDefinition>(yaml);
         assert!(err.is_err(), "unknown property 'colour' should be rejected");
     }
 
@@ -437,7 +437,7 @@ fields:
     fn test_schema_source_filepath_deser() {
         use crate::config::SchemaSource;
         let yaml = "\"schemas/base.yaml\"";
-        let source: SchemaSource = serde_saphyr::from_str(yaml).unwrap();
+        let source: SchemaSource = crate::yaml::from_str(yaml).unwrap();
         match source {
             SchemaSource::FilePath(p) => assert_eq!(p, "schemas/base.yaml"),
             SchemaSource::Inline(_) => panic!("expected FilePath"),
@@ -452,7 +452,7 @@ fields:
   - name: id
     type: integer
 "#;
-        let source: SchemaSource = serde_saphyr::from_str(yaml).unwrap();
+        let source: SchemaSource = crate::yaml::from_str(yaml).unwrap();
         match source {
             SchemaSource::Inline(def) => {
                 assert_eq!(def.fields.as_ref().unwrap().len(), 1);
@@ -469,7 +469,7 @@ fields:
     type: string
     drop: true
 "#;
-        let def: SchemaDefinition = serde_saphyr::from_str(yaml).unwrap();
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
         let err = resolve_schema(def).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("drop"), "error should mention drop: {msg}");

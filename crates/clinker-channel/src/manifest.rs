@@ -110,7 +110,7 @@ impl ChannelManifest {
                 ))
             })?;
 
-        let parsed: RawChannelFile = serde_saphyr::from_str(&interpolated)?;
+        let parsed: RawChannelFile = clinker_core::yaml::from_str(&interpolated)?;
 
         Ok(ChannelManifest {
             metadata: parsed._channel,

@@ -62,7 +62,8 @@ pub fn try_parse_yaml(yaml: &str, workspace_root: Option<&Path>) -> ParseResult 
 
 /// Serialize a `PipelineConfig` back to YAML text.
 pub fn serialize_yaml(config: &PipelineConfig) -> String {
-    serde_saphyr::to_string(config).unwrap_or_else(|e| format!("# Serialization error: {e}\n"))
+    clinker_core::yaml::to_string(config)
+        .unwrap_or_else(|e| format!("# Serialization error: {e}\n"))
 }
 
 /// Compute YAML line ranges for each named stage (best-effort).

@@ -7,7 +7,7 @@ pub enum ChannelError {
     Io(#[from] std::io::Error),
 
     #[error("YAML parse error: {0}")]
-    Yaml(#[from] serde_saphyr::Error),
+    Yaml(#[from] clinker_core::yaml::YamlError),
 
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),

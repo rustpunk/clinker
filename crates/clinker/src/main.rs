@@ -296,7 +296,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
     })?;
     let pipeline_config: clinker_core::config::PipelineConfig =
-        serde_saphyr::from_str(&interpolated).map_err(|e| {
+        clinker_core::yaml::from_str(&interpolated).map_err(|e| {
             PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
         })?;
 

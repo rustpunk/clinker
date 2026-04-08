@@ -1,6 +1,6 @@
 /// Per-item fallback parser for graceful degradation.
 ///
-/// When the standard all-or-nothing `serde_saphyr::from_str` parse fails,
+/// When the standard all-or-nothing `crate::yaml::from_str` parse fails,
 /// this module provides a two-pass approach:
 /// 1. Parse the YAML into a `serde_json::Value` tree (requires valid YAML syntax).
 /// 2. Walk the tree and deserialize each section/item individually.
@@ -50,7 +50,7 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
     let interpolated = interpolate_env_vars(yaml, &[]).map_err(|e| e.to_string())?;
 
     let tree: serde_json::Value =
-        serde_saphyr::from_str(&interpolated).map_err(|e| format!("YAML syntax error: {e}"))?;
+        crate::yaml::from_str(&interpolated).map_err(|e| format!("YAML syntax error: {e}"))?;
 
     let obj = tree
         .as_object()
