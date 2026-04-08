@@ -31,12 +31,28 @@ pub struct LocalWindowConfig {
 pub fn parse_analytic_window(
     transform: &TransformConfig,
 ) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
-    match &transform.local_window {
+    parse_analytic_window_value(&transform.local_window, &transform.name)
+}
+
+/// Phase 16b Wave 4ab — parse the analytic-window block from a
+/// `PlanTransformSpec`. Decoupled from `TransformConfig` so the planner
+/// can call into index planning without dragging the legacy type in.
+pub(crate) fn parse_analytic_window_spec(
+    spec: &crate::plan::execution::PlanTransformSpec,
+) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
+    parse_analytic_window_value(&spec.analytic_window, &spec.name)
+}
+
+fn parse_analytic_window_value(
+    raw: &Option<serde_json::Value>,
+    transform_name: &str,
+) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
+    match raw {
         None => Ok(None),
         Some(value) => {
             let config: LocalWindowConfig = serde_json::from_value(value.clone()).map_err(|e| {
                 PlanIndexError::InvalidLocalWindow {
-                    transform: transform.name.clone(),
+                    transform: transform_name.to_string(),
                     message: e.to_string(),
                 }
             })?;

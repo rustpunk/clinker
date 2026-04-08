@@ -210,6 +210,101 @@ pub struct PlanOutputPayload {
     pub validated_path: Option<crate::security::ValidatedPath>,
 }
 
+/// Phase 16b Wave 4ab — post-lowering intermediate representation of a
+/// single transform/aggregate/route node, fed into
+/// [`build_plan_from_nodes`]. Decouples the planner from the legacy
+/// `TransformConfig`/`PipelineConfig` shape so the executor public
+/// surface can be cut over without dragging the legacy types into the
+/// plan body.
+///
+/// The shape mirrors the field set the planner actually reads off
+/// `TransformConfig` (cxl source, aggregate sidecar, route sidecar, log
+/// directives, validations, analytic-window block, input wiring) plus a
+/// promoted [`ResolvedInput`] enum that distinguishes the three wiring
+/// modes that the legacy `Option<TransformInput>` encoded implicitly
+/// (none = chain, single = explicit, multiple = merge). The two
+/// span fields exist for the eventual diagnostic surface; Wave 4ab fills
+/// them with `Span::SYNTHETIC` from the legacy bridge constructor.
+// Wave 4ab M2 WIP: remaining fields (route, log, validations, input_span,
+// body_span) are consumed as Milestones 3-6 migrate the helpers off
+// TransformConfig. Keeping the full field set live avoids a second structural
+// churn when those milestones land.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct PlanTransformSpec {
+    pub name: String,
+    pub cxl_source: Option<String>,
+    pub aggregate: Option<crate::config::AggregateConfig>,
+    pub route: Option<crate::config::RouteConfig>,
+    pub analytic_window: Option<serde_json::Value>,
+    pub log: Vec<crate::config::LogDirective>,
+    pub validations: Vec<crate::config::ValidationEntry>,
+    pub input: ResolvedInput,
+    pub input_span: Span,
+    pub body_span: Span,
+}
+
+/// Resolved upstream wiring for a [`PlanTransformSpec`]. The legacy
+/// `Option<TransformInput>` encoding mapped `None` to "chain to previous
+/// declaration" and `Some(...)` to explicit single/multi wiring; this
+/// enum makes that explicit so the planner does not have to peek at
+/// declaration order to disambiguate.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedInput {
+    /// Implicit linear chain — wire to the previous transform (or the
+    /// primary source for the first transform).
+    Chain,
+    /// Explicit single upstream by name (transform, aggregate, or
+    /// dotted `route_name.branch_name`).
+    Single(String),
+    /// Multiple upstreams unioned through a synthesized merge node.
+    Multi(Vec<String>),
+}
+
+impl PlanTransformSpec {
+    /// Wave 4ab bridge: build a `PlanTransformSpec` directly from a
+    /// legacy `TransformConfig`. Used by `ExecutionPlanDag::compile`'s
+    /// thin wrapper that the executor still calls during the cutover;
+    /// will be deleted with `TransformConfig` in the final commit of
+    /// the wave.
+    pub(crate) fn from_legacy(tc: &crate::config::TransformConfig) -> Self {
+        let input = match &tc.input {
+            None => ResolvedInput::Chain,
+            Some(TransformInput::Single(s)) => ResolvedInput::Single(s.clone()),
+            Some(TransformInput::Multiple(v)) => ResolvedInput::Multi(v.clone()),
+        };
+        Self {
+            name: tc.name.clone(),
+            cxl_source: tc.cxl.clone(),
+            aggregate: tc.aggregate.clone(),
+            route: tc.route.clone(),
+            analytic_window: tc.local_window.clone(),
+            log: tc.log.clone().unwrap_or_default(),
+            validations: tc.validations.clone().unwrap_or_default(),
+            input,
+            input_span: Span::SYNTHETIC,
+            body_span: Span::SYNTHETIC,
+        }
+    }
+
+    /// CXL source text. For row-level transforms this is the top-level
+    /// `cxl` field; for aggregates it is the nested `aggregate.cxl`.
+    pub(crate) fn cxl_source(&self) -> &str {
+        if let Some(agg) = &self.aggregate {
+            agg.cxl.as_str()
+        } else if let Some(s) = &self.cxl_source {
+            s.as_str()
+        } else {
+            ""
+        }
+    }
+
+    /// True iff this spec carries an aggregate sidecar.
+    pub(crate) fn is_aggregate(&self) -> bool {
+        self.aggregate.is_some()
+    }
+}
+
 impl PlanNode {
     /// Get the name of this node regardless of variant.
     pub fn name(&self) -> &str {
@@ -480,11 +575,30 @@ impl ExecutionPlanDag {
         // Phase D: analyze all transforms
         let report = analyzer::analyze_all(compiled);
 
-        // Parse local_window configs
-        let window_configs: Vec<Option<LocalWindowConfig>> = config
-            .transforms()
-            .map(|t| index::parse_analytic_window(t).map_err(PlanError::IndexPlanning))
+        // Phase 16b Wave 4ab Milestone 2: lower TransformConfig to PlanTransformSpec.
+        // The spec list is the new post-lowering intermediate; helpers are
+        // being migrated to consume it incrementally.
+        let specs: Vec<PlanTransformSpec> =
+            config.transforms().map(PlanTransformSpec::from_legacy).collect();
+
+        // Parse analytic_window configs via the spec-taking helper.
+        let window_configs: Vec<Option<LocalWindowConfig>> = specs
+            .iter()
+            .map(|s| index::parse_analytic_window_spec(s).map_err(PlanError::IndexPlanning))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Exercise spec accessors + ResolvedInput so the types are live end-to-end.
+        let _spec_probe: Vec<(&str, bool, usize)> = specs
+            .iter()
+            .map(|s| {
+                let fanin = match &s.input {
+                    ResolvedInput::Chain => 0,
+                    ResolvedInput::Single(name) => name.len().min(1),
+                    ResolvedInput::Multi(names) => names.len(),
+                };
+                (s.cxl_source(), s.is_aggregate(), fanin)
+            })
+            .collect();
 
         // Validate: if a transform uses window.* but has no local_window, error
         for (i, analysis) in report.transforms.iter().enumerate() {
