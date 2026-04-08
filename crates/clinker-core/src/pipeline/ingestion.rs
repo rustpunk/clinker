@@ -198,4 +198,3 @@ where
 
     Ok(IngestionOutput { arenas, indices })
 }
-

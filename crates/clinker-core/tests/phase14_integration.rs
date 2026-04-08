@@ -10,6 +10,18 @@ use std::sync::{Arc, Mutex};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 
+/// Test-only: enable absolute paths in compile() path validation. Tests
+/// in this file use tempfile::tempdir() which produces absolute paths.
+/// Call from any test that uses an absolute path in its YAML. Idempotent.
+fn enable_absolute_paths() {
+    // SAFETY: cargo test threads race on set_var; but this value is
+    // idempotent ("1") and only ever set (never unset) within this test
+    // binary, so concurrent writers observe the same string.
+    unsafe {
+        std::env::set_var("CLINKER_ALLOW_ABSOLUTE_PATHS", "1");
+    }
+}
+
 /// Thread-safe in-memory buffer for capturing output in integration tests.
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -260,6 +272,7 @@ nodes:
 
 #[test]
 fn test_e2e_split_by_count() {
+    enable_absolute_paths();
     let dir = tempfile::tempdir().unwrap();
     let output_path = dir.path().join("results.csv");
 
@@ -369,6 +382,7 @@ nodes:
 
 #[test]
 fn test_e2e_split_preserves_groups() {
+    enable_absolute_paths();
     let dir = tempfile::tempdir().unwrap();
     let output_path = dir.path().join("grouped.csv");
 
@@ -601,6 +615,7 @@ nodes:
 
 #[test]
 fn test_e2e_multi_output_split() {
+    enable_absolute_paths();
     let dir = tempfile::tempdir().unwrap();
     let high_path = dir.path().join("high.csv");
     let low_path = dir.path().join("low.csv");

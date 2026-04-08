@@ -468,7 +468,12 @@ nodes:
     let comp_count = cfg
         .nodes
         .iter()
-        .filter(|n| matches!(n.value, clinker_core::config::PipelineNode::Composition { .. }))
+        .filter(|n| {
+            matches!(
+                n.value,
+                clinker_core::config::PipelineNode::Composition { .. }
+            )
+        })
         .count();
     assert_eq!(
         comp_count, 2,

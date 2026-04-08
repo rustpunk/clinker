@@ -632,22 +632,36 @@ nodes:
         let yaml = r#"
 pipeline:
   name: loaded_fixture_smoke
-inputs:
-  - name: raw
+nodes:
+- type: source
+  name: raw
+  config:
+    name: raw
     type: csv
     path: ./raw.csv
-    options: { has_header: true }
-outputs:
-  - name: results
+    options:
+      has_header: true
+- type: transform
+  name: clean
+  input: raw
+  config:
+    cxl: 'emit a = 1
+
+      '
+- type: transform
+  name: finalize
+  input: clean
+  config:
+    cxl: 'emit b = 2
+
+      '
+- type: output
+  name: results
+  input: finalize
+  config:
+    name: results
     type: csv
     path: ./results.csv
-transformations:
-  - name: clean
-    cxl: |
-      emit a = 1
-  - name: finalize
-    cxl: |
-      emit b = 2
 "#;
         let config = parse_config(yaml).expect("legacy fixture lifts to nodes");
         let view = derive_pipeline_view(&config);

@@ -49,21 +49,17 @@ use petgraph::Direction;
 /// consume a flat Vec-of-transforms view. The fields are the superset
 /// that executor sites read from; see `build_transform_specs`.
 #[derive(Debug, Clone)]
-pub(crate) struct TransformSpec {
+pub struct TransformSpec {
     pub name: String,
-    pub description: Option<String>,
     pub cxl: Option<String>,
     pub aggregate: Option<crate::config::AggregateConfig>,
     pub local_window: Option<serde_json::Value>,
-    pub log: Option<Vec<crate::config::LogDirective>>,
-    pub validations: Option<Vec<crate::config::ValidationEntry>>,
     pub route: Option<crate::config::RouteConfig>,
     pub input: Option<crate::config::TransformInput>,
-    pub notes: Option<serde_json::Value>,
 }
 
 impl TransformSpec {
-    pub(crate) fn cxl_source(&self) -> &str {
+    pub fn cxl_source(&self) -> &str {
         if let Some(agg) = &self.aggregate {
             agg.cxl.as_str()
         } else if let Some(s) = &self.cxl {
@@ -72,21 +68,15 @@ impl TransformSpec {
             ""
         }
     }
-
-    pub(crate) fn is_aggregate(&self) -> bool {
-        self.aggregate.is_some()
-    }
 }
 
 /// Walk `PipelineConfig::nodes` and materialize a flat `Vec<TransformSpec>`
 /// from the Transform/Aggregate/Route variants in declaration order. Merge
 /// nodes referenced by a transform's input are expanded back into
 /// `TransformInput::Multiple(list)` to match the legacy executor wire shape.
-pub(crate) fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
+pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
     use crate::config::node_header::NodeInput;
-    use crate::config::{
-        AggregateConfig, PipelineNode, RouteBranch, RouteConfig, TransformInput,
-    };
+    use crate::config::{AggregateConfig, PipelineNode, RouteBranch, RouteConfig, TransformInput};
 
     let merge_by_name: std::collections::HashMap<&str, Vec<String>> = config
         .nodes
@@ -125,24 +115,25 @@ pub(crate) fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpe
     let mut out = Vec::new();
     for spanned in &config.nodes {
         match &spanned.value {
-            PipelineNode::Transform { header, config: body } => {
+            PipelineNode::Transform {
+                header,
+                config: body,
+            } => {
                 out.push(TransformSpec {
                     name: header.name.clone(),
-                    description: header.description.clone(),
                     cxl: Some(body.cxl.as_ref().to_string()),
                     aggregate: None,
                     local_window: body.analytic_window.clone(),
-                    log: body.log.clone(),
-                    validations: body.validations.clone(),
                     route: None,
                     input: project_input(&header.input),
-                    notes: header.notes.clone(),
                 });
             }
-            PipelineNode::Aggregate { header, config: body } => {
+            PipelineNode::Aggregate {
+                header,
+                config: body,
+            } => {
                 out.push(TransformSpec {
                     name: header.name.clone(),
-                    description: header.description.clone(),
                     cxl: None,
                     aggregate: Some(AggregateConfig {
                         group_by: body.group_by.clone(),
@@ -150,14 +141,14 @@ pub(crate) fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpe
                         strategy: body.strategy,
                     }),
                     local_window: None,
-                    log: None,
-                    validations: None,
                     route: None,
                     input: project_input(&header.input),
-                    notes: header.notes.clone(),
                 });
             }
-            PipelineNode::Route { header, config: body } => {
+            PipelineNode::Route {
+                header,
+                config: body,
+            } => {
                 let branches: Vec<RouteBranch> = body
                     .conditions
                     .iter()
@@ -168,19 +159,15 @@ pub(crate) fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpe
                     .collect();
                 out.push(TransformSpec {
                     name: header.name.clone(),
-                    description: header.description.clone(),
                     cxl: Some(String::new()),
                     aggregate: None,
                     local_window: None,
-                    log: None,
-                    validations: None,
                     route: Some(RouteConfig {
                         mode: body.mode,
                         branches,
                         default: body.default.clone(),
                     }),
                     input: project_input(&header.input),
-                    notes: header.notes.clone(),
                 });
             }
             _ => {}
@@ -661,10 +648,12 @@ impl PipelineExecutor {
         // by moving it out of the locally-bound plan.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let resolved_transforms = crate::executor::build_transform_specs(config);
-        let mut local_plan = config.compile().map_err(|diags| PipelineError::Compilation {
-            transform_name: String::new(),
-            messages: diags.iter().map(|d| d.message.clone()).collect(),
-        })?;
+        let mut local_plan = config
+            .compile()
+            .map_err(|diags| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: diags.iter().map(|d| d.message.clone()).collect(),
+            })?;
         local_plan.bind_schema(&schema)?;
         let compiled_transforms = local_plan.take_compiled_transforms();
 
@@ -2807,19 +2796,20 @@ impl PipelineExecutor {
                     // The Merge node is named "merge_{transform}". Find the
                     // transform's input: array to determine declaration order.
                     let merge_transform_name = name.strip_prefix("merge_").unwrap_or(name);
-                    let declaration_order: Vec<String> = crate::executor::build_transform_specs(config)
-                        .into_iter()
-                        .find(|tc| tc.name == merge_transform_name)
-                        .and_then(|tc| {
-                            if let Some(crate::config::TransformInput::Multiple(ref inputs)) =
-                                tc.input
-                            {
-                                Some(inputs.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
+                    let declaration_order: Vec<String> =
+                        crate::executor::build_transform_specs(config)
+                            .into_iter()
+                            .find(|tc| tc.name == merge_transform_name)
+                            .and_then(|tc| {
+                                if let Some(crate::config::TransformInput::Multiple(ref inputs)) =
+                                    tc.input
+                                {
+                                    Some(inputs.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
 
                     // Sort predecessors by declaration order
                     let mut sorted_preds = predecessors.clone();
@@ -3444,8 +3434,7 @@ impl PipelineExecutor {
         ));
 
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
-        let resolved_transforms: Vec<&TransformSpec> =
-            resolved_transforms_owned.iter().collect();
+        let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
         let compiled = Self::compile_transforms(&resolved_transforms, &schema)?;
         let compiled_refs: Vec<(&str, &TypedProgram)> = compiled
             .iter()
@@ -4314,4 +4303,3 @@ fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
         _ => {}
     }
 }
-

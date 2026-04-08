@@ -736,7 +736,6 @@ pub struct AggregateConfig {
     pub strategy: AggregateStrategyHint,
 }
 
-
 /// A declarative validation attached to a transform.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1104,8 +1103,11 @@ impl PipelineConfig {
         // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
         // the legacy projection. Wave 2 walks `nodes:` directly.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let allow_absolute = std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
         diags.extend(crate::security::validate_all_config_paths(
-            self, &cwd, false,
+            self,
+            &cwd,
+            allow_absolute,
         ));
 
         // ── Stage 5: D3b — dotted-name check ────────────────────────
@@ -1423,7 +1425,6 @@ impl PipelineConfig {
 
         Ok(CompiledPlan::new(dag, self.clone(), Vec::new()))
     }
-
 }
 
 fn input_target(input: &node_header::NodeInput) -> &str {
@@ -1691,7 +1692,6 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     Ok(config)
 }
 
-
 /// Reserved pipeline member names that cannot be used as user variable names.
 const RESERVED_PIPELINE_NAMES: &[&str] = &[
     "start_time",
@@ -1728,7 +1728,10 @@ fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
 
     // Validate log directives on Transform nodes.
     for spanned in &config.nodes {
-        if let PipelineNode::Transform { header, config: body } = &spanned.value
+        if let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &spanned.value
             && let Some(directives) = &body.log
         {
             for (i, d) in directives.iter().enumerate() {
@@ -1836,4 +1839,3 @@ pub fn load_config_with_vars(
 pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError> {
     load_config_with_vars(path, &[])
 }
-

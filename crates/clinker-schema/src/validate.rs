@@ -483,12 +483,13 @@ distinct by customer_id
         let yaml = r#"
 pipeline:
   name: test
-inputs:
-  - name: src
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
     path: ./data.csv
     type: csv
-outputs: []
-transformations: []
 "#;
         let config = clinker_core::config::parse_config(yaml).unwrap();
 
