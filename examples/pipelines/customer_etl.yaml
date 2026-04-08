@@ -1,47 +1,41 @@
 pipeline:
   name: customer_etl
 
-inputs:
-  - name: customers
-    type: csv
-    path: ./data/customers.csv
-    options:
-      has_header: true
-    _notes:
-      fields:
-        path: Updated quarterly when the CRM team changes export locations.
-      stage: Source data from the CRM export.
+nodes:
+  - type: source
+    name: customers
+    description: Source data from the CRM export.
+    config:
+      name: customers
+      type: csv
+      path: ./data/customers.csv
+      options:
+        has_header: true
 
-outputs:
-  - name: results
-    type: csv
-    path: ./output/customers.csv
-    include_unmapped: true
-
-transformations:
-  - name: active_only
+  - type: transform
+    name: active_only
     description: Flag active customers (filter statement added in Phase 12)
-    cxl: |
-      emit is_active = status == "active"
-    _notes:
-      fields:
-        cxl: The status field uses lowercase string values.
-      stage: |
-        Active-only filtering was added in Q3 2025 to exclude
-        churned accounts from the marketing dataset.
+    input: customers
+    config:
+      cxl: |
+        emit is_active = status == "active"
 
-  - _import: compositions/clean_names.comp.yaml
-
-  - _import: compositions/validate_email.comp.yaml
-    overrides:
-      check_email_format:
-        cxl: |
-          emit email_valid = email_lower.matches("^[^@]+@(acme|globex)\\.com$")
-
-  - name: final_flag
+  - type: transform
+    name: final_flag
     description: Flag high-value customers
-    cxl: |
-      emit tier = if lifetime_value.to_int() > 10000 then "gold" else "standard"
+    input: active_only
+    config:
+      cxl: |
+        emit tier = if lifetime_value.to_int() > 10000 then "gold" else "standard"
+
+  - type: output
+    name: results
+    input: final_flag
+    config:
+      name: results
+      type: csv
+      path: ./output/customers.csv
+      include_unmapped: true
 
 error_handling:
   strategy: fail_fast
@@ -50,3 +44,5 @@ _notes:
   pipeline: |
     Customer ETL pipeline for the marketing analytics team.
     Runs nightly via cron. Output feeds the Looker dashboard.
+    TODO(16c compositions): clean_names + validate_email composition imports
+    were stripped during the 16b fixture migration.

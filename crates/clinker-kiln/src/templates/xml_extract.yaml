@@ -9,20 +9,28 @@ _template:
 pipeline:
   name: xml-extract
 
-inputs:
-  - name: source
-    type: xml
-    path: "./data/input.xml"
-    options:
-      record_element: record
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: xml
+      path: "./data/input.xml"
+      options:
+        record_element: record
 
-transformations:
-  - name: select_fields
-    cxl: |
-      emit id = id
-      emit value = value
+  - type: transform
+    name: select_fields
+    input: source
+    config:
+      cxl: |
+        emit id = id
+        emit value = value
 
-outputs:
-  - name: result
-    type: csv
-    path: "./output/extracted.csv"
+  - type: output
+    name: result
+    input: select_fields
+    config:
+      name: result
+      type: csv
+      path: "./output/extracted.csv"

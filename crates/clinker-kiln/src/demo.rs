@@ -10,44 +10,42 @@ _notes:
     Customer ETL pipeline for the marketing analytics team.
     Runs nightly via cron. Output feeds the Looker dashboard.
 
-inputs:
-  - name: customers
-    type: csv
-    path: ./data/customers.csv
-    options:
-      has_header: true
-    _notes:
-      stage: Source data from the CRM export.
-      fields:
-        path: "Updated quarterly when the CRM team changes export locations."
+nodes:
+  - type: source
+    name: customers
+    description: Source data from the CRM export.
+    config:
+      name: customers
+      type: csv
+      path: ./data/customers.csv
+      options:
+        has_header: true
 
-transformations:
-  - name: active_only
+  - type: transform
+    name: active_only
     description: Filter to active customers
-    cxl: |
-      emit status_ok = status == "active"
-    _notes:
-      stage: |
-        Active-only filtering was added in Q3 2025 to exclude
-        churned accounts from the marketing dataset.
-      fields:
-        cxl: "The status field uses lowercase string values."
+    input: customers
+    config:
+      cxl: |
+        emit status_ok = status == "active"
 
-  - name: enrich
+  - type: transform
+    name: enrich
     description: Compute derived fields
-    cxl: |
-      emit full_name = first_name + " " + last_name
-      emit email_lower = lower(email)
-    _notes:
-      stage: Derived fields for the email personalization service.
-      fields:
-        cxl: "full_name format must be 'First Last' — no middle names."
+    input: active_only
+    config:
+      cxl: |
+        emit full_name = first_name + " " + last_name
+        emit email_lower = lower(email)
 
-outputs:
-  - name: results
-    type: csv
-    path: ./output/customers.csv
-    include_unmapped: true
+  - type: output
+    name: results
+    input: enrich
+    config:
+      name: results
+      type: csv
+      path: ./output/customers.csv
+      include_unmapped: true
 
 error_handling:
   strategy: fail_fast

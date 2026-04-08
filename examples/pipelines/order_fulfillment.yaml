@@ -4,54 +4,75 @@ pipeline:
     express_surcharge: 5.99
     high_value_threshold: 500
 
-inputs:
-  - name: orders
-    type: csv
-    path: ./data/orders.csv
-    options:
-      has_header: true
-  - name: products
-    type: csv
-    path: ./data/products.csv
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders.csv
+      options:
+        has_header: true
 
-outputs:
-  - name: fulfilled_orders
-    type: csv
-    path: ./output/fulfilled_orders.csv
-    include_unmapped: false
-  - name: priority_report
-    type: json
-    path: ./output/priority_report.json
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: ./data/products.csv
+      options:
+        has_header: true
 
-transformations:
-  - name: normalize_fields
+  - type: transform
+    name: normalize_fields
     description: Clean and normalize order fields
-    cxl: |
-      emit order_ref = "ORD-" + order_id.to_string().pad_left(8, "0")
-      emit order_date_parsed = order_date.to_date("yyyy-MM-dd")
-      emit line_total = quantity * unit_price
+    input: orders
+    config:
+      cxl: |
+        emit order_ref = "ORD-" + order_id.to_string().pad_left(8, "0")
+        emit order_date_parsed = order_date.to_date("yyyy-MM-dd")
+        emit line_total = quantity * unit_price
 
-  - name: product_lookup
+  - type: transform
+    name: product_lookup
     description: Enrich orders with product catalog details
-    local_window:
-      source: products
-      "on": product_code
-      group_by: product_code
-    cxl: |
-      emit product_name = $window.first().product_name
-      emit category = $window.first().category
-      emit weight_kg = $window.first().weight_kg
+    input: normalize_fields
+    config:
+      analytic_window:
+        source: products
+        "on": product_code
+        group_by: product_code
+      cxl: |
+        emit product_name = $window.first().product_name
+        emit category = $window.first().category
+        emit weight_kg = $window.first().weight_kg
 
-  - _import: compositions/shipping_cost.comp.yaml
+  # TODO(16c compositions): shipping_cost + order_classification composition imports stripped during 16b fixture migration.
 
-  - _import: compositions/order_classification.comp.yaml
+  - type: transform
+    name: route_priority
+    description: Compute route field for downstream routing (priority_report vs fulfilled_orders)
+    input: product_lookup
+    config:
+      cxl: |
+        emit _route = if priority_level == "urgent" or priority_level == "high" then "priority_report" else "fulfilled_orders"
 
-  - name: route_priority
-    description: Filter priority report to high-value or express orders
-    cxl: |
-      emit _route = if priority_level == "urgent" or priority_level == "high" then "priority_report" else "fulfilled_orders"
+  - type: output
+    name: fulfilled_orders
+    input: route_priority
+    config:
+      name: fulfilled_orders
+      type: csv
+      path: ./output/fulfilled_orders.csv
+      include_unmapped: false
+
+  - type: output
+    name: priority_report
+    input: route_priority
+    config:
+      name: priority_report
+      type: json
+      path: ./output/priority_report.json
 
 error_handling:
   strategy: continue
