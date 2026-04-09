@@ -839,6 +839,113 @@ nodes:
     assert!(diags.iter().any(|d| d.code == "E001"));
 }
 
+// ---------------------------------------------------------------------
+// Task 16b.9 gate tests — compile-time CXL typecheck lift
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_compile_surfaces_cxl_type_error() {
+    // A transform that references a column absent from the upstream
+    // source schema must produce an E200 diagnostic during `compile()`,
+    // BEFORE any I/O occurs.
+    let yaml = r#"
+pipeline:
+  name: bad_ref
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/does_not_matter.csv
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: t
+    input: src
+    config:
+      cxl: "emit bogus = not_a_column + 1"
+  - type: output
+    name: out
+    input: t
+    config:
+      name: out
+      type: csv
+      path: data/out_nonexistent.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let res = cfg.compile();
+    assert!(res.is_err(), "compile must fail on CXL type error");
+    let diags = res.err().unwrap();
+    assert!(
+        diags.iter().any(|d| d.code == "E200"),
+        "expected E200, got: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_source_without_schema_fails() {
+    // `schema:` is a required field on SourceBody. Omitting it must
+    // hard-fail at parse time (serde field-required error). This test
+    // pins that guarantee so E201 remains the sole fallback path for
+    // programmatic construction.
+    let yaml = r#"
+pipeline:
+  name: no_schema
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/in.csv
+"#;
+    let res = clinker_core::yaml::from_str::<PipelineConfig>(yaml);
+    assert!(
+        res.is_err(),
+        "source missing `schema:` must be a parse error"
+    );
+}
+
+#[test]
+fn test_compile_time_typecheck_no_file_access() {
+    // A valid pipeline whose `source.path` points to a nonexistent
+    // file must still `compile()` successfully — typecheck is
+    // purely in-memory against the declared schema. File I/O only
+    // happens at `run_with_readers_writers` time.
+    let yaml = r#"
+pipeline:
+  name: no_file
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/definitely_not_real_in.csv
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: t
+    input: src
+    config:
+      cxl: "emit doubled = amount * 2"
+  - type: output
+    name: out
+    input: t
+    config:
+      name: out
+      type: csv
+      path: data/definitely_not_real_out.csv
+"#;
+    let cfg = parse_pipeline(yaml);
+    let plan = cfg
+        .compile()
+        .expect("compile must succeed without touching disk");
+    assert_eq!(plan.dag().graph.node_count(), 3);
+}
+
 #[test]
 fn test_compile_compiledplan_exposes_dag_runtime_sidecar() {
     let yaml = r#"

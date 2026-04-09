@@ -39,8 +39,9 @@ impl CompiledPlan {
     }
 
     /// Compile-time CXL typecheck artifacts — one entry per
-    /// CXL-bearing node (Transform/Aggregate) keyed by node name.
-    #[allow(dead_code)] // reserved for future runtime consumers
+    /// CXL-bearing node (Transform/Aggregate/Route) keyed by node name.
+    /// The runtime executor reads this map directly to pull each
+    /// transform's `Arc<TypedProgram>` instead of re-typechecking.
     pub(crate) fn artifacts(&self) -> &CompileArtifacts {
         &self.artifacts
     }

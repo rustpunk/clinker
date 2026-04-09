@@ -2229,7 +2229,7 @@ impl<Op: AccumulatorOp> StreamingAggregator<Op> {
 
 /// Outcome of evaluating whether an aggregation can run in streaming mode
 /// given its parent node's physical properties. Returned by
-/// [`qualifies_for_streaming`] and consumed by `compile_transforms()` in
+/// [`qualifies_for_streaming`] and consumed by the planner lowering in
 /// Task 16.4.9a to pick between `PlanNode::StreamingAggregation` and
 /// `PlanNode::HashAggregation`.
 #[derive(Debug, Clone)]

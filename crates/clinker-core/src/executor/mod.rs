@@ -643,13 +643,14 @@ impl PipelineExecutor {
         // propagates emitted columns downstream. Type errors surface
         // as E200 diagnostics here, BEFORE any file handle opens.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        // Surface compile-time CXL typecheck errors (E200/E201) before
-        // any file handles open. The runtime still calls compile_transforms
-        // below — redundant typecheck, identical result — because the
-        // runtime path feeds its TypedPrograms into ExecutionPlanDag with
-        // the runtime schema (Arrow-derived) which may differ in column
-        // ordering from the author-declared schema used by cxl_compile.
-        let _validated_plan = config
+        // Phase 16b Task 16b.9: ALL CXL typechecking happens at
+        // `config.compile()` time via the `cxl_compile` stage-4.5 pass.
+        // The runtime never re-typechecks; it pulls each transform's
+        // pre-typechecked `Arc<TypedProgram>` straight from the
+        // `CompiledPlan`'s artifacts map, keyed by node name. There is
+        // no second typecheck pass — `compile_transforms` is gone.
+        let _ = &schema;
+        let validated_plan = config
             .compile()
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
@@ -657,7 +658,27 @@ impl PipelineExecutor {
             })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
-        let compiled_transforms = Self::compile_transforms(&resolved_transforms, &schema)?;
+        let compiled_transforms: Vec<CompiledTransform> = resolved_transforms
+            .iter()
+            .map(|t| {
+                let typed = validated_plan
+                    .artifacts()
+                    .typed
+                    .get(&t.name)
+                    .cloned()
+                    .ok_or_else(|| PipelineError::Compilation {
+                        transform_name: t.name.clone(),
+                        messages: vec![
+                            "internal: cxl_compile produced no typed program for this node"
+                                .to_string(),
+                        ],
+                    })?;
+                Ok::<CompiledTransform, PipelineError>(CompiledTransform {
+                    name: t.name.clone(),
+                    typed,
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         // Compile route conditions if any transform has a route config.
         // Collect all emitted field names for route condition resolution.
@@ -691,11 +712,16 @@ impl PipelineExecutor {
             .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
             .collect();
 
-        let plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
-            PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![e.to_string()],
-            }
+        let runtime_input_schema: Vec<String> =
+            schema.columns().iter().map(|c| c.to_string()).collect();
+        let plan = ExecutionPlanDag::compile_with_runtime_schema(
+            config,
+            &compiled_refs,
+            Some(&runtime_input_schema),
+        )
+        .map_err(|e| PipelineError::Compilation {
+            transform_name: String::new(),
+            messages: vec![e.to_string()],
         })?;
         collector.record(compile_timer.finish(0, 0));
 
@@ -3182,133 +3208,6 @@ impl PipelineExecutor {
         ))
     }
 
-    /// Compile all CXL transform blocks against the input schema.
-    ///
-    /// Fields emitted by earlier transforms are progressively added to the
-    /// available field set so that later transforms can reference them.
-    pub(crate) fn compile_transforms(
-        transforms: &[&TransformSpec],
-        schema: &Arc<Schema>,
-    ) -> Result<Vec<CompiledTransform>, PipelineError> {
-        let mut fields: Vec<String> = schema.columns().iter().map(|c| c.to_string()).collect();
-        // CSV fields are all strings at the data level, but CXL allows
-        // polymorphic usage (e.g. `+` for concat, `.to_int()` for coercion).
-        // Declare as Any so the type checker doesn't reject valid CXL.
-        let mut type_schema: IndexMap<String, Type> =
-            fields.iter().map(|f| (f.clone(), Type::Any)).collect();
-
-        let mut compiled = Vec::with_capacity(transforms.len());
-        for t in transforms {
-            let parse_result = cxl::parser::Parser::parse(t.cxl_source());
-            if !parse_result.errors.is_empty() {
-                let messages: Vec<String> = parse_result
-                    .errors
-                    .iter()
-                    .map(|e| e.message.clone())
-                    .collect();
-                return Err(PipelineError::Compilation {
-                    transform_name: t.name.clone(),
-                    messages,
-                });
-            }
-
-            let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-            let resolved = cxl::resolve::resolve_program(
-                parse_result.ast,
-                &field_refs,
-                parse_result.node_count,
-            )
-            .map_err(|diags| PipelineError::Compilation {
-                transform_name: t.name.clone(),
-                messages: diags.into_iter().map(|d| d.message).collect(),
-            })?;
-
-            // Determine aggregate mode. For aggregate transforms, validate that
-            // every group_by field exists in the current schema, then typecheck
-            // in GroupBy mode so bare non-grouped field references are rejected.
-            let agg_mode = if let Some(agg) = &t.aggregate {
-                let mut missing = Vec::new();
-                for gb in &agg.group_by {
-                    if !type_schema.contains_key(gb) {
-                        missing.push(format!("group_by field `{gb}` not found in schema"));
-                    }
-                }
-                if !missing.is_empty() {
-                    return Err(PipelineError::Compilation {
-                        transform_name: t.name.clone(),
-                        messages: missing,
-                    });
-                }
-                cxl::typecheck::AggregateMode::GroupBy {
-                    group_by_fields: agg.group_by.iter().cloned().collect(),
-                }
-            } else {
-                cxl::typecheck::AggregateMode::Row
-            };
-
-            let typed = cxl::typecheck::type_check_with_mode(resolved, &type_schema, agg_mode)
-                .map_err(|diags| {
-                    let errors: Vec<String> = diags
-                        .iter()
-                        .filter(|d| !d.is_warning)
-                        .map(|d| d.message.clone())
-                        .collect();
-                    if errors.is_empty() {
-                        return PipelineError::Compilation {
-                            transform_name: t.name.clone(),
-                            messages: diags.into_iter().map(|d| d.message).collect(),
-                        };
-                    }
-                    PipelineError::Compilation {
-                        transform_name: t.name.clone(),
-                        messages: errors,
-                    }
-                })?;
-
-            // Build the output schema for subsequent transforms.
-            //
-            // For aggregate transforms, the output schema is strictly
-            // {group_by fields} ∪ {emitted aggregate result names}: row-level
-            // fields that are not grouped cease to exist after aggregation.
-            // For row transforms, emitted fields are appended to the existing
-            // field set.
-            if t.aggregate.is_some() {
-                let agg = t.aggregate.as_ref().unwrap();
-                let mut new_fields: Vec<String> = agg.group_by.clone();
-                let mut new_type_schema: IndexMap<String, Type> = agg
-                    .group_by
-                    .iter()
-                    .map(|g| (g.clone(), Type::Any))
-                    .collect();
-                for stmt in &typed.program.statements {
-                    if let cxl::ast::Statement::Emit { name, .. } = stmt
-                        && !new_type_schema.contains_key(name.as_ref())
-                    {
-                        new_fields.push(name.to_string());
-                        new_type_schema.insert(name.to_string(), Type::Any);
-                    }
-                }
-                fields = new_fields;
-                type_schema = new_type_schema;
-            } else {
-                for stmt in &typed.program.statements {
-                    if let cxl::ast::Statement::Emit { name, .. } = stmt
-                        && !type_schema.contains_key(name.as_ref())
-                    {
-                        fields.push(name.to_string());
-                        type_schema.insert(name.to_string(), Type::Any);
-                    }
-                }
-            }
-
-            compiled.push(CompiledTransform {
-                name: t.name.clone(),
-                typed: Arc::new(typed),
-            });
-        }
-        Ok(compiled)
-    }
-
     /// Compile route conditions from the last transform's RouteConfig.
     ///
     /// Each branch condition is compiled as `filter <condition>` — a one-statement
@@ -3391,43 +3290,43 @@ impl PipelineExecutor {
     }
 
     /// Compile execution plan and return the DAG for format-specific rendering.
+    ///
+    /// Phase 16b Task 16b.9: drives `config.compile()` so the
+    /// stage-4.5 `cxl_compile` pass produces the typed programs;
+    /// `--explain` no longer parses CXL twice.
     pub(crate) fn explain_dag(
         config: &PipelineConfig,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
-        // Extract field names from CXL AST to build a synthetic schema
-        let mut all_fields = Vec::new();
-        for t in crate::executor::build_transform_specs(config) {
-            let parsed = cxl::parser::Parser::parse(t.cxl_source());
-            if !parsed.errors.is_empty() {
-                return Err(PipelineError::Compilation {
-                    transform_name: t.name.clone(),
-                    messages: parsed.errors.iter().map(|e| e.message.clone()).collect(),
-                });
-            }
-            collect_field_refs(&parsed.ast, &mut all_fields);
-        }
-        all_fields.sort();
-        all_fields.dedup();
-
-        let schema = Arc::new(Schema::new(
-            all_fields.iter().map(|f| f.as_str().into()).collect(),
-        ));
-
+        // Phase 16b Task 16b.9 — compile-time typecheck via cxl_compile.
+        // The validated plan gives us pre-typechecked `Arc<TypedProgram>`s
+        // per node; feed them straight into `ExecutionPlanDag::compile`
+        // (the full planner path that derives output projections,
+        // parallelism profiles, and physical properties) WITHOUT
+        // re-typechecking.
+        let validated_plan = config
+            .compile()
+            .map_err(|diags| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: diags.iter().map(|d| d.message.clone()).collect(),
+            })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
-        let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
-        let compiled = Self::compile_transforms(&resolved_transforms, &schema)?;
-        let compiled_refs: Vec<(&str, &TypedProgram)> = compiled
+        let compiled_refs: Vec<(&str, &TypedProgram)> = resolved_transforms_owned
             .iter()
-            .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
+            .map(|t| {
+                let typed = validated_plan
+                    .artifacts()
+                    .typed
+                    .get(&t.name)
+                    .expect("cxl_compile must produce a typed program for every transform");
+                (t.name.as_str(), typed.as_ref())
+            })
             .collect();
-
         let plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
             PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
             }
         })?;
-
         Ok((plan, ()))
     }
 }
@@ -4216,70 +4115,4 @@ fn handle_error_no_writer(
         route: None,
         trigger: true,
     });
-}
-
-/// Extract field reference names from a CXL AST (for --explain schema inference).
-fn collect_field_refs(program: &cxl::ast::Program, names: &mut Vec<String>) {
-    for stmt in &program.statements {
-        match stmt {
-            cxl::ast::Statement::Let { expr, .. }
-            | cxl::ast::Statement::Emit { expr, .. }
-            | cxl::ast::Statement::ExprStmt { expr, .. } => collect_field_refs_expr(expr, names),
-            cxl::ast::Statement::Trace { guard, message, .. } => {
-                if let Some(g) = guard {
-                    collect_field_refs_expr(g, names);
-                }
-                collect_field_refs_expr(message, names);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_field_refs_expr(expr: &cxl::ast::Expr, names: &mut Vec<String>) {
-    match expr {
-        cxl::ast::Expr::FieldRef { name, .. } => {
-            if &**name != "it" {
-                names.push(name.to_string());
-            }
-        }
-        cxl::ast::Expr::Binary { lhs, rhs, .. } | cxl::ast::Expr::Coalesce { lhs, rhs, .. } => {
-            collect_field_refs_expr(lhs, names);
-            collect_field_refs_expr(rhs, names);
-        }
-        cxl::ast::Expr::Unary { operand, .. } => collect_field_refs_expr(operand, names),
-        cxl::ast::Expr::MethodCall { receiver, args, .. } => {
-            collect_field_refs_expr(receiver, names);
-            for a in args {
-                collect_field_refs_expr(a, names);
-            }
-        }
-        cxl::ast::Expr::IfThenElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_field_refs_expr(condition, names);
-            collect_field_refs_expr(then_branch, names);
-            if let Some(eb) = else_branch {
-                collect_field_refs_expr(eb, names);
-            }
-        }
-        cxl::ast::Expr::Match { subject, arms, .. } => {
-            if let Some(s) = subject {
-                collect_field_refs_expr(s, names);
-            }
-            for arm in arms {
-                collect_field_refs_expr(&arm.pattern, names);
-                collect_field_refs_expr(&arm.body, names);
-            }
-        }
-        cxl::ast::Expr::WindowCall { args, .. } => {
-            for a in args {
-                collect_field_refs_expr(a, names);
-            }
-        }
-        _ => {}
-    }
 }

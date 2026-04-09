@@ -66,6 +66,78 @@ fn test_diagnostic_renders_via_miette_in_cli() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn test_explain_cxl_type_error_renders_via_miette() {
+    // Task 16b.9: compile-time CXL typecheck must surface through the
+    // `--explain` path as well. A transform that references an unknown
+    // column against the declared schema is rejected at compile() time,
+    // BEFORE any file on disk is read. The resulting diagnostic must
+    // render via miette with the config filename in the header.
+    let tmp = tempdir_path();
+    let bad_yaml_path = tmp.join("cxl_type_error.yaml");
+    std::fs::write(
+        &bad_yaml_path,
+        r#"pipeline:
+  name: cxl_bad
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/definitely_not_on_disk.csv
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: t
+    input: src
+    config:
+      cxl: "emit bogus = not_a_column + 1"
+  - type: output
+    name: out
+    input: t
+    config:
+      name: out
+      type: csv
+      path: data/out.csv
+"#,
+    )
+    .expect("write cxl_type_error yaml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&bad_yaml_path)
+        .arg("--explain")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        !output.status.success(),
+        "clinker run --explain on cxl type error must fail; got status {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // File-location annotation: the config filename must appear in
+    // miette's rendered output — proof that `NamedSource` reached the
+    // report handler through the --explain path.
+    assert!(
+        stderr.contains("cxl_type_error.yaml"),
+        "stderr must mention the config filename; got:\n{stderr}"
+    );
+
+    // Diagnostic code marker — proof it went through miette, not the
+    // tracing fallback.
+    assert!(
+        stderr.contains("clinker::pipeline_error"),
+        "stderr must carry the miette diagnostic code; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Create an ephemeral per-test temp directory under the system
 /// temp root. Avoids adding a `tempfile` dev-dep.
 fn tempdir_path() -> std::path::PathBuf {

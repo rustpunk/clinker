@@ -370,17 +370,21 @@ nodes:
 "#;
     let config = crate::config::parse_config(yaml).unwrap();
 
-    // Compile transforms for plan
-    let schema = clinker_record::Schema::new(vec!["employee_id".into(), "value".into()]);
+    // Phase 16b Task 16b.9: pull pre-typechecked programs from
+    // `config.compile()` artifacts instead of running a runtime
+    // typecheck pass.
+    let validated_plan = config.compile().unwrap();
     let resolved_transforms_owned = crate::executor::build_transform_specs(&config);
-    let resolved_transforms: Vec<&crate::executor::TransformSpec> =
-        resolved_transforms_owned.iter().collect();
-    let compiled_transforms =
-        PipelineExecutor::compile_transforms(&resolved_transforms, &std::sync::Arc::new(schema))
-            .unwrap();
-    let compiled_refs: Vec<(&str, &cxl::typecheck::TypedProgram)> = compiled_transforms
+    let compiled_refs: Vec<(&str, &cxl::typecheck::TypedProgram)> = resolved_transforms_owned
         .iter()
-        .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
+        .map(|t| {
+            let typed = validated_plan
+                .artifacts()
+                .typed
+                .get(&t.name)
+                .expect("cxl_compile produced a typed program for this node");
+            (t.name.as_str(), typed.as_ref())
+        })
         .collect();
 
     let mut plan = ExecutionPlanDag::compile(&config, &compiled_refs).unwrap();

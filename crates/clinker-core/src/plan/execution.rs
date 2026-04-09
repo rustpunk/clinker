@@ -694,6 +694,20 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
     ) -> Result<Self, PlanError> {
+        Self::compile_with_runtime_schema(config, compiled, None)
+    }
+
+    /// Variant of [`compile`] that accepts the actual runtime Arrow
+    /// schema for aggregate index alignment. Phase 16b Task 16b.9 —
+    /// `typed.field_types` now reflects the author-declared source
+    /// schema (which may be a superset of the real file columns), so
+    /// aggregate `group_by_indices` must be resolved against the
+    /// runtime column layout instead of the declared one.
+    pub fn compile_with_runtime_schema(
+        config: &PipelineConfig,
+        compiled: &[(&str, &TypedProgram)],
+        runtime_input_schema: Option<&[String]>,
+    ) -> Result<Self, PlanError> {
         // D3a part2: collect source/output configs from the unified
         // `nodes:` topology once, then use the owned Vecs throughout.
         // Walking `config.nodes` repeatedly would work but wastes
@@ -933,7 +947,17 @@ impl ExecutionPlanDag {
                 // unit-test scope the projection is the identity since the
                 // executor projects records into this same order before
                 // passing them into the hash aggregator.
-                let input_schema: Vec<String> = typed.field_types.keys().cloned().collect();
+                // Phase 16b Task 16b.9: prefer the runtime Arrow
+                // schema when available. `typed.field_types` now comes
+                // from the author-declared source schema which may
+                // contain columns not present in the actual file; the
+                // aggregator projects records by positional index, so
+                // group_by_indices must be resolved against the
+                // runtime layout, not the declared superset.
+                let input_schema: Vec<String> = match runtime_input_schema {
+                    Some(rt) => rt.to_vec(),
+                    None => typed.field_types.keys().cloned().collect(),
+                };
 
                 let compiled_agg =
                     cxl::plan::extract_aggregates(typed, &agg_cfg.group_by, &input_schema)

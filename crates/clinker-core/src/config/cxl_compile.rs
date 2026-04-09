@@ -191,6 +191,7 @@ fn input_target(input: &crate::config::node_header::NodeInput) -> &str {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn typecheck_cxl(
     node_name: &str,
     source: &str,

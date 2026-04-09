@@ -368,7 +368,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // 7. Existing logic: explain / dry_run / execute
     if let Some(format) = args.explain {
-        let compiled_plan = pipeline_config.compile().expect("compile");
+        let compiled_plan =
+            pipeline_config
+                .compile()
+                .map_err(|diags| PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: diags.iter().map(|d| d.message.clone()).collect(),
+                })?;
         let (dag, _) = PipelineExecutor::explain_plan_dag(&compiled_plan)?;
         match format {
             ExplainFormat::Text => {
