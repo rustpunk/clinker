@@ -13,6 +13,13 @@ nodes:
       path: ./data/orders.csv
       options:
         has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: order_date, type: string }
+        - { name: quantity, type: string }
+        - { name: unit_price, type: string }
+        - { name: product_code, type: string }
+        - { name: priority_level, type: string }
 
   - type: source
     name: products
@@ -22,6 +29,11 @@ nodes:
       path: ./data/products.csv
       options:
         has_header: true
+      schema:
+        - { name: product_code, type: string }
+        - { name: product_name, type: string }
+        - { name: category, type: string }
+        - { name: weight_kg, type: string }
 
   - type: transform
     name: normalize_fields

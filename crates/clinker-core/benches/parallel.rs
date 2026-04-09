@@ -61,6 +61,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: heavy_transform
   input: src
@@ -157,6 +160,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: windowed
   input: src

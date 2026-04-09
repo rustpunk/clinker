@@ -10,6 +10,11 @@ nodes:
       path: ./data/sales.csv
       options:
         has_header: true
+      schema:
+        - { name: id, type: string }
+        - { name: dept, type: string }
+        - { name: amount, type: string }
+        - { name: status, type: string }
 
   - type: transform
     name: active_only

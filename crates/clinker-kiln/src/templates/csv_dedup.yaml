@@ -18,6 +18,8 @@ nodes:
       path: "./data/input.csv"
       options:
         has_header: true
+      schema:
+        - { name: id, type: string }
 
   - type: transform
     name: deduplicate

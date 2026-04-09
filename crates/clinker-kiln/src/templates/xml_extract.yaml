@@ -18,6 +18,9 @@ nodes:
       path: "./data/input.xml"
       options:
         record_element: record
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
 
   - type: transform
     name: select_fields

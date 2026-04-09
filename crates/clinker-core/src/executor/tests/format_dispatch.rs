@@ -136,6 +136,9 @@ nodes:
     path: input.json
     options:
       format: ndjson
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -176,6 +179,9 @@ nodes:
     path: input.xml
     options:
       record_path: records/record
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -216,6 +222,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -260,6 +269,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -312,6 +324,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -353,6 +368,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -401,6 +419,9 @@ nodes:
         type: integer
         start: 10
         width: 5
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -435,6 +456,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -500,6 +524,9 @@ nodes:
     name: src
     type: fixed_width
     path: input.dat
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src

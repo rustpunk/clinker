@@ -77,6 +77,9 @@ nodes:
       name: primary
       type: csv
       path: data.csv
+      schema:
+        - { name: amount, type: int }
+
   - type: aggregate
     name: by_dept
     input: primary
@@ -192,6 +195,9 @@ nodes:
       name: primary
       type: csv
       path: data.csv
+      schema:
+        - { name: amount, type: int }
+
   - type: transform
     name: step_one
     input: primary

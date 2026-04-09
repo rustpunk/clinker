@@ -15,6 +15,8 @@
 //! | `E010`      | error    | Dotted-name check (`.` reserved for branch refs)     |
 //! | `E011`      | error    | Log directive sanity (`every` must be valid)         |
 //! | `E100`      | error    | Composition node not yet supported (Phase 16c stub)  |
+//! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
+//! | `E201`      | error    | Source declaration missing required `schema:` field  |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
 //! | `W002`      | warning  | Node names differ only in case                       |
 //! | `W100`      | warning  | Aggregate lowering deferred (Phase 16b Wave 3 stub)  |

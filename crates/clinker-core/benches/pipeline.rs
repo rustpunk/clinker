@@ -54,6 +54,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: transform
   input: src
@@ -123,6 +126,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: windowed
   input: src
@@ -197,6 +203,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: route_transform_emit
   input: src
@@ -297,6 +306,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: sorted_transform
   input: src

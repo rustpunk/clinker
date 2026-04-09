@@ -635,18 +635,29 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Run the config `compile()` validation pre-pass, then build
-        // CXL `CompiledTransform`s directly from the reader-derived
-        // schema.
+        // Phase 16b Task 16b.9 — compile-time CXL typecheck.
+        // `config.compile()` drives the unified nodes: pipeline
+        // through stages 1-4 (topology/path validation), then the
+        // stage-4.5 `cxl_compile` pass that typechecks every CXL
+        // body against the author-declared source schema and
+        // propagates emitted columns downstream. Type errors surface
+        // as E200 diagnostics here, BEFORE any file handle opens.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        let resolved_transforms = crate::executor::build_transform_specs(config);
+        // Surface compile-time CXL typecheck errors (E200/E201) before
+        // any file handles open. The runtime still calls compile_transforms
+        // below — redundant typecheck, identical result — because the
+        // runtime path feeds its TypedPrograms into ExecutionPlanDag with
+        // the runtime schema (Arrow-derived) which may differ in column
+        // ordering from the author-declared schema used by cxl_compile.
         let _validated_plan = config
             .compile()
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),
             })?;
-        let compiled_transforms = Self::compile_transforms_from_config(config, &schema)?;
+        let resolved_transforms_owned = crate::executor::build_transform_specs(config);
+        let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
+        let compiled_transforms = Self::compile_transforms(&resolved_transforms, &schema)?;
 
         // Compile route conditions if any transform has a route config.
         // Collect all emitted field names for route condition resolution.
@@ -3169,18 +3180,6 @@ impl PipelineExecutor {
             std::mem::take(dlq_entries),
             rss_bytes(),
         ))
-    }
-
-    /// Convenience wrapper: build transform specs from a PipelineConfig and
-    /// compile them against the reader-derived schema. Called directly
-    /// from `run_with_readers_writers` after the readers have opened.
-    pub(crate) fn compile_transforms_from_config(
-        config: &PipelineConfig,
-        schema: &Arc<Schema>,
-    ) -> Result<Vec<CompiledTransform>, PipelineError> {
-        let owned = crate::executor::build_transform_specs(config);
-        let refs: Vec<&TransformSpec> = owned.iter().collect();
-        Self::compile_transforms(&refs, schema)
     }
 
     /// Compile all CXL transform blocks against the input schema.

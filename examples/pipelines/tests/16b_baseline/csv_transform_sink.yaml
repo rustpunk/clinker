@@ -10,6 +10,10 @@ nodes:
       path: ./data/employees.csv
       options:
         has_header: true
+      schema:
+        - { name: id, type: string }
+        - { name: name, type: string }
+        - { name: salary, type: string }
 
   - type: transform
     name: tier_flag

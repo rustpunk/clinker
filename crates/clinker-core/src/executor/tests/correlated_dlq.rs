@@ -59,6 +59,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: validate
   input: src
@@ -186,6 +189,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: validate
   input: src
@@ -240,6 +246,9 @@ nodes:
     type: csv
     sort_order:
     - timestamp
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: validate
   input: src
@@ -293,6 +302,9 @@ nodes:
     sort_order:
     - employee_id
     - timestamp
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: validate
   input: src
@@ -338,6 +350,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: validate
   input: src
@@ -486,6 +501,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: validate
   input: src

@@ -10,6 +10,9 @@ nodes:
       path: ./data/orders.csv
       options:
         has_header: true
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: string }
 
   - type: transform
     name: classify

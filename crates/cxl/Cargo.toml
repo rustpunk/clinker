@@ -14,3 +14,4 @@ indexmap = { workspace = true }
 ahash = { workspace = true }
 tracing = { workspace = true }
 static_assertions = { workspace = true }
+serde = { workspace = true }

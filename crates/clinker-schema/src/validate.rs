@@ -490,6 +490,8 @@ nodes:
     name: src
     path: ./data.csv
     type: csv
+    schema:
+      - { name: id, type: string }
 "#;
         let config = clinker_core::config::parse_config(yaml).unwrap();
 

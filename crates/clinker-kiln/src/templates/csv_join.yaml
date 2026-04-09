@@ -22,6 +22,8 @@ nodes:
       path: "./data/primary.csv"
       options:
         has_header: true
+      schema:
+        - { name: id, type: string }
 
   - type: source
     name: lookup
@@ -31,6 +33,9 @@ nodes:
       path: "./data/lookup.csv"
       options:
         has_header: true
+      schema:
+        - { name: key, type: string }
+        - { name: region_name, type: string }
 
   - type: transform
     name: enrich

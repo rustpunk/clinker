@@ -86,10 +86,10 @@ Worker threads: 4
 === DAG Topology ===
 
   ● [source] orders (line:5)
-  │ [transform] classify (line:14)
-  │ [transform] classify_route (line:22)
-  │ [output] low (line:39)
-  │ [output] high (line:31)
-  ◆ FORK [route:exclusive] 'route_classify_route' (line:22)
+  │ [transform] classify (line:17)
+  │ [transform] classify_route (line:25)
+  │ [output] low (line:42)
+  │ [output] high (line:34)
+  ◆ FORK [route:exclusive] 'route_classify_route' (line:25)
   ├──> high → high
   ├──> default → low

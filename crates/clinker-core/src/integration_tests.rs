@@ -89,6 +89,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: output
   name: dest
   input: src
@@ -132,6 +135,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: value, type: string }
+
 - type: transform
   name: will_fail_some
   input: src
@@ -167,6 +173,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: value, type: string }
+
 - type: transform
   name: will_fail
   input: src
@@ -200,6 +209,12 @@ nodes:
     name: employees
     type: csv
     path: input.csv
+    schema:
+      - { name: first_name, type: any }
+      - { name: last_name, type: any }
+      - { name: department, type: any }
+      - { name: internal_id, type: any }
+
 - type: transform
   name: compute_full_name
   input: employees
@@ -303,6 +318,9 @@ nodes:
     name: src
     type: csv
     path: /nonexistent/path/that/does/not/exist.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: t1
   input: src
@@ -347,7 +365,7 @@ nodes:
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "pipeline:\n  name: filter_test\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n  - type: transform\n    name: t1\n    input: src\n    config:\n      cxl: |\n{indented}\n  - type: output\n    name: dest\n    input: t1\n    config:\n      name: dest\n      type: csv\n      path: output.csv\n"
+            "pipeline:\n  name: filter_test\nnodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: input.csv\n      schema:\n        - {{ name: id, type: any }}\n        - {{ name: name, type: any }}\n        - {{ name: status, type: any }}\n        - {{ name: value, type: any }}\n        - {{ name: amount, type: any }}\n        - {{ name: category, type: any }}\n        - {{ name: code, type: any }}\n        - {{ name: dept, type: any }}\n        - {{ name: department, type: any }}\n        - {{ name: priority, type: any }}\n        - {{ name: optional, type: any }}\n        - {{ name: required, type: any }}\n        - {{ name: active, type: any }}\n        - {{ name: first, type: any }}\n        - {{ name: last, type: any }}\n        - {{ name: first_name, type: any }}\n  - type: transform\n    name: t1\n    input: src\n    config:\n      cxl: |\n{indented}\n  - type: output\n    name: dest\n    input: t1\n    config:\n      name: dest\n      type: csv\n      path: output.csv\n"
         )
     }
 
@@ -706,6 +724,11 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: amount, type: string }
+
 - type: transform
   name: t1
   input: src

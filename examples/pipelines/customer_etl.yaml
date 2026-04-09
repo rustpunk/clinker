@@ -11,6 +11,14 @@ nodes:
       path: ./data/customers.csv
       options:
         has_header: true
+      schema:
+        - { name: customer_id, type: string }
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
+        - { name: email, type: string }
+        - { name: status, type: string }
+        - { name: lifetime_value, type: string }
+        - { name: zip_code, type: string }
 
   - type: transform
     name: active_only

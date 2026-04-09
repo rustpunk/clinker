@@ -31,6 +31,8 @@ config:
   name: input_csv
   type: csv
   path: in.csv
+  schema:
+    - { name: id, type: string }
 "#;
     let node = parse_node(yaml);
     assert!(matches!(node.value, PipelineNode::Source { .. }));
@@ -192,6 +194,9 @@ nodes:
       name: src
       type: csv
       path: data/in.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: clean
     input: src
@@ -221,6 +226,9 @@ nodes:
       name: dup
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: dup
     input: dup
@@ -248,6 +256,9 @@ nodes:
       name: clean
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: Clean
     input: clean
@@ -277,6 +288,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: loop
     input: loop
@@ -303,6 +317,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: merge
     name: combo
     inputs:
@@ -332,12 +349,18 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: source
     name: src
     config:
       name: src
       type: csv
       path: data/b.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: loop
     input: loop
@@ -467,6 +490,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: composition
     name: comp_a
     input: src
@@ -518,6 +544,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: composition
     name: comp_a
     input: src
@@ -555,6 +584,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: clean
     input: src
@@ -587,6 +619,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: output
     name: out
     input: src
@@ -622,6 +657,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: transform
     name: clean
     input: src
@@ -655,6 +693,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: output
     name: out
     input: src
@@ -690,6 +731,9 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: route
     name: split
     input: src
@@ -730,12 +774,18 @@ nodes:
       name: a
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: source
     name: b
     config:
       name: b
       type: csv
       path: data/b.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: merge
     name: m
     inputs:
@@ -770,12 +820,17 @@ nodes:
       name: dup
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
+
   - type: source
     name: dup
     config:
       name: dup
       type: csv
       path: data/b.csv
+      schema:
+        - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
     let res = cfg.compile();
@@ -796,6 +851,8 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      schema:
+        - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg.compile().unwrap();

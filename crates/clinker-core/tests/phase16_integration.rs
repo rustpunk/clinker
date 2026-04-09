@@ -111,6 +111,19 @@ nodes:
     schema_overrides:
     - name: salary
       type: integer
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -158,6 +171,19 @@ nodes:
     schema_overrides:
     - name: salary
       type: integer
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -210,6 +236,19 @@ nodes:
     name: src
     type: csv
     path: in.csv
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -271,6 +310,20 @@ nodes:
       type: float
     - name: hours
       type: float
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+      - { name: hours, type: any }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -333,6 +386,19 @@ nodes:
     schema_overrides:
     - name: amount
       type: integer
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: globals
   input: src
@@ -377,6 +443,19 @@ nodes:
     schema_overrides:
     - name: salary
       type: integer
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -432,6 +511,19 @@ nodes:
     schema_overrides:
     - name: salary
       type: integer
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: transform
   name: bonus
   input: src
@@ -493,6 +585,19 @@ nodes:
     schema_overrides:
     - name: salary
       type: integer
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -535,6 +640,19 @@ nodes:
     - field: dept
       order: asc
       null_order: first
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: employee_id, type: any }
+      - { name: group, type: any }
+      - { name: weight, type: any }
+      - { name: score, type: any }
+
 - type: aggregate
   name: by_dept
   input: src

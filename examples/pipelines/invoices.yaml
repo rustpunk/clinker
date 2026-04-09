@@ -10,6 +10,11 @@ nodes:
       path: ./data/invoices.csv
       options:
         has_header: true
+      schema:
+        - { name: invoice_id, type: string }
+        - { name: invoice_date, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: string }
 
   - type: source
     name: customers
@@ -19,6 +24,10 @@ nodes:
       path: ./data/customers.csv
       options:
         has_header: true
+      schema:
+        - { name: customer_id, type: string }
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
 
   - type: transform
     name: recent_only

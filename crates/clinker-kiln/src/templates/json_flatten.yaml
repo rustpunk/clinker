@@ -16,6 +16,10 @@ nodes:
       name: source
       type: json
       path: "./data/input.json"
+      schema:
+        - { name: id, type: string }
+        - { name: name, type: string }
+        - { name: email, type: string }
 
   - type: transform
     name: extract_fields

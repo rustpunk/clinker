@@ -188,14 +188,20 @@ pub struct PlanSourcePayload {
 
 /// Phase 16b Wave 2 — fully-resolved Transform payload. Holds the
 /// optional analytic-window spec (renamed from local_window), the log
-/// directives, the validations sidebar, and the DLQ NodeId for
-/// downstream wiring.
+/// directives, the validations sidebar, the DLQ NodeId for downstream
+/// wiring, and the compile-time CXL `TypedProgram` (Task 16b.9).
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
     pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
     pub log: Vec<crate::config::LogDirective>,
     pub validations: Vec<crate::config::ValidationEntry>,
     pub dlq_node: Option<NodeIndex>,
+    /// Phase 16b Task 16b.9 — compile-time-typechecked CXL program.
+    /// Populated by `PipelineConfig::compile` via `cxl_compile::run`
+    /// and NEVER `None`: a transform whose CXL fails to typecheck
+    /// surfaces as a compile-time E200 diagnostic and the enclosing
+    /// `compile()` call returns `Err` before this payload is built.
+    pub typed: Arc<TypedProgram>,
 }
 
 /// Phase 16b Wave 2 — fully-resolved Output payload.

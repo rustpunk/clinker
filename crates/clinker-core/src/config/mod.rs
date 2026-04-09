@@ -1,3 +1,4 @@
+pub mod cxl_compile;
 pub mod node_header;
 pub mod pipeline_node;
 
@@ -93,7 +94,12 @@ pub struct ConcurrencyConfig {
 pub struct SourceConfig {
     pub name: String,
     pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Format-layer schema pointer (e.g. fixed-width field layouts).
+    /// Distinct from the CXL-type-level `SourceBody.schema` declared
+    /// at the parent `SourceBody` scope — this one points at on-disk
+    /// format metadata, the other declares column CXL types for
+    /// compile-time typecheck (Phase 16b Task 16b.9).
+    #[serde(rename = "format_schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_overrides: Option<Vec<FieldDef>>,
@@ -1233,6 +1239,20 @@ impl PipelineConfig {
             return Err(diags);
         }
 
+        // Stage 4.5: Phase 16b Task 16b.9 — compile-time CXL typecheck.
+        // Walks `self.nodes` in declaration order (topologically sound
+        // per stage-3 validation), seeds each source's schema from its
+        // author-declared `schema:` block, and typechecks every
+        // CXL-bearing node against the propagated upstream schema.
+        // E200 diagnostics surface here with per-node spans.
+        let artifacts = crate::config::cxl_compile::run(&self.nodes, &mut diags);
+        let has_errors = diags
+            .iter()
+            .any(|d| matches!(d.severity, crate::error::Severity::Error));
+        if has_errors {
+            return Err(diags);
+        }
+
         // ── Stage 5: per-variant lowering ───────────────────────────
         let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
         let mut name_to_idx: HashMap<String, NodeIndex> = HashMap::new();
@@ -1269,23 +1289,34 @@ impl PipelineConfig {
                         validated_path: None,
                     })),
                 }),
-                PipelineNode::Transform { config, .. } => Some(PlanNode::Transform {
-                    name: name.clone(),
-                    span,
-                    resolved: Some(Box::new(PlanTransformPayload {
-                        analytic_window: config.analytic_window.clone(),
-                        log: config.log.clone().unwrap_or_default(),
-                        validations: config.validations.clone().unwrap_or_default(),
-                        dlq_node: None,
-                    })),
-                    parallelism_class: ParallelismClass::Stateless,
-                    tier: 0,
-                    execution_reqs: NodeExecutionReqs::Streaming,
-                    window_index: None,
-                    partition_lookup: None,
-                    write_set: BTreeSet::new(),
-                    has_distinct: false,
-                }),
+                PipelineNode::Transform { config, .. } => {
+                    // Task 16b.9: every Transform has a typed program
+                    // by construction — stage 4.5 returned Err if any
+                    // typecheck failed, so the lookup is infallible.
+                    let typed = artifacts
+                        .typed
+                        .get(&name)
+                        .expect("cxl_compile must produce typed program for every transform")
+                        .clone();
+                    Some(PlanNode::Transform {
+                        name: name.clone(),
+                        span,
+                        resolved: Some(Box::new(PlanTransformPayload {
+                            analytic_window: config.analytic_window.clone(),
+                            log: config.log.clone().unwrap_or_default(),
+                            validations: config.validations.clone().unwrap_or_default(),
+                            dlq_node: None,
+                            typed,
+                        })),
+                        parallelism_class: ParallelismClass::Stateless,
+                        tier: 0,
+                        execution_reqs: NodeExecutionReqs::Streaming,
+                        window_index: None,
+                        partition_lookup: None,
+                        write_set: BTreeSet::new(),
+                        has_distinct: false,
+                    })
+                }
                 PipelineNode::Output { config, .. } => Some(PlanNode::Output {
                     name: name.clone(),
                     span,
@@ -1448,7 +1479,7 @@ impl PipelineConfig {
             let _ = any_errors;
         }
 
-        Ok(CompiledPlan::new(dag, self.clone()))
+        Ok(CompiledPlan::new(dag, self.clone(), artifacts))
     }
 }
 

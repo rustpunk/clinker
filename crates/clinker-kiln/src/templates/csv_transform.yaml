@@ -23,6 +23,10 @@ nodes:
       path: "./data/input.csv"
       options:
         has_header: true
+      schema:
+        - { name: status, type: string }
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
 
   - type: transform
     name: filter_active

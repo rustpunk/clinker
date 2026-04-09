@@ -146,6 +146,19 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: customer_id, type: any }
+      - { name: employee_id, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: group, type: any }
+      - { name: status, type: any }
+
 - type: transform
   name: tag
   input: src
@@ -215,6 +228,19 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: customer_id, type: any }
+      - { name: employee_id, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: group, type: any }
+      - { name: status, type: any }
+
 - type: transform
   name: tag
   input: src
@@ -287,6 +313,19 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - {{ name: id, type: any }}
+      - {{ name: name, type: any }}
+      - {{ name: value, type: any }}
+      - {{ name: amount, type: any }}
+      - {{ name: customer_id, type: any }}
+      - {{ name: employee_id, type: any }}
+      - {{ name: dept, type: any }}
+      - {{ name: department, type: any }}
+      - {{ name: salary, type: any }}
+      - {{ name: group, type: any }}
+      - {{ name: status, type: any }}
+
 - type: transform
   name: passthrough
   input: src
@@ -399,6 +438,19 @@ nodes:
     type: csv
     sort_order:
     - employee_id
+    schema:
+      - {{ name: id, type: any }}
+      - {{ name: name, type: any }}
+      - {{ name: value, type: any }}
+      - {{ name: amount, type: any }}
+      - {{ name: customer_id, type: any }}
+      - {{ name: employee_id, type: any }}
+      - {{ name: dept, type: any }}
+      - {{ name: department, type: any }}
+      - {{ name: salary, type: any }}
+      - {{ name: group, type: any }}
+      - {{ name: status, type: any }}
+
 - type: transform
   name: passthrough
   input: src
@@ -529,6 +581,19 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: customer_id, type: any }
+      - { name: employee_id, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: group, type: any }
+      - { name: status, type: any }
+
 - type: transform
   name: validate
   input: src
@@ -631,6 +696,19 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - {{ name: id, type: any }}
+      - {{ name: name, type: any }}
+      - {{ name: value, type: any }}
+      - {{ name: amount, type: any }}
+      - {{ name: customer_id, type: any }}
+      - {{ name: employee_id, type: any }}
+      - {{ name: dept, type: any }}
+      - {{ name: department, type: any }}
+      - {{ name: salary, type: any }}
+      - {{ name: group, type: any }}
+      - {{ name: status, type: any }}
+
 - type: transform
   name: classify_emit
   input: src
@@ -734,6 +812,19 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: any }
+      - { name: name, type: any }
+      - { name: value, type: any }
+      - { name: amount, type: any }
+      - { name: customer_id, type: any }
+      - { name: employee_id, type: any }
+      - { name: dept, type: any }
+      - { name: department, type: any }
+      - { name: salary, type: any }
+      - { name: group, type: any }
+      - { name: status, type: any }
+
 - type: transform
   name: tag_tier_emit
   input: src

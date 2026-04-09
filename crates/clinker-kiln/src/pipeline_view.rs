@@ -563,6 +563,9 @@ nodes:
       name: src
       type: csv
       path: ./in.csv
+      schema:
+        - { name: agg, type: string }
+
   - type: transform
     name: clean
     input: src
@@ -627,6 +630,9 @@ nodes:
     path: ./raw.csv
     options:
       has_header: true
+    schema:
+      - { name: agg, type: string }
+
 - type: transform
   name: clean
   input: raw
@@ -695,6 +701,9 @@ nodes:
       name: src
       type: csv
       path: ./comp_in.csv
+      schema:
+        - { name: agg, type: string }
+
   - type: composition
     name: sub
     input: src

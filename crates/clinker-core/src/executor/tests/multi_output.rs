@@ -347,6 +347,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -412,6 +415,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -474,6 +480,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -532,6 +541,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -628,6 +640,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -697,6 +712,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -765,6 +783,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: passthrough
   input: src
@@ -803,6 +824,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -892,6 +916,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -975,6 +1002,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -1055,6 +1085,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -1143,6 +1176,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -1244,6 +1280,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -1308,6 +1347,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: calc_emit
   input: src
@@ -1392,6 +1434,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -1492,6 +1537,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: calc
   input: src
@@ -1550,6 +1598,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: identity
   input: src
@@ -1610,6 +1661,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: identity
   input: src

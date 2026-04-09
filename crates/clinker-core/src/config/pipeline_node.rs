@@ -110,11 +110,44 @@ impl PipelineNode {
 // ---------------------------------------------------------------------
 
 /// Source variant body. Wraps the existing source-format configuration
-/// (formats, schemas, sort orders) — see `crate::config::SourceConfig`.
+/// (formats, sort orders) — see `crate::config::SourceConfig` — and
+/// carries a **required** `schema:` declaration of the source's
+/// top-level columns with their CXL types. The schema drives
+/// compile-time CXL typechecking in
+/// [`crate::config::PipelineConfig::compile`] (Phase 16b Task 16b.9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBody {
+    /// Declared top-level columns and their CXL types. Required —
+    /// missing this field is a serde parse error routed to E201 via
+    /// the diagnostic layer.
+    pub schema: SchemaDecl,
     #[serde(flatten)]
     pub source: crate::config::SourceConfig,
+}
+
+/// Phase 16b Task 16b.9 — inline schema declaration on `SourceBody`.
+///
+/// Deserializes from a YAML sequence of `{ name, type }` entries:
+///
+/// ```yaml
+/// schema:
+///   - { name: employee_id, type: string }
+///   - { name: salary, type: int }
+///   - { name: hired_at, type: date_time }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SchemaDecl {
+    pub columns: Vec<ColumnDecl>,
+}
+
+/// One declared column in a [`SchemaDecl`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnDecl {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: cxl::typecheck::Type,
 }
 
 /// Transform variant body. The new shape: a mandatory `cxl:` field

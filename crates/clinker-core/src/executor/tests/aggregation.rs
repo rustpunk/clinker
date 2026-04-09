@@ -152,6 +152,9 @@ nodes:
     name: src
     path: in.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -215,6 +218,9 @@ nodes:
     name: src
     path: in.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: aggregate
   name: by_dept
   input: src
@@ -443,6 +449,9 @@ nodes:
     name: src
     path: in.csv
     type: csv
+    schema:
+      - { name: id, type: string }
+
 - type: aggregate
   name: total
   input: src

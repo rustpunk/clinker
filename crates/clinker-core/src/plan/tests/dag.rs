@@ -5,7 +5,6 @@
 //! tier assignment, node counts, edge types, and JSON serialization.
 
 use crate::config::*;
-use crate::executor::TransformSpec;
 use crate::plan::execution::*;
 
 /// Build a diamond-shaped PipelineConfig for branching tests.
@@ -25,6 +24,9 @@ nodes:
       name: primary
       type: csv
       path: data.csv
+      schema:
+        - { name: amount, type: int }
+
   - type: transform
     name: categorize_emit
     input: primary
@@ -84,6 +86,9 @@ nodes:
       name: primary
       type: csv
       path: data.csv
+      schema:
+        - { name: amount, type: int }
+
   - type: transform
     name: step_one
     input: primary
@@ -190,6 +195,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: alpha
   input: beta
@@ -285,6 +293,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: router_emit
   input: primary
@@ -338,6 +349,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: branch_a
   input: primary
@@ -412,6 +426,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: only
   input: primary
@@ -477,6 +494,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: step
   input: nonexistent
@@ -547,6 +567,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: agg
   input: primary
@@ -687,6 +710,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: loopy
   input: loopy
@@ -738,6 +764,9 @@ nodes:
     name: primary
     path: data.csv
     type: csv
+    schema:
+      - { name: amount, type: string }
+
 - type: transform
   name: categorize_emit
   input: primary

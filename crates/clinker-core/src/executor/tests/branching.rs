@@ -55,6 +55,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -135,6 +138,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -209,6 +215,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -295,6 +304,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -385,6 +397,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -467,6 +482,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -540,6 +558,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -630,6 +651,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -713,6 +737,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: calc
   input: src
@@ -757,6 +784,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: stateless_calc
   input: src
@@ -812,6 +842,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src
@@ -895,6 +928,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    schema:
+      - { name: id, type: string }
+
 - type: transform
   name: classify_emit
   input: src

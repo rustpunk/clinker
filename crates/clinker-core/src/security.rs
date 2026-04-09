@@ -357,6 +357,9 @@ nodes:
       name: src
       type: csv
       path: data/input.csv
+      schema:
+        - { name: id, type: string }
+
   - type: transform
     name: t1
     input: src
