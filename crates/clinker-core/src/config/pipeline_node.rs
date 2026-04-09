@@ -11,11 +11,8 @@
 //! `#[serde(tag = ...)] + #[serde(flatten)]` interaction (a documented
 //! serde-saphyr limitation).
 //!
-//! Per-variant body structs use the `*Body` family suffix to avoid
-//! shadowing the legacy `LegacyTransformsBlock`/`SourceConfig`/`OutputConfig`
-//! types in `config/mod.rs` that the executor still consumes during
-//! Phase 16b Wave 1. Wave 2 deletes the legacy types and these `*Body`
-//! structs become the operator-facing config layer.
+//! Per-variant body structs use the `*Body` family suffix. The
+//! operator-facing config layer.
 //!
 //! See `docs/plans/cxl-engine/phase-16b-node-taxonomy-lift.md` Task 16b.2.
 
@@ -107,12 +104,9 @@ impl PipelineNode {
 // ---------------------------------------------------------------------
 // Per-variant body structs (`*Body` family)
 //
-// These exist as the parse-time shape for the new `nodes:` YAML schema.
-// During Phase 16b Wave 1 they coexist with the legacy
-// `SourceConfig`/`LegacyTransformsBlock`/`OutputConfig` types in
-// `config/mod.rs`; the legacy types still carry the operator-specific
-// payloads (formats, mappings, etc) that the executor consumes. Wave 2
-// inlines those payloads here and deletes the legacy types outright.
+// The parse-time shape for the `nodes:` YAML taxonomy. These are the
+// operator-facing config types; they carry the format, mapping, CXL
+// source, etc. that the executor consumes.
 // ---------------------------------------------------------------------
 
 /// Source variant body. Wraps the existing source-format configuration

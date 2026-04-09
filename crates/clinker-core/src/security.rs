@@ -136,6 +136,11 @@ pub fn validate_path(
 }
 
 fn sec_diag(message: String) -> Diagnostic {
+    // (c) `validate_path` takes a `&Path` with no source location.
+    // `validate_all_config_paths` rewrites `primary` to a real
+    // per-node span before the diagnostic leaves this module; the
+    // rare direct callers (e.g. `check_overwrite`) operate on
+    // pre-validated output paths with no YAML span to attach.
     Diagnostic::error(
         "E-SEC-001",
         message,
@@ -165,16 +170,40 @@ pub fn validate_all_config_paths(
     base_dir: &Path,
     allow_absolute: bool,
 ) -> Vec<Diagnostic> {
+    use crate::config::pipeline_node::PipelineNode;
     let mut diags = Vec::new();
 
-    for input in config.source_configs() {
-        if let Err(d) = validate_path(Path::new(&input.path), base_dir, allow_absolute) {
-            diags.push(d);
-        }
-    }
-
-    for output in config.output_configs() {
-        if let Err(d) = validate_path(Path::new(&output.path), base_dir, allow_absolute) {
+    // Walk `config.nodes` directly so every path-bearing node carries
+    // its real saphyr line through to the emitted diagnostic. This
+    // eliminates the last `Span::SYNTHETIC` path-security site:
+    // diagnostics now point at the offending node in the YAML.
+    for spanned in &config.nodes {
+        let saphyr_line = spanned.referenced.line();
+        let span = if saphyr_line > 0 {
+            // Real node-level span threaded through from the parser.
+            Span::line_only(saphyr_line as u32)
+        } else {
+            // (c) saphyr tagged-enum/flatten edge case — no line
+            // available. This is the only remaining synthetic span in
+            // the path-security layer and is inherited from the same
+            // library-level blocker that the other `(c)` sites cite.
+            Span::SYNTHETIC
+        };
+        let (raw, _name): (Option<&str>, &str) = match &spanned.value {
+            PipelineNode::Source { config, .. } => (
+                Some(config.source.path.as_str()),
+                config.source.name.as_str(),
+            ),
+            PipelineNode::Output { config, .. } => (
+                Some(config.output.path.as_str()),
+                config.output.name.as_str(),
+            ),
+            _ => (None, ""),
+        };
+        if let Some(raw) = raw
+            && let Err(mut d) = validate_path(Path::new(raw), base_dir, allow_absolute)
+        {
+            d.primary = LabeledSpan::new(span, None);
             diags.push(d);
         }
     }
@@ -182,6 +211,7 @@ pub fn validate_all_config_paths(
     if let Some(ref rules_path) = config.pipeline.rules_path
         && let Err(d) = validate_path(Path::new(rules_path), base_dir, allow_absolute)
     {
+        // (a) Whole-pipeline `rules_path` has no per-node origin.
         diags.push(d);
     }
 

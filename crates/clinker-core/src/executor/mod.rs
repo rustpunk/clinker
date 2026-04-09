@@ -588,11 +588,6 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        // Task 16b.8: the two-phase `bind_schema` scaffold was deleted
-        // after a grep showed zero readers of `PlanTransformPayload.typed`.
-        // The executor builds CXL `CompiledTransform`s directly against
-        // the reader-derived schema inside `run_with_readers_writers`,
-        // bypassing the plan handle entirely for that payload.
         Self::run_with_readers_writers(plan.config(), readers, writers, params)
     }
 
@@ -640,10 +635,9 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Task 16b.8: run the config `compile()` validation pre-pass,
-        // then build CXL `CompiledTransform`s directly from the
-        // reader-derived schema. The previous two-phase `bind_schema`
-        // scaffold populated a field nothing read; deleted.
+        // Run the config `compile()` validation pre-pass, then build
+        // CXL `CompiledTransform`s directly from the reader-derived
+        // schema.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let resolved_transforms = crate::executor::build_transform_specs(config);
         let _validated_plan = config

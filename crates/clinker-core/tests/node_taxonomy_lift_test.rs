@@ -382,10 +382,9 @@ config:
 
 #[test]
 fn test_no_transform_config_anywhere() {
-    // D3b gate: the legacy `TransformConf\u{0069}g` type was renamed to
-    // `LegacyTransformsBlock` in D3a and retained only as a synthesis
-    // target for `PipelineConfig::transforms()`. The old name must not
-    // reappear anywhere in the crate sources.
+    // D3b gate: the legacy `TransformConf\u{0069}g` type was fully
+    // deleted during Phase 16b Wave 4ab. The old name must not reappear
+    // anywhere in the crate sources.
     use std::path::PathBuf;
     let crate_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders: Vec<String> = Vec::new();

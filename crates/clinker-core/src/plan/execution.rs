@@ -190,12 +190,6 @@ pub struct PlanSourcePayload {
 /// optional analytic-window spec (renamed from local_window), the log
 /// directives, the validations sidebar, and the DLQ NodeId for
 /// downstream wiring.
-///
-/// Task 16b.8 — the `typed` field (and the two-phase `bind_schema`
-/// populator) was deleted after it was found to have zero readers
-/// workspace-wide. CXL typecheck results live on
-/// `executor::CompiledTransform.typed`, which the executor builds
-/// directly via `compile_transforms_from_config` after readers open.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
     pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
@@ -841,6 +835,10 @@ impl ExecutionPlanDag {
                 .copied()
                 .filter(|l| *l > 0)
                 .map(Span::line_only)
+                // (c) serde-saphyr loses the top-level Mapping line
+                // when a `#[serde(tag = ...)] + #[serde(flatten)]` node
+                // header is parsed; fall back to synthetic rather than
+                // fabricating a bogus line.
                 .unwrap_or(Span::SYNTHETIC)
         };
 
@@ -898,10 +896,13 @@ impl ExecutionPlanDag {
             //    `PlanNode::Aggregation` instead of `PlanNode::Transform`.
             //    D4: aggregates use a single dedicated plan node. D6:
             //    routes and multi-input merges are forbidden on aggregates.
-            // Task 16b.8 — convert the spec's 1-based source line to a
+            // Convert the spec's 1-based source line to a
             // `Span::line_only` so `--explain`'s annotation pass can
-            // render `(line:N)` against this node. Zero line = legacy
-            // path with no span info, which maps to `Span::SYNTHETIC`.
+            // render `(line:N)` against this node.
+            //
+            // (c) Zero line means the spec was built from a saphyr
+            // tagged-enum/flatten edge case where the YAML location is
+            // UNKNOWN; no real span is recoverable at this layer.
             let spec_span = if tc.line > 0 {
                 Span::line_only(tc.line)
             } else {
@@ -2004,7 +2005,9 @@ impl ExecutionPlanDag {
         // Task 16b.8 — planner-synthesized correlation sort enforcer.
         // This node has no source-level declaration; it is derived
         // from the primary source's correlation key and inserted on
-        // every outgoing edge. `Span::SYNTHETIC` is the correct span
+        // every outgoing edge.
+        // (a) Planner-synthesized: correlation-sort nodes have no
+        // author-written YAML origin; `Span::SYNTHETIC` is the correct span
         // here because no YAML node exists for it.
         let sort_node = PlanNode::Sort {
             name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
@@ -2132,7 +2135,8 @@ impl ExecutionPlanDag {
             // No YAML node exists for it; it is derived from the
             // consumer's `RequiresSortedInput` requirement and
             // inserted on the edge from the upstream source.
-            // `Span::SYNTHETIC` is correct.
+            // (a) Planner-synthesized: sort enforcer nodes have no
+            // author-written YAML origin; `Span::SYNTHETIC` is correct.
             let consumer_name = self.graph[consumer_idx].name().to_string();
             let sort_node = PlanNode::Sort {
                 name: format!("{ENFORCER_SORT_PREFIX}{consumer_name}"),

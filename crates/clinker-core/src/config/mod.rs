@@ -993,22 +993,24 @@ impl PipelineConfig {
         use std::collections::BTreeMap;
 
         let mut diags = Vec::new();
-        // Task 16b.8 — span_for(spanned) converts a per-node saphyr
+        // span_for(spanned) converts a per-node saphyr
         // `Spanned<PipelineNode>` into a `LabeledSpan` carrying a
-        // `Span::line_only` synthetic span with the real source line,
-        // or `Span::SYNTHETIC` when saphyr could not capture a
-        // location (the documented tagged-enum / flatten edge case).
+        // `Span::line_only` synthetic span with the real source line.
         let span_for = |spanned: &Spanned<PipelineNode>| -> LabeledSpan {
             let line = spanned.referenced.line() as u32;
             let s = if line > 0 {
                 Span::line_only(line)
             } else {
+                // (c) serde-saphyr loses node-header location info
+                // through `#[serde(tag)] + #[serde(flatten)]`; no
+                // precise span is recoverable at this layer.
                 Span::SYNTHETIC
             };
             LabeledSpan::primary(s, String::new())
         };
-        // Fallback for diagnostics with no per-node context (stage 3
-        // cycle detection emits one diagnostic for the whole DAG).
+        // (a) Whole-DAG diagnostic: stage-3 cycle detection emits one
+        // diagnostic that covers the entire pipeline graph, with no
+        // single node to anchor on.
         let synth = || LabeledSpan::primary(Span::SYNTHETIC, String::new());
 
         // ── Stage 1: duplicate names ────────────────────────────────
@@ -1126,9 +1128,7 @@ impl PipelineConfig {
 
         // ── Stage 5: D3b — dotted-name check ────────────────────────
         // `.` is reserved for branch references (e.g. "route.high").
-        // Previously enforced inside `LegacyTransformsBlock`'s custom
-        // Deserialize; with nodes: YAML bypassing that path, enforce
-        // structurally here.
+        // Enforced structurally here against the nodes: taxonomy.
         for spanned in &self.nodes {
             let name = spanned.value.name();
             if matches!(
@@ -1241,16 +1241,16 @@ impl PipelineConfig {
         // Aggregate variants are deferred to Wave 3 (require CXL
         // type-checking) — they emit a TODO diagnostic and are skipped.
         for spanned in &self.nodes {
-            // Task 16b.8 — thread the real source line number off the
-            // saphyr `Spanned<PipelineNode>::referenced` Location. We do
-            // not yet have a `SourceDb`/`FileId` threaded through
+            // Thread the real source line number off the saphyr
+            // `Spanned<PipelineNode>::referenced` Location. We do not
+            // yet have a `SourceDb`/`FileId` threaded through
             // `compile()` (that lands when the CLI parses via a helper
             // that interns into a SourceDb, Phase 16c), so we encode
             // the line via `Span::line_only` — a synthetic span whose
-            // `start` field carries the 1-based line number. `--explain`
-            // renders `(line:N)` from it. If saphyr did not capture a
-            // line (e.g. the `defined` location is UNKNOWN in a
-            // serde-saphyr tagged-enum/flatten edge case), fall back to
+            // `start` field carries the 1-based line number.
+            //
+            // (c) If saphyr did not capture a line (the documented
+            // tagged-enum + flatten edge case), fall back to
             // `Span::SYNTHETIC`.
             let saphyr_line = spanned.referenced.line();
             let span = if saphyr_line > 0 {
@@ -1383,6 +1383,9 @@ impl PipelineConfig {
         let topo_order = match petgraph::algo::toposort(&graph, None) {
             Ok(order) => order,
             Err(_) => {
+                // (a) Whole-DAG fallback: stage-5 toposort failure
+                // covers the whole graph; stage 3 should already have
+                // caught cycles upstream with node-level spans.
                 diags.push(Diagnostic::error(
                     "E003",
                     "cycle detected during stage-5 lowering (post-validate)".to_string(),
