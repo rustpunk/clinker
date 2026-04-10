@@ -44,13 +44,14 @@ fn eval_ok(
             d.iter().map(|e| &e.message).collect::<Vec<_>>()
         )
     });
-    let typed = type_check(resolved, &HashMap::new()).unwrap_or_else(|d| {
+    let typed = type_check(resolved, &indexmap::IndexMap::new()).unwrap_or_else(|d| {
         panic!(
             "Type errors: {:?}",
             d.iter().map(|e| &e.message).collect::<Vec<_>>()
         )
     });
-    let ctx = EvalContext::test_default();
+    let stable = StableEvalContext::test_default();
+    let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(record);
     eval_program::<NullStorage>(&typed, &ctx, &resolver, None)
         .unwrap_or_else(|e| panic!("Eval error: {}", e))
@@ -309,8 +310,9 @@ fn test_eval_conversion_strict() {
     // to_int on "abc" → error
     let parsed = Parser::parse("emit val = \"abc\".to_int()");
     let resolved = resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
-    let typed = type_check(resolved, &HashMap::new()).unwrap();
-    let ctx = EvalContext::test_default();
+    let typed = type_check(resolved, &indexmap::IndexMap::new()).unwrap();
+    let stable = StableEvalContext::test_default();
+    let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
     let result = eval_program::<NullStorage>(&typed, &ctx, &resolver, None);
     assert!(
@@ -356,12 +358,13 @@ fn test_eval_regex_precompiled() {
     // Regex should come from TypedProgram.regexes, pre-compiled during type check
     let parsed = Parser::parse("emit val = \"123\".matches(\"\\\\d+\")");
     let resolved = resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
-    let typed = type_check(resolved, &HashMap::new()).unwrap();
+    let typed = type_check(resolved, &indexmap::IndexMap::new()).unwrap();
     // Verify regex was pre-compiled
     let has_regex = typed.regexes.iter().any(|r| r.is_some());
     assert!(has_regex, "Expected pre-compiled regex in TypedProgram");
     // And evaluation uses it
-    let ctx = EvalContext::test_default();
+    let stable = StableEvalContext::test_default();
+    let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
     let output = eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
     assert_eq!(output.get("val"), Some(&Value::Bool(true)));

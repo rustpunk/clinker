@@ -158,6 +158,13 @@ impl<'a> Resolver<'a> {
             Statement::ExprStmt { expr, .. } => {
                 self.resolve_expr(expr);
             }
+            Statement::Filter { predicate, .. } => {
+                self.resolve_expr(predicate);
+            }
+            Statement::Distinct { .. } => {
+                // Distinct references a field name directly, not an expression.
+                // No expression resolution needed.
+            }
         }
     }
 
@@ -244,11 +251,18 @@ impl<'a> Resolver<'a> {
                     let _ = span;
                 }
             }
+            Expr::MetaAccess { node_id, .. } => {
+                // Metadata keys are runtime-resolved — accept any field name
+                self.bind(*node_id, ResolvedBinding::PipelineMember);
+            }
             Expr::Now { .. } => {
                 // `now` is a keyword, no binding needed — evaluator handles directly
             }
             Expr::Wildcard { .. } => {
                 // Wildcards don't resolve to anything
+            }
+            Expr::AggSlot { .. } | Expr::GroupKey { .. } => {
+                // Extractor-produced leaves; never present during resolve pass.
             }
             Expr::Literal { .. } => {
                 // Literals don't need resolution
@@ -371,6 +385,11 @@ impl<'a> Resolver<'a> {
                 }
                 let _ = (node_id, span);
             }
+            Expr::AggCall { args, .. } => {
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+            }
         }
     }
 
@@ -388,10 +407,10 @@ impl<'a> Resolver<'a> {
             } else {
                 self.diagnostics.push(ResolveDiagnostic {
                     span,
-                    message: "'it' is only valid inside window.any() or window.all() predicates"
+                    message: "'it' is only valid inside $window.any() or $window.all() predicates"
                         .into(),
                     help: Some(
-                        "Move this expression inside a window.any() or window.all() call".into(),
+                        "Move this expression inside a $window.any() or $window.all() call".into(),
                     ),
                 });
                 return;
@@ -491,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_resolve_pipeline_member() {
-        let resolved = resolve_ok("emit ts = pipeline.start_time", &[]);
+        let resolved = resolve_ok("emit ts = $pipeline.start_time", &[]);
         let has_pipeline = resolved
             .bindings
             .iter()
@@ -517,13 +536,13 @@ mod tests {
         assert!(
             diags[0]
                 .message
-                .contains("'it' is only valid inside window.any() or window.all()")
+                .contains("'it' is only valid inside $window.any() or $window.all()")
         );
     }
 
     #[test]
     fn test_resolve_it_inside_predicate_ok() {
-        let resolved = resolve_ok("emit has_high = window.any(it > 100000)", &["salary"]);
+        let resolved = resolve_ok("emit has_high = $window.any(it > 100000)", &["salary"]);
         let has_it = resolved
             .bindings
             .iter()

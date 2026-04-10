@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clinker_record::{Record, Schema, Value};
 
@@ -7,6 +7,7 @@ use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
 /// Configuration for the CSV writer.
+#[derive(Clone)]
 pub struct CsvWriterConfig {
     pub delimiter: u8,
     pub include_header: bool,
@@ -44,6 +45,22 @@ impl<W: Write> CsvWriter<W> {
             config,
             header_written: false,
         }
+    }
+
+    /// Write a pre-captured header row, bypassing first-record discovery.
+    ///
+    /// Used by `SplittingWriter` on rotation to ensure all split files
+    /// have identical headers (captured from the first file).
+    pub fn write_preset_header(&mut self, header: &[Box<str>]) -> Result<(), FormatError> {
+        let refs: Vec<&str> = header.iter().map(|h| h.as_ref()).collect();
+        self.inner.write_record(&refs)?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    /// Borrow the underlying writer (e.g. for byte-count inspection).
+    pub fn get_ref(&self) -> &W {
+        self.inner.get_ref()
     }
 }
 
@@ -85,6 +102,53 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     }
 }
 
+/// CSV writer wrapper that captures the header (schema + overflow fields)
+/// from the first record into shared state for replay on split rotation.
+///
+/// Only used by the CSV writer factory when splitting is enabled.
+/// Subsequent split files receive the captured header via `write_preset_header()`.
+/// Non-CSV formats do not need this — their factories are stateless.
+pub struct HeaderCapturingCsvWriter<W: Write> {
+    inner: CsvWriter<W>,
+    schema: Arc<Schema>,
+    shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
+    captured: bool,
+}
+
+impl<W: Write> HeaderCapturingCsvWriter<W> {
+    pub fn new(
+        inner: CsvWriter<W>,
+        schema: Arc<Schema>,
+        shared_header: Arc<Mutex<Option<Vec<Box<str>>>>>,
+    ) -> Self {
+        Self {
+            inner,
+            schema,
+            shared_header,
+            captured: false,
+        }
+    }
+}
+
+impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
+    fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        if !self.captured {
+            // Capture header: schema columns + overflow fields from first record
+            let mut header: Vec<Box<str>> = self.schema.columns().to_vec();
+            if let Some(overflow) = record.overflow_fields() {
+                header.extend(overflow.map(|(k, _)| Box::from(k)));
+            }
+            *self.shared_header.lock().unwrap() = Some(header);
+            self.captured = true;
+        }
+        self.inner.write_record(record)
+    }
+
+    fn flush(&mut self) -> Result<(), FormatError> {
+        self.inner.flush()
+    }
+}
+
 /// Serialize a Value to a CSV cell string.
 fn value_to_csv_cell(value: &Value) -> String {
     match value {
@@ -96,6 +160,7 @@ fn value_to_csv_cell(value: &Value) -> String {
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
         Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
+        Value::Map(m) => serde_json::to_string(m.as_ref()).unwrap_or_default(),
     }
 }
 

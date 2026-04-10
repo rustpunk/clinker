@@ -10,6 +10,8 @@ clinker-core = { workspace = true }
 clinker-channel = { workspace = true }
 clinker-format = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
 chrono = { workspace = true }
 num_cpus = "1"
 tracing = { workspace = true }

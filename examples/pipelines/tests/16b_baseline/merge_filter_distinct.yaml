@@ -1,0 +1,56 @@
+# FORWARD-ONLY: baseline captured in Task 16b.4. Pre-lift engine cannot parse this shape.
+#
+# See docs/research/RESEARCH-forward-only-baselines.md: this fixture uses the
+# post-lift unified `nodes:` taxonomy (Task 16b.2) and will only parse after the
+# node taxonomy lift lands. It is authored in 16b.0 alongside the three dual-run
+# fixtures so 16b.4 has a ready anchor the moment the lift completes.
+pipeline:
+  name: merge_filter_distinct
+  nodes:
+    - type: source
+      name: east
+      config:
+        format: csv
+        path: ./data/east.csv
+        options:
+          has_header: true
+
+    - type: source
+      name: west
+      config:
+        format: csv
+        path: ./data/west.csv
+        options:
+          has_header: true
+
+    - type: merge
+      name: combined
+      config:
+        inputs: [east, west]
+
+    - type: transform
+      name: only_ok
+      input: combined
+      config:
+        cxl: |
+          filter status == "ok"
+          emit id = id
+          emit region = region
+          emit status = status
+
+    - type: transform
+      name: uniq
+      input: only_ok
+      config:
+        cxl: |
+          distinct by id
+          emit id = id
+          emit region = region
+          emit status = status
+
+    - type: output
+      name: merged
+      input: uniq
+      config:
+        format: csv
+        path: ./output/merged.csv

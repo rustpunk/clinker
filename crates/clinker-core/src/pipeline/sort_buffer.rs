@@ -1,11 +1,23 @@
-//! Sort buffer: accumulates records, sorts in-memory or spills to disk.
+//! Sort buffer: accumulates `(record, payload)` pairs, sorts in-memory or
+//! spills to disk.
 //!
-//! Used at both source-sort and output-sort intercept points. The buffer
-//! tracks its own memory usage via `Value::heap_size()` and spills sorted
-//! chunks to NDJSON+LZ4 temp files when the budget is exceeded.
+//! Used at source-sort, output-sort, and DAG enforcer-sort intercept points.
+//! The buffer tracks its own memory usage and spills sorted chunks to
+//! NDJSON+LZ4 temp files when the budget is exceeded.
+//!
+//! Generic over per-record payload `P`. Phase 8 source/output sort uses
+//! `SortBuffer<()>`; the DAG executor's `PlanNode::Sort` dispatch arm uses
+//! `SortBuffer<(u64, IndexMap<String,Value>, IndexMap<String,Value>)>` to
+//! carry row number and metadata maps through the sort permutation.
+//!
+//! See `docs/research/RESEARCH-sort-node-sidecar-payload.md` for the
+//! architectural rationale (Pattern B: bundled-tuple sort with payload in
+//! the spill envelope).
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
 
@@ -13,27 +25,29 @@ use crate::config::SortField;
 use crate::pipeline::sort::compare_records_by_fields;
 use crate::pipeline::spill::{SpillError, SpillFile, SpillWriter};
 
-/// Result of finishing a sort buffer: either all records fit in memory,
-/// or some were spilled to disk.
-pub enum SortedOutput {
-    /// All records fit in memory. Sorted and ready to iterate.
-    InMemory(Vec<Record>),
-    /// Records were spilled to sorted temp files. Must be merged via LoserTree.
-    Spilled(Vec<SpillFile>),
+/// Result of finishing a sort buffer: either all (record, payload) pairs
+/// fit in memory, or some were spilled to disk.
+pub enum SortedOutput<P> {
+    /// All pairs fit in memory. Sorted and ready to iterate.
+    InMemory(Vec<(Record, P)>),
+    /// Pairs were spilled to sorted temp files. Must be merged via LoserTree.
+    Spilled(Vec<SpillFile<P>>),
 }
 
-/// Accumulates records, sorts in-memory or spills to disk when budget exceeded.
-pub struct SortBuffer {
-    records: Vec<Record>,
+/// Accumulates `(record, payload)` pairs, sorts in-memory or spills to disk
+/// when the byte budget is exceeded. Sort key is extracted from the record
+/// only — the payload rides along.
+pub struct SortBuffer<P> {
+    pairs: Vec<(Record, P)>,
     sort_by: Vec<SortField>,
     bytes_used: usize,
     spill_threshold: usize,
     spill_dir: Option<PathBuf>,
-    spill_files: Vec<SpillFile>,
+    spill_files: Vec<SpillFile<P>>,
     schema: Arc<Schema>,
 }
 
-impl SortBuffer {
+impl<P: Serialize + DeserializeOwned> SortBuffer<P> {
     pub fn new(
         sort_by: Vec<SortField>,
         spill_threshold: usize,
@@ -41,7 +55,7 @@ impl SortBuffer {
         schema: Arc<Schema>,
     ) -> Self {
         Self {
-            records: Vec::new(),
+            pairs: Vec::new(),
             sort_by,
             bytes_used: 0,
             spill_threshold,
@@ -51,11 +65,12 @@ impl SortBuffer {
         }
     }
 
-    /// Push a record into the buffer. Returns true if the buffer should be spilled.
-    pub fn push(&mut self, record: Record) {
-        let size = std::mem::size_of::<Record>() + record.estimated_heap_size();
+    /// Push a `(record, payload)` pair into the buffer.
+    pub fn push(&mut self, record: Record, payload: P) {
+        let size =
+            std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>();
         self.bytes_used += size;
-        self.records.push(record);
+        self.pairs.push((record, payload));
     }
 
     /// Check if the buffer has exceeded its memory threshold.
@@ -63,20 +78,21 @@ impl SortBuffer {
         self.bytes_used > 0 && self.bytes_used >= self.spill_threshold
     }
 
-    /// Sort the current in-memory records and write them to a spill file.
+    /// Sort the current in-memory pairs and write them to a spill file.
     /// Clears the buffer and resets the byte counter.
     pub fn sort_and_spill(&mut self) -> Result<(), SpillError> {
-        if self.records.is_empty() {
+        if self.pairs.is_empty() {
             return Ok(());
         }
 
         let sort_by = &self.sort_by;
-        self.records
-            .sort_by(|a, b| compare_records_by_fields(a, b, sort_by));
+        self.pairs
+            .sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
 
-        let mut writer = SpillWriter::new(self.schema.clone(), self.spill_dir.as_deref())?;
-        for record in self.records.drain(..) {
-            writer.write_record(&record)?;
+        let mut writer: SpillWriter<P> =
+            SpillWriter::new(self.schema.clone(), self.spill_dir.as_deref())?;
+        for (record, payload) in self.pairs.drain(..) {
+            writer.write_pair(&record, &payload)?;
         }
         let spill_file = writer.finish()?;
         self.spill_files.push(spill_file);
@@ -84,19 +100,17 @@ impl SortBuffer {
         Ok(())
     }
 
-    /// Finish the sort buffer. If records were spilled, the remaining in-memory
-    /// records are also spilled. Returns either sorted in-memory records or
-    /// a list of sorted spill files for merge.
-    pub fn finish(mut self) -> Result<SortedOutput, SpillError> {
+    /// Finish the sort buffer. If pairs were spilled, remaining in-memory
+    /// pairs are also spilled. Returns either sorted in-memory pairs or a
+    /// list of sorted spill files for merge.
+    pub fn finish(mut self) -> Result<SortedOutput<P>, SpillError> {
         if self.spill_files.is_empty() {
-            // Everything fits in memory — sort and return
             let sort_by = &self.sort_by;
-            self.records
-                .sort_by(|a, b| compare_records_by_fields(a, b, sort_by));
-            Ok(SortedOutput::InMemory(self.records))
+            self.pairs
+                .sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+            Ok(SortedOutput::InMemory(self.pairs))
         } else {
-            // Spill remaining records if any
-            if !self.records.is_empty() {
+            if !self.pairs.is_empty() {
                 self.sort_and_spill()?;
             }
             Ok(SortedOutput::Spilled(self.spill_files))
@@ -136,12 +150,13 @@ mod tests {
     #[test]
     fn test_sort_buffer_push_tracks_bytes() {
         let schema = test_schema();
-        let mut buf = SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
         assert_eq!(buf.bytes_used(), 0);
-        buf.push(make_record(&schema, "Alice", 1));
+        buf.push(make_record(&schema, "Alice", 1), ());
         assert!(buf.bytes_used() > 0);
         let first = buf.bytes_used();
-        buf.push(make_record(&schema, "Bob", 2));
+        buf.push(make_record(&schema, "Bob", 2), ());
         assert!(buf.bytes_used() > first);
     }
 
@@ -149,11 +164,12 @@ mod tests {
     fn test_sort_buffer_should_spill_at_threshold() {
         let schema = test_schema();
         // Very small threshold — should spill after a few records
-        let mut buf = SortBuffer::new(sort_by_value_asc(), 100, None, schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 100, None, schema.clone());
         assert!(!buf.should_spill());
         // Push records until we exceed 100 bytes
         for i in 0..10 {
-            buf.push(make_record(&schema, &format!("name_{i}"), i));
+            buf.push(make_record(&schema, &format!("name_{i}"), i), ());
             if buf.should_spill() {
                 return; // Test passes — spill triggered
             }
@@ -164,17 +180,18 @@ mod tests {
     #[test]
     fn test_sort_buffer_in_memory_sort() {
         let schema = test_schema();
-        let mut buf = SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
-        buf.push(make_record(&schema, "Charlie", 30));
-        buf.push(make_record(&schema, "Alice", 10));
-        buf.push(make_record(&schema, "Bob", 20));
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
+        buf.push(make_record(&schema, "Charlie", 30), ());
+        buf.push(make_record(&schema, "Alice", 10), ());
+        buf.push(make_record(&schema, "Bob", 20), ());
 
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                assert_eq!(records.len(), 3);
-                assert_eq!(records[0].get("value"), Some(&Value::Integer(10)));
-                assert_eq!(records[1].get("value"), Some(&Value::Integer(20)));
-                assert_eq!(records[2].get("value"), Some(&Value::Integer(30)));
+            SortedOutput::InMemory(pairs) => {
+                assert_eq!(pairs.len(), 3);
+                assert_eq!(pairs[0].0.get("value"), Some(&Value::Integer(10)));
+                assert_eq!(pairs[1].0.get("value"), Some(&Value::Integer(20)));
+                assert_eq!(pairs[2].0.get("value"), Some(&Value::Integer(30)));
             }
             SortedOutput::Spilled(_) => panic!("expected InMemory"),
         }
@@ -183,26 +200,26 @@ mod tests {
     #[test]
     fn test_sort_buffer_spill_produces_spill_files() {
         let schema = test_schema();
-        let mut buf = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone()); // threshold=1 → spill immediately
-        buf.push(make_record(&schema, "Alice", 10));
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone()); // threshold=1 → spill immediately
+        buf.push(make_record(&schema, "Alice", 10), ());
         assert!(buf.should_spill());
         buf.sort_and_spill().unwrap();
         assert_eq!(buf.bytes_used(), 0);
-        assert_eq!(buf.records.len(), 0);
+        assert_eq!(buf.pairs.len(), 0);
     }
 
     #[test]
     fn test_sort_buffer_finish_spilled_returns_files() {
         let schema = test_schema();
-        let mut buf = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
 
         // Push and spill twice
-        buf.push(make_record(&schema, "B", 20));
+        buf.push(make_record(&schema, "B", 20), ());
         buf.sort_and_spill().unwrap();
-        buf.push(make_record(&schema, "A", 10));
+        buf.push(make_record(&schema, "A", 10), ());
         buf.sort_and_spill().unwrap();
         // Push one more without spilling — finish() will spill it
-        buf.push(make_record(&schema, "C", 30));
+        buf.push(make_record(&schema, "C", 30), ());
 
         match buf.finish().unwrap() {
             SortedOutput::Spilled(files) => {
@@ -215,32 +232,79 @@ mod tests {
     #[test]
     fn test_sort_buffer_spill_files_are_sorted() {
         let schema = test_schema();
-        let mut buf = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
-        buf.push(make_record(&schema, "C", 30));
-        buf.push(make_record(&schema, "A", 10));
-        buf.push(make_record(&schema, "B", 20));
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
+        buf.push(make_record(&schema, "C", 30), ());
+        buf.push(make_record(&schema, "A", 10), ());
+        buf.push(make_record(&schema, "B", 20), ());
         buf.sort_and_spill().unwrap();
 
         // Read back and verify sorted
         match buf.finish().unwrap() {
             SortedOutput::Spilled(files) => {
                 let reader = files[0].reader().unwrap();
-                let records: Vec<_> = reader.map(|r| r.unwrap()).collect();
-                assert_eq!(records.len(), 3);
-                assert_eq!(records[0].get("value"), Some(&Value::Integer(10)));
-                assert_eq!(records[1].get("value"), Some(&Value::Integer(20)));
-                assert_eq!(records[2].get("value"), Some(&Value::Integer(30)));
+                let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
+                assert_eq!(recs.len(), 3);
+                assert_eq!(recs[0].get("value"), Some(&Value::Integer(10)));
+                assert_eq!(recs[1].get("value"), Some(&Value::Integer(20)));
+                assert_eq!(recs[2].get("value"), Some(&Value::Integer(30)));
             }
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         }
     }
 
     #[test]
+    fn test_sort_buffer_payload_survives_in_memory_sort() {
+        // Pattern B gate: payload travels with the record through sort permutation.
+        let schema = test_schema();
+        let mut buf: SortBuffer<u64> =
+            SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema.clone());
+        buf.push(make_record(&schema, "Charlie", 30), 100);
+        buf.push(make_record(&schema, "Alice", 10), 200);
+        buf.push(make_record(&schema, "Bob", 20), 300);
+        match buf.finish().unwrap() {
+            SortedOutput::InMemory(pairs) => {
+                assert_eq!(pairs.len(), 3);
+                // Sorted by value asc: Alice(10,200), Bob(20,300), Charlie(30,100)
+                assert_eq!(pairs[0].1, 200);
+                assert_eq!(pairs[1].1, 300);
+                assert_eq!(pairs[2].1, 100);
+            }
+            _ => panic!("expected InMemory"),
+        }
+    }
+
+    #[test]
+    fn test_sort_buffer_payload_survives_spill() {
+        // Pattern B gate: payload survives the NDJSON+LZ4 spill envelope.
+        let schema = test_schema();
+        let mut buf: SortBuffer<u64> =
+            SortBuffer::new(sort_by_value_asc(), 1, None, schema.clone());
+        buf.push(make_record(&schema, "C", 30), 100);
+        buf.push(make_record(&schema, "A", 10), 200);
+        buf.push(make_record(&schema, "B", 20), 300);
+        buf.sort_and_spill().unwrap();
+        match buf.finish().unwrap() {
+            SortedOutput::Spilled(files) => {
+                let reader = files[0].reader().unwrap();
+                let pairs: Vec<(Record, u64)> = reader.map(|r| r.unwrap()).collect();
+                assert_eq!(pairs.len(), 3);
+                assert_eq!(pairs[0].0.get("value"), Some(&Value::Integer(10)));
+                assert_eq!(pairs[0].1, 200);
+                assert_eq!(pairs[1].0.get("value"), Some(&Value::Integer(20)));
+                assert_eq!(pairs[1].1, 300);
+                assert_eq!(pairs[2].0.get("value"), Some(&Value::Integer(30)));
+                assert_eq!(pairs[2].1, 100);
+            }
+            _ => panic!("expected Spilled"),
+        }
+    }
+
+    #[test]
     fn test_sort_buffer_empty_returns_empty() {
         let schema = test_schema();
-        let buf = SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema);
+        let buf: SortBuffer<()> = SortBuffer::new(sort_by_value_asc(), 1_000_000, None, schema);
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => assert!(records.is_empty()),
+            SortedOutput::InMemory(pairs) => assert!(pairs.is_empty()),
             SortedOutput::Spilled(_) => panic!("expected InMemory"),
         }
     }

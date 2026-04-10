@@ -12,7 +12,7 @@ use crate::notes::StageNotes;
 pub fn StageCard(
     index: usize,
     stage_id: String,
-    accent: &'static str,
+    kind_attr: &'static str,
     badge: &'static str,
     doc: StageDoc,
     notes: StageNotes,
@@ -26,7 +26,8 @@ pub fn StageCard(
     rsx! {
         div {
             class: "kiln-stage-card",
-            style: "border-top-color: {accent}; animation: blueprintIn 0.5s ease {delay}s both;",
+            "data-stage-kind": kind_attr,
+            style: "border-top-color: var(--kiln-stage-accent); animation: blueprintIn 0.5s ease {delay}s both;",
 
             // Title block stamp
             span {
@@ -41,8 +42,8 @@ pub fn StageCard(
                 span { class: "kiln-stage-card-label", "{stage_id}" }
                 span {
                     class: "kiln-stage-card-badge",
-                    style: "color: {accent}; border-color: color-mix(in srgb, {accent} 25%, transparent); \
-                            background: color-mix(in srgb, {accent} 12%, transparent);",
+                    style: "color: var(--kiln-stage-accent); border-color: color-mix(in srgb, var(--kiln-stage-accent) 25%, transparent); \
+                            background: color-mix(in srgb, var(--kiln-stage-accent) 12%, transparent);",
                     "{badge}"
                 }
             }

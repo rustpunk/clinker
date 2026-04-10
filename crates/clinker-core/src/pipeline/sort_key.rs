@@ -17,6 +17,8 @@
 //! - DateTime: sign-flipped big-endian i64 microseconds since Unix epoch (8 bytes)
 //! - Descending: XOR all segment bytes with 0xFF
 
+use std::cmp::Ordering;
+
 use chrono::NaiveDate;
 use clinker_record::{Record, Value};
 
@@ -62,6 +64,9 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
                 !f.is_nan(),
                 "NaN should be DLQ'd before reaching sort encoder"
             );
+            // Canonicalize -0.0 → 0.0 so byte order agrees with semantic
+            // equality (`-0.0 == 0.0` per IEEE). Matches `value_to_group_key`.
+            let f = if *f == 0.0 { 0.0 } else { *f };
             let bits = f.to_bits();
             let encoded = if bits >> 63 == 1 {
                 bits ^ u64::MAX // negative: flip all bits
@@ -87,8 +92,130 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             bytes[0] ^= 0x80;
             buf.extend_from_slice(&bytes);
         }
-        Value::Null => {}     // handled by caller
-        Value::Array(_) => {} // not a valid sort key; defensive no-op
+        Value::Null => {}                     // handled by caller
+        Value::Array(_) | Value::Map(_) => {} // not a valid sort key; defensive no-op
+    }
+}
+
+/// Owning wrapper around a `Vec<SortField>` that encodes and compares
+/// memcomparable sort keys with zero steady-state allocation.
+///
+/// The encoder holds the field list once and exposes:
+///
+/// * [`SortKeyEncoder::encode_into`] — write a key into a caller-owned
+///   scratch `Vec<u8>`, reusing its backing capacity across calls.
+/// * [`SortKeyEncoder::compare_encoded`] — raw byte comparison; direction
+///   and null ordering are already baked into the bytes by
+///   [`encode_sort_key`], so `<` / `==` / `>` on the byte slices yields
+///   the declared-order result by construction.
+/// * [`SortKeyEncoder::debug_decode_pair`] — hex-dump both keys for
+///   `PipelineError::SortOrderViolation` messages. The encoding is not
+///   losslessly decodable (strings, for example, lose length framing
+///   after the terminator XOR on DESC order), so the debug renderer
+///   reports the field list together with both hex byte sequences.
+///
+/// Phase 16 Task 16.4.1.
+#[derive(Debug, Clone)]
+pub struct SortKeyEncoder {
+    sort_by: Vec<SortField>,
+}
+
+impl SortKeyEncoder {
+    /// Construct an encoder from a list of sort fields. The order is
+    /// significant — lexicographic key comparison walks the fields in
+    /// the supplied order, so this must match the declared sort order
+    /// of the upstream.
+    pub fn new(sort_by: Vec<SortField>) -> Self {
+        Self { sort_by }
+    }
+
+    /// The sort fields this encoder was built with.
+    pub fn sort_fields(&self) -> &[SortField] {
+        &self.sort_by
+    }
+
+    /// Encode `record` into the caller-owned scratch `out` buffer.
+    ///
+    /// The buffer is cleared (`Vec::clear`, which preserves capacity)
+    /// and then re-populated in place. After the first call, the
+    /// steady-state allocation cost is zero — subsequent calls reuse
+    /// the same backing allocation as long as the caller holds onto
+    /// the `Vec`. This is the streaming-aggregator hot path's
+    /// contract with the sort-key layer.
+    pub fn encode_into(&self, record: &Record, out: &mut Vec<u8>) {
+        out.clear();
+        for sf in &self.sort_by {
+            let start = out.len();
+            let null_order = sf.null_order.unwrap_or(NullOrder::Last);
+            match record.get(&sf.field) {
+                None | Some(Value::Null) => {
+                    out.push(match null_order {
+                        NullOrder::First => 0x00,
+                        NullOrder::Last | NullOrder::Drop => 0x02,
+                    });
+                }
+                Some(value) => {
+                    out.push(0x01);
+                    encode_value(value, out);
+                }
+            }
+            if sf.order == SortOrder::Desc {
+                for byte in &mut out[start..] {
+                    *byte ^= 0xFF;
+                }
+            }
+        }
+    }
+
+    /// Compare two pre-encoded sort keys.
+    ///
+    /// Because `encode_sort_key` / [`SortKeyEncoder::encode_into`]
+    /// bakes direction (ASC/DESC) and null ordering into the emitted
+    /// bytes, raw lexicographic `memcmp` of the two slices yields the
+    /// declared-order result by construction. No knowledge of the
+    /// field list is required at comparison time.
+    pub fn compare_encoded(&self, a: &[u8], b: &[u8]) -> Ordering {
+        a.cmp(b)
+    }
+
+    /// Render a human-readable debug string for a pair of pre-encoded
+    /// keys. Used by `PipelineError::SortOrderViolation` messages so
+    /// the user can see which two keys collided.
+    ///
+    /// The memcomparable format is not losslessly decodable without
+    /// type hints (and after DESC XOR the original bytes are masked),
+    /// so this intentionally surfaces the field list alongside both
+    /// hex byte sequences rather than pretending to reconstruct the
+    /// original values. Callers embed the result directly in the
+    /// `SortOrderViolation` message.
+    pub fn debug_decode_pair(&self, prev: &[u8], next: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        out.push_str("sort_fields=[");
+        for (i, sf) in self.sort_by.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let dir = match sf.order {
+                SortOrder::Asc => "ASC",
+                SortOrder::Desc => "DESC",
+            };
+            let nulls = match sf.null_order.unwrap_or(NullOrder::Last) {
+                NullOrder::First => "NULLS FIRST",
+                NullOrder::Last => "NULLS LAST",
+                NullOrder::Drop => "NULLS DROP",
+            };
+            let _ = write!(out, "{} {} {}", sf.field, dir, nulls);
+        }
+        out.push_str("] prev=0x");
+        for b in prev {
+            let _ = write!(out, "{b:02x}");
+        }
+        out.push_str(" next=0x");
+        for b in next {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
     }
 }
 
@@ -252,6 +379,113 @@ mod tests {
         let keys = &[sf_nulls("x", SortOrder::Asc, NullOrder::First)];
         // null < "" (null sentinel 0x00 < non-null sentinel 0x01)
         assert!(encode_sort_key(&r_null, keys) < encode_sort_key(&r_empty, keys));
+    }
+
+    // ---- SortKeyEncoder (Task 16.4.1) ----
+
+    #[test]
+    fn test_sort_key_encoder_new_stores_fields() {
+        let fields = vec![sf("a", SortOrder::Asc), sf("b", SortOrder::Desc)];
+        let enc = SortKeyEncoder::new(fields.clone());
+        assert_eq!(enc.sort_fields().len(), 2);
+        assert_eq!(enc.sort_fields()[0].field, "a");
+        assert_eq!(enc.sort_fields()[1].order, SortOrder::Desc);
+    }
+
+    #[test]
+    fn test_sort_key_encoder_encode_into_matches_free_fn() {
+        let enc = SortKeyEncoder::new(vec![
+            sf("dept", SortOrder::Asc),
+            sf("salary", SortOrder::Desc),
+        ]);
+        let rec = make_record(&[
+            ("dept", Value::String("eng".into())),
+            ("salary", Value::Integer(100)),
+        ]);
+        let mut scratch = Vec::new();
+        enc.encode_into(&rec, &mut scratch);
+        let expected = encode_sort_key(&rec, enc.sort_fields());
+        assert_eq!(scratch, expected);
+    }
+
+    #[test]
+    fn test_sort_key_encoder_encode_into_reuses_buffer() {
+        // Verify clear-and-reuse semantics: a second encode into the
+        // same buffer must leave it equal to a fresh encode, and the
+        // allocation capacity must not shrink between calls.
+        let enc = SortKeyEncoder::new(vec![sf("x", SortOrder::Asc)]);
+        let r1 = make_record(&[("x", Value::Integer(1))]);
+        let r2 = make_record(&[("x", Value::Integer(2))]);
+        let mut scratch = Vec::with_capacity(64);
+        let initial_cap = scratch.capacity();
+
+        enc.encode_into(&r1, &mut scratch);
+        let k1 = scratch.clone();
+
+        enc.encode_into(&r2, &mut scratch);
+        let k2_fresh = encode_sort_key(&r2, enc.sort_fields());
+        assert_eq!(scratch, k2_fresh);
+        assert_ne!(scratch, k1);
+        assert!(
+            scratch.capacity() >= initial_cap,
+            "encode_into must reuse capacity: before={initial_cap}, after={}",
+            scratch.capacity()
+        );
+    }
+
+    #[test]
+    fn test_sort_key_encoder_compare_encoded_asc() {
+        let enc = SortKeyEncoder::new(vec![sf("x", SortOrder::Asc)]);
+        let r1 = make_record(&[("x", Value::Integer(1))]);
+        let r2 = make_record(&[("x", Value::Integer(2))]);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        enc.encode_into(&r1, &mut a);
+        enc.encode_into(&r2, &mut b);
+        assert_eq!(enc.compare_encoded(&a, &b), Ordering::Less);
+        assert_eq!(enc.compare_encoded(&b, &a), Ordering::Greater);
+        assert_eq!(enc.compare_encoded(&a, &a), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_sort_key_encoder_compare_encoded_desc_inverts() {
+        // DESC direction is baked into the bytes by encode_into, so
+        // compare_encoded returns the declared-order result directly.
+        let enc = SortKeyEncoder::new(vec![sf("x", SortOrder::Desc)]);
+        let r1 = make_record(&[("x", Value::Integer(1))]);
+        let r2 = make_record(&[("x", Value::Integer(2))]);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        enc.encode_into(&r1, &mut a);
+        enc.encode_into(&r2, &mut b);
+        // Under DESC, 2 sorts before 1 — so the encoded bytes for r2
+        // must compare as Less than those for r1.
+        assert_eq!(enc.compare_encoded(&b, &a), Ordering::Less);
+    }
+
+    #[test]
+    fn test_sort_key_encoder_debug_decode_pair_mentions_fields_and_hex() {
+        let enc = SortKeyEncoder::new(vec![
+            sf_nulls("k", SortOrder::Asc, NullOrder::First),
+            sf("v", SortOrder::Desc),
+        ]);
+        let r1 = make_record(&[("k", Value::String("a".into())), ("v", Value::Integer(1))]);
+        let r2 = make_record(&[("k", Value::String("b".into())), ("v", Value::Integer(2))]);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        enc.encode_into(&r1, &mut a);
+        enc.encode_into(&r2, &mut b);
+        let rendered = enc.debug_decode_pair(&a, &b);
+        assert!(
+            rendered.contains("k ASC NULLS FIRST"),
+            "field list missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("v DESC NULLS LAST"),
+            "field list missing: {rendered}"
+        );
+        assert!(rendered.contains("prev=0x"), "prev hex missing: {rendered}");
+        assert!(rendered.contains("next=0x"), "next hex missing: {rendered}");
     }
 
     #[test]

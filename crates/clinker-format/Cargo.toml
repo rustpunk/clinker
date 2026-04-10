@@ -13,3 +13,4 @@ csv = "1"
 quick-xml = "0.37"
 chrono = { workspace = true }
 miette = { workspace = true }
+tracing = { workspace = true }

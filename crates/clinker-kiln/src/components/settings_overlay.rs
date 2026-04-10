@@ -14,7 +14,7 @@
 /// Spec: navigation addendum §N3.6.
 use dioxus::prelude::*;
 
-use crate::state::TabManagerState;
+use crate::state::{KilnTheme, TabManagerState};
 
 /// Settings overlay component — centered modal.
 #[component]
@@ -48,6 +48,36 @@ pub fn SettingsOverlay() -> Element {
             // Content
             div {
                 class: "kiln-settings-content",
+
+                // ── Appearance ─────────────────────────────────────
+                SettingsSection {
+                    label: "Appearance",
+                    div {
+                        class: "kiln-settings-theme-row",
+                        span { class: "kiln-settings-field__label", "Theme" }
+                        div { class: "kiln-settings-theme-toggle",
+                            {
+                                let current_theme = (tab_mgr.theme)();
+                                rsx! {
+                                    for variant in [KilnTheme::Oxide, KilnTheme::Enamel] {
+                                        button {
+                                            class: if current_theme == variant {
+                                                "kiln-settings-theme-btn kiln-settings-theme-btn--active"
+                                            } else {
+                                                "kiln-settings-theme-btn"
+                                            },
+                                            onclick: move |_| tab_mgr.theme.set(variant),
+                                            {match variant {
+                                                KilnTheme::Oxide => "Oxide (Dark)",
+                                                KilnTheme::Enamel => "Enamel (Light)",
+                                            }}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if let Some(ref ws) = workspace {
                     // Workspace name

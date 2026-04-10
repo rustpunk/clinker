@@ -26,7 +26,23 @@ use cxl::resolve::HashMapResolver;
 #[derive(Parser)]
 #[command(
     name = "cxl",
-    about = "CXL language validator, evaluator, and formatter"
+    version,
+    about = "CXL language validator, evaluator, and formatter",
+    long_about = "\
+Standalone tool for the CXL expression language used by Clinker pipelines. \
+Validate .cxl files for correctness, evaluate expressions against sample \
+data, or canonically reformat source files.",
+    after_long_help = "\
+QUICK START:
+  cxl check transform.cxl
+  cxl eval -e 'emit result = 1 + 2'
+  cxl eval transform.cxl --field Price=10.5 --field Qty=3
+  cxl fmt transform.cxl
+
+EXIT CODES:
+  0  Success (or warnings only)
+  1  Parse, resolve, type-check, or evaluation errors
+  2  I/O error (file not found, invalid JSON, etc.)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,11 +52,33 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Parse, resolve, and type-check a .cxl file. Exit 0 if valid, 1 if errors.
+    #[command(long_about = "\
+Parse, resolve, and type-check a .cxl file through the full compilation \
+pipeline. Reports parse errors, unresolved references, and type mismatches \
+with source locations and fix suggestions. Exits 0 if valid, 1 if errors.")]
     Check {
         /// Path to the .cxl file
         file: String,
     },
     /// Evaluate a CXL expression against provided field values.
+    #[command(
+        long_about = "\
+Evaluate a CXL expression against provided field values and print the \
+output as JSON. Provide the expression via a .cxl file or inline with -e. \
+Supply input data as a JSON object (--record) or as individual key=value \
+pairs (--field) with automatic type inference (integer, float, bool, \
+null, or string).",
+        after_long_help = "\
+EXAMPLES:
+  # Evaluate an inline expression
+  cxl eval -e 'emit greeting = \"hello\"'
+
+  # Evaluate a file with field values
+  cxl eval transform.cxl --field name=Alice --field age=30
+
+  # Evaluate with a JSON record
+  cxl eval transform.cxl --record '{\"price\": 10.5, \"qty\": 3}'"
+    )]
     Eval {
         /// Path to a .cxl file (required unless -e is provided)
         #[arg(required_unless_present = "expr")]
@@ -56,6 +94,10 @@ enum Command {
         fields: Vec<String>,
     },
     /// Parse and pretty-print a .cxl file (canonical formatting).
+    #[command(long_about = "\
+Parse a .cxl file and print it in canonical format with normalized \
+whitespace and consistent styling. Useful for enforcing a uniform code \
+style across CXL source files.")]
     Fmt {
         /// Path to the .cxl file
         file: String,
@@ -120,7 +162,7 @@ fn cmd_check(file: &str) {
         }
     };
 
-    match cxl::typecheck::type_check(resolved, &HashMap::new()) {
+    match cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()) {
         Ok(_) => {
             eprintln!("ok: {} is valid", file);
             process::exit(0);
@@ -216,7 +258,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         }
     };
 
-    let typed = match cxl::typecheck::type_check(resolved, &HashMap::new()) {
+    let typed = match cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()) {
         Ok(t) => t,
         Err(diags) => {
             for d in &diags {
@@ -228,16 +270,20 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         }
     };
 
-    let ctx = EvalContext {
+    let stable = cxl::eval::StableEvalContext {
         clock: Box::new(WallClock),
         pipeline_start_time: chrono::Utc::now().naive_utc(),
-        pipeline_name: "cxl-eval".into(),
-        pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
-        pipeline_batch_id: "00000000-0000-0000-0000-000000000000".into(),
+        pipeline_name: std::sync::Arc::from("cxl-eval"),
+        pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
+        pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
         pipeline_counters: clinker_record::PipelineCounters::default(),
-        source_file: std::sync::Arc::from(source_name),
+        pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+    };
+    let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
+    let ctx = EvalContext {
+        stable: &stable,
+        source_file: &source_file_arc,
         source_row: 1,
-        pipeline_vars: indexmap::IndexMap::new(),
     };
 
     let resolver = HashMapResolver::new(record_map);
@@ -410,6 +456,13 @@ fn value_to_json(v: Value) -> serde_json::Value {
             serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
         }
         Value::Array(arr) => serde_json::Value::Array(arr.into_iter().map(value_to_json).collect()),
+        Value::Map(m) => {
+            let obj = m
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
     }
 }
 
@@ -451,6 +504,13 @@ fn format_statement(stmt: &cxl::ast::Statement) -> String {
             s
         }
         cxl::ast::Statement::ExprStmt { expr, .. } => format_expr(expr),
+        cxl::ast::Statement::Filter { predicate, .. } => {
+            format!("filter {}", format_expr(predicate))
+        }
+        cxl::ast::Statement::Distinct { field, .. } => match field {
+            Some(f) => format!("distinct by {}", f),
+            None => "distinct".to_string(),
+        },
     }
 }
 
@@ -470,7 +530,8 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         }
         cxl::ast::Expr::Now { .. } => "now".into(),
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
-        cxl::ast::Expr::PipelineAccess { field, .. } => format!("pipeline.{}", field),
+        cxl::ast::Expr::PipelineAccess { field, .. } => format!("$pipeline.{}", field),
+        cxl::ast::Expr::MetaAccess { field, .. } => format!("$meta.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
             let op_str = match op {
                 cxl::ast::BinOp::Add => "+",
@@ -510,7 +571,11 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         }
         cxl::ast::Expr::WindowCall { function, args, .. } => {
             let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
-            format!("window.{}({})", function, args_str)
+            format!("$window.{}({})", function, args_str)
+        }
+        cxl::ast::Expr::AggCall { name, args, .. } => {
+            let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("{}({})", name, args_str)
         }
         cxl::ast::Expr::IfThenElse {
             condition,
@@ -547,6 +612,8 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
             s.push_str(" }");
             s
         }
+        cxl::ast::Expr::AggSlot { slot, .. } => format!("__agg_slot_{}", slot),
+        cxl::ast::Expr::GroupKey { slot, .. } => format!("__group_key_{}", slot),
     }
 }
 
@@ -598,18 +665,22 @@ mod tests {
         assert!(parsed.errors.is_empty());
 
         let resolved = cxl::resolve::resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
-        let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
+        let typed = cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()).unwrap();
 
-        let ctx = EvalContext {
+        let stable = cxl::eval::StableEvalContext {
             clock: Box::new(WallClock),
             pipeline_start_time: chrono::Utc::now().naive_utc(),
-            pipeline_name: "test".into(),
-            pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
-            pipeline_batch_id: "00000000-0000-0000-0000-000000000000".into(),
+            pipeline_name: std::sync::Arc::from("test"),
+            pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
+            pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            source_file: std::sync::Arc::from("test"),
+            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+        };
+        let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let ctx = EvalContext {
+            stable: &stable,
+            source_file: &source_file_arc,
             source_row: 1,
-            pipeline_vars: indexmap::IndexMap::new(),
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
@@ -632,18 +703,22 @@ mod tests {
 
         let resolved =
             cxl::resolve::resolve_program(parsed.ast, &field_refs, parsed.node_count).unwrap();
-        let typed = cxl::typecheck::type_check(resolved, &HashMap::new()).unwrap();
+        let typed = cxl::typecheck::type_check(resolved, &indexmap::IndexMap::new()).unwrap();
 
-        let ctx = EvalContext {
+        let stable = cxl::eval::StableEvalContext {
             clock: Box::new(WallClock),
             pipeline_start_time: chrono::Utc::now().naive_utc(),
-            pipeline_name: "test".into(),
-            pipeline_execution_id: "00000000-0000-0000-0000-000000000000".into(),
-            pipeline_batch_id: "00000000-0000-0000-0000-000000000000".into(),
+            pipeline_name: std::sync::Arc::from("test"),
+            pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
+            pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            source_file: std::sync::Arc::from("test"),
+            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+        };
+        let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
+        let ctx = EvalContext {
+            stable: &stable,
+            source_file: &source_file_arc,
             source_row: 1,
-            pipeline_vars: indexmap::IndexMap::new(),
         };
 
         let resolver = HashMapResolver::new(fields);

@@ -6,32 +6,49 @@ _template:
   author: "clinker"
   version: "1.0"
   hints:
-    "inputs[0].path": "primary source path"
-    "inputs[1].path": "lookup source path"
-    "transformations[0].cxl": "join key and fields to pull"
+    "nodes[0].config.path": "primary source path"
+    "nodes[1].config.path": "lookup source path"
+    "nodes[2].config.cxl": "join key and fields to pull"
 
 pipeline:
   name: csv-join
 
-inputs:
-  - name: primary
-    type: csv
-    path: "./data/primary.csv"
-    options:
-      has_header: true
-  - name: lookup
-    type: csv
-    path: "./data/lookup.csv"
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: primary
+    config:
+      name: primary
+      type: csv
+      path: "./data/primary.csv"
+      options:
+        has_header: true
+      schema:
+        - { name: id, type: string }
 
-transformations:
-  - name: enrich
-    cxl: |
-      lookup_join lookup on key = id
-        pull region_name
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: "./data/lookup.csv"
+      options:
+        has_header: true
+      schema:
+        - { name: key, type: string }
+        - { name: region_name, type: string }
 
-outputs:
-  - name: result
-    type: csv
-    path: "./output/joined.csv"
+  - type: transform
+    name: enrich
+    input: primary
+    config:
+      cxl: |
+        lookup_join lookup on key = id
+          pull region_name
+
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: "./output/joined.csv"

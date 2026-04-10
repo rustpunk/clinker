@@ -1,56 +1,52 @@
-/// Per-item fallback parser for graceful degradation.
-///
-/// When the standard all-or-nothing `serde_saphyr::from_str` parse fails,
-/// this module provides a two-pass approach:
-/// 1. Parse the YAML into a `serde_json::Value` tree (requires valid YAML syntax).
-/// 2. Walk the tree and deserialize each section/item individually.
-///
-/// Items that parse successfully become `PartialItem::Ok(T)`, failures become
-/// `PartialItem::Err` with the error message. The canvas can then render
-/// error nodes at the failure positions.
-use crate::composition::RawTransformEntry;
+//! Per-item fallback parser for graceful degradation (Kiln IDE).
+//!
+//! Phase 16b Task 16b.7: rewritten to walk the unified `nodes:` array
+//! directly. Sources and outputs deserialize into `SourceConfig`/`OutputConfig`
+//! via the Body wrappers; transforms/aggregates/routes produce a
+//! lightweight [`PartialTransform`] tile with only the fields the canvas
+//! renders.
+
 use crate::config::{
-    ErrorHandlingConfig, InputConfig, OutputConfig, PipelineMeta, interpolate_env_vars,
+    ErrorHandlingConfig, OutputConfig, PipelineMeta, SourceConfig, interpolate_env_vars,
 };
 
-/// An item that was either successfully parsed or failed with an error.
 #[derive(Debug, Clone)]
 pub enum PartialItem<T> {
     Ok(T),
-    Err {
-        /// Zero-based index within the YAML array.
-        index: usize,
-        /// Human-readable parse error message.
-        message: String,
-    },
+    Err { index: usize, message: String },
 }
 
-/// A pipeline config where individual items may have failed to parse.
-///
-/// Produced by `parse_partial_config` when the YAML is syntactically valid
-/// but one or more items fail semantic deserialization.
+/// Kiln IDE partial view of a transform-like node (Transform, Aggregate,
+/// Route). Only the fields the canvas renders are populated.
+#[derive(Debug, Clone)]
+pub struct PartialTransform {
+    pub name: String,
+    pub description: Option<String>,
+    pub cxl: String,
+}
+
+impl PartialTransform {
+    pub fn cxl_source(&self) -> &str {
+        &self.cxl
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PartialPipelineConfig {
     pub pipeline: Result<PipelineMeta, String>,
-    pub inputs: Vec<PartialItem<InputConfig>>,
-    pub transformations: Vec<PartialItem<RawTransformEntry>>,
+    pub inputs: Vec<PartialItem<SourceConfig>>,
+    pub transformations: Vec<PartialItem<PartialTransform>>,
     pub outputs: Vec<PartialItem<OutputConfig>>,
     pub error_handling: Result<ErrorHandlingConfig, String>,
     pub notes: Option<serde_json::Value>,
-    /// All error messages collected (for the parse_errors signal).
     pub errors: Vec<String>,
 }
 
-/// Parse a YAML string with per-item fallback.
-///
-/// Returns `Ok(partial)` if the YAML is syntactically valid (even if some items
-/// fail to deserialize). Returns `Err` only when the YAML itself is broken
-/// (bad indentation, unclosed quotes, etc.).
 pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String> {
     let interpolated = interpolate_env_vars(yaml, &[]).map_err(|e| e.to_string())?;
 
     let tree: serde_json::Value =
-        serde_saphyr::from_str(&interpolated).map_err(|e| format!("YAML syntax error: {e}"))?;
+        crate::yaml::from_str(&interpolated).map_err(|e| format!("YAML syntax error: {e}"))?;
 
     let obj = tree
         .as_object()
@@ -58,7 +54,6 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
 
     let mut errors = Vec::new();
 
-    // Pipeline metadata (singleton)
     let pipeline = match obj.get("pipeline") {
         Some(v) => serde_json::from_value::<PipelineMeta>(v.clone()).map_err(|e| {
             let msg = format!("pipeline: {e}");
@@ -72,17 +67,22 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
         }
     };
 
-    // Inputs array
-    let inputs = parse_array_section::<InputConfig>(obj, "inputs", &mut errors);
+    let mut inputs: Vec<PartialItem<SourceConfig>> = Vec::new();
+    let mut transformations: Vec<PartialItem<PartialTransform>> = Vec::new();
+    let mut outputs: Vec<PartialItem<OutputConfig>> = Vec::new();
 
-    // Transformations array (uses RawTransformEntry for _import support)
-    let transformations =
-        parse_array_section::<RawTransformEntry>(obj, "transformations", &mut errors);
+    if let Some(nodes_value) = obj.get("nodes")
+        && let Some(nodes_arr) = nodes_value.as_array()
+    {
+        project_partial_nodes(
+            nodes_arr,
+            &mut inputs,
+            &mut transformations,
+            &mut outputs,
+            &mut errors,
+        );
+    }
 
-    // Outputs array
-    let outputs = parse_array_section::<OutputConfig>(obj, "outputs", &mut errors);
-
-    // Error handling (singleton, optional with default)
     let error_handling = match obj.get("error_handling") {
         Some(v) => serde_json::from_value::<ErrorHandlingConfig>(v.clone()).map_err(|e| {
             let msg = format!("error_handling: {e}");
@@ -92,7 +92,6 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
         None => Ok(ErrorHandlingConfig::default()),
     };
 
-    // Notes (optional, pass-through)
     let notes = obj.get("_notes").cloned();
 
     Ok(PartialPipelineConfig {
@@ -106,39 +105,88 @@ pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String>
     })
 }
 
-/// Parse an array section with per-item fallback.
-fn parse_array_section<T: serde::de::DeserializeOwned + Clone>(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
+fn project_partial_nodes(
+    nodes_arr: &[serde_json::Value],
+    inputs: &mut Vec<PartialItem<SourceConfig>>,
+    transformations: &mut Vec<PartialItem<PartialTransform>>,
+    outputs: &mut Vec<PartialItem<OutputConfig>>,
     errors: &mut Vec<String>,
-) -> Vec<PartialItem<T>> {
-    let Some(value) = obj.get(key) else {
-        return Vec::new();
-    };
+) {
+    for (i, node) in nodes_arr.iter().enumerate() {
+        let Some(obj) = node.as_object() else {
+            let msg = format!("nodes[{i}]: expected mapping");
+            errors.push(msg.clone());
+            continue;
+        };
+        let type_tag = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let description = obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let config = obj
+            .get("config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
-    let Some(arr) = value.as_array() else {
-        let msg = format!("{key}: expected array");
-        errors.push(msg.clone());
-        return vec![PartialItem::Err {
-            index: 0,
-            message: msg,
-        }];
-    };
-
-    arr.iter()
-        .enumerate()
-        .map(
-            |(i, item)| match serde_json::from_value::<T>(item.clone()) {
-                Ok(v) => PartialItem::Ok(v),
-                Err(e) => {
-                    let msg = format!("{key}[{i}]: {e}");
-                    errors.push(msg.clone());
-                    PartialItem::Err {
-                        index: i,
-                        message: msg,
+        match type_tag {
+            "source" => {
+                match serde_json::from_value::<SourceConfig>(merge_name_into(&config, &name)) {
+                    Ok(src) => inputs.push(PartialItem::Ok(src)),
+                    Err(e) => {
+                        let msg = format!("nodes[{i}] ({name}): {e}");
+                        errors.push(msg.clone());
+                        inputs.push(PartialItem::Err {
+                            index: i,
+                            message: msg,
+                        });
                     }
                 }
-            },
-        )
-        .collect()
+            }
+            "output" => {
+                match serde_json::from_value::<OutputConfig>(merge_name_into(&config, &name)) {
+                    Ok(out) => outputs.push(PartialItem::Ok(out)),
+                    Err(e) => {
+                        let msg = format!("nodes[{i}] ({name}): {e}");
+                        errors.push(msg.clone());
+                        outputs.push(PartialItem::Err {
+                            index: i,
+                            message: msg,
+                        });
+                    }
+                }
+            }
+            "transform" | "aggregate" | "route" => {
+                let cxl = match type_tag {
+                    "transform" | "aggregate" => config
+                        .get("cxl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                };
+                transformations.push(PartialItem::Ok(PartialTransform {
+                    name: name.clone(),
+                    description: description.clone(),
+                    cxl,
+                }));
+            }
+            "merge" | "composition" => {}
+            other => {
+                let msg = format!("nodes[{i}] ({name}): unknown type '{other}'");
+                errors.push(msg);
+            }
+        }
+    }
+}
+
+fn merge_name_into(config: &serde_json::Value, name: &str) -> serde_json::Value {
+    let mut map = config.as_object().cloned().unwrap_or_default();
+    map.entry("name".to_string())
+        .or_insert(serde_json::Value::String(name.to_string()));
+    serde_json::Value::Object(map)
 }

@@ -1,0 +1,48 @@
+pipeline:
+  name: route_fanout
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: string }
+
+  - type: transform
+    name: classify
+    input: orders
+    config:
+      cxl: |
+        emit id = id
+        emit amount = amount
+
+  - type: route
+    name: classify_route
+    input: classify
+    config:
+      mode: exclusive
+      conditions:
+        high: "amount.to_int() > 100"
+      default: low
+
+  - type: output
+    name: high
+    input: classify_route.high
+    config:
+      name: high
+      type: csv
+      path: ./output/high.csv
+
+  - type: output
+    name: low
+    input: classify_route.low
+    config:
+      name: low
+      type: csv
+      path: ./output/low.csv

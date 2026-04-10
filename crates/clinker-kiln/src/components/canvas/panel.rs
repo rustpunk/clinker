@@ -5,14 +5,11 @@ use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
 use crate::pipeline_view::{
-    NODE_HEIGHT, NODE_WIDTH, derive_composition_drill_view, derive_partial_pipeline_view,
-    derive_pipeline_view,
+    NODE_HEIGHT, NODE_WIDTH, derive_partial_pipeline_view, derive_pipeline_view,
 };
 use crate::state::use_app_state;
 
-use super::breadcrumb::BreadcrumbBar;
 use super::connector::Connector;
-use super::group_frame::CompositionGroupFrame;
 use super::node::CanvasNode;
 
 // ── Canvas transform constants ───────────────────────────────────────────────
@@ -57,38 +54,15 @@ struct DragState {
 pub fn CanvasPanel() -> Element {
     let state = use_app_state();
 
-    // Derive canvas stages from the pipeline model, falling back to partial parse.
-    let compositions_read = (state.compositions).read();
-    let expanded = (state.expanded_compositions)();
-    let drill_stack = (state.composition_drill_stack)();
-    let is_drilled = !drill_stack.is_empty();
-
-    let pipeline_view = if is_drilled {
-        // Drill-in: render the top composition's transforms
-        let drill_entry = drill_stack.last().unwrap();
-        match &*(state.pipeline).read() {
-            Some(config) => {
-                derive_composition_drill_view(config, &compositions_read, &drill_entry.path)
-            }
+    let pipeline_view = match &*(state.pipeline).read() {
+        Some(config) => derive_pipeline_view(config),
+        None => match &*(state.partial_pipeline).read() {
+            Some(partial) => derive_partial_pipeline_view(partial),
             None => crate::pipeline_view::PipelineView {
                 stages: Vec::new(),
-                composition_groups: Vec::new(),
                 connections: Vec::new(),
             },
-        }
-    } else {
-        // Normal pipeline view
-        match &*(state.pipeline).read() {
-            Some(config) => derive_pipeline_view(config, &compositions_read, &expanded),
-            None => match &*(state.partial_pipeline).read() {
-                Some(partial) => derive_partial_pipeline_view(partial),
-                None => crate::pipeline_view::PipelineView {
-                    stages: Vec::new(),
-                    composition_groups: Vec::new(),
-                    connections: Vec::new(),
-                },
-            },
-        }
+        },
     };
     let connections: Vec<_> = pipeline_view
         .connections
@@ -101,22 +75,11 @@ pub fn CanvasPanel() -> Element {
         })
         .collect();
     let stages = pipeline_view.stages;
-    let composition_groups = pipeline_view.composition_groups;
 
     // ── Transform state (local — only the canvas needs these) ────────────────
     let mut pan_x = use_signal(|| 0.0_f32);
     let mut pan_y = use_signal(|| 0.0_f32);
     let mut zoom = use_signal(|| 1.0_f32);
-
-    // Reset pan/zoom when entering or leaving drill-in so the content is centered.
-    let drill_depth = drill_stack.len();
-    let mut prev_drill_depth = use_signal(|| 0_usize);
-    if drill_depth != *prev_drill_depth.peek() {
-        prev_drill_depth.set(drill_depth);
-        pan_x.set(0.0);
-        pan_y.set(0.0);
-        zoom.set(1.0);
-    }
 
     // ── Non-reactive drag state — hot path, no re-renders during drag ─────────
     let drag = use_hook(|| Rc::new(RefCell::new(DragState::default())));
@@ -240,13 +203,6 @@ pub fn CanvasPanel() -> Element {
         div {
             class: "kiln-canvas-column",
 
-            // Breadcrumb bar + scope indicator (visible during drill-in)
-            if is_drilled {
-                BreadcrumbBar {
-                    drill_stack: drill_stack.clone(),
-                }
-            }
-
             div {
                 class: "kiln-canvas-panel",
             // Events on the outer panel — pointer capture would be added in Phase 3.
@@ -279,14 +235,6 @@ pub fn CanvasPanel() -> Element {
                             from,
                             to,
                         }
-                    }
-                }
-
-                // Composition group frames (inline-expanded compositions)
-                for group in &composition_groups {
-                    CompositionGroupFrame {
-                        key: "{group.path}",
-                        group: group.clone(),
                     }
                 }
 

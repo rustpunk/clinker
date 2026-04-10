@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -8,6 +8,53 @@ use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement, UnaryOp}
 use crate::builtins::BuiltinRegistry;
 use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
+
+/// Return type inference for aggregate function calls (Phase 16).
+///
+/// - `sum(Integer)` → Integer, `sum(Float)` → Float, `sum(Numeric/Any)` → Numeric
+/// - `count(...)` → Integer (always)
+/// - `avg(...)` → Float
+/// - `min(T)` / `max(T)` → T (preserving input type)
+/// - `collect(T)` → Array (Phase 16 treats it as Array; element type is erased)
+/// - `weighted_avg(_, _)` → Float
+/// - Unknown names → Any (caller emits a diagnostic via the parser lookahead set)
+fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
+    match name {
+        "sum" => arg_types
+            .first()
+            .map(|t| match t.unwrap_nullable() {
+                Type::Int => Type::Int,
+                Type::Float => Type::Float,
+                Type::Numeric => Type::Numeric,
+                _ => Type::Numeric,
+            })
+            .unwrap_or(Type::Numeric),
+        "count" => Type::Int,
+        "avg" => Type::Float,
+        "weighted_avg" => Type::Float,
+        "min" | "max" => arg_types.first().cloned().unwrap_or(Type::Any),
+        "collect" => Type::Array,
+        _ => Type::Any,
+    }
+}
+
+/// Aggregate context mode for typecheck enforcement.
+///
+/// `Row` is the default for ordinary row-level transforms and rejects any
+/// `Expr::AggCall`. `GroupBy` is set for transforms declared via the
+/// `aggregate:` YAML block and additionally enforces that bare field
+/// references outside an aggregate call appear in the `group_by` field set.
+///
+/// Research: RESEARCH-aggregate-typecheck-context.md — PostgreSQL
+/// `parseCheckAggregates` + Spark `CheckAnalysis` pattern.
+#[derive(Debug, Clone)]
+pub enum AggregateMode {
+    /// Row-level transform. Any `Expr::AggCall` is an error.
+    Row,
+    /// Aggregate transform. Bare `FieldRef` not in `group_by_fields` and not
+    /// inside an `AggCall` is an error.
+    GroupBy { group_by_fields: HashSet<String> },
+}
 
 /// A diagnostic produced by the type checker.
 #[derive(Debug, Clone)]
@@ -45,11 +92,23 @@ pub struct TypedProgram {
     pub node_count: u32,
 }
 
-/// Run Phase C: type-check a resolved program.
-/// `schema` contains explicitly declared field types from YAML — these override inference.
+/// Run Phase C: type-check a resolved program in row-level mode (the
+/// historical default). Equivalent to `type_check_with_mode(resolved, schema,
+/// AggregateMode::Row)`. Most call sites use this entry point.
 pub fn type_check(
     resolved: ResolvedProgram,
-    schema: &HashMap<String, Type>,
+    schema: &IndexMap<String, Type>,
+) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+    type_check_with_mode(resolved, schema, AggregateMode::Row)
+}
+
+/// Run Phase C with an explicit aggregate-mode. `AggregateMode::GroupBy`
+/// enables the two-direction aggregate context checks documented on
+/// `AggregateMode`.
+pub fn type_check_with_mode(
+    resolved: ResolvedProgram,
+    schema: &IndexMap<String, Type>,
+    aggregate_mode: AggregateMode,
 ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
     let registry = BuiltinRegistry::new();
     let node_count = resolved.node_count;
@@ -69,6 +128,8 @@ pub fn type_check(
         regexes: vec![None; node_count as usize],
         field_constraints: HashMap::new(),
         diagnostics: Vec::new(),
+        aggregate_mode: aggregate_mode.clone(),
+        agg_function_depth: 0,
     };
 
     // Pass 1: Constraint collection + Pass 2: Bottom-up annotation (single walk)
@@ -81,6 +142,7 @@ pub fn type_check(
 
     // Phase C semantic checks
     checker.check_emit_count(&program);
+    checker.check_aggregate_context(&program);
 
     // Build field_types map
     let field_types = checker.build_field_type_map();
@@ -106,7 +168,7 @@ pub fn type_check(
 
 struct TypeChecker<'a> {
     bindings: &'a [Option<ResolvedBinding>],
-    schema: &'a HashMap<String, Type>,
+    schema: &'a IndexMap<String, Type>,
     registry: &'a BuiltinRegistry,
     types: Vec<Option<Type>>,
     regexes: Vec<Option<Regex>>,
@@ -114,6 +176,11 @@ struct TypeChecker<'a> {
     diagnostics: Vec<TypeDiagnostic>,
     // Note: in_predicate_expr tracking is done via the resolver's context,
     // but we track it here for the nested-window check
+    aggregate_mode: AggregateMode,
+    /// Depth counter for the `check_aggregate_context` walk. When > 0 we are
+    /// inside the arguments of an AggCall; bare FieldRefs are exempted from
+    /// the "must appear in group_by" check.
+    agg_function_depth: u32,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -152,23 +219,6 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
-    #[allow(dead_code)]
-    fn error_with_related(
-        &mut self,
-        span: Span,
-        message: String,
-        help: Option<String>,
-        related: Span,
-    ) {
-        self.diagnostics.push(TypeDiagnostic {
-            span,
-            message,
-            help,
-            related_span: Some(related),
-            is_warning: false,
-        });
-    }
-
     fn warning(&mut self, span: Span, message: String, help: Option<String>) {
         self.diagnostics.push(TypeDiagnostic {
             span,
@@ -198,6 +248,26 @@ impl<'a> TypeChecker<'a> {
             Statement::UseStmt { .. } => {}
             Statement::ExprStmt { expr, .. } => {
                 self.check_expr(expr, false);
+            }
+            Statement::Filter {
+                predicate, span, ..
+            } => {
+                let ty = self.check_expr(predicate, false);
+                // Only error when type is *known* to be non-Bool.
+                // Type::Any means unknown — can't verify, let it pass.
+                if ty != Type::Bool && ty != Type::Any {
+                    self.error(
+                        *span,
+                        format!(
+                            "filter predicate must be type Bool, got {ty}. \
+                             Use an explicit comparison."
+                        ),
+                        None,
+                    );
+                }
+            }
+            Statement::Distinct { .. } => {
+                // Distinct field validation deferred — schema pin needed for full check.
             }
         }
     }
@@ -262,12 +332,24 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::MetaAccess { node_id, .. } => {
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
+
             Expr::Now { node_id, .. } => {
                 self.set_type(*node_id, Type::DateTime);
                 Type::DateTime
             }
 
             Expr::Wildcard { node_id, .. } => {
+                self.set_type(*node_id, Type::Any);
+                Type::Any
+            }
+
+            // Extractor-produced leaves: never present during typecheck pass.
+            // Types are assigned during aggregate extraction, not here.
+            Expr::AggSlot { node_id, .. } | Expr::GroupKey { node_id, .. } => {
                 self.set_type(*node_id, Type::Any);
                 Type::Any
             }
@@ -441,7 +523,7 @@ impl<'a> TypeChecker<'a> {
                 // Check for nested window calls inside predicate_expr
                 if in_predicate {
                     self.error(*span,
-                        format!("window.{}() cannot be called inside a window.any() or window.all() predicate", function),
+                        format!("$window.{}() cannot be called inside a $window.any() or $window.all() predicate", function),
                         Some("Move the window call outside the predicate expression".into()));
                 }
 
@@ -480,6 +562,312 @@ impl<'a> TypeChecker<'a> {
                 self.set_type(*node_id, ty.clone());
                 ty
             }
+
+            Expr::AggCall {
+                node_id,
+                name,
+                args,
+                span,
+            } => {
+                // Type-check arguments (even in row context — Direction 1
+                // enforcement happens in `check_aggregate_context` so that a
+                // single pass over the tree produces all diagnostics).
+                let mut arg_types = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_types.push(self.check_expr(arg, in_predicate));
+                }
+
+                let ty = aggregate_return_type(name, &arg_types);
+
+                // Numeric-only guard for sum/avg/weighted_avg (same pattern as
+                // window sum/avg).
+                match &**name {
+                    "sum" | "avg" => {
+                        if let Some(arg_ty) = arg_types.first() {
+                            let inner = arg_ty.unwrap_nullable();
+                            if !matches!(inner, Type::Int | Type::Float | Type::Numeric | Type::Any)
+                            {
+                                self.error(
+                                    *span,
+                                    format!("{name}() requires a Numeric argument, got {arg_ty}"),
+                                    Some(
+                                        "Use a numeric field or convert with .to_int() / .to_float()"
+                                            .into(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    "weighted_avg" => {
+                        if arg_types.len() != 2 {
+                            self.error(
+                                *span,
+                                "weighted_avg() requires exactly two arguments (value, weight)"
+                                    .into(),
+                                None,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+
+                self.set_type(*node_id, ty.clone());
+                ty
+            }
+        }
+    }
+
+    /// Phase C: enforce aggregate-context rules. Walks the program after type
+    /// inference so diagnostics can reference inferred types. Runs in both
+    /// `Row` and `GroupBy` modes because Direction 1 (AggCall in Row) applies
+    /// universally.
+    fn check_aggregate_context(&mut self, program: &Program) {
+        // Expand let-bindings by collecting a map from LetVar index to the
+        // underlying expression. This lets us resolve a LetVar FieldRef to
+        // its defining expression (PostgreSQL-style alias expansion).
+        let let_exprs: Vec<Expr> = program
+            .statements
+            .iter()
+            .filter_map(|s| match s {
+                Statement::Let { expr, .. } => Some(expr.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for stmt in &program.statements {
+            match stmt {
+                Statement::Emit { expr, .. } => {
+                    self.agg_function_depth = 0;
+                    self.walk_agg_ctx(expr, &let_exprs);
+                }
+                // Let bindings are checked through their usage sites
+                // (PostgreSQL-style alias expansion): a bare non-grouped
+                // field in a let body is only an error if the let var is
+                // referenced outside an aggregate function.
+                Statement::Let { .. } => {}
+                Statement::Filter { predicate, .. } => {
+                    // Filter in an aggregate transform acts as a row-level
+                    // gate (WHERE semantics). AggCalls here are rejected in
+                    // both modes — GroupBy also rejects because aggregates
+                    // belong in HAVING (not supported), matching PostgreSQL.
+                    self.agg_function_depth = 0;
+                    self.walk_agg_ctx_row_only(predicate);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Walk with full two-direction enforcement. Used for emit/let RHS.
+    fn walk_agg_ctx(&mut self, expr: &Expr, let_exprs: &[Expr]) {
+        match expr {
+            Expr::AggCall {
+                name, args, span, ..
+            } => {
+                // Direction 1: AggCall is forbidden in Row mode.
+                if matches!(self.aggregate_mode, AggregateMode::Row) {
+                    self.error(
+                        *span,
+                        format!(
+                            "aggregate function '{name}' is not allowed in a row-level transform"
+                        ),
+                        Some(
+                            "Move this expression into an 'aggregate:' transform block, or remove the aggregate call"
+                                .into(),
+                        ),
+                    );
+                    return;
+                }
+                // Nested aggregates: forbidden in all modes.
+                if self.agg_function_depth > 0 {
+                    self.error(
+                        *span,
+                        format!(
+                            "aggregate function '{name}' cannot be nested inside another aggregate"
+                        ),
+                        None,
+                    );
+                    return;
+                }
+                self.agg_function_depth += 1;
+                for arg in args {
+                    self.walk_agg_ctx(arg, let_exprs);
+                }
+                self.agg_function_depth -= 1;
+            }
+
+            Expr::FieldRef {
+                node_id,
+                name,
+                span,
+            } => {
+                // Let-binding transparency: if this FieldRef resolves to a
+                // LetVar, recurse into the binding expression instead of
+                // treating it as a bare column reference.
+                if let Some(Some(ResolvedBinding::LetVar(i))) =
+                    self.bindings.get(node_id.0 as usize)
+                    && let Some(def_expr) = let_exprs.get(*i)
+                {
+                    self.walk_agg_ctx(def_expr, let_exprs);
+                    return;
+                }
+
+                if let AggregateMode::GroupBy { group_by_fields } = &self.aggregate_mode
+                    && self.agg_function_depth == 0
+                    && !group_by_fields.contains(name.as_ref())
+                {
+                    let msg = format!(
+                        "field '{name}' must appear in the GROUP BY list or be used inside an aggregate function"
+                    );
+                    let group_by_fields = group_by_fields.clone();
+                    self.error(
+                        *span,
+                        msg,
+                        Some(format!(
+                            "Either add '{name}' to group_by, or wrap this usage in an aggregate call (e.g. max({name})). Current group_by: [{}]",
+                            group_by_fields
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    );
+                }
+            }
+
+            // D59 / Task 16.3.13a: per-record provenance fields
+            // (`pipeline.source_row` / `pipeline.source_file`) cannot appear
+            // outside an aggregate function inside an aggregate transform —
+            // the residual evaluator at finalize() does not have a current
+            // record. Universal SQL practice (Postgres SQLSTATE 42803,
+            // DuckDB binder, Trino `$row_id` scan-only, Spark functional-
+            // dependency rule, DataFusion #20135).
+            Expr::PipelineAccess { field, span, .. }
+                if matches!(self.aggregate_mode, AggregateMode::GroupBy { .. })
+                    && self.agg_function_depth == 0
+                    && (field.as_ref() == "source_row" || field.as_ref() == "source_file") =>
+            {
+                self.error(
+                    *span,
+                    format!(
+                        "`pipeline.{field}` is per-record provenance and cannot appear in an aggregate residual expression"
+                    ),
+                    Some(format!(
+                        "Wrap in an aggregate function (e.g., `first(pipeline.{field})`, `min(pipeline.{field})`, `max(pipeline.{field})`)"
+                    )),
+                );
+            }
+
+            // Recurse into children. Literals, $pipeline.*, $meta.*, now,
+            // qualified field refs, and wildcards are all exempt.
+            Expr::Binary { lhs, rhs, .. } => {
+                self.walk_agg_ctx(lhs, let_exprs);
+                self.walk_agg_ctx(rhs, let_exprs);
+            }
+            Expr::Unary { operand, .. } => self.walk_agg_ctx(operand, let_exprs),
+            Expr::Coalesce { lhs, rhs, .. } => {
+                self.walk_agg_ctx(lhs, let_exprs);
+                self.walk_agg_ctx(rhs, let_exprs);
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.walk_agg_ctx(condition, let_exprs);
+                self.walk_agg_ctx(then_branch, let_exprs);
+                if let Some(eb) = else_branch {
+                    self.walk_agg_ctx(eb, let_exprs);
+                }
+            }
+            Expr::Match { subject, arms, .. } => {
+                if let Some(s) = subject {
+                    self.walk_agg_ctx(s, let_exprs);
+                }
+                for arm in arms {
+                    self.walk_agg_ctx(&arm.pattern, let_exprs);
+                    self.walk_agg_ctx(&arm.body, let_exprs);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.walk_agg_ctx(receiver, let_exprs);
+                for arg in args {
+                    self.walk_agg_ctx(arg, let_exprs);
+                }
+            }
+            Expr::WindowCall { args, .. } => {
+                for arg in args {
+                    self.walk_agg_ctx(arg, let_exprs);
+                }
+            }
+            Expr::Literal { .. }
+            | Expr::QualifiedFieldRef { .. }
+            | Expr::PipelineAccess { .. }
+            | Expr::MetaAccess { .. }
+            | Expr::Now { .. }
+            | Expr::Wildcard { .. }
+            | Expr::AggSlot { .. }
+            | Expr::GroupKey { .. } => {}
+        }
+    }
+
+    /// Walk that enforces Direction 1 only (no AggCall allowed anywhere).
+    /// Used for `filter` / `distinct` predicates in aggregate transforms,
+    /// matching PostgreSQL WHERE-clause semantics.
+    fn walk_agg_ctx_row_only(&mut self, expr: &Expr) {
+        match expr {
+            Expr::AggCall { name, span, .. } => {
+                self.error(
+                    *span,
+                    format!(
+                        "aggregate function '{name}' is not allowed in a filter predicate — aggregates apply after grouping"
+                    ),
+                    None,
+                );
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.walk_agg_ctx_row_only(lhs);
+                self.walk_agg_ctx_row_only(rhs);
+            }
+            Expr::Unary { operand, .. } => self.walk_agg_ctx_row_only(operand),
+            Expr::Coalesce { lhs, rhs, .. } => {
+                self.walk_agg_ctx_row_only(lhs);
+                self.walk_agg_ctx_row_only(rhs);
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.walk_agg_ctx_row_only(condition);
+                self.walk_agg_ctx_row_only(then_branch);
+                if let Some(eb) = else_branch {
+                    self.walk_agg_ctx_row_only(eb);
+                }
+            }
+            Expr::Match { subject, arms, .. } => {
+                if let Some(s) = subject {
+                    self.walk_agg_ctx_row_only(s);
+                }
+                for arm in arms {
+                    self.walk_agg_ctx_row_only(&arm.pattern);
+                    self.walk_agg_ctx_row_only(&arm.body);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.walk_agg_ctx_row_only(receiver);
+                for arg in args {
+                    self.walk_agg_ctx_row_only(arg);
+                }
+            }
+            Expr::WindowCall { args, .. } => {
+                for arg in args {
+                    self.walk_agg_ctx_row_only(arg);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -671,7 +1059,7 @@ mod tests {
     use crate::parser::Parser;
     use crate::resolve::pass::resolve_program;
 
-    fn typecheck_ok(src: &str, fields: &[&str], schema: &HashMap<String, Type>) -> TypedProgram {
+    fn typecheck_ok(src: &str, fields: &[&str], schema: &IndexMap<String, Type>) -> TypedProgram {
         let parsed = Parser::parse(src);
         assert!(
             parsed.errors.is_empty(),
@@ -695,7 +1083,7 @@ mod tests {
     fn typecheck_err(
         src: &str,
         fields: &[&str],
-        schema: &HashMap<String, Type>,
+        schema: &IndexMap<String, Type>,
     ) -> Vec<TypeDiagnostic> {
         let parsed = Parser::parse(src);
         assert!(parsed.errors.is_empty());
@@ -722,18 +1110,18 @@ mod tests {
     #[test]
     fn test_typecheck_arithmetic_int() {
         // 1 + 2 infers Int
-        let typed = typecheck_ok("emit a = 1 + 2", &[], &HashMap::new());
+        let typed = typecheck_ok("emit a = 1 + 2", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::Int);
 
         // 1 + 2.0 infers Float (promotion)
-        let typed2 = typecheck_ok("emit b = 1 + 2.0", &[], &HashMap::new());
+        let typed2 = typecheck_ok("emit b = 1 + 2.0", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed2), Type::Float);
     }
 
     #[test]
     fn test_typecheck_null_propagation() {
         // nullable_field + 1 → Nullable(Int) when field is declared Nullable(Int)
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("nullable_field".into(), Type::Nullable(Box::new(Type::Int)));
         let typed = typecheck_ok(
             "emit val = nullable_field + 1",
@@ -746,7 +1134,7 @@ mod tests {
 
     #[test]
     fn test_typecheck_coalesce_strips_nullable() {
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("nullable_field".into(), Type::Nullable(Box::new(Type::Int)));
         let typed = typecheck_ok(
             "emit val = nullable_field ?? 0",
@@ -762,7 +1150,7 @@ mod tests {
         let diags = typecheck_err(
             "emit val = match status { \"A\" => 1 }",
             &["status"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         assert!(
             diags
@@ -776,9 +1164,9 @@ mod tests {
     #[test]
     fn test_typecheck_nested_window_in_predicate() {
         let diags = typecheck_err(
-            "emit val = window.any(window.sum(it) > 0)",
+            "emit val = $window.any($window.sum(it) > 0)",
             &["amount"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         assert!(
             diags
@@ -792,9 +1180,9 @@ mod tests {
     #[test]
     fn test_typecheck_sum_requires_numeric() {
         // window.sum() on a String field should produce an error
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("name".into(), Type::String);
-        let diags = typecheck_err("emit val = window.sum(name)", &["name"], &schema);
+        let diags = typecheck_err("emit val = $window.sum(name)", &["name"], &schema);
         assert!(
             diags.iter().any(|d| d.message.contains("Numeric")),
             "Expected Numeric requirement diagnostic, got: {:?}",
@@ -808,7 +1196,7 @@ mod tests {
         let diags = typecheck_err(
             "emit a = status == \"active\"\nemit b = status + 1",
             &["status"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         // Should have a diagnostic about conflicting types
         let conflict = diags.iter().find(|d| d.message.contains("used as"));
@@ -826,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_typecheck_schema_override_conflict() {
-        let mut schema = HashMap::new();
+        let mut schema = IndexMap::new();
         schema.insert("age".into(), Type::Int);
         let diags = typecheck_err("emit val = age == \"old\"", &["age"], &schema);
         assert!(
@@ -841,7 +1229,7 @@ mod tests {
     #[test]
     fn test_typecheck_zero_emit_warning() {
         // Program with no emit → warning (not error, so type_check succeeds)
-        let typed = typecheck_ok("let x = 1", &[], &HashMap::new());
+        let typed = typecheck_ok("let x = 1", &[], &indexmap::IndexMap::new());
         // The program should have been created successfully (warnings don't block)
         assert!(typed.program.statements.len() == 1);
     }
@@ -851,7 +1239,7 @@ mod tests {
         let typed = typecheck_ok(
             "emit a = amount + 1\nemit b = name == \"test\"",
             &["amount", "name"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         // amount should be inferred as Numeric, name as String
         assert!(
@@ -868,13 +1256,13 @@ mod tests {
 
     #[test]
     fn test_typecheck_equality_always_bool() {
-        let typed = typecheck_ok("emit val = 1 == 2", &[], &HashMap::new());
+        let typed = typecheck_ok("emit val = 1 == 2", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::Bool);
     }
 
     #[test]
     fn test_typecheck_if_missing_else_nullable() {
-        let typed = typecheck_ok("emit val = if true then 1", &[], &HashMap::new());
+        let typed = typecheck_ok("emit val = if true then 1", &[], &indexmap::IndexMap::new());
         let ty = first_emit_expr_type(&typed);
         assert!(
             ty.is_nullable(),
@@ -885,16 +1273,24 @@ mod tests {
 
     #[test]
     fn test_typecheck_now_is_datetime() {
-        let typed = typecheck_ok("emit ts = now", &[], &HashMap::new());
+        let typed = typecheck_ok("emit ts = now", &[], &indexmap::IndexMap::new());
         assert_eq!(first_emit_expr_type(&typed), Type::DateTime);
     }
 
     #[test]
     fn test_typecheck_pipeline_access_types() {
-        let typed = typecheck_ok("emit ts = pipeline.start_time", &[], &HashMap::new());
+        let typed = typecheck_ok(
+            "emit ts = $pipeline.start_time",
+            &[],
+            &indexmap::IndexMap::new(),
+        );
         assert_eq!(first_emit_expr_type(&typed), Type::DateTime);
 
-        let typed2 = typecheck_ok("emit n = pipeline.total_count", &[], &HashMap::new());
+        let typed2 = typecheck_ok(
+            "emit n = $pipeline.total_count",
+            &[],
+            &indexmap::IndexMap::new(),
+        );
         assert_eq!(first_emit_expr_type(&typed2), Type::Int);
     }
 
@@ -903,7 +1299,7 @@ mod tests {
         let typed = typecheck_ok(
             "emit val = name.matches(\"\\\\d+\")",
             &["name"],
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
         // The regex should be pre-compiled and stored
         let has_regex = typed.regexes.iter().any(|r| r.is_some());
@@ -911,5 +1307,394 @@ mod tests {
             has_regex,
             "Expected pre-compiled regex in TypedProgram.regexes"
         );
+    }
+
+    // ── Phase 16 Task 16.2 — aggregate typecheck tests ─────────────────
+
+    fn agg_mode(keys: &[&str]) -> AggregateMode {
+        AggregateMode::GroupBy {
+            group_by_fields: keys.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn typecheck_with(
+        src: &str,
+        fields: &[&str],
+        mode: AggregateMode,
+    ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+        let parsed = Parser::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved =
+            resolve_program(parsed.ast, fields, parsed.node_count).expect("resolve failed");
+        type_check_with_mode(resolved, &indexmap::IndexMap::new(), mode)
+    }
+
+    fn agg_ok(src: &str, fields: &[&str], keys: &[&str]) -> TypedProgram {
+        typecheck_with(src, fields, agg_mode(keys)).unwrap_or_else(|d| {
+            panic!(
+                "Expected Ok but got type errors: {:?}",
+                d.iter().map(|e| &e.message).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    fn agg_err(src: &str, fields: &[&str], keys: &[&str]) -> Vec<TypeDiagnostic> {
+        typecheck_with(src, fields, agg_mode(keys)).expect_err("Expected type errors but got Ok")
+    }
+
+    fn row_err(src: &str, fields: &[&str]) -> Vec<TypeDiagnostic> {
+        typecheck_with(src, fields, AggregateMode::Row)
+            .expect_err("Expected type errors but got Ok")
+    }
+
+    // Direction 1 — AggCall in row-level context rejected
+
+    #[test]
+    fn test_agg_in_row_context_rejected() {
+        let errs = row_err("emit total = sum(amount)", &["amount"]);
+        assert!(errs.iter().any(|d| d.message.contains("sum")));
+    }
+
+    #[test]
+    fn test_all_agg_fns_rejected_in_row_context() {
+        for name in [
+            "sum(amount)",
+            "count(amount)",
+            "avg(amount)",
+            "min(amount)",
+            "max(amount)",
+            "collect(amount)",
+            "weighted_avg(amount, amount)",
+        ] {
+            let src = format!("emit x = {name}");
+            let errs = row_err(&src, &["amount"]);
+            assert!(
+                !errs.is_empty(),
+                "Expected row-context error for {name}, got Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agg_buried_in_binary_expr_row_context() {
+        let errs = row_err("emit x = amount + sum(amount)", &["amount"]);
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_agg_in_if_branch_row_context() {
+        let errs = row_err(
+            "emit x = if flag then sum(amount) else 0",
+            &["flag", "amount"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_agg_in_let_binding_row_context() {
+        let errs = row_err("let x = sum(amount)\nemit y = x", &["amount"]);
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_agg_in_filter_row_context() {
+        let errs = row_err("filter sum(amount) > 100\nemit x = 1", &["amount"]);
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_agg_in_method_receiver_row_context() {
+        let errs = row_err("emit x = sum(amount).to_string()", &["amount"]);
+        assert!(!errs.is_empty());
+    }
+
+    // Direction 2 — bare FieldRef in aggregate context
+
+    #[test]
+    fn test_non_grouped_field_in_emit_rejected() {
+        let errs = agg_err("emit name = name", &["name", "dept"], &["dept"]);
+        assert!(errs.iter().any(|d| d.message.contains("'name'")));
+    }
+
+    #[test]
+    fn test_group_key_in_emit_allowed() {
+        let _ = agg_ok("emit dept = dept", &["dept", "amount"], &["dept"]);
+    }
+
+    #[test]
+    fn test_multi_key_group_by() {
+        // Both group keys allowed bare; non-key errors
+        let errs = agg_err(
+            "emit dept = dept\nemit region = region\nemit name = name",
+            &["dept", "region", "name"],
+            &["dept", "region"],
+        );
+        assert!(errs.iter().any(|d| d.message.contains("'name'")));
+        assert!(!errs.iter().any(|d| d.message.contains("'dept'")));
+        assert!(!errs.iter().any(|d| d.message.contains("'region'")));
+    }
+
+    #[test]
+    fn test_non_grouped_field_inside_agg_call_allowed() {
+        let _ = agg_ok("emit total = sum(amount)", &["amount", "dept"], &["dept"]);
+    }
+
+    #[test]
+    fn test_non_grouped_in_agg_binary_arg() {
+        let _ = agg_ok(
+            "emit total = avg(salary + bonus)",
+            &["salary", "bonus", "dept"],
+            &["dept"],
+        );
+    }
+
+    #[test]
+    fn test_let_binding_used_in_agg_call() {
+        let _ = agg_ok(
+            "let x = amount\nemit total = sum(x)",
+            &["amount", "dept"],
+            &["dept"],
+        );
+    }
+
+    #[test]
+    fn test_let_binding_emitted_bare() {
+        let errs = agg_err(
+            "let x = amount\nemit out = x",
+            &["amount", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty(), "let alias to non-grouped should error");
+    }
+
+    #[test]
+    fn test_group_key_inside_agg_call() {
+        let _ = agg_ok("emit d = sum(dept_id)", &["dept_id"], &["dept_id"]);
+    }
+
+    #[test]
+    fn test_literal_in_aggregate_context() {
+        let _ = agg_ok("emit c = 42", &["dept"], &["dept"]);
+    }
+
+    #[test]
+    fn test_pipeline_meta_in_aggregate_context() {
+        let _ = agg_ok("emit run = $pipeline.execution_id", &["dept"], &["dept"]);
+    }
+
+    // D59 / Task 16.3.13a: per-record provenance fields cannot appear
+    // bare in an aggregate residual; must be wrapped in an aggregate.
+    #[test]
+    fn test_typecheck_rejects_pipeline_source_row_in_agg_residual() {
+        let errs = agg_err("emit row = $pipeline.source_row", &["dept"], &["dept"]);
+        assert!(
+            errs.iter()
+                .any(|d| d.message.contains("source_row")
+                    && d.message.contains("per-record provenance")),
+            "expected provenance rejection, got: {:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_allows_first_pipeline_source_row_in_agg() {
+        let _ = agg_ok("emit row = min($pipeline.source_row)", &["dept"], &["dept"]);
+    }
+
+    #[test]
+    fn test_filter_in_aggregate_context_allowed() {
+        let _ = agg_ok(
+            "filter salary > 50000\nemit total = sum(salary)",
+            &["salary", "dept"],
+            &["dept"],
+        );
+    }
+
+    #[test]
+    fn test_distinct_in_aggregate_context_allowed() {
+        let _ = agg_ok(
+            "distinct by employee_id\nemit total = sum(salary)",
+            &["employee_id", "salary", "dept"],
+            &["dept"],
+        );
+    }
+
+    // Nested
+
+    #[test]
+    fn test_nested_agg_call_rejected() {
+        let errs = agg_err("emit x = sum(count(id))", &["id", "dept"], &["dept"]);
+        assert!(errs.iter().any(|d| d.message.contains("nested")));
+    }
+
+    #[test]
+    fn test_nested_agg_through_method_chain() {
+        let errs = agg_err(
+            "emit x = sum(count(name).to_float())",
+            &["name", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_agg_in_filter_aggregate_context() {
+        let errs = agg_err(
+            "filter sum(amount) > 0\nemit x = 1",
+            &["amount", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_empty_group_by_global_fold() {
+        let _ = agg_ok("emit total = sum(amount)", &["amount"], &[]);
+    }
+
+    #[test]
+    fn test_error_points_at_specific_field() {
+        // Mixing a valid key emit and an invalid non-key emit — only the
+        // offending one should error.
+        let errs = agg_err(
+            "emit dept = dept\nemit bad = name",
+            &["dept", "name"],
+            &["dept"],
+        );
+        assert!(errs.iter().any(|d| d.message.contains("'name'")));
+        assert!(!errs.iter().any(|d| d.message.contains("'dept'")));
+    }
+
+    // Expression depth edge cases
+
+    #[test]
+    fn test_method_on_non_grouped_field() {
+        let errs = agg_err(
+            "emit x = employee_name.trim()",
+            &["employee_name", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_method_on_agg_result() {
+        let _ = agg_ok(
+            "emit x = sum(amount).to_string()",
+            &["amount", "dept"],
+            &["dept"],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_agg_and_literal() {
+        let _ = agg_ok("emit x = sum(amount) ?? 0", &["amount", "dept"], &["dept"]);
+    }
+
+    #[test]
+    fn test_coalesce_non_grouped_and_literal() {
+        let errs = agg_err(
+            "emit x = employee_name ?? \"unknown\"",
+            &["employee_name", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_if_both_branches_aggregated() {
+        let _ = agg_ok(
+            "emit x = if dept == \"SALES\" then sum(c) else sum(s)",
+            &["dept", "c", "s"],
+            &["dept"],
+        );
+    }
+
+    #[test]
+    fn test_if_condition_has_non_grouped() {
+        let errs = agg_err(
+            "emit x = if employee_name == \"Alice\" then sum(salary) else 0",
+            &["employee_name", "salary", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_count_literal_arg() {
+        let _ = agg_ok("emit c = count(1)", &["dept"], &["dept"]);
+    }
+
+    #[test]
+    fn test_non_grouped_in_binary_no_agg() {
+        let errs = agg_err(
+            "emit x = (amount + bonus) * 0.9",
+            &["amount", "bonus", "dept"],
+            &["dept"],
+        );
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_agg_of_binary_with_non_grouped() {
+        let _ = agg_ok(
+            "emit x = sum(amount * rate)",
+            &["amount", "rate", "dept"],
+            &["dept"],
+        );
+    }
+
+    #[test]
+    fn test_weighted_avg_in_aggregate_context() {
+        let _ = agg_ok(
+            "emit w = weighted_avg(score, weight)",
+            &["score", "weight", "dept"],
+            &["dept"],
+        );
+    }
+
+    // Type inference
+
+    #[test]
+    fn test_typecheck_sum_returns_same_type() {
+        let mut schema = IndexMap::new();
+        schema.insert("amount".into(), Type::Int);
+        let parsed = Parser::parse("emit t = sum(amount)");
+        let resolved = resolve_program(parsed.ast, &["amount", "dept"], parsed.node_count).unwrap();
+        let typed = type_check_with_mode(
+            resolved,
+            &schema,
+            AggregateMode::GroupBy {
+                group_by_fields: ["dept".to_string()].into_iter().collect(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first_emit_expr_type(&typed), Type::Int);
+    }
+
+    #[test]
+    fn test_typecheck_avg_returns_float() {
+        let typed = agg_ok("emit t = avg(amount)", &["amount", "dept"], &["dept"]);
+        assert_eq!(first_emit_expr_type(&typed), Type::Float);
+    }
+
+    #[test]
+    fn test_typecheck_collect_returns_array() {
+        let typed = agg_ok("emit t = collect(amount)", &["amount", "dept"], &["dept"]);
+        assert_eq!(first_emit_expr_type(&typed), Type::Array);
+    }
+
+    #[test]
+    fn test_typecheck_weighted_avg_returns_float() {
+        let typed = agg_ok(
+            "emit t = weighted_avg(score, weight)",
+            &["score", "weight", "dept"],
+            &["dept"],
+        );
+        assert_eq!(first_emit_expr_type(&typed), Type::Float);
     }
 }

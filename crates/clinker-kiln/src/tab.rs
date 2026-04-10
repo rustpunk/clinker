@@ -8,7 +8,6 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use clinker_core::composition::{ContractWarning, RawPipelineConfig, ResolvedComposition};
 use clinker_core::config::PipelineConfig;
 use clinker_core::partial::PartialPipelineConfig;
 use uuid::Uuid;
@@ -47,21 +46,11 @@ impl fmt::Display for TabId {
 pub struct TabSnapshot {
     pub yaml_text: String,
     pub pipeline: Option<PipelineConfig>,
-    /// Raw pipeline config preserving `_import` directives (for serialization).
-    pub raw_pipeline: Option<RawPipelineConfig>,
-    /// Resolved composition metadata (for canvas rendering).
-    #[allow(dead_code)]
-    pub compositions: Vec<ResolvedComposition>,
-    /// Contract validation warnings from composition imports.
-    #[allow(dead_code)]
-    pub contract_warnings: Vec<ContractWarning>,
     /// Partial pipeline from graceful degradation (when full parse fails).
     pub partial_pipeline: Option<PartialPipelineConfig>,
     pub parse_errors: Vec<String>,
     pub edit_source: EditSource,
     pub selected_stage: Option<String>,
-    /// Guide annotations from template instantiation (session-only, not persisted).
-    pub guide_annotations: Vec<crate::template::GuideAnnotation>,
 }
 
 /// One open pipeline tab with its file info and state snapshot.
@@ -99,14 +88,10 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: SCAFFOLD_YAML.to_string(),
                 pipeline: parse_yaml_raw_path(SCAFFOLD_YAML).ok(),
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: Vec::new(),
                 edit_source: EditSource::None,
                 selected_stage: None,
-                guide_annotations: Vec::new(),
             },
         }
     }
@@ -127,14 +112,10 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml,
                 pipeline: config,
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
-                guide_annotations: Vec::new(),
             },
         }
     }
@@ -168,42 +149,10 @@ impl TabEntry {
             snapshot: TabSnapshot {
                 yaml_text: yaml,
                 pipeline: config,
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
                 partial_pipeline: None,
                 parse_errors: errors,
                 edit_source: EditSource::None,
                 selected_stage: None,
-                guide_annotations: Vec::new(),
-            },
-        }
-    }
-
-    /// Create a tab pre-loaded with demo YAML.
-    #[allow(dead_code)]
-    pub fn new_demo(yaml: &str) -> Self {
-        let (config, errors) = match parse_yaml_raw_path(yaml) {
-            Ok(c) => (Some(c), Vec::new()),
-            Err(e) => (None, e),
-        };
-
-        Self {
-            id: TabId::new(),
-            file_path: None,
-            untitled_name: Some("demo.yaml".to_string()),
-            content_hash: None,
-            snapshot: TabSnapshot {
-                yaml_text: yaml.to_string(),
-                pipeline: config,
-                raw_pipeline: None,
-                compositions: Vec::new(),
-                contract_warnings: Vec::new(),
-                partial_pipeline: None,
-                parse_errors: errors,
-                edit_source: EditSource::None,
-                selected_stage: None,
-                guide_annotations: Vec::new(),
             },
         }
     }
@@ -214,16 +163,6 @@ impl TabEntry {
             return true;
         };
         let current = compute_hash(&self.snapshot.yaml_text);
-        current != saved_hash
-    }
-
-    /// Check dirty against live signal values (for the active tab).
-    #[allow(dead_code)]
-    pub fn is_dirty_with_yaml(&self, current_yaml: &str) -> bool {
-        let Some(saved_hash) = self.content_hash else {
-            return true;
-        };
-        let current = compute_hash(current_yaml);
         current != saved_hash
     }
 

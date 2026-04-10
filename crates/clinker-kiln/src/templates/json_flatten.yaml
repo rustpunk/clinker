@@ -9,19 +9,31 @@ _template:
 pipeline:
   name: json-flatten
 
-inputs:
-  - name: source
-    type: json
-    path: "./data/input.json"
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: json
+      path: "./data/input.json"
+      schema:
+        - { name: id, type: string }
+        - { name: name, type: string }
+        - { name: email, type: string }
 
-transformations:
-  - name: extract_fields
-    cxl: |
-      emit id = id
-      emit name = name
-      emit email = email
+  - type: transform
+    name: extract_fields
+    input: source
+    config:
+      cxl: |
+        emit id = id
+        emit name = name
+        emit email = email
 
-outputs:
-  - name: result
-    type: csv
-    path: "./output/flattened.csv"
+  - type: output
+    name: result
+    input: extract_fields
+    config:
+      name: result
+      type: csv
+      path: "./output/flattened.csv"

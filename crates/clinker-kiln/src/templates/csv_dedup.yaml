@@ -9,19 +9,29 @@ _template:
 pipeline:
   name: csv-dedup
 
-inputs:
-  - name: source
-    type: csv
-    path: "./data/input.csv"
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: "./data/input.csv"
+      options:
+        has_header: true
+      schema:
+        - { name: id, type: string }
 
-transformations:
-  - name: deduplicate
-    cxl: |
-      distinct by id
+  - type: transform
+    name: deduplicate
+    input: source
+    config:
+      cxl: |
+        distinct by id
 
-outputs:
-  - name: result
-    type: csv
-    path: "./output/deduped.csv"
+  - type: output
+    name: result
+    input: deduplicate
+    config:
+      name: result
+      type: csv
+      path: "./output/deduped.csv"

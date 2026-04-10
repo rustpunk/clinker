@@ -138,72 +138,6 @@ pub fn text_search(
     results
 }
 
-/// Perform text replacement in a single file.
-///
-/// Returns the new content with replacements applied, and the count of
-/// replacements made.
-#[allow(dead_code)]
-pub fn text_replace(
-    content: &str,
-    query: &str,
-    replacement: &str,
-    options: &TextSearchOptions,
-    replace_all: bool,
-) -> (String, usize) {
-    let Some(matcher) = build_matcher(query, options) else {
-        return (content.to_string(), 0);
-    };
-
-    match matcher {
-        Matcher::Regex(re) => {
-            if replace_all {
-                let new = re.replace_all(content, replacement);
-                let count = re.find_iter(content).count();
-                (new.into_owned(), count)
-            } else {
-                let new = re.replace(content, replacement);
-                let changed = new != content;
-                (new.into_owned(), if changed { 1 } else { 0 })
-            }
-        }
-        Matcher::Literal {
-            pattern,
-            case_sensitive,
-        } => {
-            let mut result = String::with_capacity(content.len());
-            let mut count = 0;
-            let mut remaining = content;
-
-            loop {
-                let found = if case_sensitive {
-                    remaining.find(&pattern)
-                } else {
-                    remaining.to_lowercase().find(&pattern.to_lowercase())
-                };
-
-                match found {
-                    Some(pos) => {
-                        result.push_str(&remaining[..pos]);
-                        result.push_str(replacement);
-                        remaining = &remaining[pos + pattern.len()..];
-                        count += 1;
-                        if !replace_all {
-                            result.push_str(remaining);
-                            break;
-                        }
-                    }
-                    None => {
-                        result.push_str(remaining);
-                        break;
-                    }
-                }
-            }
-
-            (result, count)
-        }
-    }
-}
-
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Compiled matcher — either regex or literal string.
@@ -432,59 +366,10 @@ pub fn structural_search(
             }
         }
 
-        // Check composition-level tags (import:, composition:, override:)
-        // Parse as raw config to see _import directives
-        if tags
-            .iter()
-            .any(|t| matches!(t.key.as_str(), "import" | "composition" | "override"))
-            && let Ok(raw) = clinker_core::composition::parse_raw_config(&content)
-        {
-            for entry in &raw.transformations {
-                if let clinker_core::composition::RawTransformEntry::Import(directive) = entry {
-                    let path_lower = directive.path.to_lowercase();
-                    let override_names: Vec<String> = directive.overrides.keys().cloned().collect();
-
-                    for tag in tags {
-                        let val_lower = tag.value.to_lowercase();
-                        match tag.key.as_str() {
-                            "import" | "composition" => {
-                                if path_lower.contains(&val_lower) {
-                                    results.push(StructuralSearchMatch {
-                                        pipeline_path: relative.clone(),
-                                        stage_name: directive.path.clone(),
-                                        stage_type: "import".to_string(),
-                                        matched_detail: format!(
-                                            "imports {} ({} override(s))",
-                                            directive.path,
-                                            directive.overrides.len()
-                                        ),
-                                    });
-                                }
-                            }
-                            "override" => {
-                                for ovr_name in &override_names {
-                                    if ovr_name.to_lowercase().contains(&val_lower) {
-                                        results.push(StructuralSearchMatch {
-                                            pipeline_path: relative.clone(),
-                                            stage_name: ovr_name.clone(),
-                                            stage_type: "override".to_string(),
-                                            matched_detail: format!(
-                                                "overrides '{}' in {}",
-                                                ovr_name, directive.path
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        // Composition/import/override tags removed in Phase 16b.
 
         // Check inputs
-        for input in &config.inputs {
+        for input in config.source_configs() {
             if stage_matches_tags(tags, "input", &input.name, &content_for_input(input)) {
                 let detail = format!("type: {}, path: {}", input.format.format_name(), input.path);
                 results.push(StructuralSearchMatch {
@@ -497,15 +382,22 @@ pub fn structural_search(
         }
 
         // Check transformations
-        for transform in config.transforms() {
-            if stage_matches_tags(tags, "transform", &transform.name, &transform.cxl) {
+        for transform in config.transform_views() {
+            if stage_matches_tags(tags, "transform", transform.name, transform.cxl_source()) {
                 let detail = transform
                     .description
-                    .clone()
-                    .unwrap_or_else(|| transform.cxl.lines().next().unwrap_or("").to_string());
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        transform
+                            .cxl_source()
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    });
                 results.push(StructuralSearchMatch {
                     pipeline_path: relative.clone(),
-                    stage_name: transform.name.clone(),
+                    stage_name: transform.name.to_string(),
                     stage_type: "transform".to_string(),
                     matched_detail: detail,
                 });
@@ -513,7 +405,7 @@ pub fn structural_search(
         }
 
         // Check outputs
-        for output in &config.outputs {
+        for output in config.output_configs() {
             if stage_matches_tags(
                 tags,
                 "output",
@@ -564,7 +456,7 @@ fn stage_matches_tags(tags: &[StructuralTag], stage_type: &str, name: &str, cont
 }
 
 /// Build searchable content string for an input stage.
-fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
+fn content_for_input(input: &clinker_core::config::SourceConfig) -> String {
     let mut content = format!(
         "{} {} {}",
         input.name,
@@ -575,134 +467,6 @@ fn content_for_input(input: &clinker_core::config::InputConfig) -> String {
         content.push_str(&format!(" schema:{schema:?}"));
     }
     content
-}
-
-// ── Channel search ──────────────────────────────────────────────────────
-
-use crate::state::ChannelState;
-
-/// A channel search match.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-pub struct ChannelSearchMatch {
-    /// Channel or group ID that matched.
-    pub id: String,
-    /// Channel name.
-    pub name: String,
-    /// What matched (e.g., "tier: enterprise").
-    pub matched_detail: String,
-    /// Whether this is a group (vs. channel).
-    pub is_group: bool,
-}
-
-/// Channel-specific structural search keys.
-#[allow(dead_code)]
-const CHANNEL_KEYS: &[&str] = &[
-    "channel",
-    "override",
-    "tier",
-    "channel-tag",
-    "group",
-    "stale",
-];
-
-/// Check if a query contains channel-specific search keys.
-#[allow(dead_code)]
-pub fn has_channel_tags(tags: &[StructuralTag]) -> bool {
-    tags.iter().any(|t| CHANNEL_KEYS.contains(&t.key.as_str()))
-}
-
-/// Search channels using structural tags.
-///
-/// Supported keys:
-/// - `channel:id` — filter by channel ID (substring match)
-/// - `tier:name` — filter by tier name
-/// - `channel-tag:value` — filter by tag
-/// - `group:id` — filter channels inheriting from a group
-/// - `override:name` — channels that have override files matching a pipeline stem
-/// - `stale:true` — channels with stale overrides (placeholder)
-#[allow(dead_code)]
-pub fn channel_search(state: &ChannelState, tags: &[StructuralTag]) -> Vec<ChannelSearchMatch> {
-    let mut results = Vec::new();
-
-    for channel in &state.channels {
-        let mut matches = true;
-        let mut detail_parts = Vec::new();
-
-        for tag in tags {
-            let val = tag.value.to_lowercase();
-            match tag.key.as_str() {
-                "channel" => {
-                    if !channel.id.to_lowercase().contains(&val)
-                        && !channel.name.to_lowercase().contains(&val)
-                    {
-                        matches = false;
-                    } else {
-                        detail_parts.push(format!("id: {}", channel.id));
-                    }
-                }
-                "tier" => {
-                    if channel.tier.as_deref().map(|t| t.to_lowercase()) != Some(val.clone()) {
-                        matches = false;
-                    } else {
-                        detail_parts
-                            .push(format!("tier: {}", channel.tier.as_deref().unwrap_or("")));
-                    }
-                }
-                "channel-tag" => {
-                    if !channel.tags.iter().any(|t| t.to_lowercase().contains(&val)) {
-                        matches = false;
-                    } else {
-                        detail_parts.push(format!("tag: {}", tag.value));
-                    }
-                }
-                "group" => {
-                    if !channel
-                        .inherits
-                        .iter()
-                        .any(|g| g.to_lowercase().contains(&val))
-                    {
-                        matches = false;
-                    } else {
-                        detail_parts.push(format!("inherits: {}", tag.value));
-                    }
-                }
-                "override" => {
-                    // Check if channel has an override file matching the value
-                    let channel_dir = state
-                        .workspace_root
-                        .join(&state.channels_dir)
-                        .join(&channel.id);
-                    let override_path = channel_dir.join(format!("{}.channel.yaml", val));
-                    if !override_path.exists() {
-                        matches = false;
-                    } else {
-                        detail_parts.push(format!("overrides: {}.yaml", tag.value));
-                    }
-                }
-                "stale" => {
-                    // Placeholder: stale detection would require mtime comparison
-                    if val != "true" {
-                        matches = false;
-                    }
-                }
-                _ => {
-                    // Non-channel key — skip (might be a pipeline key)
-                }
-            }
-        }
-
-        if matches && !detail_parts.is_empty() {
-            results.push(ChannelSearchMatch {
-                id: channel.id.clone(),
-                name: channel.name.clone(),
-                matched_detail: detail_parts.join(", "),
-                is_group: false,
-            });
-        }
-    }
-
-    results
 }
 
 #[cfg(test)]
@@ -777,24 +541,6 @@ mod tests {
         assert_eq!(matches[0].match_start, 0);
         assert_eq!(matches[1].match_start, 4);
         assert_eq!(matches[2].match_start, 8);
-    }
-
-    #[test]
-    fn test_replace_all() {
-        let content = "name: foo\npath: foo/bar\nvalue: foo";
-        let opts = TextSearchOptions::default();
-        let (result, count) = text_replace(content, "foo", "baz", &opts, true);
-        assert_eq!(count, 3);
-        assert_eq!(result, "name: baz\npath: baz/bar\nvalue: baz");
-    }
-
-    #[test]
-    fn test_replace_first() {
-        let content = "a b a b a";
-        let opts = TextSearchOptions::default();
-        let (result, count) = text_replace(content, "a", "X", &opts, false);
-        assert_eq!(count, 1);
-        assert_eq!(result, "X b a b a");
     }
 
     #[test]

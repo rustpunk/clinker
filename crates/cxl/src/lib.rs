@@ -5,5 +5,6 @@ pub mod eval;
 pub mod lexer;
 pub mod module_eval;
 pub mod parser;
+pub mod plan;
 pub mod resolve;
 pub mod typecheck;

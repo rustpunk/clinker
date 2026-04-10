@@ -9,6 +9,8 @@ pub struct PipelineCounters {
     pub total_count: u64,
     pub ok_count: u64,
     pub dlq_count: u64,
+    pub filtered_count: u64,
+    pub distinct_count: u64,
 }
 
 impl PipelineCounters {
@@ -20,6 +22,16 @@ impl PipelineCounters {
     /// Increment dlq_count by n.
     pub fn increment_dlq(&mut self, n: u64) {
         self.dlq_count += n;
+    }
+
+    /// Increment filtered_count by n.
+    pub fn increment_filtered(&mut self, n: u64) {
+        self.filtered_count += n;
+    }
+
+    /// Increment distinct_count by n.
+    pub fn increment_distinct(&mut self, n: u64) {
+        self.distinct_count += n;
     }
 
     /// Snapshot the current counters for sharing with a chunk's parallel evaluation.

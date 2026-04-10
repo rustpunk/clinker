@@ -145,6 +145,9 @@ pub struct WorkspaceState {
     /// Active channel and recent channel list for session restoration.
     #[serde(default)]
     pub channels: Option<ChannelPersistence>,
+    /// Visual theme: "oxide" or "enamel". Defaults to Oxide if missing.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 /// Persisted channel state — active selection and recent list.
@@ -253,15 +256,6 @@ impl Workspace {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "workspace".to_string())
         })
-    }
-
-    /// Make a path relative to the workspace root.
-    #[allow(dead_code)]
-    pub fn relative_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
     }
 
     /// Schema directory path, resolved from manifest or default.
@@ -606,6 +600,7 @@ pub fn save_full_session(
     run_log_expanded: bool,
     activity_bar_visible: bool,
     channel_state: &Option<ChannelState>,
+    theme: KilnTheme,
 ) {
     let Some(ws) = workspace else { return };
 
@@ -624,6 +619,7 @@ pub fn save_full_session(
         run_log_expanded,
         activity_bar_visible,
         channel_state,
+        theme,
     );
     save_workspace_state(&ws.root, &state);
     save_last_workspace(&ws.root);
@@ -647,10 +643,11 @@ pub fn load_last_workspace() -> Option<PathBuf> {
 // ── Session save/restore helpers ────────────────────────────────────────
 
 use crate::file_ops;
-use crate::state::{NavigationContext, PipelineLayoutMode};
+use crate::state::{KilnTheme, NavigationContext, PipelineLayoutMode};
 use crate::tab::TabEntry;
 
 /// Build a WorkspaceState from current app state for persistence.
+#[allow(clippy::too_many_arguments)]
 pub fn build_state_snapshot(
     tabs: &[TabEntry],
     active_file: Option<&str>,
@@ -659,6 +656,7 @@ pub fn build_state_snapshot(
     run_log_expanded: bool,
     activity_bar_visible: bool,
     channel_state: &Option<ChannelState>,
+    theme: KilnTheme,
 ) -> WorkspaceState {
     let open_paths: Vec<String> = tabs
         .iter()
@@ -693,6 +691,7 @@ pub fn build_state_snapshot(
         last_open_directory: None,
         search: None,
         channels,
+        theme: Some(theme.as_data_attr().to_string()),
     }
 }
 
@@ -780,6 +779,7 @@ pub struct SessionInit {
     pub workspace: Option<Workspace>,
     pub context: NavigationContext,
     pub pipeline_layout: PipelineLayoutMode,
+    pub theme: Option<KilnTheme>,
 }
 
 /// Restore the previous session on app startup.
@@ -817,6 +817,7 @@ pub fn restore_session() -> SessionInit {
         workspace: None,
         context: NavigationContext::Pipeline,
         pipeline_layout: PipelineLayoutMode::Hybrid,
+        theme: None,
     }
 }
 
@@ -830,6 +831,11 @@ fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
 
     // Extract navigation state before moving ws
     let (context, pipeline_layout) = parse_navigation_state(&ws.state);
+    let theme = ws
+        .state
+        .theme
+        .as_deref()
+        .map(KilnTheme::from_str_or_default);
 
     let (restored_tabs, active_path) = restore_tabs(&ws.state);
 
@@ -840,6 +846,7 @@ fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
             workspace: Some(ws),
             context,
             pipeline_layout,
+            theme,
         });
     }
 
@@ -866,5 +873,6 @@ fn try_restore_from_workspace_root(ws_root: &Path) -> Option<SessionInit> {
         workspace: Some(ws),
         context,
         pipeline_layout,
+        theme,
     })
 }

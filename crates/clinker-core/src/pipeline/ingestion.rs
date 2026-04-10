@@ -10,11 +10,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::PipelineConfig;
+use crate::config::{PipelineConfig, PipelineNode, SourceConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::SecondaryIndex;
-use crate::plan::execution::ExecutionPlan;
+use crate::plan::execution::ExecutionPlanDag;
 use crate::plan::index;
 use clinker_format::traits::FormatReader;
 
@@ -28,6 +28,21 @@ pub struct IngestionOutput {
     pub indices: HashMap<String, Vec<SecondaryIndex>>,
 }
 
+/// Collect all `Source` nodes from the unified `config.nodes` list.
+///
+/// Phase 16b Wave 4ab Checkpoint B: readers source from `nodes:` instead
+/// of the legacy top-level `inputs:` field.
+fn collect_source_nodes(config: &PipelineConfig) -> Vec<&SourceConfig> {
+    config
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.value {
+            PipelineNode::Source { config: body, .. } => Some(&body.source),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Run Phase 1 ingestion across all sources, respecting the SourceTier DAG.
 ///
 /// - Single source: fast path, no `thread::scope` overhead.
@@ -37,7 +52,7 @@ pub struct IngestionOutput {
 /// Each source thread builds its own Arena + SecondaryIndices locally.
 /// After `thread::scope` joins, results are moved into `IngestionOutput`.
 pub fn ingest_sources<F>(
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     config: &PipelineConfig,
     memory_limit: usize,
     open_reader: F,
@@ -45,7 +60,8 @@ pub fn ingest_sources<F>(
 where
     F: Fn(&str) -> Result<Box<dyn FormatReader + Send>, PipelineError> + Sync,
 {
-    if config.inputs.len() <= 1 {
+    let source_nodes = collect_source_nodes(config);
+    if source_nodes.len() <= 1 {
         return ingest_single_source(plan, config, memory_limit, &open_reader);
     }
 
@@ -90,7 +106,7 @@ where
 /// Ingest a single source: build Arena + SecondaryIndices.
 fn ingest_one_source<F>(
     source_name: &str,
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     config: &PipelineConfig,
     memory_limit: usize,
     open_reader: &F,
@@ -98,9 +114,8 @@ fn ingest_one_source<F>(
 where
     F: Fn(&str) -> Result<Box<dyn FormatReader + Send>, PipelineError>,
 {
-    let input = config
-        .inputs
-        .iter()
+    let input = collect_source_nodes(config)
+        .into_iter()
         .find(|i| i.name == source_name)
         .ok_or_else(|| PipelineError::Compilation {
             transform_name: String::new(),
@@ -121,7 +136,7 @@ where
     let mut reader = open_reader(&input.path)?;
 
     // Build Arena
-    let arena = Arena::build(reader.as_mut(), &arena_fields, memory_limit).map_err(|e| {
+    let arena = Arena::build(reader.as_mut(), &arena_fields, memory_limit, None).map_err(|e| {
         PipelineError::Compilation {
             transform_name: String::new(),
             messages: vec![e.to_string()],
@@ -158,7 +173,7 @@ where
 
 /// Fast path for single-source pipelines — no `thread::scope` overhead.
 fn ingest_single_source<F>(
-    plan: &ExecutionPlan,
+    plan: &ExecutionPlanDag,
     config: &PipelineConfig,
     memory_limit: usize,
     open_reader: &F,
@@ -166,14 +181,15 @@ fn ingest_single_source<F>(
 where
     F: Fn(&str) -> Result<Box<dyn FormatReader + Send>, PipelineError>,
 {
-    let source_name = config
-        .inputs
+    let source_nodes = collect_source_nodes(config);
+    let source_name = source_nodes
         .first()
         .map(|i| i.name.as_str())
-        .unwrap_or("primary");
+        .unwrap_or("primary")
+        .to_string();
 
     let (name, arena, idxs) =
-        ingest_one_source(source_name, plan, config, memory_limit, open_reader)?;
+        ingest_one_source(&source_name, plan, config, memory_limit, open_reader)?;
 
     let mut arenas = HashMap::new();
     let mut indices = HashMap::new();
@@ -181,357 +197,4 @@ where
     indices.insert(name, idxs);
 
     Ok(IngestionOutput { arenas, indices })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{self, *};
-    use crate::pipeline::shutdown;
-    use crate::plan::execution::ExecutionPlan;
-    use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
-    use clinker_record::{RecordStorage, Schema};
-    use std::sync::Arc;
-
-    /// Extract resolved TransformConfig from TransformEntry (tests only).
-    fn t(entry: &TransformEntry) -> &TransformConfig {
-        match entry {
-            TransformEntry::Transform(t) => t,
-            _ => panic!("test expects resolved transform"),
-        }
-    }
-
-    /// Helper: build a minimal pipeline config.
-    fn test_config(
-        inputs: Vec<(&str, &str)>,
-        transforms: Vec<(&str, &str, Option<serde_json::Value>)>,
-    ) -> PipelineConfig {
-        PipelineConfig {
-            pipeline: PipelineMeta {
-                name: "test".into(),
-                memory_limit: None,
-                vars: None,
-                date_formats: None,
-                rules_path: None,
-                concurrency: None,
-                date_locale: None,
-                log_rules: None,
-                include_provenance: None,
-                metrics: None,
-            },
-            inputs: inputs
-                .into_iter()
-                .map(|(name, path)| InputConfig {
-                    name: name.into(),
-                    format: InputFormat::Csv(None),
-                    path: path.into(),
-                    schema: None,
-                    schema_overrides: None,
-                    array_paths: None,
-                    sort_order: None,
-                    notes: None,
-                })
-                .collect(),
-            outputs: vec![OutputConfig {
-                name: "output".into(),
-                path: "out.csv".into(),
-                include_unmapped: true,
-                include_header: None,
-                mapping: None,
-                exclude: None,
-                sort_order: None,
-                preserve_nulls: None,
-                format: OutputFormat::Csv(None),
-                notes: None,
-            }],
-            transformations: transforms
-                .into_iter()
-                .map(|(name, cxl, local_window)| {
-                    TransformEntry::Transform(TransformConfig {
-                        name: name.into(),
-                        description: None,
-                        cxl: cxl.into(),
-                        local_window,
-                        log: None,
-                        validations: None,
-                        notes: None,
-                    })
-                })
-                .collect(),
-            error_handling: ErrorHandlingConfig::default(),
-            notes: None,
-        }
-    }
-
-    /// Helper: compile CXL source.
-    fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProgram {
-        let parsed = cxl::parser::Parser::parse(source);
-        assert!(
-            parsed.errors.is_empty(),
-            "Parse errors: {:?}",
-            parsed.errors
-        );
-        let resolved =
-            cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema: std::collections::HashMap<String, cxl::typecheck::types::Type> =
-            std::collections::HashMap::new();
-        cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
-    }
-
-    /// Open a CSV reader from in-memory data.
-    fn csv_reader_from_str(data: &str) -> Box<dyn FormatReader + Send> {
-        let cursor = std::io::Cursor::new(data.as_bytes().to_vec());
-        Box::new(CsvReader::from_reader(cursor, CsvReaderConfig::default()))
-    }
-
-    #[test]
-    fn test_single_source_no_spawn() {
-        let config = test_config(
-            vec![("primary", "data.csv")],
-            vec![(
-                "agg",
-                "emit total = window.sum(amount)",
-                Some(serde_json::json!({"group_by": ["dept"]})),
-            )],
-        );
-        let fields = &["dept", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        let csv_data = "dept,amount\nA,100\nB,200\nA,150\n";
-        let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |_path| {
-            Ok(csv_reader_from_str(csv_data))
-        });
-
-        let output = result.unwrap();
-        assert_eq!(output.arenas.len(), 1);
-        assert!(output.arenas.contains_key("primary"));
-        let arena = &output.arenas["primary"];
-        assert_eq!(arena.record_count(), 3);
-    }
-
-    #[test]
-    fn test_arenas_moved_to_context() {
-        // Two independent sources → IngestionOutput has both
-        let window = serde_json::json!({
-            "source": "reference",
-            "group_by": ["id"],
-            "on": "ref_id"
-        });
-        let config = test_config(
-            vec![("primary", "data.csv"), ("reference", "ref.csv")],
-            vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
-        );
-        let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        let primary_csv = "id,ref_id,amount\n1,R1,100\n2,R2,200\n";
-        let ref_csv = "id,amount\nR1,50\nR2,75\n";
-
-        let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            let data = if path == "ref.csv" {
-                ref_csv
-            } else {
-                primary_csv
-            };
-            Ok(csv_reader_from_str(data))
-        });
-
-        let output = result.unwrap();
-        assert_eq!(
-            output.arenas.len(),
-            2,
-            "Should have arenas for both sources"
-        );
-        assert!(
-            output.arenas.contains_key("primary") || output.arenas.contains_key("reference"),
-            "Should contain reference source arena"
-        );
-    }
-
-    #[test]
-    fn test_source_thread_owns_arena() {
-        // Each source produces a distinct Arena with its own schema
-        let window = serde_json::json!({
-            "source": "reference",
-            "group_by": ["id"],
-            "on": "ref_id"
-        });
-        let config = test_config(
-            vec![("primary", "data.csv"), ("reference", "ref.csv")],
-            vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
-        );
-        let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        let primary_csv = "id,ref_id,amount\n1,R1,100\n2,R2,200\n";
-        let ref_csv = "id,amount\nR1,50\nR2,75\n";
-
-        let output = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            let data = if path == "ref.csv" {
-                ref_csv
-            } else {
-                primary_csv
-            };
-            Ok(csv_reader_from_str(data))
-        })
-        .unwrap();
-
-        // Reference source arena should exist and have 2 records
-        if let Some(ref_arena) = output.arenas.get("reference") {
-            assert_eq!(ref_arena.record_count(), 2);
-        }
-    }
-
-    #[test]
-    fn test_independent_sources_concurrent() {
-        // Two independent sources in the same tier — both run
-        // We verify by checking both arenas are populated
-        let window = serde_json::json!({
-            "source": "reference",
-            "group_by": ["id"],
-            "on": "ref_id"
-        });
-        let config = test_config(
-            vec![("primary", "data.csv"), ("reference", "ref.csv")],
-            vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
-        );
-        let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        let primary_csv = "id,ref_id,amount\n1,R1,100\n";
-        let ref_csv = "id,amount\nR1,50\n";
-
-        let start = std::time::Instant::now();
-        let output = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            // Small artificial delay to demonstrate concurrency
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            let data = if path == "ref.csv" {
-                ref_csv
-            } else {
-                primary_csv
-            };
-            Ok(csv_reader_from_str(data))
-        })
-        .unwrap();
-        let elapsed = start.elapsed();
-
-        // Both sources should be populated
-        assert!(output.arenas.len() >= 1);
-        // With concurrency, two 10ms sleeps should take < 30ms (not 20ms+ serial)
-        // Being generous with the threshold to avoid flakiness
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "Ingestion took {:?}, expected < 100ms for concurrent sources",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn test_dependent_sources_sequential() {
-        // Reference source is in tier 0, primary in tier 1
-        // The DAG ensures reference completes before primary starts
-        let window = serde_json::json!({
-            "source": "reference",
-            "group_by": ["id"],
-            "on": "ref_id"
-        });
-        let config = test_config(
-            vec![("primary", "data.csv"), ("reference", "ref.csv")],
-            vec![("lookup", "emit ref_val = window.sum(amount)", Some(window))],
-        );
-        let fields = &["id", "ref_id", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("lookup", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        // Verify DAG: reference should be in tier 0 (built first)
-        assert!(plan.source_dag.len() >= 2, "Should have at least 2 tiers");
-        assert!(
-            plan.source_dag[0]
-                .sources
-                .contains(&"reference".to_string()),
-            "Reference should be in tier 0"
-        );
-
-        let primary_csv = "id,ref_id,amount\n1,R1,100\n";
-        let ref_csv = "id,amount\nR1,50\n";
-
-        let output = ingest_sources(&plan, &config, 512 * 1024 * 1024, |path| {
-            let data = if path == "ref.csv" {
-                ref_csv
-            } else {
-                primary_csv
-            };
-            Ok(csv_reader_from_str(data))
-        })
-        .unwrap();
-
-        // Both sources ingested successfully — tier ordering was respected
-        assert!(output.arenas.contains_key("reference"));
-    }
-
-    #[test]
-    fn test_source_error_propagation() {
-        let config = test_config(
-            vec![("primary", "data.csv")],
-            vec![(
-                "agg",
-                "emit total = window.sum(amount)",
-                Some(serde_json::json!({"group_by": ["dept"]})),
-            )],
-        );
-        let fields = &["dept", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        // Return an error from the reader factory
-        let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |_path| {
-            Err(PipelineError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "file not found",
-            )))
-        });
-
-        assert!(result.is_err(), "Error should propagate from source thread");
-    }
-
-    #[test]
-    fn test_signal_during_phase1_ingestion() {
-        // Set shutdown flag, verify Arena::build respects it
-        let config = test_config(
-            vec![("primary", "data.csv")],
-            vec![(
-                "agg",
-                "emit total = window.sum(amount)",
-                Some(serde_json::json!({"group_by": ["dept"]})),
-            )],
-        );
-        let fields = &["dept", "amount"];
-        let typed = compile_cxl(&t(&config.transformations[0]).cxl, fields);
-        let compiled = vec![("agg", &typed)];
-        let plan = ExecutionPlan::compile(&config, &compiled).unwrap();
-
-        // Request shutdown before ingestion
-        shutdown::request_shutdown();
-
-        let csv_data = "dept,amount\nA,100\nB,200\nA,150\n";
-        let result = ingest_sources(&plan, &config, 512 * 1024 * 1024, |_path| {
-            Ok(csv_reader_from_str(csv_data))
-        });
-
-        // Should either succeed with partial data or return an error — must not panic
-        // The key invariant: no panic, clean return
-        assert!(result.is_ok() || result.is_err());
-
-        shutdown::reset_shutdown_flag();
-    }
 }

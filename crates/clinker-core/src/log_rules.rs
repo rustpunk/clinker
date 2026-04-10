@@ -24,7 +24,7 @@ pub struct LogRulesFile {
 /// Load external log rules from a YAML file.
 pub fn load_log_rules(path: &Path) -> Result<LogRulesFile, ConfigError> {
     let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-    let rules: LogRulesFile = serde_saphyr::from_str(&content)?;
+    let rules: LogRulesFile = crate::yaml::from_str(&content)?;
     Ok(rules)
 }
 

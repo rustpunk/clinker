@@ -19,6 +19,7 @@ pub enum JsonOutputMode {
     Ndjson,
 }
 
+#[derive(Clone)]
 pub struct JsonWriterConfig {
     pub format: JsonOutputMode,
     pub pretty: bool,
@@ -145,6 +146,13 @@ fn clinker_to_json(val: &Value) -> serde_json::Value {
         Value::Date(d) => Jv::String(d.to_string()),
         Value::DateTime(dt) => Jv::String(dt.to_string()),
         Value::Array(arr) => Jv::Array(arr.iter().map(clinker_to_json).collect()),
+        Value::Map(m) => {
+            let obj = m
+                .iter()
+                .map(|(k, v)| (k.to_string(), clinker_to_json(v)))
+                .collect();
+            Jv::Object(obj)
+        }
     }
 }
 

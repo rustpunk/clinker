@@ -58,16 +58,6 @@ pub struct Template {
     pub format_category: String,
 }
 
-/// A guide annotation overlay for template-instantiated pipelines.
-#[derive(Clone, Debug)]
-pub struct GuideAnnotation {
-    /// 1-based line number in the YAML text.
-    pub line: usize,
-    /// Hint text to display.
-    #[allow(dead_code)]
-    pub hint: String,
-}
-
 // ── Bundled templates (embedded at compile time) ────────────────────────
 
 const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
@@ -95,7 +85,7 @@ struct TemplateYaml {
 /// Extracts the `_template` metadata block. Returns `None` if the YAML
 /// doesn't contain a `_template` block.
 pub fn parse_template(yaml: &str, source: TemplateSource) -> Option<Template> {
-    let parsed: TemplateYaml = serde_saphyr::from_str(yaml).ok()?;
+    let parsed: TemplateYaml = clinker_core::yaml::from_str(yaml).ok()?;
     let format_category = detect_format_category(yaml);
 
     Some(Template {
@@ -204,141 +194,6 @@ pub fn strip_template_block(yaml: &str) -> String {
     result.trim_start_matches('\n').to_string()
 }
 
-// ── Pipeline-from-schema generation (spec §S4.7) ────────────────────────
-
-/// Generate a pipeline YAML scaffold from a schema.
-///
-/// Creates a pipeline with: source (format + placeholder path + schema link),
-/// identity map stage with all fields, sink with same format.
-#[allow(dead_code)]
-pub fn generate_pipeline_from_schema(schema: &clinker_schema::SourceSchema) -> String {
-    let name = &schema.metadata.name;
-    let format = schema.metadata.format.label();
-    let schema_path = schema.path.display();
-
-    // Determine clinker format type
-    let clinker_format = match schema.metadata.format {
-        clinker_schema::SourceFormat::Csv | clinker_schema::SourceFormat::Tsv => "csv",
-        clinker_schema::SourceFormat::Json | clinker_schema::SourceFormat::Jsonl => "json",
-        clinker_schema::SourceFormat::Xml => "xml",
-        clinker_schema::SourceFormat::Parquet => "csv", // fallback
-    };
-
-    let mut yaml = String::new();
-    yaml.push_str(&format!("# Auto-generated from {schema_path}\n"));
-    yaml.push_str(&format!("pipeline:\n  name: {name}-pipeline\n\n"));
-
-    // Input
-    yaml.push_str("inputs:\n");
-    yaml.push_str(&format!("  - name: {name}\n"));
-    yaml.push_str(&format!("    type: {clinker_format}\n"));
-    yaml.push_str(&format!("    path: \"./data/{name}_*.{format}\"\n"));
-    yaml.push_str(&format!("    schema: {schema_path}\n"));
-
-    if clinker_format == "csv" {
-        yaml.push_str("    options:\n      has_header: true\n");
-    }
-    if clinker_format == "xml"
-        && let Some(ref elem) = schema.metadata.record_element
-    {
-        yaml.push_str(&format!("    options:\n      record_element: {elem}\n"));
-    }
-
-    // Identity map transformation
-    yaml.push_str("\ntransformations:\n");
-    yaml.push_str("  - name: select_fields\n");
-    yaml.push_str("    cxl: |\n");
-
-    let top_level_fields: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
-
-    for field in &top_level_fields {
-        let clean = field.trim_start_matches('@');
-        yaml.push_str(&format!("      emit {clean} = {clean}\n"));
-    }
-
-    // Output
-    yaml.push_str("\noutputs:\n");
-    yaml.push_str(&format!("  - name: {name}_output\n"));
-    yaml.push_str(&format!("    type: {clinker_format}\n"));
-    yaml.push_str(&format!("    path: \"./output/{name}_output.{format}\"\n"));
-
-    yaml
-}
-
-// ── Guide annotations (spec §S4.6) ──────────────────────────────────────
-
-/// Generate guide annotations for a template-instantiated pipeline.
-///
-/// If the template has `hints`, map them to line numbers in the stripped YAML.
-/// If no hints, auto-generate for common placeholder patterns.
-pub fn generate_guide_annotations(
-    template: &Template,
-    stripped_yaml: &str,
-) -> Vec<GuideAnnotation> {
-    if !template.metadata.hints.is_empty() {
-        return generate_from_hints(&template.metadata.hints, stripped_yaml);
-    }
-
-    // Auto-generate: look for obvious placeholder values
-    auto_generate_annotations(stripped_yaml)
-}
-
-/// Generate annotations from explicit template hints.
-fn generate_from_hints(hints: &HashMap<String, String>, yaml: &str) -> Vec<GuideAnnotation> {
-    let mut annotations = Vec::new();
-
-    for (yaml_path, hint_text) in hints {
-        // Find the line that contains this path's leaf key
-        let leaf_key = yaml_path
-            .split('.')
-            .next_back()
-            .and_then(|s| s.split('[').next())
-            .unwrap_or(yaml_path);
-
-        for (idx, line) in yaml.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with(&format!("{leaf_key}:"))
-                || trimmed.starts_with(&format!("{leaf_key} "))
-            {
-                annotations.push(GuideAnnotation {
-                    line: idx + 1,
-                    hint: hint_text.clone(),
-                });
-                break; // First match only per hint
-            }
-        }
-    }
-
-    annotations.sort_by_key(|a| a.line);
-    annotations
-}
-
-/// Auto-generate annotations for common placeholder patterns.
-fn auto_generate_annotations(yaml: &str) -> Vec<GuideAnnotation> {
-    let mut annotations = Vec::new();
-    let placeholder_patterns = [
-        ("./data/input", "replace with your source path"),
-        ("./data/primary", "replace with your primary source path"),
-        ("./data/lookup", "replace with your lookup source path"),
-        ("./output/", "replace with your output path"),
-        ("\"\"", "provide a value"),
-    ];
-
-    for (idx, line) in yaml.lines().enumerate() {
-        for (pattern, hint) in &placeholder_patterns {
-            if line.contains(pattern) {
-                annotations.push(GuideAnnotation {
-                    line: idx + 1,
-                    hint: hint.to_string(),
-                });
-                break; // One annotation per line max
-            }
-        }
-    }
-
-    annotations
-}
-
 /// All available format categories for gallery filtering.
 pub const FORMAT_CATEGORIES: &[&str] = &["All", "CSV", "JSON", "XML", "Multi"];
 
@@ -419,81 +274,5 @@ inputs:
         assert!(format_filter_matches("CSV", "csv"));
         assert!(!format_filter_matches("CSV", "json"));
         assert!(format_filter_matches("JSON", "json"));
-    }
-
-    #[test]
-    fn test_generate_pipeline_from_schema() {
-        let schema_yaml = r#"
-_schema:
-  name: customers
-  format: csv
-  description: "Customer data"
-
-fields:
-  - name: id
-    type: int
-    nullable: false
-  - name: email
-    type: string
-  - name: status
-    type: string
-"#;
-        let schema = clinker_schema::parse_schema(
-            schema_yaml,
-            std::path::Path::new("schemas/customers.schema.yaml"),
-        )
-        .unwrap();
-
-        let yaml = generate_pipeline_from_schema(&schema);
-
-        assert!(yaml.contains("name: customers-pipeline"));
-        assert!(yaml.contains("type: csv"));
-        assert!(yaml.contains("schema: schemas/customers.schema.yaml"));
-        assert!(yaml.contains("emit id = id"));
-        assert!(yaml.contains("emit email = email"));
-        assert!(yaml.contains("emit status = status"));
-        assert!(yaml.contains("has_header: true"));
-    }
-
-    #[test]
-    fn test_guide_annotations_from_hints() {
-        let yaml = include_str!("templates/csv_transform.yaml");
-        let template = parse_template(yaml, TemplateSource::Bundled).unwrap();
-        let stripped = strip_template_block(yaml);
-        let annotations = generate_guide_annotations(&template, &stripped);
-
-        // Should have annotations for the hints defined in csv_transform.yaml
-        assert!(!annotations.is_empty());
-        // Check that path hint was found
-        assert!(annotations.iter().any(|a| a.hint.contains("source path")));
-    }
-
-    #[test]
-    fn test_guide_annotations_auto_generate() {
-        let yaml = r#"_template:
-  name: "Bare"
-  description: "No hints"
-
-pipeline:
-  name: test
-
-inputs:
-  - name: source
-    type: csv
-    path: "./data/input.csv"
-
-outputs:
-  - name: dest
-    type: csv
-    path: "./output/result.csv"
-"#;
-        let template = parse_template(yaml, TemplateSource::Bundled).unwrap();
-        let stripped = strip_template_block(yaml);
-        let annotations = generate_guide_annotations(&template, &stripped);
-
-        // Auto-generated: should detect ./data/input and ./output/ placeholders
-        assert!(annotations.len() >= 2);
-        assert!(annotations.iter().any(|a| a.hint.contains("source path")));
-        assert!(annotations.iter().any(|a| a.hint.contains("output path")));
     }
 }

@@ -18,4 +18,4 @@ transformations:
   - name: normalize_names
     cxl: |
       emit full_name = first_name.trim() + " " + last_name.trim()
-      emit name_key = lower(first_name.trim() + "_" + last_name.trim())
+      emit name_key = (first_name.trim() + "_" + last_name.trim()).lower()

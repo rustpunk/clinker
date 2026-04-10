@@ -1,121 +1,93 @@
 /// Derives canvas-renderable stage data from a `PipelineConfig`.
 ///
-/// The canvas renders `StageView` nodes, not raw `PipelineConfig` structs.
-/// This module converts inputs → source nodes, transforms → transform nodes,
-/// outputs → sink nodes, and auto-layouts them horizontally.
-///
-/// Compositions are rendered in two modes:
-/// - **Inline** (≤4 transforms): individual transform nodes with `from_composition` metadata
-///   and a `CompositionGroup` boundary marker.
-/// - **Collapsed** (5+ transforms): a single `StageKind::Composition` node that can drill in.
-use clinker_core::composition::{CompositionOrigin, ResolvedComposition};
-use clinker_core::config::PipelineConfig;
+/// Phase 16b Task 16b.5: the canvas dispatches on `PipelineNode` variants
+/// directly. Every variant — Source, Transform, Aggregate, Route, Merge,
+/// Output, Composition — maps 1:1 to a [`StageKind`] via an exhaustive
+/// `match` in [`stage_kind_for_node`], so adding a new variant to
+/// `PipelineNode` is a compile-time break. Composition renders as a
+/// placeholder badge until Phase 16c supplies real rendering.
+use clinker_core::config::node_header::NodeInput;
+use clinker_core::config::{PipelineConfig, PipelineNode};
 
-/// Node height constant (matches CSS `.kiln-node` rendered height).
 pub const NODE_HEIGHT: f32 = 92.0;
-/// Node width constant (matches CSS `.kiln-node` width).
 pub const NODE_WIDTH: f32 = 160.0;
 
-/// What kind of pipeline stage this node represents.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StageKind {
     Source,
     Transform,
+    Aggregate,
+    Route,
+    Merge,
     Output,
-    /// A collapsed composition node (5+ transforms).
-    Composition(CompositionNodeMeta),
-    /// A node that failed to parse — shown as a red error placeholder.
+    Composition,
     Error,
 }
 
 impl StageKind {
-    /// Rustpunk accent colour hex for this stage kind.
-    pub fn accent_color(&self) -> &'static str {
+    pub fn kind_attr(&self) -> &'static str {
         match self {
-            StageKind::Source => "#43B3AE",         // verdigris
-            StageKind::Transform => "#C75B2A",      // ember
-            StageKind::Output => "#B7410E",         // oxide-red
-            StageKind::Composition(_) => "#43B3AE", // verdigris (same as source)
-            StageKind::Error => "#CC3333",          // danger red
+            StageKind::Source => "source",
+            StageKind::Transform => "transform",
+            StageKind::Aggregate => "aggregate",
+            StageKind::Route => "route",
+            StageKind::Merge => "merge",
+            StageKind::Output => "output",
+            StageKind::Composition => "composition",
+            StageKind::Error => "error",
         }
     }
 
-    /// Short badge label for the node card.
     pub fn badge_label(&self) -> &'static str {
         match self {
             StageKind::Source => "SOURCE",
             StageKind::Transform => "TRANSFORM",
+            StageKind::Aggregate => "AGGREGATE",
+            StageKind::Route => "ROUTE",
+            StageKind::Merge => "MERGE",
             StageKind::Output => "OUTPUT",
-            StageKind::Composition(_) => "COMPOSITION",
+            StageKind::Composition => "COMPOSITION",
             StageKind::Error => "ERROR",
         }
     }
 }
 
-/// Metadata for a collapsed composition node on the canvas.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CompositionNodeMeta {
-    /// Path to the `.comp.yaml` file (relative to workspace root).
-    pub path: String,
-    /// Display name from composition metadata.
-    pub name: String,
-    /// Version string from composition metadata.
-    pub version: Option<String>,
-    /// Number of transformations in this composition.
-    pub transform_count: usize,
-    /// Number of overrides applied from the `_import` directive.
-    pub override_count: usize,
+/// Exhaustive compile-time variant dispatch: classify a [`PipelineNode`]
+/// into its canvas [`StageKind`]. Adding a new variant to `PipelineNode`
+/// without updating this match is a build error.
+pub fn stage_kind_for_node(node: &PipelineNode) -> StageKind {
+    match node {
+        PipelineNode::Source { .. } => StageKind::Source,
+        PipelineNode::Transform { .. } => StageKind::Transform,
+        PipelineNode::Aggregate { .. } => StageKind::Aggregate,
+        PipelineNode::Route { .. } => StageKind::Route,
+        PipelineNode::Merge { .. } => StageKind::Merge,
+        PipelineNode::Output { .. } => StageKind::Output,
+        PipelineNode::Composition { .. } => StageKind::Composition,
+    }
 }
 
-/// Inline composition group boundary — marks a range of stages that came
-/// from the same composition (≤4 transforms, rendered inline).
-#[derive(Clone, Debug, PartialEq)]
-pub struct CompositionGroup {
-    /// Composition path.
-    pub path: String,
-    /// Display name.
-    pub name: String,
-    /// Version string.
-    pub version: Option<String>,
-    /// Number of overrides.
-    pub override_count: usize,
-    /// Canvas X position of the group boundary (left edge of first node).
-    pub x: f32,
-    /// Canvas Y position of the group boundary.
-    pub y: f32,
-    /// Total width of the group (all nodes + gaps).
-    pub width: f32,
-    /// Index range of stages in the `StageView` vec that belong to this group.
-    pub stage_range: (usize, usize),
+fn node_input_name(ni: &NodeInput) -> &str {
+    match ni {
+        NodeInput::Single(s) => s.as_str(),
+        NodeInput::Port { node, .. } => node.as_str(),
+    }
 }
 
-/// A canvas-renderable pipeline stage derived from `PipelineConfig`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageView {
-    /// Unique ID (the stage name from the config). Used as RSX key.
     pub id: String,
-    /// Display label (same as id for now).
     pub label: String,
-    /// What kind of stage (determines accent colour and badge).
     pub kind: StageKind,
-    /// Subtitle shown below the label (path for sources/outputs, CXL preview for transforms).
     pub subtitle: String,
-    /// Canvas world-space X position.
     pub canvas_x: f32,
-    /// Canvas world-space Y position.
     pub canvas_y: f32,
-    /// CXL source text (only for Transform stages).
     pub cxl_source: Option<String>,
-    /// Optional description from the config.
     pub description: Option<String>,
-    /// If this transform came from a composition (for grouping, badges, and override editing).
-    pub from_composition: Option<CompositionOrigin>,
-    /// Error message for `StageKind::Error` nodes (partial parse failures).
     pub error_message: Option<String>,
 }
 
 impl StageView {
-    /// Centre of the right-side output port — connector source point.
     pub fn port_out(&self) -> (f32, f32) {
         (
             self.canvas_x + NODE_WIDTH,
@@ -123,299 +95,233 @@ impl StageView {
         )
     }
 
-    /// Centre of the left-side input port — connector target point.
     pub fn port_in(&self) -> (f32, f32) {
         (self.canvas_x, self.canvas_y + NODE_HEIGHT / 2.0)
     }
 }
 
-/// Horizontal spacing between nodes in the auto-layout.
 const NODE_GAP: f32 = 80.0;
-/// Left margin for the first node.
 const LEFT_MARGIN: f32 = 60.0;
-/// Base Y position for nodes. Staggered slightly for visual interest.
 const BASE_Y: f32 = 120.0;
-/// Y stagger amount (alternates +/- for adjacent nodes).
 const STAGGER_Y: f32 = 20.0;
-/// Vertical gap between stacked output nodes.
 const STACK_GAP: f32 = 24.0;
-/// Vertical offset for secondary inputs above the transform chain.
 const INPUT_Y_OFFSET: f32 = 30.0;
 
-/// Maximum transforms in a composition that can be inline-expanded.
-/// Compositions with more than this many transforms use drill-in instead.
-pub const INLINE_THRESHOLD: usize = 4;
-
-/// Result of deriving a pipeline view with composition awareness.
 pub struct PipelineView {
     pub stages: Vec<StageView>,
-    pub composition_groups: Vec<CompositionGroup>,
-    /// Explicit connections between stages: `(from_idx, to_idx)` into `stages`.
+    /// Explicit connections between stages: `(from_idx, to_idx)`.
     pub connections: Vec<(usize, usize)>,
 }
 
-/// Derive canvas nodes from a `PipelineConfig` with composition metadata.
-///
-/// Flowchart layout: transforms form the horizontal spine; inputs float
-/// above-left of the first transform that uses them; outputs fan out to the
-/// right of the last transform.
-///
-/// All compositions are collapsed by default. Compositions whose path is in
-/// `expanded` are rendered inline with a group boundary.
-pub fn derive_pipeline_view(
-    config: &PipelineConfig,
-    compositions: &[ResolvedComposition],
-    expanded: &std::collections::HashSet<String>,
-) -> PipelineView {
-    let mut transform_stages = Vec::new();
-    let mut groups = Vec::new();
+/// Phase 16b Task 16b.5: walk `config.nodes` in declaration order and
+/// dispatch on `PipelineNode` variant to produce a [`StageView`] for every
+/// node. Connections are derived from each consumer's `input:` / `inputs:`
+/// header field. The match arms here mirror [`stage_kind_for_node`]; both
+/// are compile-time exhaustive, so adding a new `PipelineNode` variant is
+/// a build error.
+pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
+    use std::collections::HashMap;
 
-    // ── Phase A: Layout transforms (horizontal spine) ───────────────────────
-    // Leave room for the primary input at LEFT_MARGIN.
-    let transform_x_start = if config.inputs.is_empty() {
-        LEFT_MARGIN
-    } else {
-        LEFT_MARGIN + NODE_WIDTH + NODE_GAP
-    };
-    let mut x = transform_x_start;
-    let mut idx = 0;
+    // Column = 1 + max column of inputs; sources sit in column 0.
+    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut cols: Vec<usize> = Vec::with_capacity(config.nodes.len());
+    for (idx, spanned) in config.nodes.iter().enumerate() {
+        let node = &spanned.value;
+        name_to_idx.insert(node.name().to_string(), idx);
+        let col = match node {
+            PipelineNode::Source { .. } => 0,
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|ni| name_to_idx.get(node_input_name(ni)).copied())
+                .map(|i| cols[i] + 1)
+                .max()
+                .unwrap_or(1),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => name_to_idx
+                .get(node_input_name(&header.input))
+                .copied()
+                .map(|i| cols[i] + 1)
+                .unwrap_or(1),
+        };
+        cols.push(col);
+    }
 
-    let transforms: Vec<_> = config.transforms().collect();
-    let mut transform_idx = 0;
-    while transform_idx < transforms.len() {
-        let transform = transforms[transform_idx];
-
-        if let Some((comp, origin_idx)) = find_composition(transform, compositions) {
-            if expanded.contains(&comp.path) {
-                let group_start_idx = transform_stages.len();
-                let group_start_x = x;
-
-                for i in 0..comp.transform_names.len() {
-                    let t = transforms[transform_idx + i];
-                    let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
-                    let subtitle = cxl_subtitle(&t.cxl);
-                    let origin = comp.origins.get(origin_idx + i).cloned();
-
-                    transform_stages.push(StageView {
-                        id: t.name.clone(),
-                        label: t.name.clone(),
-                        kind: StageKind::Transform,
-                        subtitle,
-                        canvas_x: x,
-                        canvas_y: y,
-                        cxl_source: Some(t.cxl.clone()),
-                        description: t.description.clone(),
-                        from_composition: origin,
-                        error_message: None,
-                    });
-                    x += NODE_WIDTH + NODE_GAP;
-                    idx += 1;
-                }
-
-                let group_end_idx = transform_stages.len() - 1;
-                let group_width =
-                    (comp.transform_names.len() as f32) * (NODE_WIDTH + NODE_GAP) - NODE_GAP;
-
-                groups.push(CompositionGroup {
-                    path: comp.path.clone(),
-                    name: comp.meta.name.clone(),
-                    version: comp.meta.version.clone(),
-                    override_count: comp.override_count,
-                    x: group_start_x,
-                    y: BASE_Y - 20.0,
-                    width: group_width,
-                    // Will be adjusted after inputs are prepended to stages vec.
-                    stage_range: (group_start_idx, group_end_idx),
-                });
-
-                transform_idx += comp.transform_names.len();
-            } else {
-                let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
-                transform_stages.push(StageView {
-                    id: format!("_comp_{}", comp.path),
-                    label: comp.meta.name.clone(),
-                    kind: StageKind::Composition(CompositionNodeMeta {
-                        path: comp.path.clone(),
-                        name: comp.meta.name.clone(),
-                        version: comp.meta.version.clone(),
-                        transform_count: comp.transform_names.len(),
-                        override_count: comp.override_count,
-                    }),
-                    subtitle: format!(
-                        "{} transforms{}",
-                        comp.transform_names.len(),
-                        if comp.override_count > 0 {
-                            format!(", {} override(s)", comp.override_count)
-                        } else {
-                            String::new()
-                        }
-                    ),
-                    canvas_x: x,
-                    canvas_y: y,
-                    cxl_source: None,
-                    description: comp.meta.description.clone(),
-                    from_composition: None,
-                    error_message: None,
-                });
-                x += NODE_WIDTH + NODE_GAP;
-                idx += 1;
-                transform_idx += comp.transform_names.len();
-            }
+    // Per-column row counter for vertical stacking.
+    let mut col_rows: HashMap<usize, usize> = HashMap::new();
+    let mut stages: Vec<StageView> = Vec::with_capacity(config.nodes.len());
+    for (idx, spanned) in config.nodes.iter().enumerate() {
+        let node = &spanned.value;
+        let col = cols[idx];
+        let row = *col_rows
+            .entry(col)
+            .and_modify(|r| *r += 1)
+            .or_insert(0_usize);
+        let x = LEFT_MARGIN + (col as f32) * (NODE_WIDTH + NODE_GAP);
+        let stagger = if col.is_multiple_of(2) {
+            0.0
         } else {
-            let y = BASE_Y + if idx % 2 == 0 { 0.0 } else { STAGGER_Y };
-            let subtitle = cxl_subtitle(&transform.cxl);
-            transform_stages.push(StageView {
-                id: transform.name.clone(),
-                label: transform.name.clone(),
-                kind: StageKind::Transform,
-                subtitle,
-                canvas_x: x,
-                canvas_y: y,
-                cxl_source: Some(transform.cxl.clone()),
-                description: transform.description.clone(),
+            STAGGER_Y
+        };
+        let y = BASE_Y + (row as f32) * (NODE_HEIGHT + STACK_GAP) + stagger;
+        stages.push(build_stage_view(node, x, y));
+    }
 
-                from_composition: None,
-                error_message: None,
-            });
-            x += NODE_WIDTH + NODE_GAP;
-            idx += 1;
-            transform_idx += 1;
+    // Connections: resolve each consumer's input header reference.
+    let mut connections: Vec<(usize, usize)> = Vec::new();
+    for (idx, spanned) in config.nodes.iter().enumerate() {
+        match &spanned.value {
+            PipelineNode::Source { .. } => {}
+            PipelineNode::Merge { header, .. } => {
+                for ni in &header.inputs {
+                    if let Some(&from) = name_to_idx.get(node_input_name(ni)) {
+                        connections.push((from, idx));
+                    }
+                }
+            }
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => {
+                if let Some(&from) = name_to_idx.get(node_input_name(&header.input)) {
+                    connections.push((from, idx));
+                }
+            }
         }
     }
 
-    // ── Phase B: Map each input to its target transform ─────────────────────
-    // First input → first transform (primary stream).
-    // Others → scan transforms for local_window.source match.
-    let input_targets = map_inputs_to_transforms(config, &transforms);
-
-    // ── Phase C: Position inputs ────────────────────────────────────────────
-    let mut input_stages = Vec::new();
-    // Track how many secondary inputs already target each transform (for stacking).
-    let mut secondary_stack_count: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
-
-    for (input_idx, input) in config.inputs.iter().enumerate() {
-        let target_t_idx = input_targets[input_idx];
-
-        let (ix, iy) = if input_idx == 0 && !transform_stages.is_empty() {
-            // Primary input: on the main line, left of the first transform.
-            (LEFT_MARGIN, transform_stages[0].canvas_y)
-        } else if !transform_stages.is_empty() && target_t_idx < transform_stages.len() {
-            // Secondary input: above-left of its target transform.
-            let target = &transform_stages[target_t_idx];
-            let stack_n = secondary_stack_count.entry(target_t_idx).or_insert(0);
-            let iy = target.canvas_y
-                - NODE_HEIGHT
-                - INPUT_Y_OFFSET
-                - (*stack_n as f32) * (NODE_HEIGHT + STACK_GAP);
-            *stack_n += 1;
-            (target.canvas_x - NODE_WIDTH - NODE_GAP / 2.0, iy)
-        } else {
-            // No transforms — just place at LEFT_MARGIN.
-            (
-                LEFT_MARGIN,
-                BASE_Y + (input_idx as f32) * (NODE_HEIGHT + STACK_GAP),
-            )
-        };
-
-        input_stages.push(StageView {
-            id: input.name.clone(),
-            label: input.name.clone(),
-            kind: StageKind::Source,
-            subtitle: input.path.clone(),
-            canvas_x: ix,
-            canvas_y: iy,
-            cxl_source: None,
-            description: None,
-            from_composition: None,
-            error_message: None,
-        });
-    }
-
-    // ── Phase D: Position outputs ───────────────────────────────────────────
-    let mut output_stages = Vec::new();
-    let output_x = if transform_stages.is_empty() {
-        LEFT_MARGIN + NODE_WIDTH + NODE_GAP
-    } else {
-        let last = transform_stages.last().unwrap();
-        last.canvas_x + NODE_WIDTH + NODE_GAP
-    };
-    let output_count = config.outputs.len();
-    let center_y = BASE_Y + NODE_HEIGHT / 2.0 + STAGGER_Y / 2.0;
-    let output_ys = stack_y_positions(output_count, center_y);
-
-    for (i, output) in config.outputs.iter().enumerate() {
-        output_stages.push(StageView {
-            id: output.name.clone(),
-            label: output.name.clone(),
-            kind: StageKind::Output,
-            subtitle: output.path.clone(),
-            canvas_x: output_x,
-            canvas_y: output_ys[i],
-            cxl_source: None,
-            description: None,
-            from_composition: None,
-            error_message: None,
-        });
-    }
-
-    // ── Phase E: Build connections ──────────────────────────────────────────
-    let input_count = input_stages.len();
-    let transform_count = transform_stages.len();
-    let connections = build_connections(input_count, &input_targets, transform_count, output_count);
-
-    // ── Phase F: Assemble stages vec (inputs ++ transforms ++ outputs) ──────
-    // Adjust composition group stage_range indices (they were relative to
-    // transform_stages, now offset by input_count).
-    for group in &mut groups {
-        group.stage_range.0 += input_count;
-        group.stage_range.1 += input_count;
-    }
-
-    let mut stages = Vec::with_capacity(input_count + transform_count + output_count);
-    stages.extend(input_stages);
-    stages.extend(transform_stages);
-    stages.extend(output_stages);
-
     PipelineView {
         stages,
-        composition_groups: groups,
         connections,
     }
 }
 
-/// Map each input to the index of the transform stage it should connect to.
-///
-/// First input → index 0 (first transform, primary stream).
-/// Other inputs → scan transforms for `local_window.source` match; default to 0.
-fn map_inputs_to_transforms(
-    config: &PipelineConfig,
-    transforms: &[&clinker_core::config::TransformConfig],
-) -> Vec<usize> {
-    config
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            if i == 0 || transforms.is_empty() {
-                return 0;
+/// Variant-dispatched [`StageView`] constructor. Every arm is exhaustive;
+/// adding a new `PipelineNode` variant breaks the build here.
+fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
+    let kind = stage_kind_for_node(node);
+    match node {
+        PipelineNode::Source {
+            header,
+            config: body,
+        } => StageView {
+            id: header.name.clone(),
+            label: header.name.clone(),
+            kind,
+            subtitle: body.source.path.clone(),
+            canvas_x: x,
+            canvas_y: y,
+            cxl_source: None,
+            description: header.description.clone(),
+            error_message: None,
+        },
+        PipelineNode::Transform {
+            header,
+            config: body,
+        } => {
+            let cxl_src: &str = body.cxl.as_ref();
+            StageView {
+                id: header.name.clone(),
+                label: header.name.clone(),
+                kind,
+                subtitle: cxl_subtitle(cxl_src),
+                canvas_x: x,
+                canvas_y: y,
+                cxl_source: Some(cxl_src.to_string()),
+                description: header.description.clone(),
+                error_message: None,
             }
-            // Scan transforms for local_window.source matching this input name.
-            transforms
-                .iter()
-                .position(|t| {
-                    t.local_window
-                        .as_ref()
-                        .and_then(|lw| lw.get("source"))
-                        .and_then(|v| v.as_str())
-                        == Some(&input.name)
-                })
-                .unwrap_or(0)
-        })
-        .collect()
+        }
+        PipelineNode::Aggregate {
+            header,
+            config: body,
+        } => {
+            let cxl_src: &str = body.cxl.as_ref();
+            let subtitle = if body.group_by.is_empty() {
+                cxl_subtitle(cxl_src)
+            } else {
+                format!("by {}", body.group_by.join(", "))
+            };
+            StageView {
+                id: header.name.clone(),
+                label: header.name.clone(),
+                kind,
+                subtitle,
+                canvas_x: x,
+                canvas_y: y,
+                cxl_source: Some(cxl_src.to_string()),
+                description: header.description.clone(),
+                error_message: None,
+            }
+        }
+        PipelineNode::Route {
+            header,
+            config: body,
+        } => {
+            let subtitle = format!(
+                "{} branch{} → {}",
+                body.conditions.len(),
+                if body.conditions.len() == 1 { "" } else { "es" },
+                body.default
+            );
+            StageView {
+                id: header.name.clone(),
+                label: header.name.clone(),
+                kind,
+                subtitle,
+                canvas_x: x,
+                canvas_y: y,
+                cxl_source: None,
+                description: header.description.clone(),
+                error_message: None,
+            }
+        }
+        PipelineNode::Merge { header, .. } => StageView {
+            id: header.name.clone(),
+            label: header.name.clone(),
+            kind,
+            subtitle: format!("{} inputs", header.inputs.len()),
+            canvas_x: x,
+            canvas_y: y,
+            cxl_source: None,
+            description: header.description.clone(),
+            error_message: None,
+        },
+        PipelineNode::Output {
+            header,
+            config: body,
+        } => StageView {
+            id: header.name.clone(),
+            label: header.name.clone(),
+            kind,
+            subtitle: body.output.path.clone(),
+            canvas_x: x,
+            canvas_y: y,
+            cxl_source: None,
+            description: header.description.clone(),
+            error_message: None,
+        },
+        PipelineNode::Composition {
+            header,
+            config: body,
+        } => StageView {
+            id: header.name.clone(),
+            label: header.name.clone(),
+            kind,
+            subtitle: format!("use: {} (Phase 16c)", body.r#use.display()),
+            canvas_x: x,
+            canvas_y: y,
+            cxl_source: None,
+            description: header.description.clone(),
+            error_message: None,
+        },
+    }
 }
 
-/// Compute Y positions for a vertical stack of `count` nodes centered on `center_y`.
 fn stack_y_positions(count: usize, center_y: f32) -> Vec<f32> {
     if count == 0 {
         return Vec::new();
@@ -427,9 +333,6 @@ fn stack_y_positions(count: usize, center_y: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Build connection pairs given stage layout.
-///
-/// Stages vec order: `[inputs..., transforms..., outputs...]`.
 fn build_connections(
     input_count: usize,
     input_targets: &[usize],
@@ -437,26 +340,22 @@ fn build_connections(
     output_count: usize,
 ) -> Vec<(usize, usize)> {
     let mut conns = Vec::new();
-    let t_base = input_count; // first transform index in stages vec
+    let t_base = input_count;
 
     if transform_count > 0 {
-        // Each input → its target transform.
         for (i, &target) in input_targets.iter().enumerate() {
             let target_stage = t_base + target.min(transform_count - 1);
             conns.push((i, target_stage));
         }
-        // Sequential transform chain.
         for i in 0..transform_count - 1 {
             conns.push((t_base + i, t_base + i + 1));
         }
-        // Last transform → each output.
         let last_t = t_base + transform_count - 1;
         let o_base = t_base + transform_count;
         for j in 0..output_count {
             conns.push((last_t, o_base + j));
         }
     } else {
-        // No transforms — connect each input to each output directly.
         let o_base = input_count;
         for i in 0..input_count {
             for j in 0..output_count {
@@ -468,124 +367,18 @@ fn build_connections(
     conns
 }
 
-/// Derive a drill-in view for a composition — renders its transforms as
-/// top-level stages for the canvas to display.
-pub fn derive_composition_drill_view(
-    config: &PipelineConfig,
-    compositions: &[ResolvedComposition],
-    composition_path: &str,
-) -> PipelineView {
-    let mut stages = Vec::new();
-    let mut x = LEFT_MARGIN;
-
-    let comp = compositions.iter().find(|c| c.path == composition_path);
-    let Some(comp) = comp else {
-        return PipelineView {
-            stages: Vec::new(),
-            composition_groups: Vec::new(),
-            connections: Vec::new(),
-        };
-    };
-
-    let transforms: Vec<_> = config.transforms().collect();
-
-    let start_idx = transforms.iter().position(|t| {
-        comp.transform_names
-            .first()
-            .map(|n| n == &t.name)
-            .unwrap_or(false)
-    });
-
-    if let Some(start) = start_idx {
-        for (i, name) in comp.transform_names.iter().enumerate() {
-            let t_idx = start + i;
-            if t_idx >= transforms.len() {
-                break;
-            }
-            let t = transforms[t_idx];
-            if t.name != *name {
-                break;
-            }
-
-            let y = BASE_Y + if i % 2 == 0 { 0.0 } else { STAGGER_Y };
-            let subtitle = cxl_subtitle(&t.cxl);
-            let origin = comp.origins.get(i).cloned();
-
-            stages.push(StageView {
-                id: t.name.clone(),
-                label: t.name.clone(),
-                kind: StageKind::Transform,
-                subtitle,
-                canvas_x: x,
-                canvas_y: y,
-                cxl_source: Some(t.cxl.clone()),
-                description: t.description.clone(),
-                from_composition: origin,
-                error_message: None,
-            });
-            x += NODE_WIDTH + NODE_GAP;
-        }
-    }
-
-    // Sequential chain connections for drill-in transforms.
-    let connections: Vec<_> = (0..stages.len().saturating_sub(1))
-        .map(|i| (i, i + 1))
-        .collect();
-
-    PipelineView {
-        stages,
-        composition_groups: Vec::new(),
-        connections,
-    }
-}
-
-/// Find which composition (if any) a transform belongs to, and its index within that composition.
-fn find_composition<'a>(
-    transform: &clinker_core::config::TransformConfig,
-    compositions: &'a [ResolvedComposition],
-) -> Option<(&'a ResolvedComposition, usize)> {
-    for comp in compositions {
-        if let Some(idx) = comp
-            .transform_names
-            .iter()
-            .position(|n| n == &transform.name)
-        {
-            // Verify by checking the origin's transform name matches
-            if let Some(origin) = comp.origins.get(idx)
-                && origin.transform_name == transform.name
-            {
-                return Some((comp, idx));
-            }
-        }
-    }
-    None
-}
-
 /// Derive canvas nodes from a `PartialPipelineConfig` (graceful degradation).
-///
-/// Renders successfully-parsed items as normal nodes and failed items as
-/// `StageKind::Error` nodes. Composition grouping is skipped — import
-/// directives are rendered as plain transform nodes.
-///
-/// Uses the same flowchart layout as `derive_pipeline_view`: inputs are
-/// positioned above-left of their target transforms (primary input on the
-/// main line), outputs fan out right of the last transform.
-/// Since partial mode may lack `local_window` data, all inputs default to
-/// the first transform.
 pub fn derive_partial_pipeline_view(
     partial: &clinker_core::partial::PartialPipelineConfig,
 ) -> PipelineView {
-    use clinker_core::composition::RawTransformEntry;
     use clinker_core::partial::PartialItem;
 
     let input_count = partial.inputs.len();
     let transform_count = partial.transformations.len();
     let output_count = partial.outputs.len();
 
-    // Helper to compute staggered Y
     let y_for = |i: usize| BASE_Y + if i.is_multiple_of(2) { 0.0 } else { STAGGER_Y };
 
-    // ── Transforms (horizontal spine) ───────────────────────────────────────
     let transform_x_start = if input_count == 0 {
         LEFT_MARGIN
     } else {
@@ -597,37 +390,19 @@ pub fn derive_partial_pipeline_view(
     for (idx, item) in partial.transformations.iter().enumerate() {
         let y = y_for(idx);
         match item {
-            PartialItem::Ok(entry) => match entry {
-                RawTransformEntry::Inline(t) => {
-                    let subtitle = cxl_subtitle(&t.cxl);
-                    transform_stages.push(StageView {
-                        id: t.name.clone(),
-                        label: t.name.clone(),
-                        kind: StageKind::Transform,
-                        subtitle,
-                        canvas_x: x,
-                        canvas_y: y,
-                        cxl_source: Some(t.cxl.clone()),
-                        description: t.description.clone(),
-                        from_composition: None,
-                        error_message: None,
-                    });
-                }
-                RawTransformEntry::Import(directive) => {
-                    transform_stages.push(StageView {
-                        id: format!("_import_{}", directive.path),
-                        label: directive.path.clone(),
-                        kind: StageKind::Transform,
-                        subtitle: format!("_import: {}", directive.path),
-                        canvas_x: x,
-                        canvas_y: y,
-                        cxl_source: None,
-                        description: None,
-                        from_composition: None,
-                        error_message: None,
-                    });
-                }
-            },
+            PartialItem::Ok(t) => {
+                transform_stages.push(StageView {
+                    id: t.name.clone(),
+                    label: t.name.clone(),
+                    kind: StageKind::Transform,
+                    subtitle: cxl_subtitle(t.cxl_source()),
+                    canvas_x: x,
+                    canvas_y: y,
+                    cxl_source: Some(t.cxl_source().to_string()),
+                    description: t.description.clone(),
+                    error_message: None,
+                });
+            }
             PartialItem::Err { index, message } => {
                 transform_stages.push(StageView {
                     id: format!("_err_transform_{index}"),
@@ -638,7 +413,6 @@ pub fn derive_partial_pipeline_view(
                     canvas_y: y,
                     cxl_source: None,
                     description: None,
-                    from_composition: None,
                     error_message: Some(message.clone()),
                 });
             }
@@ -646,18 +420,14 @@ pub fn derive_partial_pipeline_view(
         x += NODE_WIDTH + NODE_GAP;
     }
 
-    // ── Inputs (all target first transform in partial mode) ─────────────────
-    let mut input_stages = Vec::new();
-    // In partial mode we can't reliably detect local_window.source, so all
-    // inputs default to the first transform.
     let input_targets: Vec<usize> = vec![0; input_count];
-
+    let mut input_stages = Vec::new();
     for (input_idx, item) in partial.inputs.iter().enumerate() {
         let (ix, iy) = if input_idx == 0 && !transform_stages.is_empty() {
             (LEFT_MARGIN, transform_stages[0].canvas_y)
         } else if !transform_stages.is_empty() {
             let target = &transform_stages[0];
-            let stack_n = input_idx - 1; // 0-based for secondary inputs
+            let stack_n = input_idx - 1;
             let iy = target.canvas_y
                 - NODE_HEIGHT
                 - INPUT_Y_OFFSET
@@ -669,7 +439,6 @@ pub fn derive_partial_pipeline_view(
                 BASE_Y + (input_idx as f32) * (NODE_HEIGHT + STACK_GAP),
             )
         };
-
         match item {
             PartialItem::Ok(input) => {
                 input_stages.push(StageView {
@@ -681,7 +450,6 @@ pub fn derive_partial_pipeline_view(
                     canvas_y: iy,
                     cxl_source: None,
                     description: None,
-                    from_composition: None,
                     error_message: None,
                 });
             }
@@ -695,14 +463,12 @@ pub fn derive_partial_pipeline_view(
                     canvas_y: iy,
                     cxl_source: None,
                     description: None,
-                    from_composition: None,
                     error_message: Some(message.clone()),
                 });
             }
         }
     }
 
-    // ── Outputs (fan out right of last transform) ───────────────────────────
     let mut output_stages = Vec::new();
     let output_x = if transform_stages.is_empty() {
         LEFT_MARGIN + NODE_WIDTH + NODE_GAP
@@ -712,7 +478,6 @@ pub fn derive_partial_pipeline_view(
     };
     let center_y = BASE_Y + NODE_HEIGHT / 2.0 + STAGGER_Y / 2.0;
     let output_ys = stack_y_positions(output_count, center_y);
-
     for (i, item) in partial.outputs.iter().enumerate() {
         match item {
             PartialItem::Ok(output) => {
@@ -725,7 +490,6 @@ pub fn derive_partial_pipeline_view(
                     canvas_y: output_ys[i],
                     cxl_source: None,
                     description: None,
-                    from_composition: None,
                     error_message: None,
                 });
             }
@@ -739,14 +503,12 @@ pub fn derive_partial_pipeline_view(
                     canvas_y: output_ys[i],
                     cxl_source: None,
                     description: None,
-                    from_composition: None,
                     error_message: Some(message.clone()),
                 });
             }
         }
     }
 
-    // ── Connections & assembly ───────────────────────────────────────────────
     let connections = build_connections(input_count, &input_targets, transform_count, output_count);
 
     let mut stages = Vec::with_capacity(input_count + transform_count + output_count);
@@ -756,12 +518,10 @@ pub fn derive_partial_pipeline_view(
 
     PipelineView {
         stages,
-        composition_groups: Vec::new(),
         connections,
     }
 }
 
-/// Truncate an error message for display as a node subtitle.
 fn truncate_error(msg: &str) -> String {
     if msg.len() <= 40 {
         msg.to_string()
@@ -770,7 +530,6 @@ fn truncate_error(msg: &str) -> String {
     }
 }
 
-/// Extract first non-empty line of CXL, truncated to 30 chars.
 fn cxl_subtitle(cxl: &str) -> String {
     cxl.lines()
         .find(|l| !l.trim().is_empty())
@@ -779,4 +538,193 @@ fn cxl_subtitle(cxl: &str) -> String {
         .chars()
         .take(30)
         .collect()
+}
+
+#[cfg(test)]
+mod task_16b_5_tests {
+    use super::*;
+    use clinker_core::config::parse_config;
+
+    /// Phase 16b Task 16b.5 gate test: compile-time exhaustiveness of the
+    /// variant dispatch. This function returns a distinct `StageKind` for
+    /// every `PipelineNode` variant; adding a new variant without updating
+    /// [`stage_kind_for_node`] is a build error.
+    #[test]
+    fn test_canvas_node_dispatches_on_variant() {
+        // Use a minimal unified-shape YAML exercising every variant so the
+        // match in `stage_kind_for_node` is hit for each at runtime too.
+        let yaml = r#"
+pipeline:
+  name: variant_dispatch_smoke
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./in.csv
+      schema:
+        - { name: agg, type: string }
+
+  - type: transform
+    name: clean
+    input: src
+    config:
+      cxl: |
+        emit x = 1
+  - type: aggregate
+    name: agg
+    input: clean
+    config:
+      group_by: [x]
+      cxl: |
+        emit n = 1
+  - type: route
+    name: split
+    input: clean
+    config:
+      conditions:
+        hi: "x > 0"
+      default: lo
+  - type: merge
+    name: joined
+    inputs: [split.hi, split.lo]
+  - type: output
+    name: out
+    input: joined
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+        let config = parse_config(yaml).expect("parse unified-shape pipeline");
+        let view = derive_pipeline_view(&config);
+
+        // Each declared node produces exactly one stage.
+        assert_eq!(view.stages.len(), 6);
+
+        // Every variant kind is represented.
+        let has = |k: &StageKind| view.stages.iter().any(|s| &s.kind == k);
+        assert!(has(&StageKind::Source));
+        assert!(has(&StageKind::Transform));
+        assert!(has(&StageKind::Aggregate));
+        assert!(has(&StageKind::Route));
+        assert!(has(&StageKind::Merge));
+        assert!(has(&StageKind::Output));
+    }
+
+    /// Phase 16b Task 16b.5 gate test: a legacy-shape fixture lifted into
+    /// the unified `nodes:` topology still renders via the variant-dispatch
+    /// code path and produces the expected stage count.
+    #[test]
+    fn test_kiln_loads_migrated_fixture() {
+        let yaml = r#"
+pipeline:
+  name: loaded_fixture_smoke
+nodes:
+- type: source
+  name: raw
+  config:
+    name: raw
+    type: csv
+    path: ./raw.csv
+    options:
+      has_header: true
+    schema:
+      - { name: agg, type: string }
+
+- type: transform
+  name: clean
+  input: raw
+  config:
+    cxl: 'emit a = 1
+
+      '
+- type: transform
+  name: finalize
+  input: clean
+  config:
+    cxl: 'emit b = 2
+
+      '
+- type: output
+  name: results
+  input: finalize
+  config:
+    name: results
+    type: csv
+    path: ./results.csv
+"#;
+        let config = parse_config(yaml).expect("legacy fixture lifts to nodes");
+        let view = derive_pipeline_view(&config);
+
+        // 1 source + 2 transforms + 1 output = 4 stages.
+        assert_eq!(view.stages.len(), 4);
+        assert_eq!(
+            view.stages
+                .iter()
+                .filter(|s| s.kind == StageKind::Transform)
+                .count(),
+            2
+        );
+        assert_eq!(
+            view.stages
+                .iter()
+                .filter(|s| s.kind == StageKind::Source)
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.stages
+                .iter()
+                .filter(|s| s.kind == StageKind::Output)
+                .count(),
+            1
+        );
+
+        // Connections are derived and non-empty for a chain of length > 1.
+        assert!(!view.connections.is_empty());
+    }
+
+    /// Phase 16b Task 16b.5 gate test: a pipeline containing a
+    /// `PipelineNode::Composition` stub renders it as a placeholder stage
+    /// (Phase 16c badge subtitle) without panic.
+    #[test]
+    fn test_kiln_composition_placeholder_renders() {
+        let yaml = r#"
+pipeline:
+  name: composition_placeholder_smoke
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./comp_in.csv
+      schema:
+        - { name: agg, type: string }
+
+  - type: composition
+    name: sub
+    input: src
+    config:
+      use: compositions/clean_names.comp.yaml
+"#;
+        let config = parse_config(yaml).expect("composition stub parses");
+        let view = derive_pipeline_view(&config);
+
+        let comp = view
+            .stages
+            .iter()
+            .find(|s| s.kind == StageKind::Composition)
+            .expect("composition stage present");
+        assert_eq!(comp.label, "sub");
+        assert!(
+            comp.subtitle.contains("Phase 16c"),
+            "placeholder subtitle should mention Phase 16c, got: {}",
+            comp.subtitle
+        );
+        // Badge text is the authoritative kind label.
+        assert_eq!(StageKind::Composition.badge_label(), "COMPOSITION");
+    }
 }

@@ -62,7 +62,7 @@ mod tests {
 
     /// Merge sorted spill files via LoserTree, returning records in merge order.
     fn merge_spill_files(
-        files: Vec<crate::pipeline::spill::SpillFile>,
+        files: Vec<crate::pipeline::spill::SpillFile<()>>,
         sort_by: &[SortField],
     ) -> Vec<Record> {
         let mut readers: Vec<_> = files.iter().map(|f| f.reader().unwrap()).collect();
@@ -71,7 +71,7 @@ mod tests {
             .iter_mut()
             .map(|r| {
                 r.next().map(|res| {
-                    let record = res.unwrap();
+                    let (record, _) = res.unwrap();
                     let key = encode_sort_key(&record, sort_by);
                     MergeEntry { key, record }
                 })
@@ -85,7 +85,7 @@ mod tests {
             let idx = tree.winner_index();
             result.push(tree.winner().unwrap().record.clone());
             let next = readers[idx].next().map(|res| {
-                let record = res.unwrap();
+                let (record, _) = res.unwrap();
                 let key = encode_sort_key(&record, sort_by);
                 MergeEntry { key, record }
             });
@@ -101,14 +101,14 @@ mod tests {
     fn test_sort_single_field_asc() {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
         for i in (0..100).rev() {
-            buf.push(rec2(&schema, &format!("r{i}"), i));
+            buf.push(rec2(&schema, &format!("r{i}"), i), ());
         }
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                assert_eq!(records.len(), 100);
-                for (i, r) in records.iter().enumerate() {
+            SortedOutput::InMemory(pairs) => {
+                assert_eq!(pairs.len(), 100);
+                for (i, (r, _)) in pairs.iter().enumerate() {
                     assert_eq!(r.get("value"), Some(&Value::Integer(i as i64)));
                 }
             }
@@ -120,15 +120,15 @@ mod tests {
     fn test_sort_single_field_desc() {
         let schema = schema_2();
         let sort_by = vec![sf("name", SortOrder::Desc)];
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
         for name in &["alpha", "charlie", "bravo", "delta", "echo"] {
-            buf.push(rec2(&schema, name, 0));
+            buf.push(rec2(&schema, name, 0), ());
         }
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                let names: Vec<_> = records
+            SortedOutput::InMemory(pairs) => {
+                let names: Vec<_> = pairs
                     .iter()
-                    .map(|r| match r.get("name").unwrap() {
+                    .map(|(r, _)| match r.get("name").unwrap() {
                         Value::String(s) => s.to_string(),
                         _ => panic!("expected string"),
                     })
@@ -143,20 +143,20 @@ mod tests {
     fn test_sort_compound_keys() {
         let schema = schema_3();
         let sort_by = vec![sf("dept", SortOrder::Asc), sf("salary", SortOrder::Desc)];
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
-        buf.push(rec3(&schema, "B", 200, 1));
-        buf.push(rec3(&schema, "A", 100, 2));
-        buf.push(rec3(&schema, "A", 300, 3));
-        buf.push(rec3(&schema, "B", 100, 4));
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        buf.push(rec3(&schema, "B", 200, 1), ());
+        buf.push(rec3(&schema, "A", 100, 2), ());
+        buf.push(rec3(&schema, "A", 300, 3), ());
+        buf.push(rec3(&schema, "B", 100, 4), ());
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
+            SortedOutput::InMemory(pairs) => {
                 // A first (ASC), within A: 300 before 100 (DESC)
-                assert_eq!(records[0].get("dept"), Some(&Value::String("A".into())));
-                assert_eq!(records[0].get("salary"), Some(&Value::Integer(300)));
-                assert_eq!(records[1].get("salary"), Some(&Value::Integer(100)));
-                assert_eq!(records[2].get("dept"), Some(&Value::String("B".into())));
-                assert_eq!(records[2].get("salary"), Some(&Value::Integer(200)));
-                assert_eq!(records[3].get("salary"), Some(&Value::Integer(100)));
+                assert_eq!(pairs[0].0.get("dept"), Some(&Value::String("A".into())));
+                assert_eq!(pairs[0].0.get("salary"), Some(&Value::Integer(300)));
+                assert_eq!(pairs[1].0.get("salary"), Some(&Value::Integer(100)));
+                assert_eq!(pairs[2].0.get("dept"), Some(&Value::String("B".into())));
+                assert_eq!(pairs[2].0.get("salary"), Some(&Value::Integer(200)));
+                assert_eq!(pairs[3].0.get("salary"), Some(&Value::Integer(100)));
             }
             _ => panic!("expected InMemory"),
         }
@@ -166,18 +166,18 @@ mod tests {
     fn test_sort_nulls_first() {
         let schema = schema_2();
         let sort_by = vec![sf_nulls("value", SortOrder::Asc, NullOrder::First)];
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
-        buf.push(rec2(&schema, "a", 30));
-        buf.push(Record::new(
-            schema.clone(),
-            vec![Value::String("b".into()), Value::Null],
-        ));
-        buf.push(rec2(&schema, "c", 10));
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        buf.push(rec2(&schema, "a", 30), ());
+        buf.push(
+            Record::new(schema.clone(), vec![Value::String("b".into()), Value::Null]),
+            (),
+        );
+        buf.push(rec2(&schema, "c", 10), ());
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                assert_eq!(records[0].get("value"), Some(&Value::Null));
-                assert_eq!(records[1].get("value"), Some(&Value::Integer(10)));
-                assert_eq!(records[2].get("value"), Some(&Value::Integer(30)));
+            SortedOutput::InMemory(pairs) => {
+                assert_eq!(pairs[0].0.get("value"), Some(&Value::Null));
+                assert_eq!(pairs[1].0.get("value"), Some(&Value::Integer(10)));
+                assert_eq!(pairs[2].0.get("value"), Some(&Value::Integer(30)));
             }
             _ => panic!("expected InMemory"),
         }
@@ -187,18 +187,18 @@ mod tests {
     fn test_sort_nulls_last() {
         let schema = schema_2();
         let sort_by = vec![sf_nulls("value", SortOrder::Asc, NullOrder::Last)];
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
-        buf.push(rec2(&schema, "a", 30));
-        buf.push(Record::new(
-            schema.clone(),
-            vec![Value::String("b".into()), Value::Null],
-        ));
-        buf.push(rec2(&schema, "c", 10));
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        buf.push(rec2(&schema, "a", 30), ());
+        buf.push(
+            Record::new(schema.clone(), vec![Value::String("b".into()), Value::Null]),
+            (),
+        );
+        buf.push(rec2(&schema, "c", 10), ());
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                assert_eq!(records[0].get("value"), Some(&Value::Integer(10)));
-                assert_eq!(records[1].get("value"), Some(&Value::Integer(30)));
-                assert_eq!(records[2].get("value"), Some(&Value::Null));
+            SortedOutput::InMemory(pairs) => {
+                assert_eq!(pairs[0].0.get("value"), Some(&Value::Integer(10)));
+                assert_eq!(pairs[1].0.get("value"), Some(&Value::Integer(30)));
+                assert_eq!(pairs[2].0.get("value"), Some(&Value::Null));
             }
             _ => panic!("expected InMemory"),
         }
@@ -208,15 +208,15 @@ mod tests {
     fn test_sort_stable_equal_keys() {
         let schema = schema_3();
         let sort_by = vec![sf("dept", SortOrder::Asc)];
-        let mut buf = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 10_000_000, None, schema.clone());
         // All same dept — seq should preserve original order (stable sort)
-        buf.push(rec3(&schema, "A", 100, 1));
-        buf.push(rec3(&schema, "A", 200, 2));
-        buf.push(rec3(&schema, "A", 300, 3));
-        buf.push(rec3(&schema, "A", 400, 4));
+        buf.push(rec3(&schema, "A", 100, 1), ());
+        buf.push(rec3(&schema, "A", 200, 2), ());
+        buf.push(rec3(&schema, "A", 300, 3), ());
+        buf.push(rec3(&schema, "A", 400, 4), ());
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                for (i, r) in records.iter().enumerate() {
+            SortedOutput::InMemory(pairs) => {
+                for (i, (r, _)) in pairs.iter().enumerate() {
                     assert_eq!(r.get("seq"), Some(&Value::Integer(i as i64 + 1)));
                 }
             }
@@ -229,10 +229,10 @@ mod tests {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
         // 1KB budget — records will exceed this quickly
-        let mut buf = SortBuffer::new(sort_by, 1024, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by, 1024, None, schema.clone());
         let mut spilled = false;
         for i in 0..100 {
-            buf.push(rec2(&schema, &format!("record_{i:04}"), i));
+            buf.push(rec2(&schema, &format!("record_{i:04}"), i), ());
             if buf.should_spill() {
                 buf.sort_and_spill().unwrap();
                 spilled = true;
@@ -246,9 +246,9 @@ mod tests {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
         // Create 32 spill files (exceeds k_max=16 → requires cascade)
-        let mut buf = SortBuffer::new(sort_by.clone(), 1, None, schema.clone());
+        let mut buf: SortBuffer<()> = SortBuffer::new(sort_by.clone(), 1, None, schema.clone());
         for i in 0..32 {
-            buf.push(rec2(&schema, &format!("r{i}"), i));
+            buf.push(rec2(&schema, &format!("r{i}"), i), ());
             buf.sort_and_spill().unwrap();
         }
         match buf.finish().unwrap() {
@@ -271,9 +271,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
-        let mut buf = SortBuffer::new(sort_by, 1, Some(dir.path().to_path_buf()), schema.clone());
+        let mut buf: SortBuffer<()> =
+            SortBuffer::new(sort_by, 1, Some(dir.path().to_path_buf()), schema.clone());
         for i in 0..5 {
-            buf.push(rec2(&schema, &format!("r{i}"), i));
+            buf.push(rec2(&schema, &format!("r{i}"), i), ());
             buf.sort_and_spill().unwrap();
         }
         // Files exist while SpillFiles are alive
@@ -306,14 +307,14 @@ mod tests {
         let schema = schema_2();
         let sort_by = vec![sf("value", SortOrder::Asc)];
         // Large budget — everything fits in memory
-        let mut buf = SortBuffer::new(
+        let mut buf: SortBuffer<()> = SortBuffer::new(
             sort_by,
             10_000_000,
             Some(dir.path().to_path_buf()),
             schema.clone(),
         );
         for i in (0..10).rev() {
-            buf.push(rec2(&schema, &format!("r{i}"), i));
+            buf.push(rec2(&schema, &format!("r{i}"), i), ());
         }
         // Verify no spill files created
         let files: Vec<_> = std::fs::read_dir(dir.path())
@@ -326,9 +327,9 @@ mod tests {
         );
 
         match buf.finish().unwrap() {
-            SortedOutput::InMemory(records) => {
-                assert_eq!(records.len(), 10);
-                for (i, r) in records.iter().enumerate() {
+            SortedOutput::InMemory(pairs) => {
+                assert_eq!(pairs.len(), 10);
+                for (i, (r, _)) in pairs.iter().enumerate() {
                     assert_eq!(r.get("value"), Some(&Value::Integer(i as i64)));
                 }
             }

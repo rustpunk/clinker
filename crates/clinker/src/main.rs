@@ -1,15 +1,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
-use clinker_channel::channel_override::{
-    ChannelOverride, resolve_channel, resolve_channel_with_inheritance,
-};
-use clinker_channel::composition::{ProvenanceMap, resolve_compositions};
-use clinker_channel::manifest::ChannelManifest;
-use clinker_channel::workspace::WorkspaceRoot;
-use clinker_core::config::load_config_with_vars;
 use clinker_core::error::PipelineError;
 use clinker_core::executor::PipelineExecutor;
 use clinker_core::metrics::{self, ExecutionMetrics};
@@ -18,7 +11,34 @@ use clinker_format::FormatReader;
 
 /// CXL streaming ETL engine.
 #[derive(Parser, Debug)]
-#[command(name = "clinker", about = "CXL streaming ETL engine")]
+#[command(
+    name = "clinker",
+    version,
+    about = "CXL streaming ETL engine",
+    long_about = "\
+Clinker is a streaming ETL engine that reads tabular data (CSV, NDJSON), \
+applies CXL transformation expressions, and writes the results to output files.\n\n\
+Pipelines are defined in YAML configuration files that specify inputs, outputs, \
+field mappings with CXL expressions, and optional channel overrides for \
+multi-tenant customization.",
+    after_long_help = "\
+QUICK START:
+  clinker run pipeline.yaml
+  clinker run pipeline.yaml --dry-run -n 10
+  clinker run pipeline.yaml --explain
+  clinker run pipeline.yaml --channel acme-corp
+
+ENVIRONMENT VARIABLES:
+  CLINKER_ENV                   Active environment for when: conditions
+  CLINKER_METRICS_SPOOL_DIR     Default metrics spool directory
+
+EXIT CODES:
+  0  Success
+  1  Configuration, schema, or CXL compilation error
+  2  Pipeline completed but DLQ entries were produced
+  3  CXL evaluation error
+  4  I/O or format error"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -28,12 +48,54 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Run a pipeline from a YAML config file
+    #[command(
+        long_about = "\
+Run a pipeline from a YAML configuration file. The pipeline reads input \
+files, applies CXL transformation expressions to each record, and writes \
+results to the configured outputs. Records that fail evaluation are routed \
+to a dead-letter queue (DLQ).",
+        after_long_help = "\
+EXAMPLES:
+  # Run a pipeline
+  clinker run pipeline.yaml
+
+  # Preview the execution plan without reading data
+  clinker run pipeline.yaml --explain
+
+  # Validate config and process 10 records as a dry run
+  clinker run pipeline.yaml --dry-run -n 10
+
+  # Run with a channel override for multi-tenant customization
+  clinker run pipeline.yaml --channel acme-corp
+
+  # Run with custom memory budget and thread count
+  clinker run pipeline.yaml --memory-limit 512M --threads 4
+
+  # Spool execution metrics for later collection
+  clinker run pipeline.yaml --metrics-spool-dir /var/spool/clinker"
+    )]
     Run(RunArgs),
     /// Metrics utilities
+    #[command(long_about = "\
+Utilities for collecting and managing pipeline execution metrics. Clinker \
+can spool per-execution metrics as JSON files during pipeline runs. Use \
+these subcommands to sweep spool directories and consolidate metrics into \
+NDJSON archives.")]
     Metrics {
         #[command(subcommand)]
         subcommand: MetricsCommands,
     },
+}
+
+/// Output format for --explain.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ExplainFormat {
+    /// Human-readable ASCII text with branch/merge indicators.
+    Text,
+    /// Structured JSON for Kiln canvas consumption.
+    Json,
+    /// Graphviz DOT for static visualization.
+    Dot,
 }
 
 /// Arguments for `clinker run`.
@@ -43,82 +105,76 @@ pub struct RunArgs {
     pub config: PathBuf,
 
     /// Memory budget (supports K/M/G suffixes), default 256M
-    #[arg(long)]
+    #[arg(long, help_heading = "Execution")]
     pub memory_limit: Option<String>,
 
     /// Thread pool size, default num_cpus
-    #[arg(long)]
+    #[arg(long, help_heading = "Execution")]
     pub threads: Option<usize>,
 
     /// Max DLQ records before abort, 0 = unlimited
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "0", help_heading = "Execution")]
     pub error_threshold: u64,
 
     /// Pipeline batch_id, default generated UUID v7
-    #[arg(long)]
+    #[arg(long, help_heading = "Execution")]
     pub batch_id: Option<String>,
 
-    /// CXL module search path
-    #[arg(long, default_value = "./rules/")]
-    pub rules_path: PathBuf,
-
-    /// Print execution plan and exit (no data read)
-    #[arg(long)]
-    pub explain: bool,
+    /// Print execution plan and exit (no data read).
+    /// Optionally specify format: text (default), json, dot.
+    #[arg(
+        long,
+        help_heading = "Validation",
+        num_args(0..=1),
+        default_missing_value("text"),
+        value_enum
+    )]
+    pub explain: Option<ExplainFormat>,
 
     /// Validate config and CXL without processing data
-    #[arg(long)]
+    #[arg(long, help_heading = "Validation")]
     pub dry_run: bool,
 
     /// Process only first N records per input (requires --dry-run)
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, help_heading = "Validation")]
     pub dry_run_n: Option<u64>,
 
     /// Write dry-run output to file instead of stdout
-    #[arg(long)]
+    #[arg(long, help_heading = "Validation")]
     pub dry_run_output: Option<PathBuf>,
 
-    /// Suppress stderr progress output
-    #[arg(long)]
-    pub quiet: bool,
-
-    /// Allow output file overwrite
-    #[arg(long)]
-    pub force: bool,
+    /// CXL module search path
+    #[arg(long, default_value = "./rules/", help_heading = "Paths")]
+    pub rules_path: PathBuf,
 
     /// Base directory for relative path resolution
-    #[arg(long)]
+    #[arg(long, help_heading = "Paths")]
     pub base_dir: Option<PathBuf>,
 
     /// Permit absolute paths in YAML config
-    #[arg(long)]
+    #[arg(long, help_heading = "Paths")]
     pub allow_absolute_paths: bool,
 
+    /// Active environment name (sets CLINKER_ENV).
+    #[arg(long, help_heading = "Environment")]
+    pub env: Option<String>,
+
+    /// Suppress stderr progress output
+    #[arg(long, help_heading = "Output")]
+    pub quiet: bool,
+
+    /// Allow output file overwrite
+    #[arg(long, help_heading = "Output")]
+    pub force: bool,
+
     /// Log level: error, warn, info, debug, trace
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "info", help_heading = "Output")]
     pub log_level: String,
 
     /// Directory to spool per-execution JSON metrics files.
     /// Overrides CLINKER_METRICS_SPOOL_DIR env var and pipeline.metrics.spool_dir in YAML.
-    #[arg(long)]
+    #[arg(long, help_heading = "Metrics")]
     pub metrics_spool_dir: Option<PathBuf>,
-
-    /// Channel override to apply (e.g., "acme-corp")
-    #[arg(long)]
-    pub channel: Option<String>,
-
-    /// Explicit path(s) to .channel.yaml override file(s). Bypasses derived-name lookup.
-    /// May be specified multiple times; applied in declaration order (later wins on conflict).
-    #[arg(long)]
-    pub channel_path: Vec<PathBuf>,
-
-    /// Workspace root (overrides clinker.toml auto-discovery)
-    #[arg(long)]
-    pub workspace: Option<PathBuf>,
-
-    /// Active environment name for when: conditions (sets CLINKER_ENV).
-    #[arg(long)]
-    pub env: Option<String>,
 }
 
 impl RunArgs {
@@ -139,6 +195,19 @@ impl RunArgs {
 #[derive(Subcommand, Debug)]
 pub enum MetricsCommands {
     /// Sweep the spool directory and append records to an NDJSON archive
+    #[command(
+        long_about = "\
+Sweep a spool directory for per-execution JSON metrics files and append \
+them to a consolidated NDJSON archive. Use --delete-after-collect to clean \
+up spool files after successful collection.",
+        after_long_help = "\
+EXAMPLES:
+  # Preview what would be collected
+  clinker metrics collect --spool-dir /var/spool/clinker --output-file metrics.ndjson --dry-run
+
+  # Collect and clean up spool files
+  clinker metrics collect --spool-dir /var/spool/clinker --output-file metrics.ndjson --delete-after-collect"
+    )]
     Collect(CollectArgs),
 }
 
@@ -176,16 +245,21 @@ fn main() -> ExitCode {
             match run(args) {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
-                    tracing::error!("{e}");
+                    render_pipeline_error(&e, &args.config);
                     match &e {
                         PipelineError::Config(_)
                         | PipelineError::Schema(_)
-                        | PipelineError::Compilation { .. } => ExitCode::from(1),
+                        | PipelineError::Compilation { .. }
+                        | PipelineError::Internal { .. }
+                        | PipelineError::SortOrderViolation { .. }
+                        | PipelineError::MergeSortOrderViolation { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
-                        PipelineError::Eval(_) => ExitCode::from(3),
-                        PipelineError::Format(_) | PipelineError::ThreadPool(_) => {
-                            ExitCode::from(4)
+                        PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
+                            ExitCode::from(3)
                         }
+                        PipelineError::Format(_)
+                        | PipelineError::ThreadPool(_)
+                        | PipelineError::Multiple(_) => ExitCode::from(4),
                     }
                 }
             }
@@ -205,95 +279,119 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &RunArgs) -> Result<u8, PipelineError> {
-    // 1. Workspace discovery
-    let workspace = match &args.workspace {
-        Some(p) => Some(WorkspaceRoot::at(p).map_err(channel_err)?),
-        None => WorkspaceRoot::discover(args.config.as_path()),
+/// Task 16b.8 — render a `PipelineError` via miette with the YAML
+/// source attached as a `NamedSource`, falling back to plain-text
+/// output when the config file is unreadable.
+///
+/// Every rendered diagnostic carries the source filename so CLI
+/// output contains the `.yaml` path as part of the message or the
+/// attached `NamedSource` header. The regression test
+/// `test_diagnostic_renders_via_miette_in_cli` asserts that stderr
+/// contains the config filename when a bad YAML is passed.
+fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
+    use miette::{Diagnostic, NamedSource, Report, Severity};
+    use std::fmt;
+
+    // Best-effort source attach. If the config file is unreadable
+    // we still render the raw error via miette's graphical handler
+    // so the user sees consistent formatting.
+    let source_text = std::fs::read_to_string(config_path).ok();
+    let filename = config_path.to_string_lossy().into_owned();
+
+    /// Hand-rolled `Error + Diagnostic` wrapper so we can attach a
+    /// `NamedSource` without pulling in a new `thiserror` dependency
+    /// in the binary crate.
+    struct WrappedPipelineError {
+        filename: String,
+        message: String,
+        src: Option<NamedSource<String>>,
+    }
+
+    impl fmt::Debug for WrappedPipelineError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}: {}", self.filename, self.message)
+        }
+    }
+
+    impl fmt::Display for WrappedPipelineError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "pipeline error in {}: {}", self.filename, self.message)
+        }
+    }
+
+    impl std::error::Error for WrappedPipelineError {}
+
+    impl Diagnostic for WrappedPipelineError {
+        fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+            Some(Box::new("clinker::pipeline_error"))
+        }
+        fn severity(&self) -> Option<Severity> {
+            Some(Severity::Error)
+        }
+        fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+            self.src.as_ref().map(|s| s as &dyn miette::SourceCode)
+        }
+    }
+
+    let wrapped = WrappedPipelineError {
+        filename: filename.clone(),
+        message: err.to_string(),
+        src: source_text
+            .as_ref()
+            .map(|s| NamedSource::new(filename.clone(), s.clone())),
     };
 
-    // 1b. Resolve effective channel: --channel flag > default_channel from clinker.toml
-    let effective_channel: Option<String> = args.channel.clone().or_else(|| {
-        workspace.as_ref().and_then(|ws| {
-            ws.config.default_channel.as_ref().map(|ch| {
-                tracing::info!(
-                    "Using default channel \"{}\" from clinker.toml (override with --channel)",
-                    ch
-                );
-                ch.clone()
-            })
-        })
-    });
+    let report = Report::new(wrapped);
+    eprintln!("{report:?}");
+}
 
-    // 2. Resolve CLINKER_ENV from precedence chain
-    let clinker_env: Option<String> = args
+fn run(args: &RunArgs) -> Result<u8, PipelineError> {
+    // Resolve CLINKER_ENV
+    if let Some(env_name) = args
         .env
         .clone()
         .or_else(|| std::env::var("CLINKER_ENV").ok())
-        .or_else(|| workspace.as_ref().and_then(|ws| ws.defaults.env.clone()));
-
-    // 3. Load channel manifest → channel vars
-    let mut channel_vars: Vec<(String, String)> = Vec::new();
-    if let Some(ref env_name) = clinker_env {
-        channel_vars.push(("CLINKER_ENV".into(), env_name.clone()));
-    }
-    if let (Some(id), Some(ws)) = (&effective_channel, &workspace) {
-        let manifest = ChannelManifest::load(&ws.channel_dir(id)).map_err(channel_err)?;
-        for (k, v) in manifest.variables {
-            channel_vars.push((k, v));
-        }
-    }
-    let vars_ref: Vec<(&str, &str)> = channel_vars
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
-    // 4. Load + interpolate pipeline YAML (single pass, channel vars included)
-    let mut pipeline_config = load_config_with_vars(&args.config, &vars_ref)?;
-
-    // 5. Resolve _import compositions → also get ProvenanceMap
-    let mut provenance = if let Some(ws) = &workspace {
-        resolve_compositions(&mut pipeline_config, ws, &vars_ref).map_err(channel_err)?
-    } else {
-        ProvenanceMap::new()
-    };
-
-    // 6. Apply channel override (group inheritance + channel-specific)
-    if let (Some(id), Some(ws)) = (&effective_channel, &workspace) {
-        if clinker_env.is_none() && !args.quiet {
-            check_warn_env_unset(id, ws, &args.config, &vars_ref);
-        }
-        pipeline_config = resolve_channel_with_inheritance(
-            pipeline_config,
-            id,
-            &args.config,
-            ws,
-            &vars_ref,
-            &mut provenance,
-        )
-        .map_err(channel_err)?;
+    {
+        unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    // 6b. Apply explicit --channel-path overrides (in declaration order; later wins on conflict)
-    for path in &args.channel_path {
-        if let Some(co) = ChannelOverride::load(path, &vars_ref).map_err(channel_err)? {
-            let ws = workspace.as_ref().ok_or_else(|| {
-                PipelineError::Config(clinker_core::config::ConfigError::Validation(
-                    "--channel-path requires a workspace (clinker.toml)".into(),
-                ))
-            })?;
-            if co.when_passes() {
-                pipeline_config =
-                    resolve_channel(pipeline_config, &co, ws, &vars_ref, &mut provenance)
-                        .map_err(channel_err)?;
-            }
-        }
-    }
+    // Load pipeline YAML directly. Composition/channel features are gone in
+    // Phase 16b; Phase 16c will rebuild them.
+    let yaml = std::fs::read_to_string(&args.config).map_err(PipelineError::Io)?;
+    let interpolated = clinker_core::config::interpolate_env_vars(&yaml, &[]).map_err(|e| {
+        PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
+    })?;
+    let pipeline_config: clinker_core::config::PipelineConfig =
+        clinker_core::yaml::from_str(&interpolated).map_err(|e| {
+            PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
+        })?;
 
     // 7. Existing logic: explain / dry_run / execute
-    if args.explain {
-        let plan_output = PipelineExecutor::explain(&pipeline_config)?;
-        println!("{}", plan_output);
+    if let Some(format) = args.explain {
+        let compiled_plan =
+            pipeline_config
+                .compile()
+                .map_err(|diags| PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: diags.iter().map(|d| d.message.clone()).collect(),
+                })?;
+        let (dag, _) = PipelineExecutor::explain_plan_dag(&compiled_plan)?;
+        match format {
+            ExplainFormat::Text => {
+                print!("{}", dag.explain_text(&pipeline_config));
+            }
+            ExplainFormat::Json => {
+                let json = serde_json::to_string_pretty(&dag).map_err(|e| {
+                    PipelineError::Config(clinker_core::config::ConfigError::Validation(format!(
+                        "JSON serialization failed: {e}"
+                    )))
+                })?;
+                println!("{json}");
+            }
+            ExplainFormat::Dot => {
+                print!("{}", dag.explain_dot());
+            }
+        }
         return Ok(0);
     }
 
@@ -310,9 +408,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         // Config-validation-only mode (no -n)
         tracing::info!(
             "Dry run: config valid, {} inputs, {} outputs, {} transforms",
-            pipeline_config.inputs.len(),
-            pipeline_config.outputs.len(),
-            pipeline_config.transformations.len(),
+            pipeline_config.source_configs().count(),
+            pipeline_config.output_configs().count(),
+            pipeline_config.transform_node_count(),
         );
         return Ok(0);
     }
@@ -338,17 +436,36 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         execution_id: execution_id.clone(),
         batch_id: batch_id.clone(),
         pipeline_vars,
+        shutdown_token: None,
     };
 
     // Run the pipeline using file-based I/O
-    let input_path = &pipeline_config.inputs[0].path;
-    let output_path = &pipeline_config.outputs[0].path;
+    let first_source = pipeline_config
+        .source_configs()
+        .next()
+        .expect("pipeline has at least one source");
+    let first_output = pipeline_config
+        .output_configs()
+        .next()
+        .expect("pipeline has at least one output");
+    let input_path = first_source.path.clone();
+    let output_path = first_output.path.clone();
+    let input_name = first_source.name.clone();
+    let output_name = first_output.name.clone();
 
-    let reader = std::fs::File::open(input_path)?;
-    let writer = std::fs::File::create(output_path)?;
+    let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&input_path)?);
+    let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output_path)?);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&pipeline_config, reader, writer, &run_params)?;
+    let readers = std::collections::HashMap::from([(input_name, reader)]);
+    let writers = std::collections::HashMap::from([(output_name, writer)]);
+
+    let compiled_plan = pipeline_config.compile().expect("compile");
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &compiled_plan,
+        readers,
+        writers,
+        &run_params,
+    )?;
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
@@ -359,7 +476,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         && let Some(ref dlq_path) = dlq_config.path
     {
         let input_schema = {
-            let f = std::fs::File::open(input_path)?;
+            let f = std::fs::File::open(&input_path)?;
             let mut r = clinker_format::csv::reader::CsvReader::from_reader(
                 f,
                 clinker_format::csv::reader::CsvReaderConfig::default(),
@@ -373,7 +490,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             dlq_writer,
             dlq_entries,
             &input_schema,
-            input_path,
+            &input_path,
             include_reason,
             include_source_row,
         )
@@ -414,17 +531,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             records_total: counters.total_count,
             records_ok: counters.ok_count,
             records_dlq: counters.dlq_count,
-            execution_mode: format!("{:?}", report.execution_mode),
+            execution_mode: report.execution_summary.clone(),
             peak_rss_bytes: report.peak_rss_bytes,
             thread_count: num_threads(args),
             input_files: pipeline_config
-                .inputs
-                .iter()
+                .source_configs()
                 .map(|i| i.path.clone())
                 .collect(),
             output_files: pipeline_config
-                .outputs
-                .iter()
+                .output_configs()
                 .map(|o| o.path.clone())
                 .collect(),
             dlq_path,
@@ -508,30 +623,6 @@ fn hostname_string() -> String {
             std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|_| "unknown".to_string())
-}
-
-/// Map ChannelError to PipelineError for uniform error handling.
-fn channel_err(e: clinker_channel::error::ChannelError) -> PipelineError {
-    PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
-}
-
-/// Warn if CLINKER_ENV is not set but override files have when: conditions.
-fn check_warn_env_unset(
-    channel_id: &str,
-    workspace: &WorkspaceRoot,
-    pipeline_path: &std::path::Path,
-    channel_vars: &[(&str, &str)],
-) {
-    let channel_dir = workspace.channel_dir(channel_id);
-    let derived = ChannelOverride::path_for(pipeline_path, &channel_dir);
-    if let Ok(Some(co)) = ChannelOverride::load(&derived, channel_vars)
-        && co.header.when.is_some()
-    {
-        tracing::warn!(
-            "CLINKER_ENV is not set; when: condition in {} will not be evaluated — override file skipped",
-            derived.display()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -726,50 +817,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_run_channel_flag() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--channel", "acme", "p.yaml"]).unwrap();
-        match cli.command {
-            Commands::Run(args) => assert_eq!(args.channel, Some("acme".into())),
-            _ => panic!("expected Run command"),
-        }
-    }
-
-    #[test]
     fn test_cli_run_env_flag() {
         let cli = Cli::try_parse_from(["clinker", "run", "--env", "prod", "p.yaml"]).unwrap();
         match cli.command {
             Commands::Run(args) => assert_eq!(args.env, Some("prod".into())),
-            _ => panic!("expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_run_channel_path_multiple() {
-        let cli = Cli::try_parse_from([
-            "clinker",
-            "run",
-            "--channel-path",
-            "a.channel.yaml",
-            "--channel-path",
-            "b.channel.yaml",
-            "p.yaml",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.channel_path.len(), 2);
-                assert_eq!(args.channel_path[0], PathBuf::from("a.channel.yaml"));
-                assert_eq!(args.channel_path[1], PathBuf::from("b.channel.yaml"));
-            }
-            _ => panic!("expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_run_workspace_flag() {
-        let cli = Cli::try_parse_from(["clinker", "run", "--workspace", "/ws", "p.yaml"]).unwrap();
-        match cli.command {
-            Commands::Run(args) => assert_eq!(args.workspace, Some(PathBuf::from("/ws"))),
             _ => panic!("expected Run command"),
         }
     }

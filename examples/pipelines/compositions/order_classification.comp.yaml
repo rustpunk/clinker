@@ -35,7 +35,7 @@ transformations:
       emit priority_level = if shipping_method == "overnight" then "urgent" else if shipping_method == "express" and line_total >= 500 then "high" else if line_total >= 1000 then "high" else "normal"
   - name: order_age
     cxl: |
-      emit days_since_order = order_date_parsed.diff_days(pipeline.start_time)
+      emit days_since_order = order_date_parsed.diff_days($pipeline.start_time)
   - name: fulfillment_risk
     description: Flag stale or high-value unshipped orders
     cxl: |

@@ -10,34 +10,55 @@ pipeline:
   name: full-etl
   memory_limit: 2GB
 
-inputs:
-  - name: source
-    type: csv
-    path: "./data/input.csv"
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: "./data/input.csv"
+      options:
+        has_header: true
+      schema:
+        - { name: id, type: string }
+        - { name: email, type: string }
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
 
-transformations:
-  - name: validate
+  - type: transform
+    name: validate
     description: "Filter out invalid records"
-    cxl: |
-      filter id != null
-      filter email.contains("@")
-  - name: enrich
-    description: "Compute derived fields"
-    cxl: |
-      emit full_name = first_name + " " + last_name
-      emit domain = email.split("@").last()
-  - name: sort_output
-    description: "Sort by last name"
-    cxl: |
-      sort by last_name asc
+    input: source
+    config:
+      cxl: |
+        filter id != null
+        filter email.contains("@")
 
-outputs:
-  - name: result
-    type: csv
-    path: "./output/result.csv"
-    include_header: true
+  - type: transform
+    name: enrich
+    description: "Compute derived fields"
+    input: validate
+    config:
+      cxl: |
+        emit full_name = first_name + " " + last_name
+        emit domain = email.split("@").last()
+
+  - type: transform
+    name: sort_output
+    description: "Sort by last name"
+    input: enrich
+    config:
+      cxl: |
+        sort by last_name asc
+
+  - type: output
+    name: result
+    input: sort_output
+    config:
+      name: result
+      type: csv
+      path: "./output/result.csv"
+      include_header: true
 
 error_handling:
   strategy: continue

@@ -5,36 +5,313 @@ pub mod error;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use clinker_record::Value;
+use clinker_record::{GroupByKey, GroupKeyError, Value, value_to_group_key};
 
 use crate::ast::{BinOp, Expr, LiteralValue, Statement, UnaryOp};
 use crate::lexer::Span;
 use crate::resolve::traits::{FieldResolver, RecordStorage, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
-pub use context::{Clock, EvalContext, FixedClock, WallClock};
+pub use context::{Clock, EvalContext, FixedClock, StableEvalContext, WallClock};
 pub use error::{EvalError, EvalErrorKind};
+
+/// Row disposition signal from CXL evaluation.
+///
+/// Returned by `ProgramEvaluator::eval_record()` and consumed by
+/// the executor to decide whether to emit, skip, or route a record.
+#[derive(Debug)]
+pub enum EvalResult {
+    /// Record passed all filters and distinct checks — emit to output.
+    /// `fields` = output field values, `metadata` = `$meta.*` writes.
+    Emit {
+        fields: indexmap::IndexMap<String, Value>,
+        metadata: indexmap::IndexMap<String, Value>,
+    },
+    /// Record should be excluded from output.
+    Skip(SkipReason),
+}
+
+impl EvalResult {
+    /// Convenience: unwrap the emitted fields (panics on Skip).
+    pub fn into_fields(self) -> indexmap::IndexMap<String, Value> {
+        match self {
+            EvalResult::Emit { fields, .. } => fields,
+            EvalResult::Skip(_) => panic!("called into_fields on Skip"),
+        }
+    }
+}
+
+/// Why a record was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A `filter` predicate evaluated to non-true.
+    Filtered,
+    /// A `distinct` statement found a duplicate value.
+    Duplicate,
+}
+
+/// Stateful CXL evaluator wrapping a compiled program.
+///
+/// Owns the `TypedProgram` and optional distinct dedup state. One evaluator
+/// per transform per partition/thread — never Clone, use factory construction.
+/// Follows DataFusion Accumulator / Polars GroupedReduction pattern.
+pub struct ProgramEvaluator {
+    typed: Arc<TypedProgram>,
+    /// HashSet for distinct dedup. None when no distinct statement present.
+    distinct_seen: Option<HashSet<Vec<GroupByKey>>>,
+    /// Current partition key for window-scoped distinct.
+    current_partition_key: Option<Vec<GroupByKey>>,
+    /// Whether this program has any distinct statements.
+    has_distinct: bool,
+}
+
+impl ProgramEvaluator {
+    /// Create a new evaluator for the given program.
+    /// `has_distinct` controls whether the distinct HashSet is allocated.
+    pub fn new(typed: Arc<TypedProgram>, has_distinct: bool) -> Self {
+        Self {
+            typed,
+            distinct_seen: if has_distinct {
+                Some(HashSet::new())
+            } else {
+                None
+            },
+            current_partition_key: None,
+            has_distinct,
+        }
+    }
+
+    /// Called before eval_record when transform has windows.
+    /// Clears distinct set on partition change.
+    pub fn set_partition(&mut self, key: &[GroupByKey]) {
+        if self.current_partition_key.as_deref() != Some(key) {
+            if let Some(seen) = &mut self.distinct_seen {
+                seen.clear();
+            }
+            self.current_partition_key = Some(key.to_vec());
+        }
+    }
+
+    /// Reset distinct state (between files or when reusing evaluator).
+    pub fn reset_distinct(&mut self) {
+        if let Some(seen) = &mut self.distinct_seen {
+            seen.clear();
+        }
+        self.current_partition_key = None;
+    }
+
+    /// Whether this program has any distinct statements.
+    pub fn has_distinct(&self) -> bool {
+        self.has_distinct
+    }
+
+    /// Borrow the underlying typed program. Used by the aggregation
+    /// engine to evaluate `BindingArg::Expr` arguments through the free
+    /// `eval_expr` entry point during the hash aggregator hot loop.
+    pub fn typed(&self) -> &Arc<TypedProgram> {
+        &self.typed
+    }
+
+    /// Evaluate a record through the full program, returning Emit or Skip.
+    pub fn eval_record<'w, S: RecordStorage + 'w>(
+        &mut self,
+        ctx: &EvalContext<'_>,
+        resolver: &dyn FieldResolver,
+        window: Option<&dyn WindowContext<'w, S>>,
+    ) -> Result<EvalResult, EvalError> {
+        let mut env: HashMap<String, Value> = HashMap::new();
+        let mut output = indexmap::IndexMap::new();
+        let mut meta_output = indexmap::IndexMap::new();
+
+        for stmt in &self.typed.program.statements {
+            match stmt {
+                Statement::Filter { predicate, .. } => {
+                    let val = eval_expr(
+                        predicate,
+                        &self.typed,
+                        ctx,
+                        resolver,
+                        window,
+                        &env,
+                        &meta_output,
+                    )?;
+                    if val != Value::Bool(true) {
+                        return Ok(EvalResult::Skip(SkipReason::Filtered));
+                    }
+                }
+                Statement::Distinct { field, .. } => {
+                    let key = self.build_distinct_key(field.as_deref(), &env, resolver)?;
+                    let seen = self
+                        .distinct_seen
+                        .as_mut()
+                        .expect("distinct statement requires ProgramEvaluator with distinct state");
+                    if !seen.insert(key) {
+                        return Ok(EvalResult::Skip(SkipReason::Duplicate));
+                    }
+                }
+                Statement::Let { name, expr, .. } => {
+                    let val =
+                        eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
+                    env.insert(name.to_string(), val);
+                }
+                Statement::Emit {
+                    name,
+                    expr,
+                    is_meta,
+                    ..
+                } => {
+                    let val =
+                        eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
+                    if *is_meta {
+                        meta_output.insert(name.to_string(), val);
+                    } else {
+                        output.insert(name.to_string(), val);
+                    }
+                }
+                Statement::Trace {
+                    level,
+                    guard,
+                    message,
+                    ..
+                } => {
+                    let should_trace = if let Some(g) = guard {
+                        matches!(
+                            eval_expr(g, &self.typed, ctx, resolver, window, &env, &meta_output)?,
+                            Value::Bool(true)
+                        )
+                    } else {
+                        true
+                    };
+                    if should_trace {
+                        let msg = eval_expr(
+                            message,
+                            &self.typed,
+                            ctx,
+                            resolver,
+                            window,
+                            &env,
+                            &meta_output,
+                        )?;
+                        let msg_str = match &msg {
+                            Value::String(s) => s.to_string(),
+                            other => format!("{:?}", other),
+                        };
+                        match level.unwrap_or(crate::ast::TraceLevel::Trace) {
+                            crate::ast::TraceLevel::Trace => tracing::trace!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Debug => tracing::debug!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Info => tracing::info!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Warn => tracing::warn!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                            crate::ast::TraceLevel::Error => tracing::error!(
+                                source_row = ctx.source_row,
+                                source_file = %ctx.source_file,
+                                "{}", msg_str
+                            ),
+                        }
+                    }
+                }
+                Statement::UseStmt { .. } => {}
+                Statement::ExprStmt { expr, .. } => {
+                    eval_expr(expr, &self.typed, ctx, resolver, window, &env, &meta_output)?;
+                }
+            }
+        }
+        Ok(EvalResult::Emit {
+            fields: output,
+            metadata: meta_output,
+        })
+    }
+
+    /// Build the distinct key for a record.
+    fn build_distinct_key(
+        &self,
+        field: Option<&str>,
+        env: &HashMap<String, Value>,
+        resolver: &dyn FieldResolver,
+    ) -> Result<Vec<GroupByKey>, EvalError> {
+        match field {
+            Some(name) => {
+                // Resolve from let-bindings first, then input fields
+                let val = env
+                    .get(name)
+                    .cloned()
+                    .or_else(|| resolver.resolve(name))
+                    .unwrap_or(Value::Null);
+                match value_to_group_key(&val, name, None, 0) {
+                    Ok(Some(gk)) => Ok(vec![gk]),
+                    Ok(None) => Ok(vec![GroupByKey::Null]),
+                    Err(e) => Err(group_key_error_to_eval_error(e)),
+                }
+            }
+            None => {
+                // Bare distinct — hash all input fields
+                let mut key = Vec::new();
+                for (name, val) in resolver.iter_fields() {
+                    match value_to_group_key(&val, &name, None, 0) {
+                        Ok(Some(gk)) => key.push(gk),
+                        Ok(None) => key.push(GroupByKey::Null),
+                        Err(e) => return Err(group_key_error_to_eval_error(e)),
+                    }
+                }
+                Ok(key)
+            }
+        }
+    }
+}
+
+/// Convert a GroupKeyError to an EvalError.
+fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
+    let got = match &e {
+        GroupKeyError::NanInGroupBy { .. } => "NaN",
+        GroupKeyError::TypeMismatch { got, .. } => got,
+        GroupKeyError::UnsupportedType { type_name, .. } => type_name,
+    };
+    EvalError::new(
+        EvalErrorKind::TypeMismatch {
+            expected: "hashable value",
+            got,
+        },
+        Span::new(0, 0),
+    )
+}
 
 /// Evaluate a full CXL program against a record. Returns the output field map.
 pub fn eval_program<'w, S: RecordStorage + 'w>(
     typed: &TypedProgram,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
 ) -> Result<indexmap::IndexMap<String, Value>, EvalError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     let mut output = indexmap::IndexMap::new();
+    let meta_state = indexmap::IndexMap::new();
 
     for stmt in &typed.program.statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
                 env.insert(name.to_string(), val);
             }
             Statement::Emit { name, expr, .. } => {
-                let val = eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                let val = eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
                 output.insert(name.to_string(), val);
             }
             Statement::Trace {
@@ -45,14 +322,14 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             } => {
                 let should_trace = if let Some(g) = guard {
                     matches!(
-                        eval_expr(g, typed, ctx, resolver, window, &env)?,
+                        eval_expr(g, typed, ctx, resolver, window, &env, &meta_state)?,
                         Value::Bool(true)
                     )
                 } else {
                     true
                 };
                 if should_trace {
-                    let msg = eval_expr(message, typed, ctx, resolver, window, &env)?;
+                    let msg = eval_expr(message, typed, ctx, resolver, window, &env, &meta_state)?;
                     let msg_str = match &msg {
                         Value::String(s) => s.to_string(),
                         other => format!("{:?}", other),
@@ -88,7 +365,11 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
             }
             Statement::UseStmt { .. } => {} // Module imports handled at compile time
             Statement::ExprStmt { expr, .. } => {
-                eval_expr(expr, typed, ctx, resolver, window, &env)?;
+                eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
+            }
+            Statement::Filter { .. } | Statement::Distinct { .. } => {
+                // Handled by ProgramEvaluator::eval_record() (Phase 12.2.5+)
+                // eval_program() is the legacy path — these statements are no-ops here.
             }
         }
     }
@@ -100,10 +381,11 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
 pub fn eval_expr<'w, S: RecordStorage + 'w>(
     expr: &Expr,
     typed: &TypedProgram,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
+    meta_state: &indexmap::IndexMap<String, Value>,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Literal { value, .. } => Ok(literal_to_value(value)),
@@ -138,18 +420,31 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             Ok(ctx.resolve_pipeline(field).unwrap_or(Value::Null))
         }
 
-        Expr::Now { .. } => Ok(Value::DateTime(ctx.clock.now())),
+        Expr::MetaAccess { field, .. } => {
+            // Check locally-emitted metadata first (same transform), then resolver
+            if let Some(val) = meta_state.get(&**field) {
+                return Ok(val.clone());
+            }
+            // Fall back to Record metadata (set by earlier transforms)
+            Ok(resolver
+                .resolve(&format!("$meta.{field}"))
+                .unwrap_or(Value::Null))
+        }
+
+        Expr::Now { .. } => Ok(Value::DateTime(ctx.stable.clock.now())),
 
         Expr::Wildcard { .. } => Ok(Value::Bool(true)), // Wildcard in match = always matches
 
         Expr::Binary {
             op, lhs, rhs, span, ..
-        } => eval_binary(*op, lhs, rhs, *span, typed, ctx, resolver, window, env),
+        } => eval_binary(
+            *op, lhs, rhs, *span, typed, ctx, resolver, window, env, meta_state,
+        ),
 
         Expr::Unary {
             op, operand, span, ..
         } => {
-            let val = eval_expr(operand, typed, ctx, resolver, window, env)?;
+            let val = eval_expr(operand, typed, ctx, resolver, window, env, meta_state)?;
             match op {
                 UnaryOp::Neg => match val {
                     Value::Integer(n) => n
@@ -169,9 +464,9 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
         }
 
         Expr::Coalesce { lhs, rhs, .. } => {
-            let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
+            let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
             if left.is_null() {
-                eval_expr(rhs, typed, ctx, resolver, window, env)
+                eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)
             } else {
                 Ok(left) // Short-circuit: RHS not evaluated
             }
@@ -183,12 +478,14 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             else_branch,
             ..
         } => {
-            let cond = eval_expr(condition, typed, ctx, resolver, window, env)?;
+            let cond = eval_expr(condition, typed, ctx, resolver, window, env, meta_state)?;
             match cond {
-                Value::Bool(true) => eval_expr(then_branch, typed, ctx, resolver, window, env),
+                Value::Bool(true) => {
+                    eval_expr(then_branch, typed, ctx, resolver, window, env, meta_state)
+                }
                 _ => {
                     if let Some(eb) = else_branch {
-                        eval_expr(eb, typed, ctx, resolver, window, env)
+                        eval_expr(eb, typed, ctx, resolver, window, env, meta_state)
                     } else {
                         Ok(Value::Null)
                     }
@@ -199,14 +496,16 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
         Expr::Match { subject, arms, .. } => {
             if let Some(scrutinee) = subject {
                 // Value-form match
-                let scrutinee_val = eval_expr(scrutinee, typed, ctx, resolver, window, env)?;
+                let scrutinee_val =
+                    eval_expr(scrutinee, typed, ctx, resolver, window, env, meta_state)?;
                 for arm in arms {
                     if matches!(arm.pattern, Expr::Wildcard { .. }) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
-                    let pat_val = eval_expr(&arm.pattern, typed, ctx, resolver, window, env)?;
+                    let pat_val =
+                        eval_expr(&arm.pattern, typed, ctx, resolver, window, env, meta_state)?;
                     if values_equal(&scrutinee_val, &pat_val) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
                 }
                 Ok(Value::Null)
@@ -214,11 +513,12 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 // Condition-form match
                 for arm in arms {
                     if matches!(arm.pattern, Expr::Wildcard { .. }) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
-                    let cond = eval_expr(&arm.pattern, typed, ctx, resolver, window, env)?;
+                    let cond =
+                        eval_expr(&arm.pattern, typed, ctx, resolver, window, env, meta_state)?;
                     if matches!(cond, Value::Bool(true)) {
-                        return eval_expr(&arm.body, typed, ctx, resolver, window, env);
+                        return eval_expr(&arm.body, typed, ctx, resolver, window, env, meta_state);
                     }
                 }
                 Ok(Value::Null)
@@ -232,10 +532,12 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             args,
             span,
         } => {
-            let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env)?;
+            let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env, meta_state)?;
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
-                arg_vals.push(eval_expr(arg, typed, ctx, resolver, window, env)?);
+                arg_vals.push(eval_expr(
+                    arg, typed, ctx, resolver, window, env, meta_state,
+                )?);
             }
 
             // Get pre-compiled regex if available
@@ -312,7 +614,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 "lag" => {
                     let offset = args
                         .first()
-                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
+                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env, meta_state))
                         .transpose()?
                         .and_then(|v| {
                             if let Value::Integer(n) = v {
@@ -327,7 +629,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 "lead" => {
                     let offset = args
                         .first()
-                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env))
+                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env, meta_state))
                         .transpose()?
                         .and_then(|v| {
                             if let Value::Integer(n) = v {
@@ -357,6 +659,38 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                 _ => Ok(Value::Null),
             }
         }
+
+        // AggCall is handled by the hash/streaming aggregator, not the row-level
+        // evaluator. Reaching here means the typecheck pass failed to reject an
+        // aggregate call in a row-level context.
+        Expr::AggCall { name, span, .. } => {
+            let _ = name;
+            Err(EvalError::new(
+                EvalErrorKind::TypeMismatch {
+                    expected: "row-level expression",
+                    got: "aggregate function call",
+                },
+                *span,
+            ))
+        }
+
+        // Extractor-produced leaves. Reaching the row-level evaluator means a
+        // post-extraction residual was evaluated without an aggregate scope —
+        // the aggregate finalize path has its own evaluator (Task 16.3.12).
+        Expr::AggSlot { span, .. } => Err(EvalError::new(
+            EvalErrorKind::TypeMismatch {
+                expected: "row-level expression",
+                got: "aggregate slot reference",
+            },
+            *span,
+        )),
+        Expr::GroupKey { span, .. } => Err(EvalError::new(
+            EvalErrorKind::TypeMismatch {
+                expected: "row-level expression",
+                got: "group-by key reference",
+            },
+            *span,
+        )),
     }
 }
 
@@ -367,20 +701,21 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
     rhs: &Expr,
     span: Span,
     typed: &TypedProgram,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
     resolver: &dyn FieldResolver,
     window: Option<&dyn WindowContext<'w, S>>,
     env: &HashMap<String, Value>,
+    meta_state: &indexmap::IndexMap<String, Value>,
 ) -> Result<Value, EvalError> {
     // Three-valued AND/OR: short-circuit before evaluating RHS
     match op {
         BinOp::And => {
-            let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
+            let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
             return match left {
                 Value::Bool(false) => Ok(Value::Bool(false)), // false && anything = false
-                Value::Bool(true) => eval_expr(rhs, typed, ctx, resolver, window, env),
+                Value::Bool(true) => eval_expr(rhs, typed, ctx, resolver, window, env, meta_state),
                 Value::Null => {
-                    let right = eval_expr(rhs, typed, ctx, resolver, window, env)?;
+                    let right = eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)?;
                     match right {
                         Value::Bool(false) => Ok(Value::Bool(false)), // null && false = false
                         _ => Ok(Value::Null),
@@ -390,12 +725,12 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
             };
         }
         BinOp::Or => {
-            let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
+            let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
             return match left {
                 Value::Bool(true) => Ok(Value::Bool(true)), // true || anything = true
-                Value::Bool(false) => eval_expr(rhs, typed, ctx, resolver, window, env),
+                Value::Bool(false) => eval_expr(rhs, typed, ctx, resolver, window, env, meta_state),
                 Value::Null => {
-                    let right = eval_expr(rhs, typed, ctx, resolver, window, env)?;
+                    let right = eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)?;
                     match right {
                         Value::Bool(true) => Ok(Value::Bool(true)), // null || true = true
                         _ => Ok(Value::Null),
@@ -407,8 +742,8 @@ fn eval_binary<'w, S: RecordStorage + 'w>(
         _ => {}
     }
 
-    let left = eval_expr(lhs, typed, ctx, resolver, window, env)?;
-    let right = eval_expr(rhs, typed, ctx, resolver, window, env)?;
+    let left = eval_expr(lhs, typed, ctx, resolver, window, env, meta_state)?;
+    let right = eval_expr(rhs, typed, ctx, resolver, window, env, meta_state)?;
 
     // Equality: never null (per spec)
     match op {

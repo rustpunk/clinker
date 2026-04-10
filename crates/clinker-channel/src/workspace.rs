@@ -152,6 +152,7 @@ fn default_groups_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     /// Walk from nested dir finds clinker.toml in ancestor.
@@ -181,6 +182,7 @@ mod tests {
 
     /// No clinker.toml anywhere → None.
     #[test]
+    #[serial]
     fn test_workspace_discover_returns_none_without_marker() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("pipeline.yaml");
@@ -252,6 +254,7 @@ env = "staging"
 
     /// CLINKER_WORKSPACE_ROOT bypasses walk.
     #[test]
+    #[serial]
     fn test_workspace_env_var_override() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();

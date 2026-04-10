@@ -4,13 +4,10 @@
 /// never from run results. The doc model is section-based: each stage
 /// gets applicable sections (schema, lineage, contract, config, provenance,
 /// channel overrides) populated from config metadata.
-use clinker_core::composition::ResolvedComposition;
 use clinker_core::config::{
     ErrorStrategy, InputFormat, OutputFormat, PipelineConfig, SchemaSource,
 };
 use clinker_record::schema_def::FieldDef;
-
-use crate::channel_resolve::{AppliedOverride, OverrideKind, OverrideSource};
 
 // ── StageDoc model ──────────────────────────────────────────────────────────
 
@@ -64,7 +61,6 @@ pub enum StageKindDoc {
     Source,
     Transform,
     Output,
-    Composition,
 }
 
 // ── Schema section ──────────────────────────────────────────────────────────
@@ -225,7 +221,8 @@ pub struct ProvenanceSection {
 
 // ── Channel override section ────────────────────────────────────────────────
 
-/// Channel override provenance — present only when documenting a resolved pipeline.
+/// Channel override provenance placeholder. Composition/channel features are
+/// removed in Phase 16b; the type is kept as a transparent stub for the UI.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelOverrideSection {
     pub channel_id: String,
@@ -234,60 +231,27 @@ pub struct ChannelOverrideSection {
     pub override_file: String,
 }
 
-// ── Channel doc context ─────────────────────────────────────────────────────
-
-/// Channel context passed to doc generation when a channel is active.
-pub struct ChannelDocContext {
-    pub channel_id: String,
-    pub overrides_applied: Vec<AppliedOverride>,
-}
-
 // ── Doc generation ──────────────────────────────────────────────────────────
 
 /// Generate documentation for the stage with the given name.
-pub fn generate_stage_doc(
-    config: &PipelineConfig,
-    compositions: &[ResolvedComposition],
-    channel_info: Option<&ChannelDocContext>,
-    stage_name: &str,
-) -> Option<StageDoc> {
-    // Check inputs
-    if let Some(input) = config.inputs.iter().find(|i| i.name == stage_name) {
-        return Some(generate_input_doc(config, input, channel_info, stage_name));
+pub fn generate_stage_doc(config: &PipelineConfig, stage_name: &str) -> Option<StageDoc> {
+    if let Some(input) = config.source_configs().find(|i| i.name == stage_name) {
+        return Some(generate_input_doc(config, input));
     }
 
-    // Check transforms
-    if let Some(transform) = config.transforms().find(|t| t.name == stage_name) {
-        return Some(generate_transform_doc(
-            config,
-            transform,
-            compositions,
-            channel_info,
-            stage_name,
-        ));
+    for node in &config.nodes {
+        if let clinker_core::config::PipelineNode::Transform {
+            header,
+            config: body,
+        } = &node.value
+            && header.name == stage_name
+        {
+            return Some(generate_transform_doc(config, header, body));
+        }
     }
 
-    // Check outputs
-    if let Some(output) = config.outputs.iter().find(|o| o.name == stage_name) {
-        return Some(generate_output_doc(
-            config,
-            output,
-            channel_info,
-            stage_name,
-        ));
-    }
-
-    // Check collapsed composition nodes (IDs prefixed with _comp_)
-    if let Some(comp_path) = stage_name.strip_prefix("_comp_")
-        && let Some(comp) = compositions.iter().find(|c| c.path == comp_path)
-    {
-        return Some(generate_composition_doc(
-            config,
-            comp,
-            compositions,
-            channel_info,
-            stage_name,
-        ));
+    if let Some(output) = config.output_configs().find(|o| o.name == stage_name) {
+        return Some(generate_output_doc(config, output));
     }
 
     None
@@ -295,9 +259,7 @@ pub fn generate_stage_doc(
 
 fn generate_input_doc(
     config: &PipelineConfig,
-    input: &clinker_core::config::InputConfig,
-    channel_info: Option<&ChannelDocContext>,
-    stage_name: &str,
+    input: &clinker_core::config::SourceConfig,
 ) -> StageDoc {
     let format_name = input.format.format_name();
 
@@ -443,7 +405,7 @@ fn generate_input_doc(
         contract: None,
         config: ConfigSection { entries },
         provenance: None,
-        channel_override: build_channel_override(channel_info, stage_name),
+        channel_override: None,
         cxl_source: None,
         sub_stages: vec![],
     }
@@ -451,13 +413,12 @@ fn generate_input_doc(
 
 fn generate_transform_doc(
     _config: &PipelineConfig,
-    transform: &clinker_core::config::TransformConfig,
-    compositions: &[ResolvedComposition],
-    channel_info: Option<&ChannelDocContext>,
-    stage_name: &str,
+    header: &clinker_core::config::NodeHeader,
+    body: &clinker_core::config::TransformBody,
 ) -> StageDoc {
     // Analyze CXL statements
-    let analysis = analyze_cxl(&transform.cxl);
+    let cxl_src: &str = body.cxl.as_ref();
+    let analysis = analyze_cxl(cxl_src);
 
     let emit_stmts: Vec<_> = analysis
         .statements
@@ -478,7 +439,7 @@ fn generate_transform_doc(
         .collect();
 
     // Build intent-aware summary
-    let summary = if let Some(ref desc) = transform.description {
+    let summary = if let Some(ref desc) = header.description {
         desc.clone()
     } else {
         let filter_fields: Vec<_> = filter_stmts
@@ -523,8 +484,8 @@ fn generate_transform_doc(
         None
     };
 
-    // Find composition origin and contract
-    let (contract, provenance) = find_composition_info(compositions, stage_name, &transform.cxl);
+    let contract: Option<ContractSection> = None;
+    let provenance: Option<ProvenanceSection> = None;
 
     // Build config section
     let has_filters = filter_count > 0;
@@ -553,14 +514,14 @@ fn generate_transform_doc(
         value: if has_filters { "conditional" } else { "yes" }.to_string(),
     });
 
-    if transform.local_window.is_some() {
+    if body.analytic_window.is_some() {
         entries.push(ConfigEntry {
             category: ConfigCategory::Window,
             key: "LOCAL WINDOW".to_string(),
             value: "configured".to_string(),
         });
     }
-    if transform.validations.is_some() {
+    if body.validations.is_some() {
         entries.push(ConfigEntry {
             category: ConfigCategory::Validation,
             key: "VALIDATIONS".to_string(),
@@ -571,14 +532,14 @@ fn generate_transform_doc(
     StageDoc {
         kind: StageKindDoc::Transform,
         summary,
-        user_description: transform.description.clone(),
+        user_description: header.description.clone(),
         schema: None,
         cxl_analysis,
         contract,
         config: ConfigSection { entries },
         provenance,
-        channel_override: build_channel_override(channel_info, stage_name),
-        cxl_source: Some(transform.cxl.clone()),
+        channel_override: None,
+        cxl_source: Some(cxl_src.to_string()),
         sub_stages: vec![],
     }
 }
@@ -586,8 +547,6 @@ fn generate_transform_doc(
 fn generate_output_doc(
     _config: &PipelineConfig,
     output: &clinker_core::config::OutputConfig,
-    channel_info: Option<&ChannelDocContext>,
-    stage_name: &str,
 ) -> StageDoc {
     let format_name = output.format.format_name();
     let mapping_count = output.mapping.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -720,7 +679,7 @@ fn generate_output_doc(
         contract: None,
         config: ConfigSection { entries },
         provenance: None,
-        channel_override: build_channel_override(channel_info, stage_name),
+        channel_override: None,
         cxl_source: None,
         sub_stages: vec![],
     }
@@ -728,7 +687,7 @@ fn generate_output_doc(
 
 // ── Helper: build input schema ──────────────────────────────────────────────
 
-fn build_input_schema(input: &clinker_core::config::InputConfig) -> Option<SchemaSection> {
+fn build_input_schema(input: &clinker_core::config::SourceConfig) -> Option<SchemaSection> {
     let mut fields = Vec::new();
     let source;
 
@@ -847,87 +806,6 @@ fn merge_overrides(fields: &mut Vec<FieldDoc>, overrides: &[FieldDef]) {
     }
 }
 
-// ── Helper: composition info ────────────────────────────────────────────────
-
-fn find_composition_info(
-    compositions: &[ResolvedComposition],
-    stage_name: &str,
-    current_cxl: &str,
-) -> (Option<ContractSection>, Option<ProvenanceSection>) {
-    for comp in compositions {
-        if let Some(origin) = comp.origins.iter().find(|o| o.transform_name == stage_name) {
-            let contract = comp.meta.contract.as_ref().map(|c| ContractSection {
-                composition_name: comp.meta.name.clone(),
-                version: comp.meta.version.clone(),
-                requires: c
-                    .requires
-                    .iter()
-                    .map(|f| ContractFieldDoc {
-                        name: f.name.clone(),
-                        field_type: f.r#type.clone(),
-                    })
-                    .collect(),
-                produces: c
-                    .produces
-                    .iter()
-                    .map(|f| ContractFieldDoc {
-                        name: f.name.clone(),
-                        field_type: f.r#type.clone(),
-                    })
-                    .collect(),
-            });
-
-            let is_overridden = origin.original_cxl != current_cxl;
-            let provenance = Some(ProvenanceSection {
-                composition_path: origin.composition_path.clone(),
-                composition_name: comp.meta.name.clone(),
-                composition_version: comp.meta.version.clone(),
-                is_overridden,
-                original_cxl: if is_overridden {
-                    Some(origin.original_cxl.clone())
-                } else {
-                    None
-                },
-                current_cxl: if is_overridden {
-                    Some(current_cxl.to_string())
-                } else {
-                    None
-                },
-            });
-
-            return (contract, provenance);
-        }
-    }
-    (None, None)
-}
-
-// ── Helper: channel override ────────────────────────────────────────────────
-
-fn build_channel_override(
-    channel_info: Option<&ChannelDocContext>,
-    stage_name: &str,
-) -> Option<ChannelOverrideSection> {
-    let ctx = channel_info?;
-    let applied = ctx
-        .overrides_applied
-        .iter()
-        .find(|o| o.target_name == stage_name)?;
-
-    Some(ChannelOverrideSection {
-        channel_id: ctx.channel_id.clone(),
-        override_kind: match applied.kind {
-            OverrideKind::Modified => "MODIFIED".to_string(),
-            OverrideKind::Added => "ADDED".to_string(),
-            OverrideKind::Removed => "REMOVED".to_string(),
-        },
-        override_source: match &applied.source {
-            OverrideSource::Channel => "channel".to_string(),
-            OverrideSource::Group(name) => format!("group: {}", name),
-        },
-        override_file: applied.file.display().to_string(),
-    })
-}
-
 // ── Helper: error handling entries ──────────────────────────────────────────
 
 fn push_error_handling_entries(entries: &mut Vec<ConfigEntry>, config: &PipelineConfig) {
@@ -958,107 +836,6 @@ fn push_error_handling_entries(entries: &mut Vec<ConfigEntry>, config: &Pipeline
             key: "TYPE ERROR THRESHOLD".to_string(),
             value: format!("{}%", threshold * 100.0),
         });
-    }
-}
-
-// ── Composition doc generation ──────────────────────────────────────────────
-
-fn generate_composition_doc(
-    config: &PipelineConfig,
-    comp: &ResolvedComposition,
-    compositions: &[ResolvedComposition],
-    channel_info: Option<&ChannelDocContext>,
-    stage_name: &str,
-) -> StageDoc {
-    let summary = if let Some(ref desc) = comp.meta.description {
-        format!("{}: {}", comp.meta.name, desc)
-    } else {
-        format!(
-            "{} \u{2014} {} transform(s), {} override(s).",
-            comp.meta.name,
-            comp.transform_names.len(),
-            comp.override_count,
-        )
-    };
-
-    let contract = comp.meta.contract.as_ref().map(|c| ContractSection {
-        composition_name: comp.meta.name.clone(),
-        version: comp.meta.version.clone(),
-        requires: c
-            .requires
-            .iter()
-            .map(|f| ContractFieldDoc {
-                name: f.name.clone(),
-                field_type: f.r#type.clone(),
-            })
-            .collect(),
-        produces: c
-            .produces
-            .iter()
-            .map(|f| ContractFieldDoc {
-                name: f.name.clone(),
-                field_type: f.r#type.clone(),
-            })
-            .collect(),
-    });
-
-    let mut entries = vec![
-        ConfigEntry {
-            category: ConfigCategory::Format,
-            key: "TYPE".to_string(),
-            value: "composition".to_string(),
-        },
-        ConfigEntry {
-            category: ConfigCategory::Format,
-            key: "PATH".to_string(),
-            value: comp.path.clone(),
-        },
-        ConfigEntry {
-            category: ConfigCategory::Format,
-            key: "TRANSFORMS".to_string(),
-            value: format!("{}", comp.transform_names.len()),
-        },
-    ];
-    if let Some(ref ver) = comp.meta.version {
-        entries.push(ConfigEntry {
-            category: ConfigCategory::Format,
-            key: "VERSION".to_string(),
-            value: ver.clone(),
-        });
-    }
-    if comp.override_count > 0 {
-        entries.push(ConfigEntry {
-            category: ConfigCategory::Format,
-            key: "OVERRIDES".to_string(),
-            value: format!("{}", comp.override_count),
-        });
-    }
-    // Build sub-stages: full doc for each transform inside the composition
-    let mut sub_stages = Vec::new();
-    for name in &comp.transform_names {
-        if let Some(transform) = config.transforms().find(|t| t.name == *name) {
-            sub_stages.push(generate_transform_doc(
-                config,
-                transform,
-                compositions,
-                channel_info,
-                name,
-            ));
-        }
-    }
-
-    StageDoc {
-        kind: StageKindDoc::Composition,
-        summary,
-        user_description: comp.meta.description.clone(),
-        schema: None,
-        cxl_analysis: None,
-        contract,
-        config: ConfigSection { entries },
-        provenance: None,
-        channel_override: build_channel_override(channel_info, stage_name),
-        cxl_source: None,
-        sub_stages,
     }
 }
 

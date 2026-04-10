@@ -7,7 +7,6 @@ use super::drawer_bar::{ActiveDrawer, DrawerToggleBar};
 use super::drawer_docs::DrawerDocs;
 use super::drawer_notes::DrawerNotes;
 use super::drawer_run::DrawerRun;
-use super::override_diff::OverrideDiff;
 use super::scoped_yaml::ScopedYaml;
 use super::stage_header::StageHeader;
 
@@ -27,50 +26,66 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         return rsx! {};
     };
 
-    // Determine stage kind and extract data
-    let input = config.inputs.iter().find(|i| i.name == stage_id);
-    let transform = config.transforms().find(|t| t.name == stage_id);
-    let output = config.outputs.iter().find(|o| o.name == stage_id);
-
-    let (kind_label, accent, subtitle) = if input.is_some() {
-        ("SOURCE", "#43B3AE", input.unwrap().path.clone())
-    } else if let Some(t) = transform {
-        (
-            "TRANSFORM",
-            "#C75B2A",
-            t.description.clone().unwrap_or_default(),
-        )
-    } else if output.is_some() {
-        ("OUTPUT", "#B7410E", output.unwrap().path.clone())
-    } else {
+    // Phase 16b Task 16b.5: dispatch inspector content on the
+    // `PipelineNode` variant tag. Every variant is handled explicitly so
+    // adding a new one is a compile break here.
+    use clinker_core::config::PipelineNode;
+    let Some(node_spanned) = config.nodes.iter().find(|n| n.value.name() == stage_id) else {
         return rsx! {};
     };
-
-    let cxl_source = transform.map(|t| t.cxl.clone());
+    let (kind_label, kind_attr, subtitle, cxl_source) = match &node_spanned.value {
+        PipelineNode::Source { config: body, .. } => {
+            ("SOURCE", "source", body.source.path.clone(), None)
+        }
+        PipelineNode::Transform { config: body, .. } => (
+            "TRANSFORM",
+            "transform",
+            String::new(),
+            Some(body.cxl.as_ref().to_string()),
+        ),
+        PipelineNode::Aggregate { config: body, .. } => {
+            let subtitle = if body.group_by.is_empty() {
+                String::new()
+            } else {
+                format!("group_by: {}", body.group_by.join(", "))
+            };
+            (
+                "AGGREGATE",
+                "aggregate",
+                subtitle,
+                Some(body.cxl.as_ref().to_string()),
+            )
+        }
+        PipelineNode::Route { config: body, .. } => {
+            let subtitle = format!(
+                "{} branch{} → {}",
+                body.conditions.len(),
+                if body.conditions.len() == 1 { "" } else { "es" },
+                body.default
+            );
+            ("ROUTE", "route", subtitle, None)
+        }
+        PipelineNode::Merge { header, .. } => (
+            "MERGE",
+            "merge",
+            format!("{} inputs", header.inputs.len()),
+            None,
+        ),
+        PipelineNode::Output { config: body, .. } => {
+            ("OUTPUT", "output", body.output.path.clone(), None)
+        }
+        PipelineNode::Composition { config: body, .. } => (
+            "COMPOSITION",
+            "composition",
+            format!("use: {} (Phase 16c)", body.r#use.display()),
+            None,
+        ),
+    };
+    let is_source_or_output = matches!(
+        &node_spanned.value,
+        PipelineNode::Source { .. } | PipelineNode::Output { .. }
+    );
     let drawer_open = (active_drawer)() != ActiveDrawer::None;
-
-    // Channel override info for this stage
-    let channel_resolution = (state.channel_pipeline)();
-    let override_info = channel_resolution.as_ref().and_then(|cr| {
-        cr.overrides_applied
-            .iter()
-            .find(|o| o.target_name == stage_id)
-            .cloned()
-    });
-
-    // Get base CXL for diff comparison
-    let base_cxl = cxl_source.clone().unwrap_or_default();
-
-    // Get resolved CXL from channel resolution
-    let resolved_cxl = channel_resolution
-        .as_ref()
-        .and_then(|cr| {
-            cr.resolved_config
-                .transforms()
-                .find(|t| t.name == stage_id)
-                .map(|t| t.cxl.clone())
-        })
-        .unwrap_or_default();
 
     rsx! {
         div {
@@ -81,17 +96,8 @@ pub fn InspectorPanel(stage_id: String) -> Element {
             StageHeader {
                 stage_id: stage_id.clone(),
                 kind_label,
-                accent,
+                kind_attr,
                 label: stage_id.clone(),
-            }
-
-            // ── Override diff (when channel override applies to this stage) ──
-            if let Some(applied) = override_info {
-                OverrideDiff {
-                    applied: applied.clone(),
-                    base_cxl: base_cxl.clone(),
-                    resolved_cxl: resolved_cxl.clone(),
-                }
             }
 
             // ── Config section (upper, always visible) ────────────────────
@@ -113,7 +119,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
                         div {
                             class: "kiln-cxl-field",
                             label { class: "kiln-cxl-label",
-                                if input.is_some() || output.is_some() { "PATH" } else { "DESCRIPTION" }
+                                if is_source_or_output { "PATH" } else { "DESCRIPTION" }
                             }
                             div {
                                 class: "kiln-inspector-value",
@@ -133,7 +139,6 @@ pub fn InspectorPanel(stage_id: String) -> Element {
 
                 ScopedYaml {
                     stage_id: stage_id.clone(),
-                    accent,
                 }
             }
 

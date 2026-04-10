@@ -17,10 +17,10 @@ _compose:
 transformations:
   - name: normalize_email
     cxl: |
-      emit email_lower = lower(email.trim())
+      emit email_lower = email.trim().lower()
   - name: check_email_format
     cxl: |
-      emit email_valid = email_lower matches "^[^@]+@[^@]+\\.[^@]+$"
+      emit email_valid = email_lower.matches("^[^@]+@[^@]+\\.[^@]+$")
   - name: extract_domain
     cxl: |
-      emit email_domain = email_lower.split("@").last()
+      emit email_domain = email_lower.capture("@(.+)", 1)

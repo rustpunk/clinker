@@ -7,6 +7,7 @@ use crate::error::FormatError;
 use crate::traits::FormatWriter;
 
 /// Configuration for the fixed-width writer.
+#[derive(Clone)]
 pub struct FixedWidthWriterConfig {
     pub line_separator: LineSeparator,
 }
@@ -23,8 +24,6 @@ impl Default for FixedWidthWriterConfig {
 struct WriteField {
     name: String,
     width: usize,
-    #[allow(dead_code)]
-    field_type: Option<FieldType>,
     justify: Justify,
     pad_char: char,
     truncation: TruncationPolicy,
@@ -85,7 +84,6 @@ impl<W: Write> FixedWidthWriter<W> {
                 Ok(WriteField {
                     name: f.name.clone(),
                     width,
-                    field_type: f.field_type.clone(),
                     justify,
                     pad_char,
                     truncation,
@@ -115,7 +113,7 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
-            Value::Array(_) => String::new(),
+            Value::Array(_) | Value::Map(_) => String::new(),
         }
     }
 

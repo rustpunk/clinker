@@ -6,30 +6,46 @@ _template:
   author: "clinker"
   version: "1.0"
   hints:
-    "inputs[0].path": "replace with your source path"
-    "outputs[0].path": "replace with your output path"
-    "transformations[0].cxl": "your filter expression"
-    "transformations[1].cxl": "your map expressions"
+    "nodes[0].config.path": "replace with your source path"
+    "nodes[3].config.path": "replace with your output path"
+    "nodes[1].config.cxl": "your filter expression"
+    "nodes[2].config.cxl": "your map expressions"
 
 pipeline:
   name: csv-transform
 
-inputs:
-  - name: source
-    type: csv
-    path: "./data/input.csv"
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: "./data/input.csv"
+      options:
+        has_header: true
+      schema:
+        - { name: status, type: string }
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
 
-transformations:
-  - name: filter_active
-    cxl: |
-      filter status == "active"
-  - name: compute_fields
-    cxl: |
-      emit full_name = first_name + " " + last_name
+  - type: transform
+    name: filter_active
+    input: source
+    config:
+      cxl: |
+        filter status == "active"
 
-outputs:
-  - name: result
-    type: csv
-    path: "./output/result.csv"
+  - type: transform
+    name: compute_fields
+    input: filter_active
+    config:
+      cxl: |
+        emit full_name = first_name + " " + last_name
+
+  - type: output
+    name: result
+    input: compute_fields
+    config:
+      name: result
+      type: csv
+      path: "./output/result.csv"

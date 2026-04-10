@@ -1,37 +1,61 @@
 pipeline:
   name: invoice_rollup
 
-inputs:
-  - name: invoices
-    type: csv
-    path: ./data/invoices.csv
-    options:
-      has_header: true
-  - name: customers
-    type: csv
-    path: ./data/customers.csv
-    options:
-      has_header: true
+nodes:
+  - type: source
+    name: invoices
+    config:
+      name: invoices
+      type: csv
+      path: ./data/invoices.csv
+      options:
+        has_header: true
+      schema:
+        - { name: invoice_id, type: string }
+        - { name: invoice_date, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: string }
 
-outputs:
-  - name: rollup
-    type: csv
-    path: ./output/invoice_rollup.csv
-    include_unmapped: false
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: ./data/customers.csv
+      options:
+        has_header: true
+      schema:
+        - { name: customer_id, type: string }
+        - { name: first_name, type: string }
+        - { name: last_name, type: string }
 
-transformations:
-  - name: recent_only
+  - type: transform
+    name: recent_only
     description: Filter to last 90 days
-    cxl: |
-      emit _include = days_since(invoice_date) < 90
+    input: invoices
+    config:
+      cxl: |
+        emit _include = days_since(invoice_date) < 90
 
-  - _import: compositions/fiscal_date.comp.yaml
+  # TODO(16c compositions): fiscal_date composition import was stripped during 16b fixture migration.
 
-  - name: totals
+  - type: transform
+    name: totals
     description: Sum by customer
-    cxl: |
-      emit total_amount = sum(amount)
-      emit invoice_count = count(invoice_id)
+    input: recent_only
+    config:
+      cxl: |
+        emit total_amount = sum(amount)
+        emit invoice_count = count(invoice_id)
+
+  - type: output
+    name: rollup
+    input: totals
+    config:
+      name: rollup
+      type: csv
+      path: ./output/invoice_rollup.csv
+      include_unmapped: false
 
 error_handling:
   strategy: continue

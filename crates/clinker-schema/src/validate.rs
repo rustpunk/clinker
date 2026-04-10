@@ -9,9 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::model::{SchemaIndex, SourceSchema};
-use clinker_core::config::{
-    InputConfig, InputFormat, PipelineConfig, SchemaSource, TransformConfig,
-};
+use clinker_core::config::{InputFormat, PipelineConfig, PipelineNode, SchemaSource, SourceConfig};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -52,13 +50,13 @@ pub fn validate_pipeline(
 ) -> Vec<SchemaWarning> {
     let mut warnings = Vec::new();
 
-    for input in &config.inputs {
+    for input in config.source_configs() {
         validate_input(input, index, workspace_root, &mut warnings);
     }
 
     // Collect known fields from all inputs for CXL validation
     let mut available_fields: HashSet<String> = HashSet::new();
-    for input in &config.inputs {
+    for input in config.source_configs() {
         if let Some(schema) = resolve_input_schema(input, index, workspace_root) {
             for field_name in schema.all_field_names() {
                 available_fields.insert(field_name);
@@ -67,11 +65,18 @@ pub fn validate_pipeline(
     }
 
     // Validate transformations against accumulated fields
-    for transform in config.transforms() {
-        validate_transform(transform, &available_fields, &mut warnings);
-        // Add emitted fields to available set
-        for emitted in extract_emit_fields(&transform.cxl) {
-            available_fields.insert(emitted);
+    for node in &config.nodes {
+        if let PipelineNode::Transform {
+            header,
+            config: body,
+        } = &node.value
+        {
+            let cxl_src: &str = body.cxl.as_ref();
+            validate_transform(&header.name, cxl_src, &available_fields, &mut warnings);
+            // Add emitted fields to available set
+            for emitted in extract_emit_fields(cxl_src) {
+                available_fields.insert(emitted);
+            }
         }
     }
 
@@ -80,7 +85,7 @@ pub fn validate_pipeline(
 
 /// Validate an input stage against its linked schema.
 fn validate_input(
-    input: &InputConfig,
+    input: &SourceConfig,
     index: &SchemaIndex,
     workspace_root: &Path,
     warnings: &mut Vec<SchemaWarning>,
@@ -142,7 +147,8 @@ fn validate_input(
 
 /// Validate a transformation's CXL against available fields.
 fn validate_transform(
-    transform: &TransformConfig,
+    stage_name: &str,
+    cxl: &str,
     available_fields: &HashSet<String>,
     warnings: &mut Vec<SchemaWarning>,
 ) {
@@ -151,14 +157,14 @@ fn validate_transform(
     }
 
     // Extract field references from CXL (simple heuristic)
-    let referenced = extract_referenced_fields(&transform.cxl);
+    let referenced = extract_referenced_fields(cxl);
     let schema_fields: Vec<&str> = available_fields.iter().map(|s| s.as_str()).collect();
 
     for field in referenced {
         if !available_fields.contains(&field) {
             let suggestion = find_closest_field(&field, &schema_fields);
             warnings.push(SchemaWarning {
-                stage_name: transform.name.clone(),
+                stage_name: stage_name.to_string(),
                 message: format!("Field '{field}' not found in upstream schema"),
                 suggestion,
                 kind: WarningKind::FieldNotFound,
@@ -169,7 +175,7 @@ fn validate_transform(
 
 /// Resolve the schema for an input stage.
 fn resolve_input_schema<'a>(
-    input: &InputConfig,
+    input: &SourceConfig,
     index: &'a SchemaIndex,
     workspace_root: &Path,
 ) -> Option<&'a SourceSchema> {
@@ -474,34 +480,20 @@ distinct by customer_id
     #[test]
     fn test_validate_pipeline_no_schema() {
         // Pipeline without schema references should produce no warnings
-        let config = PipelineConfig {
-            pipeline: clinker_core::config::PipelineMeta {
-                name: "test".to_string(),
-                memory_limit: None,
-                vars: None,
-                date_formats: None,
-                rules_path: None,
-                concurrency: None,
-                date_locale: None,
-                log_rules: None,
-                include_provenance: None,
-                metrics: None,
-            },
-            inputs: vec![InputConfig {
-                name: "src".to_string(),
-                path: "./data.csv".to_string(),
-                schema: None,
-                schema_overrides: None,
-                array_paths: None,
-                sort_order: None,
-                format: InputFormat::Csv(None),
-                notes: None,
-            }],
-            outputs: vec![],
-            transformations: vec![],
-            error_handling: Default::default(),
-            notes: None,
-        };
+        let yaml = r#"
+pipeline:
+  name: test
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: ./data.csv
+    type: csv
+    schema:
+      - { name: id, type: string }
+"#;
+        let config = clinker_core::config::parse_config(yaml).unwrap();
 
         let index = SchemaIndex::default();
         let warnings = validate_pipeline(&config, &index, Path::new("/tmp"));

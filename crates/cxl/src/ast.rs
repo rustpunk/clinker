@@ -36,6 +36,8 @@ pub enum Statement {
         node_id: NodeId,
         name: Box<str>,
         expr: Expr,
+        /// When true, writes to per-record metadata (`$meta.*`) instead of output.
+        is_meta: bool,
         span: Span,
     },
     Trace {
@@ -54,6 +56,17 @@ pub enum Statement {
     ExprStmt {
         node_id: NodeId,
         expr: Expr,
+        span: Span,
+    },
+    Filter {
+        node_id: NodeId,
+        predicate: Expr,
+        span: Span,
+    },
+    Distinct {
+        node_id: NodeId,
+        /// None = bare `distinct` (all fields), Some = `distinct by <field>`
+        field: Option<Box<str>>,
         span: Span,
     },
 }
@@ -128,6 +141,11 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    MetaAccess {
+        node_id: NodeId,
+        field: Box<str>,
+        span: Span,
+    },
     /// The `now` keyword — wall-clock DateTime at the point of evaluation.
     Now {
         node_id: NodeId,
@@ -135,6 +153,35 @@ pub enum Expr {
     },
     Wildcard {
         node_id: NodeId,
+        span: Span,
+    },
+    /// Free-standing aggregate function call (sum, count, avg, min, max,
+    /// collect, weighted_avg). Parsed via NUD lookahead: Ident + LParen where
+    /// the identifier matches a known aggregate name. Distinct from
+    /// MethodCall (which is receiver-based via `.`).
+    AggCall {
+        node_id: NodeId,
+        name: Box<str>,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// Extractor-produced leaf: references the Nth accumulator slot in a
+    /// CompiledAggregate. Never emitted by the parser; introduced by
+    /// `extract_aggregates` when rewriting an emit RHS that contains AggCalls.
+    /// At finalize time, the aggregate evaluator resolves this to the
+    /// accumulator's `finalize()` result.
+    AggSlot {
+        node_id: NodeId,
+        slot: u32,
+        span: Span,
+    },
+    /// Extractor-produced leaf: references the Nth group-by key column.
+    /// Introduced when a bare `FieldRef` in an emit RHS matches a group-by
+    /// field name — reverses the `value_to_group_key → Value` conversion at
+    /// finalize time.
+    GroupKey {
+        node_id: NodeId,
+        slot: u32,
         span: Span,
     },
 }
@@ -154,8 +201,12 @@ impl Expr {
             | Expr::Coalesce { span, .. }
             | Expr::WindowCall { span, .. }
             | Expr::PipelineAccess { span, .. }
+            | Expr::MetaAccess { span, .. }
             | Expr::Now { span, .. }
-            | Expr::Wildcard { span, .. } => *span,
+            | Expr::Wildcard { span, .. }
+            | Expr::AggCall { span, .. }
+            | Expr::AggSlot { span, .. }
+            | Expr::GroupKey { span, .. } => *span,
         }
     }
 
@@ -173,8 +224,12 @@ impl Expr {
             | Expr::Coalesce { node_id, .. }
             | Expr::WindowCall { node_id, .. }
             | Expr::PipelineAccess { node_id, .. }
+            | Expr::MetaAccess { node_id, .. }
             | Expr::Now { node_id, .. }
-            | Expr::Wildcard { node_id, .. } => *node_id,
+            | Expr::Wildcard { node_id, .. }
+            | Expr::AggCall { node_id, .. }
+            | Expr::AggSlot { node_id, .. }
+            | Expr::GroupKey { node_id, .. } => *node_id,
         }
     }
 }
@@ -287,6 +342,7 @@ mod tests {
                         name: "x".into(),
                         span,
                     },
+                    is_meta: false,
                     span,
                 },
                 Statement::ExprStmt {
@@ -315,6 +371,7 @@ mod tests {
                 name: "label".into(),
                 span,
             },
+            is_meta: false,
             span,
         };
         if let Statement::Emit { name, .. } = stmt {

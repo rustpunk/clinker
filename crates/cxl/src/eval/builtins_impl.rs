@@ -16,7 +16,7 @@ pub fn dispatch_method(
     args: &[Value],
     regex: Option<&Regex>,
     span: Span,
-    ctx: &EvalContext,
+    ctx: &EvalContext<'_>,
 ) -> Result<Option<Value>, EvalError> {
     // Null propagation: nullable receiver → Null for most methods
     if receiver.is_null() && !matches!(method, "is_null" | "type_of" | "is_empty" | "catch") {
@@ -743,6 +743,16 @@ impl std::fmt::Display for ValueDisplay<'_> {
                     write!(f, "{}", ValueDisplay(v))?;
                 }
                 write!(f, "]")
+            }
+            Value::Map(m) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", k, ValueDisplay(v))?;
+                }
+                write!(f, "}}")
             }
         }
     }

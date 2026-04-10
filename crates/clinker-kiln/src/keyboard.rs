@@ -9,6 +9,7 @@
 /// File ops: Ctrl+N/O/S/W/Q, Ctrl+Shift+S/O.
 /// Tab switching: Ctrl+1-9 (Pipeline context only), Ctrl+Tab/Shift+Tab.
 /// Overlays: Ctrl+Shift+P (command palette), Ctrl+Shift+N (templates), Ctrl+, (settings).
+/// Theme: Ctrl+Shift+T (toggle Oxide/Enamel).
 ///
 /// Attached at the AppShell level to capture shortcuts regardless of focus.
 use dioxus::prelude::*;
@@ -18,7 +19,7 @@ use crate::components::confirm_dialog::PendingConfirm;
 use crate::components::toast::{ToastState, toast_error, toast_success};
 use crate::file_ops;
 use crate::state::{AppState, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState};
-use crate::sync::serialize_raw_yaml;
+use crate::sync::serialize_yaml;
 use crate::tab::{TabEntry, TabId};
 use crate::workspace;
 
@@ -88,26 +89,6 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         return true;
     }
 
-    // ── Backspace/Escape — drill-in navigation (Pipeline context only) ───
-    if !ctrl && !alt && !shift && current_context == NavigationContext::Pipeline {
-        let mut drill_sig = app.composition_drill_stack;
-        let drill_stack = drill_sig.read();
-        if !drill_stack.is_empty() {
-            drop(drill_stack);
-            match key {
-                Key::Backspace => {
-                    drill_sig.write().pop();
-                    return true;
-                }
-                Key::Escape => {
-                    drill_sig.write().clear();
-                    return true;
-                }
-                _ => {}
-            }
-        }
-    }
-
     // ── All remaining shortcuts require Ctrl ─────────────────────────────
     if !ctrl {
         return false;
@@ -170,6 +151,13 @@ pub fn handle_keyboard(event: &KeyboardEvent, tab_mgr: &mut TabManagerState) -> 
         Key::Character(ref c) if c == "N" && shift => {
             let current = (tab_mgr.show_template_gallery)();
             tab_mgr.show_template_gallery.set(!current);
+            true
+        }
+
+        // Ctrl+Shift+T — Toggle theme (Oxide ↔ Enamel)
+        Key::Character(ref c) if c == "T" && shift => {
+            let current = (tab_mgr.theme)();
+            tab_mgr.theme.set(current.toggle());
             true
         }
 
@@ -416,8 +404,8 @@ fn save_tab_by_id(tab_mgr: &mut TabManagerState, tab_id: TabId, force_save_as: b
             return;
         };
 
-        let yaml = match tab.snapshot.raw_pipeline {
-            Some(ref config) => serialize_raw_yaml(config),
+        let yaml = match tab.snapshot.pipeline {
+            Some(ref config) => serialize_yaml(config),
             None => tab.snapshot.yaml_text.clone(),
         };
 

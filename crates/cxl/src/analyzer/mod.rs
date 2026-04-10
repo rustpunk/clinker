@@ -75,11 +75,22 @@ pub fn analyze_transform(name: &str, typed: &TypedProgram) -> TransformAnalysis 
     let mut window_calls = Vec::new();
     let mut accessed_fields = HashSet::new();
 
+    let has_distinct = typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Distinct { .. }));
+
     for stmt in &typed.program.statements {
         walk_statement(stmt, &mut window_calls, &mut accessed_fields);
     }
 
-    let parallelism_hint = classify_parallelism(&window_calls);
+    // Distinct forces Sequential — mutable HashSet state cannot be parallelized.
+    let parallelism_hint = if has_distinct {
+        ParallelismHint::Sequential
+    } else {
+        classify_parallelism(&window_calls)
+    };
 
     TransformAnalysis {
         name: name.to_string(),
@@ -131,6 +142,8 @@ fn walk_statement(stmt: &Statement, calls: &mut Vec<WindowCallInfo>, fields: &mu
         }
         Statement::ExprStmt { expr, .. } => walk_expr(expr, calls, fields, None),
         Statement::UseStmt { .. } => {}
+        Statement::Filter { predicate, .. } => walk_expr(predicate, calls, fields, None),
+        Statement::Distinct { .. } => {}
     }
 }
 
@@ -260,11 +273,19 @@ fn walk_expr(
                 walk_match_arm(arm, calls, fields);
             }
         }
+        Expr::AggCall { args, .. } => {
+            for arg in args {
+                walk_expr(arg, calls, fields, None);
+            }
+        }
         Expr::Literal { .. }
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::MetaAccess { .. }
         | Expr::Now { .. }
-        | Expr::Wildcard { .. } => {}
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
     }
 }
 
@@ -300,7 +321,8 @@ mod tests {
         );
         let fields: Vec<&str> = vec!["dept", "amount", "name", "region", "score", "date"];
         let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-        let schema: HashMap<String, crate::typecheck::types::Type> = HashMap::new();
+        let schema: indexmap::IndexMap<String, crate::typecheck::types::Type> =
+            indexmap::IndexMap::new();
         type_check(resolved, &schema).unwrap()
     }
 
@@ -315,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_analyzer_aggregate_window() {
-        let typed = compile("emit total = window.sum(amount)");
+        let typed = compile("emit total = $window.sum(amount)");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         assert_eq!(analysis.window_calls[0].function_name.as_ref(), "sum");
@@ -326,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_analyzer_positional_window() {
-        let typed = compile("emit prev = window.lag(1)");
+        let typed = compile("emit prev = $window.lag(1)");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         assert_eq!(
@@ -338,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_analyzer_multiple_windows() {
-        let typed = compile("emit total = window.sum(amount)\nemit cnt = window.count()");
+        let typed = compile("emit total = $window.sum(amount)\nemit cnt = $window.count()");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 2);
         assert_eq!(analysis.parallelism_hint, ParallelismHint::IndexReading);
@@ -347,7 +369,7 @@ mod tests {
     #[test]
     fn test_analyzer_mixed_stateless_and_window() {
         let typed =
-            compile("let x = amount + 1\nemit total = window.sum(amount)\nemit doubled = x * 2");
+            compile("let x = amount + 1\nemit total = $window.sum(amount)\nemit doubled = x * 2");
         let analysis = analyze_transform("test", &typed);
         assert_eq!(analysis.window_calls.len(), 1);
         // Still IndexReading because there IS a window call

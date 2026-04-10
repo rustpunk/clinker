@@ -4,7 +4,8 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
-use crate::config::OutputConfig;
+use crate::config::{ConfigError, IncludeMetadata, OutputConfig};
+use crate::error::PipelineError;
 
 /// Apply schema aliases to emitted fields: rename keys from original to alias names.
 ///
@@ -32,6 +33,19 @@ pub fn project_output(
     emitted: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
+    project_output_with_meta(input_record, emitted, &IndexMap::new(), config)
+}
+
+/// Project output with explicit metadata map (from EvalResult::Emit).
+///
+/// Metadata is sourced from the `metadata` parameter, not from `input_record.iter_meta()`,
+/// because `evaluate_record` works on a clone and the original input record has no metadata.
+pub fn project_output_with_meta(
+    input_record: &Record,
+    emitted: &IndexMap<String, Value>,
+    metadata: &IndexMap<String, Value>,
+    config: &OutputConfig,
+) -> Record {
     // Step 1: Gather
     let mut fields: IndexMap<String, Value> = IndexMap::new();
 
@@ -45,6 +59,26 @@ pub fn project_output(
         for (name, value) in input_record.iter_all_fields() {
             if !fields.contains_key(name) {
                 fields.insert(name.to_string(), value.clone());
+            }
+        }
+    }
+
+    // Step 1b: Merge metadata into output when include_metadata is set.
+    // Metadata fields are prefixed with `meta.` in the output.
+    if !config.include_metadata.is_none() {
+        let meta_iter: Vec<(&str, &Value)> = match &config.include_metadata {
+            IncludeMetadata::None => vec![],
+            IncludeMetadata::All => metadata.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            IncludeMetadata::Allowlist(allow) => metadata
+                .iter()
+                .filter(|(k, _)| allow.iter().any(|a| a.as_str() == *k))
+                .map(|(k, v)| (k.as_str(), v))
+                .collect(),
+        };
+        for (key, value) in meta_iter {
+            let output_name = format!("meta.{key}");
+            if !fields.contains_key(&output_name) {
+                fields.insert(output_name, value.clone());
             }
         }
     }
@@ -71,6 +105,40 @@ pub fn project_output(
     let schema = Arc::new(Schema::new(column_names));
     let values: Vec<Value> = fields.into_values().collect();
     Record::new(schema, values)
+}
+
+/// Merge per-record metadata into the projected output fields.
+///
+/// Called after `project_output` when `include_metadata` is set.
+/// Metadata fields appear with `meta.` prefix (e.g., `meta.tier`).
+/// Returns `Err` if a source field collides with a metadata field.
+pub fn merge_metadata_into_output(
+    record: &Record,
+    fields: &mut IndexMap<String, Value>,
+    include: &IncludeMetadata,
+) -> Result<(), PipelineError> {
+    let meta_keys: Vec<(&str, &Value)> = match include {
+        IncludeMetadata::None => return Ok(()),
+        IncludeMetadata::All => record.iter_meta().collect(),
+        IncludeMetadata::Allowlist(allow) => record
+            .iter_meta()
+            .filter(|(k, _)| allow.iter().any(|a| a == k))
+            .collect(),
+    };
+
+    for (key, value) in meta_keys {
+        let output_name = format!("meta.{key}");
+        if fields.contains_key(&output_name) {
+            return Err(PipelineError::Config(ConfigError::Validation(format!(
+                "metadata collision: output already contains field '{}' \
+                 and metadata key '{}' would produce the same output name",
+                output_name, key
+            ))));
+        }
+        fields.insert(output_name, value.clone());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -109,6 +177,9 @@ mod tests {
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
+            include_metadata: Default::default(),
+            schema: None,
+            split: None,
             notes: None,
         };
 
@@ -142,6 +213,9 @@ mod tests {
             exclude: Some(vec!["secret".into()]),
             sort_order: None,
             preserve_nulls: None,
+            include_metadata: Default::default(),
+            schema: None,
+            split: None,
             notes: None,
         };
 
@@ -168,6 +242,9 @@ mod tests {
             exclude: None,
             sort_order: None,
             preserve_nulls: None,
+            include_metadata: Default::default(),
+            schema: None,
+            split: None,
             notes: None,
         };
 

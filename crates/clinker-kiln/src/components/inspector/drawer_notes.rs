@@ -22,24 +22,7 @@ pub fn DrawerNotes(stage_id: String) -> Element {
             return rsx! { DrawerNotesEmpty {} };
         };
 
-        let notes_value = config
-            .inputs
-            .iter()
-            .find(|i| i.name == stage_id)
-            .and_then(|i| i.notes.as_ref())
-            .or_else(|| {
-                config
-                    .transforms()
-                    .find(|t| t.name == stage_id)
-                    .and_then(|t| t.notes.as_ref())
-            })
-            .or_else(|| {
-                config
-                    .outputs
-                    .iter()
-                    .find(|o| o.name == stage_id)
-                    .and_then(|o| o.notes.as_ref())
-            });
+        let notes_value = config.stage_notes(&stage_id);
 
         let notes = parse_notes(notes_value);
         let annotations: Vec<(String, String)> = {
@@ -64,33 +47,7 @@ pub fn DrawerNotes(stage_id: String) -> Element {
         let mut edit_src = state.edit_source;
 
         if let Some(ref mut config) = *pipeline_sig.write() {
-            let notes_field = config
-                .inputs
-                .iter_mut()
-                .find(|i| i.name == stage_id_for_save)
-                .map(|i| &mut i.notes)
-                .or_else(|| {
-                    config
-                        .transformations
-                        .iter_mut()
-                        .filter_map(|entry| match entry {
-                            clinker_core::config::TransformEntry::Transform(t) => Some(t),
-                            _ => None,
-                        })
-                        .find(|t| t.name == stage_id_for_save)
-                        .map(|t| &mut t.notes)
-                })
-                .or_else(|| {
-                    config
-                        .outputs
-                        .iter_mut()
-                        .find(|o| o.name == stage_id_for_save)
-                        .map(|o| &mut o.notes)
-                });
-
-            if let Some(field) = notes_field {
-                *field = serialized;
-            }
+            config.set_stage_notes(&stage_id_for_save, serialized);
         }
         edit_src.set(EditSource::Inspector);
     };

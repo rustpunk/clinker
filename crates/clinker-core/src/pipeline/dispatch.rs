@@ -494,6 +494,9 @@ mod tests {
             fn available_fields(&self) -> Vec<&str> {
                 vec![]
             }
+            fn iter_fields(&self) -> Vec<(String, Value)> {
+                vec![]
+            }
         }
 
         let source = "emit x = benefits.EEID.employee_id";
@@ -507,11 +510,13 @@ mod tests {
         let fields: &[&str] = &[];
         let resolved =
             cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema = std::collections::HashMap::new();
+        let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> =
+            indexmap::IndexMap::new();
         let typed = cxl::typecheck::pass::type_check(resolved, &schema).unwrap();
 
         let resolver = TestResolver;
-        let ctx = eval::EvalContext::test_default();
+        let stable = eval::StableEvalContext::test_default();
+        let ctx = eval::EvalContext::test_default_borrowed(&stable);
         let result =
             eval::eval_program::<crate::pipeline::arena::Arena>(&typed, &ctx, &resolver, None)
                 .unwrap();

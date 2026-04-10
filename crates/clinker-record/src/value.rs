@@ -1,6 +1,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
+use indexmap::IndexMap;
 use serde::Serialize;
-use serde::ser::SerializeSeq;
+use serde::ser::{SerializeMap, SerializeSeq};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -14,6 +15,9 @@ pub enum Value {
     Date(NaiveDate),
     DateTime(NaiveDateTime),
     Array(Vec<Value>),
+    /// Nested key-value map (ordered, insertion-preserving).
+    /// Box<IndexMap> is 8 bytes — enum stays at 24 bytes (Vec<Value> is already 24).
+    Map(Box<IndexMap<Box<str>, Value>>),
 }
 
 impl Serialize for Value {
@@ -38,6 +42,13 @@ impl Serialize for Value {
                 }
                 seq.end()
             }
+            Value::Map(m) => {
+                let mut map = serializer.serialize_map(Some(m.len()))?;
+                for (k, v) in m.iter() {
+                    map.serialize_entry(k.as_ref(), v)?;
+                }
+                map.end()
+            }
         }
     }
 }
@@ -53,6 +64,7 @@ impl PartialEq for Value {
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::DateTime(a), Value::DateTime(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
             _ => false,
         }
     }
@@ -93,6 +105,16 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Map(m) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k}: {v}")?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -109,6 +131,7 @@ impl Value {
             Value::Date(_) => "date",
             Value::DateTime(_) => "datetime",
             Value::Array(_) => "array",
+            Value::Map(_) => "map",
         }
     }
 
@@ -129,13 +152,59 @@ impl Value {
                 arr.capacity() * std::mem::size_of::<Value>()
                     + arr.iter().map(Value::heap_size).sum::<usize>()
             }
+            Value::Map(m) => {
+                // IndexMap overhead: each entry is (Box<str>, Value) = key heap + value heap
+                m.iter()
+                    .map(|(k, v)| k.len() + v.heap_size())
+                    .sum::<usize>()
+            }
             _ => 0,
+        }
+    }
+
+    /// Create a Map from an iterator of key-value pairs.
+    pub fn map(pairs: impl IntoIterator<Item = (impl Into<Box<str>>, Value)>) -> Self {
+        let map: IndexMap<Box<str>, Value> =
+            pairs.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        Value::Map(Box::new(map))
+    }
+
+    /// Create an empty Map.
+    pub fn empty_map() -> Self {
+        Value::Map(Box::default())
+    }
+
+    /// Borrow the inner IndexMap if this is a Map variant.
+    pub fn as_map(&self) -> Option<&IndexMap<Box<str>, Value>> {
+        match self {
+            Value::Map(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Mutably borrow the inner IndexMap if this is a Map variant.
+    pub fn as_map_mut(&mut self) -> Option<&mut IndexMap<Box<str>, Value>> {
+        match self {
+            Value::Map(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Get a field from a Map by name. Returns None if not a Map or field missing.
+    pub fn get_field(&self, name: &str) -> Option<&Value> {
+        self.as_map().and_then(|m| m.get(name))
+    }
+
+    /// Set a field on a Map. No-op if not a Map variant.
+    pub fn set_field(&mut self, name: impl Into<Box<str>>, value: Value) {
+        if let Value::Map(m) = self {
+            m.insert(name.into(), value);
         }
     }
 }
 
 use serde::Deserialize;
-use serde::de::{self, SeqAccess, Visitor};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 
 impl<'de> Deserialize<'de> for Value {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -199,6 +268,14 @@ impl<'de> Deserialize<'de> for Value {
                     arr.push(v);
                 }
                 Ok(Value::Array(arr))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+                let mut m = IndexMap::new();
+                while let Some((k, v)) = map.next_entry::<String, Value>()? {
+                    m.insert(k.into_boxed_str(), v);
+                }
+                Ok(Value::Map(Box::new(m)))
             }
         }
 
@@ -353,5 +430,130 @@ mod tests {
         assert_eq!(Value::Integer(1).type_name(), "int");
         assert_eq!(Value::Float(1.0).type_name(), "float");
         assert_eq!(Value::String("x".into()).type_name(), "string");
+        assert_eq!(Value::empty_map().type_name(), "map");
+    }
+
+    // --- Value::Map tests (Phase 13, Task 13.1) ---
+
+    #[test]
+    fn test_map_construction() {
+        let m = Value::map([("a", Value::Integer(1)), ("b", Value::Integer(2))]);
+        let inner = m.as_map().unwrap();
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner.get("a"), Some(&Value::Integer(1)));
+        assert_eq!(inner.get("b"), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn test_empty_map() {
+        let m = Value::empty_map();
+        let inner = m.as_map().unwrap();
+        assert_eq!(inner.len(), 0);
+    }
+
+    #[test]
+    fn test_map_field_access() {
+        let m = Value::map([("a", Value::Integer(1)), ("b", Value::Integer(2))]);
+        assert_eq!(m.get_field("a"), Some(&Value::Integer(1)));
+        assert_eq!(m.get_field("missing"), None);
+    }
+
+    #[test]
+    fn test_map_set_field() {
+        let mut m = Value::map([("a", Value::Integer(1))]);
+        m.set_field("c", Value::Integer(3));
+        assert_eq!(m.get_field("c"), Some(&Value::Integer(3)));
+        // Overwrite existing
+        m.set_field("a", Value::Integer(99));
+        assert_eq!(m.get_field("a"), Some(&Value::Integer(99)));
+    }
+
+    #[test]
+    fn test_map_as_map() {
+        let m = Value::empty_map();
+        assert!(m.as_map().is_some());
+        assert!(Value::Integer(1).as_map().is_none());
+        assert!(Value::Null.as_map().is_none());
+    }
+
+    #[test]
+    fn test_map_as_map_mut() {
+        let mut m = Value::empty_map();
+        assert!(m.as_map_mut().is_some());
+        let mut i = Value::Integer(1);
+        assert!(i.as_map_mut().is_none());
+    }
+
+    #[test]
+    fn test_map_display() {
+        let m = Value::map([
+            ("key1", Value::Integer(1)),
+            ("key2", Value::String("val".into())),
+        ]);
+        assert_eq!(m.to_string(), "{key1: 1, key2: val}");
+        assert_eq!(Value::empty_map().to_string(), "{}");
+    }
+
+    #[test]
+    fn test_map_serialize_roundtrip() {
+        let m = Value::map([
+            ("a", Value::Integer(1)),
+            ("b", Value::String("hello".into())),
+            ("c", Value::Bool(true)),
+        ]);
+        let json = serde_json::to_string(&m).unwrap();
+        let recovered: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, recovered);
+    }
+
+    #[test]
+    fn test_map_partial_eq() {
+        let m1 = Value::map([("a", Value::Integer(1)), ("b", Value::Integer(2))]);
+        let m2 = Value::map([("a", Value::Integer(1)), ("b", Value::Integer(2))]);
+        assert_eq!(m1, m2);
+
+        let m3 = Value::map([("a", Value::Integer(1)), ("b", Value::Integer(3))]);
+        assert_ne!(m1, m3);
+
+        // Map != non-Map
+        assert_ne!(m1, Value::Null);
+    }
+
+    #[test]
+    fn test_map_clone() {
+        let m1 = Value::map([("a", Value::Integer(1))]);
+        let mut m2 = m1.clone();
+        assert_eq!(m1, m2);
+        // Modifying clone doesn't affect original
+        m2.set_field("a", Value::Integer(99));
+        assert_eq!(m1.get_field("a"), Some(&Value::Integer(1)));
+        assert_eq!(m2.get_field("a"), Some(&Value::Integer(99)));
+    }
+
+    #[test]
+    fn test_nested_map_in_array() {
+        let nested = Value::Array(vec![
+            Value::map([("x", Value::Integer(10))]),
+            Value::map([("y", Value::Integer(20))]),
+        ]);
+        if let Value::Array(arr) = &nested {
+            assert_eq!(arr[0].get_field("x"), Some(&Value::Integer(10)));
+            assert_eq!(arr[1].get_field("y"), Some(&Value::Integer(20)));
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn test_value_enum_size() {
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
+
+    #[test]
+    fn test_map_duplicate_key_last_wins() {
+        let m = Value::map([("a", Value::Integer(1)), ("a", Value::Integer(2))]);
+        let inner = m.as_map().unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner.get("a"), Some(&Value::Integer(2)));
     }
 }
