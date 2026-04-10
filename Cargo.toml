@@ -48,6 +48,7 @@ dirs = "6"
 tokio = { version = "1", features = ["time", "rt"] }
 notify = "7"
 criterion = { version = "0.5", features = ["html_reports"] }
+serial_test = "3"
 petgraph = "0.8"
 fastrand = "2"
 clinker-bench-support = { path = "crates/clinker-bench-support" }
