@@ -3524,7 +3524,10 @@ impl PipelineExecutor {
                             .collect(),
                     }
                 })?;
-                let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+                let typed = Arc::new(typed);
+                let equality_index =
+                    crate::pipeline::lookup::build_equality_index(&typed, source_name, &table);
+                let evaluator = ProgramEvaluator::new(typed, false);
 
                 lookup_tables.insert(
                     transform_name.clone(),
@@ -3533,6 +3536,7 @@ impl PipelineExecutor {
                         where_evaluator: std::sync::Mutex::new(evaluator),
                         on_miss: lookup_config.on_miss,
                         match_mode: lookup_config.match_mode,
+                        equality_index,
                     },
                 );
             }
@@ -4155,6 +4159,7 @@ fn evaluate_record_with_lookups(
                         .expect("lookup evaluator lock"),
                     ctx,
                     rt_lookup.match_mode,
+                    rt_lookup.equality_index.as_ref(),
                 )
                 .map_err(|e| {
                     (
@@ -4555,4 +4560,5 @@ pub(crate) struct RuntimeLookup {
     pub where_evaluator: std::sync::Mutex<ProgramEvaluator>,
     pub on_miss: crate::config::pipeline_node::OnMiss,
     pub match_mode: crate::config::pipeline_node::MatchMode,
+    pub equality_index: Option<crate::pipeline::lookup::EqualityIndex>,
 }

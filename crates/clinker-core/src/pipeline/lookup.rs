@@ -158,14 +158,19 @@ pub fn find_matches(
     where_evaluator: &mut cxl::eval::ProgramEvaluator,
     ctx: &cxl::eval::EvalContext<'_>,
     match_mode: MatchMode,
+    equality_index: Option<&EqualityIndex>,
 ) -> Result<Vec<usize>, LookupError> {
-    let mut matches = Vec::new();
+    // Determine candidate row indices (full scan or index probe)
+    let candidates: Vec<usize> = if let Some(idx) = equality_index {
+        probe_equality_index(idx, input, table.len())
+    } else {
+        (0..table.len()).collect()
+    };
 
-    for (i, candidate) in table.records().iter().enumerate() {
+    let mut matches = Vec::new();
+    for i in candidates {
+        let candidate = &table.records()[i];
         let resolver = LookupResolver::matched(input, table.source_name(), candidate);
-        // Evaluate the where predicate. It should be compiled as:
-        //   filter <where_expression>
-        // So eval_record returns Skip (no match) or Emit (match).
         let result = where_evaluator
             .eval_record::<NullStorage>(ctx, &resolver, None)
             .map_err(|e| LookupError::PredicateError {
@@ -186,6 +191,42 @@ pub fn find_matches(
     }
 
     Ok(matches)
+}
+
+/// Probe the equality index with input record's key values.
+/// Returns candidate row indices (partition + null_rows), or full scan
+/// range if the input has null key values.
+fn probe_equality_index(
+    idx: &EqualityIndex,
+    input: &dyn FieldResolver,
+    table_len: usize,
+) -> Vec<usize> {
+    let mut key_values = Vec::with_capacity(idx.keys.len());
+    for eq_key in &idx.keys {
+        match input.resolve(&eq_key.input_field) {
+            Some(Value::Null) | None => {
+                // Null input key → can't use index, fall back to full scan
+                return (0..table_len).collect();
+            }
+            Some(val) => {
+                match clinker_record::value_to_group_key(&val, &eq_key.input_field, None, 0) {
+                    Ok(Some(gk)) => key_values.push(gk),
+                    _ => return (0..table_len).collect(),
+                }
+            }
+        }
+    }
+
+    let mut candidates: Vec<usize> = idx
+        .partitions
+        .get(&key_values)
+        .cloned()
+        .unwrap_or_default();
+
+    // Always include null_rows (they might match via the full predicate)
+    candidates.extend_from_slice(&idx.null_rows);
+    candidates.sort_unstable();
+    candidates
 }
 
 /// Apply lookup results to produce enriched records.
@@ -310,6 +351,160 @@ impl From<clinker_format::error::FormatError> for LookupError {
     fn from(e: clinker_format::error::FormatError) -> Self {
         LookupError::ReadError(e)
     }
+}
+
+// ── Equality index for hash-partition optimization ──
+
+/// One equality condition extracted from a where predicate AST.
+#[derive(Debug, Clone)]
+pub struct EqualityKey {
+    /// Bare field name from the input record (e.g., "product_id").
+    pub input_field: String,
+    /// Field name in the lookup table (e.g., "product_id" from "products.product_id").
+    pub lookup_field: String,
+}
+
+/// Hash-partition index over a lookup table's rows.
+///
+/// Built at compile time from equality conditions in the where predicate.
+/// At runtime, input records probe the index to narrow the candidate set
+/// before evaluating the full predicate.
+#[derive(Debug)]
+pub struct EqualityIndex {
+    /// The equality keys (input_field, lookup_field) pairs.
+    pub keys: Vec<EqualityKey>,
+    /// Maps key tuples to row indices in the lookup table.
+    pub partitions: std::collections::HashMap<Vec<clinker_record::GroupByKey>, Vec<usize>>,
+    /// Rows where at least one key field is null — always included in scans.
+    pub null_rows: Vec<usize>,
+}
+
+/// Extract equality conditions from a where predicate AST.
+///
+/// Only extracts from top-level `And` chains. Returns empty if an `Or`
+/// appears at the top level or if no `field == source.field` patterns
+/// are found.
+pub fn extract_equality_keys(expr: &cxl::ast::Expr, source_name: &str) -> Vec<EqualityKey> {
+    use cxl::ast::{BinOp, Expr};
+    match expr {
+        Expr::Binary {
+            op: BinOp::And,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let mut keys = extract_equality_keys(lhs, source_name);
+            keys.extend(extract_equality_keys(rhs, source_name));
+            keys
+        }
+        Expr::Binary {
+            op: BinOp::Eq,
+            lhs,
+            rhs,
+            ..
+        } => {
+            // Try both orderings: field == source.field, source.field == field
+            if let Some(key) = try_extract_eq_pair(lhs, rhs, source_name) {
+                vec![key]
+            } else if let Some(key) = try_extract_eq_pair(rhs, lhs, source_name) {
+                vec![key]
+            } else {
+                vec![]
+            }
+        }
+        // Or, or any other expression form: no extractable keys
+        _ => vec![],
+    }
+}
+
+/// Check if (lhs, rhs) form a (bare_field, qualified_source_field) pair.
+fn try_extract_eq_pair(
+    input_side: &cxl::ast::Expr,
+    lookup_side: &cxl::ast::Expr,
+    source_name: &str,
+) -> Option<EqualityKey> {
+    use cxl::ast::Expr;
+    let input_field = match input_side {
+        Expr::FieldRef { name, .. } => name.to_string(),
+        _ => return None,
+    };
+    match lookup_side {
+        Expr::QualifiedFieldRef { parts, .. } if parts.len() == 2 && &*parts[0] == source_name => {
+            Some(EqualityKey {
+                input_field,
+                lookup_field: parts[1].to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Build an equality index from a compiled where predicate and lookup table.
+///
+/// Returns `None` if no equality conditions can be extracted from the predicate.
+pub fn build_equality_index(
+    typed: &cxl::typecheck::TypedProgram,
+    source_name: &str,
+    table: &LookupTable,
+) -> Option<EqualityIndex> {
+    // Find the Filter statement's predicate
+    let predicate = typed.program.statements.iter().find_map(|s| {
+        if let cxl::ast::Statement::Filter { predicate, .. } = s {
+            Some(predicate)
+        } else {
+            None
+        }
+    })?;
+
+    let keys = extract_equality_keys(predicate, source_name);
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut partitions: std::collections::HashMap<Vec<clinker_record::GroupByKey>, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut null_rows: Vec<usize> = Vec::new();
+
+    for (i, record) in table.records().iter().enumerate() {
+        let mut key_values = Vec::with_capacity(keys.len());
+        let mut has_null = false;
+
+        for eq_key in &keys {
+            match record.get(&eq_key.lookup_field) {
+                Some(Value::Null) | None => {
+                    has_null = true;
+                    break;
+                }
+                Some(val) => {
+                    match clinker_record::value_to_group_key(
+                        val,
+                        &eq_key.lookup_field,
+                        None,
+                        i as u32,
+                    ) {
+                        Ok(Some(gk)) => key_values.push(gk),
+                        // Null or error (NaN) → can't index this row
+                        _ => {
+                            has_null = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_null {
+            null_rows.push(i);
+        } else {
+            partitions.entry(key_values).or_default().push(i);
+        }
+    }
+
+    Some(EqualityIndex {
+        keys,
+        partitions,
+        null_rows,
+    })
 }
 
 #[cfg(test)]
