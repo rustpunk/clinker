@@ -631,7 +631,9 @@ impl PipelineExecutor {
         })?;
         let mut collector = stage_metrics::StageCollector::default();
         let reader_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ReaderInit);
-        let mut format_reader = build_format_reader(input, reader)?;
+        let raw_reader = build_format_reader(input, reader)?;
+        // Wrap with schema-based type coercion if the source declares typed columns.
+        let mut format_reader = wrap_with_schema_coercion(raw_reader, config, &input.name)?;
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
@@ -741,6 +743,9 @@ impl PipelineExecutor {
             }
         }
 
+        // ── Build lookup tables for transforms with `lookup:` config ──
+        let lookup_tables = Self::build_lookup_tables(config, &mut readers, &source_configs)?;
+
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
             format_reader,
@@ -750,6 +755,7 @@ impl PipelineExecutor {
             &plan,
             params,
             &mut collector,
+            lookup_tables,
         )?;
 
         let stages = collector.into_stages();
@@ -1103,6 +1109,7 @@ impl PipelineExecutor {
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
+        lookup_tables: HashMap<String, RuntimeLookup>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
@@ -1714,6 +1721,7 @@ impl PipelineExecutor {
                 &mut counters,
                 &mut dlq_entries,
                 collector,
+                &lookup_tables,
             );
         }
 
@@ -1795,7 +1803,13 @@ impl PipelineExecutor {
                         };
                         let result = {
                             let _guard = transform_timer.guard();
-                            evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                            evaluate_record_with_lookups(
+                                &record,
+                                &transform_names,
+                                &mut evaluators,
+                                &ctx,
+                                &lookup_tables,
+                            )
                         };
                         match result {
                             Ok(EvalResult::Emit {
@@ -1994,7 +2008,13 @@ impl PipelineExecutor {
                         };
                         let result = {
                             let _guard = transform_timer.guard();
-                            evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                            evaluate_record_with_lookups(
+                                &record,
+                                &transform_names,
+                                &mut evaluators,
+                                &ctx,
+                                &lookup_tables,
+                            )
                         };
                         match result {
                             Ok(EvalResult::Emit {
@@ -2167,7 +2187,13 @@ impl PipelineExecutor {
                 source_file: &source_file_arc,
                 source_row: *rn,
             };
-            let result = evaluate_record(record, &transform_names, &mut evaluators, &ctx);
+            let result = evaluate_record_with_lookups(
+                record,
+                &transform_names,
+                &mut evaluators,
+                &ctx,
+                &lookup_tables,
+            );
             match &result {
                 Ok(EvalResult::Emit {
                     fields: emitted,
@@ -2295,7 +2321,13 @@ impl PipelineExecutor {
                 };
                 let result = {
                     let _guard = transform_timer.guard();
-                    evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                    evaluate_record_with_lookups(
+                        &record,
+                        &transform_names,
+                        &mut evaluators,
+                        &ctx,
+                        &lookup_tables,
+                    )
                 };
                 match result {
                     Ok(EvalResult::Emit {
@@ -2465,7 +2497,13 @@ impl PipelineExecutor {
                 };
                 let result = {
                     let _guard = transform_timer.guard();
-                    evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
+                    evaluate_record_with_lookups(
+                        &record,
+                        &transform_names,
+                        &mut evaluators,
+                        &ctx,
+                        &lookup_tables,
+                    )
                 };
                 match result {
                     Ok(EvalResult::Emit {
@@ -2556,6 +2594,7 @@ impl PipelineExecutor {
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
+        _lookup_tables: &HashMap<String, RuntimeLookup>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
@@ -3280,6 +3319,135 @@ impl PipelineExecutor {
         })
     }
 
+    /// Build lookup tables for all transforms that have a `lookup:` config.
+    ///
+    /// Extracts readers from the `readers` registry for each unique lookup source,
+    /// loads them into in-memory `LookupTable`s, and compiles the `where:` predicate
+    /// as a CXL filter evaluator. Returns a map from transform name → RuntimeLookup.
+    fn build_lookup_tables(
+        config: &PipelineConfig,
+        readers: &mut HashMap<String, Box<dyn Read + Send>>,
+        source_configs: &[crate::config::SourceConfig],
+    ) -> Result<HashMap<String, RuntimeLookup>, PipelineError> {
+        use crate::config::PipelineNode;
+        use crate::pipeline::lookup::LookupTable;
+
+        let mut lookup_tables: HashMap<String, RuntimeLookup> = HashMap::new();
+
+        // Walk nodes to find transforms with lookup config
+        for spanned in &config.nodes {
+            if let PipelineNode::Transform {
+                header,
+                config: body,
+            } = &spanned.value
+                && let Some(lookup_config) = &body.lookup
+            {
+                    let transform_name = &header.name;
+                    let source_name = &lookup_config.source;
+
+                    // Find the source config for this lookup source
+                    let source_cfg = source_configs
+                        .iter()
+                        .find(|s| s.name == *source_name)
+                        .ok_or_else(|| PipelineError::Config(
+                            crate::config::ConfigError::Validation(format!(
+                                "transform '{}' has lookup source '{}' which is not declared as a source node",
+                                transform_name, source_name,
+                            )),
+                        ))?;
+
+                    // Extract the reader for this source
+                    let reader = readers.remove(source_name).ok_or_else(|| {
+                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                            "no reader registered for lookup source '{}'",
+                            source_name,
+                        )))
+                    })?;
+
+                    // Build format reader with schema coercion and load into LookupTable
+                    let raw_reader = build_format_reader(source_cfg, reader)?;
+                    let mut format_reader =
+                        wrap_with_schema_coercion(raw_reader, config, source_name)?;
+                    let memory_limit = parse_memory_limit(config);
+                    let table =
+                        LookupTable::build(source_name.clone(), &mut *format_reader, memory_limit)
+                            .map_err(|e| PipelineError::Compilation {
+                                transform_name: transform_name.clone(),
+                                messages: vec![e.to_string()],
+                            })?;
+
+                    // Compile the where predicate as a CXL filter program.
+                    // Collect field names from the primary source schema so the
+                    // resolver can recognize bare field references. Qualified
+                    // references (source.field) are resolved at runtime by the
+                    // LookupResolver and don't need to be registered here.
+                    let where_expr = lookup_config.where_expr.trim();
+                    let filter_source = format!("filter {}", where_expr);
+                    let parse_result = cxl::parser::Parser::parse(&filter_source);
+                    if !parse_result.errors.is_empty() {
+                        return Err(PipelineError::Compilation {
+                            transform_name: transform_name.clone(),
+                            messages: parse_result
+                                .errors
+                                .iter()
+                                .map(|e| format!("lookup where parse error: {}", e.message))
+                                .collect(),
+                        });
+                    }
+                    // Collect field names from ALL source node schemas so
+                    // the CXL resolver accepts bare field references from
+                    // both the input source and the lookup source.
+                    let mut field_names: Vec<String> = Vec::new();
+                    for s in &config.nodes {
+                        if let PipelineNode::Source { config: body, .. } = &s.value {
+                            for col in &body.schema.columns {
+                                if !field_names.contains(&col.name) {
+                                    field_names.push(col.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    let field_refs: Vec<&str> = field_names.iter().map(|s| s.as_str()).collect();
+                    let resolved = cxl::resolve::resolve_program(
+                        parse_result.ast,
+                        &field_refs,
+                        parse_result.node_count,
+                    )
+                    .map_err(|diags| PipelineError::Compilation {
+                        transform_name: transform_name.clone(),
+                        messages: diags
+                            .into_iter()
+                            .map(|d| format!("lookup where resolve error: {}", d.message))
+                            .collect(),
+                    })?;
+                    let schema_map = indexmap::IndexMap::new();
+                    let typed =
+                        cxl::typecheck::type_check(resolved, &schema_map).map_err(|diags| {
+                            PipelineError::Compilation {
+                                transform_name: transform_name.clone(),
+                                messages: diags
+                                    .iter()
+                                    .map(|d| format!("lookup where type error: {}", d.message))
+                                    .collect(),
+                            }
+                        })?;
+                    let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+
+                    lookup_tables.insert(
+                        transform_name.clone(),
+                        RuntimeLookup {
+                            table,
+                            where_evaluator: std::sync::Mutex::new(evaluator),
+                            on_miss: lookup_config.on_miss,
+                            match_mode: lookup_config.match_mode,
+                        },
+                    );
+            }
+        }
+
+        Ok(lookup_tables)
+    }
+
     /// Compile execution plan and return `--explain` output without reading data.
     ///
     /// Input files are NOT opened. Field names are extracted from CXL AST
@@ -3359,6 +3527,41 @@ fn build_format_reader(
             let config = build_fw_reader_config(opts.as_ref());
             Ok(Box::new(FixedWidthReader::new(reader, fields, config)?))
         }
+    }
+}
+
+/// Wrap a format reader with schema-based type coercion if the source
+/// declares typed columns in its `schema:` block.
+fn wrap_with_schema_coercion(
+    reader: Box<dyn FormatReader>,
+    config: &PipelineConfig,
+    source_name: &str,
+) -> Result<Box<dyn FormatReader>, PipelineError> {
+    use crate::config::PipelineNode;
+
+    // Find the source node's schema declaration
+    let schema_decl = config.nodes.iter().find_map(|s| {
+        if let PipelineNode::Source {
+            header,
+            config: body,
+        } = &s.value
+            && header.name == source_name
+        {
+            return Some(&body.schema.columns);
+        }
+        None
+    });
+
+    match schema_decl {
+        Some(columns) if !columns.is_empty() => {
+            let coercing = crate::pipeline::schema_coerce::CoercingReader::new(reader, columns)
+                .map_err(|e| PipelineError::Compilation {
+                    transform_name: source_name.to_string(),
+                    messages: vec![format!("schema coercion init error: {e}")],
+                })?;
+            Ok(Box::new(coercing))
+        }
+        _ => Ok(reader),
     }
 }
 
@@ -3821,15 +4024,102 @@ fn evaluate_record(
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
 ) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
+    evaluate_record_impl(record, transform_names, evaluators, ctx, &HashMap::new())
+}
+
+fn evaluate_record_with_lookups(
+    record: &Record,
+    transform_names: &[&str],
+    evaluators: &mut [ProgramEvaluator],
+    ctx: &EvalContext,
+    lookup_tables: &HashMap<String, RuntimeLookup>,
+) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
+    evaluate_record_impl(record, transform_names, evaluators, ctx, lookup_tables)
+}
+
+fn evaluate_record_impl(
+    record: &Record,
+    transform_names: &[&str],
+    evaluators: &mut [ProgramEvaluator],
+    ctx: &EvalContext,
+    lookup_tables: &HashMap<String, RuntimeLookup>,
+) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
     let mut all_metadata = IndexMap::new();
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let name = transform_names.get(i).copied().unwrap_or("unknown");
-        match eval
-            .eval_record::<NullStorage>(ctx, &record, None)
-            .map_err(|e| (name.to_string(), e))?
-        {
+
+        // Check if this transform has a lookup
+        let eval_result = if let Some(rt_lookup) = lookup_tables.get(name) {
+            let matches = crate::pipeline::lookup::find_matches(
+                &rt_lookup.table,
+                &record,
+                &mut rt_lookup
+                    .where_evaluator
+                    .lock()
+                    .expect("lookup evaluator lock"),
+                ctx,
+                rt_lookup.match_mode,
+            )
+            .map_err(|e| {
+                (
+                    name.to_string(),
+                    cxl::eval::EvalError {
+                        kind: cxl::eval::EvalErrorKind::ConversionFailed {
+                            value: e.to_string(),
+                            target: "lookup match",
+                        },
+                        span: cxl::lexer::Span::new(0, 0),
+                    },
+                )
+            })?;
+
+            if matches.is_empty() {
+                match rt_lookup.on_miss {
+                    crate::config::pipeline_node::OnMiss::Skip => {
+                        return Ok(EvalResult::Skip(SkipReason::Filtered));
+                    }
+                    crate::config::pipeline_node::OnMiss::Error => {
+                        return Err((
+                            name.to_string(),
+                            cxl::eval::EvalError {
+                                kind: cxl::eval::EvalErrorKind::ConversionFailed {
+                                    value: format!(
+                                        "no matching row in lookup source '{}'",
+                                        rt_lookup.table.source_name()
+                                    ),
+                                    target: "lookup match",
+                                },
+                                span: cxl::lexer::Span::new(0, 0),
+                            },
+                        ));
+                    }
+                    crate::config::pipeline_node::OnMiss::NullFields => {
+                        let resolver = crate::pipeline::lookup::LookupResolver::no_match(
+                            &record,
+                            rt_lookup.table.source_name(),
+                        );
+                        eval.eval_record::<NullStorage>(ctx, &resolver, None)
+                            .map_err(|e| (name.to_string(), e))?
+                    }
+                }
+            } else {
+                let matched_row = &rt_lookup.table.records()[matches[0]];
+                let resolver = crate::pipeline::lookup::LookupResolver::matched(
+                    &record,
+                    rt_lookup.table.source_name(),
+                    matched_row,
+                );
+                eval.eval_record::<NullStorage>(ctx, &resolver, None)
+                    .map_err(|e| (name.to_string(), e))?
+            }
+        } else {
+            eval.eval_record::<NullStorage>(ctx, &record, None)
+                .map_err(|e| (name.to_string(), e))?
+        };
+
+        match eval_result {
             EvalResult::Emit {
                 fields: emitted,
                 metadata,
@@ -4115,4 +4405,14 @@ fn handle_error_no_writer(
         route: None,
         trigger: true,
     });
+}
+
+/// Runtime lookup context for a transform with `lookup:` config.
+/// Holds the in-memory reference table, compiled where-predicate
+/// evaluator, and match/miss policies.
+pub(crate) struct RuntimeLookup {
+    pub table: crate::pipeline::lookup::LookupTable,
+    pub where_evaluator: std::sync::Mutex<ProgramEvaluator>,
+    pub on_miss: crate::config::pipeline_node::OnMiss,
+    pub match_mode: crate::config::pipeline_node::MatchMode,
 }

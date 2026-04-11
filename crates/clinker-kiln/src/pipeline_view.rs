@@ -305,11 +305,7 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             description: header.description.clone(),
             error_message: None,
         },
-        PipelineNode::Composition {
-            header,
-            r#use,
-            ..
-        } => StageView {
+        PipelineNode::Composition { header, r#use, .. } => StageView {
             id: header.name.clone(),
             label: header.name.clone(),
             kind,
