@@ -446,25 +446,27 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         shutdown_token: None,
     };
 
-    // Run the pipeline using file-based I/O
+    // Run the pipeline using file-based I/O — open readers for ALL sources
+    // (primary + lookup references) and writers for ALL outputs.
     let first_source = pipeline_config
         .source_configs()
         .next()
         .expect("pipeline has at least one source");
-    let first_output = pipeline_config
-        .output_configs()
-        .next()
-        .expect("pipeline has at least one output");
     let input_path = first_source.path.clone();
-    let output_path = first_output.path.clone();
-    let input_name = first_source.name.clone();
-    let output_name = first_output.name.clone();
 
-    let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&input_path)?);
-    let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output_path)?);
+    let mut readers: std::collections::HashMap<String, Box<dyn std::io::Read + Send>> =
+        std::collections::HashMap::new();
+    for source in pipeline_config.source_configs() {
+        let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&source.path)?);
+        readers.insert(source.name.clone(), reader);
+    }
 
-    let readers = std::collections::HashMap::from([(input_name, reader)]);
-    let writers = std::collections::HashMap::from([(output_name, writer)]);
+    let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
+        std::collections::HashMap::new();
+    for output in pipeline_config.output_configs() {
+        let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output.path)?);
+        writers.insert(output.name.clone(), writer);
+    }
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
     let report = PipelineExecutor::run_plan_with_readers_writers(
