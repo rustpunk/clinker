@@ -8,10 +8,14 @@
 //! Serde-saphyr deserialization lands in 16c.1.2; [`scan_workspace_signatures`]
 //! in 16c.1.3; [`OpenTailSchema`] in 16c.1.4.
 
-use crate::span::Span;
+use crate::config::pipeline_node::PipelineNode;
+use crate::span::{FileId, Span};
+use crate::yaml::{Spanned, YamlError};
 use clinker_record::Schema;
 use indexmap::IndexMap;
 use std::path::PathBuf;
+
+mod raw;
 
 #[cfg(test)]
 mod tests;
@@ -148,4 +152,35 @@ pub struct ResourceDecl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
     File,
+}
+
+/// A fully-parsed `.comp.yaml` file: the [`CompositionSignature`] from the
+/// `_compose:` block plus the body `nodes:`.
+///
+/// Parsed via [`CompositionFile::parse`]. Canonical [`Span`] values require
+/// a [`FileId`] (LD-003), so the parse entry point takes one explicitly;
+/// callers that haven't registered the file with a `SourceDb` yet may pass
+/// a synthetic `FileId` — the span bytes still round-trip through
+/// [`Span::from_saphyr`] and can be re-homed later.
+#[derive(Debug)]
+pub struct CompositionFile {
+    pub signature: CompositionSignature,
+    pub nodes: Vec<Spanned<PipelineNode>>,
+}
+
+impl CompositionFile {
+    /// Parse a `.comp.yaml` YAML string into a [`CompositionFile`].
+    ///
+    /// `file_id` anchors every captured span to the same source file so
+    /// [`Span::from_saphyr`] can produce canonical [`Span`] values. Pass
+    /// [`PathBuf::new`] for `source_path` if the file has no on-disk origin
+    /// (e.g. in-memory fixture).
+    pub fn parse(
+        yaml: &str,
+        file_id: FileId,
+        source_path: PathBuf,
+    ) -> Result<CompositionFile, YamlError> {
+        let raw: raw::RawCompositionFile = crate::yaml::from_str(yaml)?;
+        Ok(raw.finalize(file_id, source_path))
+    }
 }

@@ -66,3 +66,172 @@ fn test_param_decl_required_field_present() {
     assert_eq!(decl.param_type, ParamType::Float);
     assert_eq!(decl.range, Some((0.0, 1.0)));
 }
+
+// ---------------------------------------------------------------------
+// Task 16c.1.2 gate tests — CompositionFile deserialization
+// ---------------------------------------------------------------------
+
+fn dummy_file_id() -> FileId {
+    FileId::new(NonZeroU32::new(1).unwrap())
+}
+
+/// Minimal `.comp.yaml` that exercises every deserialization branch.
+const WELL_FORMED_YAML: &str = "\
+_compose:
+  name: customer_enrich
+  inputs:
+    customers:
+      schema: [customer_id, email]
+      description: 'raw customer rows'
+      required: true
+    addresses:
+      required: true
+  outputs:
+    enriched: final_stage.out
+    rejected:
+      ref: addr_filter.reject
+      description: 'rows dropped by the address filter'
+  config_schema:
+    fuzzy_threshold:
+      type: float
+      default: 0.85
+      range: [0.0, 1.0]
+      description: 'fuzzy match threshold'
+    mode:
+      type: string
+      required: true
+      enum: [strict, lenient]
+  resources_schema:
+    lookup_table:
+      kind: file
+      required: true
+
+nodes: []
+";
+
+#[test]
+fn test_composition_file_deserializes_well_formed() {
+    let parsed = CompositionFile::parse(
+        WELL_FORMED_YAML,
+        dummy_file_id(),
+        PathBuf::from("customer_enrich.comp.yaml"),
+    )
+    .expect("well-formed .comp.yaml must parse");
+
+    let sig = &parsed.signature;
+    assert_eq!(sig.name, "customer_enrich");
+    assert_eq!(sig.inputs.len(), 2);
+    assert_eq!(sig.outputs.len(), 2);
+    assert_eq!(sig.config_schema.len(), 2);
+    assert_eq!(sig.resources_schema.len(), 1);
+
+    let customers = sig.inputs.get("customers").expect("customers input");
+    assert!(customers.required);
+    let schema = customers
+        .schema
+        .as_ref()
+        .expect("customers schema should parse");
+    assert_eq!(schema.column_count(), 2);
+    assert!(schema.contains("customer_id"));
+    assert!(schema.contains("email"));
+
+    let addresses = sig.inputs.get("addresses").expect("addresses input");
+    assert!(addresses.schema.is_none(), "absent schema = accept-any");
+
+    let fuzzy = sig
+        .config_schema
+        .get("fuzzy_threshold")
+        .expect("fuzzy_threshold param");
+    assert_eq!(fuzzy.param_type, ParamType::Float);
+    assert!(!fuzzy.required);
+    assert_eq!(fuzzy.default, Some(serde_json::json!(0.85)));
+    assert_eq!(fuzzy.range, Some((0.0, 1.0)));
+
+    let mode = sig.config_schema.get("mode").expect("mode param");
+    assert_eq!(mode.param_type, ParamType::String);
+    assert!(mode.required);
+    assert_eq!(
+        mode.enum_values,
+        Some(vec![
+            serde_json::json!("strict"),
+            serde_json::json!("lenient")
+        ])
+    );
+
+    let lookup = sig
+        .resources_schema
+        .get("lookup_table")
+        .expect("lookup_table resource");
+    assert_eq!(lookup.kind, ResourceKind::File);
+    assert!(lookup.required);
+
+    assert!(parsed.nodes.is_empty(), "nodes: [] should round-trip");
+}
+
+#[test]
+fn test_composition_file_rejects_unknown_param_type() {
+    let yaml = "\
+_compose:
+  name: bad
+  config_schema:
+    x:
+      type: unknown_type
+nodes: []
+";
+    let err = CompositionFile::parse(yaml, dummy_file_id(), PathBuf::from("bad.comp.yaml"))
+        .expect_err("unknown param type must be rejected");
+    // serde-saphyr's unknown-variant error surfaces the name; verify it
+    // mentions the offending token so the diagnostic is useful.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown_type") || msg.contains("unknown variant"),
+        "error should mention the unknown variant; got: {msg}"
+    );
+}
+
+#[test]
+fn test_output_alias_short_form_parses() {
+    let yaml = "\
+_compose:
+  name: short_form
+  outputs:
+    enriched: final_stage.out
+nodes: []
+";
+    let parsed = CompositionFile::parse(yaml, dummy_file_id(), PathBuf::from("s.comp.yaml"))
+        .expect("short-form output alias must parse");
+
+    let alias = parsed
+        .signature
+        .outputs
+        .get("enriched")
+        .expect("enriched output");
+    assert_eq!(alias.internal_ref.value, "final_stage.out");
+    assert!(alias.description.is_none());
+}
+
+#[test]
+fn test_output_alias_long_form_parses() {
+    let yaml = "\
+_compose:
+  name: long_form
+  outputs:
+    enriched:
+      ref: final_stage.out
+      description: 'final output after enrichment'
+nodes: []
+";
+    let parsed = CompositionFile::parse(yaml, dummy_file_id(), PathBuf::from("l.comp.yaml"))
+        .expect("long-form output alias must parse");
+
+    let alias = parsed
+        .signature
+        .outputs
+        .get("enriched")
+        .expect("enriched output");
+    assert_eq!(alias.internal_ref.value, "final_stage.out");
+    assert_eq!(
+        alias.description.as_deref(),
+        Some("final output after enrichment")
+    );
+}
