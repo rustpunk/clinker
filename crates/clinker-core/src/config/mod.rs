@@ -1,3 +1,4 @@
+pub mod composition;
 pub mod cxl_compile;
 pub mod node_header;
 pub mod pipeline_node;
