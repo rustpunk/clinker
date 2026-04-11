@@ -1,0 +1,45 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# 1 input, 2 outputs (normalized, rejected), 1 config param.
+# Normalizes addresses; routes invalid ones to rejected output.
+_compose:
+  inputs:
+    raw_addresses:
+      schema:
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+  outputs:
+    normalized:
+      schema:
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+        - { name: norm_status, type: string }
+    rejected:
+      schema:
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+        - { name: reject_reason, type: string }
+  config_schema:
+    strict_mode:
+      type: boolean
+      default: false
+
+nodes:
+  - type: transform
+    name: clean_whitespace
+    input: raw_addresses
+    config:
+      add_fields:
+        norm_status: "cleaned"
+  - type: route
+    name: validity_check
+    input: clean_whitespace
+    config:
+      branches:
+        - name: valid
+          when: "not is_empty(zip)"
+        - name: invalid
+          when: "is_empty(zip)"

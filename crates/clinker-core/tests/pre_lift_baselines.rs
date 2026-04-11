@@ -74,6 +74,101 @@ fn fixtures() -> Vec<BaselineFixture> {
     ]
 }
 
+// ───────────────────────── Phase 16c fixture corpus ─────────────────────────
+
+struct Phase16cFixture {
+    /// Stable identifier.
+    name: &'static str,
+    /// Path relative to `crates/clinker-core/tests/fixtures/`.
+    rel_path: &'static str,
+    /// Whether this is a pipeline (deserializes as PipelineConfig) or a
+    /// non-pipeline YAML (composition / channel — valid YAML only).
+    is_pipeline: bool,
+}
+
+/// All 14 Phase 16c fixtures: 5 compositions, 6 channels, 3 pipelines.
+fn phase_16c_fixtures() -> Vec<Phase16cFixture> {
+    vec![
+        // Compositions (5)
+        Phase16cFixture {
+            name: "customer_enrich",
+            rel_path: "compositions/customer_enrich.comp.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "address_normalize",
+            rel_path: "compositions/address_normalize.comp.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "dlq_shape",
+            rel_path: "compositions/dlq_shape.comp.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "nested_caller",
+            rel_path: "compositions/nested_caller.comp.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "passthrough_check",
+            rel_path: "compositions/passthrough_check.comp.yaml",
+            is_pipeline: false,
+        },
+        // Channels (6)
+        Phase16cFixture {
+            name: "acme_prod",
+            rel_path: "channels/acme_prod.channel.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "acme_staging",
+            rel_path: "channels/acme_staging.channel.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "beta_prod",
+            rel_path: "channels/beta_prod.channel.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "beta_staging",
+            rel_path: "channels/beta_staging.channel.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "comp_direct",
+            rel_path: "channels/comp_direct.channel.yaml",
+            is_pipeline: false,
+        },
+        Phase16cFixture {
+            name: "empty_defaults",
+            rel_path: "channels/empty_defaults.channel.yaml",
+            is_pipeline: false,
+        },
+        // Pipelines (3)
+        Phase16cFixture {
+            name: "composition_pipeline",
+            rel_path: "pipelines/composition_pipeline.yaml",
+            is_pipeline: true,
+        },
+        Phase16cFixture {
+            name: "nested_composition_pipeline",
+            rel_path: "pipelines/nested_composition_pipeline.yaml",
+            is_pipeline: true,
+        },
+        Phase16cFixture {
+            name: "channel_target_pipeline",
+            rel_path: "pipelines/channel_target_pipeline.yaml",
+            is_pipeline: true,
+        },
+    ]
+}
+
+fn phase_16c_fixture_root() -> PathBuf {
+    manifest_dir().join("tests").join("fixtures")
+}
+
 // ───────────────────────── I/O helpers ─────────────────────────
 
 #[derive(Clone, Default)]
@@ -291,6 +386,75 @@ fn test_baselines_loaded() {
                     first_captured_in, "16b.4",
                     "ForwardOnly fixture {} should capture in 16b.4",
                     fx.name
+                );
+            }
+        }
+    }
+}
+
+// ───────────────────────── Phase 16c gate tests ─────────────────────────
+
+/// Gate test for Task 16c.0.3. Verifies:
+///   * all 14 fixture files exist on disk
+///   * all 3 pipeline fixtures deserialize as PipelineConfig
+///   * composition and channel fixtures are valid YAML (parseable by serde_saphyr)
+#[test]
+fn test_scaffold_16c_fixture_corpus_well_formed() {
+    let root = phase_16c_fixture_root();
+
+    for fx in phase_16c_fixtures() {
+        let path = root.join(fx.rel_path);
+        assert!(
+            path.is_file(),
+            "fixture missing: {} ({})",
+            fx.name,
+            path.display()
+        );
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            !content.trim().is_empty(),
+            "fixture empty: {}",
+            path.display()
+        );
+
+        if fx.is_pipeline {
+            // Pipeline fixtures must deserialize as PipelineConfig
+            let _config = parse_config(&content).unwrap_or_else(|e| {
+                panic!(
+                    "pipeline fixture {} failed to deserialize as PipelineConfig: {e}",
+                    fx.name
+                )
+            });
+        } else {
+            // Non-pipeline fixtures must be valid YAML (structural check only)
+            let _value: serde_json::Value = clinker_core::yaml::from_str(&content)
+                .unwrap_or_else(|e| panic!("fixture {} is not valid YAML: {e}", fx.name));
+        }
+    }
+}
+
+/// Gate test for Task 16c.0.3. Verifies no ForwardOnly fixture has a
+/// premature `.expected.*` baseline file.
+#[test]
+fn test_scaffold_16c_forward_only_no_baseline() {
+    let root = phase_16c_fixture_root();
+
+    for fx in phase_16c_fixtures() {
+        // Check that no .expected.* file exists alongside the fixture
+        let path = root.join(fx.rel_path);
+        let parent = path.parent().unwrap();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+
+        // Glob for any .expected.* file with the same stem
+        for entry in std::fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_str().unwrap();
+            if name.starts_with(stem) && name.contains(".expected.") {
+                panic!(
+                    "ForwardOnly fixture {} has premature baseline: {}",
+                    fx.name, name
                 );
             }
         }

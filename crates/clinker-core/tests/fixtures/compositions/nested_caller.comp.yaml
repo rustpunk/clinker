@@ -1,0 +1,41 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Uses another composition internally (tests recursive expansion).
+_compose:
+  inputs:
+    raw:
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+  outputs:
+    final:
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+        - { name: norm_status, type: string }
+  config_schema:
+    strict_mode:
+      type: boolean
+      default: false
+
+nodes:
+  - type: composition
+    name: inner_normalize
+    input: raw
+    use: ./address_normalize.comp.yaml
+    inputs:
+      raw_addresses: raw
+    config:
+      strict_mode: true
+  - type: transform
+    name: tag_nested
+    input: inner_normalize
+    config:
+      add_fields:
+        nested_flag: "true"

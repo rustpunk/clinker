@@ -1,0 +1,13 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Binds to channel_target_pipeline, fixed + default overrides.
+channel:
+  name: acme_prod
+  target: ./pipelines/channel_target_pipeline.yaml
+config:
+  default:
+    enrich1.fuzzy_threshold: 0.85
+    output_dir: "/data/acme/prod"
+  fixed:
+    enrich1.lookup_table: "s3://acme/lookups/prod.csv"
+    environment: "production"

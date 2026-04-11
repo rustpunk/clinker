@@ -496,13 +496,11 @@ nodes:
   - type: composition
     name: comp_a
     input: src
-    config:
-      use: ./does_not_exist.yaml
+    use: ./does_not_exist.yaml
   - type: composition
     name: comp_b
     input: src
-    config:
-      use: ./also_missing.yaml
+    use: ./also_missing.yaml
 "#;
     let cfg = parse_pipeline(yaml);
     // compile() pushes E100 per Composition but returns Ok; gate test
@@ -550,8 +548,7 @@ nodes:
   - type: composition
     name: comp_a
     input: src
-    config:
-      use: ./does_not_exist.yaml
+    use: ./does_not_exist.yaml
   - type: output
     name: out
     input: src

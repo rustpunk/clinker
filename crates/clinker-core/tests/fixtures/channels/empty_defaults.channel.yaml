@@ -1,0 +1,9 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Minimal channel with only default bindings (no fixed key).
+channel:
+  name: empty_defaults
+  target: ./pipelines/channel_target_pipeline.yaml
+config:
+  default:
+    output_dir: "/tmp/empty/defaults"

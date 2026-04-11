@@ -1,0 +1,13 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Same pipeline as acme_prod, different bindings for staging.
+channel:
+  name: acme_staging
+  target: ./pipelines/channel_target_pipeline.yaml
+config:
+  default:
+    enrich1.fuzzy_threshold: 0.7
+    output_dir: "/tmp/acme/staging"
+  fixed:
+    enrich1.lookup_table: "s3://acme/lookups/staging.csv"
+    environment: "staging"

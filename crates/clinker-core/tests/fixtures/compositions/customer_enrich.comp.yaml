@@ -1,0 +1,43 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# 2 inputs (customers, addresses), 1 output, 2 config params.
+# Enriches customer records by joining with address data.
+_compose:
+  inputs:
+    customers:
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+    addresses:
+      schema:
+        - { name: customer_id, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+  outputs:
+    enriched:
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: match_score, type: decimal }
+  config_schema:
+    fuzzy_threshold:
+      type: decimal
+      default: 0.8
+    lookup_table:
+      type: string
+
+nodes:
+  - type: transform
+    name: enrich_join
+    input: customers
+    config:
+      add_fields:
+        match_score: "0.95"
+  - type: transform
+    name: enrich_format
+    input: enrich_join
+    config:
+      add_fields:
+        enriched_flag: "true"

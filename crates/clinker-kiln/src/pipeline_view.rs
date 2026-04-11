@@ -307,12 +307,13 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
         },
         PipelineNode::Composition {
             header,
-            config: body,
+            r#use,
+            ..
         } => StageView {
             id: header.name.clone(),
             label: header.name.clone(),
             kind,
-            subtitle: format!("use: {} (Phase 16c)", body.r#use.display()),
+            subtitle: format!("use: {} (Phase 16c)", r#use.display()),
             canvas_x: x,
             canvas_y: y,
             cxl_source: None,
@@ -707,8 +708,7 @@ nodes:
   - type: composition
     name: sub
     input: src
-    config:
-      use: compositions/clean_names.comp.yaml
+    use: compositions/clean_names.comp.yaml
 "#;
         let config = parse_config(yaml).expect("composition stub parses");
         let view = derive_pipeline_view(&config);

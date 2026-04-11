@@ -4,8 +4,8 @@ pub mod pipeline_node;
 
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
-    AggregateBody, AnalyticWindowSpec, CompositionBody, MergeBody, OutputBody, PipelineNode,
-    RouteBody, SourceBody, TransformBody,
+    AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, PipelineNode, RouteBody, SourceBody,
+    TransformBody,
 };
 
 use crate::yaml::Spanned;

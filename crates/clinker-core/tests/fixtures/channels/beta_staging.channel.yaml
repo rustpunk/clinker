@@ -1,0 +1,12 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Second pipeline, staging bindings.
+channel:
+  name: beta_staging
+  target: ./pipelines/composition_pipeline.yaml
+config:
+  default:
+    batch_size: 1000
+  fixed:
+    region: "us-west-2"
+    api_key: "beta-staging-key"

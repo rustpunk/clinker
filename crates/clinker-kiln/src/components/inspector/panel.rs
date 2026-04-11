@@ -74,10 +74,10 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         PipelineNode::Output { config: body, .. } => {
             ("OUTPUT", "output", body.output.path.clone(), None)
         }
-        PipelineNode::Composition { config: body, .. } => (
+        PipelineNode::Composition { r#use, .. } => (
             "COMPOSITION",
             "composition",
-            format!("use: {} (Phase 16c)", body.r#use.display()),
+            format!("use: {} (Phase 16c)", r#use.display()),
             None,
         ),
     };

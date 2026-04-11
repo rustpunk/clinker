@@ -1,0 +1,11 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Targets a composition directly (tests ChannelTarget::Composition).
+# Uses config.fixed only — binding cannot be overridden.
+channel:
+  name: comp_direct
+  target: ./compositions/customer_enrich.comp.yaml
+config:
+  fixed:
+    fuzzy_threshold: 0.95
+    lookup_table: "s3://shared/lookups/master.csv"

@@ -1,0 +1,22 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Minimal composition for testing pass-through column behavior and W101 trigger.
+_compose:
+  inputs:
+    data:
+      schema:
+        - { name: id, type: string }
+  outputs:
+    data:
+      schema:
+        - { name: id, type: string }
+        - { name: tag, type: string }
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: add_tag
+    input: data
+    config:
+      add_fields:
+        tag: "tagged"
