@@ -461,6 +461,38 @@ fn test_scaffold_16c_forward_only_no_baseline() {
     }
 }
 
+/// Gate test for Task 16c.0.4. Verifies all explain doc stubs exist.
+#[test]
+fn test_scaffold_16c_explain_docs_exist() {
+    let manifest = manifest_dir();
+    let workspace_root = manifest.parent().unwrap().parent().unwrap();
+    let explain_dir = workspace_root.join("docs").join("explain");
+
+    let expected = [
+        "E101.md", "E102.md", "E103.md", "E104.md", "E105.md", "E106.md", "E107.md", "E108.md",
+        "W101.md",
+    ];
+
+    for file in &expected {
+        let path = explain_dir.join(file);
+        assert!(
+            path.is_file(),
+            "explain doc stub missing: {}",
+            path.display()
+        );
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            content.contains("## What it means"),
+            "{file} missing 'What it means' section"
+        );
+        assert!(
+            content.contains("## How to fix"),
+            "{file} missing 'How to fix' section"
+        );
+    }
+}
+
 /// For every DualRun fixture: run pre-lift, byte-compare outputs against
 /// committed baselines, and snapshot the `--explain` topology via insta.
 #[test]
