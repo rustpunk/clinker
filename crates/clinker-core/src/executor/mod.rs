@@ -3342,11 +3342,11 @@ impl PipelineExecutor {
             } = &spanned.value
                 && let Some(lookup_config) = &body.lookup
             {
-                    let transform_name = &header.name;
-                    let source_name = &lookup_config.source;
+                let transform_name = &header.name;
+                let source_name = &lookup_config.source;
 
-                    // Find the source config for this lookup source
-                    let source_cfg = source_configs
+                // Find the source config for this lookup source
+                let source_cfg = source_configs
                         .iter()
                         .find(|s| s.name == *source_name)
                         .ok_or_else(|| PipelineError::Config(
@@ -3356,92 +3356,95 @@ impl PipelineExecutor {
                             )),
                         ))?;
 
-                    // Extract the reader for this source
-                    let reader = readers.remove(source_name).ok_or_else(|| {
-                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                            "no reader registered for lookup source '{}'",
-                            source_name,
-                        )))
-                    })?;
+                // Extract the reader for this source
+                let reader = readers.remove(source_name).ok_or_else(|| {
+                    PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                        "no reader registered for lookup source '{}'",
+                        source_name,
+                    )))
+                })?;
 
-                    // Build format reader with schema coercion and load into LookupTable
-                    let raw_reader = build_format_reader(source_cfg, reader)?;
-                    let mut format_reader =
-                        wrap_with_schema_coercion(raw_reader, config, source_name)?;
-                    let memory_limit = parse_memory_limit(config);
-                    let table =
-                        LookupTable::build(source_name.clone(), &mut *format_reader, memory_limit)
-                            .map_err(|e| PipelineError::Compilation {
-                                transform_name: transform_name.clone(),
-                                messages: vec![e.to_string()],
-                            })?;
-
-                    // Compile the where predicate as a CXL filter program.
-                    // Collect field names from the primary source schema so the
-                    // resolver can recognize bare field references. Qualified
-                    // references (source.field) are resolved at runtime by the
-                    // LookupResolver and don't need to be registered here.
-                    let where_expr = lookup_config.where_expr.trim();
-                    let filter_source = format!("filter {}", where_expr);
-                    let parse_result = cxl::parser::Parser::parse(&filter_source);
-                    if !parse_result.errors.is_empty() {
-                        return Err(PipelineError::Compilation {
+                // Build format reader with schema coercion and load into LookupTable
+                let raw_reader = build_format_reader(source_cfg, reader)?;
+                let mut format_reader = wrap_with_schema_coercion(raw_reader, config, source_name)?;
+                let memory_limit = parse_memory_limit(config);
+                let table =
+                    LookupTable::build(source_name.clone(), &mut *format_reader, memory_limit)
+                        .map_err(|e| PipelineError::Compilation {
                             transform_name: transform_name.clone(),
-                            messages: parse_result
-                                .errors
-                                .iter()
-                                .map(|e| format!("lookup where parse error: {}", e.message))
-                                .collect(),
-                        });
-                    }
-                    // Collect field names from ALL source node schemas so
-                    // the CXL resolver accepts bare field references from
-                    // both the input source and the lookup source.
-                    let mut field_names: Vec<String> = Vec::new();
-                    for s in &config.nodes {
-                        if let PipelineNode::Source { config: body, .. } = &s.value {
-                            for col in &body.schema.columns {
-                                if !field_names.contains(&col.name) {
-                                    field_names.push(col.name.clone());
-                                }
+                            messages: vec![e.to_string()],
+                        })?;
+
+                // Compile the where predicate as a CXL filter program.
+                // Collect field names from the primary source schema so the
+                // resolver can recognize bare field references. Qualified
+                // references (source.field) are resolved at runtime by the
+                // LookupResolver and don't need to be registered here.
+                // Normalize newlines to spaces so YAML block scalars
+                // (where: |) with line breaks between `and` clauses parse
+                // correctly — the CXL parser treats newlines as statement
+                // boundaries.
+                let where_expr = lookup_config.where_expr.replace('\n', " ");
+                let where_expr = where_expr.trim();
+                let filter_source = format!("filter {}", where_expr);
+                let parse_result = cxl::parser::Parser::parse(&filter_source);
+                if !parse_result.errors.is_empty() {
+                    return Err(PipelineError::Compilation {
+                        transform_name: transform_name.clone(),
+                        messages: parse_result
+                            .errors
+                            .iter()
+                            .map(|e| format!("lookup where parse error: {}", e.message))
+                            .collect(),
+                    });
+                }
+                // Collect field names from ALL source node schemas so
+                // the CXL resolver accepts bare field references from
+                // both the input source and the lookup source.
+                let mut field_names: Vec<String> = Vec::new();
+                for s in &config.nodes {
+                    if let PipelineNode::Source { config: body, .. } = &s.value {
+                        for col in &body.schema.columns {
+                            if !field_names.contains(&col.name) {
+                                field_names.push(col.name.clone());
                             }
                         }
                     }
-                    let field_refs: Vec<&str> = field_names.iter().map(|s| s.as_str()).collect();
-                    let resolved = cxl::resolve::resolve_program(
-                        parse_result.ast,
-                        &field_refs,
-                        parse_result.node_count,
-                    )
-                    .map_err(|diags| PipelineError::Compilation {
+                }
+                let field_refs: Vec<&str> = field_names.iter().map(|s| s.as_str()).collect();
+                let resolved = cxl::resolve::resolve_program(
+                    parse_result.ast,
+                    &field_refs,
+                    parse_result.node_count,
+                )
+                .map_err(|diags| PipelineError::Compilation {
+                    transform_name: transform_name.clone(),
+                    messages: diags
+                        .into_iter()
+                        .map(|d| format!("lookup where resolve error: {}", d.message))
+                        .collect(),
+                })?;
+                let schema_map = indexmap::IndexMap::new();
+                let typed = cxl::typecheck::type_check(resolved, &schema_map).map_err(|diags| {
+                    PipelineError::Compilation {
                         transform_name: transform_name.clone(),
                         messages: diags
-                            .into_iter()
-                            .map(|d| format!("lookup where resolve error: {}", d.message))
+                            .iter()
+                            .map(|d| format!("lookup where type error: {}", d.message))
                             .collect(),
-                    })?;
-                    let schema_map = indexmap::IndexMap::new();
-                    let typed =
-                        cxl::typecheck::type_check(resolved, &schema_map).map_err(|diags| {
-                            PipelineError::Compilation {
-                                transform_name: transform_name.clone(),
-                                messages: diags
-                                    .iter()
-                                    .map(|d| format!("lookup where type error: {}", d.message))
-                                    .collect(),
-                            }
-                        })?;
-                    let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+                    }
+                })?;
+                let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
 
-                    lookup_tables.insert(
-                        transform_name.clone(),
-                        RuntimeLookup {
-                            table,
-                            where_evaluator: std::sync::Mutex::new(evaluator),
-                            on_miss: lookup_config.on_miss,
-                            match_mode: lookup_config.match_mode,
-                        },
-                    );
+                lookup_tables.insert(
+                    transform_name.clone(),
+                    RuntimeLookup {
+                        table,
+                        where_evaluator: std::sync::Mutex::new(evaluator),
+                        on_miss: lookup_config.on_miss,
+                        match_mode: lookup_config.match_mode,
+                    },
+                );
             }
         }
 

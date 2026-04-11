@@ -932,7 +932,10 @@ nodes:
     config:
       lookup:
         source: rate_bands
-        where: "ee_group == rate_bands.ee_group and pay >= rate_bands.min_pay and pay <= rate_bands.max_pay"
+        where: |
+          ee_group == rate_bands.ee_group
+          and pay >= rate_bands.min_pay
+          and pay <= rate_bands.max_pay
       cxl: |
         emit employee_id = employee_id
         emit rate_class = rate_bands.rate_class
