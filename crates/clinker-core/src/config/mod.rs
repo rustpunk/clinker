@@ -3,6 +3,11 @@ pub mod cxl_compile;
 pub mod node_header;
 pub mod pipeline_node;
 
+pub use composition::{
+    CompositionSignature, CompositionSymbolTable, NodeRef, OutputAlias, ParamDecl, ParamName,
+    ParamType, PortDecl, PortName, ResourceDecl, ResourceKind, ResourceName, SourceMap,
+    SpannedNodeRef,
+};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
     AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, PipelineNode, RouteBody, SourceBody,

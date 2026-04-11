@@ -25,6 +25,11 @@ pub mod yaml;
 #[cfg(test)]
 pub mod test_helpers;
 
+pub use config::{
+    CompositionSignature, CompositionSymbolTable, NodeRef, OutputAlias, ParamDecl, ParamName,
+    ParamType, PortDecl, PortName, ResourceDecl, ResourceKind, ResourceName, SourceMap,
+    SpannedNodeRef,
+};
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
 
 #[allow(unused_imports)]
