@@ -26,9 +26,10 @@ pub mod yaml;
 pub mod test_helpers;
 
 pub use config::{
-    CompositionSignature, CompositionSymbolTable, NodeRef, OutputAlias, ParamDecl, ParamName,
-    ParamType, PortDecl, PortName, ResourceDecl, ResourceKind, ResourceName, SourceMap,
-    SpannedNodeRef,
+    CompileContext, CompositionFile, CompositionSignature, CompositionSymbolTable, NodeRef,
+    OutputAlias, ParamDecl, ParamName, ParamType, PortDecl, PortName, ResourceDecl, ResourceKind,
+    ResourceName, SourceMap, SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET,
+    scan_workspace_signatures, validate_signatures,
 };
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
 

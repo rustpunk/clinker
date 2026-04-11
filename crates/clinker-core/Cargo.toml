@@ -30,6 +30,7 @@ ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
 petgraph = { workspace = true }
 libc = "0.2"
+walkdir = "2"
 clinker-bench-support = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

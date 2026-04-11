@@ -367,10 +367,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         })?;
 
     // 7. Existing logic: explain / dry_run / execute
+    // LD-16c-12: resolve workspace_root ONCE at the entry point.
+    // Production CLI path — never call env::current_dir() inside compile().
+    let compile_ctx = clinker_core::config::CompileContext::new(
+        std::env::current_dir()
+            .map_err(|e| PipelineError::Config(clinker_core::config::ConfigError::Io(e)))?,
+    );
+
     if let Some(format) = args.explain {
         let compiled_plan =
             pipeline_config
-                .compile()
+                .compile(&compile_ctx)
                 .map_err(|diags| PipelineError::Compilation {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
@@ -459,7 +466,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let readers = std::collections::HashMap::from([(input_name, reader)]);
     let writers = std::collections::HashMap::from([(output_name, writer)]);
 
-    let compiled_plan = pipeline_config.compile().expect("compile");
+    let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,

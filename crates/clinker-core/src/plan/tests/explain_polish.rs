@@ -214,7 +214,9 @@ nodes:
       include_unmapped: true
 "#;
     let config: PipelineConfig = crate::yaml::from_str(yaml).expect("parse yaml");
-    let compiled = config.compile().expect("compile");
+    let compiled = config
+        .compile(&crate::config::CompileContext::default())
+        .expect("compile");
     let dag = compiled.dag();
     let out = dag.explain_text(&config);
 

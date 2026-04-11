@@ -2,15 +2,13 @@
 #
 # Minimal composition for testing pass-through column behavior and W101 trigger.
 _compose:
+  name: passthrough_check
   inputs:
     data:
       schema:
         - { name: id, type: string }
   outputs:
-    data:
-      schema:
-        - { name: id, type: string }
-        - { name: tag, type: string }
+    data: add_tag.out
   config_schema: {}
 
 nodes:
@@ -18,5 +16,5 @@ nodes:
     name: add_tag
     input: data
     config:
-      add_fields:
-        tag: "tagged"
+      cxl: |
+        emit tag = "tagged"

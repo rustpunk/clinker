@@ -558,7 +558,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().expect("composition must not abort lowering");
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .expect("composition must not abort lowering");
     // Source + Output should both be present (Composition is dropped).
     let names: Vec<&str> = plan.dag().graph.node_weights().map(|n| n.name()).collect();
     assert!(names.contains(&"src"), "src missing: {names:?}");
@@ -598,7 +600,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().expect("compile must succeed");
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .expect("compile must succeed");
     assert_eq!(plan.dag().graph.node_count(), 3);
     assert_eq!(plan.dag().graph.edge_count(), 2);
 }
@@ -628,7 +632,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let src = plan
         .dag()
         .graph
@@ -664,7 +670,9 @@ nodes:
       cxl: "emit foo = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
             n,
@@ -702,7 +710,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
             n,
@@ -742,7 +752,9 @@ nodes:
         b: "false"
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let route = plan
         .dag()
         .graph
@@ -790,7 +802,9 @@ nodes:
       - b
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let merge_idx = plan
         .dag()
         .graph
@@ -830,7 +844,7 @@ nodes:
         - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
-    let res = cfg.compile();
+    let res = cfg.compile(&clinker_core::config::CompileContext::default());
     assert!(res.is_err());
     let diags = res.err().unwrap();
     assert!(diags.iter().any(|d| d.code == "E001"));
@@ -871,7 +885,7 @@ nodes:
       path: data/out_nonexistent.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let res = cfg.compile();
+    let res = cfg.compile(&clinker_core::config::CompileContext::default());
     assert!(res.is_err(), "compile must fail on CXL type error");
     let diags = res.err().unwrap();
     assert!(
@@ -938,7 +952,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile()
+        .compile(&clinker_core::config::CompileContext::default())
         .expect("compile must succeed without touching disk");
     assert_eq!(plan.dag().graph.node_count(), 3);
 }
@@ -959,6 +973,8 @@ nodes:
         - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     assert_eq!(plan.dag().graph.node_count(), 1);
 }

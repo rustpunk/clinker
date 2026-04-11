@@ -2,6 +2,7 @@
 #
 # Uses another composition internally (tests recursive expansion).
 _compose:
+  name: nested_caller
   inputs:
     raw:
       schema:
@@ -11,17 +12,10 @@ _compose:
         - { name: city, type: string }
         - { name: zip, type: string }
   outputs:
-    final:
-      schema:
-        - { name: customer_id, type: string }
-        - { name: name, type: string }
-        - { name: street, type: string }
-        - { name: city, type: string }
-        - { name: zip, type: string }
-        - { name: norm_status, type: string }
+    final: tag_nested.out
   config_schema:
     strict_mode:
-      type: boolean
+      type: bool
       default: false
 
 nodes:
@@ -37,5 +31,5 @@ nodes:
     name: tag_nested
     input: inner_normalize
     config:
-      add_fields:
-        nested_flag: "true"
+      cxl: |
+        emit nested_flag = true

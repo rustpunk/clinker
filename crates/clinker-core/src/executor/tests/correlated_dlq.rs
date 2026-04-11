@@ -373,7 +373,7 @@ nodes:
     // Phase 16b Task 16b.9: pull pre-typechecked programs from
     // `config.compile()` artifacts instead of running a runtime
     // typecheck pass.
-    let validated_plan = config.compile().unwrap();
+    let validated_plan = config.compile(&crate::config::CompileContext::default()).unwrap();
     let resolved_transforms_owned = crate::executor::build_transform_specs(&config);
     let compiled_refs: Vec<(&str, &cxl::typecheck::TypedProgram)> = resolved_transforms_owned
         .iter()

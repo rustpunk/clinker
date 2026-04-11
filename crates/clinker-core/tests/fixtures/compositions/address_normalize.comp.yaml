@@ -3,6 +3,7 @@
 # 1 input, 2 outputs (normalized, rejected), 1 config param.
 # Normalizes addresses; routes invalid ones to rejected output.
 _compose:
+  name: address_normalize
   inputs:
     raw_addresses:
       schema:
@@ -10,21 +11,11 @@ _compose:
         - { name: city, type: string }
         - { name: zip, type: string }
   outputs:
-    normalized:
-      schema:
-        - { name: street, type: string }
-        - { name: city, type: string }
-        - { name: zip, type: string }
-        - { name: norm_status, type: string }
-    rejected:
-      schema:
-        - { name: street, type: string }
-        - { name: city, type: string }
-        - { name: zip, type: string }
-        - { name: reject_reason, type: string }
+    normalized: clean_whitespace.out
+    rejected: validity_check.invalid
   config_schema:
     strict_mode:
-      type: boolean
+      type: bool
       default: false
 
 nodes:
@@ -32,14 +23,13 @@ nodes:
     name: clean_whitespace
     input: raw_addresses
     config:
-      add_fields:
-        norm_status: "cleaned"
+      cxl: |
+        emit norm_status = "cleaned"
   - type: route
     name: validity_check
     input: clean_whitespace
     config:
-      branches:
-        - name: valid
-          when: "not is_empty(zip)"
-        - name: invalid
-          when: "is_empty(zip)"
+      conditions:
+        valid: "not is_empty(zip)"
+        invalid: "is_empty(zip)"
+      default: invalid

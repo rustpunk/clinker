@@ -81,7 +81,9 @@ _compose:
   name: customer_enrich
   inputs:
     customers:
-      schema: [customer_id, email]
+      schema:
+        - { name: customer_id, type: string }
+        - { name: email, type: string }
       description: 'raw customer rows'
       required: true
     addresses:
@@ -131,9 +133,9 @@ fn test_composition_file_deserializes_well_formed() {
         .schema
         .as_ref()
         .expect("customers schema should parse");
-    assert_eq!(schema.column_count(), 2);
-    assert!(schema.contains("customer_id"));
-    assert!(schema.contains("email"));
+    assert_eq!(schema.columns.len(), 2);
+    assert_eq!(schema.columns[0].name, "customer_id");
+    assert_eq!(schema.columns[1].name, "email");
 
     let addresses = sig.inputs.get("addresses").expect("addresses input");
     assert!(addresses.schema.is_none(), "absent schema = accept-any");

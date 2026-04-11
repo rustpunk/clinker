@@ -1,12 +1,14 @@
+pub mod compile_context;
 pub mod composition;
 pub mod cxl_compile;
 pub mod node_header;
 pub mod pipeline_node;
 
+pub use compile_context::CompileContext;
 pub use composition::{
-    CompositionSignature, CompositionSymbolTable, NodeRef, OutputAlias, ParamDecl, ParamName,
-    ParamType, PortDecl, PortName, ResourceDecl, ResourceKind, ResourceName, SourceMap,
-    SpannedNodeRef,
+    CompositionFile, CompositionSignature, CompositionSymbolTable, NodeRef, OutputAlias, ParamDecl,
+    ParamName, ParamType, PortDecl, PortName, ResourceDecl, ResourceKind, ResourceName, SourceMap,
+    SpannedNodeRef, WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures, validate_signatures,
 };
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
@@ -1222,7 +1224,11 @@ impl PipelineConfig {
     /// pre-pass plus any per-variant lowering errors. Composition nodes
     /// emit a single `E100` diagnostic per instance and do **not** abort
     /// the lowering walk (the rest of the pipeline still lowers cleanly).
-    pub fn compile(&self) -> Result<crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>> {
+    pub fn compile(
+        &self,
+        ctx: &CompileContext,
+    ) -> Result<crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>> {
+        use crate::config::composition::scan_workspace_signatures;
         use crate::error::{Diagnostic, LabeledSpan};
         use crate::plan::CompiledPlan;
         use crate::plan::execution::{
@@ -1243,6 +1249,37 @@ impl PipelineConfig {
             .any(|d| matches!(d.severity, crate::error::Severity::Error));
         if has_errors {
             return Err(diags);
+        }
+
+        // Stage 4.4: Phase 16c.1 Task 16c.1.3 — workspace composition scan.
+        // If this pipeline has any composition nodes, scan the workspace
+        // root resolved in `ctx` for `.comp.yaml` signatures and append
+        // any scan-level diagnostics (E101) to the compile diagnostics
+        // list. Pipelines without compositions skip the scan entirely so
+        // non-composition tests and benches are not coupled to workspace
+        // fixture validity.
+        //
+        // The resulting symbol table is built and dropped here — Phase 2
+        // body resolution (16c.2) will carry it forward onto CompiledPlan.
+        let has_compositions = self
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.value, PipelineNode::Composition { .. }));
+        if has_compositions {
+            match scan_workspace_signatures(ctx.workspace_root()) {
+                Ok(_symbol_table) => {
+                    // Table is discarded until 16c.2 consumes it.
+                }
+                Err(mut scan_diags) => {
+                    diags.append(&mut scan_diags);
+                    let has_errors = diags
+                        .iter()
+                        .any(|d| matches!(d.severity, crate::error::Severity::Error));
+                    if has_errors {
+                        return Err(diags);
+                    }
+                }
+            }
         }
 
         // Stage 4.5: Phase 16b Task 16b.9 — compile-time CXL typecheck.

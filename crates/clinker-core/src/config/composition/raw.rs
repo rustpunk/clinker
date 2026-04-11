@@ -14,10 +14,9 @@ use super::{
     CompositionFile, CompositionSignature, OutputAlias, ParamDecl, ParamType, PortDecl,
     ResourceDecl, ResourceKind, SourceMap, SpannedNodeRef,
 };
-use crate::config::pipeline_node::PipelineNode;
+use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
-use clinker_record::Schema;
 use indexmap::IndexMap;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -48,11 +47,11 @@ pub(super) struct RawCompositionSignature {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawPortDecl {
-    /// Minimum-required column set (LD-16c-2). YAML form: a list of column
-    /// names (`schema: [customer_id, email]`). Optional — absence means
-    /// accept-any.
+    /// Minimum-required column set (LD-16c-2). YAML form: a list of
+    /// `{ name, type }` entries matching the 16b `SchemaDecl` convention.
+    /// Absence means accept-any.
     #[serde(default)]
-    pub schema: Option<Vec<String>>,
+    pub schema: Option<SchemaDecl>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -234,12 +233,8 @@ impl RawCompositionSignature {
 
 impl RawPortDecl {
     fn finalize(self) -> PortDecl {
-        let schema = self.schema.map(|cols| {
-            let boxed: Vec<Box<str>> = cols.into_iter().map(String::into_boxed_str).collect();
-            Schema::new(boxed)
-        });
         PortDecl {
-            schema,
+            schema: self.schema,
             description: self.description,
             required: self.required,
         }

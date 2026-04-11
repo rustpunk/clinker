@@ -3,6 +3,7 @@
 # 2 inputs (customers, addresses), 1 output, 2 config params.
 # Enriches customer records by joining with address data.
 _compose:
+  name: customer_enrich
   inputs:
     customers:
       schema:
@@ -14,30 +15,25 @@ _compose:
         - { name: street, type: string }
         - { name: city, type: string }
   outputs:
-    enriched:
-      schema:
-        - { name: customer_id, type: string }
-        - { name: name, type: string }
-        - { name: street, type: string }
-        - { name: city, type: string }
-        - { name: match_score, type: decimal }
+    enriched: enrich_format.out
   config_schema:
     fuzzy_threshold:
-      type: decimal
+      type: float
       default: 0.8
     lookup_table:
       type: string
+      required: true
 
 nodes:
   - type: transform
     name: enrich_join
     input: customers
     config:
-      add_fields:
-        match_score: "0.95"
+      cxl: |
+        emit match_score = 0.95
   - type: transform
     name: enrich_format
     input: enrich_join
     config:
-      add_fields:
-        enriched_flag: "true"
+      cxl: |
+        emit enriched_flag = true

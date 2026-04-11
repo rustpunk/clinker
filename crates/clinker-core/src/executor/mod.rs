@@ -651,7 +651,7 @@ impl PipelineExecutor {
         // no second typecheck pass — `compile_transforms` is gone.
         let _ = &schema;
         let validated_plan = config
-            .compile()
+            .compile(&crate::config::CompileContext::default())
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),
@@ -3304,7 +3304,7 @@ impl PipelineExecutor {
         // parallelism profiles, and physical properties) WITHOUT
         // re-typechecking.
         let validated_plan = config
-            .compile()
+            .compile(&crate::config::CompileContext::default())
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),

@@ -29,6 +29,7 @@
 //! | `W002`      | warning  | Node names differ only in case                       |
 //! | `W100`      | warning  | Aggregate lowering deferred (Phase 16b Wave 3 stub)  |
 //! | `W101`      | warning  | Pass-through column shadowed by composition body column |
+//! | `W102`      | warning  | Composition signature validation (required+default contradiction, suspicious port) |
 
 use std::fmt;
 
