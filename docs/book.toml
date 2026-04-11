@@ -1,0 +1,8 @@
+[book]
+title = "Clinker User Guide"
+authors = ["Rustpunk"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
