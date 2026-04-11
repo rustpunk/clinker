@@ -2684,7 +2684,7 @@ impl PipelineExecutor {
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
-        _lookup_tables: &HashMap<String, RuntimeLookup>,
+        lookup_tables: &HashMap<String, RuntimeLookup>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
@@ -2791,41 +2791,198 @@ impl PipelineExecutor {
                             source_row: rn,
                         };
 
-                        let eval_result = {
+                        // Check if this transform has a lookup table
+                        if let Some(rt_lookup) = lookup_tables.get(name.as_str()) {
                             let _guard = transform_timer.guard();
-                            evaluate_single_transform(&record, name, &mut evaluator, &ctx)
-                        };
-                        match eval_result {
-                            Ok((modified_record, Ok((emitted, metadata)))) => {
-                                all_emitted.extend(emitted);
-                                all_metadata.extend(metadata);
-                                output_records.push((
-                                    modified_record,
-                                    rn,
-                                    all_emitted,
-                                    all_metadata,
-                                ));
-                            }
-                            Ok((_record, Err(SkipReason::Filtered))) => {
-                                counters.filtered_count += 1;
-                            }
-                            Ok((_record, Err(SkipReason::Duplicate))) => {
-                                counters.distinct_count += 1;
-                            }
-                            Err((transform_name, eval_err)) => {
-                                if strategy == ErrorStrategy::FailFast {
-                                    return Err(eval_err.into());
+                            let matches = crate::pipeline::lookup::find_matches(
+                                &rt_lookup.table,
+                                &record,
+                                &mut rt_lookup
+                                    .where_evaluator
+                                    .lock()
+                                    .expect("lookup evaluator lock"),
+                                &ctx,
+                                rt_lookup.match_mode,
+                                rt_lookup.equality_index.as_ref(),
+                            )
+                            .map_err(|e| {
+                                PipelineError::Compilation {
+                                    transform_name: name.clone(),
+                                    messages: vec![e.to_string()],
                                 }
-                                counters.dlq_count += 1;
-                                dlq_entries.push(DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: eval_err.to_string(),
-                                    original_record: record,
-                                    stage: Some(DlqEntry::stage_transform(&transform_name)),
-                                    route: None,
-                                    trigger: true,
-                                });
+                            })?;
+
+                            if matches.is_empty() {
+                                match rt_lookup.on_miss {
+                                    crate::config::pipeline_node::OnMiss::Skip => {
+                                        counters.filtered_count += 1;
+                                        continue;
+                                    }
+                                    crate::config::pipeline_node::OnMiss::Error => {
+                                        return Err(PipelineError::Compilation {
+                                            transform_name: name.clone(),
+                                            messages: vec![format!(
+                                                "no matching row in lookup source '{}'",
+                                                rt_lookup.table.source_name()
+                                            )],
+                                        });
+                                    }
+                                    crate::config::pipeline_node::OnMiss::NullFields => {
+                                        let resolver =
+                                            crate::pipeline::lookup::LookupResolver::no_match(
+                                                &record,
+                                                rt_lookup.table.source_name(),
+                                            );
+                                        match evaluator
+                                            .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                            .map_err(|e| (name.clone(), e))
+                                        {
+                                            Ok(EvalResult::Emit {
+                                                fields: emitted,
+                                                metadata,
+                                            }) => {
+                                                let mut rec = record.clone();
+                                                for (n, v) in &emitted {
+                                                    if !rec.set(n, v.clone()) {
+                                                        rec.set_overflow(
+                                                            n.clone().into_boxed_str(),
+                                                            v.clone(),
+                                                        );
+                                                    }
+                                                }
+                                                for (k, v) in &metadata {
+                                                    let _ = rec.set_meta(k, v.clone());
+                                                }
+                                                all_emitted.extend(emitted);
+                                                all_metadata.extend(metadata);
+                                                output_records.push((
+                                                    rec,
+                                                    rn,
+                                                    all_emitted,
+                                                    all_metadata,
+                                                ));
+                                            }
+                                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                                counters.filtered_count += 1;
+                                            }
+                                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                                counters.distinct_count += 1;
+                                            }
+                                            Err((tn, eval_err)) => {
+                                                if strategy == ErrorStrategy::FailFast {
+                                                    return Err(eval_err.into());
+                                                }
+                                                counters.dlq_count += 1;
+                                                dlq_entries.push(DlqEntry {
+                                                    source_row: rn,
+                                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                                    error_message: eval_err.to_string(),
+                                                    original_record: record,
+                                                    stage: Some(DlqEntry::stage_transform(&tn)),
+                                                    route: None,
+                                                    trigger: true,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Emit one output record per match
+                                for &idx in &matches {
+                                    let matched_row = &rt_lookup.table.records()[idx];
+                                    let resolver = crate::pipeline::lookup::LookupResolver::matched(
+                                        &record,
+                                        rt_lookup.table.source_name(),
+                                        matched_row,
+                                    );
+                                    match evaluator
+                                        .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                        .map_err(|e| (name.clone(), e))
+                                    {
+                                        Ok(EvalResult::Emit {
+                                            fields: emitted,
+                                            metadata,
+                                        }) => {
+                                            let mut rec = record.clone();
+                                            for (n, v) in &emitted {
+                                                if !rec.set(n, v.clone()) {
+                                                    rec.set_overflow(
+                                                        n.clone().into_boxed_str(),
+                                                        v.clone(),
+                                                    );
+                                                }
+                                            }
+                                            for (k, v) in &metadata {
+                                                let _ = rec.set_meta(k, v.clone());
+                                            }
+                                            let mut em = all_emitted.clone();
+                                            let mut mt = all_metadata.clone();
+                                            em.extend(emitted);
+                                            mt.extend(metadata);
+                                            output_records.push((rec, rn, em, mt));
+                                        }
+                                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                            counters.filtered_count += 1;
+                                        }
+                                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                            counters.distinct_count += 1;
+                                        }
+                                        Err((tn, eval_err)) => {
+                                            if strategy == ErrorStrategy::FailFast {
+                                                return Err(eval_err.into());
+                                            }
+                                            counters.dlq_count += 1;
+                                            dlq_entries.push(DlqEntry {
+                                                source_row: rn,
+                                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                                error_message: eval_err.to_string(),
+                                                original_record: record.clone(),
+                                                stage: Some(DlqEntry::stage_transform(&tn)),
+                                                route: None,
+                                                trigger: true,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // No lookup — existing single-transform evaluation
+                            let eval_result = {
+                                let _guard = transform_timer.guard();
+                                evaluate_single_transform(&record, name, &mut evaluator, &ctx)
+                            };
+                            match eval_result {
+                                Ok((modified_record, Ok((emitted, metadata)))) => {
+                                    all_emitted.extend(emitted);
+                                    all_metadata.extend(metadata);
+                                    output_records.push((
+                                        modified_record,
+                                        rn,
+                                        all_emitted,
+                                        all_metadata,
+                                    ));
+                                }
+                                Ok((_record, Err(SkipReason::Filtered))) => {
+                                    counters.filtered_count += 1;
+                                }
+                                Ok((_record, Err(SkipReason::Duplicate))) => {
+                                    counters.distinct_count += 1;
+                                }
+                                Err((transform_name, eval_err)) => {
+                                    if strategy == ErrorStrategy::FailFast {
+                                        return Err(eval_err.into());
+                                    }
+                                    counters.dlq_count += 1;
+                                    dlq_entries.push(DlqEntry {
+                                        source_row: rn,
+                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                        error_message: eval_err.to_string(),
+                                        original_record: record,
+                                        stage: Some(DlqEntry::stage_transform(&transform_name)),
+                                        route: None,
+                                        trigger: true,
+                                    });
+                                }
                             }
                         }
                     }

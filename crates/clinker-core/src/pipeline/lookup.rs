@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clinker_format::traits::FormatReader;
 use clinker_record::{FieldResolver, Record, Schema, Value};
 
-use crate::config::pipeline_node::{MatchMode, OnMiss};
+use crate::config::pipeline_node::MatchMode;
 
 /// In-memory reference table for lookup enrichment.
 ///
@@ -217,49 +217,12 @@ fn probe_equality_index(
         }
     }
 
-    let mut candidates: Vec<usize> = idx
-        .partitions
-        .get(&key_values)
-        .cloned()
-        .unwrap_or_default();
+    let mut candidates: Vec<usize> = idx.partitions.get(&key_values).cloned().unwrap_or_default();
 
     // Always include null_rows (they might match via the full predicate)
     candidates.extend_from_slice(&idx.null_rows);
     candidates.sort_unstable();
     candidates
-}
-
-/// Apply lookup results to produce enriched records.
-pub fn apply_lookup(
-    table: &LookupTable,
-    _input_record: &Record,
-    match_indices: &[usize],
-    on_miss: OnMiss,
-) -> LookupOutcome {
-    if match_indices.is_empty() {
-        match on_miss {
-            OnMiss::NullFields => LookupOutcome::NoMatch,
-            OnMiss::Skip => LookupOutcome::SkipRecord,
-            OnMiss::Error => LookupOutcome::Error(format!(
-                "no matching row in lookup source '{}' for input record",
-                table.source_name()
-            )),
-        }
-    } else {
-        LookupOutcome::Matched(match_indices.to_vec())
-    }
-}
-
-/// Result of applying lookup to an input record.
-pub enum LookupOutcome {
-    /// One or more rows matched. Contains indices into the lookup table.
-    Matched(Vec<usize>),
-    /// No match; emit with null lookup fields.
-    NoMatch,
-    /// No match; skip the record entirely.
-    SkipRecord,
-    /// No match; error.
-    Error(String),
 }
 
 /// Null storage for lookup predicate evaluation (no window context needed).
@@ -590,5 +553,186 @@ mod tests {
             resolver.resolve_qualified("rate_bands", "rate_class"),
             Some(Value::Null)
         );
+    }
+
+    // ── Equality index extraction tests ──
+
+    use cxl::ast::{BinOp, Expr, NodeId};
+    use cxl::lexer::Span;
+
+    fn nid() -> NodeId {
+        NodeId(0)
+    }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+    fn field_ref(name: &str) -> Box<Expr> {
+        Box::new(Expr::FieldRef {
+            node_id: nid(),
+            name: name.into(),
+            span: sp(),
+        })
+    }
+    fn qualified_ref(source: &str, field: &str) -> Box<Expr> {
+        Box::new(Expr::QualifiedFieldRef {
+            node_id: nid(),
+            parts: vec![source.into(), field.into()].into_boxed_slice(),
+            span: sp(),
+        })
+    }
+    fn binary(op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
+        Expr::Binary {
+            node_id: nid(),
+            op,
+            lhs,
+            rhs,
+            span: sp(),
+        }
+    }
+
+    #[test]
+    fn test_extract_single_equality() {
+        // product_id == products.product_id
+        let expr = binary(
+            BinOp::Eq,
+            field_ref("product_id"),
+            qualified_ref("products", "product_id"),
+        );
+        let keys = extract_equality_keys(&expr, "products");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].input_field, "product_id");
+        assert_eq!(keys[0].lookup_field, "product_id");
+    }
+
+    #[test]
+    fn test_extract_reversed_operands() {
+        // products.product_id == product_id
+        let expr = binary(
+            BinOp::Eq,
+            qualified_ref("products", "product_id"),
+            field_ref("product_id"),
+        );
+        let keys = extract_equality_keys(&expr, "products");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].input_field, "product_id");
+    }
+
+    #[test]
+    fn test_extract_multiple_equality_with_and() {
+        // a == src.a and b == src.b
+        let lhs = binary(BinOp::Eq, field_ref("a"), qualified_ref("src", "a"));
+        let rhs = binary(BinOp::Eq, field_ref("b"), qualified_ref("src", "b"));
+        let expr = binary(BinOp::And, Box::new(lhs), Box::new(rhs));
+        let keys = extract_equality_keys(&expr, "src");
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_mixed_equality_and_range() {
+        // a == src.a and x >= src.y
+        let eq = binary(BinOp::Eq, field_ref("a"), qualified_ref("src", "a"));
+        let range = binary(BinOp::Gte, field_ref("x"), qualified_ref("src", "y"));
+        let expr = binary(BinOp::And, Box::new(eq), Box::new(range));
+        let keys = extract_equality_keys(&expr, "src");
+        assert_eq!(keys.len(), 1, "only the equality condition is extracted");
+        assert_eq!(keys[0].input_field, "a");
+    }
+
+    #[test]
+    fn test_extract_or_returns_empty() {
+        // a == src.a or b == src.b → no keys (conservative)
+        let lhs = binary(BinOp::Eq, field_ref("a"), qualified_ref("src", "a"));
+        let rhs = binary(BinOp::Eq, field_ref("b"), qualified_ref("src", "b"));
+        let expr = binary(BinOp::Or, Box::new(lhs), Box::new(rhs));
+        let keys = extract_equality_keys(&expr, "src");
+        assert!(keys.is_empty(), "OR prevents equality extraction");
+    }
+
+    #[test]
+    fn test_extract_wrong_source_returns_empty() {
+        // a == other.a (wrong source name)
+        let expr = binary(BinOp::Eq, field_ref("a"), qualified_ref("other", "a"));
+        let keys = extract_equality_keys(&expr, "src");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_probe_equality_index_hit() {
+        let schema = make_schema(&["key", "val"]);
+        let r1 = make_record(&schema, vec![Value::String("A".into()), Value::Integer(1)]);
+        let r2 = make_record(&schema, vec![Value::String("B".into()), Value::Integer(2)]);
+        let r3 = make_record(&schema, vec![Value::String("A".into()), Value::Integer(3)]);
+
+        let mut partitions = std::collections::HashMap::new();
+        partitions.insert(
+            vec![clinker_record::GroupByKey::Str("A".into())],
+            vec![0, 2],
+        );
+        partitions.insert(vec![clinker_record::GroupByKey::Str("B".into())], vec![1]);
+        let idx = EqualityIndex {
+            keys: vec![EqualityKey {
+                input_field: "key".to_string(),
+                lookup_field: "key".to_string(),
+            }],
+            partitions,
+            null_rows: vec![],
+        };
+
+        // Input with key="A" should return indices [0, 2]
+        let input_schema = make_schema(&["key"]);
+        let input = make_record(&input_schema, vec![Value::String("A".into())]);
+        let candidates = probe_equality_index(&idx, &input, 3);
+        assert_eq!(candidates, vec![0, 2]);
+
+        // Input with key="B" should return index [1]
+        let input_b = make_record(&input_schema, vec![Value::String("B".into())]);
+        let candidates_b = probe_equality_index(&idx, &input_b, 3);
+        assert_eq!(candidates_b, vec![1]);
+
+        // Input with key="C" (no match) should return empty
+        let input_c = make_record(&input_schema, vec![Value::String("C".into())]);
+        let candidates_c = probe_equality_index(&idx, &input_c, 3);
+        assert!(candidates_c.is_empty());
+    }
+
+    #[test]
+    fn test_probe_equality_index_null_input_falls_back() {
+        let idx = EqualityIndex {
+            keys: vec![EqualityKey {
+                input_field: "key".to_string(),
+                lookup_field: "key".to_string(),
+            }],
+            partitions: std::collections::HashMap::new(),
+            null_rows: vec![],
+        };
+
+        // Null input key → full scan fallback
+        let input_schema = make_schema(&["key"]);
+        let input = make_record(&input_schema, vec![Value::Null]);
+        let candidates = probe_equality_index(&idx, &input, 5);
+        assert_eq!(
+            candidates,
+            vec![0, 1, 2, 3, 4],
+            "null key falls back to full scan"
+        );
+    }
+
+    #[test]
+    fn test_probe_equality_index_includes_null_rows() {
+        let mut partitions = std::collections::HashMap::new();
+        partitions.insert(vec![clinker_record::GroupByKey::Str("A".into())], vec![0]);
+        let idx = EqualityIndex {
+            keys: vec![EqualityKey {
+                input_field: "key".to_string(),
+                lookup_field: "key".to_string(),
+            }],
+            partitions,
+            null_rows: vec![2], // row 2 had null key in lookup table
+        };
+
+        let input_schema = make_schema(&["key"]);
+        let input = make_record(&input_schema, vec![Value::String("A".into())]);
+        let candidates = probe_equality_index(&idx, &input, 3);
+        assert_eq!(candidates, vec![0, 2], "partition [0] + null_rows [2]");
     }
 }
