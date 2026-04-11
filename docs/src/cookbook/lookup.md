@@ -1,6 +1,6 @@
 # Multi-Source Lookup
 
-This recipe enriches order records with product information from a separate catalog file. Clinker's analytic window feature provides the lookup mechanism.
+This recipe enriches order records with product information from a separate catalog file using the `lookup:` transform configuration.
 
 ## Input data
 
@@ -60,15 +60,14 @@ nodes:
     name: enrich
     input: orders
     config:
-      analytic_window:
+      lookup:
         source: products
-        on: product_id
-        group_by: [product_id]
+        where: "product_id == products.product_id"
       cxl: |
         emit order_id = order_id
         emit product_id = product_id
-        emit product_name = $window.first()
-        emit category = $window.first()
+        emit product_name = products.product_name
+        emit category = products.category
         emit quantity = quantity
         emit unit_price = unit_price
         emit line_total = quantity.to_float() * unit_price
@@ -103,72 +102,107 @@ ORD-004,PROD-C,Cable Kit,Hardware,10,9.99,99.90
 ORD-005,PROD-B,DataSync License,Software,3,149.99,449.97
 ```
 
-## How the analytic window works
+## How lookup works
 
-The `analytic_window` configuration on the transform node sets up a lookup relationship:
+The `lookup:` configuration on a transform node loads a secondary source into memory and matches each input record against it:
 
 - **`source`** -- the name of another source node in the pipeline (here, `products`).
-- **`on`** -- the join key. Both the primary input and the window source must have a column with this name.
-- **`group_by`** -- the grouping key for the window. Records in the window source are grouped by this key, and `$window` functions operate within that group.
+- **`where`** -- a CXL boolean expression evaluated per candidate lookup row. Bare field names reference the primary input; qualified names (`products.field`) reference the lookup source.
+- **`on_miss`** (optional) -- what to do when no lookup row matches: `null_fields` (default), `skip`, or `error`.
+- **`match`** (optional) -- `first` (default, 1:1) or `all` (1:N fan-out).
 
-For each record in the primary input (`orders`), Clinker finds matching records in the window source where `product_id` matches, then makes window functions available:
+Lookup fields are accessed using qualified syntax: `products.product_name`, `products.category`, etc.
 
-- `$window.first()` -- first value in the matching group
-- `$window.last()` -- last value in the matching group
-- `$window.count()` -- number of matching records
-- `$window.sum()` -- sum of numeric values in the group
+## Unmatched records
 
-The window source is loaded into memory once at pipeline start. This makes it suitable for lookup tables that fit comfortably in the memory budget -- catalogs, reference data, mapping tables.
-
-## Key points
-
-**Two source nodes.** The pipeline declares two independent sources. The transform node's `input` field connects it to the primary data stream (`orders`), while `analytic_window.source` connects it to the lookup data (`products`).
-
-**Join semantics.** This is a left join. If an order references a product_id that does not exist in the products file, `$window.first()` returns null. Add null handling if your data may have unmatched keys:
-
-```
-emit product_name = if $window.count() > 0
-  then $window.first()
-  else "UNKNOWN"
-```
-
-**Memory considerations.** The entire window source is loaded into memory, indexed by the join key. For large reference files, ensure your `--memory-limit` accounts for this. A 10 MB CSV lookup table uses roughly 10-20 MB of memory when indexed.
-
-## Variations
-
-### Multiple lookup sources
-
-A transform can reference only one analytic window. To enrich from multiple lookup tables, chain transforms:
+By default (`on_miss: null_fields`), unmatched records emit with all lookup fields set to null. Other options:
 
 ```yaml
-  - type: transform
-    name: enrich_product
-    input: orders
-    config:
-      analytic_window:
-        source: products
-        on: product_id
-        group_by: [product_id]
-      cxl: |
-        emit order_id = order_id
-        emit product_id = product_id
-        emit product_name = $window.first()
-        emit customer_id = customer_id
-        emit amount = amount
-
-  - type: transform
-    name: enrich_customer
-    input: enrich_product
-    config:
-      analytic_window:
-        source: customers
-        on: customer_id
-        group_by: [customer_id]
-      cxl: |
-        emit order_id = order_id
-        emit product_name = product_name
-        emit customer_name = $window.first()
-        emit amount = amount
+lookup:
+  source: products
+  where: "product_id == products.product_id"
+  on_miss: skip        # drop records with no match
 ```
 
-Each transform adds fields from its respective lookup source.
+```yaml
+lookup:
+  source: products
+  where: "product_id == products.product_id"
+  on_miss: error       # fail the pipeline on first unmatched record
+```
+
+## Range predicates
+
+Lookups support any CXL boolean expression, not just equality. This classifies employees into pay bands:
+
+```yaml
+- type: transform
+  name: classify
+  input: employees
+  config:
+    lookup:
+      source: rate_bands
+      where: |
+        ee_group == rate_bands.ee_group
+        and pay >= rate_bands.min_pay
+        and pay <= rate_bands.max_pay
+    cxl: |
+      emit employee_id = employee_id
+      emit rate_class = rate_bands.rate_class
+```
+
+## Fan-out (match: all)
+
+When `match: all` is set, each matching lookup row produces a separate output record. This is useful for one-to-many enrichments:
+
+```yaml
+- type: transform
+  name: expand_benefits
+  input: employees
+  config:
+    lookup:
+      source: benefits
+      where: "department == benefits.department"
+      match: all
+    cxl: |
+      emit employee_id = employee_id
+      emit benefit = benefits.benefit_name
+```
+
+An employee in a department with 3 benefits produces 3 output records.
+
+## Multiple lookup sources
+
+Each transform can reference one lookup source. Chain transforms to enrich from multiple sources:
+
+```yaml
+- type: transform
+  name: enrich_product
+  input: orders
+  config:
+    lookup:
+      source: products
+      where: "product_id == products.product_id"
+    cxl: |
+      emit order_id = order_id
+      emit product_name = products.product_name
+      emit customer_id = customer_id
+      emit amount = amount
+
+- type: transform
+  name: enrich_customer
+  input: enrich_product
+  config:
+    lookup:
+      source: customers
+      where: "customer_id == customers.customer_id"
+    cxl: |
+      emit order_id = order_id
+      emit product_name = product_name
+      emit customer_name = customers.customer_name
+      emit amount = amount
+```
+
+## Memory considerations
+
+The entire lookup source is loaded into memory. For large reference files, ensure `--memory-limit` accounts for this. A 10 MB CSV lookup table uses roughly 10-20 MB of heap when loaded.
