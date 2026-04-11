@@ -1027,4 +1027,155 @@ nodes:
         assert_eq!(counters.filtered_count, 1);
         assert!(!output.contains("PROD-MISSING"), "skipped: {output}");
     }
+
+    /// match: all — one input record fans out to multiple output records.
+    #[test]
+    fn test_lookup_match_all_fan_out() {
+        let yaml = r#"
+pipeline:
+  name: lookup_fan_out
+
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+
+  - type: source
+    name: benefits
+    config:
+      name: benefits
+      type: csv
+      path: benefits.csv
+      schema:
+        - { name: department, type: string }
+        - { name: benefit_name, type: string }
+
+  - type: transform
+    name: expand
+    input: employees
+    config:
+      lookup:
+        source: benefits
+        where: "department == benefits.department"
+        match: all
+      cxl: |
+        emit employee_id = employee_id
+        emit benefit = benefits.benefit_name
+
+  - type: output
+    name: result
+    input: expand
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        // engineering has 2 benefits, sales has 1
+        let employees = "employee_id,department\nE001,engineering\nE002,sales\nE003,engineering\n";
+        let benefits = "department,benefit_name\nengineering,health_plan\nengineering,stock_options\nsales,commission\n";
+
+        let (counters, dlq, output) =
+            run_multi_source_pipeline(yaml, &[("employees", employees), ("benefits", benefits)])
+                .unwrap();
+
+        // E001 → 2 records (health_plan, stock_options)
+        // E002 → 1 record (commission)
+        // E003 → 2 records (health_plan, stock_options)
+        // Total input: 3, total output: 5
+        eprintln!("OUTPUT:\n{output}");
+        eprintln!(
+            "COUNTERS: total={} ok={} filtered={} distinct={} dlq={}",
+            counters.total_count,
+            counters.ok_count,
+            counters.filtered_count,
+            counters.distinct_count,
+            counters.dlq_count
+        );
+        assert_eq!(counters.total_count, 3);
+        assert_eq!(counters.ok_count, 5, "fan-out: 2+1+2 = 5 output records");
+        assert!(dlq.is_empty());
+
+        // Count occurrences
+        let health_count = output.matches("health_plan").count();
+        let stock_count = output.matches("stock_options").count();
+        let commission_count = output.matches("commission").count();
+        assert_eq!(health_count, 2, "E001+E003 each get health_plan: {output}");
+        assert_eq!(stock_count, 2, "E001+E003 each get stock_options: {output}");
+        assert_eq!(commission_count, 1, "E002 gets commission: {output}");
+    }
+
+    /// match: all with on_miss: skip — unmatched records dropped, matched fan out.
+    #[test]
+    fn test_lookup_match_all_with_on_miss_skip() {
+        let yaml = r#"
+pipeline:
+  name: lookup_fan_out_skip
+
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+
+  - type: source
+    name: benefits
+    config:
+      name: benefits
+      type: csv
+      path: benefits.csv
+      schema:
+        - { name: department, type: string }
+        - { name: benefit_name, type: string }
+
+  - type: transform
+    name: expand
+    input: employees
+    config:
+      lookup:
+        source: benefits
+        where: "department == benefits.department"
+        match: all
+        on_miss: skip
+      cxl: |
+        emit employee_id = employee_id
+        emit benefit = benefits.benefit_name
+
+  - type: output
+    name: result
+    input: expand
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        // legal department has no benefits → skipped
+        let employees = "employee_id,department\nE001,engineering\nE002,legal\n";
+        let benefits =
+            "department,benefit_name\nengineering,health_plan\nengineering,stock_options\n";
+
+        let (counters, _dlq, output) =
+            run_multi_source_pipeline(yaml, &[("employees", employees), ("benefits", benefits)])
+                .unwrap();
+
+        assert_eq!(counters.total_count, 2);
+        assert_eq!(counters.ok_count, 2, "E001 fans out to 2 records");
+        assert_eq!(counters.filtered_count, 1, "E002 skipped (no benefits)");
+        assert!(
+            !output.contains("legal"),
+            "legal should be skipped: {output}"
+        );
+    }
 }

@@ -1801,7 +1801,7 @@ impl PipelineExecutor {
                             source_file: &source_file_arc,
                             source_row: rn,
                         };
-                        let result = {
+                        let results = {
                             let _guard = transform_timer.guard();
                             evaluate_record_with_lookups(
                                 &record,
@@ -1811,37 +1811,43 @@ impl PipelineExecutor {
                                 &lookup_tables,
                             )
                         };
-                        match result {
-                            Ok(EvalResult::Emit {
-                                fields: emitted,
-                                metadata,
-                            }) => {
-                                {
-                                    let _guard = route_timer.guard();
-                                    let _guard2 = projection_timer.guard();
-                                    Self::dispatch_to_outputs(
-                                        &record,
-                                        &emitted,
-                                        &metadata,
-                                        config,
-                                        &output_configs,
-                                        primary_output,
-                                        compiled_route.as_mut(),
-                                        &ctx,
-                                        &mut counters,
-                                        &mut dlq_entries,
-                                        &mut per_output_batches,
-                                        strategy,
-                                        rn,
-                                    );
+                        match results {
+                            Ok(eval_results) => {
+                                for eval_result in eval_results {
+                                    match eval_result {
+                                        EvalResult::Emit {
+                                            fields: emitted,
+                                            metadata,
+                                        } => {
+                                            {
+                                                let _guard = route_timer.guard();
+                                                let _guard2 = projection_timer.guard();
+                                                Self::dispatch_to_outputs(
+                                                    &record,
+                                                    &emitted,
+                                                    &metadata,
+                                                    config,
+                                                    &output_configs,
+                                                    primary_output,
+                                                    compiled_route.as_mut(),
+                                                    &ctx,
+                                                    &mut counters,
+                                                    &mut dlq_entries,
+                                                    &mut per_output_batches,
+                                                    strategy,
+                                                    rn,
+                                                );
+                                            }
+                                            records_emitted += 1;
+                                        }
+                                        EvalResult::Skip(SkipReason::Filtered) => {
+                                            counters.filtered_count += 1;
+                                        }
+                                        EvalResult::Skip(SkipReason::Duplicate) => {
+                                            counters.distinct_count += 1;
+                                        }
+                                    }
                                 }
-                                records_emitted += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                counters.filtered_count += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                counters.distinct_count += 1;
                             }
                             Err((transform_name, eval_err)) => {
                                 if strategy == ErrorStrategy::FailFast {
@@ -2006,7 +2012,7 @@ impl PipelineExecutor {
                             source_file: &source_file_arc,
                             source_row: rn,
                         };
-                        let result = {
+                        let results = {
                             let _guard = transform_timer.guard();
                             evaluate_record_with_lookups(
                                 &record,
@@ -2016,26 +2022,32 @@ impl PipelineExecutor {
                                 &lookup_tables,
                             )
                         };
-                        match result {
-                            Ok(EvalResult::Emit {
-                                fields: emitted, ..
-                            }) => {
-                                let projected = {
-                                    let _guard = projection_timer.guard();
-                                    project_output(&record, &emitted, primary_output)
-                                };
-                                {
-                                    let _guard = write_timer.guard();
-                                    csv_writer.write_record(&projected)?;
+                        match results {
+                            Ok(eval_results) => {
+                                for eval_result in eval_results {
+                                    match eval_result {
+                                        EvalResult::Emit {
+                                            fields: emitted, ..
+                                        } => {
+                                            let projected = {
+                                                let _guard = projection_timer.guard();
+                                                project_output(&record, &emitted, primary_output)
+                                            };
+                                            {
+                                                let _guard = write_timer.guard();
+                                                csv_writer.write_record(&projected)?;
+                                            }
+                                            counters.ok_count += 1;
+                                            records_emitted += 1;
+                                        }
+                                        EvalResult::Skip(SkipReason::Filtered) => {
+                                            counters.filtered_count += 1;
+                                        }
+                                        EvalResult::Skip(SkipReason::Duplicate) => {
+                                            counters.distinct_count += 1;
+                                        }
+                                    }
                                 }
-                                counters.ok_count += 1;
-                                records_emitted += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                counters.filtered_count += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                counters.distinct_count += 1;
                             }
                             Err((transform_name, eval_err)) => {
                                 if strategy == ErrorStrategy::FailFast {
@@ -2165,17 +2177,26 @@ impl PipelineExecutor {
         // Schema derivation: scan forward until a record emits
         let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
         let mut records_scanned: u64 = 0;
+        // First emitted result (for schema detection) plus any additional
+        // fan-out results from the same record that need dispatching later.
         #[allow(clippy::type_complexity)]
         let mut first_emitted: Option<(
             Record,
             IndexMap<String, Value>,
             IndexMap<String, Value>,
         )> = None;
+        // Extra fan-out results from the first emitting record (beyond the
+        // first Emit used for schema detection).
+        #[allow(clippy::type_complexity)]
+        let mut first_record_extra_emits: Vec<(
+            IndexMap<String, Value>,
+            IndexMap<String, Value>,
+        )> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut pending_skips_and_errors: Vec<(
             u64,
             Record,
-            Result<EvalResult, (String, cxl::eval::EvalError)>,
+            Result<Vec<EvalResult>, (String, cxl::eval::EvalError)>,
         )> = Vec::new();
         let mut scan_idx = 0;
 
@@ -2195,15 +2216,33 @@ impl PipelineExecutor {
                 &lookup_tables,
             );
             match &result {
-                Ok(EvalResult::Emit {
-                    fields: emitted,
-                    metadata,
-                }) => {
-                    counters.ok_count += 1;
-                    first_emitted = Some((record.clone(), emitted.clone(), metadata.clone()));
-                    break;
+                Ok(eval_results) => {
+                    let mut found_first = false;
+                    for eval_result in eval_results {
+                        if let EvalResult::Emit {
+                            fields: emitted,
+                            metadata,
+                        } = eval_result
+                        {
+                            if !found_first {
+                                counters.ok_count += 1;
+                                first_emitted =
+                                    Some((record.clone(), emitted.clone(), metadata.clone()));
+                                found_first = true;
+                            } else {
+                                counters.ok_count += 1;
+                                first_record_extra_emits.push((emitted.clone(), metadata.clone()));
+                            }
+                        }
+                        // Skip counting is deferred to pending_skips_and_errors processing
+                    }
+                    if found_first {
+                        break;
+                    }
+                    // All results are Skips — defer (counters updated in pending processing)
+                    pending_skips_and_errors.push((*rn, record.clone(), result));
                 }
-                Ok(EvalResult::Skip(_)) | Err(_) => {
+                Err(_) => {
                     pending_skips_and_errors.push((*rn, record.clone(), result));
                 }
             }
@@ -2228,13 +2267,19 @@ impl PipelineExecutor {
             // Process pending skips/errors
             for (_rn, _record, result) in &pending_skips_and_errors {
                 match result {
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
+                    Ok(eval_results) => {
+                        for eval_result in eval_results {
+                            match eval_result {
+                                EvalResult::Skip(SkipReason::Filtered) => {
+                                    counters.filtered_count += 1;
+                                }
+                                EvalResult::Skip(SkipReason::Duplicate) => {
+                                    counters.distinct_count += 1;
+                                }
+                                EvalResult::Emit { .. } => {} // emits handled in scan
+                            }
+                        }
                     }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
                     Err((transform_name, eval_err)) => {
                         if strategy == ErrorStrategy::FailFast {
                             drop(output_channels);
@@ -2257,50 +2302,60 @@ impl PipelineExecutor {
                 }
             }
 
-            // Dispatch first emitted record
+            // Dispatch first emitted record + extra fan-out results
             let first_emitted_was_some = first_emitted.is_some();
-            if let Some((record, emitted, metadata)) = first_emitted {
+            if let Some((ref record, ref emitted, ref metadata)) = first_emitted {
                 let route = compiled_route.as_mut().unwrap();
                 let ctx = EvalContext {
                     stable: &stable,
                     source_file: &source_file_arc,
                     source_row: 1,
                 };
-                match route.evaluate(&emitted, &metadata, &ctx) {
-                    Ok(targets) => {
-                        let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                        for target in &targets {
-                            let out_cfg = output_configs
-                                .iter()
-                                .find(|o| o.name == *target)
-                                .unwrap_or(primary_output);
-                            let projected =
-                                project_output_with_meta(&record, &emitted, &metadata, out_cfg);
-                            per_output_batches
-                                .entry(target.clone())
-                                .or_default()
-                                .push(projected);
+                // Dispatch first result + all extra fan-out results
+                #[allow(clippy::type_complexity)]
+                let all_emits: Vec<(
+                    &IndexMap<String, Value>,
+                    &IndexMap<String, Value>,
+                )> = std::iter::once((emitted, metadata))
+                    .chain(first_record_extra_emits.iter().map(|(e, m)| (e, m)))
+                    .collect();
+                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
+                for (emit, meta) in all_emits {
+                    match route.evaluate(emit, meta, &ctx) {
+                        Ok(targets) => {
+                            for target in &targets {
+                                let out_cfg = output_configs
+                                    .iter()
+                                    .find(|o| o.name == *target)
+                                    .unwrap_or(primary_output);
+                                let projected =
+                                    project_output_with_meta(record, emit, meta, out_cfg);
+                                per_output_batches
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .push(projected);
+                            }
                         }
-                        flush_output_batches(&mut per_output_batches, &output_channels)?;
-                    }
-                    Err(route_err) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            drop(output_channels);
-                            return Err(route_err.into());
+                        Err(route_err) => {
+                            if strategy == ErrorStrategy::FailFast {
+                                drop(output_channels);
+                                return Err(route_err.into());
+                            }
+                            counters.dlq_count += 1;
+                            counters.ok_count = counters.ok_count.saturating_sub(1);
+                            dlq_entries.push(DlqEntry {
+                                source_row: 1,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: route_err.to_string(),
+                                original_record: record.clone(),
+                                stage: Some(DlqEntry::stage_route_eval()),
+                                route: None,
+                                trigger: true,
+                            });
                         }
-                        counters.dlq_count += 1;
-                        counters.ok_count = counters.ok_count.saturating_sub(1);
-                        dlq_entries.push(DlqEntry {
-                            source_row: 1,
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: route_err.to_string(),
-                            original_record: record,
-                            stage: Some(DlqEntry::stage_route_eval()),
-                            route: None,
-                            trigger: true,
-                        });
                     }
                 }
+                flush_output_batches(&mut per_output_batches, &output_channels)?;
             }
 
             // Process remaining records
@@ -2310,7 +2365,11 @@ impl PipelineExecutor {
             let mut projection_timer = stage_metrics::CumulativeTimer::new();
             let mut route_timer = stage_metrics::CumulativeTimer::new();
             let mut write_timer = stage_metrics::CumulativeTimer::new();
-            let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
+            let mut records_emitted: u64 = if first_emitted_was_some {
+                1 + first_record_extra_emits.len() as u64
+            } else {
+                0
+            };
             let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
 
             for (record, rn) in all_records.into_iter().skip(scan_idx) {
@@ -2319,7 +2378,7 @@ impl PipelineExecutor {
                     source_file: &source_file_arc,
                     source_row: rn,
                 };
-                let result = {
+                let results = {
                     let _guard = transform_timer.guard();
                     evaluate_record_with_lookups(
                         &record,
@@ -2329,59 +2388,66 @@ impl PipelineExecutor {
                         &lookup_tables,
                     )
                 };
-                match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
-                        let route_result = {
-                            let _guard = route_timer.guard();
-                            route.evaluate(&emitted, &metadata, &ctx)
-                        };
-                        match route_result {
-                            Ok(targets) => {
-                                for target in &targets {
-                                    let out_cfg = output_configs
-                                        .iter()
-                                        .find(|o| o.name == *target)
-                                        .unwrap_or(primary_output);
-                                    let projected = {
-                                        let _guard = projection_timer.guard();
-                                        project_output_with_meta(
-                                            &record, &emitted, &metadata, out_cfg,
-                                        )
+                match results {
+                    Ok(eval_results) => {
+                        for eval_result in eval_results {
+                            match eval_result {
+                                EvalResult::Emit {
+                                    fields: emitted,
+                                    metadata,
+                                } => {
+                                    let route_result = {
+                                        let _guard = route_timer.guard();
+                                        route.evaluate(&emitted, &metadata, &ctx)
                                     };
-                                    per_output_batches
-                                        .entry(target.clone())
-                                        .or_default()
-                                        .push(projected);
+                                    match route_result {
+                                        Ok(targets) => {
+                                            for target in &targets {
+                                                let out_cfg = output_configs
+                                                    .iter()
+                                                    .find(|o| o.name == *target)
+                                                    .unwrap_or(primary_output);
+                                                let projected = {
+                                                    let _guard = projection_timer.guard();
+                                                    project_output_with_meta(
+                                                        &record, &emitted, &metadata, out_cfg,
+                                                    )
+                                                };
+                                                per_output_batches
+                                                    .entry(target.clone())
+                                                    .or_default()
+                                                    .push(projected);
+                                            }
+                                            counters.ok_count += 1;
+                                            records_emitted += 1;
+                                        }
+                                        Err(route_err) => {
+                                            if strategy == ErrorStrategy::FailFast {
+                                                drop(output_channels);
+                                                return Err(route_err.into());
+                                            }
+                                            counters.dlq_count += 1;
+                                            dlq_entries.push(DlqEntry {
+                                                source_row: rn,
+                                                category:
+                                                    crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                                error_message: route_err.to_string(),
+                                                original_record: record.clone(),
+                                                stage: Some(DlqEntry::stage_route_eval()),
+                                                route: None,
+                                                trigger: true,
+                                            });
+                                        }
+                                    }
                                 }
-                                counters.ok_count += 1;
-                                records_emitted += 1;
-                            }
-                            Err(route_err) => {
-                                if strategy == ErrorStrategy::FailFast {
-                                    drop(output_channels);
-                                    return Err(route_err.into());
+                                EvalResult::Skip(SkipReason::Filtered) => {
+                                    counters.filtered_count += 1;
                                 }
-                                counters.dlq_count += 1;
-                                dlq_entries.push(DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: route_err.to_string(),
-                                    original_record: record,
-                                    stage: Some(DlqEntry::stage_route_eval()),
-                                    route: None,
-                                    trigger: true,
-                                });
+                                EvalResult::Skip(SkipReason::Duplicate) => {
+                                    counters.distinct_count += 1;
+                                }
                             }
                         }
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
                     }
                     Err((transform_name, eval_err)) => {
                         if strategy == ErrorStrategy::FailFast {
@@ -2450,13 +2516,19 @@ impl PipelineExecutor {
             // Process pending skips and errors from scan-forward phase
             for (rn, record, result) in pending_skips_and_errors {
                 match result {
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
+                    Ok(eval_results) => {
+                        for eval_result in eval_results {
+                            match eval_result {
+                                EvalResult::Skip(SkipReason::Filtered) => {
+                                    counters.filtered_count += 1;
+                                }
+                                EvalResult::Skip(SkipReason::Duplicate) => {
+                                    counters.distinct_count += 1;
+                                }
+                                EvalResult::Emit { .. } => {} // emits handled in scan
+                            }
+                        }
                     }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Ok(EvalResult::Emit { .. }) => unreachable!("emits handled in scan"),
                     Err((transform_name, eval_err)) => {
                         handle_error(
                             strategy,
@@ -2477,16 +2549,26 @@ impl PipelineExecutor {
 
             // Write first emitted record (ok_count already incremented during scan)
             let first_emitted_was_some = first_emitted.is_some();
-            if let Some((record, emitted, metadata)) = first_emitted {
-                let projected = project_output_with_meta(&record, &emitted, &metadata, output);
+            if let Some((ref record, ref emitted, ref metadata)) = first_emitted {
+                let projected = project_output_with_meta(record, emitted, metadata, output);
                 csv_writer.write_record(&projected)?;
+                // Write extra fan-out results from the same first record
+                for (extra_emitted, extra_metadata) in &first_record_extra_emits {
+                    let projected =
+                        project_output_with_meta(record, extra_emitted, extra_metadata, output);
+                    csv_writer.write_record(&projected)?;
+                }
             }
 
             // Process remaining records
             let mut transform_timer = stage_metrics::CumulativeTimer::new();
             let mut projection_timer = stage_metrics::CumulativeTimer::new();
             let mut write_timer = stage_metrics::CumulativeTimer::new();
-            let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
+            let mut records_emitted: u64 = if first_emitted_was_some {
+                1 + first_record_extra_emits.len() as u64
+            } else {
+                0
+            };
             let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
 
             for (record, rn) in all_records.into_iter().skip(scan_idx) {
@@ -2495,7 +2577,7 @@ impl PipelineExecutor {
                     source_file: &source_file_arc,
                     source_row: rn,
                 };
-                let result = {
+                let results = {
                     let _guard = transform_timer.guard();
                     evaluate_record_with_lookups(
                         &record,
@@ -2505,27 +2587,35 @@ impl PipelineExecutor {
                         &lookup_tables,
                     )
                 };
-                match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
-                        let projected = {
-                            let _guard = projection_timer.guard();
-                            project_output_with_meta(&record, &emitted, &metadata, output)
-                        };
-                        {
-                            let _guard = write_timer.guard();
-                            csv_writer.write_record(&projected)?;
+                match results {
+                    Ok(eval_results) => {
+                        for eval_result in eval_results {
+                            match eval_result {
+                                EvalResult::Emit {
+                                    fields: emitted,
+                                    metadata,
+                                } => {
+                                    let projected = {
+                                        let _guard = projection_timer.guard();
+                                        project_output_with_meta(
+                                            &record, &emitted, &metadata, output,
+                                        )
+                                    };
+                                    {
+                                        let _guard = write_timer.guard();
+                                        csv_writer.write_record(&projected)?;
+                                    }
+                                    counters.ok_count += 1;
+                                    records_emitted += 1;
+                                }
+                                EvalResult::Skip(SkipReason::Filtered) => {
+                                    counters.filtered_count += 1;
+                                }
+                                EvalResult::Skip(SkipReason::Duplicate) => {
+                                    counters.distinct_count += 1;
+                                }
+                            }
                         }
-                        counters.ok_count += 1;
-                        records_emitted += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
                     }
                     Err((transform_name, eval_err)) => {
                         handle_error(
@@ -4027,127 +4117,174 @@ fn evaluate_record(
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
 ) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
-    evaluate_record_impl(record, transform_names, evaluators, ctx, &HashMap::new())
+    // No lookup tables → always returns exactly one result
+    let mut results =
+        evaluate_record_with_lookups(record, transform_names, evaluators, ctx, &HashMap::new())?;
+    Ok(results
+        .pop()
+        .unwrap_or(EvalResult::Skip(SkipReason::Filtered)))
 }
 
+/// Evaluate a transform chain with lookup enrichment, potentially producing
+/// multiple output records when `match: all` fan-out is active.
 fn evaluate_record_with_lookups(
     record: &Record,
     transform_names: &[&str],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
     lookup_tables: &HashMap<String, RuntimeLookup>,
-) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
-    evaluate_record_impl(record, transform_names, evaluators, ctx, lookup_tables)
-}
+) -> Result<Vec<EvalResult>, (String, cxl::eval::EvalError)> {
+    // Each "branch" is an in-progress record being transformed through the chain.
+    // For match:first / no-lookup this stays at 1; match:all expands it.
+    type Branch = (Record, IndexMap<String, Value>, IndexMap<String, Value>);
+    let mut branches: Vec<Branch> = vec![(record.clone(), IndexMap::new(), IndexMap::new())];
+    let mut last_skip_reason = SkipReason::Filtered;
 
-fn evaluate_record_impl(
-    record: &Record,
-    transform_names: &[&str],
-    evaluators: &mut [ProgramEvaluator],
-    ctx: &EvalContext,
-    lookup_tables: &HashMap<String, RuntimeLookup>,
-) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
-    let mut record = record.clone();
-    let mut all_emitted = IndexMap::new();
-    let mut all_metadata = IndexMap::new();
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let name = transform_names.get(i).copied().unwrap_or("unknown");
+        let mut new_branches: Vec<Branch> = Vec::with_capacity(branches.len());
 
-        // Check if this transform has a lookup
-        let eval_result = if let Some(rt_lookup) = lookup_tables.get(name) {
-            let matches = crate::pipeline::lookup::find_matches(
-                &rt_lookup.table,
-                &record,
-                &mut rt_lookup
-                    .where_evaluator
-                    .lock()
-                    .expect("lookup evaluator lock"),
-                ctx,
-                rt_lookup.match_mode,
-            )
-            .map_err(|e| {
-                (
-                    name.to_string(),
-                    cxl::eval::EvalError {
-                        kind: cxl::eval::EvalErrorKind::ConversionFailed {
-                            value: e.to_string(),
-                            target: "lookup match",
-                        },
-                        span: cxl::lexer::Span::new(0, 0),
-                    },
+        for (record, all_emitted, all_metadata) in branches {
+            if let Some(rt_lookup) = lookup_tables.get(name) {
+                let matches = crate::pipeline::lookup::find_matches(
+                    &rt_lookup.table,
+                    &record,
+                    &mut rt_lookup
+                        .where_evaluator
+                        .lock()
+                        .expect("lookup evaluator lock"),
+                    ctx,
+                    rt_lookup.match_mode,
                 )
-            })?;
-
-            if matches.is_empty() {
-                match rt_lookup.on_miss {
-                    crate::config::pipeline_node::OnMiss::Skip => {
-                        return Ok(EvalResult::Skip(SkipReason::Filtered));
-                    }
-                    crate::config::pipeline_node::OnMiss::Error => {
-                        return Err((
-                            name.to_string(),
-                            cxl::eval::EvalError {
-                                kind: cxl::eval::EvalErrorKind::ConversionFailed {
-                                    value: format!(
-                                        "no matching row in lookup source '{}'",
-                                        rt_lookup.table.source_name()
-                                    ),
-                                    target: "lookup match",
-                                },
-                                span: cxl::lexer::Span::new(0, 0),
+                .map_err(|e| {
+                    (
+                        name.to_string(),
+                        cxl::eval::EvalError {
+                            kind: cxl::eval::EvalErrorKind::ConversionFailed {
+                                value: e.to_string(),
+                                target: "lookup match",
                             },
-                        ));
+                            span: cxl::lexer::Span::new(0, 0),
+                        },
+                    )
+                })?;
+
+                if matches.is_empty() {
+                    match rt_lookup.on_miss {
+                        crate::config::pipeline_node::OnMiss::Skip => {
+                            // Drop this branch (filtered)
+                            continue;
+                        }
+                        crate::config::pipeline_node::OnMiss::Error => {
+                            return Err((
+                                name.to_string(),
+                                cxl::eval::EvalError {
+                                    kind: cxl::eval::EvalErrorKind::ConversionFailed {
+                                        value: format!(
+                                            "no matching row in lookup source '{}'",
+                                            rt_lookup.table.source_name()
+                                        ),
+                                        target: "lookup match",
+                                    },
+                                    span: cxl::lexer::Span::new(0, 0),
+                                },
+                            ));
+                        }
+                        crate::config::pipeline_node::OnMiss::NullFields => {
+                            let resolver = crate::pipeline::lookup::LookupResolver::no_match(
+                                &record,
+                                rt_lookup.table.source_name(),
+                            );
+                            let eval_result = eval
+                                .eval_record::<NullStorage>(ctx, &resolver, None)
+                                .map_err(|e| (name.to_string(), e))?;
+                            match apply_eval_to_branch(
+                                record,
+                                all_emitted,
+                                all_metadata,
+                                eval_result,
+                            ) {
+                                Ok(branch) => new_branches.push(branch),
+                                Err(reason) => last_skip_reason = reason,
+                            }
+                        }
                     }
-                    crate::config::pipeline_node::OnMiss::NullFields => {
-                        let resolver = crate::pipeline::lookup::LookupResolver::no_match(
+                } else {
+                    // Emit one branch per match (1 for First, N for All)
+                    for &idx in &matches {
+                        let matched_row = &rt_lookup.table.records()[idx];
+                        let resolver = crate::pipeline::lookup::LookupResolver::matched(
                             &record,
                             rt_lookup.table.source_name(),
+                            matched_row,
                         );
-                        eval.eval_record::<NullStorage>(ctx, &resolver, None)
-                            .map_err(|e| (name.to_string(), e))?
+                        let eval_result = eval
+                            .eval_record::<NullStorage>(ctx, &resolver, None)
+                            .map_err(|e| (name.to_string(), e))?;
+                        match apply_eval_to_branch(
+                            record.clone(),
+                            all_emitted.clone(),
+                            all_metadata.clone(),
+                            eval_result,
+                        ) {
+                            Ok(branch) => new_branches.push(branch),
+                            Err(reason) => last_skip_reason = reason,
+                        }
                     }
                 }
             } else {
-                let matched_row = &rt_lookup.table.records()[matches[0]];
-                let resolver = crate::pipeline::lookup::LookupResolver::matched(
-                    &record,
-                    rt_lookup.table.source_name(),
-                    matched_row,
-                );
-                eval.eval_record::<NullStorage>(ctx, &resolver, None)
-                    .map_err(|e| (name.to_string(), e))?
+                let eval_result = eval
+                    .eval_record::<NullStorage>(ctx, &record, None)
+                    .map_err(|e| (name.to_string(), e))?;
+                match apply_eval_to_branch(record, all_emitted, all_metadata, eval_result) {
+                    Ok(branch) => new_branches.push(branch),
+                    Err(reason) => last_skip_reason = reason,
+                }
             }
-        } else {
-            eval.eval_record::<NullStorage>(ctx, &record, None)
-                .map_err(|e| (name.to_string(), e))?
-        };
+        }
 
-        match eval_result {
-            EvalResult::Emit {
-                fields: emitted,
-                metadata,
-            } => {
-                for (name, value) in &emitted {
-                    // Use set() for schema fields (e.g. emit amount = amount.to_int()),
-                    // set_overflow() for new fields introduced by the transform.
-                    if !record.set(name, value.clone()) {
-                        record.set_overflow(name.clone().into_boxed_str(), value.clone());
-                    }
-                }
-                // Copy metadata onto Record so later transforms can read via $meta.*
-                for (key, value) in &metadata {
-                    let _ = record.set_meta(key, value.clone());
-                }
-                all_emitted.extend(emitted);
-                all_metadata.extend(metadata);
-            }
-            skip @ EvalResult::Skip(_) => return Ok(skip),
+        branches = new_branches;
+        if branches.is_empty() {
+            return Ok(vec![EvalResult::Skip(last_skip_reason)]);
         }
     }
-    Ok(EvalResult::Emit {
-        fields: all_emitted,
-        metadata: all_metadata,
-    })
+
+    Ok(branches
+        .into_iter()
+        .map(|(_, emitted, metadata)| EvalResult::Emit {
+            fields: emitted,
+            metadata,
+        })
+        .collect())
+}
+
+/// Apply an eval result to a branch, returning the updated branch or the skip reason.
+#[allow(clippy::type_complexity)]
+fn apply_eval_to_branch(
+    mut record: Record,
+    mut all_emitted: IndexMap<String, Value>,
+    mut all_metadata: IndexMap<String, Value>,
+    eval_result: EvalResult,
+) -> Result<(Record, IndexMap<String, Value>, IndexMap<String, Value>), SkipReason> {
+    match eval_result {
+        EvalResult::Emit {
+            fields: emitted,
+            metadata,
+        } => {
+            for (name, value) in &emitted {
+                if !record.set(name, value.clone()) {
+                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                }
+            }
+            for (key, value) in &metadata {
+                let _ = record.set_meta(key, value.clone());
+            }
+            all_emitted.extend(emitted);
+            all_metadata.extend(metadata);
+            Ok((record, all_emitted, all_metadata))
+        }
+        EvalResult::Skip(reason) => Err(reason),
+    }
 }
 
 /// Evaluate all transforms with window context, accumulating emitted fields.
