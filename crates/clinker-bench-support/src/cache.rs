@@ -227,25 +227,21 @@ mod tests {
     }
 
     /// Second call with identical spec returns cached file without regenerating.
-    /// Verified by checking that mtime does not change between calls.
+    /// Verified by checking that content hash is identical between calls.
     #[test]
-    #[serial_test::serial]
     fn test_cache_reuses_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let cache = BenchDataCache::new(dir.path().to_path_buf());
         let spec = test_spec();
 
         let path1 = cache.get_or_generate(&spec);
-        let mtime1 = fs::metadata(&path1).unwrap().modified().unwrap();
-
-        // Small delay to ensure mtime would differ if file were regenerated
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let hash1 = blake3::hash(&fs::read(&path1).unwrap()).to_hex().to_string();
 
         let path2 = cache.get_or_generate(&spec);
-        let mtime2 = fs::metadata(&path2).unwrap().modified().unwrap();
+        let hash2 = blake3::hash(&fs::read(&path2).unwrap()).to_hex().to_string();
 
         assert_eq!(path1, path2);
-        assert_eq!(mtime1, mtime2);
+        assert_eq!(hash1, hash2);
     }
 
     /// Changing a spec parameter produces a different cache hash,
@@ -284,17 +280,17 @@ mod tests {
         let spec = test_spec();
 
         let path1 = cache.get_or_generate(&spec);
-        let mtime1 = fs::metadata(&path1).unwrap().modified().unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Corrupt the cached file so we can detect regeneration
+        fs::write(&path1, b"corrupted").unwrap();
 
         // Set env var to force regen (unsafe in edition 2024 — V-7-1)
         unsafe { std::env::set_var("CLINKER_BENCH_REGENERATE", "1") };
         let path2 = cache.get_or_generate(&spec);
-        let mtime2 = fs::metadata(&path2).unwrap().modified().unwrap();
         unsafe { std::env::remove_var("CLINKER_BENCH_REGENERATE") };
 
         assert_eq!(path1, path2);
-        assert_ne!(mtime1, mtime2, "file should have been regenerated");
+        let content = fs::read(&path2).unwrap();
+        assert_ne!(content, b"corrupted", "file should have been regenerated");
     }
 }

@@ -1,4 +1,4 @@
-use clinker_bench_support::{CsvPayload, MEDIUM, SMALL};
+use clinker_bench_support::{CsvPayload, MEDIUM};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};

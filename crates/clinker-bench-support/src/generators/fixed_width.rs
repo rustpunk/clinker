@@ -75,25 +75,8 @@ pub fn generate_fixed_width(
     string_len: usize,
     seed: u64,
 ) -> (Vec<u8>, Vec<BenchFieldSpec>) {
-    let int_width = 10;
-    let mut specs = Vec::with_capacity(field_count);
-    let mut offset = 0;
-    for i in 0..field_count {
-        let (width, field_type, justify) = if i % 2 == 0 {
-            (int_width, BenchFieldType::Integer, BenchJustify::Right)
-        } else {
-            (string_len, BenchFieldType::String, BenchJustify::Left)
-        };
-        specs.push(BenchFieldSpec {
-            name: format!("f{i}"),
-            start: offset,
-            width,
-            field_type,
-            justify,
-        });
-        offset += width;
-    }
-    let line_len = offset + 1; // +1 for \n
+    let specs = field_specs_for(field_count, string_len);
+    let line_len = specs.iter().map(|s| s.width).sum::<usize>() + 1; // +1 for \n
     let mut buf = Vec::with_capacity(record_count * line_len);
     let mut rng = fastrand::Rng::with_seed(seed);
 
