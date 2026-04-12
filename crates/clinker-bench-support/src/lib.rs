@@ -1,18 +1,74 @@
 //! Shared deterministic data generators for Clinker benchmarks.
 //!
-//! All generators use fixed seeds for reproducibility across runs.
+//! All generators use explicit seeds for reproducibility across runs.
 
 #[cfg(feature = "bench-alloc")]
 pub mod alloc;
 
+pub mod cache;
+pub mod generators;
+
 use clinker_record::{Record, Schema, Value};
+use std::fmt;
 use std::sync::Arc;
+
+// Explicit re-exports for backward compatibility (D-9: no glob re-exports)
+pub use generators::csv::CsvPayload;
+pub use generators::fixed_width::{
+    BenchFieldSpec, BenchFieldType, BenchJustify, field_specs_for, generate_fixed_width,
+};
+pub use generators::json::{generate_json_array, generate_ndjson};
+pub use generators::xml::generate_xml;
 
 // ── Scale constants ────────────────────────────────────────────────
 
 pub const SMALL: usize = 1_000;
 pub const MEDIUM: usize = 10_000;
 pub const LARGE: usize = 100_000;
+pub const XLARGE: usize = 1_000_000;
+
+/// Benchmark data scale tiers.
+///
+/// Labels appear in Criterion benchmark IDs and HTML reports.
+/// Use `Scale::ALL` to iterate all variants for benchmark matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scale {
+    Small,
+    Medium,
+    Large,
+    XLarge,
+}
+
+impl Scale {
+    /// All scale variants in ascending order.
+    pub const ALL: &[Scale] = &[Self::Small, Self::Medium, Self::Large, Self::XLarge];
+
+    /// Number of records for this scale tier.
+    pub fn record_count(self) -> usize {
+        match self {
+            Self::Small => SMALL,
+            Self::Medium => MEDIUM,
+            Self::Large => LARGE,
+            Self::XLarge => XLARGE,
+        }
+    }
+
+    /// Short label for Criterion benchmark IDs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "1k",
+            Self::Medium => "10k",
+            Self::Large => "100k",
+            Self::XLarge => "1m",
+        }
+    }
+}
+
+impl fmt::Display for Scale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 // ── Record generation ──────────────────────────────────────────────
 
@@ -74,50 +130,6 @@ impl RecordFactory {
             .collect();
         // SAFETY: all bytes are ASCII a-z
         unsafe { String::from_utf8_unchecked(bytes) }.into_boxed_str()
-    }
-}
-
-// ── CSV payload generation ─────────────────────────────────────────
-
-/// Generate a CSV byte buffer with deterministic content.
-pub struct CsvPayload;
-
-impl CsvPayload {
-    /// Generate CSV bytes with a header row and `record_count` data rows.
-    ///
-    /// Columns: `f0` (integer), `f1` (string), ..., alternating types.
-    pub fn generate(record_count: usize, field_count: usize, string_len: usize) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(record_count * field_count * (string_len + 4));
-        let mut rng = fastrand::Rng::with_seed(42);
-
-        // Header
-        for i in 0..field_count {
-            if i > 0 {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("f{i}").as_bytes());
-        }
-        buf.push(b'\n');
-
-        // Data rows
-        for _ in 0..record_count {
-            for i in 0..field_count {
-                if i > 0 {
-                    buf.push(b',');
-                }
-                if i % 2 == 0 {
-                    buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-                } else {
-                    let s: String = (0..string_len)
-                        .map(|_| (rng.u8(b'a'..=b'z')) as char)
-                        .collect();
-                    buf.extend_from_slice(s.as_bytes());
-                }
-            }
-            buf.push(b'\n');
-        }
-
-        buf
     }
 }
 
@@ -218,63 +230,46 @@ emit c29 = f1.left(3)
 filter f0 > 100
 "#;
 
-// ── JSON payload generation ────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    /// Verify CsvPayload is accessible via crate-root re-export after extraction.
+    #[test]
+    fn test_csv_payload_backward_compat_generates_bytes() {
+        use crate::CsvPayload;
 
-/// Generate NDJSON byte buffer with deterministic content.
-pub fn generate_ndjson(record_count: usize, field_count: usize, string_len: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(record_count * field_count * (string_len + 10));
-    let mut rng = fastrand::Rng::with_seed(42);
+        let bytes = CsvPayload::generate(10, 4, 8, 42);
 
-    for _ in 0..record_count {
-        buf.push(b'{');
-        for i in 0..field_count {
-            if i > 0 {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("\"f{i}\":").as_bytes());
-            if i % 2 == 0 {
-                buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-            } else {
-                buf.push(b'"');
-                for _ in 0..string_len {
-                    buf.push(rng.u8(b'a'..=b'z'));
-                }
-                buf.push(b'"');
-            }
-        }
-        buf.extend_from_slice(b"}\n");
+        assert!(!bytes.is_empty());
+        assert!(bytes.starts_with(b"f0,f1,f2,f3\n"));
     }
-    buf
-}
 
-/// Generate JSON array byte buffer with deterministic content.
-pub fn generate_json_array(record_count: usize, field_count: usize, string_len: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(record_count * field_count * (string_len + 10));
-    let mut rng = fastrand::Rng::with_seed(42);
+    /// Verify generate_ndjson is accessible via crate-root re-export after extraction.
+    #[test]
+    fn test_json_ndjson_backward_compat_generates_bytes() {
+        use crate::generate_ndjson;
 
-    buf.push(b'[');
-    for row in 0..record_count {
-        if row > 0 {
-            buf.push(b',');
-        }
-        buf.push(b'{');
-        for i in 0..field_count {
-            if i > 0 {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("\"f{i}\":").as_bytes());
-            if i % 2 == 0 {
-                buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-            } else {
-                buf.push(b'"');
-                for _ in 0..string_len {
-                    buf.push(rng.u8(b'a'..=b'z'));
-                }
-                buf.push(b'"');
-            }
-        }
-        buf.push(b'}');
+        let bytes = generate_ndjson(10, 4, 8, 42);
+
+        assert!(!bytes.is_empty());
+        assert!(bytes[0] == b'{');
     }
-    buf.push(b']');
-    buf
+
+    /// Verify Scale enum record counts match the corresponding constants
+    /// and Display produces row-count labels.
+    #[test]
+    fn test_scale_record_counts_match_constants() {
+        use crate::{LARGE, MEDIUM, SMALL, Scale, XLARGE};
+
+        assert_eq!(Scale::Small.record_count(), SMALL);
+        assert_eq!(Scale::Medium.record_count(), MEDIUM);
+        assert_eq!(Scale::Large.record_count(), LARGE);
+        assert_eq!(Scale::XLarge.record_count(), XLARGE);
+
+        assert_eq!(Scale::Small.to_string(), "1k");
+        assert_eq!(Scale::Medium.to_string(), "10k");
+        assert_eq!(Scale::Large.to_string(), "100k");
+        assert_eq!(Scale::XLarge.to_string(), "1m");
+
+        assert_eq!(Scale::ALL.len(), 4);
+    }
 }

@@ -1,4 +1,4 @@
-use clinker_bench_support::{CsvPayload, MEDIUM, SMALL};
+use clinker_bench_support::{CsvPayload, MEDIUM};
 use clinker_core::config::parse_config;
 use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -42,7 +42,7 @@ fn bench_scaling_streaming(c: &mut Criterion) {
     group.sample_size(20); // fewer samples for expensive pipeline runs
 
     let record_count = MEDIUM;
-    let csv_bytes = CsvPayload::generate(record_count, 10, 16);
+    let csv_bytes = CsvPayload::generate(record_count, 10, 16, 42);
 
     for threads in [1, 2, 4, 8] {
         let yaml = format!(
@@ -144,7 +144,7 @@ fn bench_scaling_two_pass(c: &mut Criterion) {
     group.sample_size(20);
 
     let record_count = MEDIUM;
-    let csv_bytes = CsvPayload::generate(record_count, 10, 16);
+    let csv_bytes = CsvPayload::generate(record_count, 10, 16, 42);
 
     for threads in [1, 2, 4, 8] {
         let yaml = format!(

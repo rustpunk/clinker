@@ -51,7 +51,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
 petgraph = "0.8"
 fastrand = "2"
+quick-xml = "0.37"
 clinker-bench-support = { path = "crates/clinker-bench-support" }
+tempfile = "3"
 
 [workspace.metadata.release]
 shared-version = true

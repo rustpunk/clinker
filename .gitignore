@@ -3,5 +3,6 @@ lancedb/
 docs/internal/
 docs/book/
 target/
+bench-data/
 examples/pipelines/output/
 tests/e2e/

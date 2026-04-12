@@ -751,8 +751,15 @@ dependencies = [
 name = "clinker-bench-support"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "chrono",
  "clinker-record",
  "fastrand",
+ "quick-xml 0.37.5",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
 ]
 
 [[package]]
