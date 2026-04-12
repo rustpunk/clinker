@@ -13,11 +13,23 @@ use super::execution::ExecutionPlanDag;
 use crate::config::PipelineConfig;
 use crate::config::composition::ProvenanceDb;
 
+/// Content-hash identity for a compiled channel overlay (LD-16c-18).
+///
+/// Two plans with identical `ChannelIdentity` are byte-equivalent and
+/// do not need re-materialization (SQLMesh Virtual Environments model).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChannelIdentity {
+    pub name: String,
+    /// BLAKE3 hash of the raw `.channel.yaml` file bytes.
+    pub content_hash: [u8; 32],
+}
+
 #[derive(Debug)]
 pub struct CompiledPlan {
     dag: ExecutionPlanDag,
     config: PipelineConfig,
     artifacts: CompileArtifacts,
+    channel_identity: Option<ChannelIdentity>,
 }
 
 impl CompiledPlan {
@@ -30,6 +42,7 @@ impl CompiledPlan {
             dag,
             config,
             artifacts,
+            channel_identity: None,
         }
     }
 
@@ -62,5 +75,23 @@ impl CompiledPlan {
     /// channel overlay (16c.4).
     pub fn provenance(&self) -> &ProvenanceDb {
         &self.artifacts.provenance
+    }
+
+    /// Mutable access to the provenance side-table for channel overlay
+    /// application. The overlay applies `ChannelDefault`/`ChannelFixed`
+    /// layers to existing `ResolvedValue` entries.
+    pub fn provenance_mut(&mut self) -> &mut ProvenanceDb {
+        &mut self.artifacts.provenance
+    }
+
+    /// The channel identity stamped by [`apply_channel_overlay`], if any.
+    /// `None` for base pipeline compilations (no channel applied).
+    pub fn channel_identity(&self) -> Option<&ChannelIdentity> {
+        self.channel_identity.as_ref()
+    }
+
+    /// Stamp a channel identity onto this compiled plan.
+    pub fn set_channel_identity(&mut self, identity: ChannelIdentity) {
+        self.channel_identity = Some(identity);
     }
 }

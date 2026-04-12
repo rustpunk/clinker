@@ -762,6 +762,7 @@ dependencies = [
  "blake3",
  "clinker-core",
  "clinker-record",
+ "criterion",
  "indexmap",
  "serde",
  "serde-saphyr",

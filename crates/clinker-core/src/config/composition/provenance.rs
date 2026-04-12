@@ -158,6 +158,17 @@ impl ProvenanceDb {
             .get(&(node_name.to_owned(), param_name.to_owned()))
     }
 
+    /// Mutable lookup for `(node_name, param_name)`. Used by channel overlay
+    /// to apply `ChannelDefault`/`ChannelFixed` layers.
+    pub fn get_mut(
+        &mut self,
+        node_name: &str,
+        param_name: &str,
+    ) -> Option<&mut ResolvedValue<serde_json::Value>> {
+        self.entries
+            .get_mut(&(node_name.to_owned(), param_name.to_owned()))
+    }
+
     /// Iterate over all provenance entries.
     pub fn iter(
         &self,

@@ -7,7 +7,7 @@ pub mod index;
 pub mod properties;
 pub mod row_type;
 
-pub use compiled::CompiledPlan;
+pub use compiled::{ChannelIdentity, CompiledPlan};
 pub use composition_body::{BoundBody, CompositionBodyId};
 pub use row_type::{ColumnLookup, Row, RowTail, TailVarId};
 
