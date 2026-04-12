@@ -9,6 +9,7 @@ pub mod cache;
 pub mod generators;
 
 use clinker_record::{Record, Schema, Value};
+use std::fmt;
 use std::sync::Arc;
 
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
@@ -24,6 +25,50 @@ pub use generators::xml::generate_xml;
 pub const SMALL: usize = 1_000;
 pub const MEDIUM: usize = 10_000;
 pub const LARGE: usize = 100_000;
+pub const XLARGE: usize = 1_000_000;
+
+/// Benchmark data scale tiers.
+///
+/// Labels appear in Criterion benchmark IDs and HTML reports.
+/// Use `Scale::ALL` to iterate all variants for benchmark matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scale {
+    Small,
+    Medium,
+    Large,
+    XLarge,
+}
+
+impl Scale {
+    /// All scale variants in ascending order.
+    pub const ALL: &[Scale] = &[Self::Small, Self::Medium, Self::Large, Self::XLarge];
+
+    /// Number of records for this scale tier.
+    pub fn record_count(self) -> usize {
+        match self {
+            Self::Small => SMALL,
+            Self::Medium => MEDIUM,
+            Self::Large => LARGE,
+            Self::XLarge => XLARGE,
+        }
+    }
+
+    /// Short label for Criterion benchmark IDs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "1k",
+            Self::Medium => "10k",
+            Self::Large => "100k",
+            Self::XLarge => "1m",
+        }
+    }
+}
+
+impl fmt::Display for Scale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 // ── Record generation ──────────────────────────────────────────────
 
@@ -207,5 +252,24 @@ mod tests {
 
         assert!(!bytes.is_empty());
         assert!(bytes[0] == b'{');
+    }
+
+    /// Verify Scale enum record counts match the corresponding constants
+    /// and Display produces row-count labels.
+    #[test]
+    fn test_scale_record_counts_match_constants() {
+        use crate::{LARGE, MEDIUM, SMALL, Scale, XLARGE};
+
+        assert_eq!(Scale::Small.record_count(), SMALL);
+        assert_eq!(Scale::Medium.record_count(), MEDIUM);
+        assert_eq!(Scale::Large.record_count(), LARGE);
+        assert_eq!(Scale::XLarge.record_count(), XLARGE);
+
+        assert_eq!(Scale::Small.to_string(), "1k");
+        assert_eq!(Scale::Medium.to_string(), "10k");
+        assert_eq!(Scale::Large.to_string(), "100k");
+        assert_eq!(Scale::XLarge.to_string(), "1m");
+
+        assert_eq!(Scale::ALL.len(), 4);
     }
 }
