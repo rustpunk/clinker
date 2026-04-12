@@ -11,3 +11,6 @@ bench-alloc = []
 [dependencies]
 clinker-record = { workspace = true }
 fastrand = "2"
+
+[dev-dependencies]
+quick-xml = { workspace = true }

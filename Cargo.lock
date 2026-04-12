@@ -753,6 +753,7 @@ version = "0.1.0"
 dependencies = [
  "clinker-record",
  "fastrand",
+ "quick-xml 0.37.5",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ use std::sync::Arc;
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
 pub use generators::csv::CsvPayload;
 pub use generators::json::{generate_json_array, generate_ndjson};
+pub use generators::xml::generate_xml;
 
 // ── Scale constants ────────────────────────────────────────────────
 
