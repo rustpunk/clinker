@@ -13,7 +13,7 @@ nodes:
       sort_order:
         - field: f0
       schema:
-        - { name: f0, type: string }
+        - { name: f0, type: int }
         - { name: f1, type: string }
 
   - type: transform

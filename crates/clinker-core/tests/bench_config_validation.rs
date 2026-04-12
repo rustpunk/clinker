@@ -1,7 +1,7 @@
 use clinker_bench_support::workspace_root;
 use clinker_core::config::{
-    AggregateStrategyHint, InputFormat, NodeInput, OutputFormat, PipelineNode, SchemaSource,
-    parse_config,
+    AggregateStrategyHint, CompileContext, InputFormat, NodeInput, OutputFormat, PipelineNode,
+    SchemaSource, parse_config,
 };
 use std::fs;
 
@@ -235,14 +235,6 @@ fn test_multi_output_route_targets_match_outputs() {
             } = &node.value
             {
                 let route_name = &header.name;
-                let output_names: std::collections::HashSet<String> = config
-                    .nodes
-                    .iter()
-                    .filter_map(|n| match &n.value {
-                        PipelineNode::Output { header, .. } => Some(header.name.clone()),
-                        _ => None,
-                    })
-                    .collect();
 
                 let expected_port = |port: &str| NodeInput::Port {
                     node: route_name.clone(),
@@ -257,9 +249,11 @@ fn test_multi_output_route_targets_match_outputs() {
                         _ => false,
                     });
                     assert!(
-                        has_output || output_names.contains(key),
-                        "{}: route condition '{}' has no matching output",
+                        has_output,
+                        "{}: route condition '{}' has no output connected to port '{}.{}'",
                         path.display(),
+                        key,
+                        route_name,
                         key,
                     );
                 }
@@ -270,10 +264,12 @@ fn test_multi_output_route_targets_match_outputs() {
                     _ => false,
                 });
                 assert!(
-                    has_default || output_names.contains(&body.default),
-                    "{}: route default '{}' has no matching output",
+                    has_default,
+                    "{}: route default '{}' has no output connected to port '{}.{}'",
                     path.display(),
-                    body.default
+                    body.default,
+                    route_name,
+                    body.default,
                 );
             }
         }
@@ -421,9 +417,22 @@ fn test_scale_narrow_and_wide_cxl_field_references() {
         }
     }
 
-    // wide_50fields: CXL references include at least one field with index >= 40
+    // wide_50fields: schema must declare exactly 50 columns (f0..f49)
     let yaml = fs::read_to_string(root.join("wide_50fields.yaml")).unwrap();
     let config = parse_config(&yaml).unwrap();
+    let field_count = config
+        .nodes
+        .iter()
+        .find_map(|n| match &n.value {
+            PipelineNode::Source { config: body, .. } => Some(body.schema.columns.len()),
+            _ => None,
+        })
+        .expect("no source in wide_50fields");
+    assert_eq!(
+        field_count, 50,
+        "wide_50fields schema must declare exactly 50 columns, found {field_count}"
+    );
+    // CXL references should include at least one field with index >= 40
     let mut has_high_field = false;
     for node in &config.nodes {
         if let PipelineNode::Transform { config: body, .. } = &node.value {
@@ -479,4 +488,36 @@ fn test_aggregate_configs_have_correct_strategy() {
         source.sort_order.as_ref().map_or(false, |s| !s.is_empty()),
         "streaming_aggregate_presorted: source must have sort_order"
     );
+}
+
+/// Plan-time compilation gate: a representative subset of bench configs must
+/// survive `compile()` (topology + CXL type-checking), not just YAML parsing.
+/// Guards against schema type mismatches (e.g. numeric ops on string fields).
+#[test]
+fn test_representative_configs_compile_plan() {
+    let root = workspace_root();
+    let ctx = CompileContext::new(&root);
+    let bench_root = root.join("benches/pipelines");
+
+    // Representative subset spanning CXL ops, routes, aggregates, and windows.
+    let configs = [
+        "cxl_ops/filter_selectivity.yaml",
+        "cxl_ops/complex_realistic.yaml",
+        "cxl_ops/numeric_methods.yaml",
+        "cxl_ops/coalesce.yaml",
+        "execution_mode/streaming_multi_output.yaml",
+        "execution_mode/hash_aggregate_low_cardinality.yaml",
+        "execution_mode/two_pass_window_sum.yaml",
+        "features/validation_error.yaml",
+    ];
+
+    for name in configs {
+        let path = bench_root.join(name);
+        let yaml = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let config = parse_config(&yaml).unwrap_or_else(|e| panic!("{name}: parse error: {e}"));
+        config.compile(&ctx).unwrap_or_else(|diags| {
+            let msgs: Vec<String> = diags.iter().map(|d| format!("  {d:?}")).collect();
+            panic!("{name}: compile failed:\n{}", msgs.join("\n"));
+        });
+    }
 }
