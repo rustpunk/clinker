@@ -1,0 +1,38 @@
+pipeline:
+  name: bench-two-pass-window-all-fns
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+
+  - type: transform
+    name: windowed
+    input: source
+    config:
+      cxl: |
+        emit w_sum = $window.sum(f2)
+        emit w_avg = $window.avg(f2)
+        emit w_min = $window.min(f2)
+        emit w_max = $window.max(f2)
+        emit w_count = $window.count()
+      analytic_window:
+        group_by: [f0]
+
+  - type: output
+    name: sink
+    input: windowed
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

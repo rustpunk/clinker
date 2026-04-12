@@ -1,0 +1,35 @@
+pipeline:
+  name: bench-date-methods
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: dates
+    input: source
+    config:
+      cxl: |
+        let d = f1.to_date("yyyy-MM-dd")
+        emit d_year = d.year()
+        emit d_month = d.month()
+        emit d_add = d.add_days(30)
+        emit d_fmt = d.format_date("MM/dd/yyyy")
+
+  - type: output
+    name: sink
+    input: dates
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

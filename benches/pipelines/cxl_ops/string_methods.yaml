@@ -1,0 +1,44 @@
+pipeline:
+  name: bench-string-methods
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: strings
+    input: source
+    config:
+      cxl: |
+        emit s_upper = f1.upper()
+        emit s_lower = f1.lower()
+        emit s_trim = f1.trim()
+        emit s_replace = f1.replace("a", "x")
+        emit s_sub = f1.substring(0, 5)
+        emit s_left = f1.left(3)
+        emit s_right = f1.right(3)
+        emit s_pad = f1.pad_left(20, " ")
+        emit s_rev = f1.reverse()
+        emit s_len = f1.length()
+        emit s_sw = f1.starts_with("a")
+        emit s_ct = f1.contains("e")
+        emit s_find = f1.find("e")
+        emit s_split = f1.split(",")
+
+  - type: output
+    name: sink
+    input: strings
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

@@ -1,0 +1,42 @@
+pipeline:
+  name: bench-validation-error
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: validated
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+      validations:
+        - check: "f0 > 0"
+          severity: error
+          message: "f0 must be positive"
+
+  - type: output
+    name: sink
+    input: validated
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true
+
+error_handling:
+  strategy: continue
+  dlq:
+    path: bench://dlq.csv
+    include_reason: true
+    include_source_row: true

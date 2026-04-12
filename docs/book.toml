@@ -5,4 +5,5 @@ language = "en"
 src = "src"
 
 [output.html]
-default-theme = "navy"
+default-theme = "enamel"
+preferred-dark-theme = "blueprint"

@@ -1,0 +1,34 @@
+pipeline:
+  name: bench-xml-passthrough
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: xml
+      path: bench://input.xml
+      options:
+        record_path: records/record
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: passthrough
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+
+  - type: output
+    name: sink
+    input: passthrough
+    config:
+      name: sink
+      type: xml
+      path: bench://output.xml
+      options:
+        root_element: records
+        record_element: record
+      include_unmapped: true

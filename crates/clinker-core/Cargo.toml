@@ -52,6 +52,7 @@ csv = "1"
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true, features = [] }
 clinker-channel = { workspace = true }
+glob = "0.3"
 rayon = "1"
 fastrand = { workspace = true }
 insta = "1"

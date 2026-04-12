@@ -1,0 +1,60 @@
+pipeline:
+  name: bench-multi-output-inclusive
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: classify
+    input: source
+    config:
+      cxl: |
+        emit f0 = f0
+        emit f1 = f1
+
+  - type: route
+    name: classify_route
+    input: classify
+    config:
+      mode: inclusive
+      conditions:
+        high_value: "f0 > 500000"
+        long_string: "f1.length() > 5"
+      default: remainder
+
+  - type: output
+    name: high_value
+    input: classify_route.high_value
+    config:
+      name: high_value
+      type: csv
+      path: bench://output_high_value.csv
+      include_unmapped: true
+
+  - type: output
+    name: long_string
+    input: classify_route.long_string
+    config:
+      name: long_string
+      type: csv
+      path: bench://output_long_string.csv
+      include_unmapped: true
+
+  - type: output
+    name: remainder
+    input: classify_route.remainder
+    config:
+      name: remainder
+      type: csv
+      path: bench://output_remainder.csv
+      include_unmapped: true

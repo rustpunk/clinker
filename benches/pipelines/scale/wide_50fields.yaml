@@ -1,0 +1,84 @@
+pipeline:
+  name: bench-wide-50fields
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+        - { name: f2, type: string }
+        - { name: f3, type: string }
+        - { name: f4, type: string }
+        - { name: f5, type: string }
+        - { name: f6, type: string }
+        - { name: f7, type: string }
+        - { name: f8, type: string }
+        - { name: f9, type: string }
+        - { name: f10, type: string }
+        - { name: f11, type: string }
+        - { name: f12, type: string }
+        - { name: f13, type: string }
+        - { name: f14, type: string }
+        - { name: f15, type: string }
+        - { name: f16, type: string }
+        - { name: f17, type: string }
+        - { name: f18, type: string }
+        - { name: f19, type: string }
+        - { name: f20, type: string }
+        - { name: f21, type: string }
+        - { name: f22, type: string }
+        - { name: f23, type: string }
+        - { name: f24, type: string }
+        - { name: f25, type: string }
+        - { name: f26, type: string }
+        - { name: f27, type: string }
+        - { name: f28, type: string }
+        - { name: f29, type: string }
+        - { name: f30, type: string }
+        - { name: f31, type: string }
+        - { name: f32, type: string }
+        - { name: f33, type: string }
+        - { name: f34, type: string }
+        - { name: f35, type: string }
+        - { name: f36, type: string }
+        - { name: f37, type: string }
+        - { name: f38, type: string }
+        - { name: f39, type: string }
+        - { name: f40, type: string }
+        - { name: f41, type: string }
+        - { name: f42, type: string }
+        - { name: f43, type: string }
+        - { name: f44, type: string }
+        - { name: f45, type: string }
+        - { name: f46, type: string }
+        - { name: f47, type: string }
+        - { name: f48, type: string }
+        - { name: f49, type: string }
+
+  - type: transform
+    name: compute
+    input: source
+    config:
+      cxl: |
+        emit r0 = f0
+        emit r1 = f1
+        emit r10 = f10
+        emit r25 = f25
+        emit r40 = f40
+        emit r49 = f49
+
+  - type: output
+    name: sink
+    input: compute
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

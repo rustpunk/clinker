@@ -1,0 +1,38 @@
+pipeline:
+  name: bench-numeric-methods
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: numerics
+    input: source
+    config:
+      cxl: |
+        emit n_abs = f0.abs()
+        emit n_ceil = f0.to_float().ceil()
+        emit n_floor = f0.to_float().floor()
+        emit n_round = f0.to_float().round(2)
+        emit n_round_to = f0.to_float().round_to(3)
+        emit n_clamp = f0.clamp(100, 900000)
+        emit n_min = f0.min(500000)
+        emit n_max = f0.max(100000)
+
+  - type: output
+    name: sink
+    input: numerics
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

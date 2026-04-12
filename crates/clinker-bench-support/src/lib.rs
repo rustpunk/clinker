@@ -10,7 +10,77 @@ pub mod generators;
 
 use clinker_record::{Record, Schema, Value};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Returns the workspace root by walking up from `CARGO_MANIFEST_DIR`.
+///
+/// Single source of truth for workspace root resolution in benchmarks and tests.
+/// Panics if the workspace root cannot be found.
+pub fn workspace_root() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .find(|p| {
+            let toml = p.join("Cargo.toml");
+            toml.exists()
+                && std::fs::read_to_string(&toml)
+                    .map(|s| s.contains("[workspace]"))
+                    .unwrap_or(false)
+        })
+        .expect("could not find workspace root from CARGO_MANIFEST_DIR ancestors")
+        .to_path_buf()
+}
+
+// ── Pipeline config discovery ─────────────────────────────────────
+
+/// A discovered benchmark pipeline config.
+#[derive(Debug, Clone)]
+pub struct ConfigEntry {
+    /// Directory category (e.g. "format", "cxl_ops", "execution_mode").
+    pub category: String,
+    /// Config name without extension (e.g. "csv_passthrough").
+    pub name: String,
+    /// Absolute path to the YAML file.
+    pub path: PathBuf,
+}
+
+/// Walk `base` directory, discover all `*.yaml` configs, exclude `future/`,
+/// return sorted entries for deterministic Criterion registration order.
+pub fn discover_pipeline_configs(base: &Path) -> Vec<ConfigEntry> {
+    let pattern = base.join("**/*.yaml");
+    let Some(pattern_str) = pattern.to_str() else {
+        return Vec::new();
+    };
+    let Ok(paths) = glob::glob(pattern_str) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for entry in paths {
+        let Ok(path) = entry else { continue };
+        if path.components().any(|c| c.as_os_str() == "future") {
+            continue;
+        }
+        let category = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let name = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        entries.push(ConfigEntry {
+            category,
+            name,
+            path,
+        });
+    }
+    entries.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
+    entries
+}
 
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
 pub use generators::csv::CsvPayload;
@@ -271,5 +341,74 @@ mod tests {
         assert_eq!(Scale::XLarge.to_string(), "1m");
 
         assert_eq!(Scale::ALL.len(), 4);
+    }
+
+    /// Verify discovery finds all non-future configs (~41 expected).
+    #[test]
+    fn test_discover_configs_finds_all_non_future() {
+        let base = crate::workspace_root().join("benches/pipelines");
+        let entries = crate::discover_pipeline_configs(&base);
+        // 7 format + 10 cxl_ops + 10 execution_mode + 12 features + 2 scale = 41
+        assert!(
+            entries.len() >= 41,
+            "Expected at least 41 configs, found {}",
+            entries.len()
+        );
+    }
+
+    /// Verify no entries come from the future/ directory.
+    #[test]
+    fn test_discover_configs_excludes_future() {
+        let base = crate::workspace_root().join("benches/pipelines");
+        let entries = crate::discover_pipeline_configs(&base);
+        for entry in &entries {
+            assert_ne!(
+                entry.category, "future",
+                "future/ config should be excluded: {}",
+                entry.name
+            );
+        }
+    }
+
+    /// Two calls return identical order — deterministic for Criterion bench IDs.
+    #[test]
+    fn test_discover_configs_sorted_deterministic() {
+        let base = crate::workspace_root().join("benches/pipelines");
+        let a = crate::discover_pipeline_configs(&base);
+        let b = crate::discover_pipeline_configs(&base);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.category, y.category);
+            assert_eq!(x.name, y.name);
+            assert_eq!(x.path, y.path);
+        }
+    }
+
+    /// Every entry's category equals its YAML file's parent directory name.
+    #[test]
+    fn test_discover_configs_category_matches_parent_dirname() {
+        let base = crate::workspace_root().join("benches/pipelines");
+        let entries = crate::discover_pipeline_configs(&base);
+        for entry in &entries {
+            let parent_name = entry
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            assert_eq!(
+                entry.category, parent_name,
+                "category mismatch for {}",
+                entry.name
+            );
+        }
+    }
+
+    /// Empty directory returns empty Vec without panicking.
+    #[test]
+    fn test_discover_configs_empty_base_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = crate::discover_pipeline_configs(tmp.path());
+        assert!(entries.is_empty());
     }
 }

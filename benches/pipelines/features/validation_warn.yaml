@@ -1,0 +1,35 @@
+pipeline:
+  name: bench-validation-warn
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: validated
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+      validations:
+        - check: "f0 > 0"
+          severity: warn
+          message: "f0 should be positive"
+
+  - type: output
+    name: sink
+    input: validated
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true
