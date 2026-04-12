@@ -1,3 +1,48 @@
+//! # Kiln IDE — Clinker's Desktop Pipeline Editor
+//!
+//! Kiln is a Dioxus 0.7 desktop application for visually authoring, inspecting,
+//! and debugging Clinker ETL pipelines. It builds for both desktop (wry) and
+//! web targets from the same codebase with feature gates.
+//!
+//! ## Composition browser
+//!
+//! The workspace scanner discovers all `.comp.yaml` files (LD-16c-5) and
+//! presents them in the activity bar's composition browser. Click any
+//! composition to open it in the YAML editor or navigate to its canvas node.
+//!
+//! ## Composition drill-in and breadcrumb navigation
+//!
+//! Compositions render as collapsed nodes on the parent canvas (LD-16c-9).
+//! Clicking a composition node descends into a sub-canvas showing the
+//! composition body. A breadcrumb bar at the top tracks the navigation stack
+//! and allows jumping back to any ancestor level.
+//!
+//! ## Channel loading and Raw/Resolved toggle
+//!
+//! Load a `.channel.yaml` file to see how channel overlays affect the
+//! pipeline's configuration. The `ChannelViewMode` toggle (`Raw` vs
+//! `Resolved`) controls whether the canvas and inspector show raw config from
+//! the pipeline definition or resolved config with channel overlays applied.
+//! This toggle is independent of drill-in level — inspect resolved values at
+//! any nesting depth.
+//!
+//! ## Provenance panel
+//!
+//! The inspector's provenance panel shows the full override history for any
+//! config field. Each layer (CompositionDefault, ChannelDefault, ChannelFixed,
+//! InspectorEdit) is displayed with its source location, value, and whether it
+//! won or was shadowed. Use `clinker explain --field` for the CLI equivalent.
+//!
+//! ## Extract-as-composition
+//!
+//! Select multiple nodes on the canvas (Shift+click), then click "Extract as
+//! Composition" in the action bar. Kiln analyzes the selection boundary to
+//! derive input/output ports from crossing edges and proposes config parameters
+//! from literal constants. A confirmation modal lets you edit port names,
+//! include/exclude config candidates, and set the output path. On confirm,
+//! Kiln writes the `.comp.yaml` file and replaces the selection with a
+//! composition call site in the parent pipeline.
+
 // Hide the console window on Windows release builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

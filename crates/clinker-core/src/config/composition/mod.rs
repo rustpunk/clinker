@@ -1,12 +1,71 @@
-//! Composition type system and Phase 1 workspace loader (Phase 16c.1).
+//! # Composition Authoring Guide
 //!
-//! Task 16c.1.1 delivers the core type definitions:
-//! [`CompositionSignature`], [`PortDecl`], [`OutputAlias`], [`ParamDecl`],
-//! [`ParamType`], [`ResourceDecl`], [`ResourceKind`], plus the
-//! [`CompositionSymbolTable`] alias and the [`SourceMap`] span index.
+//! Compositions are reusable sub-plans that encapsulate a set of pipeline nodes
+//! behind a typed contract. They are the primary mechanism for packaging common
+//! patterns (customer enrichment, address normalization, DLQ shaping) as
+//! first-class reusable units.
 //!
-//! Serde-saphyr deserialization lands in 16c.1.2; [`scan_workspace_signatures`]
-//! in 16c.1.3; [`OpenTailSchema`] in 16c.1.4.
+//! ## When to use a composition
+//!
+//! Use a composition when the same subgraph appears in multiple pipelines or
+//! when you want to test a subgraph in isolation. A plain pipeline is simpler
+//! when the logic is unique to a single data flow.
+//!
+//! ## The `_compose:` header
+//!
+//! Every `.comp.yaml` file starts with a `_compose:` block declaring:
+//!
+//! - **`inputs:`** — named input ports with minimum-required schemas. Upstream
+//!   rows must carry at least the declared columns, but may carry extras
+//!   (pass-through).
+//! - **`outputs:`** — named output ports that alias internal node references.
+//!   Use the `ref:` long-form or the `port: node.channel` shorthand.
+//! - **`config_schema:`** — declared configuration parameters with `type`,
+//!   `required`, `default`, `enum`, and `range` constraints.
+//! - **`resources_schema:`** — declared resource slots (separate axis from
+//!   config per LD-16c-1).
+//!
+//! ## Port naming conventions
+//!
+//! Port names are role-based, not positional (LD-16c-7). Each input and output
+//! port is a single stream (1:1). Fan-in is modeled via an internal `Merge`
+//! node; fan-out via an internal `Route` node with multiple named outputs.
+//!
+//! ## IsolatedFromAbove sealing
+//!
+//! Composition bodies are sealed from the enclosing scope. Nodes inside the
+//! body cannot reference names from the caller's pipeline — all data must
+//! flow through declared input ports. This guarantee (modeled after MLIR's
+//! region isolation) makes compositions safe to extract, inline, or rearrange
+//! without ambient scope leaking through. Violations produce error E108.
+//!
+//! ## Pass-through columns
+//!
+//! Per LD-16c-2, upstream rows may carry additional columns beyond the declared
+//! port schema. These extras pass through the composition on the same row. On
+//! name collision between a pass-through column and a body-created column, the
+//! body wins (warning W101). If the composition should narrow its output, add
+//! an explicit projection node inside the body.
+//!
+//! ## File placement and `use:` paths
+//!
+//! `.comp.yaml` files may be placed anywhere in the workspace (LD-16c-5). No
+//! `compositions/` directory is required. Call sites reference compositions via
+//! workspace-relative `use:` paths. The Phase 1 scanner discovers all
+//! `.comp.yaml` files up to a budget of 50 per workspace.
+//!
+//! ---
+//!
+//! ## Module contents
+//!
+//! Core type definitions: [`CompositionSignature`], [`PortDecl`],
+//! [`OutputAlias`], [`ParamDecl`], [`ParamType`], [`ResourceDecl`],
+//! [`ResourceKind`], [`CompositionSymbolTable`], [`SourceMap`].
+//!
+//! Workspace scanner: [`scan_workspace_signatures`].
+//!
+//! Provenance tracking: [`ResolvedValue`], [`ProvenanceLayer`],
+//! [`LayerKind`], [`ProvenanceDb`].
 
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan, Severity};
