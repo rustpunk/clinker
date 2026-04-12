@@ -20,7 +20,7 @@ mod provenance;
 mod raw;
 mod resource;
 
-pub use provenance::{LayerKind, ProvenanceLayer, ResolvedValue};
+pub use provenance::{LayerKind, ProvenanceDb, ProvenanceLayer, ResolvedValue};
 pub use resource::Resource;
 
 #[cfg(test)]

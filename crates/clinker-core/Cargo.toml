@@ -75,3 +75,7 @@ harness = false
 name = "parallel"
 harness = false
 
+[[bench]]
+name = "provenance"
+harness = false
+

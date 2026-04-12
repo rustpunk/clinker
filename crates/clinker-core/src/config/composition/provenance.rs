@@ -6,7 +6,12 @@
 //! chain is stored in a side-table [`ProvenanceDb`], separate from
 //! [`CompiledPlan`](crate::plan::compiled::CompiledPlan).
 
+use std::collections::HashMap;
+
 use crate::span::Span;
+
+// D-H.5 / LD-16c-11: ProvenanceLayer must fit in 64 bytes.
+const _: () = assert!(std::mem::size_of::<ProvenanceLayer>() <= 64);
 
 /// Which configuration layer contributed a value.
 ///
@@ -117,5 +122,56 @@ impl<T> ResolvedValue<T> {
         if new_layer_wins {
             self.value = value;
         }
+    }
+}
+
+/// Side-table mapping `(node_name, param_name)` to provenance-tracked config values.
+///
+/// Kept separate from [`CompileArtifacts`](crate::plan::bind_schema::CompileArtifacts)
+/// to avoid polluting the hot typecheck path. Only populated for
+/// `PipelineNode::Composition` nodes that have config params.
+///
+/// Part of the `CompileOutput { plan, provenance }` separation per D-H.5 / LD-16c-11.
+#[derive(Debug, Default, Clone)]
+pub struct ProvenanceDb {
+    entries: HashMap<(String, String), ResolvedValue<serde_json::Value>>,
+}
+
+impl ProvenanceDb {
+    /// Insert a provenance entry for `(node_name, param_name)`.
+    pub fn insert(
+        &mut self,
+        node_name: String,
+        param_name: String,
+        resolved: ResolvedValue<serde_json::Value>,
+    ) {
+        self.entries.insert((node_name, param_name), resolved);
+    }
+
+    /// Look up provenance for a specific `(node_name, param_name)`.
+    pub fn get(
+        &self,
+        node_name: &str,
+        param_name: &str,
+    ) -> Option<&ResolvedValue<serde_json::Value>> {
+        self.entries
+            .get(&(node_name.to_owned(), param_name.to_owned()))
+    }
+
+    /// Iterate over all provenance entries.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&(String, String), &ResolvedValue<serde_json::Value>)> {
+        self.entries.iter()
+    }
+
+    /// Number of tracked entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the provenance table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }

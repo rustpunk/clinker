@@ -11,6 +11,7 @@ use cxl::typecheck::Row;
 use super::bind_schema::CompileArtifacts;
 use super::execution::ExecutionPlanDag;
 use crate::config::PipelineConfig;
+use crate::config::composition::ProvenanceDb;
 
 #[derive(Debug)]
 pub struct CompiledPlan {
@@ -54,5 +55,12 @@ impl CompiledPlan {
     /// (e.g. compositions whose binding failed).
     pub fn schema_for_node_name(&self, name: &str) -> Option<&Row> {
         self.artifacts.bound_schemas.output_of(name)
+    }
+
+    /// Side-table of provenance-tracked config values for composition nodes.
+    /// Populated during `bind_schema`; consumed by the Kiln inspector and
+    /// channel overlay (16c.4).
+    pub fn provenance(&self) -> &ProvenanceDb {
+        &self.artifacts.provenance
     }
 }

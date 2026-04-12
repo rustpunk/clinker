@@ -6,8 +6,8 @@ pub mod pipeline_node;
 pub use compile_context::CompileContext;
 pub use composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, NodeRef, OutputAlias,
-    ParamDecl, ParamName, ParamType, PortDecl, PortName, ProvenanceLayer, ResolvedValue, Resource,
-    ResourceDecl, ResourceKind, ResourceName, SourceMap, SpannedNodeRef,
+    ParamDecl, ParamName, ParamType, PortDecl, PortName, ProvenanceDb, ProvenanceLayer,
+    ResolvedValue, Resource, ResourceDecl, ResourceKind, ResourceName, SourceMap, SpannedNodeRef,
     WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures, validate_signatures,
 };
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};

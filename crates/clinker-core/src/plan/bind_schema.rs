@@ -26,7 +26,8 @@ use indexmap::IndexMap;
 
 use crate::config::compile_context::CompileContext;
 use crate::config::composition::{
-    CompositionFile, CompositionSignature, CompositionSymbolTable, OutputAlias, PortDecl,
+    CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, OutputAlias,
+    PortDecl, ProvenanceDb, ResolvedValue,
 };
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
@@ -60,6 +61,9 @@ pub struct CompileArtifacts {
     pub composition_body_assignments: HashMap<String, CompositionBodyId>,
     /// Monotonic counter for allocating fresh `FileId`s for body re-parses.
     next_file_id: u32,
+    /// Side-table of provenance-tracked config values (D-H.5 / LD-16c-11).
+    /// Populated by `bind_composition` for each composition node's config params.
+    pub provenance: ProvenanceDb,
 }
 
 impl CompileArtifacts {
@@ -400,6 +404,15 @@ fn bind_composition(
         return;
     }
 
+    // 5b. Populate provenance entries for each resolved config param.
+    populate_config_provenance(
+        call_config,
+        signature,
+        node_name,
+        span,
+        &mut artifacts.provenance,
+    );
+
     // 6. Build input port rows: validate upstream satisfies port schema,
     //    build Row::open(declared, fresh_tail) for each port.
     let input_port_rows = match build_input_port_rows(
@@ -639,6 +652,49 @@ fn validate_resources(
     _diags: &mut Vec<Diagnostic>,
 ) -> bool {
     true
+}
+
+/// Populate [`ProvenanceDb`] entries for each resolved config param.
+///
+/// For each param in the signature's `config_schema`, the resolved value is:
+/// - The call-site override if present, or
+/// - The signature's default if present.
+///
+/// All values at this stage are tagged as [`LayerKind::CompositionDefault`]
+/// since channel-level resolution does not exist until 16c.4.
+fn populate_config_provenance(
+    call_site: &IndexMap<String, serde_json::Value>,
+    signature: &CompositionSignature,
+    node_name: &str,
+    span: Span,
+    provenance: &mut ProvenanceDb,
+) {
+    for (param_name, param_decl) in &signature.config_schema {
+        let resolved_value = if let Some(call_value) = call_site.get(param_name) {
+            // Call-site override: use the call-site span (the composition node's span).
+            call_value.clone()
+        } else if let Some(default_value) = &param_decl.default {
+            // Signature default: use the param declaration's span.
+            default_value.clone()
+        } else {
+            // No value available (required param without default — should
+            // have been caught by validate_config, but guard defensively).
+            continue;
+        };
+
+        // Use param_decl.span for defaults, node span for call-site overrides.
+        let value_span = if call_site.contains_key(param_name) {
+            span
+        } else {
+            param_decl.span
+        };
+
+        provenance.insert(
+            node_name.to_owned(),
+            param_name.clone(),
+            ResolvedValue::new(resolved_value, LayerKind::CompositionDefault, value_span),
+        );
+    }
 }
 
 // ─── Input port row building ────────────────────────────────────────
