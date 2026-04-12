@@ -122,13 +122,13 @@ html:not(.js) .page-wrapper,
 
 /* ── Bold/strong: subtle color lift over body text ── */
 
-.enamel strong,
-.enamel b {
+.enamel main strong,
+.enamel main b {
     color: #1A2028;
 }
 
-.blueprint strong,
-.blueprint b {
+.blueprint main strong,
+.blueprint main b {
     color: #B0DAD6;
 }
 

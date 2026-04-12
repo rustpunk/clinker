@@ -12,6 +12,7 @@ members = [
     "crates/clinker-schema",
     "crates/clinker-git",
     "crates/clinker-bench-support",
+    "crates/clinker-benchmarks",
 ]
 
 [workspace.package]

@@ -755,10 +755,25 @@ dependencies = [
  "chrono",
  "clinker-record",
  "fastrand",
+ "glob",
  "quick-xml 0.37.5",
  "serde",
  "serde_json",
  "serial_test",
+ "tempfile",
+]
+
+[[package]]
+name = "clinker-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clinker-bench-support",
+ "clinker-core",
+ "criterion",
+ "indexmap",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

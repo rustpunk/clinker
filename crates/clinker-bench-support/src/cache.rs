@@ -161,12 +161,17 @@ impl BenchDataCache {
         // Generate data
         let data = self.generate_data(spec);
 
-        // Atomic write: temp file then rename (D-3)
+        // Atomic write: temp file then rename (D-3).
+        // Use PID + thread ID to avoid collisions when parallel test threads
+        // generate the same cache entry concurrently.
         let pid = std::process::id();
-        let tmp_data = self.root.join(format!("{}.tmp.{pid}", spec.file_name()));
+        let tid = format!("{:?}", std::thread::current().id());
+        let tmp_data = self
+            .root
+            .join(format!("{}.tmp.{pid}.{tid}", spec.file_name()));
         let tmp_meta = self
             .root
-            .join(format!("{}.meta.json.tmp.{pid}", spec.file_name()));
+            .join(format!("{}.meta.json.tmp.{pid}.{tid}", spec.file_name()));
 
         fs::write(&tmp_data, &data).expect("failed to write bench data");
         let meta = CacheMeta {
@@ -176,8 +181,13 @@ impl BenchDataCache {
         fs::write(&tmp_meta, serde_json::to_string_pretty(&meta).unwrap())
             .expect("failed to write meta");
 
-        fs::rename(&tmp_data, &data_path).expect("failed to rename data file");
-        fs::rename(&tmp_meta, &meta_path).expect("failed to rename meta file");
+        // Rename to final path. If another thread already placed the file,
+        // that's fine — deterministic content means last-writer-wins is correct (D-3).
+        let _ = fs::rename(&tmp_data, &data_path);
+        let _ = fs::rename(&tmp_meta, &meta_path);
+        // Clean up temp files in case rename failed (another thread won)
+        let _ = fs::remove_file(&tmp_data);
+        let _ = fs::remove_file(&tmp_meta);
 
         data_path
     }
