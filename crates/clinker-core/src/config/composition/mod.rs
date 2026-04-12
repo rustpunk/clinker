@@ -16,7 +16,9 @@ use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod provenance;
 mod raw;
+mod resource;
 
 #[cfg(test)]
 mod tests;
