@@ -8,7 +8,12 @@ pub enum ChannelError {
     #[error("YAML parse error in {path}: {source}")]
     Yaml {
         path: PathBuf,
-        source: serde_saphyr::Error,
+        source: Box<serde_saphyr::Error>,
+    },
+    #[error("invalid UTF-8 in {path}: {source}")]
+    Utf8 {
+        path: PathBuf,
+        source: std::str::Utf8Error,
     },
     #[error("invalid dotted path `{path}`: {reason}")]
     InvalidDottedPath { path: String, reason: String },
