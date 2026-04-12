@@ -24,6 +24,10 @@ pub struct CompileContext {
     /// stages that need filesystem-relative resolution. Production callers
     /// MUST resolve this once at the entry point.
     pub workspace_root: PathBuf,
+    /// Workspace-relative directory of the pipeline file being compiled.
+    /// Used to resolve relative `use:` paths on `PipelineNode::Composition`
+    /// nodes. Empty path means "workspace root" (pipeline file at root).
+    pub pipeline_dir: PathBuf,
 }
 
 impl CompileContext {
@@ -33,6 +37,18 @@ impl CompileContext {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            pipeline_dir: PathBuf::new(),
+        }
+    }
+
+    /// Build a context with both workspace root and pipeline directory.
+    pub fn with_pipeline_dir(
+        workspace_root: impl Into<PathBuf>,
+        pipeline_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            pipeline_dir: pipeline_dir.into(),
         }
     }
 
@@ -48,6 +64,7 @@ impl Default for CompileContext {
     fn default() -> Self {
         Self {
             workspace_root: std::env::current_dir().unwrap_or_default(),
+            pipeline_dir: PathBuf::new(),
         }
     }
 }

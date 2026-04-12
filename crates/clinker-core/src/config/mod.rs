@@ -1264,11 +1264,9 @@ impl PipelineConfig {
             .nodes
             .iter()
             .any(|n| matches!(&n.value, PipelineNode::Composition { .. }));
-        if has_compositions {
+        let symbol_table: crate::config::composition::CompositionSymbolTable = if has_compositions {
             match scan_workspace_signatures(ctx.workspace_root()) {
-                Ok(_symbol_table) => {
-                    // Table is discarded until 16c.2 consumes it.
-                }
+                Ok(table) => std::sync::Arc::try_unwrap(table).unwrap_or_else(|arc| (*arc).clone()),
                 Err(mut scan_diags) => {
                     diags.append(&mut scan_diags);
                     let has_errors = diags
@@ -1277,9 +1275,12 @@ impl PipelineConfig {
                     if has_errors {
                         return Err(diags);
                     }
+                    indexmap::IndexMap::new()
                 }
             }
-        }
+        } else {
+            indexmap::IndexMap::new()
+        };
 
         // Stage 4.5: Phase 16b Task 16b.9 — compile-time CXL typecheck.
         // Walks `self.nodes` in declaration order (topologically sound
@@ -1287,11 +1288,24 @@ impl PipelineConfig {
         // author-declared `schema:` block, and typechecks every
         // CXL-bearing node against the propagated upstream schema.
         // E200 diagnostics surface here with per-node spans.
-        let artifacts = crate::plan::bind_schema::bind_schema(&self.nodes, &mut diags);
-        let has_errors = diags
-            .iter()
-            .any(|d| matches!(d.severity, crate::error::Severity::Error));
-        if has_errors {
+        // Phase 16c.2: also recurses into composition bodies via
+        // bind_composition, populating CompileArtifacts.composition_bodies.
+        let artifacts = crate::plan::bind_schema::bind_schema(
+            &self.nodes,
+            &mut diags,
+            ctx,
+            &symbol_table,
+            &ctx.pipeline_dir,
+        );
+        // Only abort on non-composition CXL errors (E200/E201). Composition
+        // binding errors (E102–E109) are non-fatal for the rest of the
+        // pipeline — the composition node just won't get a body. Stage 5
+        // handles unbound compositions via the E100 stub.
+        let has_cxl_errors = diags.iter().any(|d| {
+            matches!(d.severity, crate::error::Severity::Error)
+                && (d.code == "E200" || d.code == "E201")
+        });
+        if has_cxl_errors {
             return Err(diags);
         }
 
