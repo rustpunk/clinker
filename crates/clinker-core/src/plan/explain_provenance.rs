@@ -290,4 +290,29 @@ mod tests {
     fn test_explain_code_unknown() {
         assert!(explain_code("E999").is_none());
     }
+
+    #[test]
+    fn test_explain_docs_all_have_required_sections() {
+        let codes = [
+            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "W101",
+        ];
+        let required_sections = [
+            "## What it means",
+            "## Example",
+            "## How to fix",
+            "## Technical context",
+            "## See also",
+        ];
+
+        for code in &codes {
+            let doc =
+                explain_code(code).unwrap_or_else(|| panic!("explain_code({code}) returned None"));
+            for section in &required_sections {
+                assert!(
+                    doc.contains(section),
+                    "doc {code} is missing required section: {section}"
+                );
+            }
+        }
+    }
 }
