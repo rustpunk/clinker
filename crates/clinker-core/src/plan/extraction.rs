@@ -5,11 +5,14 @@
 //! to serialize the result as a `.comp.yaml` file.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use indexmap::IndexMap;
 use petgraph::Direction;
 use petgraph::visit::EdgeRef;
+use serde::Serialize;
 
+use crate::config::PipelineConfig;
 use crate::plan::execution::{DependencyType, ExecutionPlanDag, PlanNode};
 
 /// A port detected at the extraction boundary.
@@ -189,6 +192,208 @@ pub fn analyze_extraction_boundary(
         config_candidates,
         warnings,
     })
+}
+
+// =========================================================================
+// Composition writer (Task 16c.6.3)
+// =========================================================================
+
+/// Error from writing an extracted composition.
+#[derive(Debug)]
+pub enum ExtractionWriteError {
+    /// Output path already exists and force=false.
+    OutputExists(String),
+    /// No nodes matched the internal_nodes list in the pipeline config.
+    NoMatchingNodes(String),
+    /// YAML serialization failed.
+    Serialization(String),
+    /// IO error writing the file.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ExtractionWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractionWriteError::OutputExists(p) => {
+                write!(
+                    f,
+                    "output path '{p}' already exists (use force=true to overwrite)"
+                )
+            }
+            ExtractionWriteError::NoMatchingNodes(msg) => write!(f, "{msg}"),
+            ExtractionWriteError::Serialization(msg) => write!(f, "YAML serialization: {msg}"),
+            ExtractionWriteError::Io(e) => write!(f, "IO error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ExtractionWriteError {}
+
+/// Serializable port declaration for the `_compose.inputs` block.
+#[derive(Debug, Serialize)]
+struct SerializablePortDecl {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// Serializable output alias for the `_compose.outputs` block.
+#[derive(Debug, Serialize)]
+struct SerializableOutputAlias {
+    /// Internal node reference (e.g. "transform_name.out").
+    #[serde(rename = "ref")]
+    internal_ref: String,
+}
+
+/// Serializable config param declaration for `_compose.config_schema`.
+#[derive(Debug, Serialize)]
+struct SerializableParamDecl {
+    #[serde(rename = "type")]
+    param_type: String,
+    required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<serde_json::Value>,
+}
+
+/// Top-level serializable composition file wrapper.
+#[derive(Debug, Serialize)]
+struct SerializableCompositionFile {
+    #[serde(rename = "_compose")]
+    compose: SerializableSignature,
+    nodes: Vec<serde_json::Value>,
+}
+
+/// Serializable signature block.
+#[derive(Debug, Serialize)]
+struct SerializableSignature {
+    name: String,
+    inputs: IndexMap<String, SerializablePortDecl>,
+    outputs: IndexMap<String, SerializableOutputAlias>,
+    config_schema: IndexMap<String, SerializableParamDecl>,
+}
+
+/// Write an extracted composition to a `.comp.yaml` file.
+///
+/// Builds a composition file from the boundary analysis result and the
+/// original pipeline config. Returns the call-site YAML snippet string
+/// to replace the selected nodes in the parent pipeline.
+pub fn write_extracted_composition(
+    boundary: &ExtractionBoundary,
+    config: &PipelineConfig,
+    name: &str,
+    output_path: &Path,
+    force: bool,
+) -> Result<String, ExtractionWriteError> {
+    // Check output path existence.
+    if output_path.exists() && !force {
+        return Err(ExtractionWriteError::OutputExists(
+            output_path.display().to_string(),
+        ));
+    }
+
+    // Extract matching PipelineNode entries from the config.
+    let internal_set: HashSet<&str> = boundary.internal_nodes.iter().map(|s| s.as_str()).collect();
+    let selected_nodes: Vec<serde_json::Value> = config
+        .nodes
+        .iter()
+        .filter(|spanned| internal_set.contains(spanned.value.name()))
+        .filter_map(|spanned| serde_json::to_value(&spanned.value).ok())
+        .collect();
+
+    if selected_nodes.is_empty() {
+        return Err(ExtractionWriteError::NoMatchingNodes(format!(
+            "no pipeline nodes matched the internal node names: {:?}",
+            boundary.internal_nodes
+        )));
+    }
+
+    // Build signature from boundary analysis.
+    let mut inputs = IndexMap::new();
+    for (port_name, _port) in &boundary.input_ports {
+        inputs.insert(
+            port_name.clone(),
+            SerializablePortDecl { description: None },
+        );
+    }
+
+    let mut outputs = IndexMap::new();
+    for (port_name, port) in &boundary.output_ports {
+        outputs.insert(
+            port_name.clone(),
+            SerializableOutputAlias {
+                internal_ref: format!("{}.out", port.internal_node),
+            },
+        );
+    }
+
+    let mut config_schema = IndexMap::new();
+    for candidate in &boundary.config_candidates {
+        let param_type = infer_json_type(&candidate.value);
+        config_schema.insert(
+            candidate.param_name.clone(),
+            SerializableParamDecl {
+                param_type,
+                required: false,
+                default: Some(candidate.value.clone()),
+            },
+        );
+    }
+
+    let comp_file = SerializableCompositionFile {
+        compose: SerializableSignature {
+            name: name.to_owned(),
+            inputs,
+            outputs,
+            config_schema,
+        },
+        nodes: selected_nodes,
+    };
+
+    // Serialize to YAML.
+    let yaml_content =
+        crate::yaml::to_string(&comp_file).map_err(ExtractionWriteError::Serialization)?;
+
+    // Write to output path.
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(ExtractionWriteError::Io)?;
+    }
+    std::fs::write(output_path, &yaml_content).map_err(ExtractionWriteError::Io)?;
+
+    // Build call-site snippet as a YAML mapping (without the `- ` list prefix,
+    // so it can be parsed standalone). The caller wraps it in a list item
+    // when inserting into the pipeline YAML.
+    let mut snippet = String::new();
+    snippet.push_str("type: composition\n");
+    snippet.push_str(&format!("name: {name}\n"));
+    snippet.push_str(&format!("use: {}\n", output_path.display()));
+    if !boundary.input_ports.is_empty() {
+        snippet.push_str("inputs:\n");
+        for (port_name, port) in &boundary.input_ports {
+            snippet.push_str(&format!("  {port_name}: {}\n", port.external_node));
+        }
+    }
+    if !boundary.config_candidates.is_empty() {
+        snippet.push_str("config:\n");
+        for candidate in &boundary.config_candidates {
+            let value_str = match &candidate.value {
+                serde_json::Value::String(s) => format!("\"{s}\""),
+                other => other.to_string(),
+            };
+            snippet.push_str(&format!("  {}: {value_str}\n", candidate.param_name));
+        }
+    }
+
+    Ok(snippet)
+}
+
+/// Infer a YAML config_schema type string from a JSON value.
+fn infer_json_type(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Bool(_) => "bool".to_owned(),
+        serde_json::Value::Number(n) if n.is_f64() => "float".to_owned(),
+        serde_json::Value::Number(_) => "int".to_owned(),
+        serde_json::Value::String(_) => "string".to_owned(),
+        _ => "string".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -400,5 +605,149 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "E110");
         assert!(errors[0].message.contains("nonexistent"));
+    }
+
+    // ---- Writer tests (Task 16c.6.3) ----
+
+    /// Helper: build a PipelineConfig from a YAML fixture path.
+    fn load_fixture_config(fixture_name: &str) -> PipelineConfig {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let yaml_path = root.join(fixture_name);
+        let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
+        crate::yaml::from_str(&yaml).expect("parse fixture")
+    }
+
+    #[test]
+    fn test_write_extracted_composition_produces_valid_comp_yaml() {
+        let config = load_fixture_config("pipelines/composition_pipeline.yaml");
+        let tmp_dir = std::env::temp_dir().join("clinker_extract_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let output_path = tmp_dir.join("test_extracted.comp.yaml");
+        let _ = std::fs::remove_file(&output_path);
+
+        // Build a boundary manually for the test.
+        let boundary = ExtractionBoundary {
+            input_ports: {
+                let mut m = IndexMap::new();
+                m.insert(
+                    "in_customers_src".to_owned(),
+                    ExtractedPort {
+                        name: "in_customers_src".to_owned(),
+                        external_node: "customers_src".to_owned(),
+                        internal_node: "enrich1".to_owned(),
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+                m
+            },
+            output_ports: {
+                let mut m = IndexMap::new();
+                m.insert(
+                    "out_enrich1".to_owned(),
+                    ExtractedPort {
+                        name: "out_enrich1".to_owned(),
+                        external_node: "enriched_out".to_owned(),
+                        internal_node: "enrich1".to_owned(),
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+                m
+            },
+            internal_nodes: vec!["enrich1".to_owned()],
+            config_candidates: vec![],
+            warnings: vec![],
+        };
+
+        let snippet =
+            write_extracted_composition(&boundary, &config, "test_comp", &output_path, false)
+                .expect("write should succeed");
+
+        // The output file must exist and be valid YAML.
+        assert!(output_path.exists(), "output file must exist");
+        let written = std::fs::read_to_string(&output_path).expect("read output");
+        assert!(!written.is_empty(), "output must not be empty");
+
+        // Must deserialize as valid YAML (not as CompositionFile — that
+        // requires _compose parsing, but the YAML itself must be well-formed).
+        let parsed: serde_json::Value =
+            crate::yaml::from_str(&written).expect("output must be valid YAML");
+        assert!(parsed.get("_compose").is_some(), "must have _compose block");
+        assert!(parsed.get("nodes").is_some(), "must have nodes block");
+
+        // Clean up.
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+
+        // snippet must not be empty
+        assert!(!snippet.is_empty());
+    }
+
+    #[test]
+    fn test_write_extracted_composition_callsite_snippet_is_valid_yaml() {
+        let config = load_fixture_config("pipelines/composition_pipeline.yaml");
+        let tmp_dir = std::env::temp_dir().join("clinker_extract_test2");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let output_path = tmp_dir.join("test_extracted2.comp.yaml");
+        let _ = std::fs::remove_file(&output_path);
+
+        let boundary = ExtractionBoundary {
+            input_ports: {
+                let mut m = IndexMap::new();
+                m.insert(
+                    "in_customers_src".to_owned(),
+                    ExtractedPort {
+                        name: "in_customers_src".to_owned(),
+                        external_node: "customers_src".to_owned(),
+                        internal_node: "enrich1".to_owned(),
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+                m
+            },
+            output_ports: IndexMap::new(),
+            internal_nodes: vec!["enrich1".to_owned()],
+            config_candidates: vec![ConfigCandidate {
+                node_name: "enrich1".to_owned(),
+                param_name: "threshold".to_owned(),
+                value: serde_json::json!(0.85),
+            }],
+            warnings: vec![],
+        };
+
+        let snippet =
+            write_extracted_composition(&boundary, &config, "my_comp", &output_path, false)
+                .expect("write should succeed");
+
+        // The snippet must be valid YAML.
+        let parsed: serde_json::Value =
+            crate::yaml::from_str(&snippet).expect("snippet must be valid YAML");
+
+        // Must have the composition type.
+        assert_eq!(
+            parsed.get("type").and_then(|v| v.as_str()),
+            Some("composition"),
+            "snippet must have type: composition"
+        );
+
+        // Must have the name.
+        assert_eq!(
+            parsed.get("name").and_then(|v| v.as_str()),
+            Some("my_comp"),
+            "snippet must have name: my_comp"
+        );
+
+        // Must have inputs block.
+        assert!(parsed.get("inputs").is_some(), "snippet must have inputs");
+
+        // Must have config block with threshold.
+        let config_block = parsed.get("config").expect("snippet must have config");
+        assert!(
+            config_block.get("threshold").is_some(),
+            "snippet config must have threshold"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
     }
 }
