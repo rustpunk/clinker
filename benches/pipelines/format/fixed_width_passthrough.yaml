@@ -1,0 +1,47 @@
+pipeline:
+  name: bench-fixed-width-passthrough
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: fixed_width
+      path: bench://input.dat
+      format_schema:
+        fields:
+          - name: f0
+            type: integer
+            start: 0
+            width: 10
+          - name: f1
+            type: string
+            start: 10
+            width: 10
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: passthrough
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+
+  - type: output
+    name: sink
+    input: passthrough
+    config:
+      name: sink
+      type: fixed_width
+      path: bench://output.dat
+      schema:
+        fields:
+          - name: f0
+            type: integer
+            width: 10
+          - name: f1
+            type: string
+            width: 10
+      include_unmapped: true

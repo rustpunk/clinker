@@ -1,0 +1,33 @@
+pipeline:
+  name: bench-csv-to-json
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: passthrough
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+
+  - type: output
+    name: sink
+    input: passthrough
+    config:
+      name: sink
+      type: json
+      path: bench://output.json
+      options:
+        format: ndjson
+      include_unmapped: true
