@@ -14,6 +14,7 @@ pub mod tab_bar;
 pub mod template_gallery;
 pub mod title_bar;
 pub mod toast;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod version_mode;
 pub mod welcome_screen;
 pub mod yaml_sidebar;

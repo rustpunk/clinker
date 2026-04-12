@@ -16,6 +16,7 @@ pub fn compute_hash(yaml: &str) -> [u8; 32] {
 /// Show a native "Open File" dialog filtered to YAML files.
 ///
 /// Returns `None` if the user cancels.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn open_file_dialog(starting_dir: Option<&Path>) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new()
         .add_filter("Pipeline YAML", &["yaml", "yml"])
@@ -28,9 +29,16 @@ pub fn open_file_dialog(starting_dir: Option<&Path>) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
+/// Stub for web builds — no native file picker available.
+#[cfg(target_arch = "wasm32")]
+pub fn open_file_dialog(_starting_dir: Option<&Path>) -> Option<PathBuf> {
+    None
+}
+
 /// Show a native "Save As" dialog filtered to YAML files.
 ///
 /// Returns `None` if the user cancels.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn save_file_dialog(suggested_name: &str, starting_dir: Option<&Path>) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new()
         .add_filter("Pipeline YAML", &["yaml", "yml"])
@@ -42,6 +50,12 @@ pub fn save_file_dialog(suggested_name: &str, starting_dir: Option<&Path>) -> Op
     }
 
     dialog.save_file()
+}
+
+/// Stub for web builds — no native file picker available.
+#[cfg(target_arch = "wasm32")]
+pub fn save_file_dialog(_suggested_name: &str, _starting_dir: Option<&Path>) -> Option<PathBuf> {
+    None
 }
 
 /// Read a pipeline YAML file from disk.

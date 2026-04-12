@@ -37,6 +37,7 @@ pub fn ToastOverlay() -> Element {
     let current = (toast)();
 
     // Auto-dismiss timer: spawn a task whenever a toast appears
+    #[cfg(not(target_arch = "wasm32"))]
     use_effect(move || {
         let state = (toast)();
         if let Some(ref t) = state {

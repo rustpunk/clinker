@@ -40,7 +40,7 @@ ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 static_assertions = "1"
-dioxus = { version = "=0.7.4", features = ["desktop"] }
+dioxus = { version = "=0.7.4" }
 rfd = "0.15"
 blake3 = "1"
 uuid = { version = "1", features = ["v4"] }

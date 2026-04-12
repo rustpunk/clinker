@@ -1,7 +1,5 @@
 use dioxus::prelude::*;
 
-use clinker_git::{BlameLine, GitOps};
-
 use crate::state::{TabManagerState, use_app_state};
 use crate::sync::EditSource;
 
@@ -19,15 +17,10 @@ use super::tokenizer::tokenize;
 #[component]
 pub fn YamlSidebar() -> Element {
     let state = use_app_state();
-    let tab_mgr = use_context::<TabManagerState>();
     let raw_text = (state.yaml_text)();
     let errors = (state.parse_errors)();
     let raw_lines = tokenize(&raw_text);
     let raw_line_count = raw_lines.len().max(1);
-    let mut blame_visible = use_signal(|| false);
-    let mut blame_data = use_signal(Vec::<BlameLine>::new);
-
-    let show_blame = (blame_visible)();
 
     // Compute selected stage's YAML line range for highlighting.
     let selected_range: Option<(usize, usize)> = {
@@ -48,6 +41,10 @@ pub fn YamlSidebar() -> Element {
     let (text, lines, line_count, is_editable) =
         (raw_text.clone(), raw_lines, raw_line_count, true);
 
+    // Blame visibility state — provided as context for blame sub-components.
+    let blame_visible = use_signal(|| false);
+    use_context_provider(|| blame_visible);
+
     let section_title = "PIPELINE YAML";
 
     rsx! {
@@ -61,79 +58,14 @@ pub fn YamlSidebar() -> Element {
                 span { class: "kiln-section-title", "{section_title}" }
                 span { class: "kiln-section-rule" }
 
-                // Blame toggle button (only when git repo detected)
-                if (tab_mgr.git_state)().is_some() {
-                    button {
-                        class: if show_blame {
-                            "kiln-blame-toggle kiln-blame-toggle--active"
-                        } else {
-                            "kiln-blame-toggle"
-                        },
-                        onclick: move |_| {
-                            let new_val = !show_blame;
-                            blame_visible.set(new_val);
-                            if new_val && (blame_data)().is_empty() {
-                                // Load blame data
-                                load_blame(&tab_mgr, &mut blame_data);
-                            }
-                        },
-                        "⑂ BLAME"
-                    }
-                }
+                BlameToggle {}
             }
 
             // Code area: blame gutter + line numbers + editor
             div {
                 class: "kiln-yaml-code-area",
 
-                // Blame gutter (toggleable, 130px)
-                if show_blame {
-                    div {
-                        class: "kiln-blame-gutter",
-                        for i in 0..line_count {
-                            {
-                                let bl = (blame_data)();
-                                let blame = bl.iter().find(|b| b.line == i + 1).cloned();
-                                let prev_blame = if i > 0 {
-                                    bl.iter().find(|b| b.line == i).cloned()
-                                } else {
-                                    None
-                                };
-                                let is_group_start = blame.as_ref().map(|b| {
-                                    prev_blame.as_ref().map(|pb| pb.commit_id != b.commit_id).unwrap_or(true)
-                                }).unwrap_or(false);
-
-                                if let Some(ref b) = blame {
-                                    let author = if b.author.len() > 8 { b.author[..8].to_string() } else { b.author.clone() };
-                                    let time = relative_time_short(b.timestamp);
-                                    let hash = b.commit_id.clone();
-
-                                    rsx! {
-                                        div {
-                                            key: "blame-{i}",
-                                            class: "kiln-blame-line",
-                                            if is_group_start {
-                                                span { class: "kiln-blame-author", "{author}" }
-                                                span { class: "kiln-blame-time", "{time}" }
-                                                span { class: "kiln-blame-hash", "{hash}" }
-                                            } else {
-                                                span { class: "kiln-blame-continuation", "│" }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    rsx! {
-                                        div {
-                                            key: "blame-{i}",
-                                            class: "kiln-blame-line",
-                                            span { class: "kiln-blame-uncommitted", "uncommitted" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                BlameGutter { line_count }
 
                 // Line-number gutter
                 div {
@@ -253,8 +185,123 @@ pub fn YamlSidebar() -> Element {
     }
 }
 
+// ── Blame components (desktop-only) ─────────────────────────────────────
+
+/// Blame toggle button — only rendered on desktop when git is available.
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+fn BlameToggle() -> Element {
+    let tab_mgr = use_context::<TabManagerState>();
+    let mut blame_visible = use_context::<Signal<bool>>();
+
+    // Initialize blame context if not already provided
+    let show_blame = (blame_visible)();
+
+    if (tab_mgr.git_state)().is_some() {
+        rsx! {
+            button {
+                class: if show_blame {
+                    "kiln-blame-toggle kiln-blame-toggle--active"
+                } else {
+                    "kiln-blame-toggle"
+                },
+                onclick: move |_| {
+                    blame_visible.set(!show_blame);
+                },
+                "⑂ BLAME"
+            }
+        }
+    } else {
+        rsx! {}
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn BlameToggle() -> Element {
+    rsx! {}
+}
+
+/// Blame gutter — desktop only, shows per-line git blame data.
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+fn BlameGutter(line_count: usize) -> Element {
+    use clinker_git::BlameLine;
+
+    let tab_mgr = use_context::<TabManagerState>();
+    let mut blame_data = use_signal(Vec::<BlameLine>::new);
+    let blame_visible = use_context::<Signal<bool>>();
+    let show_blame = (blame_visible)();
+
+    // Load blame data when toggled on
+    if show_blame && (blame_data)().is_empty() {
+        load_blame(&tab_mgr, &mut blame_data);
+    }
+
+    if !show_blame {
+        return rsx! {};
+    }
+
+    rsx! {
+        div {
+            class: "kiln-blame-gutter",
+            for i in 0..line_count {
+                {
+                    let bl = (blame_data)();
+                    let blame = bl.iter().find(|b| b.line == i + 1).cloned();
+                    let prev_blame = if i > 0 {
+                        bl.iter().find(|b| b.line == i).cloned()
+                    } else {
+                        None
+                    };
+                    let is_group_start = blame.as_ref().map(|b| {
+                        prev_blame.as_ref().map(|pb| pb.commit_id != b.commit_id).unwrap_or(true)
+                    }).unwrap_or(false);
+
+                    if let Some(ref b) = blame {
+                        let author = if b.author.len() > 8 { b.author[..8].to_string() } else { b.author.clone() };
+                        let time = relative_time_short(b.timestamp);
+                        let hash = b.commit_id.clone();
+
+                        rsx! {
+                            div {
+                                key: "blame-{i}",
+                                class: "kiln-blame-line",
+                                if is_group_start {
+                                    span { class: "kiln-blame-author", "{author}" }
+                                    span { class: "kiln-blame-time", "{time}" }
+                                    span { class: "kiln-blame-hash", "{hash}" }
+                                } else {
+                                    span { class: "kiln-blame-continuation", "│" }
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {
+                            div {
+                                key: "blame-{i}",
+                                class: "kiln-blame-line",
+                                span { class: "kiln-blame-uncommitted", "uncommitted" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn BlameGutter(line_count: usize) -> Element {
+    rsx! {}
+}
+
 /// Load blame data for the current file.
-fn load_blame(tab_mgr: &TabManagerState, blame_data: &mut Signal<Vec<BlameLine>>) {
+#[cfg(not(target_arch = "wasm32"))]
+fn load_blame(tab_mgr: &TabManagerState, blame_data: &mut Signal<Vec<clinker_git::BlameLine>>) {
+    use clinker_git::GitOps;
+
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
 
@@ -278,6 +325,7 @@ fn load_blame(tab_mgr: &TabManagerState, blame_data: &mut Signal<Vec<BlameLine>>
 }
 
 /// Short relative time for blame gutter (2h, 3d, 1w, 2mo).
+#[cfg(not(target_arch = "wasm32"))]
 fn relative_time_short(timestamp: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

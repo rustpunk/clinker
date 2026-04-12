@@ -9,6 +9,7 @@
 use cxl::typecheck::Row;
 
 use super::bind_schema::CompileArtifacts;
+use super::composition_body::{BoundBody, CompositionBodyId};
 use super::execution::ExecutionPlanDag;
 use crate::config::PipelineConfig;
 use crate::config::composition::ProvenanceDb;
@@ -50,7 +51,7 @@ impl CompiledPlan {
         &self.dag
     }
 
-    pub(crate) fn config(&self) -> &PipelineConfig {
+    pub fn config(&self) -> &PipelineConfig {
         &self.config
     }
 
@@ -58,8 +59,16 @@ impl CompiledPlan {
     /// CXL-bearing node (Transform/Aggregate/Route) keyed by node name.
     /// The runtime executor reads this map directly to pull each
     /// transform's `Arc<TypedProgram>` instead of re-typechecking.
-    pub(crate) fn artifacts(&self) -> &CompileArtifacts {
+    pub fn artifacts(&self) -> &CompileArtifacts {
         &self.artifacts
+    }
+
+    /// Look up a composition body by its ID.
+    ///
+    /// Returns the `BoundBody` containing the composition's expanded nodes,
+    /// bound schemas, and port rows. Used by Kiln for drill-in rendering.
+    pub fn body_of(&self, id: CompositionBodyId) -> Option<&BoundBody> {
+        self.artifacts.body_of(id)
     }
 
     /// Look up the bound output row type for a node by name.

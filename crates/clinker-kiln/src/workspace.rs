@@ -433,14 +433,44 @@ fn append_gitignore(dir: &Path) {
 
 // ── Channel discovery ──────────────────────────────────────────────────
 
-use crate::state::ChannelState;
+use crate::state::{ChannelBindingSummary, ChannelState};
 
-/// Discover channels from the workspace root.
+/// Discover channels by scanning the workspace for `.channel.yaml` files.
 ///
-/// TODO(16c.4.2): reconnect after ChannelBinding lands in clinker-channel.
-/// Legacy ChannelManifest-based discovery ripped in phase 16c.4.
-pub fn discover_channels(_ws: &Workspace) -> Option<ChannelState> {
-    None
+/// Uses `clinker_channel::scan_workspace_channels()` to find and parse
+/// all channel bindings. Returns None if no channels are found.
+pub fn discover_channels(ws: &Workspace) -> Option<ChannelState> {
+    let bindings = match clinker_channel::scan_workspace_channels(&ws.root) {
+        Ok(b) if b.is_empty() => return None,
+        Ok(b) => b,
+        Err(_diagnostics) => {
+            // Channel parse errors are non-fatal for discovery.
+            // The user will see diagnostics when they try to apply a channel.
+            return None;
+        }
+    };
+
+    let channels = bindings
+        .iter()
+        .map(|b| ChannelBindingSummary {
+            name: b.name.clone(),
+            source_path: b.source_path.clone(),
+            target: match &b.target {
+                clinker_channel::ChannelTarget::Pipeline(p) => {
+                    format!("pipeline: {}", p.display())
+                }
+                clinker_channel::ChannelTarget::Composition(p) => {
+                    format!("composition: {}", p.display())
+                }
+            },
+        })
+        .collect();
+
+    Some(ChannelState {
+        channels,
+        active_channel: None,
+        recent_channels: Vec::new(),
+    })
 }
 
 // ── Last workspace tracking (OS app data dir) ───────────────────────────
@@ -638,6 +668,7 @@ pub fn parse_navigation_state(state: &WorkspaceState) -> (NavigationContext, Pip
 }
 
 /// Show a native directory picker and try to open it as a workspace.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn open_workspace_dialog() -> Option<Workspace> {
     let dialog = rfd::FileDialog::new().set_title("Open Workspace");
 
@@ -651,6 +682,12 @@ pub fn open_workspace_dialog() -> Option<Workspace> {
         // (user might have picked the parent)
         None
     }
+}
+
+/// Stub for web builds — no native directory picker.
+#[cfg(target_arch = "wasm32")]
+pub fn open_workspace_dialog() -> Option<Workspace> {
+    None
 }
 
 // ── Session restore (single entry point for app startup) ────────────────

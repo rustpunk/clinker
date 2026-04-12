@@ -12,6 +12,7 @@
 
 use dioxus::prelude::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 use clinker_git::GitOps;
 
 use crate::components::activity_bar::switch_context;
@@ -24,6 +25,7 @@ pub fn StatusBar() -> Element {
     let mut tab_mgr = use_context::<TabManagerState>();
     let state = use_app_state();
     let current_ctx = (state.active_context)();
+    #[cfg(not(target_arch = "wasm32"))]
     let git = (tab_mgr.git_state)();
     let mut show_branch_switcher = use_signal(|| false);
     let is_switcher_open = (show_branch_switcher)();
@@ -50,56 +52,65 @@ pub fn StatusBar() -> Element {
             }
             div { class: "kiln-status-divider" }
 
-            // ── Git segments (shown in Pipeline + Git contexts) ─────────
-            if matches!(current_ctx, NavigationContext::Pipeline | NavigationContext::Git) {
-                if let Some(ref status) = git {
-                    // Branch segment (clickable → branch switcher)
-                    div {
-                        class: "kiln-status-segment kiln-status-segment--branch kiln-status-segment--clickable",
-                        onclick: move |_| show_branch_switcher.set(!is_switcher_open),
-                        span { class: "kiln-status__branch-icon", "⑂" }
-                        span { class: "kiln-status__branch-name",
-                            {
-                                if status.branch.len() > 20 {
-                                    format!("{}…", &status.branch[..19])
-                                } else {
-                                    status.branch.clone()
+            // ── Git segments (shown in Pipeline + Git contexts, desktop only) ──
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    rsx! {
+                        if matches!(current_ctx, NavigationContext::Pipeline | NavigationContext::Git) {
+                            if let Some(ref status) = git {
+                                // Branch segment (clickable → branch switcher)
+                                div {
+                                    class: "kiln-status-segment kiln-status-segment--branch kiln-status-segment--clickable",
+                                    onclick: move |_| show_branch_switcher.set(!is_switcher_open),
+                                    span { class: "kiln-status__branch-icon", "⑂" }
+                                    span { class: "kiln-status__branch-name",
+                                        {
+                                            if status.branch.len() > 20 {
+                                                format!("{}…", &status.branch[..19])
+                                            } else {
+                                                status.branch.clone()
+                                            }
+                                        }
+                                    }
+                                    if status.ahead > 0 {
+                                        span { class: "kiln-status__ahead", "↑{status.ahead}" }
+                                    }
+                                    if status.behind > 0 {
+                                        span { class: "kiln-status__behind", "↓{status.behind}" }
+                                    }
+                                }
+
+                                div { class: "kiln-status-divider" }
+
+                                // Changes segment (clickable → Git context)
+                                if status.has_changes() {
+                                    div {
+                                        class: "kiln-status-segment kiln-status-segment--changes kiln-status-segment--clickable",
+                                        onclick: move |_| {
+                                            switch_context(&state, &tab_mgr, NavigationContext::Git);
+                                        },
+                                        if status.added > 0 {
+                                            span { class: "kiln-status__added", "+{status.added}" }
+                                        }
+                                        if status.modified > 0 {
+                                            span { class: "kiln-status__modified", "~{status.modified}" }
+                                        }
+                                        if status.deleted > 0 {
+                                            span { class: "kiln-status__deleted", "−{status.deleted}" }
+                                        }
+                                        if status.untracked > 0 {
+                                            span { class: "kiln-status__untracked", "?{status.untracked}" }
+                                        }
+                                    }
+                                    div { class: "kiln-status-divider" }
                                 }
                             }
                         }
-                        if status.ahead > 0 {
-                            span { class: "kiln-status__ahead", "↑{status.ahead}" }
-                        }
-                        if status.behind > 0 {
-                            span { class: "kiln-status__behind", "↓{status.behind}" }
-                        }
-                    }
-
-                    div { class: "kiln-status-divider" }
-
-                    // Changes segment (clickable → Git context)
-                    if status.has_changes() {
-                        div {
-                            class: "kiln-status-segment kiln-status-segment--changes kiln-status-segment--clickable",
-                            onclick: move |_| {
-                                switch_context(&state, &tab_mgr, NavigationContext::Git);
-                            },
-                            if status.added > 0 {
-                                span { class: "kiln-status__added", "+{status.added}" }
-                            }
-                            if status.modified > 0 {
-                                span { class: "kiln-status__modified", "~{status.modified}" }
-                            }
-                            if status.deleted > 0 {
-                                span { class: "kiln-status__deleted", "−{status.deleted}" }
-                            }
-                            if status.untracked > 0 {
-                                span { class: "kiln-status__untracked", "?{status.untracked}" }
-                            }
-                        }
-                        div { class: "kiln-status-divider" }
                     }
                 }
+                #[cfg(target_arch = "wasm32")]
+                { rsx! {} }
             }
 
             // ── Pipeline context: cursor, encoding, language ────────────
@@ -156,25 +167,44 @@ pub fn StatusBar() -> Element {
             }
 
             // ── Git engine indicator ────────────────────────────────────
-            if git.is_some() {
-                div {
-                    class: "kiln-status-segment kiln-status-segment--engine",
-                    "git"
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    rsx! {
+                        if git.is_some() {
+                            div {
+                                class: "kiln-status-segment kiln-status-segment--engine",
+                                "git"
+                            }
+                        }
+                    }
                 }
+                #[cfg(target_arch = "wasm32")]
+                { rsx! {} }
             }
         }
 
         // ── Branch switcher dropdown ────────────────────────────────────
-        if is_switcher_open {
-            BranchSwitcher {
-                on_close: move |_| show_branch_switcher.set(false),
+        {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                rsx! {
+                    if is_switcher_open {
+                        BranchSwitcher {
+                            on_close: move |_| show_branch_switcher.set(false),
+                        }
+                    }
+                }
             }
+            #[cfg(target_arch = "wasm32")]
+            { rsx! {} }
         }
     }
 }
 
 /// Branch switcher dropdown — opens above the status bar.
 /// Spec: clinker-kiln-git-addendum.md §G3.4.
+#[cfg(not(target_arch = "wasm32"))]
 #[component]
 fn BranchSwitcher(on_close: EventHandler<()>) -> Element {
     let mut tab_mgr = use_context::<TabManagerState>();
@@ -304,6 +334,7 @@ fn BranchSwitcher(on_close: EventHandler<()>) -> Element {
 }
 
 /// Switch to a different branch.
+#[cfg(not(target_arch = "wasm32"))]
 fn switch_branch(tab_mgr: &mut TabManagerState, name: &str) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };
@@ -348,6 +379,7 @@ fn switch_branch(tab_mgr: &mut TabManagerState, name: &str) {
 }
 
 /// Create a new branch and switch to it.
+#[cfg(not(target_arch = "wasm32"))]
 fn create_and_switch(tab_mgr: &mut TabManagerState, name: &str) {
     let ws = (tab_mgr.workspace)();
     let Some(ws) = ws else { return };

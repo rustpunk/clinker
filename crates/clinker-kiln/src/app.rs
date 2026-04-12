@@ -11,6 +11,7 @@
 /// Navigation uses a two-level model:
 /// - `NavigationContext` selects the active page (Pipeline, Channels, Git, Docs, Runs)
 /// - `PipelineLayoutMode` selects the view within Pipeline (Canvas, Hybrid, Editor)
+#[cfg(not(target_arch = "wasm32"))]
 use clinker_git::GitOps;
 use dioxus::prelude::*;
 
@@ -21,15 +22,14 @@ use crate::components::{
     inspector::InspectorPanel, placeholder_page::PlaceholderPage, run_log::RunLogDrawer,
     schema_panel::SchemaPanel, schematics::SchematicsPanel, search_panel::SearchPanel,
     status_bar::StatusBar, tab_bar::TabBar, template_gallery::TemplateGallery, title_bar::TitleBar,
-    toast::ToastOverlay, version_mode::VersionMode, welcome_screen::WelcomeScreen,
-    yaml_sidebar::YamlSidebar,
+    toast::ToastOverlay, welcome_screen::WelcomeScreen, yaml_sidebar::YamlSidebar,
 };
 use clinker_schema::SchemaIndex;
 
 use crate::keyboard::handle_keyboard;
 use crate::state::{
-    AppState, KilnTheme, LeftPanel, NavigationContext, PipelineLayoutMode, TabManagerState,
-    use_app_state,
+    AppState, ChannelViewMode, KilnTheme, LeftPanel, NavigationContext, PipelineLayoutMode,
+    TabManagerState, use_app_state,
 };
 use crate::sync::{EditSource, ParseResult, serialize_yaml, try_parse_yaml};
 use crate::tab::{TabEntry, TabId};
@@ -48,6 +48,9 @@ pub fn AppShell() -> Element {
     let mut selected_stage = use_signal(|| None::<String>);
     let mut schema_warnings = use_signal(Vec::new);
     let mut partial_pipeline = use_signal(|| None);
+    let channel_view_mode = use_signal(|| ChannelViewMode::Raw);
+    let compiled_plan: Signal<Option<std::sync::Arc<clinker_core::plan::CompiledPlan>>> =
+        use_signal(|| None);
 
     // ── Session restore (single call on first mount per use_signal) ─────
     // restore_session() is called in the first use_signal closure. The result
@@ -95,7 +98,10 @@ pub fn AppShell() -> Element {
     let left_panel: Signal<LeftPanel> = use_signal(|| LeftPanel::None);
     let mut schema_index: Signal<SchemaIndex> = use_signal(SchemaIndex::default);
     let show_template_gallery: Signal<bool> = use_signal(|| false);
+    #[cfg(not(target_arch = "wasm32"))]
     let mut git_state: Signal<Option<clinker_git::RepoStatus>> = use_signal(|| None);
+    #[cfg(target_arch = "wasm32")]
+    let git_state: Signal<Option<()>> = use_signal(|| None);
     let show_command_palette: Signal<bool> = use_signal(|| false);
     let show_settings: Signal<bool> = use_signal(|| false);
     let mut channel_state: Signal<Option<crate::state::ChannelState>> = use_signal(|| None);
@@ -108,6 +114,7 @@ pub fn AppShell() -> Element {
     });
 
     // ── Git: detect repo and compute status on workspace change ──────────
+    #[cfg(not(target_arch = "wasm32"))]
     {
         use_effect(move || {
             let ws = (workspace)();
@@ -146,14 +153,11 @@ pub fn AppShell() -> Element {
             if let Some(ref ws) = ws {
                 let mut state = workspace::discover_channels(ws);
                 // Restore persisted channel selection
-                if let Some(ref mut cs) = state {
-                    if let Some(ref chan_persist) = ws.state.channels {
-                        cs.active_channel = chan_persist.active.clone();
-                        cs.recent_channels = chan_persist.recent.clone();
-                    } else if cs.default_channel.is_some() {
-                        // Use default_channel from clinker.toml on first load
-                        cs.active_channel = cs.default_channel.clone();
-                    }
+                if let Some(ref mut cs) = state
+                    && let Some(ref chan_persist) = ws.state.channels
+                {
+                    cs.active_channel = chan_persist.active.clone();
+                    cs.recent_channels = chan_persist.recent.clone();
                 }
                 channel_state.set(state);
             } else {
@@ -179,6 +183,7 @@ pub fn AppShell() -> Element {
 
     // ── Filesystem watcher: auto-refresh git status + schema index ─────
     // Spawns a background watcher on the workspace root. Debounced 500ms.
+    #[cfg(not(target_arch = "wasm32"))]
     {
         use_effect(move || {
             let ws = (workspace)();
@@ -229,6 +234,7 @@ pub fn AppShell() -> Element {
     // Periodic autosave: flush state to disk every 5 seconds.
     // Catches all state changes even if the user never switches tabs.
     // Worst case on force-kill: lose last 5 seconds of layout/tab state.
+    #[cfg(not(target_arch = "wasm32"))]
     use_future(move || {
         let tabs = tabs;
         let channel_state = channel_state;
@@ -341,6 +347,8 @@ pub fn AppShell() -> Element {
         parse_errors,
         edit_source,
         schema_warnings,
+        channel_view_mode,
+        compiled_plan,
     };
 
     let mut app_state_signal = use_signal(|| current_app_state);
@@ -560,7 +568,9 @@ pub fn AppShell() -> Element {
                                     WelcomeScreen {}
                                 }
                             },
-                            NavigationContext::Git => rsx! { VersionMode {} },
+                            NavigationContext::Git => rsx! {
+                                GitContextPage {}
+                            },
                             NavigationContext::Docs => rsx! {
                                 PlaceholderPage {
                                     name: "Technical Guide",
@@ -570,7 +580,7 @@ pub fn AppShell() -> Element {
                             NavigationContext::Channels => rsx! {
                                 PlaceholderPage {
                                     name: "Channels",
-                                    description: "Channel system removed in Phase 16b. Phase 16c will reintroduce composition support.",
+                                    description: "Channel management: load .channel.yaml files and toggle between Raw and Resolved views on the canvas.",
                                 }
                             },
                             NavigationContext::Runs => rsx! {
@@ -624,6 +634,25 @@ pub fn AppShell() -> Element {
                     },
                 }
             }
+        }
+    }
+}
+
+/// Git context page — conditional on desktop target (git not available on web).
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+fn GitContextPage() -> Element {
+    use crate::components::version_mode::VersionMode;
+    rsx! { VersionMode {} }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn GitContextPage() -> Element {
+    rsx! {
+        PlaceholderPage {
+            name: "Version Control",
+            description: "Git integration is not available in the web build.",
         }
     }
 }

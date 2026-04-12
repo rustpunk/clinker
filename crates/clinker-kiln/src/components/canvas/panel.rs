@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use crate::pipeline_view::{
     NODE_HEIGHT, NODE_WIDTH, derive_partial_pipeline_view, derive_pipeline_view,
 };
-use crate::state::use_app_state;
+use crate::state::{ChannelViewMode, use_app_state};
 
 use super::connector::Connector;
 use super::node::CanvasNode;
@@ -54,13 +54,34 @@ struct DragState {
 pub fn CanvasPanel() -> Element {
     let state = use_app_state();
 
-    let pipeline_view = match &*(state.pipeline).read() {
-        Some(config) => derive_pipeline_view(config),
-        None => match &*(state.partial_pipeline).read() {
-            Some(partial) => derive_partial_pipeline_view(partial),
-            None => crate::pipeline_view::PipelineView {
-                stages: Vec::new(),
-                connections: Vec::new(),
+    let view_mode = *state.channel_view_mode.read();
+
+    let pipeline_view = match view_mode {
+        ChannelViewMode::Resolved => {
+            // In Resolved mode, prefer the compiled plan's config (with channel overlays).
+            let compiled_guard = state.compiled_plan.read();
+            match compiled_guard.as_ref() {
+                Some(plan) => derive_pipeline_view(plan.config()),
+                None => {
+                    // No compiled plan available — fall back to raw pipeline.
+                    match &*(state.pipeline).read() {
+                        Some(config) => derive_pipeline_view(config),
+                        None => crate::pipeline_view::PipelineView {
+                            stages: Vec::new(),
+                            connections: Vec::new(),
+                        },
+                    }
+                }
+            }
+        }
+        ChannelViewMode::Raw => match &*(state.pipeline).read() {
+            Some(config) => derive_pipeline_view(config),
+            None => match &*(state.partial_pipeline).read() {
+                Some(partial) => derive_partial_pipeline_view(partial),
+                None => crate::pipeline_view::PipelineView {
+                    stages: Vec::new(),
+                    connections: Vec::new(),
+                },
             },
         },
     };
@@ -199,9 +220,40 @@ pub fn CanvasPanel() -> Element {
         (max_x + 80.0, max_y + 80.0)
     };
 
+    // Channel view mode toggle state
+    let tab_mgr = use_context::<crate::state::TabManagerState>();
+    let has_channel = tab_mgr
+        .channel_state
+        .read()
+        .as_ref()
+        .is_some_and(|cs| cs.active_channel.is_some());
+    let is_resolved = view_mode == ChannelViewMode::Resolved;
+
     rsx! {
         div {
             class: "kiln-canvas-column",
+
+            // ── Channel view mode toggle bar ─────────────────────────────
+            div {
+                class: "kiln-canvas-toolbar",
+
+                button {
+                    class: if is_resolved { "kiln-view-toggle kiln-view-toggle--active" } else { "kiln-view-toggle" },
+                    disabled: !has_channel && !is_resolved,
+                    title: if !has_channel && !is_resolved { "Select a channel to enable resolved view" } else if is_resolved { "Switch to Raw view" } else { "Switch to Resolved view" },
+                    onclick: move |_| {
+                        let mut mode = state.channel_view_mode;
+                        let current = *mode.read();
+                        mode.set(match current {
+                            ChannelViewMode::Raw => ChannelViewMode::Resolved,
+                            ChannelViewMode::Resolved => ChannelViewMode::Raw,
+                        });
+                    },
+                    span { class: "kiln-view-toggle-label",
+                        if is_resolved { "RESOLVED" } else { "RAW" }
+                    }
+                }
+            }
 
             div {
                 class: "kiln-canvas-panel",
