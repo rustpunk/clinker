@@ -29,7 +29,7 @@ fn bench_xlarge(c: &mut Criterion) {
             BenchmarkId::from_parameter(Scale::XLarge.label()),
             &Scale::XLarge,
             |b, &scale| {
-                b.iter(|| runner.run(&entry.path, scale, 20));
+                b.iter(|| runner.run(&entry.path, scale));
             },
         );
         group.finish();

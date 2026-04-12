@@ -25,7 +25,7 @@ fn bench_e2e(c: &mut Criterion) {
                 BenchmarkId::from_parameter(scale.label()),
                 &scale,
                 |b, &scale| {
-                    b.iter(|| runner.run(&entry.path, scale, 20));
+                    b.iter(|| runner.run(&entry.path, scale));
                 },
             );
         }

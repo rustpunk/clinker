@@ -111,7 +111,8 @@ pub fn format_summary_table(pipeline_name: &str, scale: &str, report: &Execution
     // Total row
     let total_wall_ns = (report.finished_at - report.started_at)
         .num_nanoseconds()
-        .unwrap_or(i64::MAX) as u128;
+        .filter(|&ns| ns >= 0)
+        .unwrap_or(0) as u128;
     let total_wall = std::time::Duration::from_nanos(total_wall_ns as u64);
 
     if verbose {
@@ -269,7 +270,9 @@ pub fn bench_result_from(
     scale: &str,
     report: &ExecutionReport,
 ) -> BenchResult {
-    let total_ms = (report.finished_at - report.started_at).num_milliseconds() as f64;
+    let total_ms = (report.finished_at - report.started_at)
+        .num_milliseconds()
+        .max(0) as f64;
     let rps = if total_ms > 0.0 {
         report.counters.total_count as f64 / total_ms * 1000.0
     } else {

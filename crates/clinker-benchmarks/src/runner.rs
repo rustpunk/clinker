@@ -9,6 +9,7 @@ use std::path::Path;
 
 use clinker_bench_support::Scale;
 use clinker_bench_support::cache::{BenchDataCache, DataSpec};
+use clinker_core::config::pipeline_node::PipelineNode;
 use clinker_core::config::{CompileContext, load_config};
 use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
@@ -29,12 +30,10 @@ impl BenchPipelineRunner {
 
     /// Run a pipeline config at the given scale. Returns `ExecutionReport`
     /// with per-stage `StageMetrics` populated.
-    pub fn run(
-        &self,
-        config_path: &Path,
-        scale: Scale,
-        field_count: usize,
-    ) -> Result<ExecutionReport, PipelineError> {
+    ///
+    /// Field count is derived from the source node's schema declaration
+    /// so generated data matches the pipeline's expected column count.
+    pub fn run(&self, config_path: &Path, scale: Scale) -> Result<ExecutionReport, PipelineError> {
         let config = load_config(config_path).expect("bench config must parse");
 
         let source = config
@@ -43,6 +42,8 @@ impl BenchPipelineRunner {
             .expect("bench config must have a source");
         let data_format =
             input_format_to_data_format(&source.format).expect("bench source format must map");
+
+        let field_count = source_schema_field_count(&config);
 
         let data_path = self.cache.get_or_generate(&DataSpec {
             format: data_format,
@@ -76,6 +77,17 @@ impl BenchPipelineRunner {
     }
 }
 
+/// Derive field count from the first source node's schema declaration.
+/// Falls back to 20 if no schema is found (shouldn't happen for bench configs).
+fn source_schema_field_count(config: &clinker_core::config::PipelineConfig) -> usize {
+    for node in config.nodes.iter() {
+        if let PipelineNode::Source { config: body, .. } = &node.value {
+            return body.schema.columns.len();
+        }
+    }
+    20
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,7 +105,7 @@ mod tests {
     fn test_runner_csv_passthrough_returns_report() {
         let runner = test_runner();
         let path = pipelines_dir().join("format/csv_passthrough.yaml");
-        let report = runner.run(&path, Scale::Small, 20).unwrap();
+        let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }
 
@@ -102,7 +114,7 @@ mod tests {
     fn test_runner_json_passthrough_returns_report() {
         let runner = test_runner();
         let path = pipelines_dir().join("format/json_ndjson_passthrough.yaml");
-        let report = runner.run(&path, Scale::Small, 20).unwrap();
+        let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }
 
@@ -111,7 +123,7 @@ mod tests {
     fn test_runner_report_has_stage_metrics() {
         let runner = test_runner();
         let path = pipelines_dir().join("format/csv_passthrough.yaml");
-        let report = runner.run(&path, Scale::Small, 20).unwrap();
+        let report = runner.run(&path, Scale::Small).unwrap();
         assert!(
             report.stages.len() >= 3,
             "expected >= 3 stages, got {}",
@@ -124,7 +136,7 @@ mod tests {
     fn test_runner_xml_passthrough_returns_report() {
         let runner = test_runner();
         let path = pipelines_dir().join("format/xml_passthrough.yaml");
-        let report = runner.run(&path, Scale::Small, 20).unwrap();
+        let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }
 
@@ -133,7 +145,7 @@ mod tests {
     fn test_runner_fixed_width_passthrough_returns_report() {
         let runner = test_runner();
         let path = pipelines_dir().join("format/fixed_width_passthrough.yaml");
-        let report = runner.run(&path, Scale::Small, 20).unwrap();
+        let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }
 }
