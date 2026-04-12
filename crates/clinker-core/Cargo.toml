@@ -80,3 +80,7 @@ harness = false
 name = "provenance"
 harness = false
 
+[[bench]]
+name = "composition"
+harness = false
+
