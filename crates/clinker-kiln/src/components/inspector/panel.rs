@@ -74,12 +74,20 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         PipelineNode::Output { config: body, .. } => {
             ("OUTPUT", "output", body.output.path.clone(), None)
         }
-        PipelineNode::Composition { r#use, .. } => (
+        PipelineNode::Composition {
+            r#use, config: _, ..
+        } => (
             "COMPOSITION",
             "composition",
-            format!("use: {} (Phase 16c)", r#use.display()),
+            format!("use: {}", r#use.display()),
             None,
         ),
+    };
+
+    // Collect config param names for composition provenance display
+    let composition_params: Vec<String> = match &node_spanned.value {
+        PipelineNode::Composition { config, .. } => config.keys().cloned().collect(),
+        _ => Vec::new(),
     };
     let is_source_or_output = matches!(
         &node_spanned.value,
@@ -139,6 +147,40 @@ pub fn InspectorPanel(stage_id: String) -> Element {
 
                 ScopedYaml {
                     stage_id: stage_id.clone(),
+                }
+
+                // ── Provenance section (composition nodes only) ──────────
+                if !composition_params.is_empty() {
+                    div {
+                        class: "kiln-inspector-section",
+
+                        div {
+                            class: "kiln-section-header",
+                            span { class: "kiln-diamond", "\u{25C6}" }
+                            span { class: "kiln-section-title", "PROVENANCE" }
+                            span { class: "kiln-section-rule" }
+                        }
+
+                        for param in composition_params.iter() {
+                            {
+                                let node = stage_id.clone();
+                                let p = param.clone();
+                                rsx! {
+                                    div {
+                                        class: "kiln-provenance-field",
+                                        div {
+                                            class: "kiln-provenance-field-name",
+                                            "{p}"
+                                        }
+                                        super::provenance::ProvenancePanel {
+                                            node_name: node,
+                                            param_name: p.clone(),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
