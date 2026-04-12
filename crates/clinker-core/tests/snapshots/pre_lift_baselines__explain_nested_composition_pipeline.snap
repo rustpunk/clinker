@@ -1,0 +1,43 @@
+---
+source: crates/clinker-core/tests/pre_lift_baselines.rs
+expression: scrubbed
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 0
+Output projections: 1
+DAG nodes: 2
+
+Source DAG:
+  Tier 0: raw_src
+
+=== Physical Properties ===
+
+output.final_out:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+source.raw_src:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+=== CXL Expressions ===
+
+=== Type Annotations ===
+
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [output] final_out (line:29)
+  ● [source] raw_src (line:7)

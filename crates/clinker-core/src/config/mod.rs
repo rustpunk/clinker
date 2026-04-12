@@ -1227,6 +1227,20 @@ impl PipelineConfig {
         &self,
         ctx: &CompileContext,
     ) -> Result<crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>> {
+        let (plan, _warnings) = self.compile_with_diagnostics(ctx)?;
+        Ok(plan)
+    }
+
+    /// Like [`compile`], but also returns non-fatal diagnostics (warnings)
+    /// that were collected during compilation. On error, all diagnostics
+    /// (errors + warnings) are in the `Err` variant as before.
+    pub fn compile_with_diagnostics(
+        &self,
+        ctx: &CompileContext,
+    ) -> Result<
+        (crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>),
+        Vec<crate::error::Diagnostic>,
+    > {
         use crate::config::composition::scan_workspace_signatures;
         use crate::error::{Diagnostic, LabeledSpan};
         use crate::plan::CompiledPlan;
@@ -1437,7 +1451,8 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        Ok(CompiledPlan::new(dag, self.clone(), artifacts))
+        let plan = CompiledPlan::new(dag, self.clone(), artifacts);
+        Ok((plan, diags))
     }
 }
 

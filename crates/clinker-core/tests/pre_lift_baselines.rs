@@ -84,6 +84,9 @@ struct Phase16cFixture {
     /// Whether this is a pipeline (deserializes as PipelineConfig) or a
     /// non-pipeline YAML (composition / channel — valid YAML only).
     is_pipeline: bool,
+    /// Set once baselines are captured; `None` for non-pipeline fixtures
+    /// and pipelines whose baselines haven't been captured yet.
+    baseline_captured_in: Option<&'static str>,
 }
 
 /// All 14 Phase 16c fixtures: 5 compositions, 6 channels, 3 pipelines.
@@ -94,73 +97,87 @@ fn phase_16c_fixtures() -> Vec<Phase16cFixture> {
             name: "customer_enrich",
             rel_path: "compositions/customer_enrich.comp.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "address_normalize",
             rel_path: "compositions/address_normalize.comp.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "dlq_shape",
             rel_path: "compositions/dlq_shape.comp.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "nested_caller",
             rel_path: "compositions/nested_caller.comp.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "passthrough_check",
             rel_path: "compositions/passthrough_check.comp.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         // Channels (6)
         Phase16cFixture {
             name: "acme_prod",
             rel_path: "channels/acme_prod.channel.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "acme_staging",
             rel_path: "channels/acme_staging.channel.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "beta_prod",
             rel_path: "channels/beta_prod.channel.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "beta_staging",
             rel_path: "channels/beta_staging.channel.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "comp_direct",
             rel_path: "channels/comp_direct.channel.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
         Phase16cFixture {
             name: "empty_defaults",
             rel_path: "channels/empty_defaults.channel.yaml",
             is_pipeline: false,
+            baseline_captured_in: None,
         },
-        // Pipelines (3)
+        // Pipelines (3) — baselines captured in Task 16c.2.4
         Phase16cFixture {
             name: "composition_pipeline",
             rel_path: "pipelines/composition_pipeline.yaml",
             is_pipeline: true,
+            baseline_captured_in: Some("16c.2.4"),
         },
         Phase16cFixture {
             name: "nested_composition_pipeline",
             rel_path: "pipelines/nested_composition_pipeline.yaml",
             is_pipeline: true,
+            baseline_captured_in: Some("16c.2.4"),
         },
         Phase16cFixture {
             name: "channel_target_pipeline",
             rel_path: "pipelines/channel_target_pipeline.yaml",
             is_pipeline: true,
+            baseline_captured_in: Some("16c.2.4"),
         },
     ]
 }
@@ -501,6 +518,37 @@ fn test_scaffold_16c_explain_docs_exist() {
     }
 }
 
+// ───────────────────────── Phase 16c pipeline baselines ─────────────────────────
+
+/// Scrub tail variable IDs from explain text. Tail var IDs are monotonic
+/// counters per compilation, so their values are run-order-dependent.
+/// Replace `body=N` patterns with `body=<ID>` for snapshot stability.
+fn scrub_tail_vars(text: &str) -> String {
+    let re = regex::Regex::new(r"body=\d+").unwrap();
+    re.replace_all(text, "body=<ID>").to_string()
+}
+
+/// Compile a Phase 16c pipeline fixture and snapshot its explain text.
+/// Uses `CompileContext::with_pipeline_dir` for `use:` path resolution.
+fn snapshot_16c_pipeline(snap_name: &str, rel_path: &str) {
+    let root = phase_16c_fixture_root();
+    let yaml_path = root.join(rel_path);
+    let yaml = std::fs::read_to_string(&yaml_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", yaml_path.display()));
+    let config = parse_config(&yaml).expect("parse_config");
+    let pipeline_dir = std::path::PathBuf::from(rel_path)
+        .parent()
+        .unwrap_or(std::path::Path::new(""))
+        .to_path_buf();
+    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
+    let compiled = clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+    let (dag, _) =
+        clinker_core::executor::PipelineExecutor::explain_plan_dag(&compiled).expect("explain_dag");
+    let text = dag.explain_text(&config);
+    let scrubbed = scrub_tail_vars(&text);
+    insta::assert_snapshot!(snap_name, scrubbed);
+}
+
 /// For every DualRun fixture: run pre-lift, byte-compare outputs against
 /// committed baselines, and snapshot the `--explain` topology via insta.
 #[test]
@@ -526,4 +574,136 @@ fn test_pre_lift_snapshots() {
             compare_or_write(baseline_file, actual);
         }
     }
+}
+
+// ───────────────────────── Task 16c.2.4 gate tests ─────────────────────────
+
+/// Gate test: the 3 pipeline fixtures each have a captured insta baseline.
+#[test]
+fn test_forward_only_pipeline_fixtures_have_baseline() {
+    for fx in phase_16c_fixtures() {
+        if !fx.is_pipeline {
+            continue;
+        }
+        assert!(
+            fx.baseline_captured_in.is_some(),
+            "pipeline fixture {} has no baseline_captured_in",
+            fx.name
+        );
+        // Verify the fixture compiles successfully
+        let root = phase_16c_fixture_root();
+        let yaml_path = root.join(fx.rel_path);
+        let yaml = std::fs::read_to_string(&yaml_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", yaml_path.display()));
+        let config = parse_config(&yaml).expect("parse_config");
+        let pipeline_dir = std::path::PathBuf::from(fx.rel_path)
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .to_path_buf();
+        let ctx = clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir);
+        let _compiled =
+            clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+    }
+    // Verify the insta snapshots exist
+    snapshot_16c_pipeline(
+        "explain_composition_pipeline",
+        "pipelines/composition_pipeline.yaml",
+    );
+    snapshot_16c_pipeline(
+        "explain_nested_composition_pipeline",
+        "pipelines/nested_composition_pipeline.yaml",
+    );
+    snapshot_16c_pipeline(
+        "explain_channel_target_pipeline",
+        "pipelines/channel_target_pipeline.yaml",
+    );
+}
+
+/// Gate test: W101 fires end-to-end through `PipelineConfig::compile_with_diagnostics`
+/// when a pipeline uses `passthrough_check.comp.yaml` with an upstream source
+/// that provides columns the body will shadow.
+#[test]
+fn test_w101_warning_emitted_end_to_end_on_passthrough_check_fixture() {
+    let root = phase_16c_fixture_root();
+    // Build a pipeline that uses passthrough_check.comp.yaml with upstream
+    // providing {id, tag}. The body emits "tag", shadowing the pass-through.
+    let yaml = r#"
+pipeline:
+  name: w101_e2e_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: data/a.csv
+      schema:
+        - { name: id, type: string }
+        - { name: tag, type: string }
+
+  - type: composition
+    name: pt_check
+    input: src
+    use: ../compositions/passthrough_check.comp.yaml
+    inputs:
+      data: src
+
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: data/o.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+        &root,
+        std::path::PathBuf::from("pipelines"),
+    );
+    let (_plan, diags) =
+        clinker_core::config::PipelineConfig::compile_with_diagnostics(&config, &ctx)
+            .expect("compile should succeed (W101 is a warning, not error)");
+
+    let w101: Vec<_> = diags.iter().filter(|d| d.code == "W101").collect();
+    assert!(
+        !w101.is_empty(),
+        "expected W101 warning for body-declared 'tag' shadowing pass-through, got: {diags:?}"
+    );
+    assert!(
+        w101[0].message.contains("tag"),
+        "W101 should mention 'tag': {:?}",
+        w101[0].message
+    );
+}
+
+/// Gate test: running the 16c pipeline snapshot twice produces identical
+/// scrubbed output — verifies tail variable redaction stability.
+#[test]
+fn test_insta_baselines_are_tail_var_stable() {
+    let root = phase_16c_fixture_root();
+    let rel_path = "pipelines/composition_pipeline.yaml";
+    let yaml_path = root.join(rel_path);
+    let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
+    let config = parse_config(&yaml).expect("parse_config");
+    let pipeline_dir = std::path::PathBuf::from(rel_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        let ctx =
+            clinker_core::config::CompileContext::with_pipeline_dir(&root, pipeline_dir.clone());
+        let compiled =
+            clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+        let (dag, _) = clinker_core::executor::PipelineExecutor::explain_plan_dag(&compiled)
+            .expect("explain_dag");
+        let text = dag.explain_text(&config);
+        outputs.push(scrub_tail_vars(&text));
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "scrubbed explain output must be identical across runs"
+    );
 }
