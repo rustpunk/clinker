@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use clinker_core::config::composition::CompositionSymbolTable;
+use clinker_core::error::{Diagnostic, LabeledSpan};
+use clinker_core::span::Span;
+
 use crate::error::ChannelError;
 
 // ── DottedPath ──────────────────────────────────────────────────────────
@@ -202,4 +206,205 @@ fn validate_dotted_keys(
             Ok((path, v))
         })
         .collect()
+}
+
+// ── Channel validation ─────────────────────────────────────────────────
+
+/// Maximum number of `.channel.yaml` files per workspace scan.
+const WORKSPACE_CHANNEL_BUDGET: usize = 50;
+
+/// Maximum filesystem depth for channel workspace walks.
+const WORKSPACE_CHANNEL_MAX_DEPTH: usize = 16;
+
+/// Scan a workspace root for `.channel.yaml` files and parse each into a
+/// [`ChannelBinding`].
+///
+/// Companion to `scan_workspace_signatures` in clinker-core — uses the
+/// same walkdir + budget pattern. Symlinks rejected, depth bounded.
+pub fn scan_workspace_channels(
+    workspace_root: &Path,
+) -> Result<Vec<ChannelBinding>, Vec<Diagnostic>> {
+    use walkdir::WalkDir;
+
+    if !workspace_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut bindings = Vec::new();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    let walker = WalkDir::new(workspace_root)
+        .follow_links(false)
+        .max_depth(WORKSPACE_CHANNEL_MAX_DEPTH)
+        .into_iter();
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        if !is_channel_yaml(path) {
+            continue;
+        }
+
+        if bindings.len() >= WORKSPACE_CHANNEL_BUDGET {
+            diagnostics.push(Diagnostic::error(
+                "E101",
+                format!(
+                    "channel file budget exceeded: more than {WORKSPACE_CHANNEL_BUDGET} \
+                     .channel.yaml files in workspace"
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diagnostics);
+        }
+
+        match ChannelBinding::load(path) {
+            Ok(binding) => bindings.push(binding),
+            Err(e) => {
+                diagnostics.push(Diagnostic::error(
+                    "E101",
+                    format!("failed to parse {}: {e}", path.display()),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diagnostics);
+            }
+        }
+    }
+
+    Ok(bindings)
+}
+
+/// Validate channel bindings against the composition symbol table.
+///
+/// For composition targets: verifies the target exists in the symbol table
+/// (E103) and that all config keys reference declared params (E105).
+/// Pipeline targets: only validates that the target path exists on disk.
+pub fn validate_channel_bindings(
+    bindings: &[ChannelBinding],
+    symbol_table: &CompositionSymbolTable,
+    workspace_root: &Path,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for binding in bindings {
+        match &binding.target {
+            ChannelTarget::Composition(comp_path) => {
+                // Resolve the workspace-relative key used in the symbol table.
+                let key = normalize_target_path(comp_path, workspace_root);
+
+                match symbol_table.get(&key) {
+                    None => {
+                        diagnostics.push(Diagnostic::error(
+                            "E103",
+                            format!(
+                                "channel {:?} targets unknown composition: {}",
+                                binding.name,
+                                comp_path.display()
+                            ),
+                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                        ));
+                    }
+                    Some(signature) => {
+                        // Validate config keys against declared config_schema.
+                        validate_config_keys(
+                            &binding.config_default,
+                            signature,
+                            &binding.name,
+                            &mut diagnostics,
+                        );
+                        validate_config_keys(
+                            &binding.config_fixed,
+                            signature,
+                            &binding.name,
+                            &mut diagnostics,
+                        );
+                    }
+                }
+            }
+            ChannelTarget::Pipeline(pipeline_path) => {
+                // Pipeline-target: validate path exists, skip config key
+                // validation (deferred per V-2-2).
+                let resolved = if pipeline_path.is_relative() {
+                    workspace_root.join(pipeline_path)
+                } else {
+                    pipeline_path.clone()
+                };
+                if !resolved.exists() {
+                    diagnostics.push(Diagnostic::error(
+                        "E103",
+                        format!(
+                            "channel {:?} targets pipeline that does not exist: {}",
+                            binding.name,
+                            pipeline_path.display()
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Validate config keys from a channel binding against a composition's
+/// declared `config_schema`. Emits E105 for undeclared keys.
+fn validate_config_keys(
+    config: &IndexMap<DottedPath, serde_json::Value>,
+    signature: &clinker_core::config::composition::CompositionSignature,
+    channel_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for dotted_path in config.keys() {
+        // For composition targets, the dotted path is just the param name
+        // (single segment) since the channel targets the composition
+        // directly. Two-segment paths (alias.param) are for pipeline-level
+        // channels that target specific compositions within a pipeline.
+        let param_name = match dotted_path.segments() {
+            (None, param) => param,
+            (Some(_alias), param) => param,
+        };
+
+        if !signature.config_schema.contains_key(param_name) {
+            diagnostics.push(Diagnostic::error(
+                "E105",
+                format!(
+                    "channel {:?}: config key {:?} is not declared in composition \
+                     {:?} config_schema",
+                    channel_name,
+                    dotted_path.as_str(),
+                    signature.name,
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+        }
+    }
+}
+
+fn is_channel_yaml(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".channel.yaml"))
+        .unwrap_or(false)
+}
+
+/// Normalize a target path for lookup in the composition symbol table.
+///
+/// The symbol table keys are workspace-relative paths. Channel target paths
+/// are typically `./compositions/foo.comp.yaml` — strip the leading `./`
+/// to match the symbol table key format.
+fn normalize_target_path(target: &Path, _workspace_root: &Path) -> PathBuf {
+    let s = target.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix("./") {
+        PathBuf::from(stripped)
+    } else {
+        target.to_path_buf()
+    }
 }
