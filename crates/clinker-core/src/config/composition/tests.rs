@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::span::{FileId, Span};
+use crate::yaml;
 use indexmap::IndexMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -236,4 +237,43 @@ nodes: []
         alias.description.as_deref(),
         Some("final output after enrichment")
     );
+}
+
+// ---------------------------------------------------------------------
+// Task 16c.3.1 gate tests — Resource enum
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_resource_file_variant_deserializes() {
+    let yaml = "kind: file\npath: data/a.csv\n";
+    let resource: Resource = yaml::from_str(yaml).expect("Resource::File must deserialize");
+    match &resource {
+        Resource::File { path, .. } => {
+            assert_eq!(path, &PathBuf::from("data/a.csv"));
+        }
+    }
+}
+
+/// Compile-time gate: exhaustive match on both `Resource` and `ResourceKind`
+/// with no wildcard arm. If a variant is added to one but not the other,
+/// this test fails to compile.
+#[test]
+fn test_resource_kind_covers_all_resource_variants() {
+    let resource = Resource::File {
+        path: PathBuf::from("x.csv"),
+        span: dummy_span(),
+    };
+
+    // Exhaustive match on Resource → derive the expected ResourceKind.
+    let expected_kind = match &resource {
+        Resource::File { .. } => ResourceKind::File,
+    };
+
+    // Exhaustive match on ResourceKind → verify round-trip.
+    match expected_kind {
+        ResourceKind::File => {}
+    }
+
+    // Also verify the .kind() helper agrees.
+    assert_eq!(resource.kind(), expected_kind);
 }

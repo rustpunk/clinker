@@ -20,6 +20,8 @@ mod provenance;
 mod raw;
 mod resource;
 
+pub use resource::Resource;
+
 #[cfg(test)]
 mod tests;
 

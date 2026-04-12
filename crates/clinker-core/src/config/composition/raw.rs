@@ -11,7 +11,7 @@
 //! Nothing in this module is exported outside the `composition` module.
 
 use super::{
-    CompositionFile, CompositionSignature, OutputAlias, ParamDecl, ParamType, PortDecl,
+    CompositionFile, CompositionSignature, OutputAlias, ParamDecl, ParamType, PortDecl, Resource,
     ResourceDecl, ResourceKind, SourceMap, SpannedNodeRef,
 };
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
@@ -319,5 +319,56 @@ impl<'de> Deserialize<'de> for ResourceKind {
             "file" => Ok(ResourceKind::File),
             other => Err(de::Error::unknown_variant(other, &["file"])),
         }
+    }
+}
+
+/// Internally-tagged deserialization for [`Resource`].
+///
+/// Dispatches on the `kind:` field, then extracts variant-specific payload
+/// fields. Follows the same manual-Visitor pattern used by [`RawOutputAlias`].
+///
+/// The resulting [`Span`] is synthetic (`Span::SYNTHETIC`) because the
+/// real [`FileId`] is not available at deserialization time. Callers that
+/// need anchored spans must re-set them via finalization, same as all other
+/// raw types in this module.
+impl<'de> Deserialize<'de> for Resource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct FilePayload {
+            kind: String,
+            path: Spanned<String>,
+        }
+
+        struct ResourceVisitor;
+
+        impl<'de> Visitor<'de> for ResourceVisitor {
+            type Value = Resource;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a map with 'kind' and variant-specific fields (e.g. kind: file, path: ...)",
+                )
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let payload = FilePayload::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                match payload.kind.as_str() {
+                    "file" => Ok(Resource::File {
+                        path: std::path::PathBuf::from(payload.path.value),
+                        span: Span::SYNTHETIC,
+                    }),
+                    other => Err(de::Error::unknown_variant(other, &["file"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ResourceVisitor)
     }
 }
