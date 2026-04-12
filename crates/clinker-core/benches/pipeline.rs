@@ -15,9 +15,6 @@ impl BenchBuffer {
     fn new() -> Self {
         Self::default()
     }
-    fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
-    }
 }
 
 impl Write for BenchBuffer {

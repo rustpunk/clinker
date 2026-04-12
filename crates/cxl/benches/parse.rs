@@ -1,10 +1,9 @@
 use clinker_bench_support::CxlComplexity;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use cxl::lexer::Lexer;
+use cxl::lexer::{Lexer, Span};
 use cxl::parser::Parser;
 use cxl::resolve::resolve_program;
-use cxl::typecheck::type_check;
-use std::collections::HashMap;
+use cxl::typecheck::{Row, type_check};
 
 fn bench_lex(c: &mut Criterion) {
     let mut group = c.benchmark_group("cxl_lex");
@@ -55,7 +54,11 @@ fn bench_typecheck(c: &mut Criterion) {
         );
         let resolved =
             resolve_program(parsed.ast, &fields, parsed.node_count).expect("resolve failed");
-        type_check(resolved, &indexmap::IndexMap::new()).expect("typecheck failed");
+        type_check(
+            resolved,
+            &Row::closed(indexmap::IndexMap::new(), Span::new(0, 0)),
+        )
+        .expect("typecheck failed");
 
         // Benchmark: resolve + typecheck (since ResolvedProgram isn't Clone,
         // we include resolve in the measured path)
@@ -63,7 +66,11 @@ fn bench_typecheck(c: &mut Criterion) {
             b.iter(|| {
                 let parsed = Parser::parse(src);
                 let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-                type_check(resolved, &indexmap::IndexMap::new()).unwrap()
+                type_check(
+                    resolved,
+                    &Row::closed(indexmap::IndexMap::new(), Span::new(0, 0)),
+                )
+                .unwrap()
             });
         });
     }
@@ -83,7 +90,11 @@ fn bench_full_compile(c: &mut Criterion) {
             b.iter(|| {
                 let parsed = Parser::parse(src);
                 let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-                type_check(resolved, &indexmap::IndexMap::new()).unwrap()
+                type_check(
+                    resolved,
+                    &Row::closed(indexmap::IndexMap::new(), Span::new(0, 0)),
+                )
+                .unwrap()
             });
         });
     }

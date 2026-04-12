@@ -6,6 +6,7 @@ license.workspace = true
 description = "End-to-end benchmark runner and reporters for Clinker pipelines"
 
 [features]
+bench-alloc = ["clinker-bench-support/bench-alloc"]
 bench-xlarge = []
 
 [dependencies]

@@ -50,8 +50,7 @@ fn bench_scaling_streaming(c: &mut Criterion) {
 pipeline:
   name: bench_scaling
   concurrency:
-    threads:
-      threads: null
+    threads: {threads}
 error_handling:
   strategy: continue
 nodes:
@@ -62,7 +61,7 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - {{ name: id, type: string }}
 
 - type: transform
   name: heavy_transform
@@ -152,8 +151,7 @@ fn bench_scaling_two_pass(c: &mut Criterion) {
 pipeline:
   name: bench_scaling_2pass
   concurrency:
-    threads:
-      threads: null
+    threads: {threads}
 error_handling:
   strategy: continue
 nodes:
@@ -164,7 +162,7 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - {{ name: id, type: string }}
 
 - type: transform
   name: windowed

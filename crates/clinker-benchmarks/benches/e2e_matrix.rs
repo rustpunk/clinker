@@ -45,7 +45,7 @@ fn main() {
         let configs = discover_pipeline_configs(&pipelines_base());
         let mut results = Vec::new();
         for entry in &configs {
-            if let Ok(report) = runner.run(&entry.path, Scale::Medium, 20) {
+            if let Ok(report) = runner.run(&entry.path, Scale::Medium) {
                 clinker_benchmarks::report::print_summary_table(
                     &format!("{}/{}", entry.category, entry.name),
                     "medium",

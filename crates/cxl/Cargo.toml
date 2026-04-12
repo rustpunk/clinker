@@ -15,3 +15,15 @@ ahash = { workspace = true }
 tracing = { workspace = true }
 static_assertions = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+clinker-bench-support = { workspace = true }
+
+[[bench]]
+name = "eval"
+harness = false
+
+[[bench]]
+name = "parse"
+harness = false
