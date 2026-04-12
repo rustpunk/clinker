@@ -759,6 +759,7 @@ dependencies = [
 name = "clinker-channel"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clinker-core",
  "clinker-record",
  "indexmap",
@@ -768,7 +769,6 @@ dependencies = [
  "serial_test",
  "tempfile",
  "thiserror 2.0.18",
- "toml",
  "tracing",
 ]
 

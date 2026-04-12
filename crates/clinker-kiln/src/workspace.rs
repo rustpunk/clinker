@@ -433,129 +433,14 @@ fn append_gitignore(dir: &Path) {
 
 // ── Channel discovery ──────────────────────────────────────────────────
 
-use crate::state::{ChannelState, ChannelSummary, GroupSummary};
-use clinker_channel::manifest::{ChannelInherits, ChannelManifest};
+use crate::state::ChannelState;
 
-/// Discover channels and groups by convention from the workspace root.
+/// Discover channels from the workspace root.
 ///
-/// Convention-based discovery: if a `channels/` directory (or the name configured
-/// in `[channels] directory` in kiln.toml) exists in the workspace root, channels
-/// are enabled. No `clinker.toml` required.
-///
-/// Returns None if the channels directory doesn't exist (graceful degradation).
-/// Errors during individual channel parsing are silently skipped.
-pub fn discover_channels(ws: &Workspace) -> Option<ChannelState> {
-    let chan_config = ws.manifest.channels.clone().unwrap_or_default();
-    let channels_dir_name = &chan_config.directory;
-    let groups_dir_name = &chan_config.groups_directory;
-
-    let channels_abs = ws.root.join(channels_dir_name);
-    let groups_abs = channels_abs.join(groups_dir_name);
-
-    let dir_exists = channels_abs.is_dir();
-
-    // Discover channels: scan channel dir for subdirectories containing channel.yaml
-    let mut channels = Vec::new();
-    let mut groups = Vec::new();
-
-    if dir_exists {
-        if let Ok(entries) = std::fs::read_dir(&channels_abs) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                // Skip the groups directory
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if dir_name == groups_dir_name || dir_name.starts_with('.') {
-                    continue;
-                }
-                let channel_yaml = path.join("channel.yaml");
-                if !channel_yaml.exists() {
-                    continue;
-                }
-                if let Ok(manifest) = ChannelManifest::load(&path) {
-                    let override_count = count_channel_yaml_files(&path);
-                    let inherits = match &manifest.metadata.inherits {
-                        ChannelInherits::None => Vec::new(),
-                        ChannelInherits::Single(id) => vec![id.clone()],
-                        ChannelInherits::Multiple(ids) => ids.clone(),
-                    };
-                    channels.push(ChannelSummary {
-                        id: manifest.metadata.id.clone(),
-                        name: manifest.metadata.name.clone(),
-                        description: manifest.metadata.description.clone(),
-                        contact: manifest.metadata.contact.clone(),
-                        tier: manifest.metadata.tier.clone(),
-                        tags: manifest.metadata.tags.clone(),
-                        active: manifest.metadata.active,
-                        inherits,
-                        override_count,
-                        variable_count: manifest.variables.len(),
-                    });
-                }
-            }
-        }
-        channels.sort_by(|a, b| a.id.cmp(&b.id));
-
-        // Discover groups: scan groups dir for subdirectories with .channel.yaml files
-        if groups_abs.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&groups_abs)
-        {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let group_id = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let override_count = count_channel_yaml_files(&path);
-                let inheritor_ids: Vec<String> = channels
-                    .iter()
-                    .filter(|c| c.inherits.contains(&group_id))
-                    .map(|c| c.id.clone())
-                    .collect();
-                groups.push(GroupSummary {
-                    id: group_id,
-                    override_count,
-                    inheritor_ids,
-                });
-            }
-        }
-        groups.sort_by(|a, b| a.id.cmp(&b.id));
-    }
-
-    Some(ChannelState {
-        workspace_root: ws.root.clone(),
-        channels_dir: channels_dir_name.clone(),
-        groups_dir: groups_dir_name.clone(),
-        default_channel: chan_config.default.clone(),
-        dir_exists,
-        channels,
-        groups,
-        active_channel: None,
-        recent_channels: Vec::new(),
-    })
-}
-
-/// Count `.channel.yaml` files in a directory (override files for pipelines).
-fn count_channel_yaml_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| {
-                    e.path()
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.ends_with(".channel.yaml") && n != "channel.yaml")
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0)
+/// TODO(16c.4.2): reconnect after ChannelBinding lands in clinker-channel.
+/// Legacy ChannelManifest-based discovery ripped in phase 16c.4.
+pub fn discover_channels(_ws: &Workspace) -> Option<ChannelState> {
+    None
 }
 
 // ── Last workspace tracking (OS app data dir) ───────────────────────────
