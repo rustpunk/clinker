@@ -14,12 +14,22 @@
 //! | `E003`      | error    | Cycle detected between nodes                         |
 //! | `E010`      | error    | Dotted-name check (`.` reserved for branch refs)     |
 //! | `E011`      | error    | Log directive sanity (`every` must be valid)         |
-//! | `E100`      | error    | Composition node not yet supported (Phase 16c stub)  |
+//! | `E101`      | error    | Composition signature parse error (malformed `.comp.yaml`) |
+//! | `E102`      | error    | Composition body references undeclared port          |
+//! | `E103`      | error    | Call site or channel binds undeclared input/config/resource |
+//! | `E104`      | error    | Call site or channel missing required input/config   |
+//! | `E105`      | error    | Channel binding references undeclared config key     |
+//! | `E106`      | error    | Name collision after composition expansion           |
+//! | `E107`      | error    | Cycle detected in flat post-expansion graph          |
+//! | `E108`      | error    | Composition body references enclosing scope (IsolatedFromAbove) |
+//! | `E109`      | error    | Ambiguous column reference (declared vs pass-through in open row) |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
 //! | `W002`      | warning  | Node names differ only in case                       |
 //! | `W100`      | warning  | Aggregate lowering deferred (Phase 16b Wave 3 stub)  |
+//! | `W101`      | warning  | Pass-through column shadowed by composition body column |
+//! | `W102`      | warning  | Composition signature validation (required+default contradiction, suspicious port) |
 
 use std::fmt;
 
@@ -304,5 +314,24 @@ mod diagnostic_tests {
         assert_eq!(diag.primary.label.as_deref(), Some("first defined here"));
         assert_eq!(diag.secondary.len(), 1);
         assert_eq!(diag.help.as_deref(), Some("rename one of the nodes"));
+    }
+
+    #[test]
+    fn test_error_registry_e101_through_e108_documented() {
+        let source = include_str!("error.rs");
+        for code in [
+            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E109",
+        ] {
+            let pattern = format!("`{code}`");
+            assert!(
+                source.contains(&pattern),
+                "error.rs registry missing entry for {code}"
+            );
+        }
+        // Also verify W101 is registered
+        assert!(
+            source.contains("`W101`"),
+            "error.rs registry missing entry for W101"
+        );
     }
 }

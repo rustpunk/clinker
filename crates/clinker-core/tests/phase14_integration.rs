@@ -79,7 +79,11 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::Execution
     )]);
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
+        &clinker_core::config::PipelineConfig::compile(
+            &config,
+            &clinker_core::config::CompileContext::default(),
+        )
+        .expect("compile"),
         readers,
         writers,
         &params,
@@ -115,7 +119,11 @@ fn run_multi(
         .collect();
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
+        &clinker_core::config::PipelineConfig::compile(
+            &config,
+            &clinker_core::config::CompileContext::default(),
+        )
+        .expect("compile"),
         readers,
         writers,
         &params,
@@ -371,7 +379,11 @@ nodes:
     )]);
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
+        &clinker_core::config::PipelineConfig::compile(
+            &config,
+            &clinker_core::config::CompileContext::default(),
+        )
+        .expect("compile"),
         readers,
         writers,
         &params,
@@ -500,7 +512,11 @@ nodes:
     )]);
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
+        &clinker_core::config::PipelineConfig::compile(
+            &config,
+            &clinker_core::config::CompileContext::default(),
+        )
+        .expect("compile"),
         readers,
         writers,
         &params,
@@ -636,7 +652,11 @@ nodes:
     )]);
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(&config).expect("compile"),
+        &clinker_core::config::PipelineConfig::compile(
+            &config,
+            &clinker_core::config::CompileContext::default(),
+        )
+        .expect("compile"),
         readers,
         writers,
         &params,

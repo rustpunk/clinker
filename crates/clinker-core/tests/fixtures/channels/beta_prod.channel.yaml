@@ -1,0 +1,12 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Second pipeline target, production bindings.
+channel:
+  name: beta_prod
+  target: ./pipelines/composition_pipeline.yaml
+config:
+  default:
+    batch_size: 5000
+  fixed:
+    region: "us-east-1"
+    api_key: "beta-prod-key"

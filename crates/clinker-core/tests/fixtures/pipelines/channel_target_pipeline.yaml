@@ -1,0 +1,34 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Target of acme_prod, acme_staging, and empty_defaults channels.
+pipeline:
+  name: channel_target_pipeline
+nodes:
+  - type: source
+    name: ingest_src
+    config:
+      name: ingest_src
+      type: csv
+      path: data/ingest.csv
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+        - { name: amount, type: numeric }
+
+  - type: composition
+    name: enrich1
+    input: ingest_src
+    use: ../compositions/customer_enrich.comp.yaml
+    inputs:
+      customers: ingest_src
+    config:
+      fuzzy_threshold: 0.8
+      lookup_table: "default-lookup.csv"
+
+  - type: output
+    name: sink
+    input: enrich1
+    config:
+      name: sink
+      type: csv
+      path: data/channel_output.csv

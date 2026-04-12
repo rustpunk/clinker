@@ -334,7 +334,7 @@ nodes:
     type: csv
     path: /tmp/clinker_test_out.csv
 "#;
-        let config = config::parse_config(yaml).unwrap();
+        let _config = config::parse_config(yaml).unwrap();
         let result: Result<_, PipelineError> = Err(PipelineError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "file not found",
@@ -507,7 +507,7 @@ emit out_name = name
 emit out_dept = dept"#,
         );
         let csv = "name,dept\nAlice,Eng\nBob,Sales\nAlice,Eng\nBob,HR\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, _output) = run_pipeline(&yaml, csv).unwrap();
         assert_eq!(counters.ok_count, 3); // Alice+Eng, Bob+Sales, Bob+HR are unique
         assert_eq!(counters.distinct_count, 1); // Alice+Eng duplicate
     }
@@ -785,5 +785,397 @@ emit out_code = code"#,
         // Row 1: empty string "", Row 2: "foo", Row 3: empty string "" (dup), Row 4: "bar"
         assert_eq!(counters.ok_count, 3); // "", "foo", "bar"
         assert_eq!(counters.distinct_count, 1); // second ""
+    }
+
+    // ── Lookup enrichment tests ──
+
+    /// Helper: run executor with multiple named in-memory CSV sources.
+    fn run_multi_source_pipeline(
+        yaml: &str,
+        sources: &[(&str, &str)],
+    ) -> Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+        let config = config::parse_config(yaml).unwrap();
+        let output_buf = SharedBuffer::new();
+
+        let mut readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::new();
+        for (name, data) in sources {
+            readers.insert(
+                name.to_string(),
+                Box::new(std::io::Cursor::new(data.as_bytes().to_vec()))
+                    as Box<dyn std::io::Read + Send>,
+            );
+        }
+
+        let first_output = config.output_configs().next().unwrap().name.clone();
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            first_output,
+            Box::new(output_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(|v| config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+            shutdown_token: None,
+        };
+
+        let report =
+            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+
+        let output = output_buf.as_string();
+        Ok((report.counters, report.dlq_entries, output))
+    }
+
+    /// Equality lookup: enrich orders with product names.
+    #[test]
+    fn test_lookup_equality() {
+        let yaml = r#"
+pipeline:
+  name: lookup_eq
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "product_id == products.product_id"
+      cxl: |
+        emit order_id = order_id
+        emit product_name = products.product_name
+        emit quantity = quantity
+
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        let orders = "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\n";
+        let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
+
+        let (counters, dlq, output) =
+            run_multi_source_pipeline(yaml, &[("orders", orders), ("products", products)]).unwrap();
+
+        assert_eq!(counters.total_count, 2);
+        assert_eq!(counters.ok_count, 2);
+        assert!(dlq.is_empty());
+        assert!(output.contains("Widget"), "output: {output}");
+        assert!(output.contains("Gadget"), "output: {output}");
+    }
+
+    /// Range lookup: classify employees by pay bands.
+    #[test]
+    fn test_lookup_range_predicate() {
+        let yaml = r#"
+pipeline:
+  name: lookup_range
+
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: ee_group, type: string }
+        - { name: pay, type: int }
+
+  - type: source
+    name: rate_bands
+    config:
+      name: rate_bands
+      type: csv
+      path: rate_bands.csv
+      schema:
+        - { name: ee_group, type: string }
+        - { name: min_pay, type: int }
+        - { name: max_pay, type: int }
+        - { name: rate_class, type: string }
+
+  - type: transform
+    name: classify
+    input: employees
+    config:
+      lookup:
+        source: rate_bands
+        where: |
+          ee_group == rate_bands.ee_group
+          and pay >= rate_bands.min_pay
+          and pay <= rate_bands.max_pay
+      cxl: |
+        emit employee_id = employee_id
+        emit rate_class = rate_bands.rate_class
+
+  - type: output
+    name: result
+    input: classify
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        let employees =
+            "employee_id,ee_group,pay\nE001,exempt,75000\nE002,hourly,35000\nE003,exempt,120000\n";
+        let rate_bands = "ee_group,min_pay,max_pay,rate_class\nexempt,50000,80000,tier_1\nexempt,80001,150000,tier_2\nhourly,20000,50000,tier_3\n";
+
+        let (counters, dlq, output) = run_multi_source_pipeline(
+            yaml,
+            &[("employees", employees), ("rate_bands", rate_bands)],
+        )
+        .unwrap();
+
+        assert_eq!(counters.total_count, 3);
+        assert_eq!(counters.ok_count, 3);
+        assert!(dlq.is_empty());
+        assert!(output.contains("tier_1"), "E001 should be tier_1: {output}");
+        assert!(output.contains("tier_3"), "E002 should be tier_3: {output}");
+        assert!(output.contains("tier_2"), "E003 should be tier_2: {output}");
+    }
+
+    /// on_miss: skip — unmatched records are dropped.
+    #[test]
+    fn test_lookup_on_miss_skip() {
+        let yaml = r#"
+pipeline:
+  name: lookup_skip
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "product_id == products.product_id"
+        on_miss: skip
+      cxl: |
+        emit order_id = order_id
+        emit product_name = products.product_name
+
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        let orders = "order_id,product_id\nORD-1,PROD-A\nORD-2,PROD-MISSING\nORD-3,PROD-A\n";
+        let products = "product_id,product_name\nPROD-A,Widget\n";
+
+        let (counters, _dlq, output) =
+            run_multi_source_pipeline(yaml, &[("orders", orders), ("products", products)]).unwrap();
+
+        assert_eq!(counters.total_count, 3);
+        assert_eq!(counters.ok_count, 2);
+        assert_eq!(counters.filtered_count, 1);
+        assert!(!output.contains("PROD-MISSING"), "skipped: {output}");
+    }
+
+    /// match: all — one input record fans out to multiple output records.
+    #[test]
+    fn test_lookup_match_all_fan_out() {
+        let yaml = r#"
+pipeline:
+  name: lookup_fan_out
+
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+
+  - type: source
+    name: benefits
+    config:
+      name: benefits
+      type: csv
+      path: benefits.csv
+      schema:
+        - { name: department, type: string }
+        - { name: benefit_name, type: string }
+
+  - type: transform
+    name: expand
+    input: employees
+    config:
+      lookup:
+        source: benefits
+        where: "department == benefits.department"
+        match: all
+      cxl: |
+        emit employee_id = employee_id
+        emit benefit = benefits.benefit_name
+
+  - type: output
+    name: result
+    input: expand
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        // engineering has 2 benefits, sales has 1
+        let employees = "employee_id,department\nE001,engineering\nE002,sales\nE003,engineering\n";
+        let benefits = "department,benefit_name\nengineering,health_plan\nengineering,stock_options\nsales,commission\n";
+
+        let (counters, dlq, output) =
+            run_multi_source_pipeline(yaml, &[("employees", employees), ("benefits", benefits)])
+                .unwrap();
+
+        // E001 → 2 records (health_plan, stock_options)
+        // E002 → 1 record (commission)
+        // E003 → 2 records (health_plan, stock_options)
+        // Total input: 3, total output: 5
+        eprintln!("OUTPUT:\n{output}");
+        eprintln!(
+            "COUNTERS: total={} ok={} filtered={} distinct={} dlq={}",
+            counters.total_count,
+            counters.ok_count,
+            counters.filtered_count,
+            counters.distinct_count,
+            counters.dlq_count
+        );
+        assert_eq!(counters.total_count, 3);
+        assert_eq!(counters.ok_count, 5, "fan-out: 2+1+2 = 5 output records");
+        assert!(dlq.is_empty());
+
+        // Count occurrences
+        let health_count = output.matches("health_plan").count();
+        let stock_count = output.matches("stock_options").count();
+        let commission_count = output.matches("commission").count();
+        assert_eq!(health_count, 2, "E001+E003 each get health_plan: {output}");
+        assert_eq!(stock_count, 2, "E001+E003 each get stock_options: {output}");
+        assert_eq!(commission_count, 1, "E002 gets commission: {output}");
+    }
+
+    /// match: all with on_miss: skip — unmatched records dropped, matched fan out.
+    #[test]
+    fn test_lookup_match_all_with_on_miss_skip() {
+        let yaml = r#"
+pipeline:
+  name: lookup_fan_out_skip
+
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+
+  - type: source
+    name: benefits
+    config:
+      name: benefits
+      type: csv
+      path: benefits.csv
+      schema:
+        - { name: department, type: string }
+        - { name: benefit_name, type: string }
+
+  - type: transform
+    name: expand
+    input: employees
+    config:
+      lookup:
+        source: benefits
+        where: "department == benefits.department"
+        match: all
+        on_miss: skip
+      cxl: |
+        emit employee_id = employee_id
+        emit benefit = benefits.benefit_name
+
+  - type: output
+    name: result
+    input: expand
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+
+        // legal department has no benefits → skipped
+        let employees = "employee_id,department\nE001,engineering\nE002,legal\n";
+        let benefits =
+            "department,benefit_name\nengineering,health_plan\nengineering,stock_options\n";
+
+        let (counters, _dlq, output) =
+            run_multi_source_pipeline(yaml, &[("employees", employees), ("benefits", benefits)])
+                .unwrap();
+
+        assert_eq!(counters.total_count, 2);
+        assert_eq!(counters.ok_count, 2, "E001 fans out to 2 records");
+        assert_eq!(counters.filtered_count, 1, "E002 skipped (no benefits)");
+        assert!(
+            !output.contains("legal"),
+            "legal should be skipped: {output}"
+        );
     }
 }

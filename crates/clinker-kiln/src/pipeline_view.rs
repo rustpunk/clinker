@@ -305,14 +305,11 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             description: header.description.clone(),
             error_message: None,
         },
-        PipelineNode::Composition {
-            header,
-            config: body,
-        } => StageView {
+        PipelineNode::Composition { header, r#use, .. } => StageView {
             id: header.name.clone(),
             label: header.name.clone(),
             kind,
-            subtitle: format!("use: {} (Phase 16c)", body.r#use.display()),
+            subtitle: format!("use: {} (Phase 16c)", r#use.display()),
             canvas_x: x,
             canvas_y: y,
             cxl_source: None,
@@ -540,6 +537,60 @@ fn cxl_subtitle(cxl: &str) -> String {
         .collect()
 }
 
+/// Derive canvas nodes from a `BoundBody`'s `PlanNode` list.
+///
+/// Used when drilled into a composition: the sub-canvas renders the
+/// composition's internal nodes. Layout is a simple left-to-right chain.
+pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) -> PipelineView {
+    use clinker_core::plan::execution::PlanNode;
+
+    let mut stages = Vec::with_capacity(body.nodes.len());
+
+    for (idx, plan_node) in body.nodes.iter().enumerate() {
+        let x = LEFT_MARGIN + idx as f32 * (NODE_WIDTH + NODE_GAP);
+        let y = BASE_Y;
+
+        let (id, kind, subtitle) = match plan_node {
+            PlanNode::Source { name, .. } => (name.clone(), StageKind::Source, String::new()),
+            PlanNode::Transform { name, .. } => (name.clone(), StageKind::Transform, String::new()),
+            PlanNode::Route { name, mode, .. } => {
+                (name.clone(), StageKind::Route, format!("{mode:?}"))
+            }
+            PlanNode::Merge { name, .. } => (name.clone(), StageKind::Merge, String::new()),
+            PlanNode::Output { name, .. } => (name.clone(), StageKind::Output, String::new()),
+            PlanNode::Sort { name, .. } => (name.clone(), StageKind::Transform, "sort".into()),
+            PlanNode::Aggregation { name, strategy, .. } => {
+                (name.clone(), StageKind::Aggregate, format!("{strategy:?}"))
+            }
+            PlanNode::Composition { name, .. } => {
+                (name.clone(), StageKind::Composition, String::new())
+            }
+        };
+
+        stages.push(StageView {
+            id,
+            label: plan_node.name().to_string(),
+            kind,
+            subtitle,
+            canvas_x: x,
+            canvas_y: y,
+            cxl_source: None,
+            description: None,
+            error_message: None,
+        });
+    }
+
+    // Simple sequential connections for body nodes
+    let connections: Vec<(usize, usize)> = (0..stages.len().saturating_sub(1))
+        .map(|i| (i, i + 1))
+        .collect();
+
+    PipelineView {
+        stages,
+        connections,
+    }
+}
+
 #[cfg(test)]
 mod task_16b_5_tests {
     use super::*;
@@ -707,8 +758,7 @@ nodes:
   - type: composition
     name: sub
     input: src
-    config:
-      use: compositions/clean_names.comp.yaml
+    use: compositions/clean_names.comp.yaml
 "#;
         let config = parse_config(yaml).expect("composition stub parses");
         let view = derive_pipeline_view(&config);

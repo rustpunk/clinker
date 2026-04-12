@@ -1,0 +1,36 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# 1 input, 1 output, 3 config params. Models DLQ reshaping pattern.
+_compose:
+  name: dlq_shape
+  inputs:
+    failed_records:
+      schema:
+        - { name: payload, type: string }
+        - { name: error_code, type: string }
+  outputs:
+    shaped: stamp_topic.out
+  config_schema:
+    max_retries:
+      type: int
+      default: 3
+    dlq_topic:
+      type: string
+      required: true
+    error_category:
+      type: string
+      default: "unclassified"
+
+nodes:
+  - type: transform
+    name: add_retry_metadata
+    input: failed_records
+    config:
+      cxl: |
+        emit retry_count = 0
+  - type: transform
+    name: stamp_topic
+    input: add_retry_metadata
+    config:
+      cxl: |
+        emit topic = "default-dlq"

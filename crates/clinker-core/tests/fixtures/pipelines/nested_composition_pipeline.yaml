@@ -1,0 +1,35 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Uses nested_caller (which uses address_normalize internally).
+pipeline:
+  name: nested_composition_pipeline
+nodes:
+  - type: source
+    name: raw_src
+    config:
+      name: raw_src
+      type: csv
+      path: data/raw_records.csv
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+
+  - type: composition
+    name: nested_process
+    input: raw_src
+    use: ../compositions/nested_caller.comp.yaml
+    inputs:
+      raw: raw_src
+    config:
+      strict_mode: false
+
+  - type: output
+    name: final_out
+    input: nested_process
+    config:
+      name: final_out
+      type: csv
+      path: data/nested_output.csv

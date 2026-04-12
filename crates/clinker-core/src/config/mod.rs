@@ -1,11 +1,19 @@
-pub mod cxl_compile;
+pub mod compile_context;
+pub mod composition;
 pub mod node_header;
 pub mod pipeline_node;
 
+pub use compile_context::CompileContext;
+pub use composition::{
+    CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, NodeRef, OutputAlias,
+    ParamDecl, ParamName, ParamType, PortDecl, PortName, ProvenanceDb, ProvenanceLayer,
+    ResolvedValue, Resource, ResourceDecl, ResourceKind, ResourceName, SourceMap, SpannedNodeRef,
+    WORKSPACE_COMPOSITION_BUDGET, scan_workspace_signatures, validate_signatures,
+};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use pipeline_node::{
-    AggregateBody, AnalyticWindowSpec, CompositionBody, MergeBody, OutputBody, PipelineNode,
-    RouteBody, SourceBody, TransformBody,
+    AggregateBody, AnalyticWindowSpec, MergeBody, OutputBody, PipelineNode, RouteBody, SourceBody,
+    TransformBody,
 };
 
 use crate::yaml::Spanned;
@@ -992,7 +1000,7 @@ impl PipelineConfig {
     /// matching the rustc `Session::has_errors` pattern. Self-loops
     /// are routed to the dedicated E002 check before general cycle
     /// detection so the diagnostic message is more actionable.
-    pub fn compile_topology_only(&self) -> Vec<crate::error::Diagnostic> {
+    pub fn compile_topology_only(&self, ctx: &CompileContext) -> Vec<crate::error::Diagnostic> {
         use crate::error::{Diagnostic, LabeledSpan};
         use crate::graph::NameGraph;
         use crate::span::Span;
@@ -1125,7 +1133,8 @@ impl PipelineConfig {
         // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
         // the legacy projection. Wave 2 walks `nodes:` directly.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let allow_absolute = std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
+        let allow_absolute =
+            ctx.allow_absolute_paths || std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
         diags.extend(crate::security::validate_all_config_paths(
             self,
             &cwd,
@@ -1213,23 +1222,39 @@ impl PipelineConfig {
     /// legacy planner.
     ///
     /// On error, returns the accumulated diagnostics from the topology
-    /// pre-pass plus any per-variant lowering errors. Composition nodes
-    /// emit a single `E100` diagnostic per instance and do **not** abort
-    /// the lowering walk (the rest of the pipeline still lowers cleanly).
-    pub fn compile(&self) -> Result<crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>> {
+    /// pre-pass plus any per-variant lowering errors. Composition binding
+    /// errors (E102–E109) are non-fatal — the composition node is silently
+    /// omitted from the DAG.
+    pub fn compile(
+        &self,
+        ctx: &CompileContext,
+    ) -> Result<crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>> {
+        let (plan, _warnings) = self.compile_with_diagnostics(ctx)?;
+        Ok(plan)
+    }
+
+    /// Like [`compile`], but also returns non-fatal diagnostics (warnings)
+    /// that were collected during compilation. On error, all diagnostics
+    /// (errors + warnings) are in the `Err` variant as before.
+    pub fn compile_with_diagnostics(
+        &self,
+        ctx: &CompileContext,
+    ) -> Result<
+        (crate::plan::CompiledPlan, Vec<crate::error::Diagnostic>),
+        Vec<crate::error::Diagnostic>,
+    > {
+        use crate::config::composition::scan_workspace_signatures;
         use crate::error::{Diagnostic, LabeledSpan};
         use crate::plan::CompiledPlan;
         use crate::plan::execution::{
-            DependencyType, ExecutionPlanDag, NodeExecutionReqs, ParallelismClass,
-            ParallelismProfile, PlanEdge, PlanNode, PlanOutputPayload, PlanSourcePayload,
-            PlanTransformPayload,
+            DependencyType, ExecutionPlanDag, ParallelismProfile, PlanEdge, PlanNode,
         };
         use crate::span::Span;
         use petgraph::graph::{DiGraph, NodeIndex};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         // Stage 1-4: name/topology/path validation pre-pass.
-        let mut diags = self.compile_topology_only();
+        let mut diags = self.compile_topology_only(ctx);
         // Hard-error stop: stages 1-4 already collected; stage 5
         // refuses to lower if any error-severity diagnostic is present.
         let has_errors = diags
@@ -1239,17 +1264,61 @@ impl PipelineConfig {
             return Err(diags);
         }
 
+        // Stage 4.4: Phase 16c.1 Task 16c.1.3 — workspace composition scan.
+        // If this pipeline has any composition nodes, scan the workspace
+        // root resolved in `ctx` for `.comp.yaml` signatures and append
+        // any scan-level diagnostics (E101) to the compile diagnostics
+        // list. Pipelines without compositions skip the scan entirely so
+        // non-composition tests and benches are not coupled to workspace
+        // fixture validity.
+        //
+        // The resulting symbol table is built and dropped here — Phase 2
+        // body resolution (16c.2) will carry it forward onto CompiledPlan.
+        let has_compositions = self
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.value, PipelineNode::Composition { .. }));
+        let symbol_table: crate::config::composition::CompositionSymbolTable = if has_compositions {
+            match scan_workspace_signatures(ctx.workspace_root()) {
+                Ok(table) => std::sync::Arc::try_unwrap(table).unwrap_or_else(|arc| (*arc).clone()),
+                Err(mut scan_diags) => {
+                    diags.append(&mut scan_diags);
+                    let has_errors = diags
+                        .iter()
+                        .any(|d| matches!(d.severity, crate::error::Severity::Error));
+                    if has_errors {
+                        return Err(diags);
+                    }
+                    indexmap::IndexMap::new()
+                }
+            }
+        } else {
+            indexmap::IndexMap::new()
+        };
+
         // Stage 4.5: Phase 16b Task 16b.9 — compile-time CXL typecheck.
         // Walks `self.nodes` in declaration order (topologically sound
         // per stage-3 validation), seeds each source's schema from its
         // author-declared `schema:` block, and typechecks every
         // CXL-bearing node against the propagated upstream schema.
         // E200 diagnostics surface here with per-node spans.
-        let artifacts = crate::config::cxl_compile::run(&self.nodes, &mut diags);
-        let has_errors = diags
-            .iter()
-            .any(|d| matches!(d.severity, crate::error::Severity::Error));
-        if has_errors {
+        // Phase 16c.2: also recurses into composition bodies via
+        // bind_composition, populating CompileArtifacts.composition_bodies.
+        let artifacts = crate::plan::bind_schema::bind_schema(
+            &self.nodes,
+            &mut diags,
+            ctx,
+            &symbol_table,
+            &ctx.pipeline_dir,
+        );
+        // Only abort on non-composition CXL errors (E200/E201). Composition
+        // binding errors (E102–E109) are non-fatal for the rest of the
+        // pipeline — the composition node is omitted from the DAG.
+        let has_cxl_errors = diags.iter().any(|d| {
+            matches!(d.severity, crate::error::Severity::Error)
+                && (d.code == "E200" || d.code == "E201")
+        });
+        if has_cxl_errors {
             return Err(diags);
         }
 
@@ -1280,87 +1349,7 @@ impl PipelineConfig {
             };
             let node = &spanned.value;
             let name = node.name().to_string();
-            let plan_node = match node {
-                PipelineNode::Source { config, .. } => Some(PlanNode::Source {
-                    name: name.clone(),
-                    span,
-                    resolved: Some(Box::new(PlanSourcePayload {
-                        source: config.source.clone(),
-                        validated_path: None,
-                    })),
-                }),
-                PipelineNode::Transform { config, .. } => {
-                    // Task 16b.9: every Transform has a typed program
-                    // by construction — stage 4.5 returned Err if any
-                    // typecheck failed, so the lookup is infallible.
-                    let typed = artifacts
-                        .typed
-                        .get(&name)
-                        .expect("cxl_compile must produce typed program for every transform")
-                        .clone();
-                    Some(PlanNode::Transform {
-                        name: name.clone(),
-                        span,
-                        resolved: Some(Box::new(PlanTransformPayload {
-                            analytic_window: config.analytic_window.clone(),
-                            log: config.log.clone().unwrap_or_default(),
-                            validations: config.validations.clone().unwrap_or_default(),
-                            dlq_node: None,
-                            typed,
-                        })),
-                        parallelism_class: ParallelismClass::Stateless,
-                        tier: 0,
-                        execution_reqs: NodeExecutionReqs::Streaming,
-                        window_index: None,
-                        partition_lookup: None,
-                        write_set: BTreeSet::new(),
-                        has_distinct: false,
-                    })
-                }
-                PipelineNode::Output { config, .. } => Some(PlanNode::Output {
-                    name: name.clone(),
-                    span,
-                    resolved: Some(Box::new(PlanOutputPayload {
-                        output: config.output.clone(),
-                        validated_path: None,
-                    })),
-                }),
-                PipelineNode::Route { config, .. } => Some(PlanNode::Route {
-                    name: name.clone(),
-                    span,
-                    mode: config.mode,
-                    branches: config.conditions.keys().cloned().collect(),
-                    default: config.default.clone(),
-                }),
-                PipelineNode::Merge { .. } => Some(PlanNode::Merge {
-                    name: name.clone(),
-                    span,
-                }),
-                PipelineNode::Composition { .. } => {
-                    // E100: Composition stub. One diagnostic per instance.
-                    // Lowering does NOT abort — the rest of the pipeline
-                    // continues. The Composition node itself is omitted
-                    // from the lowered DAG (Phase 16c will lower it).
-                    diags.push(Diagnostic::error(
-                        "E100",
-                        format!("composition node {name:?} is not yet supported (Phase 16c)"),
-                        LabeledSpan::primary(span, String::new()),
-                    ));
-                    None
-                }
-                PipelineNode::Aggregate { .. } => {
-                    // Aggregate lowering deferred to Wave 3 (requires CXL
-                    // type-checking to build CompiledAggregate). For now
-                    // we record a stub diagnostic at warning severity so
-                    // it surfaces in --explain but does not block compile.
-                    diags.push(Diagnostic::warning(
-                        "W100",
-                        format!("aggregate node {name:?} lowering deferred to Phase 16b Wave 3"),
-                        LabeledSpan::primary(span, String::new()),
-                    ));
-                    None
-                }
-            };
+            let plan_node = lower_node_to_plan_node(node, &name, span, &artifacts, &mut diags);
             if let Some(pn) = plan_node {
                 let idx = graph.add_node(pn);
                 name_to_idx.insert(name, idx);
@@ -1453,33 +1442,19 @@ impl PipelineConfig {
             node_properties: HashMap::new(),
         };
 
-        // If lowering accumulated any error-severity diagnostics
-        // (Composition E100s do not block; warnings do not block),
-        // return them; otherwise yield the CompiledPlan and discard
-        // warning-only diagnostics by surfacing them via the plan's
-        // future explain hook (Wave 3).
-        let any_errors = diags
-            .iter()
-            .any(|d| matches!(d.severity, crate::error::Severity::Error));
-        if any_errors {
-            // E100s ARE errors per the registry but they explicitly do
-            // NOT abort lowering — the test
-            // `test_compile_composition_does_not_abort` enforces this.
-            // We still return the CompiledPlan so callers can inspect
-            // the rest of the topology, but per the directive's gate
-            // tests we wrap that in Ok(...) and let the diagnostics
-            // surface via the rendering layer in 16b.6. For now, the
-            // tests check (a) one diagnostic per Composition instance
-            // and (b) the Composition does not abort lowering — both
-            // achieved by returning Ok(plan) here regardless of E100
-            // count, with the diagnostics carried out-of-band in a
-            // future enrichment of CompiledPlan. Because the current
-            // CompiledPlan struct does not yet hold diagnostics, the
-            // lowering tests use `compile_with_diagnostics` instead.
-            let _ = any_errors;
+        // If lowering accumulated any non-composition error-severity
+        // diagnostics, return them. Composition binding errors
+        // (E102–E109) are non-fatal — the composition node is silently
+        // omitted from the DAG. Warnings do not block.
+        let has_fatal_errors = diags.iter().any(|d| {
+            matches!(d.severity, crate::error::Severity::Error) && !d.code.starts_with("E10")
+        });
+        if has_fatal_errors {
+            return Err(diags);
         }
 
-        Ok(CompiledPlan::new(dag, self.clone(), artifacts))
+        let plan = CompiledPlan::new(dag, self.clone(), artifacts);
+        Ok((plan, diags))
     }
 }
 
@@ -1487,6 +1462,110 @@ fn input_target(input: &node_header::NodeInput) -> &str {
     match input {
         node_header::NodeInput::Single(s) => s.as_str(),
         node_header::NodeInput::Port { node, .. } => node.as_str(),
+    }
+}
+
+/// Lower a single `PipelineNode` into its `PlanNode` counterpart.
+///
+/// Returns `None` for variants that are not yet lowered (Aggregate stub)
+/// or for compositions whose binding failed (no body assignment in
+/// `artifacts`). Called from `PipelineConfig::compile()` Stage 5 for
+/// top-level nodes and from `bind_composition` for body nodes.
+pub(crate) fn lower_node_to_plan_node(
+    node: &PipelineNode,
+    name: &str,
+    span: crate::span::Span,
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<crate::error::Diagnostic>,
+) -> Option<crate::plan::execution::PlanNode> {
+    use crate::error::{Diagnostic, LabeledSpan};
+    use crate::plan::composition_body::CompositionBodyId;
+    use crate::plan::execution::{
+        NodeExecutionReqs, ParallelismClass, PlanNode, PlanOutputPayload, PlanSourcePayload,
+        PlanTransformPayload,
+    };
+    use std::collections::BTreeSet;
+
+    match node {
+        PipelineNode::Source { config, .. } => Some(PlanNode::Source {
+            name: name.to_string(),
+            span,
+            resolved: Some(Box::new(PlanSourcePayload {
+                source: config.source.clone(),
+                validated_path: None,
+            })),
+        }),
+        PipelineNode::Transform { config, .. } => {
+            // Missing typed program means bind_schema hit a CXL error
+            // (E108, E200, etc.) on this node — skip lowering.
+            let typed = match artifacts.typed.get(name) {
+                Some(t) => t.clone(),
+                None => return None,
+            };
+            Some(PlanNode::Transform {
+                name: name.to_string(),
+                span,
+                resolved: Some(Box::new(PlanTransformPayload {
+                    analytic_window: config.analytic_window.clone(),
+                    log: config.log.clone().unwrap_or_default(),
+                    validations: config.validations.clone().unwrap_or_default(),
+                    dlq_node: None,
+                    typed,
+                })),
+                parallelism_class: ParallelismClass::Stateless,
+                tier: 0,
+                execution_reqs: NodeExecutionReqs::Streaming,
+                window_index: None,
+                partition_lookup: None,
+                write_set: BTreeSet::new(),
+                has_distinct: false,
+            })
+        }
+        PipelineNode::Output { config, .. } => Some(PlanNode::Output {
+            name: name.to_string(),
+            span,
+            resolved: Some(Box::new(PlanOutputPayload {
+                output: config.output.clone(),
+                validated_path: None,
+            })),
+        }),
+        PipelineNode::Route { config, .. } => Some(PlanNode::Route {
+            name: name.to_string(),
+            span,
+            mode: config.mode,
+            branches: config.conditions.keys().cloned().collect(),
+            default: config.default.clone(),
+        }),
+        PipelineNode::Merge { .. } => Some(PlanNode::Merge {
+            name: name.to_string(),
+            span,
+        }),
+        PipelineNode::Composition { .. } => {
+            // Look up the body assigned by bind_composition. If binding
+            // failed (E102–E109), there's no entry — silently omit the
+            // node (the binding errors already surfaced in Stage 4.5).
+            let body_id = artifacts
+                .composition_body_assignments
+                .get(name)
+                .copied()
+                .unwrap_or(CompositionBodyId::SENTINEL);
+            if body_id == CompositionBodyId::SENTINEL {
+                return None;
+            }
+            Some(PlanNode::Composition {
+                name: name.to_string(),
+                span,
+                body: body_id,
+            })
+        }
+        PipelineNode::Aggregate { .. } => {
+            diags.push(Diagnostic::warning(
+                "W100",
+                format!("aggregate node {name:?} lowering deferred to Phase 16b Wave 3"),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            None
+        }
     }
 }
 

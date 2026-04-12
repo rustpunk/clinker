@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::pipeline_view::{NODE_HEIGHT, NODE_WIDTH, StageKind, StageView};
-use crate::state::use_app_state;
+use crate::state::{CompositionDrillFrame, use_app_state};
 
 /// A single pipeline stage rendered as a rustpunk node card on the canvas.
 #[component]
@@ -10,15 +10,23 @@ pub fn CanvasNode(stage: StageView) -> Element {
     let kind_attr = stage.kind.kind_attr();
     let badge = stage.kind.badge_label();
     let stage_id = stage.id.clone();
+    let is_composition = matches!(&stage.kind, StageKind::Composition);
 
-    let is_selected = (state.selected_stage)().as_deref() == Some(stage_id.as_str());
+    let is_selected = state.selected_stages.read().contains(stage_id.as_str());
     let is_error = matches!(&stage.kind, StageKind::Error);
 
-    let node_class = match (is_selected, is_error) {
-        (true, true) => "kiln-node kiln-node--selected kiln-node--error",
-        (false, true) => "kiln-node kiln-node--error",
-        (true, false) => "kiln-node kiln-node--selected",
-        (false, false) => "kiln-node",
+    let node_class = match (is_selected, is_error, is_composition) {
+        (_, _, true) => {
+            if is_selected {
+                "kiln-node kiln-node--selected kiln-node--composition"
+            } else {
+                "kiln-node kiln-node--composition"
+            }
+        }
+        (true, true, _) => "kiln-node kiln-node--selected kiln-node--error",
+        (false, true, _) => "kiln-node kiln-node--error",
+        (true, false, _) => "kiln-node kiln-node--selected",
+        (false, false, _) => "kiln-node",
     };
 
     let border_style = format!(
@@ -43,12 +51,26 @@ pub fn CanvasNode(stage: StageView) -> Element {
                 let stage_id = stage_id.clone();
                 move |e: MouseEvent| {
                     e.stop_propagation();
-                    let mut sel = state.selected_stage;
-                    let current = sel.peek().clone();
-                    if current.as_deref() == Some(stage_id.as_str()) {
-                        sel.set(None);
+                    let mut sel = state.selected_stages;
+                    let shift = e.data().modifiers().shift();
+                    if shift {
+                        // Shift+click: toggle this node in the multi-select set.
+                        let mut set = sel.write();
+                        if set.contains(stage_id.as_str()) {
+                            set.remove(stage_id.as_str());
+                        } else {
+                            set.insert(stage_id.clone());
+                        }
                     } else {
-                        sel.set(Some(stage_id.clone()));
+                        // Regular click: single-select toggle.
+                        let current = sel.read().clone();
+                        if current.len() == 1 && current.contains(stage_id.as_str()) {
+                            sel.set(std::collections::HashSet::new());
+                        } else {
+                            let mut set = std::collections::HashSet::new();
+                            set.insert(stage_id.clone());
+                            sel.set(set);
+                        }
                     }
                 }
             },
@@ -63,6 +85,23 @@ pub fn CanvasNode(stage: StageView) -> Element {
             hr { class: "kiln-rust-line" }
             div { class: "kiln-node-subtitle", "{stage.subtitle}" }
 
+            // Drill-in button for composition nodes
+            if is_composition {
+                button {
+                    class: "kiln-node-drill-btn",
+                    title: "Drill into composition",
+                    onclick: {
+                        let stage_id = stage.id.clone();
+                        let subtitle = stage.subtitle.clone();
+                        move |e: MouseEvent| {
+                            e.stop_propagation();
+                            drill_into_composition(&state, &stage_id, &subtitle);
+                        }
+                    },
+                    "▶"
+                }
+            }
+
             div {
                 class: "kiln-node-port kiln-node-port--in",
                 style: "top: {port_y}px;",
@@ -73,4 +112,32 @@ pub fn CanvasNode(stage: StageView) -> Element {
             }
         }
     }
+}
+
+/// Push a drill frame for a composition node onto the drill stack.
+fn drill_into_composition(state: &crate::state::AppState, node_name: &str, _subtitle: &str) {
+    let compiled_guard = state.compiled_plan.read();
+    let Some(plan) = compiled_guard.as_ref() else {
+        return;
+    };
+
+    // Look up the body ID from the compilation artifacts
+    let Some(&body_id) = plan.artifacts().composition_body_assignments.get(node_name) else {
+        return;
+    };
+
+    // Get the use_path from the body
+    let use_path = plan
+        .body_of(body_id)
+        .map(|b| b.signature_path.clone())
+        .unwrap_or_default();
+
+    drop(compiled_guard);
+
+    let mut drill = state.composition_drill_stack;
+    drill.write().push(CompositionDrillFrame {
+        body_id,
+        alias: node_name.to_string(),
+        use_path,
+    });
 }

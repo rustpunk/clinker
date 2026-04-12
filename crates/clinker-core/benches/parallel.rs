@@ -120,8 +120,11 @@ nodes:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    let plan =
-                        clinker_core::config::PipelineConfig::compile(&config).expect("compile");
+                    let plan = clinker_core::config::PipelineConfig::compile(
+                        &config,
+                        &clinker_core::config::CompileContext::default(),
+                    )
+                    .expect("compile");
                     let report = PipelineExecutor::run_plan_with_readers_writers(
                         &plan, readers, writers, &params,
                     )
@@ -212,8 +215,11 @@ nodes:
                         "out".to_string(),
                         Box::new(buf.clone()) as Box<dyn Write + Send>,
                     )]);
-                    let plan =
-                        clinker_core::config::PipelineConfig::compile(&config).expect("compile");
+                    let plan = clinker_core::config::PipelineConfig::compile(
+                        &config,
+                        &clinker_core::config::CompileContext::default(),
+                    )
+                    .expect("compile");
                     let report = PipelineExecutor::run_plan_with_readers_writers(
                         &plan, readers, writers, &params,
                     )

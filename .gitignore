@@ -1,6 +1,7 @@
 .claude/
 lancedb/
-docs/
+docs/internal/
+docs/book/
 target/
 examples/pipelines/output/
-docs/plans/kiln-debugger/PROGRESS-phase-01.md
+tests/e2e/

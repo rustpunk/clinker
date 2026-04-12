@@ -85,6 +85,25 @@ NDJSON archives.")]
         #[command(subcommand)]
         subcommand: MetricsCommands,
     },
+    /// Explain pipeline field provenance or error codes
+    #[command(
+        long_about = "\
+Inspect field-level provenance chains or look up error/warning code documentation.\n\n\
+Use --field to trace where a composition config value comes from across all \
+configuration layers (composition defaults, channel defaults, channel fixed). \
+Use --code to look up the documentation for a diagnostic code (E101–E110, W101).",
+        after_long_help = "\
+EXAMPLES:
+  # Show provenance for a composition config field
+  clinker explain pipeline.yaml --field enrich1.fuzzy_threshold
+
+  # Show provenance with a channel overlay applied
+  clinker explain pipeline.yaml --field enrich1.fuzzy_threshold --channel acme_prod.channel.yaml
+
+  # Look up error code documentation
+  clinker explain --code E105"
+    )]
+    Explain(ExplainArgs),
 }
 
 /// Output format for --explain.
@@ -231,6 +250,30 @@ pub struct CollectArgs {
     pub dry_run: bool,
 }
 
+/// Arguments for `clinker explain`.
+#[derive(Parser, Debug)]
+pub struct ExplainArgs {
+    /// Path to the pipeline YAML configuration file.
+    /// Not required when using --code alone.
+    pub config: Option<PathBuf>,
+
+    /// Dotted field path to explain provenance for (e.g. "enrich1.fuzzy_threshold")
+    #[arg(long)]
+    pub field: Option<String>,
+
+    /// Channel YAML file to apply before provenance lookup
+    #[arg(long)]
+    pub channel: Option<PathBuf>,
+
+    /// Error/warning code to look up (e.g. "E105")
+    #[arg(long)]
+    pub code: Option<String>,
+
+    /// Base directory for relative path resolution
+    #[arg(long, default_value = ".")]
+    pub base_dir: PathBuf,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -272,6 +315,18 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("clinker metrics error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Explain(args) => {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .init();
+            match run_explain(args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("clinker explain error: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -367,10 +422,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         })?;
 
     // 7. Existing logic: explain / dry_run / execute
+    // LD-16c-12: resolve workspace_root ONCE at the entry point.
+    // Production CLI path — never call env::current_dir() inside compile().
+    let mut compile_ctx = clinker_core::config::CompileContext::new(
+        std::env::current_dir()
+            .map_err(|e| PipelineError::Config(clinker_core::config::ConfigError::Io(e)))?,
+    );
+    compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
+
     if let Some(format) = args.explain {
         let compiled_plan =
             pipeline_config
-                .compile()
+                .compile(&compile_ctx)
                 .map_err(|diags| PipelineError::Compilation {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
@@ -439,27 +502,29 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         shutdown_token: None,
     };
 
-    // Run the pipeline using file-based I/O
+    // Run the pipeline using file-based I/O — open readers for ALL sources
+    // (primary + lookup references) and writers for ALL outputs.
     let first_source = pipeline_config
         .source_configs()
         .next()
         .expect("pipeline has at least one source");
-    let first_output = pipeline_config
-        .output_configs()
-        .next()
-        .expect("pipeline has at least one output");
     let input_path = first_source.path.clone();
-    let output_path = first_output.path.clone();
-    let input_name = first_source.name.clone();
-    let output_name = first_output.name.clone();
 
-    let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&input_path)?);
-    let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output_path)?);
+    let mut readers: std::collections::HashMap<String, Box<dyn std::io::Read + Send>> =
+        std::collections::HashMap::new();
+    for source in pipeline_config.source_configs() {
+        let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&source.path)?);
+        readers.insert(source.name.clone(), reader);
+    }
 
-    let readers = std::collections::HashMap::from([(input_name, reader)]);
-    let writers = std::collections::HashMap::from([(output_name, writer)]);
+    let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
+        std::collections::HashMap::new();
+    for output in pipeline_config.output_configs() {
+        let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output.path)?);
+        writers.insert(output.name.clone(), writer);
+    }
 
-    let compiled_plan = pipeline_config.compile().expect("compile");
+    let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,
@@ -623,6 +688,67 @@ fn hostname_string() -> String {
             std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Mode 1: --code — look up error/warning code documentation.
+    if let Some(ref code) = args.code {
+        match clinker_core::plan::explain_provenance::explain_code(code) {
+            Some(doc) => {
+                print!("{doc}");
+                return Ok(());
+            }
+            None => {
+                return Err(format!(
+                    "unknown diagnostic code '{code}'. Valid codes: E101-E108, E110, W101"
+                )
+                .into());
+            }
+        }
+    }
+
+    // Mode 2: --field — field provenance chain.
+    let config_path = args.config.as_ref().ok_or(
+        "a pipeline config path is required when using --field (usage: clinker explain pipeline.yaml --field node.param)",
+    )?;
+
+    let field = args.field.as_ref().ok_or(
+        "either --field or --code is required (usage: clinker explain pipeline.yaml --field node.param)",
+    )?;
+
+    let yaml = std::fs::read_to_string(config_path)?;
+    let interpolated = clinker_core::config::interpolate_env_vars(&yaml, &[])
+        .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
+    let pipeline_config: clinker_core::config::PipelineConfig =
+        clinker_core::yaml::from_str(&interpolated)
+            .map_err(|e| format!("YAML parse error: {e}"))?;
+
+    // Resolve workspace root and pipeline_dir so composition `use:` paths
+    // resolve correctly. The workspace root is the base_dir (default: CWD),
+    // and pipeline_dir is the config file's parent relative to workspace_root.
+    let workspace_root = args.base_dir.canonicalize()?;
+    let config_parent = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .canonicalize()?;
+    let pipeline_dir = config_parent
+        .strip_prefix(&workspace_root)
+        .unwrap_or_else(|_| std::path::Path::new(""))
+        .to_path_buf();
+    let compile_ctx =
+        clinker_core::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
+
+    let compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|diags| {
+        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        format!("compilation failed:\n{}", messages.join("\n"))
+    })?;
+
+    let output =
+        clinker_core::plan::explain_provenance::explain_field_provenance(&compiled_plan, field)
+            .map_err(|e| format!("{e}"))?;
+
+    print!("{output}");
+    Ok(())
 }
 
 #[cfg(test)]

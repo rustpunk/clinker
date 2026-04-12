@@ -5,9 +5,9 @@ use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
 use crate::pipeline_view::{
-    NODE_HEIGHT, NODE_WIDTH, derive_partial_pipeline_view, derive_pipeline_view,
+    NODE_HEIGHT, NODE_WIDTH, derive_body_view, derive_partial_pipeline_view, derive_pipeline_view,
 };
-use crate::state::use_app_state;
+use crate::state::{ChannelViewMode, use_app_state};
 
 use super::connector::Connector;
 use super::node::CanvasNode;
@@ -54,16 +54,51 @@ struct DragState {
 pub fn CanvasPanel() -> Element {
     let state = use_app_state();
 
-    let pipeline_view = match &*(state.pipeline).read() {
-        Some(config) => derive_pipeline_view(config),
-        None => match &*(state.partial_pipeline).read() {
-            Some(partial) => derive_partial_pipeline_view(partial),
+    let view_mode = *state.channel_view_mode.read();
+    let drill_stack = state.composition_drill_stack.read();
+
+    // If drilled into a composition, render the body's nodes instead of top-level.
+    let pipeline_view = if let Some(frame) = drill_stack.last() {
+        let compiled_guard = state.compiled_plan.read();
+        match compiled_guard
+            .as_ref()
+            .and_then(|plan| plan.body_of(frame.body_id))
+        {
+            Some(body) => derive_body_view(body),
             None => crate::pipeline_view::PipelineView {
                 stages: Vec::new(),
                 connections: Vec::new(),
             },
-        },
+        }
+    } else {
+        // Top-level: dispatch on view mode
+        match view_mode {
+            ChannelViewMode::Resolved => {
+                let compiled_guard = state.compiled_plan.read();
+                match compiled_guard.as_ref() {
+                    Some(plan) => derive_pipeline_view(plan.config()),
+                    None => match &*(state.pipeline).read() {
+                        Some(config) => derive_pipeline_view(config),
+                        None => crate::pipeline_view::PipelineView {
+                            stages: Vec::new(),
+                            connections: Vec::new(),
+                        },
+                    },
+                }
+            }
+            ChannelViewMode::Raw => match &*(state.pipeline).read() {
+                Some(config) => derive_pipeline_view(config),
+                None => match &*(state.partial_pipeline).read() {
+                    Some(partial) => derive_partial_pipeline_view(partial),
+                    None => crate::pipeline_view::PipelineView {
+                        stages: Vec::new(),
+                        connections: Vec::new(),
+                    },
+                },
+            },
+        }
     };
+    drop(drill_stack);
     let connections: Vec<_> = pipeline_view
         .connections
         .iter()
@@ -199,9 +234,73 @@ pub fn CanvasPanel() -> Element {
         (max_x + 80.0, max_y + 80.0)
     };
 
+    // Channel view mode toggle state
+    let tab_mgr = use_context::<crate::state::TabManagerState>();
+    let has_channel = tab_mgr
+        .channel_state
+        .read()
+        .as_ref()
+        .is_some_and(|cs| cs.active_channel.is_some());
+    let is_resolved = view_mode == ChannelViewMode::Resolved;
+
     rsx! {
         div {
             class: "kiln-canvas-column",
+
+            // ── Breadcrumb bar (composition drill-in navigation) ─────────
+            {
+                let stack = state.composition_drill_stack.read();
+                if !stack.is_empty() {
+                    let frames: Vec<_> = stack.iter().map(|f| f.alias.clone()).collect();
+                    drop(stack);
+                    rsx! {
+                        super::breadcrumbs::BreadcrumbBar {
+                            frames,
+                        }
+                    }
+                } else {
+                    drop(stack);
+                    rsx! {}
+                }
+            }
+
+            // ── Channel view mode toggle bar ─────────────────────────────
+            div {
+                class: "kiln-canvas-toolbar",
+
+                button {
+                    class: if is_resolved { "kiln-view-toggle kiln-view-toggle--active" } else { "kiln-view-toggle" },
+                    disabled: !has_channel && !is_resolved,
+                    title: if !has_channel && !is_resolved { "Select a channel to enable resolved view" } else if is_resolved { "Switch to Raw view" } else { "Switch to Resolved view" },
+                    onclick: move |_| {
+                        let mut mode = state.channel_view_mode;
+                        let current = *mode.read();
+                        mode.set(match current {
+                            ChannelViewMode::Raw => ChannelViewMode::Resolved,
+                            ChannelViewMode::Resolved => ChannelViewMode::Raw,
+                        });
+                    },
+                    span { class: "kiln-view-toggle-label",
+                        if is_resolved { "RESOLVED" } else { "RAW" }
+                    }
+                }
+
+                // ── Extract as Composition button (enabled with 2+ nodes selected) ──
+                {
+                    let count = state.selected_stages.read().len();
+                    rsx! {
+                        button {
+                            class: "kiln-view-toggle",
+                            disabled: count < 2,
+                            title: if count < 2 { "Select 2+ nodes to extract as composition" } else { "Extract selected nodes as a composition" },
+                            onclick: move |_| {
+                                // TODO: open extraction modal (Phase 16c.6.4)
+                            },
+                            span { class: "kiln-view-toggle-label", "EXTRACT" }
+                        }
+                    }
+                }
+            }
 
             div {
                 class: "kiln-canvas-panel",
@@ -215,8 +314,8 @@ pub fn CanvasPanel() -> Element {
             // Clicking empty canvas deselects any selected node.
             // Node clicks call stop_propagation(), so this only fires on empty space.
             onclick: move |_| {
-                let mut sel = state.selected_stage;
-                sel.set(None);
+                let mut sel = state.selected_stages;
+                sel.set(std::collections::HashSet::new());
             },
 
             // ── Transformed viewport ──────────────────────────────────────

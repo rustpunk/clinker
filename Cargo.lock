@@ -759,8 +759,10 @@ dependencies = [
 name = "clinker-channel"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clinker-core",
  "clinker-record",
+ "criterion",
  "indexmap",
  "serde",
  "serde-saphyr",
@@ -768,8 +770,8 @@ dependencies = [
  "serial_test",
  "tempfile",
  "thiserror 2.0.18",
- "toml",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -779,6 +781,7 @@ dependencies = [
  "ahash",
  "chrono",
  "clinker-bench-support",
+ "clinker-channel",
  "clinker-format",
  "clinker-record",
  "criterion",
@@ -802,9 +805,11 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tracing",
  "uuid",
+ "walkdir",
  "windows-sys 0.61.2",
 ]
 
@@ -1546,9 +1551,9 @@ checksum = "b99d7d199aad72431b549759550002e7d72c8a257eba500dca9fbdb2122de103"
 
 [[package]]
 name = "dioxus-desktop"
-version = "0.7.4"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df90224b51e0246bedeffe166e8ae782440dfaf45e329532a1d71afc79e0732"
+checksum = "179da7c66fcd70386f47bcff06e4b4bdb0c2ed5e7b877423ea14dc4c333bae4c"
 dependencies = [
  "async-trait",
  "base64",
@@ -3827,9 +3832,9 @@ dependencies = [
 
 [[package]]
 name = "muda"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01c1738382f66ed56b3b9c8119e794a2e23148ac8ea214eda86622d4cb9d415a"
+checksum = "7c9fec5a4e89860383d778d10563a605838f8f0b2f9303868937e5ff32e86177"
 dependencies = [
  "crossbeam-channel",
  "dpi",

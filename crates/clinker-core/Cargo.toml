@@ -30,6 +30,7 @@ ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
 petgraph = { workspace = true }
 libc = "0.2"
+walkdir = "2"
 clinker-bench-support = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -50,9 +51,11 @@ bench-alloc = ["dep:clinker-bench-support", "clinker-bench-support/bench-alloc"]
 csv = "1"
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true, features = [] }
+clinker-channel = { workspace = true }
 rayon = "1"
 fastrand = { workspace = true }
 insta = "1"
+serial_test = { workspace = true }
 
 [[bench]]
 name = "sort"
@@ -72,5 +75,13 @@ harness = false
 
 [[bench]]
 name = "parallel"
+harness = false
+
+[[bench]]
+name = "provenance"
+harness = false
+
+[[bench]]
+name = "composition"
 harness = false
 

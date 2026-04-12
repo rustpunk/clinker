@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_arena_build_from_csv() {
-        let csv = "dept,amount,name\nA,100,Alice\nB,200,Bob\nA,150,Carol\n";
+        let _csv = "dept,amount,name\nA,100,Alice\nB,200,Bob\nA,150,Carol\n";
         // Repeat to get ~100 rows
         let mut big_csv = "dept,amount,name\n".to_string();
         for i in 0..100 {

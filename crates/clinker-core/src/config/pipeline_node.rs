@@ -16,7 +16,6 @@
 //!
 //! See `docs/plans/cxl-engine/phase-16b-node-taxonomy-lift.md` Task 16b.2.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -63,13 +62,35 @@ pub enum PipelineNode {
         header: NodeHeader,
         config: OutputBody,
     },
-    /// Phase 16c stub. Parsing this is allowed; `compile()` returns a
-    /// single `E100` diagnostic per Composition node and otherwise
-    /// continues lowering the rest of the pipeline.
+    /// Composition call-site node. Lowered to `PlanNode::Composition` in
+    /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
+    /// keyed by the `body` handle.
     Composition {
         #[serde(flatten)]
         header: NodeHeader,
-        config: CompositionBody,
+        /// Path to the `.comp.yaml` file defining the composition.
+        #[serde(rename = "use")]
+        r#use: PathBuf,
+        /// Optional alias for namespace-mangling after expansion.
+        #[serde(default)]
+        alias: Option<String>,
+        /// Port bindings: composition input port → upstream node ref.
+        #[serde(default)]
+        inputs: IndexMap<String, String>,
+        /// Port bindings: composition output port → downstream node ref.
+        #[serde(default)]
+        outputs: IndexMap<String, String>,
+        /// Behavioural config param overrides.
+        #[serde(default)]
+        config: IndexMap<String, serde_json::Value>,
+        /// Resource bindings (file paths, connection strings, etc.).
+        #[serde(default)]
+        resources: IndexMap<String, serde_json::Value>,
+        /// Populated by `bind_composition` in 16c.2. Serde-default to a
+        /// sentinel; any consumer reading this before `bind_schema` runs
+        /// gets a clear debug-panic.
+        #[serde(skip)]
+        body: crate::plan::composition_body::CompositionBodyId,
     },
 }
 
@@ -166,10 +187,64 @@ pub struct TransformBody {
     /// runtime binding is orthogonal and is NOT renamed.
     #[serde(default)]
     pub analytic_window: Option<AnalyticWindowSpec>,
+    /// Reference table lookup enrichment. Loads a secondary source into
+    /// memory and matches each input record against it using a CXL
+    /// predicate. Matched fields are available in the `cxl:` block as
+    /// `source_name.field_name`.
+    #[serde(default)]
+    pub lookup: Option<LookupConfig>,
     #[serde(default)]
     pub log: Option<Vec<crate::config::LogDirective>>,
     #[serde(default)]
     pub validations: Option<Vec<crate::config::ValidationEntry>>,
+}
+
+/// Configuration for reference table lookup enrichment on a transform.
+///
+/// The `where` predicate is a CXL boolean expression evaluated against
+/// each candidate row in the lookup source. Bare field names reference
+/// the primary input record; qualified names (`source_name.field`)
+/// reference the lookup source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookupConfig {
+    /// Name of the source node providing the reference table.
+    pub source: String,
+    /// CXL boolean expression evaluated per candidate lookup row.
+    /// Both primary input fields (bare) and lookup fields
+    /// (`source.field`) are in scope.
+    #[serde(rename = "where")]
+    pub where_expr: String,
+    /// Behavior when no lookup row matches the predicate.
+    #[serde(default)]
+    pub on_miss: OnMiss,
+    /// Whether to take the first matching row or all matching rows.
+    #[serde(default, rename = "match")]
+    pub match_mode: MatchMode,
+}
+
+/// Behavior when a lookup finds no matching rows.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMiss {
+    /// All lookup fields resolve to null. Record is still emitted.
+    #[default]
+    NullFields,
+    /// Record is silently skipped (not emitted).
+    Skip,
+    /// Pipeline errors on the first unmatched record.
+    Error,
+}
+
+/// Match cardinality for lookup enrichment.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    /// Return the first matching row (scalar enrichment, 1:1).
+    #[default]
+    First,
+    /// Return all matching rows (fan-out, 1:N).
+    All,
 }
 
 /// Phase 16b rename of `LocalWindowSpec`. Wave 1 keeps the payload
@@ -211,14 +286,4 @@ pub struct MergeBody {}
 pub struct OutputBody {
     #[serde(flatten)]
     pub output: crate::config::OutputConfig,
-}
-
-/// Composition stub body (Phase 16c placeholder).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompositionBody {
-    #[serde(rename = "use")]
-    pub r#use: PathBuf,
-    #[serde(default)]
-    pub config: BTreeMap<String, serde_json::Value>,
 }

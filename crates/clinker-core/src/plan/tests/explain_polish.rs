@@ -51,10 +51,11 @@ fn compile_cxl_for_spec(
     );
     let resolved =
         cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> = fields
+    let cols: indexmap::IndexMap<String, cxl::typecheck::types::Type> = fields
         .iter()
         .map(|f| (f.to_string(), cxl::typecheck::types::Type::Any))
         .collect();
+    let schema = cxl::typecheck::Row::closed(cols, cxl::lexer::Span::new(0, 0));
     let mode = if let Some(agg) = &spec.aggregate {
         cxl::typecheck::AggregateMode::GroupBy {
             group_by_fields: agg.group_by.iter().cloned().collect(),
@@ -214,7 +215,9 @@ nodes:
       include_unmapped: true
 "#;
     let config: PipelineConfig = crate::yaml::from_str(yaml).expect("parse yaml");
-    let compiled = config.compile().expect("compile");
+    let compiled = config
+        .compile(&crate::config::CompileContext::default())
+        .expect("compile");
     let dag = compiled.dag();
     let out = dag.explain_text(&config);
 

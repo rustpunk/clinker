@@ -127,7 +127,8 @@ fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProg
     );
     let resolved =
         cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> = indexmap::IndexMap::new();
+    let schema =
+        cxl::typecheck::Row::closed(indexmap::IndexMap::new(), cxl::lexer::Span::new(0, 0));
     cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
 }
 

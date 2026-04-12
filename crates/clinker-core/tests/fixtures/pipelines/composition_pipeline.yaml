@@ -1,0 +1,54 @@
+# FORWARD-ONLY: baseline captured in Task 16c.2.4
+#
+# Uses customer_enrich and address_normalize compositions.
+pipeline:
+  name: composition_pipeline
+nodes:
+  - type: source
+    name: customers_src
+    config:
+      name: customers_src
+      type: csv
+      path: data/customers.csv
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+
+  - type: source
+    name: addresses_src
+    config:
+      name: addresses_src
+      type: csv
+      path: data/addresses.csv
+      schema:
+        - { name: customer_id, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+
+  - type: composition
+    name: enrich1
+    input: customers_src
+    use: ../compositions/customer_enrich.comp.yaml
+    inputs:
+      customers: customers_src
+      addresses: addresses_src
+    config:
+      fuzzy_threshold: 0.9
+
+  - type: composition
+    name: addr_norm
+    input: addresses_src
+    use: ../compositions/address_normalize.comp.yaml
+    inputs:
+      raw_addresses: addresses_src
+    config:
+      strict_mode: true
+
+  - type: output
+    name: enriched_out
+    input: enrich1
+    config:
+      name: enriched_out
+      type: csv
+      path: data/enriched.csv

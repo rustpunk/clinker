@@ -236,7 +236,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(
         diags.iter().any(|d| d.code == "E001"),
         "expected E001, got: {:?}",
@@ -266,7 +266,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(
         diags.iter().any(|d| d.code == "W002"),
         "expected W002, got: {:?}",
@@ -298,7 +298,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(diags.iter().any(|d| d.code == "E002"));
     // Self-loop should NOT also be reported as E003 (the dedicated
     // E002 pass strips it before tarjan_scc looks at it).
@@ -327,7 +327,7 @@ nodes:
       - combo
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(
         diags.iter().any(|d| d.code == "E002"),
         "expected E002 for self-merge, got {:?}",
@@ -368,7 +368,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(diags.iter().any(|d| d.code == "E001"), "missing E001");
     assert!(diags.iter().any(|d| d.code == "E002"), "missing E002");
 }
@@ -477,97 +477,6 @@ fn test_cxl_source_in_variant_has_span() {
     // Wave 3 alongside SourceDb interning.
 }
 
-#[test]
-fn test_compile_composition_stub_one_diagnostic_per_instance() {
-    // Wave 2: stage-5 lowering emits exactly one E100 per Composition node.
-    let yaml = r#"
-pipeline:
-  name: comp
-nodes:
-  - type: source
-    name: src
-    config:
-      name: src
-      type: csv
-      path: data/a.csv
-      schema:
-        - { name: amount, type: string }
-
-  - type: composition
-    name: comp_a
-    input: src
-    config:
-      use: ./does_not_exist.yaml
-  - type: composition
-    name: comp_b
-    input: src
-    config:
-      use: ./also_missing.yaml
-"#;
-    let cfg = parse_pipeline(yaml);
-    // compile() pushes E100 per Composition but returns Ok; gate test
-    // uses compile_topology_only to surface them as topology diagnostics.
-    let diags = cfg.compile_topology_only();
-    // compile_topology_only only runs stages 1-4; Composition E100 lives
-    // in stage 5. Parse + compile and check diagnostics via the error
-    // path instead.
-    let _ = diags;
-    // Re-run compile() and scan via a dry walk for Composition nodes.
-    let comp_count = cfg
-        .nodes
-        .iter()
-        .filter(|n| {
-            matches!(
-                n.value,
-                clinker_core::config::PipelineNode::Composition { .. }
-            )
-        })
-        .count();
-    assert_eq!(
-        comp_count, 2,
-        "expected two composition nodes, got {comp_count}"
-    );
-}
-
-#[test]
-fn test_compile_composition_does_not_abort() {
-    // Wave 2: a Composition node must NOT halt lowering of the rest of
-    // the pipeline. The CompiledPlan should still be returned with the
-    // remaining (Source/Output) nodes lowered.
-    let yaml = r#"
-pipeline:
-  name: comp
-nodes:
-  - type: source
-    name: src
-    config:
-      name: src
-      type: csv
-      path: data/a.csv
-      schema:
-        - { name: amount, type: string }
-
-  - type: composition
-    name: comp_a
-    input: src
-    config:
-      use: ./does_not_exist.yaml
-  - type: output
-    name: out
-    input: src
-    config:
-      name: out
-      type: csv
-      path: data/o.csv
-"#;
-    let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().expect("composition must not abort lowering");
-    // Source + Output should both be present (Composition is dropped).
-    let names: Vec<&str> = plan.dag().graph.node_weights().map(|n| n.name()).collect();
-    assert!(names.contains(&"src"), "src missing: {names:?}");
-    assert!(names.contains(&"out"), "out missing: {names:?}");
-}
-
 // ---------------------------------------------------------------------
 // Group H — stage-5 lowering tests (8 new tests, in-memory only)
 // ---------------------------------------------------------------------
@@ -601,7 +510,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().expect("compile must succeed");
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .expect("compile must succeed");
     assert_eq!(plan.dag().graph.node_count(), 3);
     assert_eq!(plan.dag().graph.edge_count(), 2);
 }
@@ -631,7 +542,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let src = plan
         .dag()
         .graph
@@ -667,7 +580,9 @@ nodes:
       cxl: "emit foo = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
             n,
@@ -705,7 +620,9 @@ nodes:
       path: data/o.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let has = plan.dag().graph.node_weights().any(|n| {
         matches!(
             n,
@@ -745,7 +662,9 @@ nodes:
         b: "false"
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let route = plan
         .dag()
         .graph
@@ -793,7 +712,9 @@ nodes:
       - b
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     let merge_idx = plan
         .dag()
         .graph
@@ -833,7 +754,7 @@ nodes:
         - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
-    let res = cfg.compile();
+    let res = cfg.compile(&clinker_core::config::CompileContext::default());
     assert!(res.is_err());
     let diags = res.err().unwrap();
     assert!(diags.iter().any(|d| d.code == "E001"));
@@ -874,7 +795,7 @@ nodes:
       path: data/out_nonexistent.csv
 "#;
     let cfg = parse_pipeline(yaml);
-    let res = cfg.compile();
+    let res = cfg.compile(&clinker_core::config::CompileContext::default());
     assert!(res.is_err(), "compile must fail on CXL type error");
     let diags = res.err().unwrap();
     assert!(
@@ -941,7 +862,7 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let plan = cfg
-        .compile()
+        .compile(&clinker_core::config::CompileContext::default())
         .expect("compile must succeed without touching disk");
     assert_eq!(plan.dag().graph.node_count(), 3);
 }
@@ -962,6 +883,8 @@ nodes:
         - { name: amount, type: string }
 "#;
     let cfg = parse_pipeline(yaml);
-    let plan = cfg.compile().unwrap();
+    let plan = cfg
+        .compile(&clinker_core::config::CompileContext::default())
+        .unwrap();
     assert_eq!(plan.dag().graph.node_count(), 1);
 }

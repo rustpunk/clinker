@@ -50,14 +50,13 @@ nodes:
     description: Enrich orders with product catalog details
     input: normalize_fields
     config:
-      analytic_window:
+      lookup:
         source: products
-        "on": product_code
-        group_by: product_code
+        where: "product_code == products.product_code"
       cxl: |
-        emit product_name = $window.first().product_name
-        emit category = $window.first().category
-        emit weight_kg = $window.first().weight_kg
+        emit product_name = products.product_name
+        emit category = products.category
+        emit weight_kg = products.weight_kg
 
   # TODO(16c compositions): shipping_cost + order_classification composition imports stripped during 16b fixture migration.
 

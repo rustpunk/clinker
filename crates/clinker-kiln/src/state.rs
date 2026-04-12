@@ -10,10 +10,11 @@
 /// - `NavigationContext` — top-level activity (Pipeline, Channels, Git, Docs, Runs)
 /// - `PipelineLayoutMode` — view within Pipeline context only (Canvas, Hybrid, Editor)
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clinker_core::config::PipelineConfig;
 use clinker_core::partial::PartialPipelineConfig;
-use clinker_git::RepoStatus;
+use clinker_core::plan::CompiledPlan;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -202,6 +203,38 @@ impl PipelineLayoutMode {
         [Self::Canvas, Self::Hybrid, Self::Editor, Self::Schematics];
 }
 
+/// Canvas data source mode — switches between raw pipeline config and
+/// channel-resolved compiled plan.
+///
+/// `Raw` shows the pipeline as authored (PipelineConfig from YAML).
+/// `Resolved` shows the pipeline after channel overlay application
+/// (CompiledPlan with provenance-tracked config values).
+///
+/// Orthogonal to composition drill depth — a user can be drilled into
+/// a composition at depth 2 and toggle between Raw and Resolved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ChannelViewMode {
+    /// Show pipeline config from YAML (state.pipeline).
+    #[default]
+    Raw,
+    /// Show resolved config from channel overlay (compiled_plan).
+    Resolved,
+}
+
+/// A frame in the composition drill-in stack.
+///
+/// Each frame represents one level of drill-in. The body_id indexes into
+/// `CompileArtifacts::composition_bodies` to get the sub-canvas nodes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositionDrillFrame {
+    /// Body ID for the composition's bound body (not an alias prefix string).
+    pub body_id: clinker_core::plan::composition_body::CompositionBodyId,
+    /// Display label for the breadcrumb (composition alias or name).
+    pub alias: String,
+    /// Path to the `.comp.yaml` file (for display in breadcrumb tooltip).
+    pub use_path: std::path::PathBuf,
+}
+
 /// Per-tab reactive state — consumed by canvas, inspector, YAML sidebar, etc.
 ///
 /// Downstream components call `use_context::<AppState>()` and get the
@@ -211,7 +244,7 @@ pub struct AppState {
     pub active_context: Signal<NavigationContext>,
     pub pipeline_layout: Signal<PipelineLayoutMode>,
     pub run_log_expanded: Signal<bool>,
-    pub selected_stage: Signal<Option<String>>,
+    pub selected_stages: Signal<std::collections::HashSet<String>>,
     /// Raw YAML text shown in the sidebar editor.
     pub yaml_text: Signal<String>,
     /// Parsed pipeline config (None if YAML is invalid).
@@ -224,6 +257,14 @@ pub struct AppState {
     pub edit_source: Signal<EditSource>,
     /// Schema validation warnings for the current pipeline.
     pub schema_warnings: Signal<Vec<SchemaWarning>>,
+    /// Canvas data source mode (Raw = pipeline config, Resolved = compiled plan).
+    pub channel_view_mode: Signal<ChannelViewMode>,
+    /// Composition drill-in stack. Empty = top-level pipeline view.
+    /// Each frame holds a body ID for rendering the sub-canvas.
+    pub composition_drill_stack: Signal<Vec<CompositionDrillFrame>>,
+    /// Compiled plan with channel overlay applied. None when no channel is
+    /// loaded or in Raw mode. Wrapped in Arc because CompiledPlan is not Clone.
+    pub compiled_plan: Signal<Option<Arc<CompiledPlan>>>,
 }
 
 /// Read the current `AppState` from context.
@@ -249,7 +290,11 @@ pub struct TabManagerState {
     /// Whether the template gallery overlay is visible.
     pub show_template_gallery: Signal<bool>,
     /// Git repository status — branch, ahead/behind, file changes.
-    pub git_state: Signal<Option<RepoStatus>>,
+    /// On web builds, this is always None (git not available in WASM).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub git_state: Signal<Option<clinker_git::RepoStatus>>,
+    #[cfg(target_arch = "wasm32")]
+    pub git_state: Signal<Option<()>>,
     /// Whether the command palette overlay is visible.
     pub show_command_palette: Signal<bool>,
     /// Whether the settings overlay is visible.
@@ -268,57 +313,27 @@ use clinker_schema::{SchemaIndex, SchemaWarning};
 
 // ── Channel state ──────────────────────────────────────────────────────
 
-/// Discovered channel workspace state. Extracted from `clinker-channel`
-/// types into Clone + PartialEq structs safe for Dioxus signals.
+/// Discovered channel workspace state based on the 16c ChannelBinding model.
 ///
-/// Populated when a workspace has a `clinker.toml` with a channels directory.
-/// None when no `clinker.toml` is found (channel features degrade gracefully).
+/// Populated when a workspace has `.channel.yaml` files in its channels
+/// directory. None when no workspace is loaded or no channels are found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelState {
-    /// Root directory containing clinker.toml.
-    pub workspace_root: PathBuf,
-    /// Channel directory name (from clinker.toml `[workspace] channels_dir`).
-    pub channels_dir: String,
-    /// Group directory name (from clinker.toml `[workspace] groups_dir`).
-    pub groups_dir: String,
-    /// Default channel ID (from clinker.toml `[workspace] default_channel`).
-    pub default_channel: Option<String>,
-    /// Whether the channels directory exists on disk.
-    pub dir_exists: bool,
-    /// Discovered channels with summary metadata.
-    pub channels: Vec<ChannelSummary>,
-    /// Discovered groups with summary metadata.
-    pub groups: Vec<GroupSummary>,
-    /// Currently selected channel ID (None = run base pipeline).
+    /// Discovered channel binding summaries.
+    pub channels: Vec<ChannelBindingSummary>,
+    /// Currently selected channel name (None = run base pipeline).
     pub active_channel: Option<String>,
-    /// Recently selected channel IDs (most recent first, max 10).
+    /// Recently selected channel names (most recent first, max 10).
     pub recent_channels: Vec<String>,
 }
 
-/// Summary of a discovered channel (extracted from `ChannelManifest`).
+/// Summary of a discovered `.channel.yaml` binding file.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ChannelSummary {
-    pub id: String,
+pub struct ChannelBindingSummary {
+    /// Channel name (from the binding's `name` field).
     pub name: String,
-    pub description: Option<String>,
-    pub contact: Option<String>,
-    pub tier: Option<String>,
-    pub tags: Vec<String>,
-    pub active: bool,
-    /// Group IDs this channel inherits from.
-    pub inherits: Vec<String>,
-    /// Number of `.channel.yaml` override files in this channel's directory.
-    pub override_count: usize,
-    /// Number of variables defined in `channel.yaml`.
-    pub variable_count: usize,
-}
-
-/// Summary of a discovered group (from `_groups/` directory).
-#[derive(Clone, Debug, PartialEq)]
-pub struct GroupSummary {
-    pub id: String,
-    /// Number of `.channel.yaml` override files in this group's directory.
-    pub override_count: usize,
-    /// Channel IDs that inherit from this group.
-    pub inheritor_ids: Vec<String>,
+    /// Path to the `.channel.yaml` file on disk.
+    pub source_path: PathBuf,
+    /// Display string for the channel's target (pipeline or composition path).
+    pub target: String,
 }

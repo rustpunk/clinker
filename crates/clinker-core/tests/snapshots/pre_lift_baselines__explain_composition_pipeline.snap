@@ -1,0 +1,50 @@
+---
+source: crates/clinker-core/tests/pre_lift_baselines.rs
+expression: scrubbed
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 0
+Output projections: 1
+DAG nodes: 3
+
+Source DAG:
+  Tier 0: customers_src, addresses_src
+
+=== Physical Properties ===
+
+output.enriched_out:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+source.addresses_src:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+source.customers_src:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+=== CXL Expressions ===
+
+=== Type Annotations ===
+
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [output] enriched_out (line:48)
+  ● [source] addresses_src (line:17)
+  ● [source] customers_src (line:7)

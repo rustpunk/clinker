@@ -31,8 +31,8 @@ pub fn StageHeader(
             button {
                 class: "kiln-inspector-close",
                 onclick: move |_| {
-                    let mut sel = state.selected_stage;
-                    sel.set(None);
+                    let mut sel = state.selected_stages;
+                    sel.set(std::collections::HashSet::new());
                 },
                 "\u{00D7}"
             }

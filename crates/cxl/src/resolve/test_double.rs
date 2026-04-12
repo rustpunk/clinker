@@ -26,6 +26,7 @@ mod tests {
     #[test]
     fn test_window_context_object_safety() {
         use clinker_record::{RecordStorage, WindowContext};
+        #[allow(dead_code)]
         struct DummyStorage;
         impl RecordStorage for DummyStorage {
             fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {

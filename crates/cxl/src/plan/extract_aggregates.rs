@@ -706,9 +706,11 @@ fn diag_missing_group_by_field(name: &str) -> TypeDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lexer::Span;
     use crate::parser::Parser;
     use crate::resolve::pass::resolve_program;
     use crate::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use crate::typecheck::row::Row;
     use crate::typecheck::types::Type;
     use indexmap::IndexMap;
     use std::collections::HashSet;
@@ -723,10 +725,11 @@ mod tests {
         let field_names: Vec<&str> = schema_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema: IndexMap<String, Type> = schema_fields
+        let cols: IndexMap<String, Type> = schema_fields
             .iter()
             .map(|(n, t)| ((*n).to_string(), t.clone()))
             .collect();
+        let schema = Row::closed(cols, Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
             group_by_fields: group_by
                 .iter()
