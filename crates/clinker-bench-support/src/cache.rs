@@ -235,10 +235,14 @@ mod tests {
         let spec = test_spec();
 
         let path1 = cache.get_or_generate(&spec);
-        let hash1 = blake3::hash(&fs::read(&path1).unwrap()).to_hex().to_string();
+        let hash1 = blake3::hash(&fs::read(&path1).unwrap())
+            .to_hex()
+            .to_string();
 
         let path2 = cache.get_or_generate(&spec);
-        let hash2 = blake3::hash(&fs::read(&path2).unwrap()).to_hex().to_string();
+        let hash2 = blake3::hash(&fs::read(&path2).unwrap())
+            .to_hex()
+            .to_string();
 
         assert_eq!(path1, path2);
         assert_eq!(hash1, hash2);
