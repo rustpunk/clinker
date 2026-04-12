@@ -4,12 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Pre-commit checks
 
-Before any git commit, run in this order:
+Before any git commit, run the same checks as GitHub CI (`.github/workflows/ci.yml`):
 
-1. `cargo fmt --all`
+1. `cargo fmt --all` (CI runs `--check`; locally fix first)
 2. `cargo clippy --workspace -- -D warnings`
+3. `cargo test --workspace`
+4. `cargo deny check`
 
-Fix any issues before committing.
+Fix any issues before committing. All four must pass — these are the exact checks CI enforces on every PR.
 
 ## Build & test commands
 
