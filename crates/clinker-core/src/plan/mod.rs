@@ -3,6 +3,8 @@ pub mod bound_schemas;
 pub mod compiled;
 pub mod composition_body;
 pub mod execution;
+pub mod explain_provenance;
+pub mod extraction;
 pub mod index;
 pub mod properties;
 pub mod row_type;
