@@ -1,12 +1,19 @@
 //! Shared deterministic data generators for Clinker benchmarks.
 //!
-//! All generators use fixed seeds for reproducibility across runs.
+//! All generators use explicit seeds for reproducibility across runs.
 
 #[cfg(feature = "bench-alloc")]
 pub mod alloc;
 
+pub mod cache;
+pub mod generators;
+
 use clinker_record::{Record, Schema, Value};
 use std::sync::Arc;
+
+// Explicit re-exports for backward compatibility (D-9: no glob re-exports)
+pub use generators::csv::CsvPayload;
+pub use generators::json::{generate_json_array, generate_ndjson};
 
 // ── Scale constants ────────────────────────────────────────────────
 
@@ -74,50 +81,6 @@ impl RecordFactory {
             .collect();
         // SAFETY: all bytes are ASCII a-z
         unsafe { String::from_utf8_unchecked(bytes) }.into_boxed_str()
-    }
-}
-
-// ── CSV payload generation ─────────────────────────────────────────
-
-/// Generate a CSV byte buffer with deterministic content.
-pub struct CsvPayload;
-
-impl CsvPayload {
-    /// Generate CSV bytes with a header row and `record_count` data rows.
-    ///
-    /// Columns: `f0` (integer), `f1` (string), ..., alternating types.
-    pub fn generate(record_count: usize, field_count: usize, string_len: usize) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(record_count * field_count * (string_len + 4));
-        let mut rng = fastrand::Rng::with_seed(42);
-
-        // Header
-        for i in 0..field_count {
-            if i > 0 {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("f{i}").as_bytes());
-        }
-        buf.push(b'\n');
-
-        // Data rows
-        for _ in 0..record_count {
-            for i in 0..field_count {
-                if i > 0 {
-                    buf.push(b',');
-                }
-                if i % 2 == 0 {
-                    buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-                } else {
-                    let s: String = (0..string_len)
-                        .map(|_| (rng.u8(b'a'..=b'z')) as char)
-                        .collect();
-                    buf.extend_from_slice(s.as_bytes());
-                }
-            }
-            buf.push(b'\n');
-        }
-
-        buf
     }
 }
 
@@ -218,63 +181,27 @@ emit c29 = f1.left(3)
 filter f0 > 100
 "#;
 
-// ── JSON payload generation ────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    /// Verify CsvPayload is accessible via crate-root re-export after extraction.
+    #[test]
+    fn test_csv_payload_backward_compat_generates_bytes() {
+        use crate::CsvPayload;
 
-/// Generate NDJSON byte buffer with deterministic content.
-pub fn generate_ndjson(record_count: usize, field_count: usize, string_len: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(record_count * field_count * (string_len + 10));
-    let mut rng = fastrand::Rng::with_seed(42);
+        let bytes = CsvPayload::generate(10, 4, 8, 42);
 
-    for _ in 0..record_count {
-        buf.push(b'{');
-        for i in 0..field_count {
-            if i > 0 {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("\"f{i}\":").as_bytes());
-            if i % 2 == 0 {
-                buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-            } else {
-                buf.push(b'"');
-                for _ in 0..string_len {
-                    buf.push(rng.u8(b'a'..=b'z'));
-                }
-                buf.push(b'"');
-            }
-        }
-        buf.extend_from_slice(b"}\n");
+        assert!(!bytes.is_empty());
+        assert!(bytes.starts_with(b"f0,f1,f2,f3\n"));
     }
-    buf
-}
 
-/// Generate JSON array byte buffer with deterministic content.
-pub fn generate_json_array(record_count: usize, field_count: usize, string_len: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(record_count * field_count * (string_len + 10));
-    let mut rng = fastrand::Rng::with_seed(42);
+    /// Verify generate_ndjson is accessible via crate-root re-export after extraction.
+    #[test]
+    fn test_json_ndjson_backward_compat_generates_bytes() {
+        use crate::generate_ndjson;
 
-    buf.push(b'[');
-    for row in 0..record_count {
-        if row > 0 {
-            buf.push(b',');
-        }
-        buf.push(b'{');
-        for i in 0..field_count {
-            if i > 0 {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("\"f{i}\":").as_bytes());
-            if i % 2 == 0 {
-                buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-            } else {
-                buf.push(b'"');
-                for _ in 0..string_len {
-                    buf.push(rng.u8(b'a'..=b'z'));
-                }
-                buf.push(b'"');
-            }
-        }
-        buf.push(b'}');
+        let bytes = generate_ndjson(10, 4, 8, 42);
+
+        assert!(!bytes.is_empty());
+        assert!(bytes[0] == b'{');
     }
-    buf.push(b']');
-    buf
 }
