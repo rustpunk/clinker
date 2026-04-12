@@ -7,6 +7,7 @@
 //! [`CompiledPlan`](crate::plan::compiled::CompiledPlan).
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::span::Span;
 
@@ -25,6 +26,17 @@ pub enum LayerKind {
     ChannelDefault = 1,
     ChannelFixed = 2,
     InspectorEdit = 3,
+}
+
+impl fmt::Display for LayerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LayerKind::CompositionDefault => write!(f, "CompositionDefault"),
+            LayerKind::ChannelDefault => write!(f, "ChannelDefault"),
+            LayerKind::ChannelFixed => write!(f, "ChannelFixed"),
+            LayerKind::InspectorEdit => write!(f, "InspectorEdit"),
+        }
+    }
 }
 
 /// A single provenance record: one layer's contribution to a config value.
@@ -57,12 +69,18 @@ pub struct ResolvedValue<T> {
     /// Ordered provenance chain. Each entry records a layer's contribution.
     /// At most 4 entries (one per [`LayerKind`]). Exactly one has `won == true`.
     pub provenance: Vec<ProvenanceLayer>,
+    /// Per-layer values keyed by [`LayerKind`]. Stores the value contributed
+    /// by each layer so `--explain --field` can display shadowed values.
+    /// Kept separate from [`ProvenanceLayer`] to preserve its 64-byte size.
+    pub layer_values: HashMap<LayerKind, T>,
 }
 
-impl<T> ResolvedValue<T> {
+impl<T: Clone> ResolvedValue<T> {
     /// Create a new resolved value with a single provenance layer.
     /// The initial layer is always the winner (V-7-3).
     pub fn new(value: T, kind: LayerKind, span: Span) -> Self {
+        let mut layer_values = HashMap::new();
+        layer_values.insert(kind, value.clone());
         Self {
             value,
             provenance: vec![ProvenanceLayer {
@@ -70,6 +88,7 @@ impl<T> ResolvedValue<T> {
                 kind,
                 won: true,
             }],
+            layer_values,
         }
     }
 
@@ -88,6 +107,9 @@ impl<T> ResolvedValue<T> {
             self.provenance.len() <= 4,
             "provenance chain exceeds 4-layer bound (LD-16c-8)"
         );
+
+        // Store this layer's value before any winner computation.
+        self.layer_values.insert(kind, value.clone());
 
         // Find existing entry for this kind (same-kind replace-in-place).
         let existing_idx = self.provenance.iter().position(|l| l.kind == kind);
@@ -122,6 +144,11 @@ impl<T> ResolvedValue<T> {
         if new_layer_wins {
             self.value = value;
         }
+    }
+
+    /// Look up the value contributed by a specific layer kind.
+    pub fn layer_value(&self, kind: LayerKind) -> Option<&T> {
+        self.layer_values.get(&kind)
     }
 }
 
@@ -174,6 +201,28 @@ impl ProvenanceDb {
         &self,
     ) -> impl Iterator<Item = (&(String, String), &ResolvedValue<serde_json::Value>)> {
         self.entries.iter()
+    }
+
+    /// List all param names tracked for a given node.
+    pub fn params_for_node(&self, node_name: &str) -> Vec<&str> {
+        self.entries
+            .keys()
+            .filter(|(n, _)| n == node_name)
+            .map(|(_, p)| p.as_str())
+            .collect()
+    }
+
+    /// List all tracked node names.
+    pub fn node_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .entries
+            .keys()
+            .map(|(n, _)| n.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        names.sort();
+        names
     }
 
     /// Number of tracked entries.
