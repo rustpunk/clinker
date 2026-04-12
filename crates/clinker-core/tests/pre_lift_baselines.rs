@@ -92,73 +92,73 @@ struct Phase16cFixture {
 /// All 14 Phase 16c fixtures: 5 compositions, 6 channels, 3 pipelines.
 fn phase_16c_fixtures() -> Vec<Phase16cFixture> {
     vec![
-        // Compositions (5)
+        // Compositions (5) — baselines captured in Task 16c.4.4
         Phase16cFixture {
             name: "customer_enrich",
             rel_path: "compositions/customer_enrich.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "address_normalize",
             rel_path: "compositions/address_normalize.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "dlq_shape",
             rel_path: "compositions/dlq_shape.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "nested_caller",
             rel_path: "compositions/nested_caller.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "passthrough_check",
             rel_path: "compositions/passthrough_check.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
-        // Channels (6)
+        // Channels (6) — baselines captured in Task 16c.4.4
         Phase16cFixture {
             name: "acme_prod",
             rel_path: "channels/acme_prod.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "acme_staging",
             rel_path: "channels/acme_staging.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "beta_prod",
             rel_path: "channels/beta_prod.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "beta_staging",
             rel_path: "channels/beta_staging.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "comp_direct",
             rel_path: "channels/comp_direct.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         Phase16cFixture {
             name: "empty_defaults",
             rel_path: "channels/empty_defaults.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: None,
+            baseline_captured_in: Some("16c.4.4"),
         },
         // Pipelines (3) — baselines captured in Task 16c.2.4
         Phase16cFixture {
@@ -706,4 +706,86 @@ fn test_insta_baselines_are_tail_var_stable() {
         outputs[0], outputs[1],
         "scrubbed explain output must be identical across runs"
     );
+}
+
+// ───────────────────────── Task 16c.4.4 gate tests ─────────────────────────
+
+/// Gate test: all 14 Phase 16c fixtures have a baseline_captured_in value.
+#[test]
+fn test_all_14_fixtures_have_baseline() {
+    let fixtures = phase_16c_fixtures();
+    assert_eq!(fixtures.len(), 14, "expected exactly 14 Phase 16c fixtures");
+    for fx in &fixtures {
+        assert!(
+            fx.baseline_captured_in.is_some(),
+            "fixture {} has no baseline_captured_in",
+            fx.name
+        );
+    }
+}
+
+/// Gate test: channel overlay on a pipeline produces a provenance chain with
+/// ChannelFixed layer recorded in the compiled plan.
+#[test]
+fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
+    use clinker_channel::binding::ChannelBinding;
+    use clinker_channel::overlay::apply_channel_overlay;
+    use clinker_core::config::composition::LayerKind;
+
+    let root = phase_16c_fixture_root();
+    let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
+    let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
+    let config = parse_config(&yaml).expect("parse_config");
+    let ctx = clinker_core::config::CompileContext::with_pipeline_dir(
+        &root,
+        std::path::PathBuf::from("pipelines"),
+    );
+    let mut plan = clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
+
+    // Apply the acme_prod channel (which has ChannelFixed bindings) but
+    // adapted to target this pipeline's provenance entries.
+    let channel_yaml = br#"
+channel:
+  name: acme_prod_test
+  target: ./pipelines/nested_composition_pipeline.yaml
+config:
+  fixed:
+    nested_process.strict_mode: true
+"#;
+    let binding = ChannelBinding::from_yaml_bytes(
+        channel_yaml,
+        root.join("channels/synthetic_test.channel.yaml"),
+    )
+    .expect("parse channel");
+
+    let _diags = apply_channel_overlay(&mut plan, &binding);
+
+    // Verify the provenance chain contains a ChannelFixed layer
+    let resolved = plan
+        .provenance()
+        .get("nested_process", "strict_mode")
+        .expect("nested_process.strict_mode must exist in provenance");
+
+    let has_channel_fixed = resolved
+        .provenance
+        .iter()
+        .any(|l| l.kind == LayerKind::ChannelFixed);
+    assert!(
+        has_channel_fixed,
+        "provenance chain must contain a ChannelFixed layer"
+    );
+
+    let winner = resolved.winning_layer().expect("must have a winner");
+    assert_eq!(
+        winner.kind,
+        LayerKind::ChannelFixed,
+        "ChannelFixed must be the winning layer"
+    );
+
+    // Verify channel identity is stamped
+    let identity = plan
+        .channel_identity()
+        .expect("channel identity must be set");
+    assert_eq!(identity.name, "acme_prod_test");
+    assert_ne!(identity.content_hash, [0u8; 32]);
 }

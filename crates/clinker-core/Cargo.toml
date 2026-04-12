@@ -51,6 +51,7 @@ bench-alloc = ["dep:clinker-bench-support", "clinker-bench-support/bench-alloc"]
 csv = "1"
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true, features = [] }
+clinker-channel = { workspace = true }
 rayon = "1"
 fastrand = { workspace = true }
 insta = "1"

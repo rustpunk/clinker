@@ -781,6 +781,7 @@ dependencies = [
  "ahash",
  "chrono",
  "clinker-bench-support",
+ "clinker-channel",
  "clinker-format",
  "clinker-record",
  "criterion",
