@@ -2,7 +2,6 @@
 lancedb/
 docs/internal/
 docs/book/
-docs/explain/
 target/
 examples/pipelines/output/
 tests/e2e/
