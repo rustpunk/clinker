@@ -110,6 +110,14 @@ html:not(.js) .left-buttons button {
     text-transform: uppercase;
     cursor: pointer;
 }
+@media only screen and (max-width: 520px) {
+    h1.menu-title,
+    .blueprint h1.menu-title {
+        font-size: 1.6rem;
+        letter-spacing: 0;
+        text-transform: none;
+    }
+}
 .enamel .menu-title {
     font-family: "Rajdhani", sans-serif;
 }

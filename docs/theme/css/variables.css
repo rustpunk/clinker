@@ -21,8 +21,8 @@
     --fg: #28323A;
 
     --sidebar-bg: #262C34;
-    --sidebar-fg: #8A9298;
-    --sidebar-non-existant: #565E68;
+    --sidebar-fg: #A8B0B8;
+    --sidebar-non-existant: #8A929A;
     --sidebar-active: #B7410E;
     --sidebar-spacer: #363E48;
 
@@ -46,7 +46,7 @@
 
     --table-border-color: #B4BCC4;
     --table-header-bg: #262C34;
-    --table-header-fg: #8A9298;
+    --table-header-fg: #A8B0B8;
     --table-alternate-bg: #E6E9EC;
 
     --searchbar-border-color: #A0A8B0;
