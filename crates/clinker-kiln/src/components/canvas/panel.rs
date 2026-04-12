@@ -5,7 +5,7 @@ use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 
 use crate::pipeline_view::{
-    NODE_HEIGHT, NODE_WIDTH, derive_partial_pipeline_view, derive_pipeline_view,
+    NODE_HEIGHT, NODE_WIDTH, derive_body_view, derive_partial_pipeline_view, derive_pipeline_view,
 };
 use crate::state::{ChannelViewMode, use_app_state};
 
@@ -55,36 +55,50 @@ pub fn CanvasPanel() -> Element {
     let state = use_app_state();
 
     let view_mode = *state.channel_view_mode.read();
+    let drill_stack = state.composition_drill_stack.read();
 
-    let pipeline_view = match view_mode {
-        ChannelViewMode::Resolved => {
-            // In Resolved mode, prefer the compiled plan's config (with channel overlays).
-            let compiled_guard = state.compiled_plan.read();
-            match compiled_guard.as_ref() {
-                Some(plan) => derive_pipeline_view(plan.config()),
-                None => {
-                    // No compiled plan available — fall back to raw pipeline.
-                    match &*(state.pipeline).read() {
+    // If drilled into a composition, render the body's nodes instead of top-level.
+    let pipeline_view = if let Some(frame) = drill_stack.last() {
+        let compiled_guard = state.compiled_plan.read();
+        match compiled_guard
+            .as_ref()
+            .and_then(|plan| plan.body_of(frame.body_id))
+        {
+            Some(body) => derive_body_view(body),
+            None => crate::pipeline_view::PipelineView {
+                stages: Vec::new(),
+                connections: Vec::new(),
+            },
+        }
+    } else {
+        // Top-level: dispatch on view mode
+        match view_mode {
+            ChannelViewMode::Resolved => {
+                let compiled_guard = state.compiled_plan.read();
+                match compiled_guard.as_ref() {
+                    Some(plan) => derive_pipeline_view(plan.config()),
+                    None => match &*(state.pipeline).read() {
                         Some(config) => derive_pipeline_view(config),
                         None => crate::pipeline_view::PipelineView {
                             stages: Vec::new(),
                             connections: Vec::new(),
                         },
-                    }
+                    },
                 }
             }
-        }
-        ChannelViewMode::Raw => match &*(state.pipeline).read() {
-            Some(config) => derive_pipeline_view(config),
-            None => match &*(state.partial_pipeline).read() {
-                Some(partial) => derive_partial_pipeline_view(partial),
-                None => crate::pipeline_view::PipelineView {
-                    stages: Vec::new(),
-                    connections: Vec::new(),
+            ChannelViewMode::Raw => match &*(state.pipeline).read() {
+                Some(config) => derive_pipeline_view(config),
+                None => match &*(state.partial_pipeline).read() {
+                    Some(partial) => derive_partial_pipeline_view(partial),
+                    None => crate::pipeline_view::PipelineView {
+                        stages: Vec::new(),
+                        connections: Vec::new(),
+                    },
                 },
             },
-        },
+        }
     };
+    drop(drill_stack);
     let connections: Vec<_> = pipeline_view
         .connections
         .iter()
@@ -232,6 +246,23 @@ pub fn CanvasPanel() -> Element {
     rsx! {
         div {
             class: "kiln-canvas-column",
+
+            // ── Breadcrumb bar (composition drill-in navigation) ─────────
+            {
+                let stack = state.composition_drill_stack.read();
+                if !stack.is_empty() {
+                    let frames: Vec<_> = stack.iter().map(|f| f.alias.clone()).collect();
+                    drop(stack);
+                    rsx! {
+                        super::breadcrumbs::BreadcrumbBar {
+                            frames,
+                        }
+                    }
+                } else {
+                    drop(stack);
+                    rsx! {}
+                }
+            }
 
             // ── Channel view mode toggle bar ─────────────────────────────
             div {

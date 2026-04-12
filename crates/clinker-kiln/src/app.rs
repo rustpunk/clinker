@@ -51,6 +51,8 @@ pub fn AppShell() -> Element {
     let channel_view_mode = use_signal(|| ChannelViewMode::Raw);
     let compiled_plan: Signal<Option<std::sync::Arc<clinker_core::plan::CompiledPlan>>> =
         use_signal(|| None);
+    let composition_drill_stack: Signal<Vec<crate::state::CompositionDrillFrame>> =
+        use_signal(Vec::new);
 
     // ── Session restore (single call on first mount per use_signal) ─────
     // restore_session() is called in the first use_signal closure. The result
@@ -349,6 +351,7 @@ pub fn AppShell() -> Element {
         schema_warnings,
         channel_view_mode,
         compiled_plan,
+        composition_drill_stack,
     };
 
     let mut app_state_signal = use_signal(|| current_app_state);

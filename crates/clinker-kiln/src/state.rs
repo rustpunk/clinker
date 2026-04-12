@@ -221,6 +221,20 @@ pub enum ChannelViewMode {
     Resolved,
 }
 
+/// A frame in the composition drill-in stack.
+///
+/// Each frame represents one level of drill-in. The body_id indexes into
+/// `CompileArtifacts::composition_bodies` to get the sub-canvas nodes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositionDrillFrame {
+    /// Body ID for the composition's bound body (not an alias prefix string).
+    pub body_id: clinker_core::plan::composition_body::CompositionBodyId,
+    /// Display label for the breadcrumb (composition alias or name).
+    pub alias: String,
+    /// Path to the `.comp.yaml` file (for display in breadcrumb tooltip).
+    pub use_path: std::path::PathBuf,
+}
+
 /// Per-tab reactive state — consumed by canvas, inspector, YAML sidebar, etc.
 ///
 /// Downstream components call `use_context::<AppState>()` and get the
@@ -245,6 +259,9 @@ pub struct AppState {
     pub schema_warnings: Signal<Vec<SchemaWarning>>,
     /// Canvas data source mode (Raw = pipeline config, Resolved = compiled plan).
     pub channel_view_mode: Signal<ChannelViewMode>,
+    /// Composition drill-in stack. Empty = top-level pipeline view.
+    /// Each frame holds a body ID for rendering the sub-canvas.
+    pub composition_drill_stack: Signal<Vec<CompositionDrillFrame>>,
     /// Compiled plan with channel overlay applied. None when no channel is
     /// loaded or in Raw mode. Wrapped in Arc because CompiledPlan is not Clone.
     pub compiled_plan: Signal<Option<Arc<CompiledPlan>>>,

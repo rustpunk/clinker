@@ -1,3 +1,4 @@
+pub mod breadcrumbs;
 mod connector;
 mod node;
 mod panel;
