@@ -236,7 +236,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(
         diags.iter().any(|d| d.code == "E001"),
         "expected E001, got: {:?}",
@@ -266,7 +266,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(
         diags.iter().any(|d| d.code == "W002"),
         "expected W002, got: {:?}",
@@ -298,7 +298,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(diags.iter().any(|d| d.code == "E002"));
     // Self-loop should NOT also be reported as E003 (the dedicated
     // E002 pass strips it before tarjan_scc looks at it).
@@ -327,7 +327,7 @@ nodes:
       - combo
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(
         diags.iter().any(|d| d.code == "E002"),
         "expected E002 for self-merge, got {:?}",
@@ -368,7 +368,7 @@ nodes:
       cxl: "emit a = 1"
 "#;
     let cfg = parse_pipeline(yaml);
-    let diags = cfg.compile_topology_only();
+    let diags = cfg.compile_topology_only(&Default::default());
     assert!(diags.iter().any(|d| d.code == "E001"), "missing E001");
     assert!(diags.iter().any(|d| d.code == "E002"), "missing E002");
 }

@@ -8,7 +8,6 @@ use crate::lexer::Span;
 use crate::parser::Parser;
 use crate::resolve::HashMapResolver;
 use crate::resolve::pass::resolve_program;
-use crate::typecheck::Type;
 use crate::typecheck::pass::type_check;
 use crate::typecheck::row::Row;
 

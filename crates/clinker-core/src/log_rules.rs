@@ -77,6 +77,7 @@ pub fn resolve_log_rules(
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn make_directive(level: LogLevel, when: LogTiming, message: &str) -> LogDirective {
         LogDirective {
             level,

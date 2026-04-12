@@ -659,9 +659,9 @@ mod tests {
     #[test]
     fn test_probe_equality_index_hit() {
         let schema = make_schema(&["key", "val"]);
-        let r1 = make_record(&schema, vec![Value::String("A".into()), Value::Integer(1)]);
-        let r2 = make_record(&schema, vec![Value::String("B".into()), Value::Integer(2)]);
-        let r3 = make_record(&schema, vec![Value::String("A".into()), Value::Integer(3)]);
+        let _r1 = make_record(&schema, vec![Value::String("A".into()), Value::Integer(1)]);
+        let _r2 = make_record(&schema, vec![Value::String("B".into()), Value::Integer(2)]);
+        let _r3 = make_record(&schema, vec![Value::String("A".into()), Value::Integer(3)]);
 
         let mut partitions = std::collections::HashMap::new();
         partitions.insert(

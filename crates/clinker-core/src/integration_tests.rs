@@ -334,7 +334,7 @@ nodes:
     type: csv
     path: /tmp/clinker_test_out.csv
 "#;
-        let config = config::parse_config(yaml).unwrap();
+        let _config = config::parse_config(yaml).unwrap();
         let result: Result<_, PipelineError> = Err(PipelineError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "file not found",
@@ -507,7 +507,7 @@ emit out_name = name
 emit out_dept = dept"#,
         );
         let csv = "name,dept\nAlice,Eng\nBob,Sales\nAlice,Eng\nBob,HR\n";
-        let (counters, _, output) = run_pipeline(&yaml, csv).unwrap();
+        let (counters, _, _output) = run_pipeline(&yaml, csv).unwrap();
         assert_eq!(counters.ok_count, 3); // Alice+Eng, Bob+Sales, Bob+HR are unique
         assert_eq!(counters.distinct_count, 1); // Alice+Eng duplicate
     }

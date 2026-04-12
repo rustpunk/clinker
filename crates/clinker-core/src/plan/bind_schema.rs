@@ -1091,10 +1091,13 @@ fn typecheck_cxl(
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared.clone();
     for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit { name, .. } = stmt
-            && !out.contains_key(name.as_ref())
-        {
-            out.insert(name.to_string(), Type::Any);
+        if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
+            let emit_type = typed
+                .types
+                .get(expr.node_id().0 as usize)
+                .and_then(|t| t.clone())
+                .unwrap_or(Type::Any);
+            out.insert(name.to_string(), emit_type);
         }
     }
     Row {
@@ -1111,10 +1114,13 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
         out.insert(gb.clone(), t);
     }
     for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit { name, .. } = stmt
-            && !out.contains_key(name.as_ref())
-        {
-            out.insert(name.to_string(), Type::Any);
+        if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
+            let emit_type = typed
+                .types
+                .get(expr.node_id().0 as usize)
+                .and_then(|t| t.clone())
+                .unwrap_or(Type::Any);
+            out.insert(name.to_string(), emit_type);
         }
     }
     Row {

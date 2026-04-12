@@ -311,7 +311,6 @@ mod tests {
     use crate::resolve::pass::resolve_program;
     use crate::typecheck::pass::type_check;
     use crate::typecheck::row::Row;
-    use std::collections::HashMap;
 
     /// Helper: compile CXL source to TypedProgram for testing the analyzer.
     fn compile(source: &str) -> TypedProgram {

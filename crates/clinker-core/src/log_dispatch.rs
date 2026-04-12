@@ -255,7 +255,7 @@ mod tests {
         // Simulate 300 records — should fire on records 1, 101, 201 = 3 events
         let mut fire_count = 0;
         for i in 1..=300 {
-            let ctx = make_template_context(
+            let _ctx = make_template_context(
                 &fields, "t", None, "f.csv", i, 0, 0, 0, "p", "e", None, None,
             );
             // We can't easily count tracing events, so we test the counter logic

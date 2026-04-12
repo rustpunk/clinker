@@ -28,6 +28,10 @@ pub struct CompileContext {
     /// Used to resolve relative `use:` paths on `PipelineNode::Composition`
     /// nodes. Empty path means "workspace root" (pipeline file at root).
     pub pipeline_dir: PathBuf,
+    /// When `true`, absolute paths in YAML config are permitted.
+    /// Wired from the `--allow-absolute-paths` CLI flag and/or
+    /// the `CLINKER_ALLOW_ABSOLUTE_PATHS` env var.
+    pub allow_absolute_paths: bool,
 }
 
 impl CompileContext {
@@ -38,6 +42,7 @@ impl CompileContext {
         Self {
             workspace_root: workspace_root.into(),
             pipeline_dir: PathBuf::new(),
+            allow_absolute_paths: false,
         }
     }
 
@@ -49,6 +54,7 @@ impl CompileContext {
         Self {
             workspace_root: workspace_root.into(),
             pipeline_dir: pipeline_dir.into(),
+            allow_absolute_paths: false,
         }
     }
 
@@ -65,6 +71,7 @@ impl Default for CompileContext {
         Self {
             workspace_root: std::env::current_dir().unwrap_or_default(),
             pipeline_dir: PathBuf::new(),
+            allow_absolute_paths: false,
         }
     }
 }

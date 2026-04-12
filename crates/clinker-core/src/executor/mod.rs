@@ -3405,15 +3405,35 @@ impl PipelineExecutor {
                 }
 
                 PlanNode::Output { ref name, .. } => {
-                    // Get input records from predecessor
-                    let predecessors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let input_records = predecessors
-                        .iter()
-                        .find_map(|p| node_buffers.remove(p))
-                        .unwrap_or_default();
+                    // Get input records: check own buffer first (Route
+                    // nodes store records at the successor's index), then
+                    // fall back to predecessor buffers.
+                    let input_records = if let Some(own_buf) = node_buffers.remove(&node_idx) {
+                        own_buf
+                    } else {
+                        let predecessors: Vec<NodeIndex> = plan
+                            .graph
+                            .neighbors_directed(node_idx, Direction::Incoming)
+                            .collect();
+                        predecessors
+                            .iter()
+                            .find_map(|&p| {
+                                // When multiple outputs share a predecessor,
+                                // clone the buffer for all but the last
+                                // consumer to avoid starving siblings.
+                                let remaining_consumers = plan
+                                    .graph
+                                    .neighbors_directed(p, Direction::Outgoing)
+                                    .filter(|&succ| succ > node_idx)
+                                    .count();
+                                if remaining_consumers == 0 {
+                                    node_buffers.remove(&p)
+                                } else {
+                                    node_buffers.get(&p).cloned()
+                                }
+                            })
+                            .unwrap_or_default()
+                    };
 
                     // Count ok records
                     let output_record_count = input_records.len() as u64;

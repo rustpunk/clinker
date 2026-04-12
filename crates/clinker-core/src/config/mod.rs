@@ -1000,7 +1000,7 @@ impl PipelineConfig {
     /// matching the rustc `Session::has_errors` pattern. Self-loops
     /// are routed to the dedicated E002 check before general cycle
     /// detection so the diagnostic message is more actionable.
-    pub fn compile_topology_only(&self) -> Vec<crate::error::Diagnostic> {
+    pub fn compile_topology_only(&self, ctx: &CompileContext) -> Vec<crate::error::Diagnostic> {
         use crate::error::{Diagnostic, LabeledSpan};
         use crate::graph::NameGraph;
         use crate::span::Span;
@@ -1133,7 +1133,8 @@ impl PipelineConfig {
         // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
         // the legacy projection. Wave 2 walks `nodes:` directly.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let allow_absolute = std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
+        let allow_absolute =
+            ctx.allow_absolute_paths || std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
         diags.extend(crate::security::validate_all_config_paths(
             self,
             &cwd,
@@ -1253,7 +1254,7 @@ impl PipelineConfig {
         use std::collections::HashMap;
 
         // Stage 1-4: name/topology/path validation pre-pass.
-        let mut diags = self.compile_topology_only();
+        let mut diags = self.compile_topology_only(ctx);
         // Hard-error stop: stages 1-4 already collected; stage 5
         // refuses to lower if any error-severity diagnostic is present.
         let has_errors = diags

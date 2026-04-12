@@ -1,4 +1,4 @@
-use clinker_channel::binding::{scan_workspace_channels, validate_channel_bindings};
+use clinker_channel::binding::validate_channel_bindings;
 use clinker_channel::{ChannelBinding, ChannelTarget, DottedPath};
 use std::path::PathBuf;
 

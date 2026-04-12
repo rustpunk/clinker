@@ -1097,6 +1097,7 @@ mod tests {
         type_check(resolved, schema).expect_err("Expected type errors but got Ok")
     }
 
+    #[allow(dead_code)]
     fn node_type(typed: &TypedProgram, idx: usize) -> &Type {
         typed.types[idx].as_ref().unwrap_or(&Type::Any)
     }

@@ -230,7 +230,7 @@ impl JsonReader {
                                 if let serde_json::Value::Object(obj) = elem {
                                     r.remove(&ap.path);
                                     for (k, v) in obj {
-                                        r.insert(format!("{}.{k}", ap.path), v.clone());
+                                        r.insert(k.clone(), v.clone());
                                     }
                                 } else {
                                     r.insert(ap.path.clone(), elem.clone());
@@ -612,9 +612,9 @@ mod tests {
         let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("name"), Some(&Value::String("Alice".into())));
-        assert_eq!(r1.get("orders.id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
         let r2 = r.next_record().unwrap().unwrap();
-        assert_eq!(r2.get("orders.id"), Some(&Value::Integer(2)));
+        assert_eq!(r2.get("id"), Some(&Value::Integer(2)));
         assert!(r.next_record().unwrap().is_none());
     }
 

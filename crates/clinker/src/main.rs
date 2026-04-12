@@ -424,10 +424,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // 7. Existing logic: explain / dry_run / execute
     // LD-16c-12: resolve workspace_root ONCE at the entry point.
     // Production CLI path — never call env::current_dir() inside compile().
-    let compile_ctx = clinker_core::config::CompileContext::new(
+    let mut compile_ctx = clinker_core::config::CompileContext::new(
         std::env::current_dir()
             .map_err(|e| PipelineError::Config(clinker_core::config::ConfigError::Io(e)))?,
     );
+    compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
 
     if let Some(format) = args.explain {
         let compiled_plan =
