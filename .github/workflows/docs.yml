@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - 'docs/**'
-    workflow_dispatch:
+  workflow_dispatch:
     
 jobs:
   deploy:
