@@ -1,0 +1,52 @@
+pipeline:
+  name: bench-streaming-multi-output
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+        - { name: f2, type: string }
+
+  - type: transform
+    name: classify
+    input: source
+    config:
+      cxl: |
+        emit f0 = f0
+        emit f1 = f1
+        emit f2 = f2
+
+  - type: route
+    name: classify_route
+    input: classify
+    config:
+      mode: exclusive
+      conditions:
+        high: "f0 > 500000"
+      default: low
+
+  - type: output
+    name: high
+    input: classify_route.high
+    config:
+      name: high
+      type: csv
+      path: bench://output_high.csv
+      include_unmapped: true
+
+  - type: output
+    name: low
+    input: classify_route.low
+    config:
+      name: low
+      type: csv
+      path: bench://output_low.csv
+      include_unmapped: true

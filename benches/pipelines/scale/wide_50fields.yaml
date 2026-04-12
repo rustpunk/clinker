@@ -1,0 +1,40 @@
+pipeline:
+  name: bench-wide-50fields
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+        - { name: f10, type: string }
+        - { name: f25, type: string }
+        - { name: f40, type: string }
+        - { name: f49, type: string }
+
+  - type: transform
+    name: compute
+    input: source
+    config:
+      cxl: |
+        emit r0 = f0
+        emit r1 = f1
+        emit r10 = f10
+        emit r25 = f25
+        emit r40 = f40
+        emit r49 = f49
+
+  - type: output
+    name: sink
+    input: compute
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

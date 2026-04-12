@@ -1,5 +1,8 @@
 use clinker_bench_support::workspace_root;
-use clinker_core::config::{InputFormat, OutputFormat, PipelineNode, SchemaSource, parse_config};
+use clinker_core::config::{
+    AggregateStrategyHint, InputFormat, NodeInput, OutputFormat, PipelineNode, SchemaSource,
+    parse_config,
+};
 use std::fs;
 
 /// Validates every YAML pipeline config in benches/pipelines/ (except future/)
@@ -192,5 +195,288 @@ fn test_complex_realistic_has_31_emits() {
     assert!(
         emit_count >= 31,
         "expected >= 31 emit lines in complex_realistic, found {emit_count}"
+    );
+}
+
+// ── Task 3.3 gate tests ──────────────────────────────────────────
+
+/// future/ directory has expected stub files.
+#[test]
+fn test_future_stubs_exist() {
+    let root = workspace_root().join("benches/pipelines/future");
+    let stubs: Vec<_> = glob::glob(root.join("*.yaml").to_str().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        stubs.len() >= 2,
+        "Expected at least 2 future stubs, found {}",
+        stubs.len()
+    );
+}
+
+/// For every config with a Route node, every condition key and the default
+/// value names a real output node in the same config.
+#[test]
+fn test_multi_output_route_targets_match_outputs() {
+    let root = workspace_root().join("benches/pipelines");
+    for entry in glob::glob(root.join("**/*.yaml").to_str().unwrap()).unwrap() {
+        let path = entry.unwrap();
+        if path.components().any(|c| c.as_os_str() == "future") {
+            continue;
+        }
+        let yaml = fs::read_to_string(&path).unwrap();
+        let config = parse_config(&yaml).unwrap();
+
+        for node in &config.nodes {
+            if let PipelineNode::Route {
+                header,
+                config: body,
+            } = &node.value
+            {
+                let route_name = &header.name;
+                let output_names: std::collections::HashSet<String> = config
+                    .nodes
+                    .iter()
+                    .filter_map(|n| match &n.value {
+                        PipelineNode::Output { header, .. } => Some(header.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let expected_port = |port: &str| NodeInput::Port {
+                    node: route_name.clone(),
+                    port: port.to_string(),
+                };
+
+                // Each condition key should have a matching output connected via route.port
+                for key in body.conditions.keys() {
+                    let expected = expected_port(key);
+                    let has_output = config.nodes.iter().any(|n| match &n.value {
+                        PipelineNode::Output { header, .. } => header.input == expected,
+                        _ => false,
+                    });
+                    assert!(
+                        has_output || output_names.contains(key),
+                        "{}: route condition '{}' has no matching output",
+                        path.display(),
+                        key,
+                    );
+                }
+                // Default should also have matching output
+                let expected_default = expected_port(&body.default);
+                let has_default = config.nodes.iter().any(|n| match &n.value {
+                    PipelineNode::Output { header, .. } => header.input == expected_default,
+                    _ => false,
+                });
+                assert!(
+                    has_default || output_names.contains(&body.default),
+                    "{}: route default '{}' has no matching output",
+                    path.display(),
+                    body.default
+                );
+            }
+        }
+    }
+}
+
+/// Correlated configs have sort_order and correlation_key.
+#[test]
+fn test_correlated_configs_have_sort_order_and_key() {
+    let configs = [
+        "execution_mode/sorted_streaming_correlated.yaml",
+        "execution_mode/sorted_streaming_group_flush.yaml",
+        "features/dlq_correlated.yaml",
+    ];
+    let root = workspace_root().join("benches/pipelines");
+    for name in configs {
+        let path = root.join(name);
+        let yaml = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let config = parse_config(&yaml).unwrap_or_else(|e| panic!("{name}: {e}"));
+
+        let source = config.source_configs().next().expect("no source");
+        assert!(
+            source.sort_order.as_ref().map_or(false, |s| !s.is_empty()),
+            "{name}: source must have non-empty sort_order"
+        );
+        assert!(
+            config.error_handling.correlation_key.is_some(),
+            "{name}: error_handling must have correlation_key"
+        );
+    }
+}
+
+/// Two-pass configs have analytic_window with non-empty group_by.
+#[test]
+fn test_two_pass_configs_have_analytic_window_group_by() {
+    let configs = [
+        "execution_mode/two_pass_window_sum.yaml",
+        "execution_mode/two_pass_window_all_fns.yaml",
+        "execution_mode/two_pass_parallel_scaling.yaml",
+    ];
+    let root = workspace_root().join("benches/pipelines");
+    for name in configs {
+        let path = root.join(name);
+        let yaml = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let config = parse_config(&yaml).unwrap_or_else(|e| panic!("{name}: {e}"));
+
+        let has_window = config.nodes.iter().any(|n| {
+            if let PipelineNode::Transform { config: body, .. } = &n.value {
+                if let Some(window) = &body.analytic_window {
+                    window
+                        .get("group_by")
+                        .and_then(|v| v.as_array())
+                        .map_or(false, |a| !a.is_empty())
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_window,
+            "{name}: must have transform with analytic_window containing non-empty group_by"
+        );
+    }
+}
+
+/// Split configs have mutually exclusive threshold fields.
+#[test]
+fn test_split_config_max_fields_mutually_exclusive() {
+    let root = workspace_root().join("benches/pipelines/features");
+
+    // splitting_by_records: only max_records
+    let yaml = fs::read_to_string(root.join("splitting_by_records.yaml")).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    let output = config.output_configs().next().unwrap();
+    let split = output.split.as_ref().expect("split config missing");
+    assert!(
+        split.max_records.is_some(),
+        "splitting_by_records must set max_records"
+    );
+    assert!(
+        split.max_bytes.is_none(),
+        "splitting_by_records must NOT set max_bytes"
+    );
+
+    // splitting_by_bytes: only max_bytes
+    let yaml = fs::read_to_string(root.join("splitting_by_bytes.yaml")).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    let output = config.output_configs().next().unwrap();
+    let split = output.split.as_ref().expect("split config missing");
+    assert!(
+        split.max_bytes.is_some(),
+        "splitting_by_bytes must set max_bytes"
+    );
+    assert!(
+        split.max_records.is_none(),
+        "splitting_by_bytes must NOT set max_records"
+    );
+
+    // splitting_by_group_key: max_records + group_key
+    let yaml = fs::read_to_string(root.join("splitting_by_group_key.yaml")).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    let output = config.output_configs().next().unwrap();
+    let split = output.split.as_ref().expect("split config missing");
+    assert!(
+        split.max_records.is_some(),
+        "splitting_by_group_key must set max_records"
+    );
+    assert!(
+        split.group_key.is_some(),
+        "splitting_by_group_key must set group_key"
+    );
+}
+
+/// validation_warn.yaml parses without error_handling block.
+#[test]
+fn test_validation_warn_without_error_handling_parses() {
+    let path = workspace_root().join("benches/pipelines/features/validation_warn.yaml");
+    let yaml = fs::read_to_string(&path).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    // Default error_handling should be permissive (no DLQ required for warn)
+    assert!(
+        config.error_handling.dlq.is_none(),
+        "validation_warn should have no DLQ config"
+    );
+}
+
+/// Scale configs reference fields matching their filename convention.
+#[test]
+fn test_scale_narrow_and_wide_cxl_field_references() {
+    let root = workspace_root().join("benches/pipelines/scale");
+
+    // narrow_5fields: CXL references only f0..f4
+    let yaml = fs::read_to_string(root.join("narrow_5fields.yaml")).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    for node in &config.nodes {
+        if let PipelineNode::Transform { config: body, .. } = &node.value {
+            let src: &str = body.cxl.as_ref();
+            // Should not reference f5 or higher
+            assert!(
+                !src.contains("f5"),
+                "narrow_5fields should not reference f5+"
+            );
+        }
+    }
+
+    // wide_50fields: CXL references include at least one field with index >= 40
+    let yaml = fs::read_to_string(root.join("wide_50fields.yaml")).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    let mut has_high_field = false;
+    for node in &config.nodes {
+        if let PipelineNode::Transform { config: body, .. } = &node.value {
+            let src: &str = body.cxl.as_ref();
+            if src.contains("f40") || src.contains("f41") || src.contains("f49") {
+                has_high_field = true;
+            }
+        }
+    }
+    assert!(
+        has_high_field,
+        "wide_50fields must reference fields with index >= 40"
+    );
+}
+
+/// Aggregate configs have correct strategy hints.
+#[test]
+fn test_aggregate_configs_have_correct_strategy() {
+    let root = workspace_root().join("benches/pipelines/execution_mode");
+
+    // hash aggregate configs should have Hash strategy
+    for name in [
+        "hash_aggregate_low_cardinality.yaml",
+        "hash_aggregate_high_cardinality.yaml",
+    ] {
+        let yaml = fs::read_to_string(root.join(name)).unwrap();
+        let config = parse_config(&yaml).unwrap();
+        for node in &config.nodes {
+            if let PipelineNode::Aggregate { config: body, .. } = &node.value {
+                assert_eq!(
+                    body.strategy,
+                    AggregateStrategyHint::Hash,
+                    "{name}: expected Hash strategy"
+                );
+            }
+        }
+    }
+
+    // streaming aggregate should have Streaming strategy + sorted source
+    let yaml = fs::read_to_string(root.join("streaming_aggregate_presorted.yaml")).unwrap();
+    let config = parse_config(&yaml).unwrap();
+    for node in &config.nodes {
+        if let PipelineNode::Aggregate { config: body, .. } = &node.value {
+            assert_eq!(
+                body.strategy,
+                AggregateStrategyHint::Streaming,
+                "streaming_aggregate_presorted: expected Streaming strategy"
+            );
+        }
+    }
+    let source = config.source_configs().next().unwrap();
+    assert!(
+        source.sort_order.as_ref().map_or(false, |s| !s.is_empty()),
+        "streaming_aggregate_presorted: source must have sort_order"
     );
 }

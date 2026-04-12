@@ -1,0 +1,38 @@
+pipeline:
+  name: bench-dlq-basic
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: passthrough
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+
+  - type: output
+    name: sink
+    input: passthrough
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true
+
+error_handling:
+  strategy: continue
+  dlq:
+    path: bench://dlq.csv
+    include_reason: true
+    include_source_row: true

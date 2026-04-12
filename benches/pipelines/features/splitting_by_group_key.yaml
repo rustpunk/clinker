@@ -1,0 +1,37 @@
+pipeline:
+  name: bench-splitting-by-group-key
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      sort_order:
+        - field: f0
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: passthrough
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+
+  - type: output
+    name: sink
+    input: passthrough
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true
+      split:
+        max_records: 10000
+        group_key: f0
+        naming: "output_{seq:04}.csv"

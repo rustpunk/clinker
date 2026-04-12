@@ -1,0 +1,4 @@
+# STUB: Phase 18 dependency — document transforms with nested assembly
+# This file intentionally does NOT parse as a valid pipeline config.
+this_is_not_a_valid_pipeline: true
+deliberately_broken: yes
