@@ -86,6 +86,11 @@ pub enum PipelineNode {
         /// Resource bindings (file paths, connection strings, etc.).
         #[serde(default)]
         resources: IndexMap<String, serde_json::Value>,
+        /// Populated by `bind_composition` in 16c.2. Serde-default to a
+        /// sentinel; any consumer reading this before `bind_schema` runs
+        /// gets a clear debug-panic.
+        #[serde(skip)]
+        body: crate::plan::composition_body::CompositionBodyId,
     },
 }
 

@@ -8,6 +8,7 @@ pub mod properties;
 pub mod row_type;
 
 pub use compiled::CompiledPlan;
+pub use composition_body::{BoundBody, CompositionBodyId};
 pub use row_type::{ColumnLookup, Row, RowTail, TailVarId};
 
 pub use properties::{

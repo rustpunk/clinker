@@ -20,6 +20,7 @@ use indexmap::IndexMap;
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::bound_schemas::BoundSchemas;
+use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::span::Span;
 use crate::yaml::Spanned;
 
@@ -32,6 +33,36 @@ pub struct CompileArtifacts {
     /// `bind_schema` walk; persisted on `CompiledPlan` for downstream
     /// phases to consume.
     pub bound_schemas: BoundSchemas,
+    /// All bound composition bodies, keyed by `CompositionBodyId`. The
+    /// top-level pipeline is NOT in this map — it lives on
+    /// `CompiledPlan.dag()` directly. Only body scopes are here.
+    pub composition_bodies: IndexMap<CompositionBodyId, BoundBody>,
+    /// Monotonic counter for allocating fresh `CompositionBodyId`s.
+    next_body_id: u32,
+}
+
+impl CompileArtifacts {
+    /// Allocate a fresh, unique `CompositionBodyId`.
+    pub fn fresh_body_id(&mut self) -> CompositionBodyId {
+        let id = CompositionBodyId(self.next_body_id);
+        self.next_body_id += 1;
+        id
+    }
+
+    /// Insert a bound body. Panics if the id is already present.
+    pub fn insert_body(&mut self, id: CompositionBodyId, body: BoundBody) {
+        let prev = self.composition_bodies.insert(id, body);
+        assert!(
+            prev.is_none(),
+            "CompositionBodyId({}) already present in composition_bodies",
+            id.0
+        );
+    }
+
+    /// Look up a bound body by id.
+    pub fn body_of(&self, id: CompositionBodyId) -> Option<&BoundBody> {
+        self.composition_bodies.get(&id)
+    }
 }
 
 /// Run compile-time CXL typechecking over the unified `nodes:` DAG.

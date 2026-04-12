@@ -32,7 +32,7 @@ pub use config::{
     scan_workspace_signatures, validate_signatures,
 };
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
-pub use plan::{ColumnLookup, Row, RowTail, TailVarId};
+pub use plan::{BoundBody, ColumnLookup, CompositionBodyId, Row, RowTail, TailVarId};
 
 #[allow(unused_imports)]
 use clinker_record::{PipelineCounters, Record, RecordProvenance, Schema, Value};
