@@ -1,0 +1,36 @@
+pipeline:
+  name: bench-type-conversions
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: conversions
+    input: source
+    config:
+      cxl: |
+        emit t_int = f0.to_int()
+        emit t_float = f0.to_float()
+        emit t_str = f0.to_string()
+        emit t_bool = f0.to_bool()
+        emit t_try_int = f1.try_int()
+        emit t_try_float = f1.try_float()
+
+  - type: output
+    name: sink
+    input: conversions
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

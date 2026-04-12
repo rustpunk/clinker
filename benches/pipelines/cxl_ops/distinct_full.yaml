@@ -1,0 +1,32 @@
+pipeline:
+  name: bench-distinct-full
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: dedup
+    input: source
+    config:
+      cxl: |
+        emit out = f0
+        distinct
+
+  - type: output
+    name: sink
+    input: dedup
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

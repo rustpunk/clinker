@@ -1,0 +1,66 @@
+pipeline:
+  name: bench-filter-selectivity
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: filter_90pct
+    input: source
+    config:
+      cxl: |
+        filter f0 > 100000
+        emit out = f0
+
+  - type: transform
+    name: filter_50pct
+    input: source
+    config:
+      cxl: |
+        filter f0 > 500000
+        emit out = f0
+
+  - type: transform
+    name: filter_10pct
+    input: source
+    config:
+      cxl: |
+        filter f0 > 900000
+        emit out = f0
+
+  - type: output
+    name: high_pass
+    input: filter_90pct
+    config:
+      name: high_pass
+      type: csv
+      path: bench://output_90.csv
+      include_unmapped: true
+
+  - type: output
+    name: mid_pass
+    input: filter_50pct
+    config:
+      name: mid_pass
+      type: csv
+      path: bench://output_50.csv
+      include_unmapped: true
+
+  - type: output
+    name: low_pass
+    input: filter_10pct
+    config:
+      name: low_pass
+      type: csv
+      path: bench://output_10.csv
+      include_unmapped: true

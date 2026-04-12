@@ -1,0 +1,39 @@
+pipeline:
+  name: bench-conditionals
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+
+  - type: transform
+    name: conditionals
+    input: source
+    config:
+      cxl: |
+        emit tier = if f0 > 900000 then "top"
+                    else if f0 > 500000 then "mid"
+                    else if f0 > 100000 then "low"
+                    else "bottom"
+        emit flag = if f1.length() > 5 and f0 > 500000 then "yes" else "no"
+        emit matched = match f0 > 800000 {
+          true => "high"
+          false => "low"
+        }
+
+  - type: output
+    name: sink
+    input: conditionals
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

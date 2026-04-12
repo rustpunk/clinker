@@ -1,0 +1,64 @@
+pipeline:
+  name: bench-complex-realistic
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+        - { name: f2, type: string }
+
+  - type: transform
+    name: complex
+    input: source
+    config:
+      cxl: |
+        let base = f0 + f2
+        let ratio = f0.to_float() / (f2.to_float() + 1.0)
+        emit c0 = base
+        emit c1 = f1.upper()
+        emit c2 = ratio.round(2)
+        emit c3 = if f0 > 500000 then "high" else if f0 > 250000 then "medium" else "low"
+        emit c4 = f0 ?? 0
+        emit c5 = f1.lower()
+        emit c6 = f1.length()
+        emit c7 = base * 2
+        emit c8 = ratio
+        emit c9 = f0.to_string()
+        emit c10 = f0.to_float()
+        emit c11 = f1.replace("a", "x")
+        emit c12 = f1.substring(0, 5)
+        emit c13 = f0.abs()
+        emit c14 = f1.starts_with("a")
+        emit c15 = f2 ?? f0
+        emit c16 = if f0 > 100 and f2 > 100 then base else 0
+        emit c17 = f0.to_float().round(2)
+        emit c18 = f1.pad_left(20, " ")
+        emit c19 = f1.right(3)
+        emit c20 = f0.clamp(0, 999999)
+        emit c21 = f1.trim()
+        emit c22 = f1.contains("e")
+        emit c23 = f0.min(f2)
+        emit c24 = f0.max(f2)
+        emit c25 = f1.reverse()
+        emit c26 = f0.to_float().ceil()
+        emit c27 = f0.to_float().floor()
+        emit c28 = f1.left(5)
+        emit c29 = f1.find("a")
+        emit c30 = if f0 > 750000 then "top" else if f0 > 250000 then "mid" else "low"
+
+  - type: output
+    name: sink
+    input: complex
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true
