@@ -764,6 +764,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "clinker-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clinker-bench-support",
+ "clinker-core",
+ "criterion",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "clinker-channel"
 version = "0.1.0"
 dependencies = [
