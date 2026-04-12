@@ -1,0 +1,5 @@
+# STUB: Phase 18 dependency — multi-record type support
+# This file intentionally does NOT parse as a valid pipeline config.
+# It exists to verify the harness correctly excludes future/ from validation.
+this_is_not_a_valid_pipeline: true
+deliberately_broken: yes

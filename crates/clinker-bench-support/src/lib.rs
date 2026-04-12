@@ -10,7 +10,27 @@ pub mod generators;
 
 use clinker_record::{Record, Schema, Value};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Returns the workspace root by walking up from `CARGO_MANIFEST_DIR`.
+///
+/// Single source of truth for workspace root resolution in benchmarks and tests.
+/// Panics if the workspace root cannot be found.
+pub fn workspace_root() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .find(|p| {
+            let toml = p.join("Cargo.toml");
+            toml.exists()
+                && std::fs::read_to_string(&toml)
+                    .map(|s| s.contains("[workspace]"))
+                    .unwrap_or(false)
+        })
+        .expect("could not find workspace root from CARGO_MANIFEST_DIR ancestors")
+        .to_path_buf()
+}
 
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
 pub use generators::csv::CsvPayload;
