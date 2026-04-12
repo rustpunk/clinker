@@ -3463,6 +3463,26 @@ impl PipelineExecutor {
                         }
                     }
                 }
+
+                PlanNode::Composition { ref name, body, .. } => {
+                    // Composition runtime expansion deferred to Phase 16c.3.
+                    // For now, pass records through unchanged — the body is
+                    // lowered for --explain and property derivation only.
+                    debug_assert_ne!(
+                        body,
+                        crate::plan::composition_body::CompositionBodyId::SENTINEL,
+                        "composition {name:?}: body_id is sentinel — bind_composition did not run"
+                    );
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let input_records = predecessors
+                        .iter()
+                        .find_map(|p| node_buffers.remove(p))
+                        .unwrap_or_default();
+                    node_buffers.insert(node_idx, input_records);
+                }
             }
         }
 

@@ -19,6 +19,7 @@ use crate::config::{
     AggregateConfig, OutputConfig, PipelineConfig, RouteMode, SortField, SourceConfig,
 };
 use crate::error::PipelineError;
+use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
@@ -173,6 +174,18 @@ pub enum PlanNode {
         /// construction. `Some` iff resolved strategy is Streaming.
         #[serde(skip_serializing_if = "Option::is_none")]
         qualified_sort_order: Option<Vec<SortField>>,
+    },
+    /// Composition call-site node. Lowered to `PlanNode::Composition` in
+    /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
+    /// keyed by the `body` handle.
+    Composition {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Handle into `CompileArtifacts.composition_bodies`. Populated by
+        /// `bind_composition` during `bind_schema`; sentinel
+        /// `CompositionBodyId::SENTINEL` before binding runs.
+        body: CompositionBodyId,
     },
 }
 
@@ -443,7 +456,8 @@ impl PlanNode {
             | PlanNode::Merge { name, .. }
             | PlanNode::Output { name, .. }
             | PlanNode::Sort { name, .. }
-            | PlanNode::Aggregation { name, .. } => name,
+            | PlanNode::Aggregation { name, .. }
+            | PlanNode::Composition { name, .. } => name,
         }
     }
 
@@ -457,7 +471,8 @@ impl PlanNode {
             | PlanNode::Merge { span, .. }
             | PlanNode::Output { span, .. }
             | PlanNode::Sort { span, .. }
-            | PlanNode::Aggregation { span, .. } => *span,
+            | PlanNode::Aggregation { span, .. }
+            | PlanNode::Composition { span, .. } => *span,
         }
     }
 
@@ -471,6 +486,7 @@ impl PlanNode {
             PlanNode::Output { .. } => "output",
             PlanNode::Sort { .. } => "sort",
             PlanNode::Aggregation { .. } => "aggregation",
+            PlanNode::Composition { .. } => "composition",
         }
     }
 
@@ -500,6 +516,9 @@ impl PlanNode {
                     AggregateStrategy::Streaming => "streaming",
                 };
                 format!("[aggregation:{s}] {name}")
+            }
+            PlanNode::Composition { name, body, .. } => {
+                format!("[composition:body={}] {name}", body.0)
             }
         }
     }
@@ -1542,7 +1561,8 @@ impl ExecutionPlanDag {
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
-                | PlanNode::Sort { .. } => {
+                | PlanNode::Sort { .. }
+                | PlanNode::Composition { .. } => {
                     let deps: Vec<String> = self
                         .graph
                         .neighbors_directed(idx, petgraph::Direction::Incoming)
@@ -2622,6 +2642,30 @@ fn compute_one(
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
             // is non-None so explain chains through.
+            let parent = match parents.first() {
+                Some(p) => p,
+                None => return NodeProperties::unordered_single(),
+            };
+            let provenance = if parent.ordering.sort_order.is_some() {
+                OrderingProvenance::Preserved {
+                    from_node: name.clone(),
+                }
+            } else {
+                parent.ordering.provenance.clone()
+            };
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: parent.ordering.sort_order.clone(),
+                    provenance,
+                },
+                partitioning: parent.partitioning.clone(),
+            }
+        }
+
+        PlanNode::Composition { name, .. } => {
+            // Composition is opaque at the top-level property pass.
+            // Inherit parent ordering/partitioning — body-internal
+            // properties live in BoundBody.bound_schemas, not here.
             let parent = match parents.first() {
                 Some(p) => p,
                 None => return NodeProperties::unordered_single(),

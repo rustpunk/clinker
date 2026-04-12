@@ -12,7 +12,7 @@ use super::execution::PlanNode;
 /// Opaque handle into `CompileArtifacts.composition_bodies`. Each
 /// `PipelineNode::Composition` in `CompiledPlan` carries one of these
 /// pointing at its bound body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct CompositionBodyId(pub u32);
 
 impl CompositionBodyId {

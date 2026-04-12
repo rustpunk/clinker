@@ -500,10 +500,27 @@ fn bind_composition(
         body_bound_schemas.set_output(node_name.clone(), row.clone());
     }
 
-    // 13. Build and insert BoundBody.
+    // 13. Lower body nodes to PlanNodes via the shared lowering function.
+    let body_plan_nodes: Vec<crate::plan::execution::PlanNode> = body_file
+        .nodes
+        .iter()
+        .filter_map(|spanned| {
+            let saphyr_line = spanned.referenced.line();
+            let body_span = if saphyr_line > 0 {
+                crate::span::Span::line_only(saphyr_line as u32)
+            } else {
+                crate::span::Span::SYNTHETIC
+            };
+            let n = &spanned.value;
+            let n_name = n.name().to_string();
+            crate::config::lower_node_to_plan_node(n, &n_name, body_span, artifacts, diags)
+        })
+        .collect();
+
+    // 14. Build and insert BoundBody.
     let bound_body = BoundBody {
         signature_path: resolved_path,
-        nodes: vec![], // Body lowering deferred to 16c.2.3 (Stage 5 refactor).
+        nodes: body_plan_nodes,
         bound_schemas: body_bound_schemas,
         output_port_rows: output_port_rows.clone(),
         input_port_rows,
@@ -514,7 +531,7 @@ fn bind_composition(
         .composition_body_assignments
         .insert(node_name.to_string(), body_id);
 
-    // 14. Write composition's output row to parent scope.
+    // 15. Write composition's output row to parent scope.
     // Use the first output port's row as the composition node's output.
     if let Some((_, row)) = output_port_rows.into_iter().next() {
         parent_schema_by_name.insert(node_name.to_string(), row);

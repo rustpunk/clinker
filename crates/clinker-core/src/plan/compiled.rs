@@ -51,7 +51,7 @@ impl CompiledPlan {
     /// Look up the bound output row type for a node by name.
     ///
     /// Returns `None` for nodes that didn't participate in `bind_schema`
-    /// (e.g. `PipelineNode::Composition` stubs in 16c.1).
+    /// (e.g. compositions whose binding failed).
     pub fn schema_for_node_name(&self, name: &str) -> Option<&Row> {
         self.artifacts.bound_schemas.output_of(name)
     }

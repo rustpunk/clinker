@@ -14,7 +14,6 @@
 //! | `E003`      | error    | Cycle detected between nodes                         |
 //! | `E010`      | error    | Dotted-name check (`.` reserved for branch refs)     |
 //! | `E011`      | error    | Log directive sanity (`every` must be valid)         |
-//! | `E100`      | error    | Composition node not yet supported (Phase 16c stub)  |
 //! | `E101`      | error    | Composition signature parse error (malformed `.comp.yaml`) |
 //! | `E102`      | error    | Composition body references undeclared port          |
 //! | `E103`      | error    | Call site or channel binds undeclared input/config/resource |

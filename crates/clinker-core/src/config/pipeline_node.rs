@@ -62,9 +62,9 @@ pub enum PipelineNode {
         header: NodeHeader,
         config: OutputBody,
     },
-    /// Composition call-site node. Parsing is allowed; `compile()` emits
-    /// a single `E100` diagnostic per instance until Phase 16c lands the
-    /// full expansion/lowering.
+    /// Composition call-site node. Lowered to `PlanNode::Composition` in
+    /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
+    /// keyed by the `body` handle.
     Composition {
         #[serde(flatten)]
         header: NodeHeader,
