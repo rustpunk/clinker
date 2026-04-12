@@ -55,6 +55,7 @@ clinker-channel = { workspace = true }
 rayon = "1"
 fastrand = { workspace = true }
 insta = "1"
+serial_test = { workspace = true }
 
 [[bench]]
 name = "sort"

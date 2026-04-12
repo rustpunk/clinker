@@ -197,6 +197,7 @@ pub fn resolve_spool_dir(cli_flag: Option<&Path>, yaml_spool_dir: Option<&str>) 
 mod tests {
     use super::*;
     use chrono::Utc;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn sample_metrics(id: &str) -> ExecutionMetrics {
@@ -324,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_spool_dir_cli_wins() {
         unsafe { std::env::remove_var("CLINKER_METRICS_SPOOL_DIR") };
         let cli_path = Path::new("/cli/path");
@@ -332,6 +334,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_spool_dir_env_over_yaml() {
         unsafe { std::env::set_var("CLINKER_METRICS_SPOOL_DIR", "/env/path") };
         let result = resolve_spool_dir(None, Some("/yaml/path"));
@@ -340,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_spool_dir_yaml_fallback() {
         unsafe { std::env::remove_var("CLINKER_METRICS_SPOOL_DIR") };
         let result = resolve_spool_dir(None, Some("/yaml/path"));
@@ -347,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_spool_dir_none_when_all_absent() {
         unsafe { std::env::remove_var("CLINKER_METRICS_SPOOL_DIR") };
         let result = resolve_spool_dir(None, None);
