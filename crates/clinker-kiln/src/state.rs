@@ -244,7 +244,7 @@ pub struct AppState {
     pub active_context: Signal<NavigationContext>,
     pub pipeline_layout: Signal<PipelineLayoutMode>,
     pub run_log_expanded: Signal<bool>,
-    pub selected_stage: Signal<Option<String>>,
+    pub selected_stages: Signal<std::collections::HashSet<String>>,
     /// Raw YAML text shown in the sidebar editor.
     pub yaml_text: Signal<String>,
     /// Parsed pipeline config (None if YAML is invalid).

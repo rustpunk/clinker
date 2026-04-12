@@ -284,6 +284,22 @@ pub fn CanvasPanel() -> Element {
                         if is_resolved { "RESOLVED" } else { "RAW" }
                     }
                 }
+
+                // ── Extract as Composition button (enabled with 2+ nodes selected) ──
+                {
+                    let count = state.selected_stages.read().len();
+                    rsx! {
+                        button {
+                            class: "kiln-view-toggle",
+                            disabled: count < 2,
+                            title: if count < 2 { "Select 2+ nodes to extract as composition" } else { "Extract selected nodes as a composition" },
+                            onclick: move |_| {
+                                // TODO: open extraction modal (Phase 16c.6.4)
+                            },
+                            span { class: "kiln-view-toggle-label", "EXTRACT" }
+                        }
+                    }
+                }
             }
 
             div {
@@ -298,8 +314,8 @@ pub fn CanvasPanel() -> Element {
             // Clicking empty canvas deselects any selected node.
             // Node clicks call stop_propagation(), so this only fires on empty space.
             onclick: move |_| {
-                let mut sel = state.selected_stage;
-                sel.set(None);
+                let mut sel = state.selected_stages;
+                sel.set(std::collections::HashSet::new());
             },
 
             // ── Transformed viewport ──────────────────────────────────────

@@ -24,9 +24,15 @@ pub fn YamlSidebar() -> Element {
 
     // Compute selected stage's YAML line range for highlighting.
     let selected_range: Option<(usize, usize)> = {
-        let selected = (state.selected_stage)();
+        let stages = state.selected_stages.read();
+        let single_selected = if stages.len() == 1 {
+            stages.iter().next().cloned()
+        } else {
+            None
+        };
+        drop(stages);
         let pipeline_guard = (state.pipeline).read();
-        match (selected.as_deref(), pipeline_guard.as_ref()) {
+        match (single_selected.as_deref(), pipeline_guard.as_ref()) {
             (Some(stage_id), Some(config)) => {
                 let ranges = crate::sync::compute_yaml_ranges(&raw_text, config);
                 ranges.get(stage_id).copied()

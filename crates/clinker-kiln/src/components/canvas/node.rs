@@ -12,7 +12,7 @@ pub fn CanvasNode(stage: StageView) -> Element {
     let stage_id = stage.id.clone();
     let is_composition = matches!(&stage.kind, StageKind::Composition);
 
-    let is_selected = (state.selected_stage)().as_deref() == Some(stage_id.as_str());
+    let is_selected = state.selected_stages.read().contains(stage_id.as_str());
     let is_error = matches!(&stage.kind, StageKind::Error);
 
     let node_class = match (is_selected, is_error, is_composition) {
@@ -51,12 +51,26 @@ pub fn CanvasNode(stage: StageView) -> Element {
                 let stage_id = stage_id.clone();
                 move |e: MouseEvent| {
                     e.stop_propagation();
-                    let mut sel = state.selected_stage;
-                    let current = sel.peek().clone();
-                    if current.as_deref() == Some(stage_id.as_str()) {
-                        sel.set(None);
+                    let mut sel = state.selected_stages;
+                    let shift = e.data().modifiers().shift();
+                    if shift {
+                        // Shift+click: toggle this node in the multi-select set.
+                        let mut set = sel.write();
+                        if set.contains(stage_id.as_str()) {
+                            set.remove(stage_id.as_str());
+                        } else {
+                            set.insert(stage_id.clone());
+                        }
                     } else {
-                        sel.set(Some(stage_id.clone()));
+                        // Regular click: single-select toggle.
+                        let current = sel.read().clone();
+                        if current.len() == 1 && current.contains(stage_id.as_str()) {
+                            sel.set(std::collections::HashSet::new());
+                        } else {
+                            let mut set = std::collections::HashSet::new();
+                            set.insert(stage_id.clone());
+                            sel.set(set);
+                        }
                     }
                 }
             },

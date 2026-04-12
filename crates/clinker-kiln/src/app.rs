@@ -45,7 +45,7 @@ pub fn AppShell() -> Element {
     let mut pipeline = use_signal(|| None);
     let mut parse_errors = use_signal(Vec::new);
     let mut edit_source = use_signal(|| EditSource::None);
-    let mut selected_stage = use_signal(|| None::<String>);
+    let mut selected_stages = use_signal(std::collections::HashSet::<String>::new);
     let mut schema_warnings = use_signal(Vec::new);
     let mut partial_pipeline = use_signal(|| None);
     let channel_view_mode = use_signal(|| ChannelViewMode::Raw);
@@ -276,7 +276,7 @@ pub fn AppShell() -> Element {
                 old_tab.snapshot.partial_pipeline = (partial_pipeline)();
                 old_tab.snapshot.parse_errors = (parse_errors)();
                 old_tab.snapshot.edit_source = (edit_source)();
-                old_tab.snapshot.selected_stage = (selected_stage)();
+                old_tab.snapshot.selected_stage = selected_stages.read().iter().next().cloned();
             }
         }
 
@@ -288,7 +288,7 @@ pub fn AppShell() -> Element {
                 pipeline.set(new_tab.snapshot.pipeline.clone());
                 partial_pipeline.set(new_tab.snapshot.partial_pipeline.clone());
                 parse_errors.set(new_tab.snapshot.parse_errors.clone());
-                selected_stage.set(new_tab.snapshot.selected_stage.clone());
+                selected_stages.set(new_tab.snapshot.selected_stage.iter().cloned().collect());
 
                 // If tab was loaded from disk (edit_source == None) and has content,
                 // trigger a full re-parse to resolve _import compositions.
@@ -308,7 +308,7 @@ pub fn AppShell() -> Element {
             partial_pipeline.set(None);
             parse_errors.set(Vec::new());
             edit_source.set(EditSource::None);
-            selected_stage.set(None);
+            selected_stages.set(std::collections::HashSet::new());
         }
 
         prev_tab_id.set(current_active);
@@ -342,7 +342,7 @@ pub fn AppShell() -> Element {
         active_context,
         pipeline_layout,
         run_log_expanded,
-        selected_stage,
+        selected_stages,
         yaml_text,
         pipeline,
         partial_pipeline,
@@ -507,7 +507,7 @@ pub fn AppShell() -> Element {
             let pp = (partial_pipeline)();
             let errs = (parse_errors)();
             let src = (edit_source)();
-            let sel = (selected_stage)();
+            let sel = selected_stages.read().iter().next().cloned();
 
             if let Some(active_id) = (active_tab_id)() {
                 let mut tabs_w = tabs.write();
@@ -668,7 +668,7 @@ fn GitContextPage() -> Element {
 fn ActiveTabContent() -> Element {
     let state = use_app_state();
     let pipeline_layout = state.pipeline_layout;
-    let selected_stage = state.selected_stage;
+    let selected_stages = state.selected_stages;
     let tab_mgr = use_context::<TabManagerState>();
     let left_panel = (tab_mgr.left_panel)();
 
@@ -704,10 +704,19 @@ fn ActiveTabContent() -> Element {
 
             // Inspector shows for any selected stage, even when drilled into a composition.
             // Drilled transforms exist in state.pipeline (expanded during resolution).
-            if let Some(ref stage_id) = (selected_stage)() {
-                InspectorPanel {
-                    key: "{stage_id}",
-                    stage_id: stage_id.clone(),
+            {
+                let stages = selected_stages.read();
+                if stages.len() == 1 {
+                    let stage_id = stages.iter().next().unwrap().clone();
+                    drop(stages);
+                    rsx! {
+                        InspectorPanel {
+                            key: "{stage_id}",
+                            stage_id: stage_id.clone(),
+                        }
+                    }
+                } else {
+                    rsx! {}
                 }
             }
 
