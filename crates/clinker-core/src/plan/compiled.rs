@@ -4,11 +4,13 @@
 //! [`crate::config::PipelineConfig::compile`] lowering path. It wraps
 //! a validated `PipelineConfig`, its lowered DAG, and the
 //! compile-time CXL typecheck artifacts produced by
-//! [`crate::config::cxl_compile::run`].
+//! [`crate::plan::bind_schema::bind_schema`].
 
+use cxl::typecheck::Row;
+
+use super::bind_schema::CompileArtifacts;
 use super::execution::ExecutionPlanDag;
 use crate::config::PipelineConfig;
-use crate::config::cxl_compile::CompileArtifacts;
 
 #[derive(Debug)]
 pub struct CompiledPlan {
@@ -44,5 +46,13 @@ impl CompiledPlan {
     /// transform's `Arc<TypedProgram>` instead of re-typechecking.
     pub(crate) fn artifacts(&self) -> &CompileArtifacts {
         &self.artifacts
+    }
+
+    /// Look up the bound output row type for a node by name.
+    ///
+    /// Returns `None` for nodes that didn't participate in `bind_schema`
+    /// (e.g. `PipelineNode::Composition` stubs in 16c.1).
+    pub fn schema_for_node_name(&self, name: &str) -> Option<&Row> {
+        self.artifacts.bound_schemas.output_of(name)
     }
 }

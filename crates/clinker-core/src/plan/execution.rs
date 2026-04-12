@@ -197,7 +197,7 @@ pub struct PlanTransformPayload {
     pub validations: Vec<crate::config::ValidationEntry>,
     pub dlq_node: Option<NodeIndex>,
     /// Phase 16b Task 16b.9 — compile-time-typechecked CXL program.
-    /// Populated by `PipelineConfig::compile` via `cxl_compile::run`
+    /// Populated by `PipelineConfig::compile` via `bind_schema::bind_schema`
     /// and NEVER `None`: a transform whose CXL fails to typecheck
     /// surfaces as a compile-time E200 diagnostic and the enclosing
     /// `compile()` call returns `Err` before this payload is built.

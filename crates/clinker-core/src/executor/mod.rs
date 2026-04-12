@@ -640,13 +640,13 @@ impl PipelineExecutor {
         // Phase 16b Task 16b.9 — compile-time CXL typecheck.
         // `config.compile()` drives the unified nodes: pipeline
         // through stages 1-4 (topology/path validation), then the
-        // stage-4.5 `cxl_compile` pass that typechecks every CXL
+        // stage-4.5 `bind_schema` pass that typechecks every CXL
         // body against the author-declared source schema and
         // propagates emitted columns downstream. Type errors surface
         // as E200 diagnostics here, BEFORE any file handle opens.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         // Phase 16b Task 16b.9: ALL CXL typechecking happens at
-        // `config.compile()` time via the `cxl_compile` stage-4.5 pass.
+        // `config.compile()` time via the `bind_schema` stage-4.5 pass.
         // The runtime never re-typechecks; it pulls each transform's
         // pre-typechecked `Arc<TypedProgram>` straight from the
         // `CompiledPlan`'s artifacts map, keyed by node name. There is
@@ -671,7 +671,7 @@ impl PipelineExecutor {
                     .ok_or_else(|| PipelineError::Compilation {
                         transform_name: t.name.clone(),
                         messages: vec![
-                            "internal: cxl_compile produced no typed program for this node"
+                            "internal: bind_schema produced no typed program for this node"
                                 .to_string(),
                         ],
                     })?;
@@ -3503,10 +3503,11 @@ impl PipelineExecutor {
         route_config: &crate::config::RouteConfig,
         emitted_fields: &[String],
     ) -> Result<CompiledRoute, PipelineError> {
-        let type_schema: IndexMap<String, Type> = emitted_fields
+        let type_cols: IndexMap<String, Type> = emitted_fields
             .iter()
             .map(|f| (f.clone(), Type::Any))
             .collect();
+        let type_schema = cxl::typecheck::Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
         let field_refs: Vec<&str> = emitted_fields.iter().map(|s| s.as_str()).collect();
 
         let mut branches = Vec::with_capacity(route_config.branches.len());
@@ -3671,8 +3672,11 @@ impl PipelineExecutor {
                         .map(|d| format!("lookup where resolve error: {}", d.message))
                         .collect(),
                 })?;
-                let schema_map = indexmap::IndexMap::new();
-                let typed = cxl::typecheck::type_check(resolved, &schema_map).map_err(|diags| {
+                let schema_row = cxl::typecheck::Row::closed(
+                    indexmap::IndexMap::new(),
+                    cxl::lexer::Span::new(0, 0),
+                );
+                let typed = cxl::typecheck::type_check(resolved, &schema_row).map_err(|diags| {
                     PipelineError::Compilation {
                         transform_name: transform_name.clone(),
                         messages: diags
@@ -3714,12 +3718,12 @@ impl PipelineExecutor {
     /// Compile execution plan and return the DAG for format-specific rendering.
     ///
     /// Phase 16b Task 16b.9: drives `config.compile()` so the
-    /// stage-4.5 `cxl_compile` pass produces the typed programs;
+    /// stage-4.5 `bind_schema` pass produces the typed programs;
     /// `--explain` no longer parses CXL twice.
     pub(crate) fn explain_dag(
         config: &PipelineConfig,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
-        // Phase 16b Task 16b.9 — compile-time typecheck via cxl_compile.
+        // Phase 16b Task 16b.9 — compile-time typecheck via bind_schema.
         // The validated plan gives us pre-typechecked `Arc<TypedProgram>`s
         // per node; feed them straight into `ExecutionPlanDag::compile`
         // (the full planner path that derives output projections,
@@ -3739,7 +3743,7 @@ impl PipelineExecutor {
                     .artifacts()
                     .typed
                     .get(&t.name)
-                    .expect("cxl_compile must produce a typed program for every transform");
+                    .expect("bind_schema must produce a typed program for every transform");
                 (t.name.as_str(), typed.as_ref())
             })
             .collect();

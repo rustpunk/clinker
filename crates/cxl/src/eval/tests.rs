@@ -4,11 +4,17 @@ use chrono::Datelike;
 use clinker_record::{RecordStorage, Value};
 
 use super::*;
+use crate::lexer::Span;
 use crate::parser::Parser;
 use crate::resolve::HashMapResolver;
 use crate::resolve::pass::resolve_program;
 use crate::typecheck::Type;
 use crate::typecheck::pass::type_check;
+use crate::typecheck::row::Row;
+
+fn empty_row() -> Row {
+    Row::closed(indexmap::IndexMap::new(), Span::new(0, 0))
+}
 
 /// Dummy storage for no-window evaluation tests.
 struct NullStorage;
@@ -44,7 +50,7 @@ fn eval_ok(
             d.iter().map(|e| &e.message).collect::<Vec<_>>()
         )
     });
-    let typed = type_check(resolved, &indexmap::IndexMap::new()).unwrap_or_else(|d| {
+    let typed = type_check(resolved, &empty_row()).unwrap_or_else(|d| {
         panic!(
             "Type errors: {:?}",
             d.iter().map(|e| &e.message).collect::<Vec<_>>()
@@ -310,7 +316,7 @@ fn test_eval_conversion_strict() {
     // to_int on "abc" → error
     let parsed = Parser::parse("emit val = \"abc\".to_int()");
     let resolved = resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
-    let typed = type_check(resolved, &indexmap::IndexMap::new()).unwrap();
+    let typed = type_check(resolved, &empty_row()).unwrap();
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
@@ -358,7 +364,7 @@ fn test_eval_regex_precompiled() {
     // Regex should come from TypedProgram.regexes, pre-compiled during type check
     let parsed = Parser::parse("emit val = \"123\".matches(\"\\\\d+\")");
     let resolved = resolve_program(parsed.ast, &[], parsed.node_count).unwrap();
-    let typed = type_check(resolved, &indexmap::IndexMap::new()).unwrap();
+    let typed = type_check(resolved, &empty_row()).unwrap();
     // Verify regex was pre-compiled
     let has_regex = typed.regexes.iter().any(|r| r.is_some());
     assert!(has_regex, "Expected pre-compiled regex in TypedProgram");

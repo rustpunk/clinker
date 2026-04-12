@@ -1,6 +1,5 @@
 pub mod compile_context;
 pub mod composition;
-pub mod cxl_compile;
 pub mod node_header;
 pub mod pipeline_node;
 
@@ -1288,7 +1287,7 @@ impl PipelineConfig {
         // author-declared `schema:` block, and typechecks every
         // CXL-bearing node against the propagated upstream schema.
         // E200 diagnostics surface here with per-node spans.
-        let artifacts = crate::config::cxl_compile::run(&self.nodes, &mut diags);
+        let artifacts = crate::plan::bind_schema::bind_schema(&self.nodes, &mut diags);
         let has_errors = diags
             .iter()
             .any(|d| matches!(d.severity, crate::error::Severity::Error));
@@ -1339,7 +1338,7 @@ impl PipelineConfig {
                     let typed = artifacts
                         .typed
                         .get(&name)
-                        .expect("cxl_compile must produce typed program for every transform")
+                        .expect("bind_schema must produce typed program for every transform")
                         .clone();
                     Some(PlanNode::Transform {
                         name: name.clone(),

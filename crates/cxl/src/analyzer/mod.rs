@@ -306,9 +306,11 @@ fn is_window_call_chain(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lexer::Span;
     use crate::parser::Parser;
     use crate::resolve::pass::resolve_program;
     use crate::typecheck::pass::type_check;
+    use crate::typecheck::row::Row;
     use std::collections::HashMap;
 
     /// Helper: compile CXL source to TypedProgram for testing the analyzer.
@@ -321,8 +323,7 @@ mod tests {
         );
         let fields: Vec<&str> = vec!["dept", "amount", "name", "region", "score", "date"];
         let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
-        let schema: indexmap::IndexMap<String, crate::typecheck::types::Type> =
-            indexmap::IndexMap::new();
+        let schema = Row::closed(indexmap::IndexMap::new(), Span::new(0, 0));
         type_check(resolved, &schema).unwrap()
     }
 

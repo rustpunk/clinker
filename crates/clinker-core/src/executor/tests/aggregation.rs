@@ -27,6 +27,7 @@ mod dispatch {
     use cxl::plan::extract_aggregates;
     use cxl::resolve::pass::resolve_program;
     use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use cxl::typecheck::Row;
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
@@ -68,10 +69,11 @@ mod dispatch {
             .iter()
             .map(|(n, t)| ((*n).to_string(), t.clone()))
             .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
             group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
         };
-        let typed = type_check_with_mode(resolved, &schema_map, mode).expect("typecheck");
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
         let schema_names: Vec<String> =
             input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
         let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
@@ -256,6 +258,7 @@ nodes:
                 let resolved = resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
                 let mut schema_map: IndexMap<String, Type> = IndexMap::new();
                 schema_map.insert("dept".to_string(), Type::String);
+                let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
                 let mode = if t.is_aggregate() {
                     AggregateMode::GroupBy {
                         group_by_fields: ["dept".to_string()].into_iter().collect(),
@@ -265,7 +268,7 @@ nodes:
                 };
                 (
                     t.name.clone(),
-                    type_check_with_mode(resolved, &schema_map, mode).unwrap(),
+                    type_check_with_mode(resolved, &row, mode).unwrap(),
                 )
             })
             .collect();
@@ -608,10 +611,11 @@ nodes:
             .iter()
             .map(|(n, t)| ((*n).to_string(), t.clone()))
             .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
             group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
         };
-        let typed = type_check_with_mode(resolved, &schema_map, mode).expect("typecheck");
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
         let schema_names: Vec<String> =
             input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
         let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
@@ -1706,6 +1710,7 @@ mod task_16_4_3_spill {
     use cxl::plan::extract_aggregates;
     use cxl::resolve::pass::resolve_program;
     use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use cxl::typecheck::row::Row;
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
@@ -1735,10 +1740,11 @@ mod task_16_4_3_spill {
             .iter()
             .map(|(n, t)| ((*n).to_string(), t.clone()))
             .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
             group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
         };
-        let typed = type_check_with_mode(resolved, &schema_map, mode).expect("typecheck");
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
         let schema_names: Vec<String> =
             input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
         let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();

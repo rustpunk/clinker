@@ -23,6 +23,7 @@
 //! | `E106`      | error    | Name collision after composition expansion           |
 //! | `E107`      | error    | Cycle detected in flat post-expansion graph          |
 //! | `E108`      | error    | Composition body references enclosing scope (IsolatedFromAbove) |
+//! | `E109`      | error    | Ambiguous column reference (declared vs pass-through in open row) |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
@@ -320,7 +321,7 @@ mod diagnostic_tests {
     fn test_error_registry_e101_through_e108_documented() {
         let source = include_str!("error.rs");
         for code in [
-            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108",
+            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E109",
         ] {
             let pattern = format!("`{code}`");
             assert!(

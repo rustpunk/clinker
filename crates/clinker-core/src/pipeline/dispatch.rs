@@ -510,8 +510,8 @@ mod tests {
         let fields: &[&str] = &[];
         let resolved =
             cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-        let schema: indexmap::IndexMap<String, cxl::typecheck::types::Type> =
-            indexmap::IndexMap::new();
+        let schema =
+            cxl::typecheck::Row::closed(indexmap::IndexMap::new(), cxl::lexer::Span::new(0, 0));
         let typed = cxl::typecheck::pass::type_check(resolved, &schema).unwrap();
 
         let resolver = TestResolver;

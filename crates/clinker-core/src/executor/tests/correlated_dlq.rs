@@ -382,7 +382,7 @@ nodes:
                 .artifacts()
                 .typed
                 .get(&t.name)
-                .expect("cxl_compile produced a typed program for this node");
+                .expect("bind_schema produced a typed program for this node");
             (t.name.as_str(), typed.as_ref())
         })
         .collect();
