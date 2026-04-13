@@ -4,13 +4,14 @@
 //! `cxl::eval` can use it for distinct without depending on `clinker-core`.
 
 use chrono::{NaiveDate, NaiveDateTime};
+use serde::{Deserialize, Serialize};
 
 use crate::schema_def::{FieldDef, FieldType};
 use crate::value::Value;
 
 /// Group-by key for SecondaryIndex and distinct dedup.
 /// Supports Eq + Hash for HashMap/HashSet keys.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GroupByKey {
     Str(Box<str>),
     /// Used only when schema_overrides pins a field to "integer".

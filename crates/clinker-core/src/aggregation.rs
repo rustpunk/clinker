@@ -39,9 +39,7 @@ use indexmap::IndexMap;
 
 use crate::config::{NullOrder, SortField, SortOrder};
 use crate::error::PipelineError;
-use crate::pipeline::loser_tree::{LoserTree, MergeEntry};
-use crate::pipeline::sort_key::encode_sort_key;
-use crate::pipeline::spill::{SpillFile, SpillWriter};
+use crate::pipeline::loser_tree::LoserTree;
 
 /// Local stand-in to satisfy `eval_expr`'s `S: RecordStorage` type
 /// parameter when no window context is in play. The aggregator hot loop
@@ -131,6 +129,43 @@ impl AccumulatorFactory {
     pub fn compiled(&self) -> &Arc<CompiledAggregate> {
         &self.compiled
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-group memory estimation (PostgreSQL hash_agg_entry_size pattern)
+// ---------------------------------------------------------------------------
+
+/// Conservative estimate of total memory consumed per distinct group in the
+/// hash table. Accounts for the hashbrown bucket entry, key heap, accumulator
+/// row heap, IndexMap sidecar overhead, and MetadataCommonTracker base.
+///
+/// Used to pre-compute `max_groups = (budget * 0.6) / estimated_bytes` so the
+/// spill trigger can fire on a simple group-count comparison (O(1)) instead of
+/// the broken `allocation_size() * 3 > headroom` heuristic that only saw the
+/// bucket array.
+fn estimated_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> usize {
+    // hashbrown stores (Key, Value) inline in the bucket array + 1 control byte.
+    let bucket_entry = std::mem::size_of::<(Vec<GroupByKey>, AggregatorGroupState)>() + 1;
+
+    // Vec<GroupByKey> heap: one GroupByKey enum per group-by column, plus an
+    // average 32 bytes of string heap per field (typical 10-50 byte keys).
+    let key_heap = gb_count * (std::mem::size_of::<GroupByKey>() + 32);
+
+    // AccumulatorRow heap: Vec header is inline in AggregatorGroupState,
+    // elements are on the heap.
+    let acc_heap = factory.compiled().bindings.len() * std::mem::size_of::<AccumulatorEnum>();
+
+    // IndexMap base overhead for common_emitted + union_accumulated.
+    // An empty IndexMap is ~128 bytes; two of them per group.
+    let sidecar_maps = 256;
+
+    // MetadataCommonTracker: empty HashMap base allocation + headroom for
+    // a few observed keys.
+    let meta_base = std::mem::size_of::<MetadataCommonTracker>() + 128;
+
+    // hashbrown targets ~87.5% load factor → ~1.15x bucket overallocation.
+    let raw = bucket_entry + key_heap + acc_heap + sidecar_maps + meta_base;
+    (raw as f64 * 1.15) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +675,7 @@ mod tracker_tests {
 /// "Keep Only Common Attributes" propagator (D11 revised) that
 /// observes every input record's metadata so finalize can emit
 /// non-conflicting keys without per-key user wiring.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatorGroupState {
     pub row: AccumulatorRow,
     pub meta_tracker: MetadataCommonTracker,
@@ -985,7 +1020,7 @@ pub struct HashAggregator {
     pre_agg_filter: Option<Expr>,
     value_heap_bytes: usize,
     memory_budget: usize,
-    spill_files: Vec<SpillFile<()>>,
+    spill_files: Vec<AggSpillFile>,
     spill_schema: Arc<Schema>,
     spill_dir: Option<PathBuf>,
     output_schema: Arc<Schema>,
@@ -1002,6 +1037,14 @@ pub struct HashAggregator {
     /// a record. Used by the global-fold empty-input special case in
     /// `finalize` (D12, D44).
     rows_seen: u64,
+    /// Pre-computed maximum group count before spill fires. Derived from
+    /// `(memory_budget * 60%) / estimated_bytes_per_group`. The 60% share
+    /// leaves 40% for `value_heap_bytes` growth (Collect accumulators,
+    /// meta tracker observations). `usize::MAX` when budget is 0.
+    max_groups: usize,
+    /// Counter for periodic RSS backstop polling. Checked every 4096
+    /// records to limit /proc/self/statm read overhead.
+    records_since_rss_check: u32,
 }
 
 impl HashAggregator {
@@ -1030,6 +1073,12 @@ impl HashAggregator {
             .map(|e| e.output_name.clone())
             .collect();
         let factory = AccumulatorFactory::new(compiled);
+        let estimated = estimated_bytes_per_group(&factory, group_by_indices.len());
+        let max_groups = if memory_budget > 0 && estimated > 0 {
+            (memory_budget * 60 / 100) / estimated
+        } else {
+            usize::MAX
+        };
         Self {
             groups: hashbrown::HashMap::new(),
             factory,
@@ -1047,6 +1096,8 @@ impl HashAggregator {
             explicit_meta_keys,
             meta_conflict_logged: HashSet::new(),
             rows_seen: 0,
+            max_groups,
+            records_since_rss_check: 0,
         }
     }
 
@@ -1061,6 +1112,11 @@ impl HashAggregator {
         self.value_heap_bytes
     }
 
+    /// Pre-computed maximum group count before spill fires.
+    pub fn max_groups(&self) -> usize {
+        self.max_groups
+    }
+
     /// Number of input records that have passed the pre-aggregation
     /// filter (D44). Drives the global-fold empty-input special case.
     pub fn rows_seen(&self) -> u64 {
@@ -1069,7 +1125,7 @@ impl HashAggregator {
 
     /// Borrow the spill file vector. Empty until 16.3.10 wires the
     /// spill writer.
-    pub fn spill_files(&self) -> &[SpillFile<()>] {
+    pub fn spill_files(&self) -> &[AggSpillFile] {
         &self.spill_files
     }
 
@@ -1192,50 +1248,61 @@ impl HashAggregator {
             }
         }
 
-        // 7. Resize-aware spill trigger (D1). Uses hashbrown's
-        // `allocation_size` so the trigger fires before the next resize
-        // doubles the table footprint.
-        let table_alloc = self.groups.allocation_size();
-        let headroom = self.memory_budget.saturating_sub(self.value_heap_bytes);
-        if table_alloc.saturating_mul(3) > headroom && self.memory_budget > 0 {
+        // 7. Dual-threshold spill trigger (PostgreSQL hash_agg_check_limits
+        // pattern). Primary: group count exceeds pre-computed max_groups
+        // (60% of budget / estimated_bytes_per_group). Secondary:
+        // value_heap_bytes exceeds 40% of budget (catches Collect
+        // accumulators that grow unbounded per group).
+        if self.memory_budget > 0
+            && (self.groups.len() >= self.max_groups
+                || self.value_heap_bytes > self.memory_budget * 40 / 100)
+        {
             self.spill()?;
+        }
+
+        // 8. RSS backstop — periodic process-wide memory check. Catches
+        //    cases where the per-group estimate underestimates or Collect
+        //    accumulators grow beyond what value_heap_bytes tracks.
+        self.records_since_rss_check += 1;
+        if self.records_since_rss_check >= 4096 {
+            self.records_since_rss_check = 0;
+            if self.memory_budget > 0
+                && let Some(rss) = crate::pipeline::memory::rss_bytes()
+            {
+                let backstop = (self.memory_budget as u64) * 85 / 100;
+                if rss > backstop {
+                    tracing::warn!(
+                        transform = %self.transform_name,
+                        rss_mb = rss / (1024 * 1024),
+                        budget_mb = self.memory_budget / (1024 * 1024),
+                        groups = self.groups.len(),
+                        "RSS backstop triggered — force-spilling"
+                    );
+                    self.spill()?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// Spill the in-memory groups to disk (Task 16.3.10).
+    /// Spill the in-memory groups to disk as bincode + LZ4.
     ///
     /// 1. Drain `self.groups` into a Vec.
-    /// 2. Sort by group key via [`compare_group_keys`] so the merge
-    ///    phase (16.3.12) can do a k-way LoserTree walk.
-    /// 3. Build one [`Record`] per group matching `spill_schema`
-    ///    (group-by columns ++ `__acc_state` ++ `__meta_tracker`). The
-    ///    accumulator row and the metadata common-tracker are serialized
-    ///    as JSON strings in their respective columns.
-    /// 4. Stream through [`SpillWriter`], finish the writer, and push
-    ///    the resulting [`SpillFile`] onto `self.spill_files`.
-    /// 5. Reset `value_heap_bytes = 0` because every per-group value
-    ///    heap is now off-process.
-    ///
-    /// Per D11 revised: `MetadataCommonTracker` is serialized alongside
-    /// the accumulator row so the spill-merge path can associatively
-    /// merge partial trackers at key boundaries during recovery.
+    /// 2. Encode sort keys and sort by memcmp bytes so the k-way merge
+    ///    can walk entries in group-key order.
+    /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) via
+    ///    bincode into an LZ4 frame-compressed temp file.
+    /// 4. Push the resulting `AggSpillFile` onto `self.spill_files`.
+    /// 5. Reset `value_heap_bytes = 0`.
     fn spill(&mut self) -> Result<(), HashAggError> {
-        let spill_err = |e: crate::pipeline::spill::SpillError| HashAggError::Spill(e.to_string());
-        let json_err = |e: serde_json::Error| HashAggError::Spill(e.to_string());
-
         // 1. Drain.
         let drained: Vec<(Vec<GroupByKey>, AggregatorGroupState)> = self.groups.drain().collect();
 
-        // 2. Encode each group's key into bytes via the same
-        //    `SortKeyEncoder` configuration the read side will use, then
-        //    sort by raw `Vec<u8>` (memcmp). The encoded buffers are
-        //    transient — they drop at end of scope. Phase 16 Task 16.4.3.
+        // 2. Encode sort keys via SortKeyEncoder (same encoding the
+        //    streaming merge path uses).
         let sort_fields = group_by_sort_fields(&self.group_by_fields, &self.spill_schema);
         let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
 
-        // Pre-build synthetic records once so we can encode them via
-        // the same `Record`-based encoder both write and read sides use.
         let gb_count = self.group_by_indices.len();
         let mut prepared: Vec<(Vec<u8>, usize)> = Vec::with_capacity(drained.len());
         for (idx, (key, _state)) in drained.iter().enumerate() {
@@ -1243,6 +1310,7 @@ impl HashAggregator {
             for gk in key {
                 values.push(gk.to_value());
             }
+            // Pad to match spill_schema column count for SortKeyEncoder.
             values.push(Value::Null);
             values.push(Value::Null);
             let synth = Record::new(Arc::clone(&self.spill_schema), values);
@@ -1252,27 +1320,19 @@ impl HashAggregator {
         }
         prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        let mut writer: SpillWriter<()> =
-            SpillWriter::new(Arc::clone(&self.spill_schema), self.spill_dir.as_deref())
-                .map_err(spill_err)?;
-
-        for (_encoded, idx) in &prepared {
-            let (key, state) = &drained[*idx];
-            let acc_json = serde_json::to_string(&state.row).map_err(json_err)?;
-            let meta_json = serde_json::to_string(&state.meta_tracker).map_err(json_err)?;
-
-            let mut values: Vec<Value> = Vec::with_capacity(gb_count + 2);
-            for gk in key {
-                values.push(gk.to_value());
-            }
-            values.push(Value::String(acc_json.into()));
-            values.push(Value::String(meta_json.into()));
-
-            let record = Record::new(Arc::clone(&self.spill_schema), values);
-            writer.write_record(&record).map_err(spill_err)?;
+        // 3. Write sorted entries as bincode + LZ4.
+        let mut writer = AggSpillWriter::new(self.spill_dir.as_deref())?;
+        for (sort_key, idx) in prepared {
+            let (key, state) = &drained[idx];
+            let entry = AggSpillEntry {
+                sort_key,
+                group_key: key.clone(),
+                state: state.clone(),
+            };
+            writer.write_entry(&entry)?;
         }
 
-        let spill_file = writer.finish().map_err(spill_err)?;
+        let spill_file = writer.finish()?;
         self.spill_files.push(spill_file);
 
         // 5. All per-group value heap bytes are now off-process.
@@ -1381,94 +1441,94 @@ impl HashAggregator {
             self.spill()?;
         }
 
-        // Open readers over every spill file.
-        let spill_err = |e: crate::pipeline::spill::SpillError| HashAggError::Spill(e.to_string());
-        let mut readers: Vec<crate::pipeline::spill::SpillReader<()>> = self
+        // Open binary readers over every spill file.
+        let mut readers: Vec<AggSpillReader> = self
             .spill_files
             .iter()
-            .map(|f| f.reader().map_err(spill_err))
+            .map(|f| f.reader())
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Sort fields for both the LoserTree's own ordering key and the
-        // GroupBoundary's encoder. Single source of truth.
-        let sort_fields = group_by_sort_fields(&self.group_by_fields, &self.spill_schema);
-
         // Prime the loser tree with one entry per reader.
-        let mut initial: Vec<Option<MergeEntry>> = Vec::with_capacity(readers.len());
+        let mut initial: Vec<Option<AggMergeEntry>> = Vec::with_capacity(readers.len());
         for reader in &mut readers {
-            match reader.next() {
-                Some(Ok((record, _))) => {
-                    let key = encode_sort_key(&record, &sort_fields);
-                    initial.push(Some(MergeEntry { key, record }));
-                }
-                Some(Err(e)) => return Err(HashAggError::Spill(e.to_string())),
-                None => initial.push(None),
-            }
+            initial.push(reader.next_entry()?);
         }
         let mut tree = LoserTree::new(initial);
 
-        let gb_count = self.group_by_indices.len();
-        // FALLBACK per drill-pass-7 Option (b): the spill envelope does
-        // NOT carry the D57 sidecars. For spill-recovered groups we push
-        // identity sidecars into the shared `GroupBoundary` detector,
-        // now byte-keyed (Phase 16 Task 16.4.3 — "Single-Encoder
-        // Two-Phase Bytes").
+        // Direct merge loop: detect group boundaries via sort key bytes,
+        // merge accumulator rows + sidecars within each boundary, and
+        // finalize when the key changes.
         let factory = &self.factory;
         let output_schema = &self.output_schema;
-        let transform_name = self.transform_name.clone();
+        let transform_name = &self.transform_name;
 
-        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields.clone());
-        let mut boundary = crate::pipeline::streaming_merge::GroupBoundary::new(
-            encoder,
-            crate::pipeline::streaming_merge::StreamingErrorMode::SpillMerge,
-        );
-
-        // The finalize closure receives the previously-open record (held
-        // by `GroupBoundary::open_record`) and re-derives the semantic
-        // group key from it via `decode_spill_record`. No `RefCell`
-        // shadow of the key needed.
-        let gb_fields = self.group_by_fields.clone();
-        let finalize_closure =
-            |rec: &Record, s: &AggregatorGroupState| -> Result<Record, HashAggError> {
-                let (key, _state) = decode_spill_record(rec, &gb_fields, gb_count)?;
-                finalize_group_inner(factory, output_schema, &transform_name, &key, s)
-            };
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut current_group_key: Option<Vec<GroupByKey>> = None;
+        let mut current_state: Option<AggregatorGroupState> = None;
 
         while tree.winner().is_some() {
             let stream_idx = tree.winner_index();
-            let record = tree.winner().unwrap().record.clone();
+            let winner = tree.winner().unwrap();
+            let same_group = current_key.as_ref().is_some_and(|k| k == &winner.sort_key);
 
-            let (_key, state) = decode_spill_record(&record, &self.group_by_fields, gb_count)?;
-
-            // Encode the spilled record's group-by columns into
-            // boundary.current via the owned encoder.
-            let mut scratch = std::mem::take(&mut boundary.current);
-            boundary.encoder().encode_into(&record, &mut scratch);
-            boundary.current = scratch;
-
-            // The boundary stores `record` as the new open_record so the
-            // finalize closure receives it on the *next* boundary.
-            boundary.push(
-                state,
-                record,
-                (0, IndexMap::new(), IndexMap::new()),
-                &finalize_closure,
-                out,
-            )?;
+            if same_group {
+                // Merge into current group: row-by-row accumulator merge
+                // + sidecar merge (same logic as GroupBoundary::push).
+                let cur = current_state.as_mut().unwrap();
+                for (a, b) in cur.row.iter_mut().zip(winner.state.row.iter()) {
+                    AccumulatorEnum::merge(a, b);
+                }
+                let mut src = winner.state.clone();
+                src.row.clear(); // already merged above
+                merge_group_sidecars(cur, src);
+            } else {
+                // Finalize previous group (if any).
+                if let (Some(gk), Some(state)) = (current_group_key.take(), current_state.take()) {
+                    let record =
+                        finalize_group_inner(factory, output_schema, transform_name, &gk, &state)?;
+                    let row_num = if state.min_row_num == u64::MAX {
+                        0
+                    } else {
+                        state.min_row_num
+                    };
+                    let emitted: IndexMap<String, Value> = record
+                        .schema()
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (c.to_string(), record.values()[i].clone()))
+                        .collect();
+                    out.push((record, row_num, emitted, IndexMap::new()));
+                }
+                // Start new group from the winner.
+                current_key = Some(winner.sort_key.clone());
+                current_group_key = Some(winner.group_key.clone());
+                current_state = Some(winner.state.clone());
+            }
 
             // Advance the winning stream.
-            let next = match readers[stream_idx].next() {
-                Some(Ok((record, _))) => {
-                    let key = encode_sort_key(&record, &sort_fields);
-                    Some(MergeEntry { key, record })
-                }
-                Some(Err(e)) => return Err(HashAggError::Spill(e.to_string())),
-                None => None,
-            };
+            let next = readers[stream_idx].next_entry()?;
             tree.replace_winner(next);
         }
 
-        boundary.flush(&finalize_closure, out)?;
+        // Finalize the last group.
+        if let (Some(gk), Some(state)) = (current_group_key.take(), current_state.take()) {
+            let record = finalize_group_inner(factory, output_schema, transform_name, &gk, &state)?;
+            let row_num = if state.min_row_num == u64::MAX {
+                0
+            } else {
+                state.min_row_num
+            };
+            let emitted: IndexMap<String, Value> = record
+                .schema()
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.to_string(), record.values()[i].clone()))
+                .collect();
+            out.push((record, row_num, emitted, IndexMap::new()));
+        }
+
         let _ = ctx; // reserved for future per-group eval scope
         Ok(())
     }
@@ -1531,64 +1591,121 @@ pub(crate) fn finalize_group_inner(
     Ok(record)
 }
 
-/// Decode one spill record produced by [`HashAggregator::spill`] back
-/// into its `(group_key, AggregatorGroupState)` representation.
-///
-/// The spill schema is: `[group-by columns..] ++ __acc_state ++
-/// __meta_tracker`. Both trailer columns hold JSON-serialized
-/// `AccumulatorRow` / `MetadataCommonTracker` strings.
-fn decode_spill_record(
-    record: &Record,
-    gb_fields: &[String],
-    gb_count: usize,
-) -> Result<(Vec<GroupByKey>, AggregatorGroupState), HashAggError> {
-    let values = record.values();
-    if values.len() < gb_count + 2 {
-        return Err(HashAggError::Spill(format!(
-            "spill record has {} columns, expected at least {}",
-            values.len(),
-            gb_count + 2
-        )));
+// ---------------------------------------------------------------------------
+// Binary aggregation spill infrastructure (Phase 2: bincode + LZ4)
+// ---------------------------------------------------------------------------
+
+/// Merge entry for the binary aggregation spill path. Ordered by
+/// pre-encoded sort key bytes for the `LoserTree` k-way merge.
+struct AggMergeEntry {
+    sort_key: Vec<u8>,
+    group_key: Vec<GroupByKey>,
+    state: AggregatorGroupState,
+}
+
+impl PartialEq for AggMergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_key == other.sort_key
+    }
+}
+impl Eq for AggMergeEntry {}
+impl PartialOrd for AggMergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for AggMergeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key.cmp(&other.sort_key)
+    }
+}
+
+/// Binary spill entry serialized to disk via bincode + LZ4.
+#[derive(Serialize, Deserialize)]
+struct AggSpillEntry {
+    sort_key: Vec<u8>,
+    group_key: Vec<GroupByKey>,
+    state: AggregatorGroupState,
+}
+
+/// Binary aggregation spill writer. Writes `AggSpillEntry` via bincode
+/// into an LZ4 frame-compressed temp file. No schema header — the
+/// caller knows the group-by layout at construction time.
+struct AggSpillWriter {
+    encoder: lz4_flex::frame::FrameEncoder<std::io::BufWriter<tempfile::NamedTempFile>>,
+}
+
+impl AggSpillWriter {
+    fn new(spill_dir: Option<&std::path::Path>) -> Result<Self, HashAggError> {
+        let temp_file = if let Some(dir) = spill_dir {
+            tempfile::NamedTempFile::new_in(dir)
+        } else {
+            tempfile::NamedTempFile::new()
+        }
+        .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let buf_writer = std::io::BufWriter::new(temp_file);
+        let encoder = lz4_flex::frame::FrameEncoder::new(buf_writer);
+        Ok(Self { encoder })
     }
 
-    let mut key: Vec<GroupByKey> = Vec::with_capacity(gb_count);
-    for (i, name) in gb_fields.iter().enumerate() {
-        let v = &values[i];
-        match value_to_group_key(v, name, None, 0)
-            .map_err(|e| HashAggError::Spill(format!("spill group-key decode: {e:?}")))?
-        {
-            Some(k) => key.push(k),
-            None => key.push(GroupByKey::Null),
-        }
+    fn write_entry(&mut self, entry: &AggSpillEntry) -> Result<(), HashAggError> {
+        bincode::serialize_into(&mut self.encoder, entry)
+            .map_err(|e| HashAggError::Spill(e.to_string()))
     }
 
-    let acc_json = match &values[gb_count] {
-        Value::String(s) => s.as_ref(),
-        other => {
-            return Err(HashAggError::Spill(format!(
-                "spill __acc_state column is not a string: {other:?}"
-            )));
-        }
-    };
-    let meta_json = match &values[gb_count + 1] {
-        Value::String(s) => s.as_ref(),
-        other => {
-            return Err(HashAggError::Spill(format!(
-                "spill __meta_tracker column is not a string: {other:?}"
-            )));
-        }
-    };
+    fn finish(self) -> Result<AggSpillFile, HashAggError> {
+        let buf_writer = self
+            .encoder
+            .finish()
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let temp_file = buf_writer
+            .into_inner()
+            .map_err(|e| HashAggError::Spill(e.into_error().to_string()))?;
+        let path = temp_file.into_temp_path();
+        Ok(AggSpillFile { path })
+    }
+}
 
-    let row: AccumulatorRow = serde_json::from_str(acc_json)
-        .map_err(|e| HashAggError::Spill(format!("__acc_state decode: {e}")))?;
-    let meta_tracker: MetadataCommonTracker = serde_json::from_str(meta_json)
-        .map_err(|e| HashAggError::Spill(format!("__meta_tracker decode: {e}")))?;
+/// Completed binary spill file handle. Auto-deletes on drop via `TempPath`.
+pub struct AggSpillFile {
+    path: tempfile::TempPath,
+}
 
-    // Spill-recovered state has no D57 sidecars (see Option (b) fallback
-    // comment in `finalize_with_spill`). Sidecars stay at identity values.
-    let mut state = AggregatorGroupState::new(row);
-    state.meta_tracker = meta_tracker;
-    Ok((key, state))
+impl AggSpillFile {
+    fn reader(&self) -> Result<AggSpillReader, HashAggError> {
+        let file =
+            std::fs::File::open(&self.path).map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let decoder = lz4_flex::frame::FrameDecoder::new(file);
+        let buf_reader = std::io::BufReader::new(decoder);
+        Ok(AggSpillReader { reader: buf_reader })
+    }
+}
+
+/// Binary aggregation spill reader. Yields `AggMergeEntry` via bincode
+/// deserialization from an LZ4 frame-compressed file.
+struct AggSpillReader {
+    reader: std::io::BufReader<lz4_flex::frame::FrameDecoder<std::fs::File>>,
+}
+
+impl AggSpillReader {
+    fn next_entry(&mut self) -> Result<Option<AggMergeEntry>, HashAggError> {
+        match bincode::deserialize_from::<_, AggSpillEntry>(&mut self.reader) {
+            Ok(entry) => Ok(Some(AggMergeEntry {
+                sort_key: entry.sort_key,
+                group_key: entry.group_key,
+                state: entry.state,
+            })),
+            Err(e) => {
+                // bincode returns an Io error with UnexpectedEof at end of stream.
+                if let bincode::ErrorKind::Io(ref io_err) = *e
+                    && io_err.kind() == std::io::ErrorKind::UnexpectedEof
+                {
+                    return Ok(None);
+                }
+                Err(HashAggError::Spill(e.to_string()))
+            }
+        }
+    }
 }
 
 /// Single source of truth for the `Vec<SortField>` configuration used
@@ -2696,5 +2813,320 @@ mod accumulator_op_tests {
             }
             other => panic!("expected Streaming, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod spill_trigger_tests {
+    use super::*;
+    use cxl::eval::{EvalContext, ProgramEvaluator, StableEvalContext};
+    use cxl::parser::Parser;
+    use cxl::plan::extract_aggregates;
+    use cxl::resolve::pass::resolve_program;
+    use cxl::typecheck::Row;
+    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use cxl::typecheck::types::Type;
+
+    fn make_schema(cols: &[&str]) -> Arc<Schema> {
+        Arc::new(Schema::new(cols.iter().map(|c| (*c).into()).collect()))
+    }
+
+    fn make_record(schema: &Arc<Schema>, vals: Vec<Value>) -> Record {
+        Record::new(Arc::clone(schema), vals)
+    }
+
+    /// Compile a CXL aggregate snippet against input_fields, returning a
+    /// fully initialized HashAggregator ready for `add_record` calls.
+    fn build_test_aggregator(
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+        memory_budget: usize,
+        spill_dir: Option<std::path::PathBuf>,
+    ) -> HashAggregator {
+        let parsed = Parser::parse(cxl_src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
+        let resolved =
+            resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
+        let schema_map: IndexMap<String, Type> = input_fields
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
+        let schema_names: Vec<String> =
+            input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
+        let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
+        let compiled =
+            extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates");
+
+        let output_columns: Vec<Box<str>> = compiled
+            .emits
+            .iter()
+            .filter(|e| !e.is_meta)
+            .map(|e| e.output_name.clone())
+            .collect();
+        let output_schema = Arc::new(Schema::new(output_columns));
+
+        let mut spill_cols: Vec<Box<str>> = group_by_owned
+            .iter()
+            .map(|s| Box::<str>::from(s.as_str()))
+            .collect();
+        spill_cols.push("__acc_state".into());
+        spill_cols.push("__meta_tracker".into());
+        let spill_schema = Arc::new(Schema::new(spill_cols));
+
+        let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+
+        HashAggregator::new(
+            Arc::new(compiled),
+            evaluator,
+            output_schema,
+            spill_schema,
+            memory_budget,
+            spill_dir,
+            "test_agg",
+        )
+    }
+
+    fn ctx_for<'a>(stable: &'a StableEvalContext, file: &'a Arc<str>, row: u64) -> EvalContext<'a> {
+        EvalContext {
+            stable,
+            source_file: file,
+            source_row: row,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // estimated_bytes_per_group sanity
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_estimated_bytes_positive() {
+        let agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            512 * 1024 * 1024,
+            None,
+        );
+        assert!(
+            agg.max_groups() > 0 && agg.max_groups() < usize::MAX,
+            "max_groups should be a finite positive value, got {}",
+            agg.max_groups(),
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Spill trigger fires on group count
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_spill_fires_at_max_groups() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            10_000, // 10KB budget — tiny
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..500u64 {
+            let r = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .expect("add_record");
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "tiny budget + many unique keys must trigger at least one spill"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // No spill within generous budget
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_no_spill_within_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            10_000_000, // 10MB — plenty for 10 groups
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..10u64 {
+            let r = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert!(
+            agg.spill_files().is_empty(),
+            "generous budget + few keys should not trigger spill"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Spill-merge correctness: 4 keys × 16 records
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_spill_merge_correctness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            1024,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let keys = ["a", "b", "c", "d"];
+        for i in 0..64u64 {
+            let k = keys[(i as usize) % keys.len()];
+            let r = make_record(&input, vec![Value::String(k.into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "expected at least one spill under tiny budget"
+        );
+
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize after spill");
+        assert_eq!(out.len(), 4, "four distinct groups after spill-merge");
+        for (rec, _row_num, _e, _a) in &out {
+            assert_eq!(
+                rec.values()[1],
+                Value::Integer(16),
+                "per-group count(*) preserved through spill merge"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-spill merge: 8 keys × 32 records, >= 2 spill files
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_spill_merge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            512,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let keys = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for i in 0..256u64 {
+            let k = keys[(i as usize) % keys.len()];
+            let r = make_record(&input, vec![Value::String(k.into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .unwrap();
+        }
+        assert!(
+            agg.spill_files().len() >= 2,
+            "expected multiple spill files, got {}",
+            agg.spill_files().len()
+        );
+
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out)
+            .expect("multi-spill finalize merges correctly");
+        assert_eq!(out.len(), 8, "eight distinct groups after k-way merge");
+        for (rec, _, _, _) in &out {
+            assert_eq!(
+                rec.values()[1],
+                Value::Integer(32),
+                "32 records per group survive multi-round merge"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // RSS backstop: tiny budget triggers spill via RSS check
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rss_backstop_with_tiny_budget() {
+        if crate::pipeline::memory::rss_bytes().is_none() {
+            return; // Skip on unsupported platforms
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        // Budget of 1 byte — RSS always exceeds 85% of 1 byte.
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            1,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // Feed enough records to trigger the RSS check (>= 4096).
+        for i in 0..5000u64 {
+            let r = make_record(&input, vec![Value::String(format!("rss_{i}").into())]);
+            agg.add_record(
+                &r,
+                i,
+                &IndexMap::new(),
+                &IndexMap::new(),
+                &ctx_for(&stable, &file, i),
+            )
+            .expect("add_record");
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "RSS backstop should trigger spill with 1-byte budget"
+        );
     }
 }
