@@ -3,13 +3,13 @@
 //! Generates data files on first access, caches them in `bench-data/`,
 //! and regenerates when metadata doesn't match (blake3 hash invalidation).
 
-use crate::Scale;
 use crate::generators::{
     csv::CsvPayload,
     fixed_width::generate_fixed_width,
     json::{generate_json_array, generate_ndjson},
     xml::generate_xml,
 };
+use crate::{FieldKind, Scale};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,9 @@ pub struct DataSpec {
     pub field_count: usize,
     pub string_len: usize,
     pub seed: u64,
+    /// Per-field type layout. Length must equal `field_count`.
+    /// Determines what kind of value each field generates.
+    pub field_types: Vec<FieldKind>,
 }
 
 /// Supported data formats for benchmark generation.
@@ -65,6 +68,9 @@ impl DataSpec {
         hasher.update(&(self.field_count as u64).to_le_bytes());
         hasher.update(&(self.string_len as u64).to_le_bytes());
         hasher.update(&self.seed.to_le_bytes());
+        for ft in &self.field_types {
+            hasher.update(&[*ft as u8]);
+        }
         hasher.finalize().to_hex().to_string()
     }
 
@@ -194,15 +200,15 @@ impl BenchDataCache {
 
     fn generate_data(&self, spec: &DataSpec) -> Vec<u8> {
         let rc = spec.scale.record_count();
-        let fc = spec.field_count;
         let sl = spec.string_len;
         let seed = spec.seed;
+        let ft = &spec.field_types;
         match spec.format {
-            DataFormat::Csv => CsvPayload::generate(rc, fc, sl, seed),
-            DataFormat::JsonNdjson => generate_ndjson(rc, fc, sl, seed),
-            DataFormat::JsonArray => generate_json_array(rc, fc, sl, seed),
-            DataFormat::Xml => generate_xml(rc, fc, sl, seed),
-            DataFormat::FixedWidth => generate_fixed_width(rc, fc, sl, seed).0,
+            DataFormat::Csv => CsvPayload::generate(rc, ft, sl, seed),
+            DataFormat::JsonNdjson => generate_ndjson(rc, ft, sl, seed),
+            DataFormat::JsonArray => generate_json_array(rc, ft, sl, seed),
+            DataFormat::Xml => generate_xml(rc, ft, sl, seed),
+            DataFormat::FixedWidth => generate_fixed_width(rc, ft, sl, seed).0,
         }
     }
 }
@@ -218,6 +224,7 @@ mod tests {
             field_count: 4,
             string_len: 8,
             seed: 42,
+            field_types: FieldKind::default_layout(4),
         }
     }
 

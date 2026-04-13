@@ -13,7 +13,12 @@ use std::sync::Arc;
 fn bench_csv_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("csv_read");
     for (record_count, field_count) in [(SMALL, 5), (SMALL, 20), (MEDIUM, 10)] {
-        let csv_bytes = CsvPayload::generate(record_count, field_count, 16, 42);
+        let csv_bytes = CsvPayload::generate(
+            record_count,
+            &clinker_bench_support::FieldKind::default_layout(field_count),
+            16,
+            42,
+        );
         let byte_len = csv_bytes.len();
 
         group.throughput(Throughput::Bytes(byte_len as u64));
@@ -72,7 +77,12 @@ fn bench_csv_write(c: &mut Criterion) {
 fn bench_json_ndjson_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("json_ndjson_read");
     for record_count in [SMALL, MEDIUM] {
-        let json_bytes = clinker_bench_support::generate_ndjson(record_count, 10, 16, 42);
+        let json_bytes = clinker_bench_support::generate_ndjson(
+            record_count,
+            &clinker_bench_support::FieldKind::default_layout(10),
+            16,
+            42,
+        );
         let byte_len = json_bytes.len();
 
         group.throughput(Throughput::Bytes(byte_len as u64));
@@ -102,7 +112,12 @@ fn bench_json_ndjson_read(c: &mut Criterion) {
 fn bench_json_array_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("json_array_read");
     for record_count in [SMALL, MEDIUM] {
-        let json_bytes = clinker_bench_support::generate_json_array(record_count, 10, 16, 42);
+        let json_bytes = clinker_bench_support::generate_json_array(
+            record_count,
+            &clinker_bench_support::FieldKind::default_layout(10),
+            16,
+            42,
+        );
         let byte_len = json_bytes.len();
 
         group.throughput(Throughput::Bytes(byte_len as u64));

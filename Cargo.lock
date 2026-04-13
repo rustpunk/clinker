@@ -771,6 +771,7 @@ dependencies = [
  "clinker-bench-support",
  "clinker-core",
  "criterion",
+ "cxl",
  "indexmap",
  "serde",
  "serde_json",

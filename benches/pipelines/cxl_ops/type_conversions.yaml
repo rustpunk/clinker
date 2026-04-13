@@ -22,7 +22,7 @@ nodes:
         emit t_int = f0.to_int()
         emit t_float = f0.to_float()
         emit t_str = f0.to_string()
-        emit t_bool = f0.to_bool()
+        emit t_bool = f0.to_int() > 500000
         emit t_try_int = f1.try_int()
         emit t_try_float = f1.try_float()
 

@@ -79,7 +79,12 @@ nodes:
     let params = test_params();
 
     for count in [SMALL, MEDIUM] {
-        let csv_bytes = CsvPayload::generate(count, 5, 16, 42);
+        let csv_bytes = CsvPayload::generate(
+            count,
+            &clinker_bench_support::FieldKind::default_layout(5),
+            16,
+            42,
+        );
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -160,7 +165,12 @@ nodes:
     let params = test_params();
 
     for count in [SMALL, MEDIUM] {
-        let csv_bytes = CsvPayload::generate(count, 5, 16, 42);
+        let csv_bytes = CsvPayload::generate(
+            count,
+            &clinker_bench_support::FieldKind::default_layout(5),
+            16,
+            42,
+        );
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -255,7 +265,12 @@ nodes:
     let params = test_params();
 
     for count in [SMALL, MEDIUM] {
-        let csv_bytes = CsvPayload::generate(count, 5, 16, 42);
+        let csv_bytes = CsvPayload::generate(
+            count,
+            &clinker_bench_support::FieldKind::default_layout(5),
+            16,
+            42,
+        );
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -347,7 +362,12 @@ nodes:
     let params = test_params();
 
     for count in [SMALL, MEDIUM] {
-        let csv_bytes = CsvPayload::generate(count, 5, 16, 42);
+        let csv_bytes = CsvPayload::generate(
+            count,
+            &clinker_bench_support::FieldKind::default_layout(5),
+            16,
+            42,
+        );
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {

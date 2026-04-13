@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
-use clinker_bench_support::Scale;
 use clinker_bench_support::cache::{BenchDataCache, DataSpec};
+use clinker_bench_support::{FieldKind, Scale};
 use clinker_core::config::pipeline_node::PipelineNode;
 use clinker_core::config::{CompileContext, load_config};
 use clinker_core::error::PipelineError;
@@ -43,7 +43,8 @@ impl BenchPipelineRunner {
         let data_format =
             input_format_to_data_format(&source.format).expect("bench source format must map");
 
-        let field_count = source_schema_field_count(&config);
+        let field_types = source_schema_field_types(&config);
+        let field_count = field_types.len();
 
         let data_path = self.cache.get_or_generate(&DataSpec {
             format: data_format,
@@ -51,6 +52,7 @@ impl BenchPipelineRunner {
             field_count,
             string_len: 10,
             seed: 42,
+            field_types,
         });
 
         let file = std::fs::File::open(&data_path).expect("cached data file must exist");
@@ -77,15 +79,39 @@ impl BenchPipelineRunner {
     }
 }
 
-/// Derive field count from the first source node's schema declaration.
-/// Falls back to 20 if no schema is found (shouldn't happen for bench configs).
-fn source_schema_field_count(config: &clinker_core::config::PipelineConfig) -> usize {
+/// Derive per-field type layout from the first source node's schema declaration.
+///
+/// CSV delivers all values as strings, so the default int/string alternation
+/// (even=int, odd=string) produces universally parseable data. Only override
+/// for types that need a specific string format (Date, DateTime) — a random
+/// string like "misljiqatu" can't be parsed as a date.
+fn source_schema_field_types(config: &clinker_core::config::PipelineConfig) -> Vec<FieldKind> {
+    use cxl::typecheck::Type;
+
     for node in config.nodes.iter() {
         if let PipelineNode::Source { config: body, .. } = &node.value {
-            return body.schema.columns.len();
+            return body
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| match &col.ty {
+                    Type::Date | Type::DateTime => FieldKind::Date,
+                    _ => {
+                        // Default positional layout: even=int, odd=string.
+                        // Integers render as parseable digit strings in CSV,
+                        // so `.to_int()` / `.to_float()` work on them.
+                        if i % 2 == 0 {
+                            FieldKind::Int
+                        } else {
+                            FieldKind::String
+                        }
+                    }
+                })
+                .collect();
         }
     }
-    20
+    FieldKind::default_layout(20)
 }
 
 #[cfg(test)]

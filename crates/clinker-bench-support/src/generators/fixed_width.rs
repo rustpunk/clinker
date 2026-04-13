@@ -1,5 +1,6 @@
 //! Deterministic fixed-width payload generator for benchmarks.
 
+use crate::FieldKind;
 use clinker_record::schema_def::{FieldDef, FieldType, Justify};
 
 /// Lightweight field descriptor for benchmark fixed-width data.
@@ -67,32 +68,39 @@ impl From<&BenchFieldSpec> for FieldDef {
 /// Generate deterministic fixed-width bytes and field layout.
 ///
 /// Integer fields: 10 chars, right-justified, space-padded.
-/// String fields: `string_len` chars, left-justified, space-padded.
+/// String/Date/Float/Bool fields: `string_len` chars, left-justified, space-padded.
 /// Line separator: `\n` (D-8).
 pub fn generate_fixed_width(
     record_count: usize,
-    field_count: usize,
+    field_types: &[FieldKind],
     string_len: usize,
     seed: u64,
 ) -> (Vec<u8>, Vec<BenchFieldSpec>) {
-    let specs = field_specs_for(field_count, string_len);
+    let specs = field_specs_for(field_types, string_len);
     let line_len = specs.iter().map(|s| s.width).sum::<usize>() + 1; // +1 for \n
     let mut buf = Vec::with_capacity(record_count * line_len);
     let mut rng = fastrand::Rng::with_seed(seed);
 
     for _ in 0..record_count {
-        for spec in &specs {
+        for (idx, spec) in specs.iter().enumerate() {
+            let kind = field_types[idx];
             match spec.field_type {
                 BenchFieldType::Integer => {
-                    let val = rng.i64(0..1_000_000).to_string();
+                    let mut val_buf = Vec::new();
+                    crate::write_field_value(&mut val_buf, kind, &mut rng, string_len);
                     // Right-justify: pad left with spaces
-                    buf.extend(std::iter::repeat_n(b' ', spec.width - val.len()));
-                    buf.extend_from_slice(val.as_bytes());
+                    if val_buf.len() < spec.width {
+                        buf.extend(std::iter::repeat_n(b' ', spec.width - val_buf.len()));
+                    }
+                    buf.extend_from_slice(&val_buf);
                 }
                 BenchFieldType::String => {
-                    // Left-justify: value fills entire width (no padding needed)
-                    for _ in 0..spec.width {
-                        buf.push(rng.u8(b'a'..=b'z'));
+                    let start = buf.len();
+                    crate::write_field_value(&mut buf, kind, &mut rng, string_len);
+                    let written = buf.len() - start;
+                    // Left-justify: pad right with spaces
+                    if written < spec.width {
+                        buf.extend(std::iter::repeat_n(b' ', spec.width - written));
                     }
                 }
             }
@@ -107,15 +115,15 @@ pub fn generate_fixed_width(
 ///
 /// Pure computation — deterministic from parameters. Used by cache system
 /// to provide FieldSpec without re-reading cached files (D-11).
-pub fn field_specs_for(field_count: usize, string_len: usize) -> Vec<BenchFieldSpec> {
+pub fn field_specs_for(field_types: &[FieldKind], string_len: usize) -> Vec<BenchFieldSpec> {
     let int_width = 10;
-    let mut specs = Vec::with_capacity(field_count);
+    let mut specs = Vec::with_capacity(field_types.len());
     let mut offset = 0;
-    for i in 0..field_count {
-        let (width, field_type, justify) = if i % 2 == 0 {
-            (int_width, BenchFieldType::Integer, BenchJustify::Right)
-        } else {
-            (string_len, BenchFieldType::String, BenchJustify::Left)
+    for (i, &kind) in field_types.iter().enumerate() {
+        let (width, field_type, justify) = match kind {
+            FieldKind::Int => (int_width, BenchFieldType::Integer, BenchJustify::Right),
+            FieldKind::Float => (14, BenchFieldType::String, BenchJustify::Right),
+            _ => (string_len, BenchFieldType::String, BenchJustify::Left),
         };
         specs.push(BenchFieldSpec {
             name: format!("f{i}"),
@@ -137,7 +145,8 @@ mod tests {
     /// column boundaries in the generated output.
     #[test]
     fn test_fixed_width_generator_field_positions_match() {
-        let (bytes, specs) = generate_fixed_width(10, 6, 8, 42);
+        let ft = FieldKind::default_layout(6);
+        let (bytes, specs) = generate_fixed_width(10, &ft, 8, 42);
         let lines: Vec<&[u8]> = bytes
             .split(|&b| b == b'\n')
             .filter(|l| !l.is_empty())
@@ -170,8 +179,9 @@ mod tests {
     /// Verify deterministic output — same parameters always produce identical bytes.
     #[test]
     fn test_fixed_width_generator_deterministic() {
-        let (a, specs_a) = generate_fixed_width(50, 4, 6, 42);
-        let (b, specs_b) = generate_fixed_width(50, 4, 6, 42);
+        let ft = FieldKind::default_layout(4);
+        let (a, specs_a) = generate_fixed_width(50, &ft, 6, 42);
+        let (b, specs_b) = generate_fixed_width(50, &ft, 6, 42);
         assert_eq!(a, b);
         assert_eq!(specs_a, specs_b);
     }

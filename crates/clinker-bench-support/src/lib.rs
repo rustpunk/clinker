@@ -83,6 +83,7 @@ pub fn discover_pipeline_configs(base: &Path) -> Vec<ConfigEntry> {
 }
 
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
+pub use cache::DataSpec;
 pub use generators::csv::CsvPayload;
 pub use generators::fixed_width::{
     BenchFieldSpec, BenchFieldType, BenchJustify, field_specs_for, generate_fixed_width,
@@ -137,6 +138,83 @@ impl Scale {
 impl fmt::Display for Scale {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
+    }
+}
+
+// ── Field kind for typed data generation ──────────────────────────
+
+/// Kind of value to generate for a benchmark field.
+///
+/// Used by `DataSpec` and all format generators to produce type-appropriate
+/// values. `repr(u8)` ensures stable discriminants for cache hashing.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FieldKind {
+    /// Integer: 0..1_000_000
+    Int = 0,
+    /// Random lowercase ASCII string
+    String = 1,
+    /// ISO 8601 date: `yyyy-MM-dd` in range 2020-01-01..2026-12-31
+    Date = 2,
+    /// Float: 0.0..1_000_000.0 with 2 decimal places
+    Float = 3,
+    /// Boolean: `true` or `false`
+    Bool = 4,
+}
+
+impl FieldKind {
+    /// Default field kind layout: even-indexed fields are Int, odd are String.
+    /// This matches the legacy generator behavior.
+    pub fn default_layout(field_count: usize) -> Vec<FieldKind> {
+        (0..field_count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    FieldKind::Int
+                } else {
+                    FieldKind::String
+                }
+            })
+            .collect()
+    }
+}
+
+/// Write a single field value into `buf` according to its `FieldKind`.
+///
+/// Shared by all format generators. The value is written as a UTF-8 string
+/// without any quoting or escaping — callers handle format-specific wrapping.
+pub fn write_field_value(
+    buf: &mut Vec<u8>,
+    kind: FieldKind,
+    rng: &mut fastrand::Rng,
+    string_len: usize,
+) {
+    match kind {
+        FieldKind::Int => {
+            buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
+        }
+        FieldKind::String => {
+            for _ in 0..string_len {
+                buf.push(rng.u8(b'a'..=b'z'));
+            }
+        }
+        FieldKind::Date => {
+            // Deterministic date in 2020-01-01..2026-12-31 range (~2556 days)
+            let day_offset = rng.u32(0..2556);
+            let base = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+            let date = base + chrono::Duration::days(day_offset as i64);
+            buf.extend_from_slice(date.format("%Y-%m-%d").to_string().as_bytes());
+        }
+        FieldKind::Float => {
+            let val = rng.f64() * 1_000_000.0;
+            buf.extend_from_slice(format!("{val:.2}").as_bytes());
+        }
+        FieldKind::Bool => {
+            if rng.bool() {
+                buf.extend_from_slice(b"true");
+            } else {
+                buf.extend_from_slice(b"false");
+            }
+        }
     }
 }
 
@@ -305,9 +383,9 @@ mod tests {
     /// Verify CsvPayload is accessible via crate-root re-export after extraction.
     #[test]
     fn test_csv_payload_backward_compat_generates_bytes() {
-        use crate::CsvPayload;
+        use crate::{CsvPayload, FieldKind};
 
-        let bytes = CsvPayload::generate(10, 4, 8, 42);
+        let bytes = CsvPayload::generate(10, &FieldKind::default_layout(4), 8, 42);
 
         assert!(!bytes.is_empty());
         assert!(bytes.starts_with(b"f0,f1,f2,f3\n"));
@@ -316,9 +394,9 @@ mod tests {
     /// Verify generate_ndjson is accessible via crate-root re-export after extraction.
     #[test]
     fn test_json_ndjson_backward_compat_generates_bytes() {
-        use crate::generate_ndjson;
+        use crate::{FieldKind, generate_ndjson};
 
-        let bytes = generate_ndjson(10, 4, 8, 42);
+        let bytes = generate_ndjson(10, &FieldKind::default_layout(4), 8, 42);
 
         assert!(!bytes.is_empty());
         assert!(bytes[0] == b'{');

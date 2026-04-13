@@ -12,6 +12,7 @@ bench-xlarge = []
 [dependencies]
 clinker-core = { workspace = true }
 clinker-bench-support = { workspace = true }
+cxl = { workspace = true }
 criterion = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true }
