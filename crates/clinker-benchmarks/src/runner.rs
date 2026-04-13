@@ -14,6 +14,7 @@ use clinker_core::config::{CompileContext, load_config};
 use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use indexmap::IndexMap;
+use tempfile::TempDir;
 
 use crate::format_mapping::input_format_to_data_format;
 
@@ -34,7 +35,11 @@ impl BenchPipelineRunner {
     /// Field count is derived from the source node's schema declaration
     /// so generated data matches the pipeline's expected column count.
     pub fn run(&self, config_path: &Path, scale: Scale) -> Result<ExecutionReport, PipelineError> {
-        let config = load_config(config_path).expect("bench config must parse");
+        let mut config = load_config(config_path).expect("bench config must parse");
+
+        // Split outputs create files on disk via a file factory, so we need a
+        // real temp directory for them instead of the placeholder `bench://` path.
+        let _split_dir = rewrite_split_output_paths(&mut config);
 
         let source = config
             .source_configs()
@@ -77,6 +82,53 @@ impl BenchPipelineRunner {
 
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
     }
+}
+
+/// Rewrite output paths for split outputs to use a real temp directory.
+///
+/// Split outputs bypass the provided in-memory writer and create files on disk
+/// via a file factory. The placeholder `bench://` paths don't exist on the
+/// filesystem, so we rewrite them to a temp directory under `target/`.
+/// The returned `TempDir` must be kept alive for the duration of the pipeline run.
+fn rewrite_split_output_paths(
+    config: &mut clinker_core::config::PipelineConfig,
+) -> Option<TempDir> {
+    let has_split = config.nodes.iter().any(|n| {
+        matches!(&n.value, PipelineNode::Output { config: body, .. } if body.output.split.is_some())
+    });
+    if !has_split {
+        return None;
+    }
+
+    // Create a temp dir under the workspace `target/` directory. Use an
+    // absolute path because `cargo test` CWD is the crate directory, not
+    // the workspace root, so relative paths would resolve incorrectly when
+    // the executor's file factory calls `File::create`.
+    let base = clinker_bench_support::workspace_root().join("target/bench-split-tmp");
+    std::fs::create_dir_all(&base).expect("failed to create bench split tmp dir");
+    let dir = TempDir::new_in(&base).expect("failed to create temp dir for split output");
+    let dir_path = dir.path().to_string_lossy().into_owned();
+
+    // The security path validator rejects absolute paths by default.
+    // Set the env var so both compile() calls (runner + executor internal)
+    // allow the absolute temp path. Benchmarks are single-threaded at
+    // setup time so this is safe.
+    // SAFETY: no other thread reads this env var during config setup.
+    unsafe { std::env::set_var("CLINKER_ALLOW_ABSOLUTE_PATHS", "1") };
+
+    for node in &mut config.nodes {
+        if let PipelineNode::Output { config: body, .. } = &mut node.value
+            && body.output.split.is_some()
+        {
+            let filename = std::path::Path::new(&body.output.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("output.csv");
+            body.output.path = format!("{dir_path}/{filename}");
+        }
+    }
+
+    Some(dir)
 }
 
 /// Derive per-field type layout from the first source node's schema declaration.
@@ -171,6 +223,15 @@ mod tests {
     fn test_runner_fixed_width_passthrough_returns_report() {
         let runner = test_runner();
         let path = pipelines_dir().join("format/fixed_width_passthrough.yaml");
+        let report = runner.run(&path, Scale::Small).unwrap();
+        assert!(!report.stages.is_empty());
+    }
+
+    /// Runner executes a split-by-bytes config.
+    #[test]
+    fn test_runner_splitting_by_bytes() {
+        let runner = test_runner();
+        let path = pipelines_dir().join("features/splitting_by_bytes.yaml");
         let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }
