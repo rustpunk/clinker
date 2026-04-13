@@ -1,0 +1,51 @@
+pipeline:
+  name: bench-windowed-analytics
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+
+  - type: transform
+    name: windowed
+    input: source
+    config:
+      cxl: |
+        emit f0 = f0
+        emit f1 = f1
+        emit metric = f2
+        emit w_sum = $window.sum(f2)
+        emit w_avg = $window.avg(f2)
+        emit w_count = $window.count()
+        emit w_rank = $window.row_number()
+      analytic_window:
+        group_by: [f0]
+
+  - type: aggregate
+    name: summarize
+    input: windowed
+    config:
+      group_by: [f1]
+      strategy: hash
+      cxl: |
+        emit total_metric = sum(metric)
+        emit avg_w_sum = avg(w_sum)
+        emit record_count = count(*)
+
+  - type: output
+    name: sink
+    input: summarize
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

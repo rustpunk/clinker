@@ -1,0 +1,82 @@
+pipeline:
+  name: bench-route-fanout
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+
+  - type: transform
+    name: enrich
+    input: source
+    config:
+      cxl: |
+        emit priority = if f0 > 750000 then "high" else if f0 > 250000 then "medium" else "low"
+        emit value = f2
+        emit label = f1.upper()
+
+  - type: route
+    name: split
+    input: enrich
+    config:
+      mode: exclusive
+      conditions:
+        high: "priority == \"high\""
+        medium: "priority == \"medium\""
+      default: low
+
+  - type: aggregate
+    name: agg_high
+    input: split.high
+    config:
+      group_by: [priority]
+      strategy: hash
+      cxl: |
+        emit total = sum(value)
+        emit n = count(*)
+
+  - type: aggregate
+    name: agg_low
+    input: split.low
+    config:
+      group_by: [priority]
+      strategy: hash
+      cxl: |
+        emit total = sum(value)
+        emit n = count(*)
+
+  - type: output
+    name: high_out
+    input: agg_high
+    config:
+      name: high_out
+      type: csv
+      path: bench://output_high.csv
+      include_unmapped: true
+
+  - type: output
+    name: medium_out
+    input: split.medium
+    config:
+      name: medium_out
+      type: csv
+      path: bench://output_medium.csv
+      include_unmapped: true
+
+  - type: output
+    name: low_out
+    input: agg_low
+    config:
+      name: low_out
+      type: csv
+      path: bench://output_low.csv
+      include_unmapped: true

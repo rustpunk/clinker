@@ -426,10 +426,10 @@ mod tests {
     fn test_discover_configs_finds_all_non_future() {
         let base = crate::workspace_root().join("benches/pipelines");
         let entries = crate::discover_pipeline_configs(&base);
-        // 7 format + 10 cxl_ops + 10 execution_mode + 12 features + 2 scale = 41
+        // 7 format + 10 cxl_ops + 10 execution_mode + 12 features + 2 scale + 8 realistic = 49
         assert!(
-            entries.len() >= 41,
-            "Expected at least 41 configs, found {}",
+            entries.len() >= 49,
+            "Expected at least 49 configs, found {}",
             entries.len()
         );
     }

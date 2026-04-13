@@ -2,15 +2,16 @@
 //!
 //! Executes benchmark pipeline configs against cached generated data.
 //! Streaming: reads from cached file, writes to in-memory buffer.
+//! Supports multi-source pipelines (lookup, merge) and nested formats.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
-use clinker_bench_support::cache::{BenchDataCache, DataSpec};
+use clinker_bench_support::cache::{BenchDataCache, DataSpec, NestedWrapper};
 use clinker_bench_support::{FieldKind, Scale};
-use clinker_core::config::pipeline_node::PipelineNode;
-use clinker_core::config::{CompileContext, load_config};
+use clinker_core::config::pipeline_node::{PipelineNode, SourceBody};
+use clinker_core::config::{CompileContext, InputFormat, load_config};
 use clinker_core::error::PipelineError;
 use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use indexmap::IndexMap;
@@ -32,8 +33,9 @@ impl BenchPipelineRunner {
     /// Run a pipeline config at the given scale. Returns `ExecutionReport`
     /// with per-stage `StageMetrics` populated.
     ///
-    /// Field count is derived from the source node's schema declaration
-    /// so generated data matches the pipeline's expected column count.
+    /// Supports multi-source pipelines: generates and caches data for each
+    /// source node independently. Field count and types are derived from
+    /// each source node's schema declaration.
     pub fn run(&self, config_path: &Path, scale: Scale) -> Result<ExecutionReport, PipelineError> {
         let mut config = load_config(config_path).expect("bench config must parse");
 
@@ -41,28 +43,52 @@ impl BenchPipelineRunner {
         // real temp directory for them instead of the placeholder `bench://` path.
         let _split_dir = rewrite_split_output_paths(&mut config);
 
-        let source = config
-            .source_configs()
-            .next()
-            .expect("bench config must have a source");
-        let data_format =
-            input_format_to_data_format(&source.format).expect("bench source format must map");
+        // Count sources to decide whether to tag cache files for disambiguation.
+        let source_count = config
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.value, PipelineNode::Source { .. }))
+            .count();
 
-        let field_types = source_schema_field_types(&config);
-        let field_count = field_types.len();
+        // Build a reader for each source node.
+        let mut readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::new();
 
-        let data_path = self.cache.get_or_generate(&DataSpec {
-            format: data_format,
-            scale,
-            field_count,
-            string_len: 10,
-            seed: 42,
-            field_types,
-        });
+        for spanned in &config.nodes {
+            if let PipelineNode::Source {
+                header,
+                config: body,
+            } = &spanned.value
+            {
+                let data_format = input_format_to_data_format(&body.source.format)
+                    .expect("bench source format must map");
+                let field_types = field_types_for_source(body);
+                let field_count = field_types.len();
+                let wrapper = nested_wrapper_for_source(body);
 
-        let file = std::fs::File::open(&data_path).expect("cached data file must exist");
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> =
-            HashMap::from([(source.name.clone(), Box::new(BufReader::new(file)) as _)]);
+                let tag = if source_count > 1 {
+                    header.name.clone()
+                } else {
+                    String::new()
+                };
+
+                let data_path = self.cache.get_or_generate(&DataSpec {
+                    format: data_format,
+                    scale,
+                    field_count,
+                    string_len: 10,
+                    seed: 42,
+                    field_types,
+                    tag,
+                    wrapper,
+                });
+
+                let file = std::fs::File::open(&data_path).expect("cached data file must exist");
+                readers.insert(
+                    body.source.name.clone(),
+                    Box::new(BufReader::new(file)) as _,
+                );
+            }
+        }
 
         let mut writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::new();
         for output in config.output_configs() {
@@ -131,39 +157,65 @@ fn rewrite_split_output_paths(
     Some(dir)
 }
 
-/// Derive per-field type layout from the first source node's schema declaration.
+/// Derive per-field type layout from a source node's schema declaration.
 ///
 /// CSV delivers all values as strings, so the default int/string alternation
 /// (even=int, odd=string) produces universally parseable data. Only override
 /// for types that need a specific string format (Date, DateTime) — a random
 /// string like "misljiqatu" can't be parsed as a date.
-fn source_schema_field_types(config: &clinker_core::config::PipelineConfig) -> Vec<FieldKind> {
+fn field_types_for_source(body: &SourceBody) -> Vec<FieldKind> {
     use cxl::typecheck::Type;
 
-    for node in config.nodes.iter() {
-        if let PipelineNode::Source { config: body, .. } = &node.value {
-            return body
-                .schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| match &col.ty {
-                    Type::Date | Type::DateTime => FieldKind::Date,
-                    _ => {
-                        // Default positional layout: even=int, odd=string.
-                        // Integers render as parseable digit strings in CSV,
-                        // so `.to_int()` / `.to_float()` work on them.
-                        if i % 2 == 0 {
-                            FieldKind::Int
-                        } else {
-                            FieldKind::String
-                        }
-                    }
-                })
-                .collect();
+    body.schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| match &col.ty {
+            Type::Date | Type::DateTime => FieldKind::Date,
+            _ => {
+                if i % 2 == 0 {
+                    FieldKind::Int
+                } else {
+                    FieldKind::String
+                }
+            }
+        })
+        .collect()
+}
+
+/// Detect nested source configs and return the appropriate `NestedWrapper`.
+///
+/// When a source has `record_path` set (JSON or XML), the generated data needs
+/// to be wrapped in a parent structure so the format reader can navigate to it.
+fn nested_wrapper_for_source(body: &SourceBody) -> Option<NestedWrapper> {
+    match &body.source.format {
+        InputFormat::Json(Some(opts)) => {
+            let record_path = opts.record_path.as_deref()?;
+            let segments: Vec<String> = record_path.split('.').map(String::from).collect();
+            if segments.is_empty() {
+                return None;
+            }
+            Some(NestedWrapper::Json {
+                path_segments: segments,
+            })
         }
+        InputFormat::Xml(Some(opts)) => {
+            let record_path = opts.record_path.as_deref()?;
+            // XML record_path uses `/` separator and includes the record element.
+            // E.g., "root/data/record" → parent_elements = ["root", "data"],
+            // and records are wrapped in <root><data>...<record>...</record>...</data></root>
+            let segments: Vec<String> = record_path.split('/').map(String::from).collect();
+            if segments.len() < 2 {
+                return None;
+            }
+            // All segments except the last are parent elements.
+            // The last segment is the record element name (already "record" in our generators).
+            Some(NestedWrapper::Xml {
+                parent_elements: segments[..segments.len() - 1].to_vec(),
+            })
+        }
+        _ => None,
     }
-    FieldKind::default_layout(20)
 }
 
 #[cfg(test)]
@@ -232,6 +284,42 @@ mod tests {
     fn test_runner_splitting_by_bytes() {
         let runner = test_runner();
         let path = pipelines_dir().join("features/splitting_by_bytes.yaml");
+        let report = runner.run(&path, Scale::Small).unwrap();
+        assert!(!report.stages.is_empty());
+    }
+
+    /// Runner executes a transform→aggregate pipeline (etl classic).
+    #[test]
+    fn test_runner_etl_classic() {
+        let runner = test_runner();
+        let path = pipelines_dir().join("realistic/etl_classic.yaml");
+        let report = runner.run(&path, Scale::Small).unwrap();
+        assert!(!report.stages.is_empty());
+    }
+
+    /// Runner executes a multi-source lookup pipeline.
+    #[test]
+    fn test_runner_multi_source_lookup() {
+        let runner = test_runner();
+        let path = pipelines_dir().join("realistic/lookup_enrichment.yaml");
+        let report = runner.run(&path, Scale::Small).unwrap();
+        assert!(!report.stages.is_empty());
+    }
+
+    /// Runner executes a nested JSON pipeline.
+    #[test]
+    fn test_runner_nested_json() {
+        let runner = test_runner();
+        let path = pipelines_dir().join("realistic/nested_json_etl.yaml");
+        let report = runner.run(&path, Scale::Small).unwrap();
+        assert!(!report.stages.is_empty());
+    }
+
+    /// Runner executes a nested XML pipeline.
+    #[test]
+    fn test_runner_nested_xml() {
+        let runner = test_runner();
+        let path = pipelines_dir().join("realistic/nested_xml_etl.yaml");
         let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }
