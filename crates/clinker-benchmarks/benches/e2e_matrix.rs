@@ -17,6 +17,13 @@ fn bench_e2e(c: &mut Criterion) {
     let configs = discover_pipeline_configs(&pipelines_base());
 
     for entry in &configs {
+        // Pre-flight: verify pipeline compiles and runs correctly at Small scale
+        // before entering the timed loop. Surfaces runtime errors (bad CXL, schema
+        // mismatches) as panics so `cargo test --benches` catches them.
+        runner
+            .run(&entry.path, Scale::Small)
+            .unwrap_or_else(|e| panic!("pre-flight failed for {}/{}: {e}", entry.category, entry.name));
+
         let mut group = c.benchmark_group(format!("e2e/{}/{}", entry.category, entry.name));
         for &scale in &[Scale::Small, Scale::Medium, Scale::Large] {
             group.throughput(Throughput::Elements(scale.record_count() as u64));
