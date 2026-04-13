@@ -6,7 +6,6 @@
 use clinker_bench_support::{Scale, cache::BenchDataCache, discover_pipeline_configs};
 use clinker_benchmarks::runner::BenchPipelineRunner;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
-use std::path::Path;
 
 fn pipelines_base() -> std::path::PathBuf {
     clinker_bench_support::workspace_root().join("benches/pipelines")
