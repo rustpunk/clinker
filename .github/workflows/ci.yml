@@ -29,6 +29,26 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace
 
+      # Bench infrastructure CI gate (compile + smoke)
+      - run: cargo check --benches --workspace
+      - run: cargo check --features bench-alloc -p clinker-benchmarks
+      - run: cargo test --benches -p clinker-benchmarks
+
+  cross-platform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --target x86_64-pc-windows-msvc -p clinker-core
+      - run: cargo check --target aarch64-apple-darwin -p clinker-core
+
   deny:
     runs-on: ubuntu-latest
     steps:

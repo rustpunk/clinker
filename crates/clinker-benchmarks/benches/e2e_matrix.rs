@@ -37,7 +37,6 @@ criterion_group!(benches, bench_e2e);
 
 fn main() {
     benches();
-    Criterion::default().configure_from_args().final_summary();
 
     if std::env::var("CLINKER_BENCH_SUMMARY").is_ok() {
         let cache = BenchDataCache::default_location();
@@ -56,9 +55,10 @@ fn main() {
                 ));
             }
         }
-        clinker_benchmarks::report::write_ci_json(
-            &results,
-            Path::new("target/bench-results/summary.json"),
-        );
+        let output_path =
+            clinker_bench_support::workspace_root().join("target/bench-results/summary.json");
+        clinker_benchmarks::report::write_ci_json(&results, &output_path);
     }
+
+    Criterion::default().configure_from_args().final_summary();
 }
