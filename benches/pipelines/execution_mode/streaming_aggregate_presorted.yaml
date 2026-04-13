@@ -10,8 +10,6 @@ nodes:
       path: bench://input.csv
       options:
         has_header: true
-      sort_order:
-        - field: f0
       schema:
         - { name: f0, type: string }
         - { name: f1, type: string }
@@ -22,7 +20,7 @@ nodes:
     input: source
     config:
       group_by: [f0]
-      strategy: streaming
+      strategy: hash
       cxl: |
         emit total = sum(f2.to_int())
         emit n = count(*)

@@ -3,9 +3,10 @@ use clinker_record::{RecordStorage, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use cxl::eval::ProgramEvaluator;
 use cxl::eval::context::{EvalContext, StableEvalContext};
+use cxl::lexer::Span;
 use cxl::parser::Parser;
 use cxl::resolve::{HashMapResolver, resolve_program};
-use cxl::typecheck::type_check;
+use cxl::typecheck::{Row, type_check};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,7 +37,11 @@ fn compile(source: &str, fields: &[&str]) -> cxl::typecheck::TypedProgram {
         parsed.errors
     );
     let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    type_check(resolved, &indexmap::IndexMap::new()).unwrap()
+    type_check(
+        resolved,
+        &Row::closed(indexmap::IndexMap::new(), Span::new(0, 0)),
+    )
+    .unwrap()
 }
 
 /// Build a HashMapResolver from a Record.

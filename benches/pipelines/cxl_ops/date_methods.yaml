@@ -12,18 +12,17 @@ nodes:
         has_header: true
       schema:
         - { name: f0, type: string }
-        - { name: f1, type: string }
+        - { name: f1, type: date }
 
   - type: transform
     name: dates
     input: source
     config:
       cxl: |
-        let d = f1.to_date("yyyy-MM-dd")
-        emit d_year = d.year()
-        emit d_month = d.month()
-        emit d_add = d.add_days(30)
-        emit d_fmt = d.format_date("MM/dd/yyyy")
+        emit d_year = f1.year()
+        emit d_month = f1.month()
+        emit d_add = f1.add_days(30)
+        emit d_fmt = f1.format_date("%m/%d/%Y")
 
   - type: output
     name: sink

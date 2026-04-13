@@ -1,16 +1,18 @@
 //! Deterministic XML payload generator for benchmarks.
 
+use crate::FieldKind;
+
 /// Generate deterministic XML bytes with prolog and `<records>` root element.
 ///
-/// Streams records into a pre-allocated `Vec<u8>`. Field pattern matches
-/// CSV/JSON generators: even-indexed fields are integers, odd are strings.
-/// Uses hand-rolled byte writing for performance (D-6).
+/// Streams records into a pre-allocated `Vec<u8>`. Uses hand-rolled byte
+/// writing for performance (D-6).
 pub fn generate_xml(
     record_count: usize,
-    field_count: usize,
+    field_types: &[FieldKind],
     string_len: usize,
     seed: u64,
 ) -> Vec<u8> {
+    let field_count = field_types.len();
     let mut buf = Vec::with_capacity(38 + record_count * field_count * (string_len + 20) + 20);
     let mut rng = fastrand::Rng::with_seed(seed);
 
@@ -19,19 +21,13 @@ pub fn generate_xml(
 
     for _ in 0..record_count {
         buf.extend_from_slice(b"<record>");
-        for i in 0..field_count {
+        for (i, &kind) in field_types.iter().enumerate() {
             let tag = format!("f{i}");
             buf.extend_from_slice(b"<");
             buf.extend_from_slice(tag.as_bytes());
             buf.extend_from_slice(b">");
 
-            if i % 2 == 0 {
-                buf.extend_from_slice(rng.i64(0..1_000_000).to_string().as_bytes());
-            } else {
-                for _ in 0..string_len {
-                    buf.push(rng.u8(b'a'..=b'z'));
-                }
-            }
+            crate::write_field_value(&mut buf, kind, &mut rng, string_len);
 
             buf.extend_from_slice(b"</");
             buf.extend_from_slice(tag.as_bytes());
@@ -53,7 +49,7 @@ mod tests {
     /// could introduce (unclosed tags, bad escaping).
     #[test]
     fn test_xml_generator_produces_valid_xml() {
-        let xml = generate_xml(100, 5, 8, 42);
+        let xml = generate_xml(100, &FieldKind::default_layout(5), 8, 42);
 
         use quick_xml::Reader;
         use quick_xml::events::Event;
@@ -76,8 +72,9 @@ mod tests {
     /// Verify deterministic output — same parameters always produce identical bytes.
     #[test]
     fn test_xml_generator_deterministic() {
-        let a = generate_xml(50, 4, 6, 42);
-        let b = generate_xml(50, 4, 6, 42);
+        let ft = FieldKind::default_layout(4);
+        let a = generate_xml(50, &ft, 6, 42);
+        let b = generate_xml(50, &ft, 6, 42);
         assert_eq!(a, b);
     }
 
@@ -86,7 +83,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_xml_generator_xlarge_no_oom() {
-        let xml = generate_xml(1_000_000, 20, 10, 42);
+        let xml = generate_xml(1_000_000, &FieldKind::default_layout(20), 10, 42);
         assert!(xml.len() > 100_000_000);
     }
 }

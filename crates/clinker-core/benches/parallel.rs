@@ -42,7 +42,12 @@ fn bench_scaling_streaming(c: &mut Criterion) {
     group.sample_size(20); // fewer samples for expensive pipeline runs
 
     let record_count = MEDIUM;
-    let csv_bytes = CsvPayload::generate(record_count, 10, 16, 42);
+    let csv_bytes = CsvPayload::generate(
+        record_count,
+        &clinker_bench_support::FieldKind::default_layout(10),
+        16,
+        42,
+    );
 
     for threads in [1, 2, 4, 8] {
         let yaml = format!(
@@ -50,8 +55,7 @@ fn bench_scaling_streaming(c: &mut Criterion) {
 pipeline:
   name: bench_scaling
   concurrency:
-    threads:
-      threads: null
+    threads: {threads}
 error_handling:
   strategy: continue
 nodes:
@@ -62,7 +66,7 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - {{ name: id, type: string }}
 
 - type: transform
   name: heavy_transform
@@ -144,7 +148,12 @@ fn bench_scaling_two_pass(c: &mut Criterion) {
     group.sample_size(20);
 
     let record_count = MEDIUM;
-    let csv_bytes = CsvPayload::generate(record_count, 10, 16, 42);
+    let csv_bytes = CsvPayload::generate(
+        record_count,
+        &clinker_bench_support::FieldKind::default_layout(10),
+        16,
+        42,
+    );
 
     for threads in [1, 2, 4, 8] {
         let yaml = format!(
@@ -152,8 +161,7 @@ fn bench_scaling_two_pass(c: &mut Criterion) {
 pipeline:
   name: bench_scaling_2pass
   concurrency:
-    threads:
-      threads: null
+    threads: {threads}
 error_handling:
   strategy: continue
 nodes:
@@ -164,7 +172,7 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - {{ name: id, type: string }}
 
 - type: transform
   name: windowed

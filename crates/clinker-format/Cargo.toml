@@ -14,3 +14,11 @@ quick-xml = "0.37"
 chrono = { workspace = true }
 miette = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+clinker-bench-support = { workspace = true }
+
+[[bench]]
+name = "io_throughput"
+harness = false

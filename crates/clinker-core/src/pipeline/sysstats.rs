@@ -196,8 +196,7 @@ fn io_counters_impl() -> Option<IoCounters> {
 
 #[cfg(target_os = "windows")]
 fn io_counters_impl() -> Option<IoCounters> {
-    use windows_sys::Win32::System::ProcessStatus::GetProcessIoCounters;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessIoCounters};
 
     // The `IO_COUNTERS` struct lives under `Win32::System::Threading` in
     // recent windows-sys; redeclare locally to avoid hunting feature flags.

@@ -11,3 +11,11 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 ahash = { workspace = true }
 indexmap = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+clinker-bench-support = { workspace = true }
+
+[[bench]]
+name = "record_ops"
+harness = false

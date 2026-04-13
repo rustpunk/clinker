@@ -982,6 +982,7 @@ impl Parser {
         // Parse then-branch at coalesce BP floor (BP 1) so it extends far right
         let then_branch = self.parse_expr(1)?;
 
+        self.skip_newlines();
         let else_branch = if *self.peek() == Token::Else {
             self.advance();
             Some(Box::new(self.parse_expr(1)?))
