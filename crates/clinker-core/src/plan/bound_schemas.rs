@@ -6,7 +6,9 @@
 //! never need to recompute schema propagation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use clinker_record::schema::Schema;
 use cxl::typecheck::row::{Row, TailVarId};
 
 /// Per-node bound row types produced by `bind_schema`.
@@ -39,5 +41,35 @@ impl BoundSchemas {
     /// Retrieve the output row for a node by name.
     pub fn output_of(&self, node_name: &str) -> Option<&Row> {
         self.output.get(node_name)
+    }
+
+    /// Return the declared column names (in declaration order) of a
+    /// node's bound output row, or `None` if the node has no recorded
+    /// output row.
+    ///
+    /// This is the Option-W positional slot table: the column ordering
+    /// here is the runtime `Record::values` layout contract for records
+    /// produced by `node_name`.
+    pub fn columns_of(&self, node_name: &str) -> Option<Vec<String>> {
+        self.output
+            .get(node_name)
+            .map(|row| row.declared.keys().cloned().collect())
+    }
+
+    /// Iterate `(node_name, row)` pairs for every recorded output.
+    pub fn iter_outputs(&self) -> impl Iterator<Item = (&String, &Row)> {
+        self.output.iter()
+    }
+
+    /// Materialize an `Arc<Schema>` for a node's bound output row.
+    ///
+    /// Every transform/source/aggregate/route node in the DAG has an
+    /// entry; records produced at the node's output carry this schema
+    /// on `Record::schema` and are positionally aligned to it.
+    pub fn schema_of(&self, node_name: &str) -> Option<Arc<Schema>> {
+        self.columns_of(node_name).map(|cols| {
+            let boxed: Vec<Box<str>> = cols.into_iter().map(|c| c.into_boxed_str()).collect();
+            Arc::new(Schema::new(boxed))
+        })
     }
 }

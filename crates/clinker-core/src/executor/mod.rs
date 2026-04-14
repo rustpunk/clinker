@@ -716,9 +716,10 @@ impl PipelineExecutor {
 
         let runtime_input_schema: Vec<String> =
             schema.columns().iter().map(|c| c.to_string()).collect();
-        let plan = ExecutionPlanDag::compile_with_runtime_schema(
+        let plan = ExecutionPlanDag::compile_with_bound_schemas(
             config,
             &compiled_refs,
+            Some(&validated_plan.artifacts().bound_schemas),
             Some(&runtime_input_schema),
         )
         .map_err(|e| PipelineError::Compilation {
@@ -746,6 +747,24 @@ impl PipelineExecutor {
         // ── Build lookup tables for transforms with `lookup:` config ──
         let lookup_tables = Self::build_lookup_tables(config, &mut readers, &source_configs)?;
 
+        // Option-W runtime layout: materialize each node's bound
+        // output `Arc<Schema>` from `bind_schema`'s `BoundSchemas` so
+        // every record produced at a node's output is positionally
+        // aligned to the schema that downstream positional consumers
+        // (aggregator `group_by_indices`, sort keys) resolve against.
+        let bound_output_schemas: HashMap<String, Arc<Schema>> = validated_plan
+            .artifacts()
+            .bound_schemas
+            .iter_outputs()
+            .filter_map(|(name, _row)| {
+                validated_plan
+                    .artifacts()
+                    .bound_schemas
+                    .schema_of(name)
+                    .map(|s| (name.to_string(), s))
+            })
+            .collect();
+
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
             format_reader,
@@ -756,6 +775,7 @@ impl PipelineExecutor {
             params,
             &mut collector,
             lookup_tables,
+            &bound_output_schemas,
         )?;
 
         let stages = collector.into_stages();
@@ -790,6 +810,7 @@ impl PipelineExecutor {
         _pipeline_start_time: chrono::NaiveDateTime,
         stable: &StableEvalContext,
         transform_names: &[&str],
+        transform_output_schemas: &[Option<Arc<Schema>>],
         evaluators: &mut [ProgramEvaluator],
         mut compiled_route: Option<&mut CompiledRoute>,
         _params: &PipelineRunParams,
@@ -820,7 +841,13 @@ impl PipelineExecutor {
                 source_file: &source_file_arc,
                 source_row: rn,
             };
-            let result = evaluate_record(&record, transform_names, evaluators, &ctx);
+            let result = evaluate_record(
+                &record,
+                transform_names,
+                transform_output_schemas,
+                evaluators,
+                &ctx,
+            );
             if result.is_err() && !any_failed {
                 any_failed = true;
                 if let Err((_, ref eval_err)) = result {
@@ -947,6 +974,7 @@ impl PipelineExecutor {
         _pipeline_start_time: chrono::NaiveDateTime,
         stable: &StableEvalContext,
         transform_names: &[&str],
+        transform_output_schemas: &[Option<Arc<Schema>>],
         evaluators: &mut [ProgramEvaluator],
         _params: &PipelineRunParams,
         _strategy: ErrorStrategy,
@@ -975,7 +1003,13 @@ impl PipelineExecutor {
                 source_file: &source_file_arc,
                 source_row: rn,
             };
-            let result = evaluate_record(&record, transform_names, evaluators, &ctx);
+            let result = evaluate_record(
+                &record,
+                transform_names,
+                transform_output_schemas,
+                evaluators,
+                &ctx,
+            );
             if result.is_err() && !any_failed {
                 any_failed = true;
                 if let Err((_, ref eval_err)) = result {
@@ -1110,6 +1144,7 @@ impl PipelineExecutor {
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
         lookup_tables: HashMap<String, RuntimeLookup>,
+        bound_output_schemas: &HashMap<String, Arc<Schema>>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
@@ -1238,6 +1273,10 @@ impl PipelineExecutor {
             )> = None;
             let mut evaluators = build_evaluators(transforms);
             let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+            let transform_output_schemas: Vec<Option<Arc<Schema>>> = transform_names
+                .iter()
+                .map(|n| bound_output_schemas.get(*n).cloned())
+                .collect();
 
             for pos in 0..record_count {
                 records_scanned += 1;
@@ -1250,6 +1289,7 @@ impl PipelineExecutor {
                 let result = evaluate_record_with_window(
                     &record,
                     &transform_names,
+                    &transform_output_schemas,
                     &mut evaluators,
                     &ctx,
                     plan,
@@ -1330,6 +1370,7 @@ impl PipelineExecutor {
                                     *result = Some(evaluate_record_with_window(
                                         record,
                                         &transform_names,
+                                        &transform_output_schemas,
                                         &mut local_evals,
                                         &ctx,
                                         plan,
@@ -1356,6 +1397,7 @@ impl PipelineExecutor {
                         *result = Some(evaluate_record_with_window(
                             record,
                             &transform_names,
+                            &transform_output_schemas,
                             evaluators,
                             &ctx,
                             plan,
@@ -1722,6 +1764,7 @@ impl PipelineExecutor {
                 &mut dlq_entries,
                 collector,
                 &lookup_tables,
+                bound_output_schemas,
             );
         }
 
@@ -1734,6 +1777,10 @@ impl PipelineExecutor {
         // Phase 3: Schema derivation (scan for first emitting record)
         let mut evaluators = build_evaluators(transforms);
         let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+        let transform_output_schemas: Vec<Option<Arc<Schema>>> = transform_names
+            .iter()
+            .map(|n| bound_output_schemas.get(*n).cloned())
+            .collect();
 
         let mut first_emitted_schema: Option<Arc<Schema>> = None;
         if requires_sorted_input {
@@ -1749,8 +1796,13 @@ impl PipelineExecutor {
                 };
                 if let Ok(EvalResult::Emit {
                     fields: emitted, ..
-                }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
-                {
+                }) = evaluate_record(
+                    record,
+                    &transform_names,
+                    &transform_output_schemas,
+                    &mut evaluators,
+                    &ctx,
+                ) {
                     let projected = project_output(record, &emitted, primary_output);
                     first_emitted_schema = Some(Arc::clone(projected.schema()));
                     break;
@@ -1806,6 +1858,7 @@ impl PipelineExecutor {
                             evaluate_record_with_lookups(
                                 &record,
                                 &transform_names,
+                                &transform_output_schemas,
                                 &mut evaluators,
                                 &ctx,
                                 &lookup_tables,
@@ -1886,6 +1939,7 @@ impl PipelineExecutor {
                                 pipeline_start_time,
                                 &stable,
                                 &transform_names,
+                                &transform_output_schemas,
                                 &mut evaluators,
                                 compiled_route.as_mut(),
                                 params,
@@ -1937,6 +1991,7 @@ impl PipelineExecutor {
                         pipeline_start_time,
                         &stable,
                         &transform_names,
+                        &transform_output_schemas,
                         &mut evaluators,
                         compiled_route.as_mut(),
                         params,
@@ -2017,6 +2072,7 @@ impl PipelineExecutor {
                             evaluate_record_with_lookups(
                                 &record,
                                 &transform_names,
+                                &transform_output_schemas,
                                 &mut evaluators,
                                 &ctx,
                                 &lookup_tables,
@@ -2084,6 +2140,7 @@ impl PipelineExecutor {
                                 pipeline_start_time,
                                 &stable,
                                 &transform_names,
+                                &transform_output_schemas,
                                 &mut evaluators,
                                 params,
                                 strategy,
@@ -2132,6 +2189,7 @@ impl PipelineExecutor {
                         pipeline_start_time,
                         &stable,
                         &transform_names,
+                        &transform_output_schemas,
                         &mut evaluators,
                         params,
                         strategy,
@@ -2211,6 +2269,7 @@ impl PipelineExecutor {
             let result = evaluate_record_with_lookups(
                 record,
                 &transform_names,
+                &transform_output_schemas,
                 &mut evaluators,
                 &ctx,
                 &lookup_tables,
@@ -2383,6 +2442,7 @@ impl PipelineExecutor {
                     evaluate_record_with_lookups(
                         &record,
                         &transform_names,
+                        &transform_output_schemas,
                         &mut evaluators,
                         &ctx,
                         &lookup_tables,
@@ -2582,6 +2642,7 @@ impl PipelineExecutor {
                     evaluate_record_with_lookups(
                         &record,
                         &transform_names,
+                        &transform_output_schemas,
                         &mut evaluators,
                         &ctx,
                         &lookup_tables,
@@ -2685,6 +2746,7 @@ impl PipelineExecutor {
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         lookup_tables: &HashMap<String, RuntimeLookup>,
+        bound_output_schemas: &HashMap<String, Arc<Schema>>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
@@ -2738,11 +2800,35 @@ impl PipelineExecutor {
         for &node_idx in &plan.topo_order {
             let node = plan.graph[node_idx].clone();
             match node {
-                PlanNode::Source { .. } => {
-                    // Source node: populate buffer with all input records
+                PlanNode::Source { ref name, .. } => {
+                    // Option-W: widen source records onto the source's
+                    // bound output schema (the author-declared schema),
+                    // so every record produced by this node carries
+                    // the same `Arc<Schema>` that downstream positional
+                    // consumers (aggregator `group_by_indices`, sort
+                    // keys) resolve against.
+                    //
+                    // The CSV/JSON reader produces records whose
+                    // schema reflects what's actually in the file
+                    // (a subset of the declared schema); `bind_schema`
+                    // walks the author-declared schema (a superset).
+                    // Left unreconciled, indices resolve at the wrong
+                    // slot — widen here once at source ingress.
+                    let source_schema = bound_output_schemas.get(name.as_str()).cloned();
                     let records: Vec<_> = all_records
                         .iter()
-                        .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
+                        .map(|(r, rn)| {
+                            let widened = if let Some(schema) = source_schema.as_ref() {
+                                if Arc::ptr_eq(r.schema(), schema) {
+                                    r.clone()
+                                } else {
+                                    reproject_record(r, schema, &IndexMap::new())
+                                }
+                            } else {
+                                r.clone()
+                            };
+                            (widened, *rn, IndexMap::new(), IndexMap::new())
+                        })
                         .collect();
                     node_buffers.insert(node_idx, records);
                 }
@@ -2781,6 +2867,10 @@ impl PipelineExecutor {
                         Arc::clone(&transforms[transform_idx].typed),
                         transforms[transform_idx].has_distinct(),
                     );
+
+                    // Option-W: every record emitted by this Transform
+                    // carries the node's bound output schema.
+                    let node_output_schema = bound_output_schemas.get(name.as_str()).cloned();
 
                     let mut output_records = Vec::with_capacity(input_records.len());
 
@@ -2841,15 +2931,17 @@ impl PipelineExecutor {
                                                 fields: emitted,
                                                 metadata,
                                             }) => {
-                                                let mut rec = record.clone();
-                                                for (n, v) in &emitted {
-                                                    if !rec.set(n, v.clone()) {
-                                                        rec.set_overflow(
-                                                            n.clone().into_boxed_str(),
-                                                            v.clone(),
-                                                        );
+                                                let mut rec = if let Some(schema) =
+                                                    node_output_schema.as_ref()
+                                                {
+                                                    reproject_record(&record, schema, &emitted)
+                                                } else {
+                                                    let mut r = record.clone();
+                                                    for (n, v) in &emitted {
+                                                        let _ = r.set(n, v.clone());
                                                     }
-                                                }
+                                                    r
+                                                };
                                                 for (k, v) in &metadata {
                                                     let _ = rec.set_meta(k, v.clone());
                                                 }
@@ -2903,15 +2995,16 @@ impl PipelineExecutor {
                                             fields: emitted,
                                             metadata,
                                         }) => {
-                                            let mut rec = record.clone();
-                                            for (n, v) in &emitted {
-                                                if !rec.set(n, v.clone()) {
-                                                    rec.set_overflow(
-                                                        n.clone().into_boxed_str(),
-                                                        v.clone(),
-                                                    );
-                                                }
-                                            }
+                                            let mut rec =
+                                                if let Some(schema) = node_output_schema.as_ref() {
+                                                    reproject_record(&record, schema, &emitted)
+                                                } else {
+                                                    let mut r = record.clone();
+                                                    for (n, v) in &emitted {
+                                                        let _ = r.set(n, v.clone());
+                                                    }
+                                                    r
+                                                };
                                             for (k, v) in &metadata {
                                                 let _ = rec.set_meta(k, v.clone());
                                             }
@@ -2949,7 +3042,13 @@ impl PipelineExecutor {
                             // No lookup — existing single-transform evaluation
                             let eval_result = {
                                 let _guard = transform_timer.guard();
-                                evaluate_single_transform(&record, name, &mut evaluator, &ctx)
+                                evaluate_single_transform(
+                                    &record,
+                                    name,
+                                    &mut evaluator,
+                                    &ctx,
+                                    node_output_schema.as_ref(),
+                                )
                             };
                             match eval_result {
                                 Ok((modified_record, Ok((emitted, metadata)))) => {
@@ -4311,20 +4410,30 @@ fn build_stable_eval_context(
 
 /// Evaluate all transforms against a single record, accumulating emitted fields.
 ///
-/// Emitted fields from earlier transforms are merged into the record's overflow
-/// so that later transforms can reference them as input fields.
+/// `transform_output_schemas` aligns with `transform_names`; each entry
+/// is the transform's bound output `Arc<Schema>` (Option-W) or `None`
+/// for legacy paths. Under Option-W every emit-producing transform
+/// has a bound schema; `None` entries fall back to in-place `set()`
+/// and silently drop unknown-slot emits.
 ///
 /// On error, returns `(transform_name, EvalError)` so callers can populate
 /// the DLQ stage field with `"transform:{name}"`.
 fn evaluate_record(
     record: &Record,
     transform_names: &[&str],
+    transform_output_schemas: &[Option<Arc<Schema>>],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
 ) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
     // No lookup tables → always returns exactly one result
-    let mut results =
-        evaluate_record_with_lookups(record, transform_names, evaluators, ctx, &HashMap::new())?;
+    let mut results = evaluate_record_with_lookups(
+        record,
+        transform_names,
+        transform_output_schemas,
+        evaluators,
+        ctx,
+        &HashMap::new(),
+    )?;
     Ok(results
         .pop()
         .unwrap_or(EvalResult::Skip(SkipReason::Filtered)))
@@ -4335,6 +4444,7 @@ fn evaluate_record(
 fn evaluate_record_with_lookups(
     record: &Record,
     transform_names: &[&str],
+    transform_output_schemas: &[Option<Arc<Schema>>],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
     lookup_tables: &HashMap<String, RuntimeLookup>,
@@ -4347,6 +4457,8 @@ fn evaluate_record_with_lookups(
 
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let name = transform_names.get(i).copied().unwrap_or("unknown");
+        let output_schema: Option<&Arc<Schema>> =
+            transform_output_schemas.get(i).and_then(|s| s.as_ref());
         let mut new_branches: Vec<Branch> = Vec::with_capacity(branches.len());
 
         for (record, all_emitted, all_metadata) in branches {
@@ -4409,6 +4521,7 @@ fn evaluate_record_with_lookups(
                                 all_emitted,
                                 all_metadata,
                                 eval_result,
+                                output_schema,
                             ) {
                                 Ok(branch) => new_branches.push(branch),
                                 Err(reason) => last_skip_reason = reason,
@@ -4432,6 +4545,7 @@ fn evaluate_record_with_lookups(
                             all_emitted.clone(),
                             all_metadata.clone(),
                             eval_result,
+                            output_schema,
                         ) {
                             Ok(branch) => new_branches.push(branch),
                             Err(reason) => last_skip_reason = reason,
@@ -4442,7 +4556,13 @@ fn evaluate_record_with_lookups(
                 let eval_result = eval
                     .eval_record::<NullStorage>(ctx, &record, None)
                     .map_err(|e| (name.to_string(), e))?;
-                match apply_eval_to_branch(record, all_emitted, all_metadata, eval_result) {
+                match apply_eval_to_branch(
+                    record,
+                    all_emitted,
+                    all_metadata,
+                    eval_result,
+                    output_schema,
+                ) {
                     Ok(branch) => new_branches.push(branch),
                     Err(reason) => last_skip_reason = reason,
                 }
@@ -4464,24 +4584,83 @@ fn evaluate_record_with_lookups(
         .collect())
 }
 
+/// Option-W re-projection: build a record whose `values` are
+/// positionally aligned to `output_schema`.
+///
+/// This is the runtime half of Option W. The planner (`bind_schema`)
+/// computes each node's bound output row; the executor materializes
+/// every record produced at that node with an `Arc<Schema>` matching
+/// the bound row, so downstream positional consumers (`HashAggregator`
+/// group-key indices, sort keys, aggregator `BindingArg::Field` slots)
+/// read the right slot.
+///
+/// For each declared column in `output_schema`:
+///  * If `emitted` contains the column name, use that value (emit
+///    overrides passthrough; matches bind_schema's statement-order
+///    propagation).
+///  * Else if the input record has a slot named the same, carry it
+///    forward (passthrough).
+///  * Else `Null` (column is declared in the output but neither
+///    passed through nor emitted — shouldn't happen if bind_schema is
+///    correct, but we stay defensive).
+///
+/// Per-record metadata is carried forward verbatim.
+fn reproject_record(
+    input: &Record,
+    output_schema: &Arc<Schema>,
+    emitted: &IndexMap<String, Value>,
+) -> Record {
+    let mut values = Vec::with_capacity(output_schema.column_count());
+    for col in output_schema.columns() {
+        let name = col.as_ref();
+        let v = if let Some(v) = emitted.get(name) {
+            v.clone()
+        } else if let Some(v) = input.get(name) {
+            v.clone()
+        } else {
+            Value::Null
+        };
+        values.push(v);
+    }
+    let mut rec = Record::new(Arc::clone(output_schema), values);
+    if input.has_meta() {
+        for (k, v) in input.iter_meta() {
+            let _ = rec.set_meta(k, v.clone());
+        }
+    }
+    rec
+}
+
 /// Apply an eval result to a branch, returning the updated branch or the skip reason.
+///
+/// `output_schema` — if `Some`, the resulting record is reprojected to
+/// this node's bound output schema (Option-W runtime layout). If
+/// `None` (legacy paths not yet wired to `BoundSchemas`), the input
+/// record's schema is reused and emits to unknown fields are dropped
+/// at this site. Well-formed plans always supply `Some`.
 #[allow(clippy::type_complexity)]
 fn apply_eval_to_branch(
-    mut record: Record,
+    record: Record,
     mut all_emitted: IndexMap<String, Value>,
     mut all_metadata: IndexMap<String, Value>,
     eval_result: EvalResult,
+    output_schema: Option<&Arc<Schema>>,
 ) -> Result<(Record, IndexMap<String, Value>, IndexMap<String, Value>), SkipReason> {
     match eval_result {
         EvalResult::Emit {
             fields: emitted,
             metadata,
         } => {
-            for (name, value) in &emitted {
-                if !record.set(name, value.clone()) {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+            let mut record = if let Some(schema) = output_schema {
+                reproject_record(&record, schema, &emitted)
+            } else {
+                // Legacy fallback: write into existing schema slots.
+                let mut r = record;
+                for (name, value) in &emitted {
+                    let _ = r.set(name, value.clone());
                 }
-            }
+                r
+            };
             for (key, value) in &metadata {
                 let _ = record.set_meta(key, value.clone());
             }
@@ -4495,8 +4674,17 @@ fn apply_eval_to_branch(
 
 /// Evaluate all transforms with window context, accumulating emitted fields.
 ///
-/// Emitted fields from earlier transforms are merged into the record's overflow
-/// so that later transforms can reference them as input fields.
+/// Option-W runtime layout: at every transform iteration, the record
+/// is reprojected onto that transform's bound output `Arc<Schema>`
+/// (from `transform_output_schemas`, aligned with `transform_names`).
+/// The next iteration's input therefore carries the upstream
+/// transform's bound schema — which is the invariant required by
+/// downstream positional consumers (aggregator `group_by_indices`,
+/// sort keys, `BindingArg::Field` slots).
+///
+/// `transform_output_schemas`: `None` entries fall back to the input
+/// record's schema (legacy path; emits to unknown fields are dropped
+/// at that site — well-formed plans always supply `Some`).
 ///
 /// On error, returns `(transform_name, EvalError)` so callers can populate
 /// the DLQ stage field with `"transform:{name}"`.
@@ -4504,6 +4692,7 @@ fn apply_eval_to_branch(
 fn evaluate_record_with_window(
     record: &Record,
     transform_names: &[&str],
+    transform_output_schemas: &[Option<Arc<Schema>>],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
     plan: &ExecutionPlanDag,
@@ -4518,6 +4707,18 @@ fn evaluate_record_with_window(
     let window_info = plan.transform_window_info();
 
     for (i, eval) in evaluators.iter_mut().enumerate() {
+        // `window_info` is built from `PlanNode::Transform` nodes
+        // only; `evaluators` is built from the full
+        // transform/aggregate/route spec list (see
+        // `build_transform_specs`). When the pipeline chain has more
+        // evaluators than windowed-transform slots (e.g. a window
+        // transform followed by an aggregate) we have nothing to do
+        // at this site for the extra entries — the aggregate/route is
+        // dispatched separately by the DAG walker. Stop iterating
+        // rather than indexing past `window_info.len()`.
+        if i >= window_info.len() {
+            break;
+        }
         let (wi, _pl) = &window_info[i];
         let name = transform_names.get(i).copied().unwrap_or("unknown");
 
@@ -4564,13 +4765,21 @@ fn evaluate_record_with_window(
                 fields: emitted,
                 metadata,
             } => {
-                for (name, value) in &emitted {
-                    // Use set() for schema fields (e.g. emit amount = amount.to_int()),
-                    // set_overflow() for new fields introduced by the transform.
-                    if !record.set(name, value.clone()) {
-                        record.set_overflow(name.clone().into_boxed_str(), value.clone());
+                // Reproject onto this transform's bound output schema
+                // so the next iteration's input (and any downstream
+                // positional consumer) sees emits in their planner-
+                // allocated slots.
+                record = if let Some(schema) =
+                    transform_output_schemas.get(i).and_then(|s| s.as_ref())
+                {
+                    reproject_record(&record, schema, &emitted)
+                } else {
+                    let mut r = record;
+                    for (name, value) in &emitted {
+                        let _ = r.set(name, value.clone());
                     }
-                }
+                    r
+                };
                 for (key, value) in &metadata {
                     let _ = record.set_meta(key, value.clone());
                 }
@@ -4591,6 +4800,11 @@ fn evaluate_record_with_window(
 /// with emitted fields merged in.
 ///
 /// Used by the DAG-walking executor for per-node evaluation.
+/// `output_schema` — when supplied, the returned record is built with
+/// this schema (Option-W). `None` falls back to in-place `set()` on
+/// the input record's schema (legacy; emits to unknown fields are
+/// dropped at this site). Well-formed plans always supply `Some`.
+///
 /// Returns `Ok((modified_record, emitted, metadata))` on emit,
 /// `Ok` with `EvalResult::Skip` variant on skip.
 /// On error, returns `(transform_name, EvalError)`.
@@ -4600,6 +4814,7 @@ fn evaluate_single_transform(
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
+    output_schema: Option<&Arc<Schema>>,
 ) -> Result<
     (
         Record,
@@ -4607,26 +4822,30 @@ fn evaluate_single_transform(
     ),
     (String, cxl::eval::EvalError),
 > {
-    let mut record = record.clone();
+    let record_ref = record;
     match evaluator
-        .eval_record::<NullStorage>(ctx, &record, None)
+        .eval_record::<NullStorage>(ctx, record_ref, None)
         .map_err(|e| (transform_name.to_string(), e))?
     {
         EvalResult::Emit {
             fields: emitted,
             metadata,
         } => {
-            for (name, value) in &emitted {
-                if !record.set(name, value.clone()) {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+            let mut record = if let Some(schema) = output_schema {
+                reproject_record(record_ref, schema, &emitted)
+            } else {
+                let mut r = record_ref.clone();
+                for (name, value) in &emitted {
+                    let _ = r.set(name, value.clone());
                 }
-            }
+                r
+            };
             for (key, value) in &metadata {
                 let _ = record.set_meta(key, value.clone());
             }
             Ok((record, Ok((emitted, metadata))))
         }
-        EvalResult::Skip(reason) => Ok((record, Err(reason))),
+        EvalResult::Skip(reason) => Ok((record_ref.clone(), Err(reason))),
     }
 }
 

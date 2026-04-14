@@ -19,6 +19,7 @@ use crate::config::{
     AggregateConfig, OutputConfig, PipelineConfig, RouteMode, SortField, SourceConfig,
 };
 use crate::error::PipelineError;
+use crate::plan::bound_schemas::BoundSchemas;
 use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 use crate::plan::properties::{
@@ -713,7 +714,7 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
     ) -> Result<Self, PlanError> {
-        Self::compile_with_runtime_schema(config, compiled, None)
+        Self::compile_with_bound_schemas(config, compiled, None, None)
     }
 
     /// Variant of [`compile`] that accepts the actual runtime Arrow
@@ -725,6 +726,29 @@ impl ExecutionPlanDag {
     pub fn compile_with_runtime_schema(
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
+        runtime_input_schema: Option<&[String]>,
+    ) -> Result<Self, PlanError> {
+        Self::compile_with_bound_schemas(config, compiled, None, runtime_input_schema)
+    }
+
+    /// Option-W variant: resolves aggregate `group_by_indices` against
+    /// the upstream node's bound output row (from `bind_schema`).
+    ///
+    /// This is the correct plan-time schema oracle: the runtime record
+    /// entering an aggregate carries the upstream node's bound output
+    /// schema positionally, so indices resolved against that schema
+    /// match the runtime `Record::values` layout exactly. Replaces the
+    /// Task 16.3.13 TODO — the reconciliation that never landed —
+    /// with the final Option-W contract.
+    ///
+    /// `bound_schemas` is `None` only for legacy test paths that do
+    /// not run `bind_schema`; in that case we fall back to the Arrow
+    /// runtime schema (`runtime_input_schema`) or the typed-program's
+    /// declared field set.
+    pub fn compile_with_bound_schemas(
+        config: &PipelineConfig,
+        compiled: &[(&str, &TypedProgram)],
+        bound_schemas: Option<&BoundSchemas>,
         runtime_input_schema: Option<&[String]>,
     ) -> Result<Self, PlanError> {
         // D3a part2: collect source/output configs from the unified
@@ -895,6 +919,12 @@ impl ExecutionPlanDag {
             )?;
         }
 
+        // Declaration-order "chain predecessor" for `ResolvedInput::Chain`.
+        // Tracks the most recent spec name so that a `Chain`-wired
+        // aggregate can resolve its upstream for `BoundSchemas` lookup.
+        // Matches the Phase-2 edge-wiring `prev_transform_key` logic.
+        let mut prev_chain_name: Option<String> = None;
+
         // Transform nodes in declaration order (deterministic toposort per V-7-2)
         for (i, tc) in specs.iter().enumerate() {
             let analysis = &report.transforms[i];
@@ -960,23 +990,44 @@ impl ExecutionPlanDag {
                 }
 
                 let typed = compiled[i].1;
-                // Synthetic input schema: deterministic ordering of every
-                // field referenced by the CXL program. Task 16.3.13 will
-                // reconcile this with the upstream node's true schema; for
-                // unit-test scope the projection is the identity since the
-                // executor projects records into this same order before
-                // passing them into the hash aggregator.
-                // Phase 16b Task 16b.9: prefer the runtime Arrow
-                // schema when available. `typed.field_types` now comes
-                // from the author-declared source schema which may
-                // contain columns not present in the actual file; the
-                // aggregator projects records by positional index, so
-                // group_by_indices must be resolved against the
-                // runtime layout, not the declared superset.
-                let input_schema: Vec<String> = match runtime_input_schema {
-                    Some(rt) => rt.to_vec(),
-                    None => typed.field_types.keys().cloned().collect(),
+                // Option W — resolve the aggregator's input schema
+                // against the **upstream node's bound output row**. This
+                // is the positional slot table for records flowing into
+                // the aggregator: at runtime every record carries the
+                // upstream's bound output schema on `Record::schema`
+                // with `values` aligned to it, so `group_by_indices`
+                // derived here point at the right slots at
+                // `add_record` time.
+                //
+                // Replaces the stale Task-16.3.13 reconciliation that
+                // fed the aggregator the source's Arrow schema (or the
+                // typed program's declared field set) — both of which
+                // drift whenever an upstream transform emits new
+                // columns (e.g. `emit priority = ...` then
+                // `group_by: [priority]`).
+                let upstream_name: Option<&str> = match &tc.input {
+                    ResolvedInput::Single(name) => {
+                        // `Single("route_name.branch_name")` shares the
+                        // route's bound output row (routes pass their
+                        // upstream schema through unchanged per
+                        // bind_schema).
+                        Some(name.split('.').next().unwrap_or(name.as_str()))
+                    }
+                    ResolvedInput::Chain => prev_chain_name.as_deref().or({
+                        if primary_source.is_empty() {
+                            None
+                        } else {
+                            Some(primary_source.as_str())
+                        }
+                    }),
+                    // `Multi` was rejected above.
+                    ResolvedInput::Multi(_) => unreachable!("aggregate with multi-input rejected"),
                 };
+
+                let input_schema: Vec<String> = bound_schemas
+                    .and_then(|bs| upstream_name.and_then(|n| bs.columns_of(n)))
+                    .or_else(|| runtime_input_schema.map(|rt| rt.to_vec()))
+                    .unwrap_or_else(|| typed.field_types.keys().cloned().collect());
 
                 let compiled_agg =
                     cxl::plan::extract_aggregates(typed, &agg_cfg.group_by, &input_schema)
@@ -1017,6 +1068,10 @@ impl ExecutionPlanDag {
                     &mut node_by_name,
                     &mut slug_set,
                 )?;
+
+                // Track this aggregate as the chain predecessor for a
+                // subsequent `ResolvedInput::Chain` downstream node.
+                prev_chain_name = Some(tc.name.clone());
 
                 continue;
             }
@@ -1072,6 +1127,10 @@ impl ExecutionPlanDag {
                     &mut slug_set,
                 )?;
             }
+
+            // Track this transform as the chain predecessor for a
+            // subsequent `ResolvedInput::Chain` downstream node.
+            prev_chain_name = Some(tc.name.clone());
         }
 
         // Output nodes

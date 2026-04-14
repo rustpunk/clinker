@@ -276,25 +276,19 @@ impl<R: BufRead> XmlReader<R> {
         }
     }
 
-    /// Convert raw field pairs to a Record, applying array_paths and type inference.
+    /// Convert raw field pairs to a Record (Option-W: fields not
+    /// declared in the source schema are dropped).
     fn fields_to_record(&self, fields: Vec<(String, String)>, schema: &Arc<Schema>) -> Record {
         let mut values = vec![Value::Null; schema.column_count()];
-        let mut overflow: Vec<(String, Value)> = Vec::new();
 
         for (key, val) in fields {
             let value = infer_value(&val);
             if let Some(idx) = schema.index(&key) {
                 values[idx] = value;
-            } else {
-                overflow.push((key, value));
             }
         }
 
-        let mut record = Record::new(Arc::clone(schema), values);
-        for (key, val) in overflow {
-            record.set_overflow(key.into(), val);
-        }
-        record
+        Record::new(Arc::clone(schema), values)
     }
 }
 
