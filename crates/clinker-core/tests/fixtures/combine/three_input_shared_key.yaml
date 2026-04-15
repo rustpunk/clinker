@@ -2,12 +2,14 @@
 # Pattern: orders joined with products AND a per-product categories lookup,
 # all on product_id equality.
 # Input order is significant — IndexMap preserves insertion order (C.0.1 test).
-name: three_input_shared_key
+pipeline:
+  name: three_input_shared_key
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -16,7 +18,8 @@ nodes:
   - type: source
     name: products
     config:
-      format: csv
+      name: products
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -25,7 +28,8 @@ nodes:
   - type: source
     name: categories
     config:
-      format: csv
+      name: categories
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -51,5 +55,6 @@ nodes:
     name: fully_enriched_out
     input: fully_enriched
     config:
-      format: csv
+      name: fully_enriched_out
+      type: csv
       path: /tmp/fully_enriched_three_input_shared_key.csv

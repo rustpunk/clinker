@@ -1,11 +1,13 @@
 # 2-input combine, on_miss: skip — inner-join semantics.
 # Orders referencing product_id 101 (no match) are dropped.
-name: on_miss_skip
+pipeline:
+  name: on_miss_skip
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -14,7 +16,8 @@ nodes:
   - type: source
     name: products
     config:
-      format: csv
+      name: products
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -38,5 +41,6 @@ nodes:
     name: matched_only_out
     input: matched_only
     config:
-      format: csv
+      name: matched_only_out
+      type: csv
       path: /tmp/matched_only_on_miss_skip.csv

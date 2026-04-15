@@ -1,12 +1,14 @@
 # 2-input combine, pure equi predicate.
 # Pattern: orders enriched with product metadata on product_id equality.
 # match: first, on_miss: null_fields (default semantics).
-name: two_input_equi
+pipeline:
+  name: two_input_equi
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -15,7 +17,8 @@ nodes:
   - type: source
     name: products
     config:
-      format: csv
+      name: products
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -40,5 +43,6 @@ nodes:
     name: enriched_out
     input: enriched
     config:
-      format: csv
+      name: enriched_out
+      type: csv
       path: /tmp/enriched_two_input_equi.csv

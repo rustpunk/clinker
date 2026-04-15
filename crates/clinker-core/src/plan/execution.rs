@@ -414,7 +414,10 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                 PipelineNode::Source { .. }
                 | PipelineNode::Output { .. }
                 | PipelineNode::Merge { .. }
-                | PipelineNode::Composition { .. } => {}
+                | PipelineNode::Composition { .. }
+                // Phase Combine C.0.1: Combine lowers to `PlanNode::Combine`
+                // in C.0.2, not to a `PlanTransformSpec`. No-op here.
+                | PipelineNode::Combine { .. } => {}
             }
         }
         return specs;

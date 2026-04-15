@@ -2,12 +2,14 @@
 # For each order, emit one row per matching product entry. When the build side
 # has multiple rows per key this is 1:N; here products is unique per key so
 # the cardinality matches match:first, but the compile path is distinct.
-name: match_all
+pipeline:
+  name: match_all
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -16,7 +18,8 @@ nodes:
   - type: source
     name: products
     config:
-      format: csv
+      name: products
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -40,5 +43,6 @@ nodes:
     name: fanned_out
     input: fanned
     config:
-      format: csv
+      name: fanned_out
+      type: csv
       path: /tmp/fanned_match_all.csv

@@ -19,6 +19,7 @@ pub enum StageKind {
     Aggregate,
     Route,
     Merge,
+    Combine,
     Output,
     Composition,
     Error,
@@ -32,6 +33,7 @@ impl StageKind {
             StageKind::Aggregate => "aggregate",
             StageKind::Route => "route",
             StageKind::Merge => "merge",
+            StageKind::Combine => "combine",
             StageKind::Output => "output",
             StageKind::Composition => "composition",
             StageKind::Error => "error",
@@ -45,6 +47,7 @@ impl StageKind {
             StageKind::Aggregate => "AGGREGATE",
             StageKind::Route => "ROUTE",
             StageKind::Merge => "MERGE",
+            StageKind::Combine => "COMBINE",
             StageKind::Output => "OUTPUT",
             StageKind::Composition => "COMPOSITION",
             StageKind::Error => "ERROR",
@@ -62,6 +65,7 @@ pub fn stage_kind_for_node(node: &PipelineNode) -> StageKind {
         PipelineNode::Aggregate { .. } => StageKind::Aggregate,
         PipelineNode::Route { .. } => StageKind::Route,
         PipelineNode::Merge { .. } => StageKind::Merge,
+        PipelineNode::Combine { .. } => StageKind::Combine,
         PipelineNode::Output { .. } => StageKind::Output,
         PipelineNode::Composition { .. } => StageKind::Composition,
     }
@@ -137,6 +141,13 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
                 .map(|i| cols[i] + 1)
                 .max()
                 .unwrap_or(1),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|ni| name_to_idx.get(node_input_name(ni)).copied())
+                .map(|i| cols[i] + 1)
+                .max()
+                .unwrap_or(1),
             PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
@@ -177,6 +188,13 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             PipelineNode::Source { .. } => {}
             PipelineNode::Merge { header, .. } => {
                 for ni in &header.inputs {
+                    if let Some(&from) = name_to_idx.get(node_input_name(ni)) {
+                        connections.push((from, idx));
+                    }
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for ni in header.input.values() {
                     if let Some(&from) = name_to_idx.get(node_input_name(ni)) {
                         connections.push((from, idx));
                     }
@@ -291,6 +309,23 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             description: header.description.clone(),
             error_message: None,
         },
+        PipelineNode::Combine {
+            header,
+            config: body,
+        } => {
+            let cxl_src: &str = body.cxl.as_ref();
+            StageView {
+                id: header.name.clone(),
+                label: header.name.clone(),
+                kind,
+                subtitle: format!("{} inputs", header.input.len()),
+                canvas_x: x,
+                canvas_y: y,
+                cxl_source: Some(cxl_src.to_string()),
+                description: header.description.clone(),
+                error_message: None,
+            }
+        }
         PipelineNode::Output {
             header,
             config: body,

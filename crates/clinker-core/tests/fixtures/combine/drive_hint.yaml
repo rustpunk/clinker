@@ -2,12 +2,14 @@
 # the driving (probe) stream. The planner would default to orders (larger
 # input); `drive: products` overrides that to emit one row per product
 # enriched with the first matching order.
-name: drive_hint
+pipeline:
+  name: drive_hint
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -16,7 +18,8 @@ nodes:
   - type: source
     name: products
     config:
-      format: csv
+      name: products
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -42,5 +45,6 @@ nodes:
     name: product_driven_out
     input: product_driven
     config:
-      format: csv
+      name: product_driven_out
+      type: csv
       path: /tmp/product_driven_drive_hint.csv

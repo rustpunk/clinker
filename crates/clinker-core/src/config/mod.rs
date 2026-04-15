@@ -1080,6 +1080,11 @@ impl PipelineConfig {
                         self_ref = true;
                     }
                 }
+                PipelineNode::Combine { header, .. } => {
+                    if header.input.values().any(|i| input_target(i) == name) {
+                        self_ref = true;
+                    }
+                }
             }
             if self_ref {
                 diags.push(Diagnostic::error(
@@ -1112,6 +1117,14 @@ impl PipelineConfig {
                 }
                 PipelineNode::Merge { header, .. } => {
                     for i in &header.inputs {
+                        let producer = input_target(i);
+                        if producer != consumer && graph.index_of(producer).is_some() {
+                            graph.add_edge(producer, consumer);
+                        }
+                    }
+                }
+                PipelineNode::Combine { header, .. } => {
+                    for i in header.input.values() {
                         let producer = input_target(i);
                         if producer != consumer && graph.index_of(producer).is_some() {
                             graph.add_edge(producer, consumer);
@@ -1394,6 +1407,12 @@ impl PipelineConfig {
                         }
                     }
                 }
+                // Phase Combine C.0.1: edges for Combine nodes are wired in a
+                // dedicated block added by Task C.0.4 (paralleling Merge edge
+                // wiring). Until then, Combine nodes have no upstream edges
+                // in the DAG — which is harmless because PlanNode::Combine
+                // doesn't exist yet (lands in C.0.2).
+                PipelineNode::Combine { .. } => {}
             }
         }
 
@@ -1566,6 +1585,10 @@ pub(crate) fn lower_node_to_plan_node(
             ));
             None
         }
+        // Phase Combine C.0.1: Combine lowering lands in Task C.0.2 when
+        // `PlanNode::Combine` is added. For now, skip to keep `build_specs`
+        // exhaustive without emitting a half-formed plan node.
+        PipelineNode::Combine { .. } => None,
     }
 }
 

@@ -71,6 +71,15 @@ pub fn InspectorPanel(stage_id: String) -> Element {
             format!("{} inputs", header.inputs.len()),
             None,
         ),
+        PipelineNode::Combine {
+            header,
+            config: body,
+        } => (
+            "COMBINE",
+            "combine",
+            format!("{} inputs", header.input.len()),
+            Some(body.cxl.as_ref().to_string()),
+        ),
         PipelineNode::Output { config: body, .. } => {
             ("OUTPUT", "output", body.output.path.clone(), None)
         }

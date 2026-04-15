@@ -1,12 +1,14 @@
 # 2-input combine, pure range predicate.
 # Pattern: assign each order to a tax bracket by amount range.
 # Tax brackets cover 0..=1000 in contiguous non-overlapping ranges.
-name: two_input_range
+pipeline:
+  name: two_input_range
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -15,7 +17,8 @@ nodes:
   - type: source
     name: tax_brackets
     config:
-      format: csv
+      name: tax_brackets
+      type: csv
       path: tests/fixtures/combine/data/tax_brackets.csv
       schema:
         - { name: bracket_id, type: string }
@@ -40,5 +43,6 @@ nodes:
     name: bracketed_out
     input: bracketed
     config:
-      format: csv
+      name: bracketed_out
+      type: csv
       path: /tmp/bracketed_two_input_range.csv

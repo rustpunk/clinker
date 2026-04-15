@@ -4,6 +4,7 @@
 //! will wire them into the enum itself; for now they stand alone so the
 //! foundation tests can lock their shapes in.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// A reference to a producer node from a consumer's `input:` field.
@@ -85,6 +86,28 @@ pub struct MergeHeader {
     #[serde(default)]
     pub description: Option<String>,
     pub inputs: Vec<NodeInput>,
+    #[serde(default, rename = "_notes")]
+    pub notes: Option<serde_json::Value>,
+}
+
+/// Header for combine nodes — takes a named map of inputs.
+///
+/// Unlike [`MergeHeader`] (which uses `Vec<NodeInput>`), Combine uses an
+/// [`IndexMap<String, NodeInput>`]: each input has a qualifier name used
+/// in the body's CXL `where:` / `cxl:` expressions (e.g. `orders.id ==
+/// products.id`). Insertion order is preserved and determines the default
+/// driving input (first entry) when no explicit `drive:` is set on the
+/// body — see `CombineBody::drive` in `config/pipeline_node.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombineHeader {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Named input map: key = qualifier name, value = upstream node ref.
+    /// Order is preserved (IndexMap) and determines the default driving
+    /// input (first entry) when no explicit `drive:` is set.
+    pub input: IndexMap<String, NodeInput>,
     #[serde(default, rename = "_notes")]
     pub notes: Option<serde_json::Value>,
 }

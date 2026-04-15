@@ -287,6 +287,11 @@ fn bind_schema_inner(
                     schema_by_name.insert(name, upstream.clone());
                 }
             }
+            // Phase Combine C.0.1: schema binding for Combine nodes lands in
+            // Phase C.1 (plan/combine.rs with predicate decomposition and
+            // per-input schema propagation). For now, skip — downstream nodes
+            // referencing a Combine will not yet resolve its output schema.
+            PipelineNode::Combine { .. } => {}
             PipelineNode::Composition {
                 r#use,
                 inputs,

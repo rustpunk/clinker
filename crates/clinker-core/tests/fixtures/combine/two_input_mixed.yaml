@@ -6,12 +6,14 @@
 # per-row self-reference trick isn't useful), so use a synthetic pattern —
 # equi on a coarse bucket (product_id first digit) and range on amount.
 # For scaffold purposes the shape matters more than semantic realism.
-name: two_input_mixed
+pipeline:
+  name: two_input_mixed
 nodes:
   - type: source
     name: orders
     config:
-      format: csv
+      name: orders
+      type: csv
       path: tests/fixtures/combine/data/orders.csv
       schema:
         - { name: order_id, type: string }
@@ -20,7 +22,8 @@ nodes:
   - type: source
     name: products
     config:
-      format: csv
+      name: products
+      type: csv
       path: tests/fixtures/combine/data/products.csv
       schema:
         - { name: product_id, type: string }
@@ -46,5 +49,6 @@ nodes:
     name: qualified_out
     input: qualified
     config:
-      format: csv
+      name: qualified_out
+      type: csv
       path: /tmp/qualified_two_input_mixed.csv

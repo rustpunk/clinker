@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::config::node_header::{MergeHeader, NodeHeader, SourceHeader};
+use crate::config::node_header::{CombineHeader, MergeHeader, NodeHeader, SourceHeader};
 use crate::yaml::CxlSource;
 
 /// Unified pipeline node taxonomy. Every node in the YAML `nodes:` list
@@ -90,6 +90,15 @@ pub enum PipelineNode {
         header: MergeHeader,
         #[serde(default)]
         config: MergeBody,
+    },
+    /// N-ary record combining with mixed predicates (equi + range + arbitrary
+    /// CXL). Distinct from Merge (which concatenates records streamwise) and
+    /// from Transform+lookup (which is 1×1-table only). Introduced in Phase
+    /// Combine; see `docs/internal/plans/cxl-engine/phase-combine-node/`.
+    Combine {
+        #[serde(flatten)]
+        header: CombineHeader,
+        config: CombineBody,
     },
     Output {
         #[serde(flatten)]
@@ -188,6 +197,16 @@ impl TryFrom<serde_json::Value> for PipelineNode {
                 )?;
                 Ok(PipelineNode::Merge { header, config })
             }
+            "combine" => {
+                let header: CombineHeader =
+                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
+                let config: CombineBody = extract_field(obj, "config")?;
+                reject_unknown(
+                    obj,
+                    &["type", "name", "description", "input", "_notes", "config"],
+                )?;
+                Ok(PipelineNode::Combine { header, config })
+            }
             "output" => {
                 let header: NodeHeader =
                     extract_sub(obj, &["name", "description", "input", "_notes"])?;
@@ -239,7 +258,7 @@ impl TryFrom<serde_json::Value> for PipelineNode {
                 })
             }
             other => Err(format!(
-                "unknown node type {other:?}, expected one of: source, transform, aggregate, route, merge, output, composition"
+                "unknown node type {other:?}, expected one of: source, transform, aggregate, route, merge, combine, output, composition"
             )),
         }
     }
@@ -316,6 +335,7 @@ impl PipelineNode {
             | PipelineNode::Output { header, .. }
             | PipelineNode::Composition { header, .. } => &header.name,
             PipelineNode::Merge { header, .. } => &header.name,
+            PipelineNode::Combine { header, .. } => &header.name,
         }
     }
 
@@ -327,6 +347,7 @@ impl PipelineNode {
             PipelineNode::Aggregate { .. } => "aggregate",
             PipelineNode::Route { .. } => "route",
             PipelineNode::Merge { .. } => "merge",
+            PipelineNode::Combine { .. } => "combine",
             PipelineNode::Output { .. } => "output",
             PipelineNode::Composition { .. } => "composition",
         }
@@ -447,7 +468,7 @@ pub enum OnMiss {
     Error,
 }
 
-/// Match cardinality for lookup enrichment.
+/// Match cardinality for lookup/combine enrichment.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {
@@ -456,6 +477,10 @@ pub enum MatchMode {
     First,
     /// Return all matching rows (fan-out, 1:N).
     All,
+    /// Aggregate all matches into Value::Array. Empty array on miss.
+    /// Per-group limit 10K (D26, RESEARCH-collect-semantics.md).
+    /// OQ-1 RESOLVED: ships with existing Type::Array.
+    Collect,
 }
 
 /// Phase 16b rename of `LocalWindowSpec`. Wave 1 keeps the payload
@@ -491,6 +516,32 @@ pub struct RouteBody {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MergeBody {}
+
+/// Combine variant body. N-ary record combining with mixed predicates.
+///
+/// The `where:` CXL expression matches records across the named inputs
+/// declared on [`CombineHeader`]; the `cxl:` body defines the output
+/// schema via `emit` statements. See Phase Combine drill for the full
+/// matching semantics (equi/range/arbitrary predicate decomposition).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombineBody {
+    /// CXL boolean predicate matching records across inputs.
+    #[serde(rename = "where")]
+    pub where_expr: CxlSource,
+    /// Cardinality control.
+    #[serde(default, rename = "match")]
+    pub match_mode: MatchMode,
+    /// Missing record handling.
+    #[serde(default)]
+    pub on_miss: OnMiss,
+    /// CXL output body with emit statements defining the output schema.
+    pub cxl: CxlSource,
+    /// Optional explicit driving input name. When absent, the first entry
+    /// in [`CombineHeader::input`] is used (IndexMap iteration order).
+    #[serde(default)]
+    pub drive: Option<String>,
+}
 
 /// Output variant body. Wraps the existing sink config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -764,6 +815,351 @@ nodes:
             err.to_string().contains("bogus"),
             "error must name the field, got: {}",
             err
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Task C.0.1: PipelineNode::Combine deserialization tests
+//
+// Validate that the `combine` arm in `TryFrom<serde_json::Value>`
+// correctly parses the `CombineHeader` (IndexMap-based) and `CombineBody`
+// (where_expr, match_mode, on_miss, cxl, drive). Exercises IndexMap
+// insertion-order preservation, MatchMode::Collect, drive override, and
+// unknown-field rejection on both the header and the body.
+//
+// The spanned fixtures in tests/fixtures/combine/ use a flat top-level
+// `name:` (not `pipeline.name:`), so these tests use inline YAML with a
+// proper `pipeline:` wrapper. The fixtures are separately exercised by
+// tests/combine_test.rs.
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod combine_deser_tests {
+    use super::*;
+    use crate::config::PipelineConfig;
+    use crate::config::node_header::NodeInput;
+
+    /// Parse a PipelineConfig and pull the Combine node named `node_name`.
+    /// Panics if not found or not a Combine.
+    fn parse_and_find_combine<'a>(
+        doc: &'a PipelineConfig,
+        node_name: &str,
+    ) -> (&'a CombineHeader, &'a CombineBody) {
+        for spanned in &doc.nodes {
+            if let PipelineNode::Combine { header, config } = &spanned.value
+                && header.name == node_name
+            {
+                return (header, config);
+            }
+        }
+        panic!("combine node {node_name:?} not found in pipeline");
+    }
+
+    /// 2-input combine with equi predicate parses correctly. Verifies
+    /// header name, input map keys and order, body where/cxl fields.
+    #[test]
+    fn test_combine_yaml_deser_two_input_equi() {
+        let yaml = r#"
+pipeline:
+  name: combine_two_input_equi
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: enrich
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+"#;
+        let doc: PipelineConfig =
+            crate::yaml::from_str(yaml).expect("two-input combine should parse");
+        let (header, body) = parse_and_find_combine(&doc, "enrich");
+        assert_eq!(header.name, "enrich");
+        assert_eq!(header.description, None);
+        assert_eq!(header.input.len(), 2);
+        let keys: Vec<&str> = header.input.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["orders", "products"]);
+        assert!(matches!(header.input.get("orders"), Some(NodeInput::Single(s)) if s == "orders"));
+        assert!(
+            matches!(header.input.get("products"), Some(NodeInput::Single(s)) if s == "products")
+        );
+        assert_eq!(
+            body.where_expr.source,
+            "orders.product_id == products.product_id"
+        );
+        assert!(body.cxl.source.contains("emit order_id = orders.order_id"));
+        // Defaults stay defaults.
+        assert_eq!(body.match_mode, MatchMode::First);
+        assert_eq!(body.on_miss, OnMiss::NullFields);
+        assert_eq!(body.drive, None);
+    }
+
+    /// 3-input combine; IndexMap preserves insertion order.
+    #[test]
+    fn test_combine_yaml_deser_three_input() {
+        let yaml = r#"
+pipeline:
+  name: combine_three_input
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: categories
+    config:
+      name: categories
+      type: csv
+      path: categories.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: fully_enriched
+    input:
+      orders: orders
+      products: products
+      categories: categories
+    config:
+      where: "orders.product_id == products.product_id and products.product_id == categories.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+"#;
+        let doc: PipelineConfig =
+            crate::yaml::from_str(yaml).expect("three-input combine should parse");
+        let (header, _body) = parse_and_find_combine(&doc, "fully_enriched");
+        assert_eq!(header.input.len(), 3);
+        let keys: Vec<&str> = header.input.keys().map(String::as_str).collect();
+        // IndexMap MUST preserve insertion order: orders, products, categories.
+        assert_eq!(
+            keys,
+            vec!["orders", "products", "categories"],
+            "IndexMap did not preserve insertion order"
+        );
+    }
+
+    /// `match: collect` parses to `MatchMode::Collect`.
+    #[test]
+    fn test_combine_yaml_deser_match_collect() {
+        let yaml = r#"
+pipeline:
+  name: combine_match_collect
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      cxl: |
+        emit order_id = orders.order_id
+        emit products_list = products
+"#;
+        let doc: PipelineConfig = crate::yaml::from_str(yaml).expect("match: collect should parse");
+        let (_header, body) = parse_and_find_combine(&doc, "collected");
+        assert_eq!(body.match_mode, MatchMode::Collect);
+    }
+
+    /// `drive:` field parses correctly.
+    #[test]
+    fn test_combine_yaml_deser_drive_field() {
+        let yaml = r#"
+pipeline:
+  name: combine_drive_hint
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: product_driven
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      drive: products
+      cxl: |
+        emit product_id = products.product_id
+"#;
+        let doc: PipelineConfig = crate::yaml::from_str(yaml).expect("drive: should parse");
+        let (_header, body) = parse_and_find_combine(&doc, "product_driven");
+        assert_eq!(body.drive.as_deref(), Some("products"));
+    }
+
+    /// `name()` returns header name; `type_tag()` returns `"combine"`.
+    #[test]
+    fn test_combine_name_and_type_tag() {
+        use indexmap::IndexMap;
+
+        let mut input_map: IndexMap<String, NodeInput> = IndexMap::new();
+        input_map.insert("a".to_string(), NodeInput::Single("src_a".to_string()));
+        input_map.insert("b".to_string(), NodeInput::Single("src_b".to_string()));
+
+        let header = CombineHeader {
+            name: "my_combine".to_string(),
+            description: None,
+            input: input_map,
+            notes: None,
+        };
+        let body = CombineBody {
+            where_expr: CxlSource::unspanned("a.id == b.id"),
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::NullFields,
+            cxl: CxlSource::unspanned("emit id = a.id"),
+            drive: None,
+        };
+        let node = PipelineNode::Combine {
+            header,
+            config: body,
+        };
+
+        assert_eq!(node.name(), "my_combine");
+        assert_eq!(node.type_tag(), "combine");
+    }
+
+    /// Unknown fields in header or body produce serde errors with field names.
+    #[test]
+    fn test_combine_rejects_unknown_fields() {
+        // (1) Unknown field at the node top-level (caught by reject_unknown
+        // on the Combine arm — the expected-fields list names the field).
+        let yaml_unknown_top = r#"
+pipeline:
+  name: combine_bad_top
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: bad
+    input:
+      orders: orders
+      products: products
+    bogus_header_field: oops
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: "emit order_id = orders.order_id"
+"#;
+        let err = crate::yaml::from_str::<PipelineConfig>(yaml_unknown_top)
+            .expect_err("unknown top-level field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus_header_field"),
+            "error should name the unknown field, got: {msg}"
+        );
+
+        // (2) Unknown field inside `config:` body (caught by the
+        // `#[serde(deny_unknown_fields)]` on CombineBody).
+        let yaml_unknown_body = r#"
+pipeline:
+  name: combine_bad_body
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: bad_body
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: "emit order_id = orders.order_id"
+      bogus_body_field: oops
+"#;
+        let err = crate::yaml::from_str::<PipelineConfig>(yaml_unknown_body)
+            .expect_err("unknown body field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus_body_field"),
+            "error should name the unknown body field, got: {msg}"
         );
     }
 }
