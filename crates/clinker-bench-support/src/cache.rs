@@ -27,6 +27,30 @@ pub struct DataSpec {
     /// Per-field type layout. Length must equal `field_count`.
     /// Determines what kind of value each field generates.
     pub field_types: Vec<FieldKind>,
+    /// Optional tag for cache file disambiguation.
+    ///
+    /// When multiple sources share the same format/scale/field_count/string_len
+    /// but differ in field_types, the tag prevents cache file thrashing.
+    /// Set to the source node name for multi-source pipelines; empty string
+    /// for single-source pipelines (preserves existing cache filenames).
+    pub tag: String,
+    /// Optional nesting wrapper for JSON/XML formats.
+    ///
+    /// When set, the generated flat data is wrapped in a parent structure
+    /// so that format readers with `record_path` can navigate to the records.
+    pub wrapper: Option<NestedWrapper>,
+}
+
+/// Nesting wrapper for benchmark data generation.
+///
+/// Wraps flat generated records in a parent structure so that format
+/// readers configured with `record_path` can find them.
+#[derive(Debug, Clone, Hash)]
+pub enum NestedWrapper {
+    /// Wraps JSON array in nested object: `{"seg1":{"seg2":[...]}}`
+    Json { path_segments: Vec<String> },
+    /// Wraps XML records in parent elements: `<seg1><seg2><record>...`
+    Xml { parent_elements: Vec<String> },
 }
 
 /// Supported data formats for benchmark generation.
@@ -71,6 +95,26 @@ impl DataSpec {
         for ft in &self.field_types {
             hasher.update(&[*ft as u8]);
         }
+        hasher.update(self.tag.as_bytes());
+        match &self.wrapper {
+            None => {
+                hasher.update(&[0u8]);
+            }
+            Some(NestedWrapper::Json { path_segments }) => {
+                hasher.update(&[1u8]);
+                for seg in path_segments {
+                    hasher.update(seg.as_bytes());
+                    hasher.update(&[0u8]); // separator
+                }
+            }
+            Some(NestedWrapper::Xml { parent_elements }) => {
+                hasher.update(&[2u8]);
+                for elem in parent_elements {
+                    hasher.update(elem.as_bytes());
+                    hasher.update(&[0u8]);
+                }
+            }
+        }
         hasher.finalize().to_hex().to_string()
     }
 
@@ -85,7 +129,7 @@ impl DataSpec {
         }
     }
 
-    /// Cache file name: `{format}_{scale}_{fields}f_{strlen}s.{ext}`
+    /// Cache file name: `{format}_{scale}_{fields}f_{strlen}s[_{tag}][_nested].{ext}`
     pub fn file_name(&self) -> String {
         let fmt = match self.format {
             DataFormat::Csv => "csv",
@@ -94,12 +138,24 @@ impl DataSpec {
             DataFormat::Xml => "xml",
             DataFormat::FixedWidth => "fixed_width",
         };
+        let tag_suffix = if self.tag.is_empty() {
+            String::new()
+        } else {
+            format!("_{}", self.tag)
+        };
+        let nested_suffix = if self.wrapper.is_some() {
+            "_nested"
+        } else {
+            ""
+        };
         format!(
-            "{}_{}_{field_count}f_{string_len}s.{ext}",
+            "{}_{}_{field_count}f_{string_len}s{tag}{nested}.{ext}",
             fmt,
             self.scale.label(),
             field_count = self.field_count,
             string_len = self.string_len,
+            tag = tag_suffix,
+            nested = nested_suffix,
             ext = self.extension(),
         )
     }
@@ -203,13 +259,79 @@ impl BenchDataCache {
         let sl = spec.string_len;
         let seed = spec.seed;
         let ft = &spec.field_types;
-        match spec.format {
+        let data = match spec.format {
             DataFormat::Csv => CsvPayload::generate(rc, ft, sl, seed),
             DataFormat::JsonNdjson => generate_ndjson(rc, ft, sl, seed),
             DataFormat::JsonArray => generate_json_array(rc, ft, sl, seed),
             DataFormat::Xml => generate_xml(rc, ft, sl, seed),
             DataFormat::FixedWidth => generate_fixed_width(rc, ft, sl, seed).0,
+        };
+        match &spec.wrapper {
+            None => data,
+            Some(wrapper) => wrap_nested(data, spec.format, wrapper),
         }
+    }
+}
+
+/// Wrap flat generated data in a nesting structure for `record_path` testing.
+fn wrap_nested(data: Vec<u8>, format: DataFormat, wrapper: &NestedWrapper) -> Vec<u8> {
+    match (format, wrapper) {
+        (DataFormat::JsonArray, NestedWrapper::Json { path_segments }) => {
+            // Wrap JSON array `[...]` in nested objects: `{"seg1":{"seg2":[...]}}`
+            let mut buf = Vec::with_capacity(data.len() + path_segments.len() * 20);
+            for seg in path_segments {
+                buf.extend_from_slice(b"{\"");
+                buf.extend_from_slice(seg.as_bytes());
+                buf.extend_from_slice(b"\":");
+            }
+            buf.extend_from_slice(&data);
+            buf.extend(std::iter::repeat_n(b'}', path_segments.len()));
+            buf
+        }
+        (DataFormat::Xml, NestedWrapper::Xml { parent_elements }) => {
+            // Wrap XML: insert parent elements after prolog, before <records>,
+            // and close them after </records>.
+            // Current XML format: `<?xml ...?>\n<records>\n...\n</records>\n`
+            // We replace `<records>` with `<parent1><parent2>` and keep <record> as-is.
+            //
+            // Every structural marker the wrapper depends on (`?>\n`,
+            // `<records>\n`, `</records>\n`) is guarded up front with a
+            // `let-else` so a future format change falls through to the
+            // same unchanged-bytes fallback instead of panicking in a
+            // subsequent `.unwrap()`.
+            let data_str = String::from_utf8(data).expect("XML is UTF-8");
+            let Some(prolog_end) = data_str.find("?>\n") else {
+                return data_str.into_bytes();
+            };
+            let Some(records_start) = data_str.find("<records>\n") else {
+                return data_str.into_bytes();
+            };
+            let Some(records_end) = data_str.find("</records>\n") else {
+                return data_str.into_bytes();
+            };
+            let mut buf = Vec::with_capacity(data_str.len() + parent_elements.len() * 30);
+            buf.extend_from_slice(&data_str.as_bytes()[..prolog_end + 3]);
+            // Open parent elements
+            for elem in parent_elements {
+                buf.extend_from_slice(b"<");
+                buf.extend_from_slice(elem.as_bytes());
+                buf.extend_from_slice(b">");
+            }
+            buf.push(b'\n');
+            // Emit the record elements (between <records>\n and </records>\n)
+            buf.extend_from_slice(
+                &data_str.as_bytes()[records_start + "<records>\n".len()..records_end],
+            );
+            // Close parent elements in reverse
+            for elem in parent_elements.iter().rev() {
+                buf.extend_from_slice(b"</");
+                buf.extend_from_slice(elem.as_bytes());
+                buf.extend_from_slice(b">");
+            }
+            buf.push(b'\n');
+            buf
+        }
+        _ => data, // No wrapping for other format/wrapper combinations
     }
 }
 
@@ -225,6 +347,8 @@ mod tests {
             string_len: 8,
             seed: 42,
             field_types: FieldKind::default_layout(4),
+            tag: String::new(),
+            wrapper: None,
         }
     }
 
@@ -290,6 +414,73 @@ mod tests {
         let meta: CacheMeta =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert_eq!(meta.hash, spec1.cache_hash());
+    }
+
+    /// Tag field produces a distinct filename and cache hash.
+    #[test]
+    fn test_tag_produces_distinct_filename() {
+        let mut a = test_spec();
+        a.tag = String::new();
+        let mut b = test_spec();
+        b.tag = "orders".to_string();
+
+        assert_ne!(a.file_name(), b.file_name());
+        assert_ne!(a.cache_hash(), b.cache_hash());
+        assert!(b.file_name().contains("_orders"));
+    }
+
+    /// Nested wrapper produces a distinct filename with _nested suffix.
+    #[test]
+    fn test_nested_wrapper_produces_distinct_filename() {
+        let mut flat = test_spec();
+        flat.format = DataFormat::JsonArray;
+
+        let mut nested = flat.clone();
+        nested.wrapper = Some(NestedWrapper::Json {
+            path_segments: vec!["data".into(), "records".into()],
+        });
+
+        assert_ne!(flat.file_name(), nested.file_name());
+        assert_ne!(flat.cache_hash(), nested.cache_hash());
+        assert!(nested.file_name().contains("_nested"));
+    }
+
+    /// JSON nesting wraps array in nested objects.
+    #[test]
+    fn test_wrap_nested_json() {
+        let data = b"[{\"f0\":1},{\"f0\":2}]".to_vec();
+        let wrapped = wrap_nested(
+            data,
+            DataFormat::JsonArray,
+            &NestedWrapper::Json {
+                path_segments: vec!["data".into(), "records".into()],
+            },
+        );
+        let s = String::from_utf8(wrapped).unwrap();
+        assert!(s.starts_with("{\"data\":{\"records\":"));
+        assert!(s.ends_with("}}"));
+        // Verify valid JSON
+        let _: serde_json::Value = serde_json::from_str(&s).unwrap();
+    }
+
+    /// XML nesting wraps records in parent elements.
+    #[test]
+    fn test_wrap_nested_xml() {
+        let data =
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<records>\n<record><f0>1</f0></record>\n</records>\n"
+                .to_vec();
+        let wrapped = wrap_nested(
+            data,
+            DataFormat::Xml,
+            &NestedWrapper::Xml {
+                parent_elements: vec!["root".into(), "data".into()],
+            },
+        );
+        let s = String::from_utf8(wrapped).unwrap();
+        assert!(s.contains("<root><data>"));
+        assert!(s.contains("</data></root>"));
+        assert!(s.contains("<record><f0>1</f0></record>"));
+        assert!(!s.contains("<records>"));
     }
 
     /// CLINKER_BENCH_REGENERATE=1 forces regeneration regardless of cache state.

@@ -8,17 +8,16 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
 use indexmap::IndexMap;
-use rayon::prelude::*;
 
 use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
-use crate::pipeline::memory::{MemoryBudget, rss_bytes};
+use crate::pipeline::memory::rss_bytes;
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
-use crate::plan::execution::{ExecutionPlanDag, ParallelismClass, PlanNode};
-use crate::projection::{project_output, project_output_with_meta};
+use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use crate::projection::project_output_with_meta;
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
@@ -289,12 +288,35 @@ impl CompiledTransform {
     }
 }
 
-/// Build ProgramEvaluators for a set of compiled transforms.
-fn build_evaluators(transforms: &[CompiledTransform]) -> Vec<ProgramEvaluator> {
-    transforms
-        .iter()
-        .map(|t| ProgramEvaluator::new(Arc::clone(&t.typed), t.has_distinct()))
-        .collect()
+/// One captured record at an Output node under deferred-write
+/// semantics. Used by `OutputSink::Captured` during correlation-key
+/// per-group walker invocation.
+pub(crate) struct CapturedRow {
+    pub record: Record,
+    pub row_num: u64,
+    pub metadata: IndexMap<String, Value>,
+}
+
+/// Output dispatch target for the DAG walker's Output arm.
+///
+/// `Streamed` is the default: records are projected through the
+/// predecessor's `OutputLayout` and written directly to the configured
+/// `Write + Send` writer. Ownership of the writer map is transferred
+/// into the walker.
+///
+/// `Captured` is used by the correlation-key pre-DAG driver
+/// (Option W Shortcut #2) to defer writes until the group's
+/// success/failure decision is known. The walker pushes raw (pre-
+/// projection) records into a per-output-name `Vec`; the caller
+/// inspects the captured records and decides whether to flush them
+/// through the real writers or demote them to collateral DLQ.
+///
+/// One parameter encodes the choice structurally. "If capture is set,
+/// writers should be empty" is NOT expressible as two separate
+/// parameters without a conventional invariant — hence the enum.
+pub(crate) enum OutputSink<'a> {
+    Streamed(HashMap<String, Box<dyn Write + Send>>),
+    Captured(&'a mut HashMap<String, Vec<CapturedRow>>),
 }
 
 /// Compiled route branch: a named CXL boolean condition evaluator.
@@ -310,35 +332,67 @@ struct CompiledRoute {
     mode: crate::config::RouteMode,
 }
 
+/// Composite resolver for route predicate evaluation: the record
+/// resolves bare `FieldRef`s positionally (via `Record: FieldResolver`)
+/// while accumulated per-record metadata resolves `$meta.*` lookups.
+///
+/// Why not set_meta on the record and use the record as a sole resolver?
+/// Accumulated metadata across a multi-transform chain can exceed
+/// `Record`'s 64-key cap; keeping metadata side-by-side avoids that bound.
+struct RouteResolver<'a> {
+    record: &'a Record,
+    metadata: &'a IndexMap<String, Value>,
+}
+
+impl clinker_record::FieldResolver for RouteResolver<'_> {
+    fn resolve(&self, name: &str) -> Option<Value> {
+        if let Some(meta_key) = name.strip_prefix("$meta.") {
+            return self.metadata.get(meta_key).cloned();
+        }
+        self.record.resolve(name)
+    }
+    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
+        self.record.resolve_qualified(source, field)
+    }
+    fn available_fields(&self) -> Vec<&str> {
+        self.record.available_fields()
+    }
+    fn iter_fields(&self) -> Vec<(String, Value)> {
+        self.record.iter_fields()
+    }
+}
+
 impl CompiledRoute {
-    /// Evaluate route conditions against emitted fields.
+    /// Evaluate route conditions against a positional record plus
+    /// accumulated metadata.
+    ///
+    /// Under Option W, the record carries the upstream transform's
+    /// bound output schema — all passthroughs and emits are resolvable
+    /// positionally via `Record: FieldResolver`. Route predicates may
+    /// reference any column of that schema, not just CXL-emitted ones:
+    /// the "emitted vs passthrough" distinction that the per-record
+    /// emit map used to preserve is now a compile-time property of the
+    /// upstream node's `OutputLayout`, not a runtime field-set filter.
+    /// Strictly stronger semantics — matches the single-oracle mandate
+    /// of `RESEARCH-runtime-record-layout.md`.
     ///
     /// Returns the list of output names the record should be dispatched to.
     /// In Exclusive mode: first matching branch (or default).
     /// In Inclusive mode: all matching branches (or default if none match).
     fn evaluate(
         &mut self,
-        emitted: &IndexMap<String, Value>,
+        record: &Record,
         metadata: &IndexMap<String, Value>,
         ctx: &EvalContext,
     ) -> Result<Vec<String>, cxl::eval::EvalError> {
-        // Convert emitted IndexMap to HashMap for HashMapResolver.
-        // Include $meta.* entries so route conditions can reference metadata.
-        let mut hash_fields: HashMap<String, Value> = emitted
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (key, value) in metadata {
-            hash_fields.insert(format!("$meta.{key}"), value.clone());
-        }
-        let resolver = clinker_record::HashMapResolver::new(hash_fields);
+        let resolver = RouteResolver { record, metadata };
 
         match self.mode {
             crate::config::RouteMode::Exclusive => {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
-                        .eval_record::<NullStorage>(ctx, &resolver, None)?
+                        .eval_record::<NullStorage>(ctx, record, &resolver, None)?
                     {
                         EvalResult::Emit { .. } => return Ok(vec![branch.name.clone()]),
                         EvalResult::Skip(_) => continue,
@@ -351,7 +405,7 @@ impl CompiledRoute {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
-                        .eval_record::<NullStorage>(ctx, &resolver, None)?
+                        .eval_record::<NullStorage>(ctx, record, &resolver, None)?
                     {
                         EvalResult::Emit { .. } => matched.push(branch.name.clone()),
                         EvalResult::Skip(_) => {}
@@ -366,121 +420,6 @@ impl CompiledRoute {
     }
 }
 
-/// Per-output writer channel for multi-output dispatch.
-///
-/// Each output gets a dedicated thread with a bounded SPSC channel.
-/// Records are sent as `Vec<Record>` batches (one batch per chunk or per
-/// accumulated routing result) to amortize ~50ns/send channel overhead.
-struct OutputChannel {
-    sender: crossbeam_channel::Sender<Vec<Record>>,
-    cancel_sender: crossbeam_channel::Sender<()>,
-    handle: std::thread::JoinHandle<Result<(), PipelineError>>,
-}
-
-/// Spawn a dedicated writer thread per output.
-///
-/// Each thread owns a `CsvWriter` and reads from a bounded channel (capacity 4).
-/// The channel carries `Vec<Record>` batches. The thread uses `crossbeam::select!`
-/// to wait on data or cancel signals.
-fn spawn_writer_threads(
-    writers: HashMap<String, Box<dyn Write + Send>>,
-    output_configs: &[OutputConfig],
-    output_schema: Arc<Schema>,
-) -> HashMap<String, OutputChannel> {
-    writers
-        .into_iter()
-        .map(|(name, raw_writer)| {
-            let (data_tx, data_rx) = crossbeam_channel::bounded::<Vec<Record>>(4);
-            let (cancel_tx, cancel_rx) = crossbeam_channel::bounded::<()>(0);
-            let config = output_configs
-                .iter()
-                .find(|o| o.name == name)
-                .unwrap()
-                .clone();
-            let schema = Arc::clone(&output_schema);
-
-            let handle = std::thread::Builder::new()
-                .name(format!("cxl-writer-{name}"))
-                .spawn(move || {
-                    let mut writer = build_format_writer(&config, raw_writer, schema)?;
-
-                    loop {
-                        crossbeam_channel::select! {
-                            recv(data_rx) -> msg => match msg {
-                                Ok(records) => {
-                                    for record in &records {
-                                        writer.write_record(record)?;
-                                    }
-                                }
-                                Err(_) => break, // all senders dropped = normal EOF
-                            },
-                            recv(cancel_rx) -> _ => {
-                                // Cancel signal — drain remaining buffered items
-                                while let Ok(records) = data_rx.try_recv() {
-                                    for record in &records {
-                                        writer.write_record(record)?;
-                                    }
-                                }
-                                break;
-                            },
-                        }
-                    }
-                    writer.flush()?;
-                    Ok(())
-                })
-                .expect("failed to spawn writer thread");
-
-            (
-                name,
-                OutputChannel {
-                    sender: data_tx,
-                    cancel_sender: cancel_tx,
-                    handle,
-                },
-            )
-        })
-        .collect()
-}
-
-/// Join all writer threads, collecting ALL results. Never early-return.
-/// DataFusion Collection pattern (PR #14439).
-fn join_writer_threads(channels: HashMap<String, OutputChannel>) -> Result<(), PipelineError> {
-    let mut errors = Vec::new();
-    for (_name, channel) in channels {
-        drop(channel.sender); // signal EOF
-        drop(channel.cancel_sender);
-        match channel.handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => errors.push(e),
-            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
-        }
-    }
-    match errors.len() {
-        0 => Ok(()),
-        1 => Err(errors.into_iter().next().unwrap()),
-        _ => Err(PipelineError::Multiple(errors)),
-    }
-}
-
-/// Flush accumulated per-output batches through channels.
-fn flush_output_batches(
-    per_output_batches: &mut HashMap<String, Vec<Record>>,
-    output_channels: &HashMap<String, OutputChannel>,
-) -> Result<(), PipelineError> {
-    for (name, batch) in per_output_batches.drain() {
-        if batch.is_empty() {
-            continue;
-        }
-        if let Some(channel) = output_channels.get(&name)
-            && channel.sender.send(batch).is_err()
-        {
-            // Writer thread died (panicked or errored) — channel disconnected.
-            // Don't deadlock; stop sending to this output. Errors will be
-            // collected in join_writer_threads.
-        }
-    }
-    Ok(())
-}
 /// Record that failed evaluation, queued for DLQ output.
 #[derive(Debug)]
 pub struct DlqEntry {
@@ -522,39 +461,13 @@ impl DlqEntry {
     }
 }
 
-/// Extract correlation key values from a record as a vector of GroupByKey.
-fn extract_correlation_key(
-    record: &Record,
-    correlation_key: &crate::config::CorrelationKey,
-) -> Vec<GroupByKey> {
-    let fields = correlation_key.fields();
-    fields
-        .iter()
-        .map(|field| {
-            match record.get(field) {
-                Some(value) if !value.is_null() => {
-                    // Treat empty strings as null (CSV has no native null concept)
-                    if let Value::String(s) = value
-                        && s.is_empty()
-                    {
-                        return GroupByKey::Null;
-                    }
-                    // Use value_to_group_key for consistent hashing/comparison
-                    match value_to_group_key(value, field, None, 0) {
-                        Ok(Some(gk)) => gk,
-                        Ok(None) => GroupByKey::Null,
-                        Err(_) => GroupByKey::Null,
-                    }
-                }
-                _ => GroupByKey::Null,
-            }
-        })
-        .collect()
-}
-
-/// Unified pipeline executor. Plan-driven branching:
-/// - Streaming (single-pass) when no window functions
-/// - TwoPass (arena + indices) when windows are present
+/// Unified pipeline executor.
+///
+/// Option-W single dispatch path: reads source records, optionally
+/// builds an Arena + SecondaryIndex pair when `plan.required_arena()`
+/// is true, and walks the DAG in topological order. One code path for
+/// transforms, windowed transforms, aggregates, routes, merges, sorts,
+/// and outputs.
 pub struct PipelineExecutor;
 
 impl PipelineExecutor {
@@ -716,10 +629,15 @@ impl PipelineExecutor {
 
         let runtime_input_schema: Vec<String> =
             schema.columns().iter().map(|c| c.to_string()).collect();
-        let plan = ExecutionPlanDag::compile_with_runtime_schema(
+        let plan = ExecutionPlanDag::compile_with_bound_schemas(
             config,
             &compiled_refs,
+            Some(&validated_plan.artifacts().bound_schemas),
             Some(&runtime_input_schema),
+            // Bind-time output_layouts map — the planner augments this
+            // with inheritance for synthesised nodes and stores the
+            // complete map on the DAG.
+            Some(&validated_plan.artifacts().output_layouts),
         )
         .map_err(|e| PipelineError::Compilation {
             transform_name: String::new(),
@@ -746,6 +664,30 @@ impl PipelineExecutor {
         // ── Build lookup tables for transforms with `lookup:` config ──
         let lookup_tables = Self::build_lookup_tables(config, &mut readers, &source_configs)?;
 
+        // Option-W runtime layout: materialize each node's bound
+        // output `Arc<Schema>` from `bind_schema`'s `BoundSchemas` so
+        // every record produced at a node's output is positionally
+        // aligned to the schema that downstream positional consumers
+        // (aggregator `group_by_indices`, sort keys) resolve against.
+        let bound_output_schemas: HashMap<String, Arc<Schema>> = validated_plan
+            .artifacts()
+            .bound_schemas
+            .iter_outputs()
+            .filter_map(|(name, _row)| {
+                validated_plan
+                    .artifacts()
+                    .bound_schemas
+                    .schema_of(name)
+                    .map(|s| (name.to_string(), s))
+            })
+            .collect();
+
+        // Option W Amendment A7: per-plan-node `OutputLayout` map is
+        // authoritative on the DAG itself — populated at plan-compile
+        // time with synthesized-node inheritance already applied. No
+        // runtime derivation: read and consult.
+        let bound_output_layouts = &plan.output_layouts;
+
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
             format_reader,
@@ -756,6 +698,8 @@ impl PipelineExecutor {
             params,
             &mut collector,
             lookup_tables,
+            &bound_output_schemas,
+            bound_output_layouts,
         )?;
 
         let stages = collector.into_stages();
@@ -779,324 +723,23 @@ impl PipelineExecutor {
         })
     }
 
-    /// Flush a buffered correlation group: evaluate all records, DLQ entire group if any fails.
-    #[allow(clippy::too_many_arguments)]
-    fn flush_correlated_group(
-        buffer: &mut Vec<(Record, u64)>,
-        _config: &PipelineConfig,
-        output_configs: &[OutputConfig],
-        primary_output: &OutputConfig,
-        input: &crate::config::SourceConfig,
-        _pipeline_start_time: chrono::NaiveDateTime,
-        stable: &StableEvalContext,
-        transform_names: &[&str],
-        evaluators: &mut [ProgramEvaluator],
-        mut compiled_route: Option<&mut CompiledRoute>,
-        _params: &PipelineRunParams,
-        strategy: ErrorStrategy,
-        counters: &mut PipelineCounters,
-        dlq_entries: &mut Vec<DlqEntry>,
-        per_output_batches: &mut HashMap<String, Vec<Record>>,
-        _max_group_buffer: u64,
-    ) {
-        if buffer.is_empty() {
-            return;
-        }
-        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
-
-        // Evaluate all records in the group, collect results
-        #[allow(clippy::type_complexity)]
-        let mut results: Vec<(
-            Record,
-            u64,
-            Result<EvalResult, (String, cxl::eval::EvalError)>,
-        )> = Vec::with_capacity(buffer.len());
-        let mut any_failed = false;
-        let mut first_failure_message: Option<String> = None;
-
-        for (record, rn) in buffer.drain(..) {
-            let ctx = EvalContext {
-                stable,
-                source_file: &source_file_arc,
-                source_row: rn,
-            };
-            let result = evaluate_record(&record, transform_names, evaluators, &ctx);
-            if result.is_err() && !any_failed {
-                any_failed = true;
-                if let Err((_, ref eval_err)) = result {
-                    first_failure_message = Some(eval_err.to_string());
-                }
-            }
-            results.push((record, rn, result));
-        }
-
-        if any_failed {
-            // DLQ entire group
-            for (record, rn, result) in results {
-                let (is_trigger, error_message) = match result {
-                    Err((_, eval_err)) => (true, eval_err.to_string()),
-                    Ok(_) => (
-                        false,
-                        format!(
-                            "correlated with failure in group: {}",
-                            first_failure_message.as_deref().unwrap_or("unknown")
-                        ),
-                    ),
-                };
-                counters.dlq_count += 1;
-                dlq_entries.push(DlqEntry {
-                    source_row: rn,
-                    category: crate::dlq::DlqErrorCategory::ValidationFailure,
-                    error_message,
-                    original_record: record,
-                    stage: Some("transform:correlated_dlq".to_string()),
-                    route: None,
-                    trigger: is_trigger,
-                });
-            }
-        } else {
-            // All passed — dispatch to outputs
-            for (record, rn, result) in results {
-                match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
-                        if let Some(ref mut route) = compiled_route {
-                            let ctx = EvalContext {
-                                stable,
-                                source_file: &source_file_arc,
-                                source_row: rn,
-                            };
-                            match route.evaluate(&emitted, &metadata, &ctx) {
-                                Ok(targets) => {
-                                    for target in &targets {
-                                        let out_cfg = output_configs
-                                            .iter()
-                                            .find(|o| o.name == *target)
-                                            .unwrap_or(primary_output);
-                                        let projected = project_output_with_meta(
-                                            &record, &emitted, &metadata, out_cfg,
-                                        );
-                                        per_output_batches
-                                            .entry(target.clone())
-                                            .or_default()
-                                            .push(projected);
-                                    }
-                                    counters.ok_count += 1;
-                                }
-                                Err(route_err) => {
-                                    if strategy == ErrorStrategy::FailFast {
-                                        // Can't propagate error from here easily;
-                                        // this path shouldn't hit FailFast with correlation
-                                        counters.dlq_count += 1;
-                                        dlq_entries.push(DlqEntry {
-                                            source_row: rn,
-                                            category:
-                                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                            error_message: route_err.to_string(),
-                                            original_record: record,
-                                            stage: Some(DlqEntry::stage_route_eval()),
-                                            route: None,
-                                            trigger: true,
-                                        });
-                                    } else {
-                                        counters.dlq_count += 1;
-                                        dlq_entries.push(DlqEntry {
-                                            source_row: rn,
-                                            category:
-                                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                            error_message: route_err.to_string(),
-                                            original_record: record,
-                                            stage: Some(DlqEntry::stage_route_eval()),
-                                            route: None,
-                                            trigger: true,
-                                        });
-                                    }
-                                }
-                            }
-                        } else {
-                            // Single-output in multi-output path (shouldn't happen, but handle)
-                            let projected = project_output(&record, &emitted, primary_output);
-                            per_output_batches
-                                .entry(primary_output.name.clone())
-                                .or_default()
-                                .push(projected);
-                            counters.ok_count += 1;
-                        }
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Err(_) => unreachable!("failures handled in any_failed branch"),
-                }
-            }
-        }
-    }
-
-    /// Flush a buffered correlation group for single-output path.
-    #[allow(clippy::too_many_arguments)]
-    fn flush_correlated_group_single_output(
-        buffer: &mut Vec<(Record, u64)>,
-        _config: &PipelineConfig,
-        primary_output: &OutputConfig,
-        input: &crate::config::SourceConfig,
-        _pipeline_start_time: chrono::NaiveDateTime,
-        stable: &StableEvalContext,
-        transform_names: &[&str],
-        evaluators: &mut [ProgramEvaluator],
-        _params: &PipelineRunParams,
-        _strategy: ErrorStrategy,
-        counters: &mut PipelineCounters,
-        dlq_entries: &mut Vec<DlqEntry>,
-        writer: &mut dyn FormatWriter,
-        _max_group_buffer: u64,
-    ) -> Result<(), PipelineError> {
-        if buffer.is_empty() {
-            return Ok(());
-        }
-        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
-
-        #[allow(clippy::type_complexity)]
-        let mut results: Vec<(
-            Record,
-            u64,
-            Result<EvalResult, (String, cxl::eval::EvalError)>,
-        )> = Vec::with_capacity(buffer.len());
-        let mut any_failed = false;
-        let mut first_failure_message: Option<String> = None;
-
-        for (record, rn) in buffer.drain(..) {
-            let ctx = EvalContext {
-                stable,
-                source_file: &source_file_arc,
-                source_row: rn,
-            };
-            let result = evaluate_record(&record, transform_names, evaluators, &ctx);
-            if result.is_err() && !any_failed {
-                any_failed = true;
-                if let Err((_, ref eval_err)) = result {
-                    first_failure_message = Some(eval_err.to_string());
-                }
-            }
-            results.push((record, rn, result));
-        }
-
-        if any_failed {
-            for (record, rn, result) in results {
-                let (is_trigger, error_message) = match result {
-                    Err((_, eval_err)) => (true, eval_err.to_string()),
-                    Ok(_) => (
-                        false,
-                        format!(
-                            "correlated with failure in group: {}",
-                            first_failure_message.as_deref().unwrap_or("unknown")
-                        ),
-                    ),
-                };
-                counters.dlq_count += 1;
-                dlq_entries.push(DlqEntry {
-                    source_row: rn,
-                    category: crate::dlq::DlqErrorCategory::ValidationFailure,
-                    error_message,
-                    original_record: record,
-                    stage: Some("transform:correlated_dlq".to_string()),
-                    route: None,
-                    trigger: is_trigger,
-                });
-            }
-        } else {
-            for (record, _rn, result) in results {
-                match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted, ..
-                    }) => {
-                        let projected = project_output(&record, &emitted, primary_output);
-                        writer.write_record(&projected)?;
-                        counters.ok_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Err(_) => unreachable!("failures handled in any_failed branch"),
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Dispatch an emitted record to outputs via route evaluation (multi-output helper).
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_to_outputs(
-        record: &Record,
-        emitted: &IndexMap<String, Value>,
-        metadata: &IndexMap<String, Value>,
-        _config: &PipelineConfig,
-        output_configs: &[OutputConfig],
-        primary_output: &OutputConfig,
-        compiled_route: Option<&mut CompiledRoute>,
-        ctx: &EvalContext,
-        counters: &mut PipelineCounters,
-        dlq_entries: &mut Vec<DlqEntry>,
-        per_output_batches: &mut HashMap<String, Vec<Record>>,
-        _strategy: ErrorStrategy,
-        row_num: u64,
-    ) {
-        if let Some(route) = compiled_route {
-            match route.evaluate(emitted, metadata, ctx) {
-                Ok(targets) => {
-                    for target in &targets {
-                        let out_cfg = output_configs
-                            .iter()
-                            .find(|o| o.name == *target)
-                            .unwrap_or(primary_output);
-                        let projected =
-                            project_output_with_meta(record, emitted, metadata, out_cfg);
-                        per_output_batches
-                            .entry(target.clone())
-                            .or_default()
-                            .push(projected);
-                    }
-                    counters.ok_count += 1;
-                }
-                Err(route_err) => {
-                    counters.dlq_count += 1;
-                    dlq_entries.push(DlqEntry {
-                        source_row: row_num,
-                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                        error_message: route_err.to_string(),
-                        original_record: record.clone(),
-                        stage: Some(DlqEntry::stage_route_eval()),
-                        route: None,
-                        trigger: true,
-                    });
-                }
-            }
-        } else {
-            let projected = project_output(record, emitted, primary_output);
-            per_output_batches
-                .entry(primary_output.name.clone())
-                .or_default()
-                .push(projected);
-            counters.ok_count += 1;
-        }
-    }
-
-    /// Single DAG-driven execution entry point — replaces execute_streaming,
-    /// execute_two_pass, and execute_correlated_streaming.
+    /// Option-W unified execute entry point — single DAG-driven dispatch.
     ///
-    /// Walks the DAG in topological order and dispatches per-node based on
-    /// `NodeExecutionReqs`. Handles all three execution modes internally:
-    /// 1. RequiresArena → build Arena + indices first, then walk DAG with window context
-    /// 2. RequiresSortedInput → read all, sort, then walk DAG with group-boundary logic
-    /// 3. Streaming → read all, walk DAG with per-record evaluation
+    /// Reads every record from the source, optionally builds an `Arena`
+    /// and `SecondaryIndex`es when `plan.required_arena()` is true, then
+    /// dispatches to the single DAG walker (`execute_dag_branching`) for
+    /// every pipeline shape — transforms, routes, merges, aggregates,
+    /// sorts, and windowed transforms. There is no longer a separate
+    /// chunk-based closed loop, no `has_branching` dispatch gate, and
+    /// no `requires_sorted_input` early-bailout: the unified walker
+    /// handles all of it.
+    ///
+    /// Rayon chunk-parallelism (previously gated by
+    /// `can_parallelize(plan)` in the arena path) has been removed.
+    /// Parallel re-entry via `ParallelismClass` annotations on DAG
+    /// nodes is explicit future work per
+    /// `RESEARCH-runtime-record-layout.md` Failure mode #7's "pool
+    /// later if measured" guardrail.
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     #[allow(clippy::too_many_arguments)]
@@ -1105,42 +748,30 @@ impl PipelineExecutor {
         mut format_reader: Box<dyn FormatReader>,
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
-        compiled_route: Option<CompiledRoute>,
+        mut compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
         lookup_tables: HashMap<String, RuntimeLookup>,
+        bound_output_schemas: &HashMap<String, Arc<Schema>>,
+        bound_output_layouts: &HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let source_configs: Vec<_> = config.source_configs().cloned().collect();
-        let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let input = &source_configs[0];
-        let primary_output = &output_configs[0];
-        let pipeline_start_time = chrono::Local::now().naive_local();
-
-        // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
-        // here, reused (via borrow) at every per-record dispatch site below.
-        let stable = build_stable_eval_context(
-            config,
-            pipeline_start_time,
-            &params.execution_id,
-            &params.batch_id,
-            &params.pipeline_vars,
-        );
-        let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
-
         let mut counters = PipelineCounters::default();
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
-        let strategy = config.error_handling.strategy;
-        let is_multi_output = compiled_route.is_some() && writers.len() > 1;
-        let mut compiled_route = compiled_route;
 
-        let requires_arena = plan.required_arena();
-        let requires_sorted_input = plan.required_sorted_input();
+        // Read every source record. Arena construction, when required,
+        // consumes the reader directly (it streams through the same
+        // reader with a field-projection filter); otherwise we collect
+        // into `all_records` here for the DAG walker.
+        let source_configs: Vec<_> = config.source_configs().cloned().collect();
+        let input = &source_configs[0];
 
-        // ── Phase 0+1: Read source and optionally build Arena ──
-
-        if requires_arena {
-            // TwoPass path: build Arena + indices, chunk-based evaluation
+        #[allow(clippy::type_complexity)]
+        let (arena_opt, indices_opt, all_records): (
+            Option<Arc<Arena>>,
+            Option<Vec<SecondaryIndex>>,
+            Vec<(Record, u64)>,
+        ) = if plan.required_arena() {
             let arena_fields =
                 crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
             let memory_limit = parse_memory_limit(config);
@@ -1187,7 +818,7 @@ impl PipelineExecutor {
                 indices.push(idx);
             }
 
-            // Phase 1.5: Sort partitions
+            // Sort partitions per spec, same as the former arena path.
             for (i, spec) in plan.indices_to_build.iter().enumerate() {
                 if !spec.already_sorted {
                     for partition in indices[i].groups.values_mut() {
@@ -1198,519 +829,53 @@ impl PipelineExecutor {
                 }
             }
 
-            // Phase 2: Chunk-based evaluation with optional rayon parallelism
-            let pool = build_thread_pool(config)?;
-            let use_parallel = can_parallelize(plan);
-
-            let output_schema_ref = arena.schema();
+            // Materialize arena records into Records aligned to the
+            // source's bound output schema (what the DAG walker feeds
+            // into the Source node arm).
+            let arena_schema = Arc::clone(arena.schema());
             let record_count = arena.record_count();
-            if record_count == 0 {
-                return Ok((PipelineCounters::default(), Vec::new(), rss_bytes()));
-            }
-
-            let mut rss_budget = MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
-            let chunk_size = config
-                .pipeline
-                .concurrency
-                .as_ref()
-                .and_then(|c| c.chunk_size)
-                .unwrap_or(1024) as u32;
-
-            let build_record_from_arena = |pos: u32| -> Record {
-                let schema = Arc::clone(output_schema_ref);
-                let values: Vec<Value> = schema
+            let mut recs: Vec<(Record, u64)> = Vec::with_capacity(record_count as usize);
+            for pos in 0..record_count {
+                let values: Vec<Value> = arena_schema
                     .columns()
                     .iter()
                     .map(|col| arena.resolve_field(pos, col).unwrap_or(Value::Null))
                     .collect();
-                Record::new(schema, values)
-            };
-
-            // Schema derivation scan
-            let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
-            let mut records_scanned: u64 = 0;
-            let mut first_emit_pos: Option<u32> = None;
-            #[allow(clippy::type_complexity)]
-            let mut first_emitted: Option<(
-                Record,
-                IndexMap<String, Value>,
-                IndexMap<String, Value>,
-            )> = None;
-            let mut evaluators = build_evaluators(transforms);
-            let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
-
-            for pos in 0..record_count {
-                records_scanned += 1;
-                let record = build_record_from_arena(pos);
-                let ctx = EvalContext {
-                    stable: &stable,
-                    source_file: &source_file_arc,
-                    source_row: pos as u64 + 1,
-                };
-                let result = evaluate_record_with_window(
-                    &record,
-                    &transform_names,
-                    &mut evaluators,
-                    &ctx,
-                    plan,
-                    &arena,
-                    &indices,
-                    pos,
-                );
+                recs.push((
+                    Record::new(Arc::clone(&arena_schema), values),
+                    pos as u64 + 1,
+                ));
+            }
+            (Some(Arc::new(arena)), Some(indices), recs)
+        } else {
+            let mut all_records: Vec<(Record, u64)> = Vec::new();
+            let mut row_num: u64 = 0;
+            while let Some(record) = format_reader.next_record()? {
+                row_num += 1;
                 counters.total_count += 1;
-                match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
-                        first_emitted = Some((record, emitted, metadata));
-                        first_emit_pos = Some(pos);
-                        counters.ok_count += 1;
-                        break;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                        counters.filtered_count += 1;
-                    }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                        counters.distinct_count += 1;
-                    }
-                    Err((transform_name, eval_err)) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            return Err(eval_err.into());
-                        }
-                        handle_error_no_writer(
-                            &record,
-                            pos as u64 + 1,
-                            &eval_err,
-                            Some(DlqEntry::stage_transform(&transform_name)),
-                            &mut counters,
-                            &mut dlq_entries,
-                        );
-                    }
-                }
+                all_records.push((record, row_num));
             }
+            (None, None, all_records)
+        };
 
-            collector.record(
-                scan_timer.finish(records_scanned, if first_emitted.is_some() { 1 } else { 0 }),
-            );
-
-            let final_output_schema = if let Some((ref rec, ref emitted, ref metadata)) =
-                first_emitted
-            {
-                let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
-                Arc::clone(projected.schema())
-            } else {
-                Arc::clone(output_schema_ref)
-            };
-
-            // Evaluate chunk helper (same as execute_two_pass)
-            // Returns accumulated transform eval duration for this chunk.
-            #[allow(clippy::type_complexity)]
-            let evaluate_chunk = |chunk: &mut Vec<(
-                u32,
-                Record,
-                Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-            )>,
-                                  evaluators: &mut Vec<ProgramEvaluator>|
-             -> std::time::Duration {
-                if use_parallel {
-                    pool.install(|| {
-                        chunk
-                            .par_iter_mut()
-                            .fold(
-                                stage_metrics::ChunkTimers::default,
-                                |mut timers, (pos, record, result)| {
-                                    let start = std::time::Instant::now();
-                                    let ctx = EvalContext {
-                                        stable: &stable,
-                                        source_file: &source_file_arc,
-                                        source_row: *pos as u64 + 1,
-                                    };
-                                    let mut local_evals = build_evaluators(transforms);
-                                    *result = Some(evaluate_record_with_window(
-                                        record,
-                                        &transform_names,
-                                        &mut local_evals,
-                                        &ctx,
-                                        plan,
-                                        &arena,
-                                        &indices,
-                                        *pos,
-                                    ));
-                                    timers.transform_eval += start.elapsed();
-                                    timers
-                                },
-                            )
-                            .reduce(stage_metrics::ChunkTimers::default, |a, b| a.merge(b))
-                            .transform_eval
-                    })
-                } else {
-                    let mut elapsed = std::time::Duration::ZERO;
-                    for (pos, record, result) in chunk.iter_mut() {
-                        let start = std::time::Instant::now();
-                        let ctx = EvalContext {
-                            stable: &stable,
-                            source_file: &source_file_arc,
-                            source_row: *pos as u64 + 1,
-                        };
-                        *result = Some(evaluate_record_with_window(
-                            record,
-                            &transform_names,
-                            evaluators,
-                            &ctx,
-                            plan,
-                            &arena,
-                            &indices,
-                            *pos,
-                        ));
-                        elapsed += start.elapsed();
-                    }
-                    elapsed
-                }
-            };
-
-            let mut chunk_start = first_emit_pos.map_or(record_count, |p| p + 1);
-            let first_emitted_was_some = first_emitted.is_some();
-
-            if is_multi_output {
-                let output_channels = spawn_writer_threads(
-                    writers,
-                    &output_configs,
-                    Arc::clone(&final_output_schema),
-                );
-
-                // Dispatch first emitted record
-                if let Some((record, emitted, metadata)) = first_emitted {
-                    let route = compiled_route.as_mut().unwrap();
-                    let ctx = EvalContext {
-                        stable: &stable,
-                        source_file: &source_file_arc,
-                        source_row: first_emit_pos.unwrap() as u64 + 1,
-                    };
-                    match route.evaluate(&emitted, &metadata, &ctx) {
-                        Ok(targets) => {
-                            let mut per_output_batches: HashMap<String, Vec<Record>> =
-                                HashMap::new();
-                            for target in &targets {
-                                let out_cfg = output_configs
-                                    .iter()
-                                    .find(|o| o.name == *target)
-                                    .unwrap_or(primary_output);
-                                let projected =
-                                    project_output_with_meta(&record, &emitted, &metadata, out_cfg);
-                                per_output_batches
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .push(projected);
-                            }
-                            flush_output_batches(&mut per_output_batches, &output_channels)?;
-                        }
-                        Err(route_err) => {
-                            if strategy == ErrorStrategy::FailFast {
-                                drop(output_channels);
-                                return Err(route_err.into());
-                            }
-                            counters.dlq_count += 1;
-                            counters.ok_count = counters.ok_count.saturating_sub(1);
-                            dlq_entries.push(DlqEntry {
-                                source_row: first_emit_pos.unwrap() as u64 + 1,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: route_err.to_string(),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_route_eval()),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
-                    }
-                }
-
-                // Process remaining records in chunks
-                let route = compiled_route.as_mut().unwrap();
-                let mut transform_dur = std::time::Duration::ZERO;
-                let mut projection_timer = stage_metrics::CumulativeTimer::new();
-                let mut route_timer = stage_metrics::CumulativeTimer::new();
-                let mut write_timer = stage_metrics::CumulativeTimer::new();
-                let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
-
-                while chunk_start < record_count {
-                    let chunk_end = (chunk_start + chunk_size).min(record_count);
-
-                    #[allow(clippy::type_complexity)]
-                    let mut chunk: Vec<(
-                        u32,
-                        Record,
-                        Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-                    )> = (chunk_start..chunk_end)
-                        .map(|pos| (pos, build_record_from_arena(pos), None))
-                        .collect();
-
-                    transform_dur += evaluate_chunk(&mut chunk, &mut evaluators);
-
-                    let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                    for (pos, record, result) in &chunk {
-                        let row_num = *pos as u64 + 1;
-                        counters.total_count += 1;
-                        match result.as_ref().unwrap() {
-                            Ok(EvalResult::Emit {
-                                fields: emitted,
-                                metadata,
-                            }) => {
-                                let ctx = EvalContext {
-                                    stable: &stable,
-                                    source_file: &source_file_arc,
-                                    source_row: row_num,
-                                };
-                                let route_result = {
-                                    let _guard = route_timer.guard();
-                                    route.evaluate(emitted, metadata, &ctx)
-                                };
-                                match route_result {
-                                    Ok(targets) => {
-                                        for target in &targets {
-                                            let out_cfg = output_configs
-                                                .iter()
-                                                .find(|o| o.name == *target)
-                                                .unwrap_or(primary_output);
-                                            let projected = {
-                                                let _guard = projection_timer.guard();
-                                                project_output_with_meta(
-                                                    record, emitted, metadata, out_cfg,
-                                                )
-                                            };
-                                            per_output_batches
-                                                .entry(target.clone())
-                                                .or_default()
-                                                .push(projected);
-                                        }
-                                        counters.ok_count += 1;
-                                        records_emitted += 1;
-                                    }
-                                    Err(route_err) => {
-                                        if strategy == ErrorStrategy::FailFast {
-                                            drop(output_channels);
-                                            return Err(route_err.into());
-                                        }
-                                        counters.dlq_count += 1;
-                                        dlq_entries.push(DlqEntry {
-                                            source_row: row_num,
-                                            category:
-                                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                            error_message: route_err.to_string(),
-                                            original_record: record.clone(),
-                                            stage: Some(DlqEntry::stage_route_eval()),
-                                            route: None,
-                                            trigger: true,
-                                        });
-                                    }
-                                }
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                counters.filtered_count += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                counters.distinct_count += 1;
-                            }
-                            Err((transform_name, eval_err)) => {
-                                if strategy == ErrorStrategy::FailFast {
-                                    drop(output_channels);
-                                    return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                        span: eval_err.span,
-                                        kind: eval_err.kind.clone(),
-                                    }));
-                                }
-                                counters.dlq_count += 1;
-                                dlq_entries.push(DlqEntry {
-                                    source_row: row_num,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: eval_err.to_string(),
-                                    original_record: record.clone(),
-                                    stage: Some(DlqEntry::stage_transform(transform_name)),
-                                    route: None,
-                                    trigger: true,
-                                });
-                            }
-                        }
-                    }
-                    {
-                        let _guard = write_timer.guard();
-                        flush_output_batches(&mut per_output_batches, &output_channels)?;
-                    }
-
-                    rss_budget.observe();
-                    chunk_start = chunk_end;
-                }
-
-                join_writer_threads(output_channels)?;
-
-                collector.record(stage_metrics::StageMetrics {
-                    name: stage_metrics::StageName::TransformEval,
-                    elapsed: transform_dur,
-                    records_in: record_count as u64,
-                    records_out: records_emitted,
-                    bytes_written: None,
-                    rss_after: None,
-                    cpu_user_delta_ns: None,
-                    cpu_sys_delta_ns: None,
-                    io_read_delta: None,
-                    io_write_delta: None,
-                    heap_delta_bytes: None,
-                    heap_alloc_count: None,
-                });
-                collector.record(projection_timer.finish(
-                    stage_metrics::StageName::Projection,
-                    records_emitted,
-                    records_emitted,
-                ));
-                collector.record(route_timer.finish(
-                    stage_metrics::StageName::RouteEval,
-                    records_emitted,
-                    records_emitted,
-                ));
-                collector.record(write_timer.finish(
-                    stage_metrics::StageName::Write,
-                    records_emitted,
-                    records_emitted,
-                ));
-            } else {
-                // Single-output path
-                let output = primary_output;
-                let raw_writer = writers
-                    .into_iter()
-                    .next()
-                    .map(|(_, w)| w)
-                    .expect("validated above");
-                let mut csv_writer =
-                    build_format_writer(output, raw_writer, Arc::clone(&final_output_schema))?;
-
-                // Write first emitted record
-                if let Some((record, emitted, metadata)) = first_emitted {
-                    let projected = project_output_with_meta(&record, &emitted, &metadata, output);
-                    csv_writer.write_record(&projected)?;
-                }
-
-                let mut transform_dur = std::time::Duration::ZERO;
-                let mut projection_timer = stage_metrics::CumulativeTimer::new();
-                let mut write_timer = stage_metrics::CumulativeTimer::new();
-                let mut records_emitted: u64 = if first_emitted_was_some { 1 } else { 0 };
-
-                while chunk_start < record_count {
-                    let chunk_end = (chunk_start + chunk_size).min(record_count);
-
-                    #[allow(clippy::type_complexity)]
-                    let mut chunk: Vec<(
-                        u32,
-                        Record,
-                        Option<Result<EvalResult, (String, cxl::eval::EvalError)>>,
-                    )> = (chunk_start..chunk_end)
-                        .map(|pos| (pos, build_record_from_arena(pos), None))
-                        .collect();
-
-                    transform_dur += evaluate_chunk(&mut chunk, &mut evaluators);
-
-                    for (pos, record, result) in &chunk {
-                        let row_num = *pos as u64 + 1;
-                        counters.total_count += 1;
-                        match result.as_ref().unwrap() {
-                            Ok(EvalResult::Emit {
-                                fields: emitted, ..
-                            }) => {
-                                let projected = {
-                                    let _guard = projection_timer.guard();
-                                    project_output(record, emitted, output)
-                                };
-                                {
-                                    let _guard = write_timer.guard();
-                                    csv_writer.write_record(&projected)?;
-                                }
-                                counters.ok_count += 1;
-                                records_emitted += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                counters.filtered_count += 1;
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                counters.distinct_count += 1;
-                            }
-                            Err((transform_name, eval_err)) => {
-                                handle_error(
-                                    strategy,
-                                    record,
-                                    row_num,
-                                    eval_err,
-                                    Some(DlqEntry::stage_transform(transform_name)),
-                                    None,
-                                    &mut counters,
-                                    &mut dlq_entries,
-                                    output,
-                                    &final_output_schema,
-                                    &mut *csv_writer,
-                                )?;
-                            }
-                        }
-                    }
-
-                    rss_budget.observe();
-                    chunk_start = chunk_end;
-                }
-
-                csv_writer.flush()?;
-
-                collector.record(stage_metrics::StageMetrics {
-                    name: stage_metrics::StageName::TransformEval,
-                    elapsed: transform_dur,
-                    records_in: record_count as u64,
-                    records_out: records_emitted,
-                    bytes_written: None,
-                    rss_after: None,
-                    cpu_user_delta_ns: None,
-                    cpu_sys_delta_ns: None,
-                    io_read_delta: None,
-                    io_write_delta: None,
-                    heap_delta_bytes: None,
-                    heap_alloc_count: None,
-                });
-                collector.record(projection_timer.finish(
-                    stage_metrics::StageName::Projection,
-                    records_emitted,
-                    records_emitted,
-                ));
-                let mut write_metrics = write_timer.finish(
-                    stage_metrics::StageName::Write,
-                    records_emitted,
-                    records_emitted,
-                );
-                write_metrics.bytes_written = csv_writer.bytes_written();
-                collector.record(write_metrics);
-            }
-
-            return Ok((counters, dlq_entries, rss_budget.peak_rss));
+        if plan.required_arena() {
+            counters.total_count = all_records.len() as u64;
         }
 
-        // ── Non-arena path: read all records, optionally sort ──
-
-        let schema = format_reader.schema()?;
-        let mut all_records: Vec<(Record, u64)> = Vec::new();
-        let mut row_num: u64 = 0;
-        while let Some(record) = format_reader.next_record()? {
-            row_num += 1;
-            counters.total_count += 1;
-            all_records.push((record, row_num));
-        }
-
-        // D12: a global-fold aggregate (group_by: []) must still emit one
-        // row over empty input, so we cannot early-return when the plan
-        // contains an Aggregation node — the DAG walk needs to fire the
-        // aggregator's empty-input special case.
-        if all_records.is_empty() && !plan.has_branching() {
-            return Ok((counters, dlq_entries, rss_bytes()));
-        }
-
-        // ── Branching DAG walk path ──
-        // When the DAG has Route/Merge nodes, use per-node evaluation
-        // instead of the sequential transform chain.
-        if plan.has_branching() {
-            return Self::execute_dag_branching(
+        // Option W Shortcut #2: correlation-key atomic failure-domain
+        // batching. When `error_handling.correlation_key` is set, group
+        // source records by the key and invoke the walker PER GROUP
+        // with a Captured output sink. If any record in a group
+        // produces a DLQ entry, demote ALL captured records in that
+        // group to collateral DLQ (`trigger: false`); otherwise flush
+        // the captured records through the real writer.
+        //
+        // Combined with window/arena operations this combination is
+        // rejected at plan time (see `plan/execution.rs` E150
+        // diagnostic) — per-group Arena construction is documented
+        // follow-up work.
+        if let Some(corr_key) = config.error_handling.correlation_key.clone() {
+            return Self::execute_dag_with_correlation(
                 config,
                 all_records,
                 writers,
@@ -1718,943 +883,267 @@ impl PipelineExecutor {
                 compiled_route,
                 plan,
                 params,
-                &mut counters,
-                &mut dlq_entries,
+                counters,
+                dlq_entries,
                 collector,
                 &lookup_tables,
+                bound_output_schemas,
+                bound_output_layouts,
+                arena_opt.as_deref(),
+                indices_opt.as_deref(),
+                &corr_key,
             );
         }
 
-        // Legacy non-arena sort block deleted by Task 16.0.5.8.
-        // Sorts now flow through the planner-synthesized `PlanNode::Sort`
-        // enforcer node, dispatched in the DAG topo walk via
-        // `SortBuffer<P>` (Pattern B; see
-        // docs/research/RESEARCH-sort-node-sidecar-payload.md).
+        Self::execute_dag_branching(
+            config,
+            all_records,
+            OutputSink::Streamed(writers),
+            transforms,
+            compiled_route.as_mut(),
+            plan,
+            params,
+            &mut counters,
+            &mut dlq_entries,
+            collector,
+            &lookup_tables,
+            bound_output_schemas,
+            bound_output_layouts,
+            arena_opt.as_deref(),
+            indices_opt.as_deref(),
+        )
+    }
 
-        // Phase 3: Schema derivation (scan for first emitting record)
-        let mut evaluators = build_evaluators(transforms);
-        let transform_names: Vec<&str> = transforms.iter().map(|t| t.name.as_str()).collect();
+    /// Per-group correlation-key execution driver. See
+    /// [`execute_dag`]'s comment at the branch for semantics. Produces
+    /// the same `(PipelineCounters, Vec<DlqEntry>, Option<u64>)` tuple
+    /// as the non-correlated path, with group-demotion accounting
+    /// folded into the counters and DLQ entries.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_dag_with_correlation(
+        config: &PipelineConfig,
+        all_records: Vec<(Record, u64)>,
+        mut writers: HashMap<String, Box<dyn Write + Send>>,
+        transforms: &[CompiledTransform],
+        mut compiled_route: Option<CompiledRoute>,
+        plan: &ExecutionPlanDag,
+        params: &PipelineRunParams,
+        mut counters: PipelineCounters,
+        mut dlq_entries: Vec<DlqEntry>,
+        collector: &mut stage_metrics::StageCollector,
+        lookup_tables: &HashMap<String, RuntimeLookup>,
+        bound_output_schemas: &HashMap<String, Arc<Schema>>,
+        bound_output_layouts: &HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
+        arena: Option<&Arena>,
+        indices: Option<&[SecondaryIndex]>,
+        correlation_key: &crate::config::CorrelationKey,
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        let max_buffer = config.error_handling.max_group_buffer.unwrap_or(100_000);
 
-        let mut first_emitted_schema: Option<Arc<Schema>> = None;
-        if requires_sorted_input {
-            // For sorted path, scan once for schema then recreate evaluators
-            let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
-            let mut records_scanned: u64 = 0;
-            for (record, rn) in &all_records {
-                records_scanned += 1;
-                let ctx = EvalContext {
-                    stable: &stable,
-                    source_file: &source_file_arc,
-                    source_row: *rn,
-                };
-                if let Ok(EvalResult::Emit {
-                    fields: emitted, ..
-                }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
-                {
-                    let projected = project_output(record, &emitted, primary_output);
-                    first_emitted_schema = Some(Arc::clone(projected.schema()));
-                    break;
-                }
+        // Phase 1: group records by correlation key with sticky
+        // overflow flag. `IndexMap` preserves first-seen insertion
+        // order so group flushing is deterministic.
+        struct GroupState {
+            records: Vec<(Record, u64)>,
+            /// Sticky: once true, the group is pre-failed (overflow).
+            /// All further records of this group append to `records`
+            /// for DLQ accounting but never reach the walker.
+            failed: bool,
+        }
+        let mut groups: IndexMap<Vec<GroupByKey>, GroupState> = IndexMap::new();
+        for (record, rn) in all_records {
+            let key = extract_correlation_key(&record, correlation_key);
+            let state = groups.entry(key).or_insert_with(|| GroupState {
+                records: Vec::new(),
+                failed: false,
+            });
+            if !state.failed && state.records.len() as u64 >= max_buffer {
+                state.failed = true;
             }
-            collector.record(scan_timer.finish(
-                records_scanned,
-                if first_emitted_schema.is_some() { 1 } else { 0 },
-            ));
-            evaluators = build_evaluators(transforms);
+            state.records.push((record, rn));
         }
 
-        if requires_sorted_input {
-            // ── Correlated streaming path ──
-            let correlation_key = config
-                .error_handling
-                .correlation_key
-                .as_ref()
-                .expect("SortedStreaming requires correlation_key");
-            let max_group_buffer = config.error_handling.max_group_buffer.unwrap_or(100_000);
+        // Accumulator for captured records from successful groups.
+        // Flushed once after all groups are processed to ensure a
+        // single FormatWriter per output across all successful groups
+        // (writers are owned; `writers.remove` only succeeds once).
+        let mut successful_captures: HashMap<String, Vec<CapturedRow>> = HashMap::new();
 
-            let output_schema = first_emitted_schema.unwrap_or(schema);
-
-            if is_multi_output {
-                let output_channels =
-                    spawn_writer_threads(writers, &output_configs, Arc::clone(&output_schema));
-
-                let mut group_buffer: Vec<(Record, u64)> = Vec::new();
-                let mut current_key: Option<Vec<GroupByKey>> = None;
-                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                let mut transform_timer = stage_metrics::CumulativeTimer::new();
-                let mut projection_timer = stage_metrics::CumulativeTimer::new();
-                let mut route_timer = stage_metrics::CumulativeTimer::new();
-                let mut write_timer = stage_metrics::CumulativeTimer::new();
-                let mut group_flush_timer = stage_metrics::CumulativeTimer::new();
-                let total_records = all_records.len() as u64;
-                let mut records_emitted: u64 = 0;
-                let mut group_flush_records_in: u64 = 0;
-                let mut group_flush_records_out: u64 = 0;
-
-                for (record, rn) in all_records {
-                    let key = extract_correlation_key(&record, correlation_key);
-                    let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
-
-                    if is_null_key {
-                        let ctx = EvalContext {
-                            stable: &stable,
-                            source_file: &source_file_arc,
-                            source_row: rn,
-                        };
-                        let results = {
-                            let _guard = transform_timer.guard();
-                            evaluate_record_with_lookups(
-                                &record,
-                                &transform_names,
-                                &mut evaluators,
-                                &ctx,
-                                &lookup_tables,
-                            )
-                        };
-                        match results {
-                            Ok(eval_results) => {
-                                for eval_result in eval_results {
-                                    match eval_result {
-                                        EvalResult::Emit {
-                                            fields: emitted,
-                                            metadata,
-                                        } => {
-                                            {
-                                                let _guard = route_timer.guard();
-                                                let _guard2 = projection_timer.guard();
-                                                Self::dispatch_to_outputs(
-                                                    &record,
-                                                    &emitted,
-                                                    &metadata,
-                                                    config,
-                                                    &output_configs,
-                                                    primary_output,
-                                                    compiled_route.as_mut(),
-                                                    &ctx,
-                                                    &mut counters,
-                                                    &mut dlq_entries,
-                                                    &mut per_output_batches,
-                                                    strategy,
-                                                    rn,
-                                                );
-                                            }
-                                            records_emitted += 1;
-                                        }
-                                        EvalResult::Skip(SkipReason::Filtered) => {
-                                            counters.filtered_count += 1;
-                                        }
-                                        EvalResult::Skip(SkipReason::Duplicate) => {
-                                            counters.distinct_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            Err((transform_name, eval_err)) => {
-                                if strategy == ErrorStrategy::FailFast {
-                                    drop(output_channels);
-                                    return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                        span: eval_err.span,
-                                        kind: eval_err.kind.clone(),
-                                    }));
-                                }
-                                counters.dlq_count += 1;
-                                dlq_entries.push(DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: eval_err.to_string(),
-                                    original_record: record,
-                                    stage: Some(DlqEntry::stage_transform(&transform_name)),
-                                    route: None,
-                                    trigger: true,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-
-                    if current_key.as_ref() != Some(&key) {
-                        {
-                            let _guard = group_flush_timer.guard();
-                            group_flush_records_in += group_buffer.len() as u64;
-                            let before = counters.ok_count;
-                            Self::flush_correlated_group(
-                                &mut group_buffer,
-                                config,
-                                &output_configs,
-                                primary_output,
-                                input,
-                                pipeline_start_time,
-                                &stable,
-                                &transform_names,
-                                &mut evaluators,
-                                compiled_route.as_mut(),
-                                params,
-                                strategy,
-                                &mut counters,
-                                &mut dlq_entries,
-                                &mut per_output_batches,
-                                max_group_buffer,
-                            );
-                            group_flush_records_out += counters.ok_count - before;
-                        }
-                        current_key = Some(key);
-                    }
-
-                    if group_buffer.len() as u64 >= max_group_buffer {
-                        group_buffer.push((record, rn));
-                        for (rec, rec_rn) in group_buffer.drain(..) {
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rec_rn,
-                                category: crate::dlq::DlqErrorCategory::ValidationFailure,
-                                error_message:
-                                    "group_size_exceeded: correlation group exceeded max_group_buffer"
-                                        .to_string(),
-                                original_record: rec,
-                                stage: Some("transform:correlated_dlq".to_string()),
-                                route: None,
-                                trigger: false,
-                            });
-                        }
-                        current_key = None;
-                        continue;
-                    }
-
-                    group_buffer.push((record, rn));
-                }
-
-                // Flush final group
-                {
-                    let _guard = group_flush_timer.guard();
-                    group_flush_records_in += group_buffer.len() as u64;
-                    let before = counters.ok_count;
-                    Self::flush_correlated_group(
-                        &mut group_buffer,
-                        config,
-                        &output_configs,
-                        primary_output,
-                        input,
-                        pipeline_start_time,
-                        &stable,
-                        &transform_names,
-                        &mut evaluators,
-                        compiled_route.as_mut(),
-                        params,
-                        strategy,
-                        &mut counters,
-                        &mut dlq_entries,
-                        &mut per_output_batches,
-                        max_group_buffer,
-                    );
-                    group_flush_records_out += counters.ok_count - before;
-                }
-
-                {
-                    let _guard = write_timer.guard();
-                    flush_output_batches(&mut per_output_batches, &output_channels)?;
-                }
-                drop(output_channels);
-
-                collector.record(transform_timer.finish(
-                    stage_metrics::StageName::TransformEval,
-                    total_records,
-                    records_emitted,
-                ));
-                collector.record(projection_timer.finish(
-                    stage_metrics::StageName::Projection,
-                    records_emitted,
-                    records_emitted,
-                ));
-                collector.record(route_timer.finish(
-                    stage_metrics::StageName::RouteEval,
-                    records_emitted,
-                    records_emitted,
-                ));
-                collector.record(write_timer.finish(
-                    stage_metrics::StageName::Write,
-                    records_emitted,
-                    records_emitted,
-                ));
-                collector.record(group_flush_timer.finish(
-                    stage_metrics::StageName::GroupFlush,
-                    group_flush_records_in,
-                    group_flush_records_out,
-                ));
-            } else {
-                // Single-output correlated path
-                let raw_writer = writers
-                    .into_iter()
-                    .next()
-                    .map(|(_, w)| w)
-                    .expect("at least one writer");
-
-                let mut csv_writer =
-                    build_format_writer(primary_output, raw_writer, Arc::clone(&output_schema))?;
-
-                let mut group_buffer: Vec<(Record, u64)> = Vec::new();
-                let mut current_key: Option<Vec<GroupByKey>> = None;
-                let mut transform_timer = stage_metrics::CumulativeTimer::new();
-                let mut projection_timer = stage_metrics::CumulativeTimer::new();
-                let mut write_timer = stage_metrics::CumulativeTimer::new();
-                let mut group_flush_timer = stage_metrics::CumulativeTimer::new();
-                let total_records = all_records.len() as u64;
-                let mut records_emitted: u64 = 0;
-                let mut group_flush_records_in: u64 = 0;
-                let mut group_flush_records_out: u64 = 0;
-
-                for (record, rn) in all_records {
-                    let key = extract_correlation_key(&record, correlation_key);
-                    let is_null_key = key.iter().all(|k| matches!(k, GroupByKey::Null));
-
-                    if is_null_key {
-                        let ctx = EvalContext {
-                            stable: &stable,
-                            source_file: &source_file_arc,
-                            source_row: rn,
-                        };
-                        let results = {
-                            let _guard = transform_timer.guard();
-                            evaluate_record_with_lookups(
-                                &record,
-                                &transform_names,
-                                &mut evaluators,
-                                &ctx,
-                                &lookup_tables,
-                            )
-                        };
-                        match results {
-                            Ok(eval_results) => {
-                                for eval_result in eval_results {
-                                    match eval_result {
-                                        EvalResult::Emit {
-                                            fields: emitted, ..
-                                        } => {
-                                            let projected = {
-                                                let _guard = projection_timer.guard();
-                                                project_output(&record, &emitted, primary_output)
-                                            };
-                                            {
-                                                let _guard = write_timer.guard();
-                                                csv_writer.write_record(&projected)?;
-                                            }
-                                            counters.ok_count += 1;
-                                            records_emitted += 1;
-                                        }
-                                        EvalResult::Skip(SkipReason::Filtered) => {
-                                            counters.filtered_count += 1;
-                                        }
-                                        EvalResult::Skip(SkipReason::Duplicate) => {
-                                            counters.distinct_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            Err((transform_name, eval_err)) => {
-                                if strategy == ErrorStrategy::FailFast {
-                                    return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                        span: eval_err.span,
-                                        kind: eval_err.kind.clone(),
-                                    }));
-                                }
-                                counters.dlq_count += 1;
-                                dlq_entries.push(DlqEntry {
-                                    source_row: rn,
-                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                    error_message: eval_err.to_string(),
-                                    original_record: record,
-                                    stage: Some(DlqEntry::stage_transform(&transform_name)),
-                                    route: None,
-                                    trigger: true,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-
-                    if current_key.as_ref() != Some(&key) {
-                        {
-                            let _guard = group_flush_timer.guard();
-                            group_flush_records_in += group_buffer.len() as u64;
-                            let before = counters.ok_count;
-                            Self::flush_correlated_group_single_output(
-                                &mut group_buffer,
-                                config,
-                                primary_output,
-                                input,
-                                pipeline_start_time,
-                                &stable,
-                                &transform_names,
-                                &mut evaluators,
-                                params,
-                                strategy,
-                                &mut counters,
-                                &mut dlq_entries,
-                                &mut *csv_writer,
-                                max_group_buffer,
-                            )?;
-                            group_flush_records_out += counters.ok_count - before;
-                        }
-                        current_key = Some(key);
-                    }
-
-                    if group_buffer.len() as u64 >= max_group_buffer {
-                        group_buffer.push((record, rn));
-                        for (rec, rec_rn) in group_buffer.drain(..) {
-                            counters.dlq_count += 1;
-                            dlq_entries.push(DlqEntry {
-                                source_row: rec_rn,
-                                category: crate::dlq::DlqErrorCategory::ValidationFailure,
-                                error_message:
-                                    "group_size_exceeded: correlation group exceeded max_group_buffer"
-                                        .to_string(),
-                                original_record: rec,
-                                stage: Some("transform:correlated_dlq".to_string()),
-                                route: None,
-                                trigger: false,
-                            });
-                        }
-                        current_key = None;
-                        continue;
-                    }
-
-                    group_buffer.push((record, rn));
-                }
-
-                {
-                    let _guard = group_flush_timer.guard();
-                    group_flush_records_in += group_buffer.len() as u64;
-                    let before = counters.ok_count;
-                    Self::flush_correlated_group_single_output(
-                        &mut group_buffer,
-                        config,
-                        primary_output,
-                        input,
-                        pipeline_start_time,
-                        &stable,
-                        &transform_names,
-                        &mut evaluators,
-                        params,
-                        strategy,
-                        &mut counters,
-                        &mut dlq_entries,
-                        &mut *csv_writer,
-                        max_group_buffer,
-                    )?;
-                    group_flush_records_out += counters.ok_count - before;
-                }
-
-                csv_writer.flush()?;
-
-                collector.record(transform_timer.finish(
-                    stage_metrics::StageName::TransformEval,
-                    total_records,
-                    records_emitted,
-                ));
-                collector.record(projection_timer.finish(
-                    stage_metrics::StageName::Projection,
-                    records_emitted,
-                    records_emitted,
-                ));
-                let mut write_metrics = write_timer.finish(
-                    stage_metrics::StageName::Write,
-                    records_emitted,
-                    records_emitted,
+        // Phase 2: per-group walker invocation with deferred output.
+        for (key, state) in groups {
+            if state.failed {
+                // Overflow: synthesise a `GroupSizeExceeded` root-cause
+                // DLQ entry (trigger: true) tied to the last appended
+                // record, plus collateral entries for every record in
+                // the group. The walker is NOT invoked for overflowing
+                // groups.
+                let key_fmt = format_group_key(&key);
+                let count = state.records.len() as u64;
+                let overflow_msg = format!(
+                    "correlation-key group {key_fmt:?} exceeded \
+                     max_group_buffer={max_buffer} after {count} records"
                 );
-                write_metrics.bytes_written = csv_writer.bytes_written();
-                collector.record(write_metrics);
-                collector.record(group_flush_timer.finish(
-                    stage_metrics::StageName::GroupFlush,
-                    group_flush_records_in,
-                    group_flush_records_out,
-                ));
+                // Root cause: the offending (last-appended) record.
+                if let Some((trigger_rec, trigger_rn)) = state.records.last().cloned() {
+                    dlq_entries.push(DlqEntry {
+                        source_row: trigger_rn,
+                        category: crate::dlq::DlqErrorCategory::GroupSizeExceeded,
+                        error_message: overflow_msg.clone(),
+                        original_record: trigger_rec,
+                        stage: Some("correlation_group_overflow".to_string()),
+                        route: None,
+                        trigger: true,
+                    });
+                }
+                // Collaterals: every OTHER record in the group.
+                let last_idx = state.records.len().saturating_sub(1);
+                for (idx, (rec, rn)) in state.records.into_iter().enumerate() {
+                    if idx == last_idx {
+                        continue;
+                    }
+                    dlq_entries.push(DlqEntry {
+                        source_row: rn,
+                        category: crate::dlq::DlqErrorCategory::Correlated,
+                        error_message: format!("correlated with failure in group: {overflow_msg}"),
+                        original_record: rec,
+                        stage: Some("correlation_group_overflow".to_string()),
+                        route: None,
+                        trigger: false,
+                    });
+                }
+                counters.dlq_count += count;
+                continue;
             }
 
-            return Ok((counters, dlq_entries, rss_bytes()));
+            // Non-overflowing group: invoke walker with Captured sink.
+            //
+            // Note: `execute_dag_branching` uses `std::mem::take` on the
+            // counters/dlq &mut params at the end, packaging them into
+            // its return tuple. So we must read from the return tuple,
+            // NOT from the `group_counters`/`group_dlq` bindings we
+            // pass in (which will be reset to default post-call).
+            let mut group_capture: HashMap<String, Vec<CapturedRow>> = HashMap::new();
+            let mut counters_slot = PipelineCounters::default();
+            let mut dlq_slot: Vec<DlqEntry> = Vec::new();
+            let (group_counters, mut group_dlq, _group_rss) = Self::execute_dag_branching(
+                config,
+                state.records,
+                OutputSink::Captured(&mut group_capture),
+                transforms,
+                compiled_route.as_mut(),
+                plan,
+                params,
+                &mut counters_slot,
+                &mut dlq_slot,
+                collector,
+                lookup_tables,
+                bound_output_schemas,
+                bound_output_layouts,
+                arena,
+                indices,
+            )?;
+
+            if group_dlq.is_empty() {
+                // Group succeeded: accumulate captured records for
+                // post-loop flush. We defer the actual writer build +
+                // write until ALL groups are processed so multiple
+                // successful groups can share a single FormatWriter
+                // per output (writers are owned once; `writers.remove`
+                // can only succeed once per output name).
+                for (out_name, rows) in group_capture {
+                    successful_captures
+                        .entry(out_name)
+                        .or_default()
+                        .extend(rows);
+                }
+                counters.ok_count += group_counters.ok_count;
+                counters.filtered_count += group_counters.filtered_count;
+                counters.distinct_count += group_counters.distinct_count;
+            } else {
+                // Group failed: demote every captured OK record to
+                // collateral DLQ (trigger: false) with the first
+                // root-cause's message. Root-cause DLQ entries already
+                // carry trigger: true from the walker.
+                let root_msg = group_dlq
+                    .first()
+                    .map(|e| e.error_message.clone())
+                    .unwrap_or_else(|| "group failed".to_string());
+                let mut collateral_count: u64 = 0;
+                for (out_name, rows) in group_capture {
+                    for row in rows {
+                        dlq_entries.push(DlqEntry {
+                            source_row: row.row_num,
+                            category: crate::dlq::DlqErrorCategory::Correlated,
+                            error_message: format!("correlated with failure in group: {root_msg}"),
+                            original_record: row.record,
+                            stage: Some(format!("output:{out_name}")),
+                            route: None,
+                            trigger: false,
+                        });
+                        collateral_count += 1;
+                    }
+                }
+                // Accept the walker's DLQ entries verbatim (they have
+                // trigger: true / real categories already).
+                dlq_entries.append(&mut group_dlq);
+                counters.dlq_count += group_counters.dlq_count + collateral_count;
+                counters.filtered_count += group_counters.filtered_count;
+                counters.distinct_count += group_counters.distinct_count;
+            }
         }
 
-        // ── Streaming path: read all records already done, now evaluate ──
-
-        // Schema derivation: scan forward until a record emits
-        let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
-        let mut records_scanned: u64 = 0;
-        // First emitted result (for schema detection) plus any additional
-        // fan-out results from the same record that need dispatching later.
-        #[allow(clippy::type_complexity)]
-        let mut first_emitted: Option<(
-            Record,
-            IndexMap<String, Value>,
-            IndexMap<String, Value>,
-        )> = None;
-        // Extra fan-out results from the first emitting record (beyond the
-        // first Emit used for schema detection).
-        #[allow(clippy::type_complexity)]
-        let mut first_record_extra_emits: Vec<(
-            IndexMap<String, Value>,
-            IndexMap<String, Value>,
-        )> = Vec::new();
-        #[allow(clippy::type_complexity)]
-        let mut pending_skips_and_errors: Vec<(
-            u64,
-            Record,
-            Result<Vec<EvalResult>, (String, cxl::eval::EvalError)>,
-        )> = Vec::new();
-        let mut scan_idx = 0;
-
-        for (record, rn) in &all_records {
-            scan_idx += 1;
-            records_scanned += 1;
-            let ctx = EvalContext {
-                stable: &stable,
-                source_file: &source_file_arc,
-                source_row: *rn,
+        // Phase 3: flush accumulated successful-group captures to real
+        // writers. One FormatWriter per output spans all successful
+        // groups; records preserve source-row order within each group
+        // and are emitted in group-insertion (IndexMap) order across
+        // groups.
+        for (out_name, rows) in successful_captures {
+            if rows.is_empty() {
+                continue;
+            }
+            let out_cfg = config
+                .output_configs()
+                .find(|o| o.name == out_name)
+                .cloned()
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "correlation_group_flush",
+                    node: out_name.clone(),
+                    detail: "Output node not in config".to_string(),
+                })?;
+            // The Output node's projection layout = its single
+            // predecessor's entry in `plan.output_layouts`. Planner
+            // populated the map for every top-level + synthesized
+            // passthrough node at compile time; a direct lookup is
+            // authoritative. No on-demand graph walk needed.
+            let layout = plan
+                .graph
+                .node_indices()
+                .find(|&i| plan.graph[i].name() == out_name)
+                .and_then(|idx| {
+                    plan.graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .find_map(|p| bound_output_layouts.get(plan.graph[p].name()).cloned())
+                });
+            let Some(layout) = layout else {
+                // Edge case (direct Source → Output with no wired
+                // predecessor): write nothing, mirroring Streamed-mode.
+                continue;
             };
-            let result = evaluate_record_with_lookups(
-                record,
-                &transform_names,
-                &mut evaluators,
-                &ctx,
-                &lookup_tables,
-            );
-            match &result {
-                Ok(eval_results) => {
-                    let mut found_first = false;
-                    for eval_result in eval_results {
-                        if let EvalResult::Emit {
-                            fields: emitted,
-                            metadata,
-                        } = eval_result
-                        {
-                            if !found_first {
-                                counters.ok_count += 1;
-                                first_emitted =
-                                    Some((record.clone(), emitted.clone(), metadata.clone()));
-                                found_first = true;
-                            } else {
-                                counters.ok_count += 1;
-                                first_record_extra_emits.push((emitted.clone(), metadata.clone()));
-                            }
-                        }
-                        // Skip counting is deferred to pending_skips_and_errors processing
-                    }
-                    if found_first {
-                        break;
-                    }
-                    // All results are Skips — defer (counters updated in pending processing)
-                    pending_skips_and_errors.push((*rn, record.clone(), result));
-                }
-                Err(_) => {
-                    pending_skips_and_errors.push((*rn, record.clone(), result));
-                }
-            }
-        }
-
-        collector.record(
-            scan_timer.finish(records_scanned, if first_emitted.is_some() { 1 } else { 0 }),
-        );
-
-        let output_schema = if let Some((ref rec, ref emitted, ref metadata)) = first_emitted {
-            let projected = project_output_with_meta(rec, emitted, metadata, primary_output);
-            Arc::clone(projected.schema())
-        } else {
-            schema
-        };
-
-        if is_multi_output {
-            // Multi-output streaming path
-            let output_channels =
-                spawn_writer_threads(writers, &output_configs, Arc::clone(&output_schema));
-
-            // Process pending skips/errors
-            for (_rn, _record, result) in &pending_skips_and_errors {
-                match result {
-                    Ok(eval_results) => {
-                        for eval_result in eval_results {
-                            match eval_result {
-                                EvalResult::Skip(SkipReason::Filtered) => {
-                                    counters.filtered_count += 1;
-                                }
-                                EvalResult::Skip(SkipReason::Duplicate) => {
-                                    counters.distinct_count += 1;
-                                }
-                                EvalResult::Emit { .. } => {} // emits handled in scan
-                            }
-                        }
-                    }
-                    Err((transform_name, eval_err)) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            drop(output_channels);
-                            return Err(PipelineError::Eval(cxl::eval::EvalError {
-                                span: eval_err.span,
-                                kind: eval_err.kind.clone(),
-                            }));
-                        }
-                        counters.dlq_count += 1;
-                        dlq_entries.push(DlqEntry {
-                            source_row: _rn.to_owned(),
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: eval_err.to_string(),
-                            original_record: _record.clone(),
-                            stage: Some(DlqEntry::stage_transform(transform_name)),
-                            route: None,
-                            trigger: true,
-                        });
-                    }
-                }
-            }
-
-            // Dispatch first emitted record + extra fan-out results
-            let first_emitted_was_some = first_emitted.is_some();
-            if let Some((ref record, ref emitted, ref metadata)) = first_emitted {
-                let route = compiled_route.as_mut().unwrap();
-                let ctx = EvalContext {
-                    stable: &stable,
-                    source_file: &source_file_arc,
-                    source_row: 1,
-                };
-                // Dispatch first result + all extra fan-out results
-                #[allow(clippy::type_complexity)]
-                let all_emits: Vec<(
-                    &IndexMap<String, Value>,
-                    &IndexMap<String, Value>,
-                )> = std::iter::once((emitted, metadata))
-                    .chain(first_record_extra_emits.iter().map(|(e, m)| (e, m)))
-                    .collect();
-                let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                for (emit, meta) in all_emits {
-                    match route.evaluate(emit, meta, &ctx) {
-                        Ok(targets) => {
-                            for target in &targets {
-                                let out_cfg = output_configs
-                                    .iter()
-                                    .find(|o| o.name == *target)
-                                    .unwrap_or(primary_output);
-                                let projected =
-                                    project_output_with_meta(record, emit, meta, out_cfg);
-                                per_output_batches
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .push(projected);
-                            }
-                        }
-                        Err(route_err) => {
-                            if strategy == ErrorStrategy::FailFast {
-                                drop(output_channels);
-                                return Err(route_err.into());
-                            }
-                            counters.dlq_count += 1;
-                            counters.ok_count = counters.ok_count.saturating_sub(1);
-                            dlq_entries.push(DlqEntry {
-                                source_row: 1,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: route_err.to_string(),
-                                original_record: record.clone(),
-                                stage: Some(DlqEntry::stage_route_eval()),
-                                route: None,
-                                trigger: true,
-                            });
-                        }
-                    }
-                }
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
-            }
-
-            // Process remaining records
-            let route = compiled_route.as_mut().unwrap();
-            let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-            let mut transform_timer = stage_metrics::CumulativeTimer::new();
-            let mut projection_timer = stage_metrics::CumulativeTimer::new();
-            let mut route_timer = stage_metrics::CumulativeTimer::new();
-            let mut write_timer = stage_metrics::CumulativeTimer::new();
-            let mut records_emitted: u64 = if first_emitted_was_some {
-                1 + first_record_extra_emits.len() as u64
-            } else {
-                0
+            let Some(raw_writer) = writers.remove(&out_name) else {
+                continue;
             };
-            let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
-
-            for (record, rn) in all_records.into_iter().skip(scan_idx) {
-                let ctx = EvalContext {
-                    stable: &stable,
-                    source_file: &source_file_arc,
-                    source_row: rn,
-                };
-                let results = {
-                    let _guard = transform_timer.guard();
-                    evaluate_record_with_lookups(
-                        &record,
-                        &transform_names,
-                        &mut evaluators,
-                        &ctx,
-                        &lookup_tables,
-                    )
-                };
-                match results {
-                    Ok(eval_results) => {
-                        for eval_result in eval_results {
-                            match eval_result {
-                                EvalResult::Emit {
-                                    fields: emitted,
-                                    metadata,
-                                } => {
-                                    let route_result = {
-                                        let _guard = route_timer.guard();
-                                        route.evaluate(&emitted, &metadata, &ctx)
-                                    };
-                                    match route_result {
-                                        Ok(targets) => {
-                                            for target in &targets {
-                                                let out_cfg = output_configs
-                                                    .iter()
-                                                    .find(|o| o.name == *target)
-                                                    .unwrap_or(primary_output);
-                                                let projected = {
-                                                    let _guard = projection_timer.guard();
-                                                    project_output_with_meta(
-                                                        &record, &emitted, &metadata, out_cfg,
-                                                    )
-                                                };
-                                                per_output_batches
-                                                    .entry(target.clone())
-                                                    .or_default()
-                                                    .push(projected);
-                                            }
-                                            counters.ok_count += 1;
-                                            records_emitted += 1;
-                                        }
-                                        Err(route_err) => {
-                                            if strategy == ErrorStrategy::FailFast {
-                                                drop(output_channels);
-                                                return Err(route_err.into());
-                                            }
-                                            counters.dlq_count += 1;
-                                            dlq_entries.push(DlqEntry {
-                                                source_row: rn,
-                                                category:
-                                                    crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                                error_message: route_err.to_string(),
-                                                original_record: record.clone(),
-                                                stage: Some(DlqEntry::stage_route_eval()),
-                                                route: None,
-                                                trigger: true,
-                                            });
-                                        }
-                                    }
-                                }
-                                EvalResult::Skip(SkipReason::Filtered) => {
-                                    counters.filtered_count += 1;
-                                }
-                                EvalResult::Skip(SkipReason::Duplicate) => {
-                                    counters.distinct_count += 1;
-                                }
-                            }
-                        }
-                    }
-                    Err((transform_name, eval_err)) => {
-                        if strategy == ErrorStrategy::FailFast {
-                            drop(output_channels);
-                            return Err(eval_err.into());
-                        }
-                        counters.dlq_count += 1;
-                        dlq_entries.push(DlqEntry {
-                            source_row: rn,
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: eval_err.to_string(),
-                            original_record: record,
-                            stage: Some(DlqEntry::stage_transform(&transform_name)),
-                            route: None,
-                            trigger: true,
-                        });
-                    }
-                }
-
-                {
-                    let _guard = write_timer.guard();
-                    flush_output_batches(&mut per_output_batches, &output_channels)?;
-                }
+            let first = &rows[0];
+            let first_projected =
+                project_output_with_meta(&first.record, &layout, &first.metadata, &out_cfg);
+            let mut w =
+                build_format_writer(&out_cfg, raw_writer, Arc::clone(first_projected.schema()))?;
+            w.write_record(&first_projected)?;
+            for row in &rows[1..] {
+                let projected =
+                    project_output_with_meta(&row.record, &layout, &row.metadata, &out_cfg);
+                w.write_record(&projected)?;
             }
-
-            // Final flush
-            {
-                let _guard = write_timer.guard();
-                flush_output_batches(&mut per_output_batches, &output_channels)?;
-            }
-            join_writer_threads(output_channels)?;
-
-            let total_records = records_scanned + remaining_count;
-            collector.record(transform_timer.finish(
-                stage_metrics::StageName::TransformEval,
-                total_records,
-                records_emitted,
-            ));
-            collector.record(projection_timer.finish(
-                stage_metrics::StageName::Projection,
-                records_emitted,
-                records_emitted,
-            ));
-            collector.record(route_timer.finish(
-                stage_metrics::StageName::RouteEval,
-                records_emitted,
-                records_emitted,
-            ));
-            collector.record(write_timer.finish(
-                stage_metrics::StageName::Write,
-                records_emitted,
-                records_emitted,
-            ));
-        } else {
-            // Single-output streaming path
-            let output = primary_output;
-            let raw_writer = writers
-                .into_iter()
-                .next()
-                .map(|(_, w)| w)
-                .expect("validated above");
-
-            let mut csv_writer =
-                build_format_writer(output, raw_writer, Arc::clone(&output_schema))?;
-
-            // Process pending skips and errors from scan-forward phase
-            for (rn, record, result) in pending_skips_and_errors {
-                match result {
-                    Ok(eval_results) => {
-                        for eval_result in eval_results {
-                            match eval_result {
-                                EvalResult::Skip(SkipReason::Filtered) => {
-                                    counters.filtered_count += 1;
-                                }
-                                EvalResult::Skip(SkipReason::Duplicate) => {
-                                    counters.distinct_count += 1;
-                                }
-                                EvalResult::Emit { .. } => {} // emits handled in scan
-                            }
-                        }
-                    }
-                    Err((transform_name, eval_err)) => {
-                        handle_error(
-                            strategy,
-                            &record,
-                            rn,
-                            &eval_err,
-                            Some(DlqEntry::stage_transform(&transform_name)),
-                            None,
-                            &mut counters,
-                            &mut dlq_entries,
-                            output,
-                            &output_schema,
-                            &mut *csv_writer,
-                        )?;
-                    }
-                }
-            }
-
-            // Write first emitted record (ok_count already incremented during scan)
-            let first_emitted_was_some = first_emitted.is_some();
-            if let Some((ref record, ref emitted, ref metadata)) = first_emitted {
-                let projected = project_output_with_meta(record, emitted, metadata, output);
-                csv_writer.write_record(&projected)?;
-                // Write extra fan-out results from the same first record
-                for (extra_emitted, extra_metadata) in &first_record_extra_emits {
-                    let projected =
-                        project_output_with_meta(record, extra_emitted, extra_metadata, output);
-                    csv_writer.write_record(&projected)?;
-                }
-            }
-
-            // Process remaining records
-            let mut transform_timer = stage_metrics::CumulativeTimer::new();
-            let mut projection_timer = stage_metrics::CumulativeTimer::new();
-            let mut write_timer = stage_metrics::CumulativeTimer::new();
-            let mut records_emitted: u64 = if first_emitted_was_some {
-                1 + first_record_extra_emits.len() as u64
-            } else {
-                0
-            };
-            let remaining_count = all_records.len().saturating_sub(scan_idx) as u64;
-
-            for (record, rn) in all_records.into_iter().skip(scan_idx) {
-                let ctx = EvalContext {
-                    stable: &stable,
-                    source_file: &source_file_arc,
-                    source_row: rn,
-                };
-                let results = {
-                    let _guard = transform_timer.guard();
-                    evaluate_record_with_lookups(
-                        &record,
-                        &transform_names,
-                        &mut evaluators,
-                        &ctx,
-                        &lookup_tables,
-                    )
-                };
-                match results {
-                    Ok(eval_results) => {
-                        for eval_result in eval_results {
-                            match eval_result {
-                                EvalResult::Emit {
-                                    fields: emitted,
-                                    metadata,
-                                } => {
-                                    let projected = {
-                                        let _guard = projection_timer.guard();
-                                        project_output_with_meta(
-                                            &record, &emitted, &metadata, output,
-                                        )
-                                    };
-                                    {
-                                        let _guard = write_timer.guard();
-                                        csv_writer.write_record(&projected)?;
-                                    }
-                                    counters.ok_count += 1;
-                                    records_emitted += 1;
-                                }
-                                EvalResult::Skip(SkipReason::Filtered) => {
-                                    counters.filtered_count += 1;
-                                }
-                                EvalResult::Skip(SkipReason::Duplicate) => {
-                                    counters.distinct_count += 1;
-                                }
-                            }
-                        }
-                    }
-                    Err((transform_name, eval_err)) => {
-                        handle_error(
-                            strategy,
-                            &record,
-                            rn,
-                            &eval_err,
-                            Some(DlqEntry::stage_transform(&transform_name)),
-                            None,
-                            &mut counters,
-                            &mut dlq_entries,
-                            output,
-                            &output_schema,
-                            &mut *csv_writer,
-                        )?;
-                    }
-                }
-            }
-
-            csv_writer.flush()?;
-
-            let total_records = records_scanned + remaining_count;
-            collector.record(transform_timer.finish(
-                stage_metrics::StageName::TransformEval,
-                total_records,
-                records_emitted,
-            ));
-            collector.record(projection_timer.finish(
-                stage_metrics::StageName::Projection,
-                records_emitted,
-                records_emitted,
-            ));
-            let mut write_metrics = write_timer.finish(
-                stage_metrics::StageName::Write,
-                records_emitted,
-                records_emitted,
-            );
-            write_metrics.bytes_written = csv_writer.bytes_written();
-            collector.record(write_metrics);
+            w.flush()?;
         }
 
         Ok((counters, dlq_entries, rss_bytes()))
@@ -2673,19 +1162,31 @@ impl PipelineExecutor {
     /// branch-level fork-join — scheduling overhead exceeds benefit at
     /// typical ETL branch sizes (2-4 branches, millisecond chains).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn execute_dag_branching(
         config: &PipelineConfig,
         all_records: Vec<(Record, u64)>,
-        mut writers: HashMap<String, Box<dyn Write + Send>>,
+        mut sink: OutputSink<'_>,
         transforms: &[CompiledTransform],
-        compiled_route: Option<CompiledRoute>,
+        // Option W Shortcut #2: passed by `&mut` rather than owned so
+        // the per-group correlation-key driver can invoke the walker N
+        // times against the same CompiledRoute (route evaluators carry
+        // per-record mutable state). Serial per-group execution means
+        // exclusive borrow across calls is sound.
+        mut compiled_route: Option<&mut CompiledRoute>,
         plan: &ExecutionPlanDag,
         params: &PipelineRunParams,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         lookup_tables: &HashMap<String, RuntimeLookup>,
+        bound_output_schemas: &HashMap<String, Arc<Schema>>,
+        bound_output_layouts: &HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
+        arena: Option<&Arena>,
+        indices: Option<&[SecondaryIndex]>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
+        let _ = arena;
+        let _ = indices;
         use petgraph::graph::NodeIndex;
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
@@ -2706,7 +1207,6 @@ impl PipelineExecutor {
         let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
 
         let strategy = config.error_handling.strategy;
-        let mut compiled_route = compiled_route;
         let mut transform_timer = stage_metrics::CumulativeTimer::new();
         let mut route_timer = stage_metrics::CumulativeTimer::new();
         let mut projection_timer = stage_metrics::CumulativeTimer::new();
@@ -2723,26 +1223,42 @@ impl PipelineExecutor {
 
         // Inter-node buffers: each node produces records into its buffer.
         // Records are (Record, row_number, accumulated_emitted, accumulated_metadata).
-        #[allow(clippy::type_complexity)]
-        let mut node_buffers: HashMap<
-            NodeIndex,
-            Vec<(
-                Record,
-                u64,
-                IndexMap<String, Value>,
-                IndexMap<String, Value>,
-            )>,
-        > = HashMap::new();
+        // Option-W: per-node buffer tuple is (record, row_num, metadata).
+        // Emits live positionally on the record via its bound output
+        // schema; the per-record emitted side-map has been eliminated
+        // (single oracle, Failure mode #5).
+        type NodeRow = (Record, u64, IndexMap<String, Value>);
+        let mut node_buffers: HashMap<NodeIndex, Vec<NodeRow>> = HashMap::new();
 
         // Walk DAG in topological order
         for &node_idx in &plan.topo_order {
             let node = plan.graph[node_idx].clone();
             match node {
-                PlanNode::Source { .. } => {
-                    // Source node: populate buffer with all input records
+                PlanNode::Source { ref name, .. } => {
+                    // Option-W: widen source records onto the source's
+                    // bound output schema (the author-declared schema),
+                    // so every record produced by this node carries
+                    // the same `Arc<Schema>` that downstream positional
+                    // consumers (aggregator `group_by_indices`, sort
+                    // keys) resolve against.
+                    //
+                    // The CSV/JSON reader produces records whose
+                    // schema reflects what's actually in the file
+                    // (a subset of the declared schema); `bind_schema`
+                    // walks the author-declared schema (a superset).
+                    // Left unreconciled, indices resolve at the wrong
+                    // slot — widen here once at source ingress.
+                    let source_schema = bound_output_schemas.get(name.as_str()).cloned();
                     let records: Vec<_> = all_records
                         .iter()
-                        .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
+                        .map(|(r, rn)| {
+                            let widened = if let Some(schema) = source_schema.as_ref() {
+                                widen_to_schema(r, schema)
+                            } else {
+                                r.clone()
+                            };
+                            (widened, *rn, IndexMap::<String, Value>::new())
+                        })
                         .collect();
                     node_buffers.insert(node_idx, records);
                 }
@@ -2782,9 +1298,18 @@ impl PipelineExecutor {
                         transforms[transform_idx].has_distinct(),
                     );
 
+                    // Option-W: every record emitted by this Transform
+                    // carries the node's bound output schema (single
+                    // oracle — the same Arc as transforms[i].typed
+                    // .output_layout.schema).
+                    let node_output_schema = bound_output_schemas
+                        .get(name.as_str())
+                        .cloned()
+                        .expect("Option W: every CXL-bearing node has a bound output schema");
+
                     let mut output_records = Vec::with_capacity(input_records.len());
 
-                    for (record, rn, mut all_emitted, mut all_metadata) in input_records {
+                    for (record, rn, mut all_metadata) in input_records {
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
@@ -2834,33 +1359,26 @@ impl PipelineExecutor {
                                                 rt_lookup.table.source_name(),
                                             );
                                         match evaluator
-                                            .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                            .eval_record::<NullStorage>(
+                                                &ctx, &record, &resolver, None,
+                                            )
                                             .map_err(|e| (name.clone(), e))
                                         {
-                                            Ok(EvalResult::Emit {
-                                                fields: emitted,
-                                                metadata,
-                                            }) => {
-                                                let mut rec = record.clone();
-                                                for (n, v) in &emitted {
-                                                    if !rec.set(n, v.clone()) {
-                                                        rec.set_overflow(
-                                                            n.clone().into_boxed_str(),
-                                                            v.clone(),
-                                                        );
+                                            Ok(EvalResult::Emit { values, metadata }) => {
+                                                let mut rec = Record::new(
+                                                    Arc::clone(&node_output_schema),
+                                                    values,
+                                                );
+                                                if record.has_meta() {
+                                                    for (k, v) in record.iter_meta() {
+                                                        let _ = rec.set_meta(k, v.clone());
                                                     }
                                                 }
                                                 for (k, v) in &metadata {
                                                     let _ = rec.set_meta(k, v.clone());
                                                 }
-                                                all_emitted.extend(emitted);
                                                 all_metadata.extend(metadata);
-                                                output_records.push((
-                                                    rec,
-                                                    rn,
-                                                    all_emitted,
-                                                    all_metadata,
-                                                ));
+                                                output_records.push((rec, rn, all_metadata));
                                             }
                                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                                                 counters.filtered_count += 1;
@@ -2896,30 +1414,25 @@ impl PipelineExecutor {
                                         matched_row,
                                     );
                                     match evaluator
-                                        .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                        .eval_record::<NullStorage>(&ctx, &record, &resolver, None)
                                         .map_err(|e| (name.clone(), e))
                                     {
-                                        Ok(EvalResult::Emit {
-                                            fields: emitted,
-                                            metadata,
-                                        }) => {
-                                            let mut rec = record.clone();
-                                            for (n, v) in &emitted {
-                                                if !rec.set(n, v.clone()) {
-                                                    rec.set_overflow(
-                                                        n.clone().into_boxed_str(),
-                                                        v.clone(),
-                                                    );
+                                        Ok(EvalResult::Emit { values, metadata }) => {
+                                            let mut rec = Record::new(
+                                                Arc::clone(&node_output_schema),
+                                                values,
+                                            );
+                                            if record.has_meta() {
+                                                for (k, v) in record.iter_meta() {
+                                                    let _ = rec.set_meta(k, v.clone());
                                                 }
                                             }
                                             for (k, v) in &metadata {
                                                 let _ = rec.set_meta(k, v.clone());
                                             }
-                                            let mut em = all_emitted.clone();
                                             let mut mt = all_metadata.clone();
-                                            em.extend(emitted);
                                             mt.extend(metadata);
-                                            output_records.push((rec, rn, em, mt));
+                                            output_records.push((rec, rn, mt));
                                         }
                                         Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                                             counters.filtered_count += 1;
@@ -2946,21 +1459,103 @@ impl PipelineExecutor {
                                 }
                             }
                         } else {
-                            // No lookup — existing single-transform evaluation
-                            let eval_result = {
+                            // No lookup — single-transform evaluation.
+                            // Windowed transforms dispatch with a
+                            // `PartitionWindowContext` derived from the
+                            // arena + secondary index built in
+                            // `execute_dag` before the walker runs; the
+                            // record's position in the arena is passed as
+                            // `rn - 1` (source row numbers are 1-based).
+                            let window_idx =
+                                plan.graph.node_weight(node_idx).and_then(|n| match n {
+                                    PlanNode::Transform { window_index, .. } => *window_index,
+                                    _ => None,
+                                });
+                            type TransformEvalResult = Result<
+                                (Record, Result<IndexMap<String, Value>, SkipReason>),
+                                (String, cxl::eval::EvalError),
+                            >;
+                            let eval_result: TransformEvalResult = {
                                 let _guard = transform_timer.guard();
-                                evaluate_single_transform(&record, name, &mut evaluator, &ctx)
+                                if let (Some(widx), Some(arena_ref), Some(indices_ref)) =
+                                    (window_idx, arena, indices)
+                                {
+                                    let record_pos = rn.saturating_sub(1) as u32;
+                                    let spec = &plan.indices_to_build[widx];
+                                    let index = &indices_ref[widx];
+                                    let key: Option<Vec<GroupByKey>> = spec
+                                        .group_by
+                                        .iter()
+                                        .map(|field| {
+                                            let val =
+                                                record.get(field).cloned().unwrap_or(Value::Null);
+                                            value_to_group_key(&val, field, None, record_pos)
+                                                .ok()
+                                                .flatten()
+                                        })
+                                        .collect();
+                                    let result: Result<EvalResult, cxl::eval::EvalError> =
+                                        if let Some(key) = key {
+                                            if let Some(partition) = index.get(&key) {
+                                                let pos_in_partition = partition
+                                                    .iter()
+                                                    .position(|&p| p == record_pos)
+                                                    .unwrap_or(0);
+                                                let wctx = PartitionWindowContext::new(
+                                                    arena_ref,
+                                                    partition,
+                                                    pos_in_partition,
+                                                );
+                                                evaluator.eval_record(
+                                                    &ctx,
+                                                    &record,
+                                                    &record,
+                                                    Some(&wctx),
+                                                )
+                                            } else {
+                                                evaluator.eval_record::<Arena>(
+                                                    &ctx, &record, &record, None,
+                                                )
+                                            }
+                                        } else {
+                                            evaluator
+                                                .eval_record::<Arena>(&ctx, &record, &record, None)
+                                        };
+                                    match result {
+                                        Ok(EvalResult::Emit { values, metadata }) => {
+                                            let mut out_record = Record::new(
+                                                Arc::clone(&node_output_schema),
+                                                values,
+                                            );
+                                            if record.has_meta() {
+                                                for (k, v) in record.iter_meta() {
+                                                    let _ = out_record.set_meta(k, v.clone());
+                                                }
+                                            }
+                                            for (k, v) in &metadata {
+                                                let _ = out_record.set_meta(k, v.clone());
+                                            }
+                                            Ok((out_record, Ok(metadata)))
+                                        }
+                                        Ok(EvalResult::Skip(reason)) => {
+                                            Ok((record.clone(), Err(reason)))
+                                        }
+                                        Err(e) => Err((name.clone(), e)),
+                                    }
+                                } else {
+                                    evaluate_single_transform(
+                                        &record,
+                                        name,
+                                        &mut evaluator,
+                                        &ctx,
+                                        &node_output_schema,
+                                    )
+                                }
                             };
                             match eval_result {
-                                Ok((modified_record, Ok((emitted, metadata)))) => {
-                                    all_emitted.extend(emitted);
+                                Ok((modified_record, Ok(metadata))) => {
                                     all_metadata.extend(metadata);
-                                    output_records.push((
-                                        modified_record,
-                                        rn,
-                                        all_emitted,
-                                        all_metadata,
-                                    ));
+                                    output_records.push((modified_record, rn, all_metadata));
                                 }
                                 Ok((_record, Err(SkipReason::Filtered))) => {
                                     counters.filtered_count += 1;
@@ -3014,26 +1609,40 @@ impl PipelineExecutor {
                         .collect();
 
                     // Build branch_name -> successor NodeIndex mapping.
-                    // A successor transform's `input:` field is "route_parent.branch_name".
-                    // Extract the route parent name from this Route node's name
-                    // (which is "route_{parent_transform}").
+                    //
+                    // Two successor shapes are supported:
+                    //
+                    // 1. **Branch transforms** whose `input:` is
+                    //    "route_parent.branch_name" (classic fan-out:
+                    //    Route → Transform → Output). The branch name is
+                    //    the suffix after the route parent.
+                    //
+                    // 2. **Output nodes** directly downstream of the Route
+                    //    whose name matches a branch name in the route
+                    //    config (multi-output split: Route → Output[name]).
+                    //    This is the shape used by
+                    //    `route: { conditions: { high: ... }, default: low }`
+                    //    with two `output` nodes named `high` and `low`.
                     let route_parent = name.strip_prefix("route_").unwrap_or(name);
                     let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
                     for &succ in &successors {
-                        let succ_name = plan.graph[succ].name();
-                        // Check config transforms for matching input reference
+                        let succ_name = plan.graph[succ].name().to_string();
+                        let mut matched = false;
                         for tc in crate::executor::build_transform_specs(config) {
                             if tc.name == succ_name
                                 && let Some(crate::config::TransformInput::Single(ref input_ref)) =
                                     tc.input
-                            {
-                                // input_ref is "parent.branch" or just "parent"
-                                if let Some(branch) =
+                                && let Some(branch) =
                                     input_ref.strip_prefix(&format!("{}.", route_parent))
-                                {
-                                    branch_to_succ.insert(branch.to_string(), succ);
-                                }
+                            {
+                                branch_to_succ.insert(branch.to_string(), succ);
+                                matched = true;
                             }
+                        }
+                        // Shape 2: Output node directly downstream of Route
+                        // — the output's name IS the branch label.
+                        if !matched && matches!(plan.graph[succ], PlanNode::Output { .. }) {
+                            branch_to_succ.insert(succ_name, succ);
                         }
                     }
 
@@ -3045,7 +1654,7 @@ impl PipelineExecutor {
 
                     // Use compiled_route to evaluate conditions
                     if let Some(ref mut route) = compiled_route {
-                        for (record, rn, all_emitted, all_metadata) in input_records {
+                        for (record, rn, all_metadata) in input_records {
                             let ctx = EvalContext {
                                 stable: &stable,
                                 source_file: &source_file_arc,
@@ -3054,7 +1663,7 @@ impl PipelineExecutor {
 
                             let route_result = {
                                 let _guard = route_timer.guard();
-                                route.evaluate(&all_emitted, &all_metadata, &ctx)
+                                route.evaluate(&record, &all_metadata, &ctx)
                             };
                             match route_result {
                                 Ok(targets) => {
@@ -3063,7 +1672,6 @@ impl PipelineExecutor {
                                             branch_buffers.entry(succ).or_default().push((
                                                 record.clone(),
                                                 rn,
-                                                all_emitted.clone(),
                                                 all_metadata.clone(),
                                             ));
                                         }
@@ -3153,6 +1761,8 @@ impl PipelineExecutor {
                     ref sort_fields,
                     ..
                 } => {
+                    let _ = name;
+                    let _ = sort_fields;
                     // Enforcer-sort dispatch (Task 16.0.5.8). Reuses the
                     // generalized `SortBuffer<P>` carrying per-record sidecar
                     // (row_num + emitted/accumulated metadata maps) through
@@ -3160,13 +1770,8 @@ impl PipelineExecutor {
                     // docs/research/RESEARCH-sort-node-sidecar-payload.md.
                     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 
-                    type SortPayload = (u64, IndexMap<String, Value>, IndexMap<String, Value>);
-                    type SortRow = (
-                        Record,
-                        u64,
-                        IndexMap<String, Value>,
-                        IndexMap<String, Value>,
-                    );
+                    type SortPayload = (u64, IndexMap<String, Value>);
+                    type SortRow = (Record, u64, IndexMap<String, Value>);
 
                     let predecessors: Vec<NodeIndex> = plan
                         .graph
@@ -3189,8 +1794,8 @@ impl PipelineExecutor {
 
                     let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
                     let sort_count = input_records.len() as u64;
-                    for (record, row_num, emitted, accumulated) in input_records {
-                        buf.push(record, (row_num, emitted, accumulated));
+                    for (record, row_num, accumulated) in input_records {
+                        buf.push(record, (row_num, accumulated));
                         if buf.should_spill() {
                             buf.sort_and_spill().map_err(|e| {
                                 PipelineError::Io(std::io::Error::other(format!(
@@ -3209,15 +1814,11 @@ impl PipelineExecutor {
                     let mut out: Vec<SortRow> = Vec::with_capacity(sort_count as usize);
                     match sorted {
                         SortedOutput::InMemory(pairs) => {
-                            for (record, (row_num, emitted, accumulated)) in pairs {
-                                out.push((record, row_num, emitted, accumulated));
+                            for (record, (row_num, accumulated)) in pairs {
+                                out.push((record, row_num, accumulated));
                             }
                         }
                         SortedOutput::Spilled(files) => {
-                            // Spill files are individually sorted but not
-                            // globally merged. For correctness when multiple
-                            // spill files exist, a k-way merge is required.
-                            // Single-file fast path is exact.
                             if files.len() > 1 {
                                 return Err(PipelineError::Io(std::io::Error::other(format!(
                                     "sort enforcer '{name}' produced {} spill files; \
@@ -3233,13 +1834,12 @@ impl PipelineExecutor {
                                     )))
                                 })?;
                                 for entry in reader {
-                                    let (record, (row_num, emitted, accumulated)) =
-                                        entry.map_err(|e| {
-                                            PipelineError::Io(std::io::Error::other(format!(
-                                                "sort enforcer '{name}' spill decode failed: {e}"
-                                            )))
-                                        })?;
-                                    out.push((record, row_num, emitted, accumulated));
+                                    let (record, (row_num, accumulated)) = entry.map_err(|e| {
+                                        PipelineError::Io(std::io::Error::other(format!(
+                                            "sort enforcer '{name}' spill decode failed: {e}"
+                                        )))
+                                    })?;
+                                    out.push((record, row_num, accumulated));
                                 }
                             }
                         }
@@ -3320,7 +1920,7 @@ impl PipelineExecutor {
                     let input_count = input.len() as u64;
 
                     let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-                    for (record, row_num, emitted, accumulated) in &input {
+                    for (record, row_num, accumulated) in &input {
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
@@ -3329,7 +1929,6 @@ impl PipelineExecutor {
                         if let Err(e) = stream.add_record(
                             record,
                             *row_num,
-                            emitted,
                             accumulated,
                             &ctx,
                             &mut emitted_rows,
@@ -3378,7 +1977,7 @@ impl PipelineExecutor {
                             }
                             ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
                                 counters.dlq_count += 1;
-                                let synthetic = if let Some((rec, _, _, _)) = input.first() {
+                                let synthetic = if let Some((rec, _, _)) = input.first() {
                                     rec.clone()
                                 } else {
                                     Record::new(Arc::clone(output_schema), Vec::new())
@@ -3408,13 +2007,19 @@ impl PipelineExecutor {
                     // Get input records: check own buffer first (Route
                     // nodes store records at the successor's index), then
                     // fall back to predecessor buffers.
+                    //
+                    // Locate the predecessor node so we can fetch its
+                    // canonical `OutputLayout` from `bound_output_layouts`
+                    // (Option W: the predecessor's layout is the single
+                    // oracle for the CXL-emitted vs passthrough distinction
+                    // that drives `include_unmapped: false` semantics).
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
                     let input_records = if let Some(own_buf) = node_buffers.remove(&node_idx) {
                         own_buf
                     } else {
-                        let predecessors: Vec<NodeIndex> = plan
-                            .graph
-                            .neighbors_directed(node_idx, Direction::Incoming)
-                            .collect();
                         predecessors
                             .iter()
                             .find_map(|&p| {
@@ -3448,38 +2053,90 @@ impl PipelineExecutor {
                         .find(|o| o.name == *name)
                         .unwrap_or(primary_output);
 
-                    let output_schema =
-                        if let Some((rec, _, emitted, metadata)) = input_records.first() {
-                            let projected = {
-                                let _guard = projection_timer.guard();
-                                project_output_with_meta(rec, emitted, metadata, out_cfg)
-                            };
-                            Arc::clone(projected.schema())
-                        } else {
-                            // No records to write — use empty schema
-                            collector.record(scan_timer.finish(0, 0));
-                            continue;
-                        };
+                    // Option W Amendment A7: use the predecessor's bound
+                    // `OutputLayout` as the single oracle for projection.
+                    // For Transform/Aggregate/Route predecessors the layout
+                    // carries real `emit_slots` (CXL-named columns); for
+                    // Source/Merge predecessors it's an identity-passthrough
+                    // layout. `include_unmapped: false` correctly filters
+                    // to emits-only because the layout knows the truth.
+                    //
+                    // Edge case: a direct Source → Output pipeline (no
+                    // transform between them) has NO edge wired in the
+                    // plan DAG — the planner's output-wiring logic at
+                    // `plan/execution.rs:1273-1297` only connects Output
+                    // nodes when `prev_transform_key` is Some. In that
+                    // case `input_records` is empty (handled below) and
+                    // no projection happens. We mirror this by only
+                    // looking up a layout when we actually have records.
+                    let layout = predecessors
+                        .first()
+                        .map(|&p| plan.graph[p].name())
+                        .and_then(|pred_name| bound_output_layouts.get(pred_name));
 
-                    // Find and take the writer for this output
-                    if let Some(raw_writer) = writers.remove(name) {
-                        let mut csv_writer =
-                            build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema))?;
-                        collector.record(scan_timer.finish(1, 1));
-
-                        for (record, _rn, emitted, metadata) in &input_records {
-                            let projected = {
-                                let _guard = projection_timer.guard();
-                                project_output_with_meta(record, emitted, metadata, out_cfg)
-                            };
-                            {
-                                let _guard = write_timer.guard();
-                                csv_writer.write_record(&projected)?;
+                    match sink {
+                        OutputSink::Captured(ref mut cap) => {
+                            // Correlation-key pre-DAG driver: buffer raw
+                            // records pending group success/failure. No
+                            // projection, no write — caller decides.
+                            let buf = cap.entry(name.clone()).or_default();
+                            for (record, rn, metadata) in &input_records {
+                                buf.push(CapturedRow {
+                                    record: record.clone(),
+                                    row_num: *rn,
+                                    metadata: metadata.clone(),
+                                });
                             }
+                            collector.record(
+                                scan_timer
+                                    .finish(input_records.len() as u64, input_records.len() as u64),
+                            );
                         }
-                        {
-                            let _guard = write_timer.guard();
-                            csv_writer.flush()?;
+                        OutputSink::Streamed(ref mut writers) => {
+                            let output_schema = match (input_records.first(), layout) {
+                                (Some((rec, _, metadata)), Some(layout)) => {
+                                    let projected = {
+                                        let _guard = projection_timer.guard();
+                                        project_output_with_meta(rec, layout, metadata, out_cfg)
+                                    };
+                                    Arc::clone(projected.schema())
+                                }
+                                _ => {
+                                    // No records or no predecessor — nothing
+                                    // to write. Record the scan metric and
+                                    // continue.
+                                    collector.record(scan_timer.finish(0, 0));
+                                    continue;
+                                }
+                            };
+                            let layout = layout.expect(
+                                "Option W invariant: layout lookup succeeded \
+                                 above implies predecessor in bound_output_layouts",
+                            );
+
+                            if let Some(raw_writer) = writers.remove(name) {
+                                let mut csv_writer = build_format_writer(
+                                    out_cfg,
+                                    raw_writer,
+                                    Arc::clone(&output_schema),
+                                )?;
+                                collector.record(scan_timer.finish(1, 1));
+
+                                for (record, _rn, metadata) in &input_records {
+                                    let projected = {
+                                        let _guard = projection_timer.guard();
+                                        project_output_with_meta(record, layout, metadata, out_cfg)
+                                    };
+                                    {
+                                        let _guard = write_timer.guard();
+                                        csv_writer.write_record(&projected)?;
+                                    }
+                                }
+                                {
+                                    let _guard = write_timer.guard();
+                                    csv_writer.flush()?;
+                                }
+                            }
                         }
                     }
                 }
@@ -4254,34 +2911,6 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
     parent.join(filename).to_string_lossy().into_owned()
 }
 
-/// Build a rayon thread pool from config. Explicit pool (not global) for testability.
-///
-/// Default: `min(num_cpus - 2, 4)`. Overridable via `concurrency.threads` config.
-fn build_thread_pool(config: &PipelineConfig) -> Result<rayon::ThreadPool, PipelineError> {
-    let worker_threads = config
-        .pipeline
-        .concurrency
-        .as_ref()
-        .and_then(|c| c.threads)
-        .unwrap_or_else(|| std::cmp::min(num_cpus::get().saturating_sub(2).max(1), 4));
-
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_threads)
-        .thread_name(|i| format!("cxl-worker-{i}"))
-        .build()
-        .map_err(|e| PipelineError::ThreadPool(e.to_string()))
-}
-
-/// Determine if all transforms can be parallelized (Stateless or IndexReading).
-fn can_parallelize(plan: &ExecutionPlanDag) -> bool {
-    plan.parallelism.per_transform.iter().all(|c| {
-        matches!(
-            c,
-            ParallelismClass::Stateless | ParallelismClass::IndexReading
-        )
-    })
-}
-
 /// Build the pipeline-stable evaluation context (D59 / Task 16.3.13a).
 ///
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
@@ -4309,290 +2938,85 @@ fn build_stable_eval_context(
     }
 }
 
-/// Evaluate all transforms against a single record, accumulating emitted fields.
+/// Extract the correlation-key value(s) from a record.
 ///
-/// Emitted fields from earlier transforms are merged into the record's overflow
-/// so that later transforms can reference them as input fields.
+/// For a compound key (`CorrelationKey::Compound(["a", "b"])`) returns
+/// one `GroupByKey` per field. Missing or null values — as well as
+/// empty strings (CSV's null stand-in) — produce `GroupByKey::Null`.
 ///
-/// On error, returns `(transform_name, EvalError)` so callers can populate
-/// the DLQ stage field with `"transform:{name}"`.
-fn evaluate_record(
+/// Re-instated from commit `74a06c7` as part of Option W Shortcut #2
+/// (correlation-key DLQ failure-domain batching).
+fn extract_correlation_key(
     record: &Record,
-    transform_names: &[&str],
-    evaluators: &mut [ProgramEvaluator],
-    ctx: &EvalContext,
-) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
-    // No lookup tables → always returns exactly one result
-    let mut results =
-        evaluate_record_with_lookups(record, transform_names, evaluators, ctx, &HashMap::new())?;
-    Ok(results
-        .pop()
-        .unwrap_or(EvalResult::Skip(SkipReason::Filtered)))
-}
-
-/// Evaluate a transform chain with lookup enrichment, potentially producing
-/// multiple output records when `match: all` fan-out is active.
-fn evaluate_record_with_lookups(
-    record: &Record,
-    transform_names: &[&str],
-    evaluators: &mut [ProgramEvaluator],
-    ctx: &EvalContext,
-    lookup_tables: &HashMap<String, RuntimeLookup>,
-) -> Result<Vec<EvalResult>, (String, cxl::eval::EvalError)> {
-    // Each "branch" is an in-progress record being transformed through the chain.
-    // For match:first / no-lookup this stays at 1; match:all expands it.
-    type Branch = (Record, IndexMap<String, Value>, IndexMap<String, Value>);
-    let mut branches: Vec<Branch> = vec![(record.clone(), IndexMap::new(), IndexMap::new())];
-    let mut last_skip_reason = SkipReason::Filtered;
-
-    for (i, eval) in evaluators.iter_mut().enumerate() {
-        let name = transform_names.get(i).copied().unwrap_or("unknown");
-        let mut new_branches: Vec<Branch> = Vec::with_capacity(branches.len());
-
-        for (record, all_emitted, all_metadata) in branches {
-            if let Some(rt_lookup) = lookup_tables.get(name) {
-                let matches = crate::pipeline::lookup::find_matches(
-                    &rt_lookup.table,
-                    &record,
-                    &mut rt_lookup
-                        .where_evaluator
-                        .lock()
-                        .expect("lookup evaluator lock"),
-                    ctx,
-                    rt_lookup.match_mode,
-                    rt_lookup.equality_index.as_ref(),
-                )
-                .map_err(|e| {
-                    (
-                        name.to_string(),
-                        cxl::eval::EvalError {
-                            kind: cxl::eval::EvalErrorKind::ConversionFailed {
-                                value: e.to_string(),
-                                target: "lookup match",
-                            },
-                            span: cxl::lexer::Span::new(0, 0),
-                        },
-                    )
-                })?;
-
-                if matches.is_empty() {
-                    match rt_lookup.on_miss {
-                        crate::config::pipeline_node::OnMiss::Skip => {
-                            // Drop this branch (filtered)
-                            continue;
-                        }
-                        crate::config::pipeline_node::OnMiss::Error => {
-                            return Err((
-                                name.to_string(),
-                                cxl::eval::EvalError {
-                                    kind: cxl::eval::EvalErrorKind::ConversionFailed {
-                                        value: format!(
-                                            "no matching row in lookup source '{}'",
-                                            rt_lookup.table.source_name()
-                                        ),
-                                        target: "lookup match",
-                                    },
-                                    span: cxl::lexer::Span::new(0, 0),
-                                },
-                            ));
-                        }
-                        crate::config::pipeline_node::OnMiss::NullFields => {
-                            let resolver = crate::pipeline::lookup::LookupResolver::no_match(
-                                &record,
-                                rt_lookup.table.source_name(),
-                            );
-                            let eval_result = eval
-                                .eval_record::<NullStorage>(ctx, &resolver, None)
-                                .map_err(|e| (name.to_string(), e))?;
-                            match apply_eval_to_branch(
-                                record,
-                                all_emitted,
-                                all_metadata,
-                                eval_result,
-                            ) {
-                                Ok(branch) => new_branches.push(branch),
-                                Err(reason) => last_skip_reason = reason,
-                            }
-                        }
-                    }
-                } else {
-                    // Emit one branch per match (1 for First, N for All)
-                    for &idx in &matches {
-                        let matched_row = &rt_lookup.table.records()[idx];
-                        let resolver = crate::pipeline::lookup::LookupResolver::matched(
-                            &record,
-                            rt_lookup.table.source_name(),
-                            matched_row,
-                        );
-                        let eval_result = eval
-                            .eval_record::<NullStorage>(ctx, &resolver, None)
-                            .map_err(|e| (name.to_string(), e))?;
-                        match apply_eval_to_branch(
-                            record.clone(),
-                            all_emitted.clone(),
-                            all_metadata.clone(),
-                            eval_result,
-                        ) {
-                            Ok(branch) => new_branches.push(branch),
-                            Err(reason) => last_skip_reason = reason,
-                        }
-                    }
+    correlation_key: &crate::config::CorrelationKey,
+) -> Vec<GroupByKey> {
+    let fields = correlation_key.fields();
+    fields
+        .iter()
+        .map(|field| match record.get(field) {
+            Some(value) if !value.is_null() => {
+                // Treat empty strings as null (CSV has no native null concept).
+                if let Value::String(s) = value
+                    && s.is_empty()
+                {
+                    return GroupByKey::Null;
                 }
-            } else {
-                let eval_result = eval
-                    .eval_record::<NullStorage>(ctx, &record, None)
-                    .map_err(|e| (name.to_string(), e))?;
-                match apply_eval_to_branch(record, all_emitted, all_metadata, eval_result) {
-                    Ok(branch) => new_branches.push(branch),
-                    Err(reason) => last_skip_reason = reason,
+                match value_to_group_key(value, field, None, 0) {
+                    Ok(Some(gk)) => gk,
+                    Ok(None) => GroupByKey::Null,
+                    Err(_) => GroupByKey::Null,
                 }
             }
-        }
-
-        branches = new_branches;
-        if branches.is_empty() {
-            return Ok(vec![EvalResult::Skip(last_skip_reason)]);
-        }
-    }
-
-    Ok(branches
-        .into_iter()
-        .map(|(_, emitted, metadata)| EvalResult::Emit {
-            fields: emitted,
-            metadata,
+            _ => GroupByKey::Null,
         })
-        .collect())
+        .collect()
 }
 
-/// Apply an eval result to a branch, returning the updated branch or the skip reason.
-#[allow(clippy::type_complexity)]
-fn apply_eval_to_branch(
-    mut record: Record,
-    mut all_emitted: IndexMap<String, Value>,
-    mut all_metadata: IndexMap<String, Value>,
-    eval_result: EvalResult,
-) -> Result<(Record, IndexMap<String, Value>, IndexMap<String, Value>), SkipReason> {
-    match eval_result {
-        EvalResult::Emit {
-            fields: emitted,
-            metadata,
-        } => {
-            for (name, value) in &emitted {
-                if !record.set(name, value.clone()) {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
-                }
-            }
-            for (key, value) in &metadata {
-                let _ = record.set_meta(key, value.clone());
-            }
-            all_emitted.extend(emitted);
-            all_metadata.extend(metadata);
-            Ok((record, all_emitted, all_metadata))
-        }
-        EvalResult::Skip(reason) => Err(reason),
+/// Format a compound group key for diagnostics (e.g., collateral DLQ
+/// messages, `CorrelationGroupOverflow` carriage).
+fn format_group_key(key: &[GroupByKey]) -> String {
+    key.iter()
+        .map(|k| format!("{k:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Option-W source widening: materialize a record onto the declared
+/// source schema. The reader-produced record's schema reflects what was
+/// in the file (possibly a subset of declared columns); this helper
+/// pads to the full declared schema positionally. Replaces the former
+/// `reproject_record(input, schema, &IndexMap::new())` source-arm call.
+fn widen_to_schema(input: &Record, target: &Arc<Schema>) -> Record {
+    if Arc::ptr_eq(input.schema(), target) {
+        return input.clone();
     }
-}
-
-/// Evaluate all transforms with window context, accumulating emitted fields.
-///
-/// Emitted fields from earlier transforms are merged into the record's overflow
-/// so that later transforms can reference them as input fields.
-///
-/// On error, returns `(transform_name, EvalError)` so callers can populate
-/// the DLQ stage field with `"transform:{name}"`.
-#[allow(clippy::too_many_arguments)]
-fn evaluate_record_with_window(
-    record: &Record,
-    transform_names: &[&str],
-    evaluators: &mut [ProgramEvaluator],
-    ctx: &EvalContext,
-    plan: &ExecutionPlanDag,
-    arena: &Arena,
-    indices: &[SecondaryIndex],
-    record_pos: u32,
-) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
-    let mut record = record.clone();
-    let mut all_emitted = IndexMap::new();
-    let mut all_metadata = IndexMap::new();
-
-    let window_info = plan.transform_window_info();
-
-    for (i, eval) in evaluators.iter_mut().enumerate() {
-        let (wi, _pl) = &window_info[i];
-        let name = transform_names.get(i).copied().unwrap_or("unknown");
-
-        let result = if let Some(idx_num) = *wi {
-            // This transform uses windows — look up partition
-            let spec = &plan.indices_to_build[idx_num];
-            let index = &indices[idx_num];
-
-            // Compute group key from current record
-            let key: Option<Vec<GroupByKey>> = spec
-                .group_by
-                .iter()
-                .map(|field| {
-                    let val = record.get(field).cloned().unwrap_or(Value::Null);
-                    value_to_group_key(&val, field, None, record_pos)
-                        .ok()
-                        .flatten()
-                })
-                .collect();
-
-            if let Some(key) = key {
-                if let Some(partition) = index.get(&key) {
-                    // Find current position within partition
-                    let pos_in_partition =
-                        partition.iter().position(|&p| p == record_pos).unwrap_or(0);
-                    let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
-                    eval.eval_record(ctx, &record, Some(&wctx))
-                        .map_err(|e| (name.to_string(), e))?
-                } else {
-                    eval.eval_record::<Arena>(ctx, &record, None)
-                        .map_err(|e| (name.to_string(), e))?
-                }
-            } else {
-                eval.eval_record::<Arena>(ctx, &record, None)
-                    .map_err(|e| (name.to_string(), e))?
-            }
-        } else {
-            eval.eval_record::<NullStorage>(ctx, &record, None)
-                .map_err(|e| (name.to_string(), e))?
-        };
-
-        match result {
-            EvalResult::Emit {
-                fields: emitted,
-                metadata,
-            } => {
-                for (name, value) in &emitted {
-                    // Use set() for schema fields (e.g. emit amount = amount.to_int()),
-                    // set_overflow() for new fields introduced by the transform.
-                    if !record.set(name, value.clone()) {
-                        record.set_overflow(name.clone().into_boxed_str(), value.clone());
-                    }
-                }
-                for (key, value) in &metadata {
-                    let _ = record.set_meta(key, value.clone());
-                }
-                all_emitted.extend(emitted);
-                all_metadata.extend(metadata);
-            }
-            skip @ EvalResult::Skip(_) => return Ok(skip),
+    let values: Vec<Value> = target
+        .columns()
+        .iter()
+        .map(|c| input.get(c.as_ref()).cloned().unwrap_or(Value::Null))
+        .collect();
+    let mut rec = Record::new(Arc::clone(target), values);
+    if input.has_meta() {
+        for (k, v) in input.iter_meta() {
+            let _ = rec.set_meta(k, v.clone());
         }
     }
-
-    Ok(EvalResult::Emit {
-        fields: all_emitted,
-        metadata: all_metadata,
-    })
+    rec
 }
 
-/// Evaluate a single transform against a record, returning the modified record
-/// with emitted fields merged in.
+/// Apply an eval result to a branch (Option-W positional). The
+/// evaluator's output `values: Vec<Value>` is positionally aligned to
+/// the producing node's `OutputLayout::schema`, which is passed in as
+/// `output_schema`.
+/// Evaluate a single transform against a record (Option-W positional).
 ///
-/// Used by the DAG-walking executor for per-node evaluation.
-/// Returns `Ok((modified_record, emitted, metadata))` on emit,
-/// `Ok` with `EvalResult::Skip` variant on skip.
+/// The evaluator writes its output positionally into `values: Vec<Value>`
+/// aligned to the transform's bound output schema (`output_schema`).
+/// Callers materialize the output record via `Record::new(output_schema,
+/// values)` — no reprojection, no name lookups.
+///
+/// Returns `Ok((output_record, Ok(metadata)))` on emit,
+/// `Ok((input_clone, Err(SkipReason)))` on skip.
 /// On error, returns `(transform_name, EvalError)`.
 #[allow(clippy::type_complexity)]
 fn evaluate_single_transform(
@@ -4600,33 +3024,25 @@ fn evaluate_single_transform(
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
-) -> Result<
-    (
-        Record,
-        Result<(IndexMap<String, Value>, IndexMap<String, Value>), SkipReason>,
-    ),
-    (String, cxl::eval::EvalError),
-> {
-    let mut record = record.clone();
+    output_schema: &Arc<Schema>,
+) -> Result<(Record, Result<IndexMap<String, Value>, SkipReason>), (String, cxl::eval::EvalError)> {
     match evaluator
-        .eval_record::<NullStorage>(ctx, &record, None)
+        .eval_record::<NullStorage>(ctx, record, record, None)
         .map_err(|e| (transform_name.to_string(), e))?
     {
-        EvalResult::Emit {
-            fields: emitted,
-            metadata,
-        } => {
-            for (name, value) in &emitted {
-                if !record.set(name, value.clone()) {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
+        EvalResult::Emit { values, metadata } => {
+            let mut out_record = Record::new(Arc::clone(output_schema), values);
+            if record.has_meta() {
+                for (k, v) in record.iter_meta() {
+                    let _ = out_record.set_meta(k, v.clone());
                 }
             }
             for (key, value) in &metadata {
-                let _ = record.set_meta(key, value.clone());
+                let _ = out_record.set_meta(key, value.clone());
             }
-            Ok((record, Ok((emitted, metadata))))
+            Ok((out_record, Ok(metadata)))
         }
-        EvalResult::Skip(reason) => Ok((record, Err(reason))),
+        EvalResult::Skip(reason) => Ok((record.clone(), Err(reason))),
     }
 }
 
@@ -4671,86 +3087,6 @@ fn parse_memory_limit(config: &PipelineConfig) -> usize {
             }
         })
         .unwrap_or(512 * 1024 * 1024) // 512MB default
-}
-
-/// Handle an evaluation error according to the configured strategy.
-#[allow(clippy::too_many_arguments)]
-fn handle_error(
-    strategy: ErrorStrategy,
-    record: &Record,
-    row_num: u64,
-    eval_err: &cxl::eval::EvalError,
-    stage: Option<String>,
-    route: Option<String>,
-    counters: &mut PipelineCounters,
-    dlq_entries: &mut Vec<DlqEntry>,
-    output: &OutputConfig,
-    _output_schema: &Arc<Schema>,
-    writer: &mut dyn FormatWriter,
-) -> Result<(), PipelineError> {
-    match strategy {
-        ErrorStrategy::FailFast => {
-            return Err(PipelineError::Eval(cxl::eval::EvalError {
-                span: eval_err.span,
-                kind: eval_err.kind.clone(),
-            }));
-        }
-        ErrorStrategy::Continue => {
-            counters.dlq_count += 1;
-            dlq_entries.push(DlqEntry {
-                source_row: row_num,
-                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                error_message: eval_err.to_string(),
-                original_record: record.clone(),
-                stage,
-                route,
-                trigger: true,
-            });
-            // Skip this record — don't write to output
-        }
-        ErrorStrategy::BestEffort => {
-            counters.dlq_count += 1;
-            dlq_entries.push(DlqEntry {
-                source_row: row_num,
-                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                error_message: eval_err.to_string(),
-                original_record: record.clone(),
-                stage,
-                route,
-                trigger: true,
-            });
-            // Write original record unchanged
-            let emitted = IndexMap::new();
-            let projected = project_output(record, &emitted, output);
-            writer.write_record(&projected)?;
-            counters.ok_count += 1;
-        }
-    }
-    Ok(())
-}
-
-/// Handle an evaluation error before the writer is initialized (scan-forward phase).
-/// FailFast should be handled by the caller before reaching this function.
-/// For Continue/BestEffort, we count the error and queue it for DLQ — no output write
-/// is possible because the output schema is not yet known.
-fn handle_error_no_writer(
-    record: &Record,
-    row_num: u64,
-    eval_err: &cxl::eval::EvalError,
-    stage: Option<String>,
-    counters: &mut PipelineCounters,
-    dlq_entries: &mut Vec<DlqEntry>,
-) {
-    counters.dlq_count += 1;
-    dlq_entries.push(DlqEntry {
-        source_row: row_num,
-        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-        error_message: eval_err.to_string(),
-        original_record: record.clone(),
-        stage,
-        route: None,
-        trigger: true,
-    });
 }
 
 /// Runtime lookup context for a transform with `lookup:` config.

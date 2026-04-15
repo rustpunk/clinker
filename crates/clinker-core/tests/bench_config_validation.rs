@@ -216,7 +216,7 @@ fn test_future_stubs_exist() {
 }
 
 /// For every config with a Route node, every condition key and the default
-/// value names a real output node in the same config.
+/// value has a downstream node connected via route.port.
 #[test]
 fn test_multi_output_route_targets_match_outputs() {
     let root = workspace_root().join("benches/pipelines");
@@ -241,31 +241,34 @@ fn test_multi_output_route_targets_match_outputs() {
                     port: port.to_string(),
                 };
 
-                // Each condition key should have a matching output connected via route.port
+                // Helper: check if any node has this port as its input
+                let has_downstream = |expected: &NodeInput| {
+                    config.nodes.iter().any(|n| match &n.value {
+                        PipelineNode::Output { header, .. }
+                        | PipelineNode::Transform { header, .. }
+                        | PipelineNode::Aggregate { header, .. }
+                        | PipelineNode::Route { header, .. } => header.input == *expected,
+                        _ => false,
+                    })
+                };
+
+                // Each condition key should have a downstream node connected via route.port
                 for key in body.conditions.keys() {
                     let expected = expected_port(key);
-                    let has_output = config.nodes.iter().any(|n| match &n.value {
-                        PipelineNode::Output { header, .. } => header.input == expected,
-                        _ => false,
-                    });
                     assert!(
-                        has_output,
-                        "{}: route condition '{}' has no output connected to port '{}.{}'",
+                        has_downstream(&expected),
+                        "{}: route condition '{}' has no downstream node connected to port '{}.{}'",
                         path.display(),
                         key,
                         route_name,
                         key,
                     );
                 }
-                // Default should also have matching output
+                // Default should also have matching downstream
                 let expected_default = expected_port(&body.default);
-                let has_default = config.nodes.iter().any(|n| match &n.value {
-                    PipelineNode::Output { header, .. } => header.input == expected_default,
-                    _ => false,
-                });
                 assert!(
-                    has_default,
-                    "{}: route default '{}' has no output connected to port '{}.{}'",
+                    has_downstream(&expected_default),
+                    "{}: route default '{}' has no downstream node connected to port '{}.{}'",
                     path.display(),
                     body.default,
                     route_name,

@@ -68,29 +68,18 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         // Write header on first record
         if self.config.include_header && !self.header_written {
-            let mut header: Vec<&str> = self.schema.columns().iter().map(|c| c.as_ref()).collect();
-            // Overflow fields in emit order (IndexMap insertion order)
-            if let Some(overflow) = record.overflow_fields() {
-                header.extend(overflow.map(|(k, _)| k));
-            }
+            let header: Vec<&str> = self.schema.columns().iter().map(|c| c.as_ref()).collect();
             self.inner.write_record(&header)?;
             self.header_written = true;
         }
 
-        // Schema fields in schema order
-        let mut fields: Vec<String> = self
+        // Schema fields in schema order (Option-W: no overflow side-channel).
+        let fields: Vec<String> = self
             .schema
             .columns()
             .iter()
             .map(|col| record.get(col).map(value_to_csv_cell).unwrap_or_default())
             .collect();
-
-        // Overflow fields in emit order (IndexMap insertion order)
-        if let Some(overflow) = record.overflow_fields() {
-            for (_, value) in overflow {
-                fields.push(value_to_csv_cell(value));
-            }
-        }
 
         self.inner.write_record(&fields)?;
         Ok(())
@@ -133,11 +122,9 @@ impl<W: Write> HeaderCapturingCsvWriter<W> {
 impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         if !self.captured {
-            // Capture header: schema columns + overflow fields from first record
-            let mut header: Vec<Box<str>> = self.schema.columns().to_vec();
-            if let Some(overflow) = record.overflow_fields() {
-                header.extend(overflow.map(|(k, _)| Box::from(k)));
-            }
+            // Capture schema columns for split-rotation replay (Option-W:
+            // no overflow side-channel, so the schema is the full header).
+            let header: Vec<Box<str>> = self.schema.columns().to_vec();
             *self.shared_header.lock().unwrap() = Some(header);
             self.captured = true;
         }
@@ -265,19 +252,6 @@ mod tests {
         let output = write_to_string(&schema, CsvWriterConfig::default(), &records);
         // Null becomes empty string between delimiters
         assert_eq!(output, "a,b,c\nx,,z\n");
-    }
-
-    #[test]
-    fn test_csv_writer_overflow_fields_emit_order() {
-        let schema = make_schema(&["id"]);
-        let mut record = make_record(&schema, vec![Value::Integer(1)]);
-        record.set_overflow("zulu".into(), Value::String("z".into()));
-        record.set_overflow("alpha".into(), Value::String("a".into()));
-        record.set_overflow("mike".into(), Value::String("m".into()));
-
-        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
-        // Schema field first, then overflow in emit order (insertion order)
-        assert_eq!(output, "id,zulu,alpha,mike\n1,z,a,m\n");
     }
 
     #[test]

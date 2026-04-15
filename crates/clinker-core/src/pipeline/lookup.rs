@@ -167,12 +167,16 @@ pub fn find_matches(
         (0..table.len()).collect()
     };
 
+    // The where predicate has a zero-column standalone OutputLayout (it's
+    // a filter with no emits), so the positional input_record is unused
+    // for passthrough; we pass the matched candidate as the positional
+    // source for consistency with Option W's per-record shape.
     let mut matches = Vec::new();
     for i in candidates {
         let candidate = &table.records()[i];
         let resolver = LookupResolver::matched(input, table.source_name(), candidate);
         let result = where_evaluator
-            .eval_record::<NullStorage>(ctx, &resolver, None)
+            .eval_record::<NullStorage>(ctx, candidate, &resolver, None)
             .map_err(|e| LookupError::PredicateError {
                 source: table.source_name().to_string(),
                 row: i,

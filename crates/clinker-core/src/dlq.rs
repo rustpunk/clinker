@@ -21,6 +21,15 @@ pub enum DlqErrorCategory {
     /// Distinct from `AggregateTypeError`, which fires during the per-record
     /// add path. Routed by the Phase 16 executor dispatch arm (Task 16.3.13).
     AggregateFinalize,
+    /// Collateral demotion: this record passed its own evaluation but
+    /// belongs to a `correlation_key` group where another record failed.
+    /// Always emitted with `trigger: false`. See
+    /// `error_handling.correlation_key` in config docs.
+    Correlated,
+    /// A correlation-key group exceeded `max_group_buffer`. One summary
+    /// entry with `trigger: true` per overflowing group; peer records in
+    /// the group land as collateral.
+    GroupSizeExceeded,
 }
 
 impl DlqErrorCategory {
@@ -33,6 +42,8 @@ impl DlqErrorCategory {
             Self::AggregateTypeError => "aggregate_type_error",
             Self::ValidationFailure => "validation_failure",
             Self::AggregateFinalize => "aggregate_finalize",
+            Self::Correlated => "correlated",
+            Self::GroupSizeExceeded => "group_size_exceeded",
         }
     }
 }

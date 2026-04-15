@@ -184,35 +184,6 @@ fn bench_metadata(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Overflow set + get ─────────────────────────────────────────────
-
-fn bench_overflow(c: &mut Criterion) {
-    let mut group = c.benchmark_group("overflow_set_get");
-    for overflow_count in [1, 10, 50] {
-        let schema = make_schema(5);
-        group.bench_with_input(
-            BenchmarkId::from_parameter(overflow_count),
-            &overflow_count,
-            |b, &count| {
-                b.iter(|| {
-                    let mut record = Record::new(Arc::clone(&schema), vec![Value::Null; 5]);
-                    for i in 0..count {
-                        record.set_overflow(
-                            format!("extra_{i}").into_boxed_str(),
-                            Value::Integer(i as i64),
-                        );
-                    }
-                    // Read back via get()
-                    if count > 0 {
-                        black_box(record.get(&format!("extra_{}", count - 1)));
-                    }
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
 // ── Batch record generation throughput ─────────────────────────────
 
 fn bench_factory_throughput(c: &mut Criterion) {
@@ -239,7 +210,6 @@ criterion_group!(
     bench_value_from_string,
     bench_schema_index,
     bench_metadata,
-    bench_overflow,
     bench_factory_throughput,
 );
 criterion_main!(benches);

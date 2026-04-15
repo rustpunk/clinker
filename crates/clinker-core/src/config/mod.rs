@@ -1349,7 +1349,14 @@ impl PipelineConfig {
             };
             let node = &spanned.value;
             let name = node.name().to_string();
-            let plan_node = lower_node_to_plan_node(node, &name, span, &artifacts, &mut diags);
+            let plan_node = lower_node_to_plan_node(
+                node,
+                &name,
+                span,
+                &artifacts,
+                LowerScope::TopLevel,
+                &mut diags,
+            );
             if let Some(pn) = plan_node {
                 let idx = graph.add_node(pn);
                 name_to_idx.insert(name, idx);
@@ -1440,6 +1447,14 @@ impl PipelineConfig {
             },
             correlation_sort_note: None,
             node_properties: HashMap::new(),
+            // CompiledPlan's lowering path is a thin bind_schema-stage
+            // synthesis used only for composition/config validation
+            // preview (no CXL execution). It does not seed runtime
+            // `output_layouts`; the real path is
+            // `ExecutionPlanDag::compile_with_bound_schemas` at
+            // execute time, which takes the bind-time layouts map as
+            // input and augments it with synthesized-node inheritance.
+            output_layouts: HashMap::new(),
         };
 
         // If lowering accumulated any non-composition error-severity
@@ -1471,11 +1486,24 @@ fn input_target(input: &node_header::NodeInput) -> &str {
 /// or for compositions whose binding failed (no body assignment in
 /// `artifacts`). Called from `PipelineConfig::compile()` Stage 5 for
 /// top-level nodes and from `bind_composition` for body nodes.
+/// Scope discriminator for `lower_node_to_plan_node` lookups into
+/// `CompileArtifacts`. TOP-LEVEL DAG nodes read TypedPrograms from
+/// `artifacts.typed`; composition body nodes read from
+/// `artifacts.composition_body_typed`. This makes the split of
+/// top-level vs body TypedProgram storage structurally visible at
+/// every lowering call site (Option W execution-debt closure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LowerScope {
+    TopLevel,
+    Body,
+}
+
 pub(crate) fn lower_node_to_plan_node(
     node: &PipelineNode,
     name: &str,
     span: crate::span::Span,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    scope: LowerScope,
     diags: &mut Vec<crate::error::Diagnostic>,
 ) -> Option<crate::plan::execution::PlanNode> {
     use crate::error::{Diagnostic, LabeledSpan};
@@ -1497,10 +1525,20 @@ pub(crate) fn lower_node_to_plan_node(
         }),
         PipelineNode::Transform { config, .. } => {
             // Missing typed program means bind_schema hit a CXL error
-            // (E108, E200, etc.) on this node — skip lowering.
-            let typed = match artifacts.typed.get(name) {
-                Some(t) => t.clone(),
-                None => return None,
+            // (E108, E200, etc.) on this node — skip lowering. Look up
+            // in the scope-appropriate map: top-level DAG Transforms
+            // live in `artifacts.typed` (runtime-canonical layouts);
+            // body Transforms live in `artifacts.composition_body_typed`
+            // (standalone layouts).
+            let typed = match scope {
+                LowerScope::TopLevel => match artifacts.typed.get(name) {
+                    Some(t) => t.clone(),
+                    None => return None,
+                },
+                LowerScope::Body => match artifacts.composition_body_typed.get(name) {
+                    Some(t) => t.clone(),
+                    None => return None,
+                },
             };
             Some(PlanNode::Transform {
                 name: name.to_string(),
@@ -1569,10 +1607,46 @@ pub(crate) fn lower_node_to_plan_node(
     }
 }
 
-/// Correlation key for grouped DLQ rejection.
+/// Correlation key for grouped DLQ rejection. Defines an **atomic
+/// failure domain**: records sharing a key value form a correlation
+/// group, and the entire group succeeds or fails atomically.
 ///
-/// When set on `ErrorHandlingConfig`, all records sharing a correlation key value
-/// are DLQ'd atomically if any single record in the group fails evaluation.
+/// # Semantics
+///
+/// - If any record in a group produces a DLQ entry during pipeline
+///   execution, the entire group is rejected. Root-cause records land
+///   in DLQ with `trigger: true`. OK records from the same group are
+///   demoted to collateral DLQ with `trigger: false` and the
+///   error message `"correlated with failure in group: {first_failure_msg}"`.
+/// - Otherwise (all records in the group succeed), every record flows
+///   through to the configured output.
+///
+/// # Structural consequences
+///
+/// correlation_key **partitions the pipeline into per-group
+/// execution**. Transforms, routes, and aggregates run within a single
+/// correlation group at a time. Aggregates in the downstream DAG thus
+/// aggregate per-group — which is the direct consequence of treating
+/// the group as an atomicity unit.
+///
+/// # Unsupported combinations
+///
+/// Combining `correlation_key` with window operations or other
+/// arena-required nodes is rejected at plan time with
+/// `PlanError::CorrelationKeyWithArena` (E150). Per-group arena
+/// construction is planned follow-up work; see
+/// `docs/internal/FOLLOWUP-correlation-with-arena.md`.
+///
+/// # Group size
+///
+/// A per-group buffer cap is configured via
+/// `ErrorHandlingConfig::max_group_buffer` (default 100,000). A group
+/// exceeding this cap is DLQ'd in its entirety with a
+/// `DlqErrorCategory::GroupSizeExceeded` root-cause entry plus
+/// collateral entries for every buffered peer.
+///
+/// # Config
+///
 /// Custom `Deserialize`: accepts `"field"` string or `["f1", "f2"]` array.
 #[derive(Debug, Clone, Serialize)]
 pub enum CorrelationKey {

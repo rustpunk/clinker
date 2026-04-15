@@ -1,0 +1,59 @@
+pipeline:
+  name: bench-transform-chain
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: transform
+    name: clean
+    input: source
+    config:
+      cxl: |
+        emit val = f0.clamp(0, 999999)
+        emit label = f1.upper().trim()
+        emit amount = f2
+        emit code = f3.left(3)
+
+  - type: transform
+    name: derive
+    input: clean
+    config:
+      cxl: |
+        emit val = val
+        emit label = label
+        emit amount = amount
+        emit code = code
+        emit ratio = val.to_float() / (amount.to_float() + 1.0)
+        emit tier = if val > 500000 then "A" else if val > 100000 then "B" else "C"
+
+  - type: transform
+    name: finalize
+    input: derive
+    config:
+      cxl: |
+        emit final_val = val * 2
+        emit final_label = label
+        emit final_tier = tier
+        emit final_ratio = ratio.round(2)
+        filter amount > 0
+
+  - type: output
+    name: sink
+    input: finalize
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

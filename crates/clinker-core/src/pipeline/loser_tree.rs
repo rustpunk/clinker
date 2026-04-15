@@ -36,23 +36,23 @@ impl Ord for MergeEntry {
     }
 }
 
-/// K-way merge loser tree.
+/// K-way merge loser tree, generic over any `Ord` entry type.
 ///
 /// After initialization, `winner()` returns the smallest element.
 /// Call `replace_winner(next)` to advance: supply the next element
 /// from the winning stream (or `None` if exhausted), and the tree
 /// replays to find the new winner.
-pub struct LoserTree {
+pub struct LoserTree<T: Ord> {
     /// Internal nodes. `tree[0]` holds the overall winner index.
     /// `tree[1..k]` hold loser indices at each internal node.
     tree: Vec<usize>,
     /// One cursor per input stream. `None` = exhausted (infinity sentinel).
-    cursors: Vec<Option<MergeEntry>>,
+    cursors: Vec<Option<T>>,
 }
 
-impl LoserTree {
+impl<T: Ord> LoserTree<T> {
     /// Create a new loser tree from initial entries (one per stream).
-    pub fn new(initial_entries: Vec<Option<MergeEntry>>) -> Self {
+    pub fn new(initial_entries: Vec<Option<T>>) -> Self {
         let k = initial_entries.len();
         let mut lt = LoserTree {
             tree: vec![usize::MAX; k],
@@ -63,7 +63,7 @@ impl LoserTree {
     }
 
     /// The current winner entry, or `None` if all streams are exhausted.
-    pub fn winner(&self) -> Option<&MergeEntry> {
+    pub fn winner(&self) -> Option<&T> {
         if self.cursors.is_empty() {
             return None;
         }
@@ -77,7 +77,7 @@ impl LoserTree {
 
     /// Replace the winner's entry with the next element from its stream
     /// (or `None` if exhausted), then replay the tree to find the new winner.
-    pub fn replace_winner(&mut self, entry: Option<MergeEntry>) {
+    pub fn replace_winner(&mut self, entry: Option<T>) {
         let winner_idx = self.tree[0];
         self.cursors[winner_idx] = entry;
         self.update_loser_tree();

@@ -303,6 +303,13 @@ fn main() -> ExitCode {
                         PipelineError::Format(_)
                         | PipelineError::ThreadPool(_)
                         | PipelineError::Multiple(_) => ExitCode::from(4),
+                        // `CorrelationGroupOverflow` is a non-fatal
+                        // diagnostic carrier: it surfaces only inside
+                        // DLQ entries during per-group accounting and is
+                        // never returned as Err from the pipeline. Map
+                        // to partial-success (2) if it ever reaches
+                        // here, matching DLQ presence semantics.
+                        PipelineError::CorrelationGroupOverflow { .. } => ExitCode::from(2),
                     }
                 }
             }

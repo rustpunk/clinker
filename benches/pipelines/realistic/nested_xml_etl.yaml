@@ -1,0 +1,45 @@
+pipeline:
+  name: bench-nested-xml-etl
+
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: xml
+      path: bench://input.xml
+      options:
+        record_path: root/data/record
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+
+  - type: transform
+    name: derive
+    input: source
+    config:
+      cxl: |
+        emit f0 = f0
+        emit f1 = f1
+        emit value = f2
+        emit label = f1.upper()
+
+  - type: aggregate
+    name: summarize
+    input: derive
+    config:
+      group_by: [f1]
+      strategy: hash
+      cxl: |
+        emit total = sum(value)
+        emit n = count(*)
+
+  - type: output
+    name: sink
+    input: summarize
+    config:
+      name: sink
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

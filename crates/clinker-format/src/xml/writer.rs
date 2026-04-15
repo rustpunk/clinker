@@ -57,22 +57,13 @@ impl<W: Write> XmlWriter<W> {
         Ok(())
     }
 
-    /// Collect all fields (schema + overflow) as (name, value) pairs,
-    /// then write them as nested XML elements.
+    /// Collect schema fields in order and write them as nested XML
+    /// elements (Option-W: no overflow side-channel).
     fn write_fields(&mut self, record: &Record) -> Result<(), FormatError> {
         let mut fields: Vec<(&str, &Value)> = Vec::new();
-
-        // Schema fields in order
         for col in self.schema.columns() {
             let val = record.get(col).unwrap_or(&Value::Null);
             fields.push((&**col, val));
-        }
-
-        // Overflow fields
-        if let Some(overflow) = record.overflow_fields() {
-            for (key, val) in overflow {
-                fields.push((key, val));
-            }
         }
 
         // Build a tree of field segments for nested expansion

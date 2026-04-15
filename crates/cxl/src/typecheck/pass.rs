@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use clinker_record::Schema;
 use indexmap::IndexMap;
 use regex::Regex;
 
@@ -76,6 +78,76 @@ struct FieldConstraint {
     span: Span,
 }
 
+/// Plan-time positional slot table for a node's output (Option-W codegen).
+///
+/// One per CXL-bearing node, attached to its [`TypedProgram`]. Holds the
+/// authoritative `Arc<Schema>` that runtime [`clinker_record::Record`] values
+/// produced by this node are aligned to, plus the precomputed `(name → slot)`
+/// resolution baked in at compile time. The evaluator never looks up emit
+/// names at runtime — it writes directly into `values[emit_slots[i]]`.
+///
+/// Sourced from `BoundSchemas.schema_of(node_name)` when constructed by
+/// `bind_schema`. When constructed standalone (REPL / unit tests with no
+/// upstream Row), the schema is derived from the program's non-meta emit
+/// names in statement order, with no passthroughs.
+///
+/// **Invariant** (debug_assert at construction):
+/// `schema.column_count() == passthroughs.len() + non_meta_emit_count`.
+/// **Drift guardrail (Failure mode #5 of RESEARCH-runtime-record-layout.md):**
+/// the executor checks `Arc::ptr_eq` between this `schema` and
+/// `BoundSchemas.schema_of(node_name)` at walker entry.
+#[derive(Debug, Clone)]
+pub struct OutputLayout {
+    /// The node's bound output schema. When attached by `bind_schema`, this
+    /// is the *same Arc* as `BoundSchemas.schema_of(name)` — one oracle.
+    pub schema: Arc<Schema>,
+    /// Indexed by statement position in `program.statements`. `Some(slot)`
+    /// iff the statement is a non-meta `Statement::Emit` whose `name` is at
+    /// `slot` in `schema`. `None` for Let / Filter / Distinct / Trace /
+    /// UseStmt / ExprStmt and for meta emits.
+    pub emit_slots: Vec<Option<u32>>,
+    /// `(upstream_slot, output_slot)` copies applied to the output `values`
+    /// vector before statement evaluation. One entry per upstream column NOT
+    /// shadowed by an emit with the same name. Standalone layouts (no
+    /// upstream context) carry an empty vector.
+    pub passthroughs: Vec<(u32, u32)>,
+}
+
+impl OutputLayout {
+    /// Build a *standalone* layout for a TypedProgram that has no upstream
+    /// context (REPL / unit tests). Schema is constructed from the non-meta
+    /// emit names in statement order; passthroughs are empty; `emit_slots[i]`
+    /// matches the emit's position in that schema.
+    ///
+    /// `bind_schema` produces an upstream-aware layout via
+    /// `build_output_layout` and replaces this one through
+    /// `TypedProgram::with_output_layout`.
+    pub fn standalone(program: &Program) -> Arc<Self> {
+        let mut emit_names: Vec<Box<str>> = Vec::new();
+        let mut emit_slots: Vec<Option<u32>> = Vec::with_capacity(program.statements.len());
+        for stmt in &program.statements {
+            match stmt {
+                Statement::Emit {
+                    name,
+                    is_meta: false,
+                    ..
+                } => {
+                    let slot = emit_names.len() as u32;
+                    emit_names.push(Box::<str>::from(name.as_ref()));
+                    emit_slots.push(Some(slot));
+                }
+                _ => emit_slots.push(None),
+            }
+        }
+        let schema = Arc::new(Schema::new(emit_names));
+        Arc::new(Self {
+            schema,
+            emit_slots,
+            passthroughs: Vec::new(),
+        })
+    }
+}
+
 /// Output of the type checker. Flat struct — takes ownership of ResolvedProgram fields.
 /// Distinct type: compiler enforces Program → ResolvedProgram → TypedProgram ordering.
 /// Must be Send + Sync for Arc sharing across rayon workers.
@@ -91,6 +163,27 @@ pub struct TypedProgram {
     pub regexes: Vec<Option<Regex>>,
     /// Total node count.
     pub node_count: u32,
+    /// Plan-time positional slot table for output materialization (Option W).
+    /// Always present: `type_check_with_mode` builds a standalone layout
+    /// unconditionally; `bind_schema` replaces it with an upstream-aware
+    /// layout via [`Self::with_output_layout`]. Single oracle, structural
+    /// invariant — no `Option`, no lazy init.
+    pub output_layout: Arc<OutputLayout>,
+}
+
+impl TypedProgram {
+    /// Replace the standalone layout with an upstream-aware one. Called by
+    /// `bind_schema` after `propagate_row` / `propagate_aggregate` produces
+    /// the node's bound output Row.
+    pub fn with_output_layout(mut self, layout: Arc<OutputLayout>) -> Self {
+        debug_assert_eq!(
+            layout.emit_slots.len(),
+            self.program.statements.len(),
+            "OutputLayout::emit_slots length must equal program.statements length"
+        );
+        self.output_layout = layout;
+        self
+    }
 }
 
 /// Run Phase C: type-check a resolved program in row-level mode (the
@@ -157,6 +250,11 @@ pub fn type_check_with_mode(
     let types = checker.types;
     let regexes = checker.regexes;
 
+    // Build the standalone layout from the program's own emits. `bind_schema`
+    // replaces this with an upstream-aware layout via `with_output_layout`
+    // before exposing the TypedProgram to the executor.
+    let output_layout = OutputLayout::standalone(&program);
+
     Ok(TypedProgram {
         program,
         bindings,
@@ -164,6 +262,7 @@ pub fn type_check_with_mode(
         field_types,
         regexes,
         node_count,
+        output_layout,
     })
 }
 

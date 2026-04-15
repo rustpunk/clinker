@@ -191,6 +191,13 @@ pub enum PipelineError {
     MergeSortOrderViolation {
         message: String,
     },
+    /// A correlation-key group exceeded `error_handling.max_group_buffer`.
+    /// Used only as a diagnostic carrier for the root-cause DLQ entry
+    /// emitted when overflow occurs. Does NOT hard-abort the pipeline.
+    CorrelationGroupOverflow {
+        group_key: String,
+        count: u64,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -238,6 +245,14 @@ impl fmt::Display for PipelineError {
             }
             Self::MergeSortOrderViolation { message } => {
                 write!(f, "spill-merge sort-order violation: {message}")
+            }
+            Self::CorrelationGroupOverflow { group_key, count } => {
+                write!(
+                    f,
+                    "correlation-key group {group_key:?} exceeded max_group_buffer \
+                     after {count} records — remaining records of the group are \
+                     DLQ'd as collateral"
+                )
             }
         }
     }

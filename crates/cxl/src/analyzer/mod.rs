@@ -232,12 +232,21 @@ fn walk_expr(
             }
         }
 
-        // Field access on a window result: `window.first().name` might also appear as
-        // QualifiedFieldRef if the parser treats it that way
+        // Field access. Any bare `FieldRef` means this transform needs
+        // the field from the upstream record at runtime — Option W's
+        // arena projection must include it, or the evaluator will read
+        // Null from a missing slot. This was a latent bug before the
+        // arena/DAG unification: the analyzer tracked only
+        // window-argument fields, so plain `emit f1 = f1` inside a
+        // window-using transform silently dropped f1.
+        //
+        // `postfix_target` is additionally collected for
+        // `window.first().name`-style access (so we can attach the
+        // postfix to the preceding WindowCall for aggregate-op dispatch).
         Expr::FieldRef { name, .. } => {
+            fields.insert(name.to_string());
             if let Some(postfix) = postfix_target {
                 postfix.push(name.to_string());
-                fields.insert(name.to_string());
             }
         }
 
@@ -331,7 +340,14 @@ mod tests {
         let typed = compile("let x = amount + 1\nemit result = x * 2");
         let analysis = analyze_transform("test", &typed);
         assert!(analysis.window_calls.is_empty());
-        assert!(analysis.accessed_fields.is_empty());
+        // Under Option W, `accessed_fields` tracks every FieldRef the
+        // transform reads (not just fields reached via window calls) so
+        // the arena projection covers every field needed at runtime.
+        // `amount` is referenced in the `let` expression.
+        assert!(
+            analysis.accessed_fields.contains("amount"),
+            "amount is referenced in the let binding"
+        );
         assert_eq!(analysis.parallelism_hint, ParallelismHint::Stateless);
     }
 

@@ -266,18 +266,16 @@ impl JsonReader {
         flat: &serde_json::Map<String, serde_json::Value>,
         schema: &Arc<Schema>,
     ) -> Record {
+        // Option-W: the source record carries the declared source
+        // schema; fields present in the JSON document but not in the
+        // schema are dropped. Users must declare all interesting
+        // columns (or run `clinker guess` at authoring time).
         let values: Vec<Value> = schema
             .columns()
             .iter()
             .map(|col| flat.get(&**col).map(json_to_value).unwrap_or(Value::Null))
             .collect();
-        let mut record = Record::new(Arc::clone(schema), values);
-        for (key, val) in flat {
-            if schema.index(key).is_none() {
-                record.set_overflow(key.clone().into(), json_to_value(val));
-            }
-        }
-        record
+        Record::new(Arc::clone(schema), values)
     }
 }
 
@@ -662,14 +660,18 @@ mod tests {
     }
 
     #[test]
-    fn test_json_new_fields_to_overflow() {
+    fn test_json_new_fields_outside_schema_are_dropped() {
+        // Option-W: the source record carries the inferred schema;
+        // fields present in a later record but absent from the
+        // inferred schema are dropped. The overflow side-channel has
+        // been removed per the 2026-04-13 research.
         let mut r = reader_from_str("{\"a\":1}\n{\"a\":2,\"b\":3}\n", default_config());
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 1);
         let _r1 = r.next_record().unwrap().unwrap();
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("a"), Some(&Value::Integer(2)));
-        assert_eq!(r2.get("b"), Some(&Value::Integer(3)));
+        assert_eq!(r2.get("b"), None);
     }
 
     #[test]
@@ -692,6 +694,11 @@ mod tests {
 
     #[test]
     fn test_json_array_paths_empty_array() {
+        // Schema is inferred from the first document's exploded
+        // records. Alice has `orders: []`, which produces zero
+        // exploded rows, so the schema is empty. Option-W: fields
+        // absent from the inferred schema are dropped — Bob's
+        // `name` and `orders.id` both become invisible.
         let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
         let config = JsonReaderConfig {
             array_paths: vec![ArrayPathSpec {
@@ -702,9 +709,10 @@ mod tests {
             ..default_config()
         };
         let mut r = reader_from_str(input, config);
-        let _s = r.schema().unwrap();
+        let s = r.schema().unwrap();
+        assert_eq!(s.columns().len(), 0);
         let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.get("name"), Some(&Value::String("Bob".into())));
+        assert_eq!(r1.get("name"), None);
         assert!(r.next_record().unwrap().is_none());
     }
 }

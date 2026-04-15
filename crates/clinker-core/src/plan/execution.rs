@@ -19,6 +19,7 @@ use crate::config::{
     AggregateConfig, OutputConfig, PipelineConfig, RouteMode, SortField, SourceConfig,
 };
 use crate::error::PipelineError;
+use crate::plan::bound_schemas::BoundSchemas;
 use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
 use crate::plan::properties::{
@@ -578,6 +579,15 @@ pub struct ExecutionPlanDag {
     /// [`compute_node_properties`](ExecutionPlanDag::compute_node_properties)
     /// after transform compilation. Default-empty on construction.
     pub node_properties: HashMap<NodeIndex, crate::plan::properties::NodeProperties>,
+    /// Per-plan-node canonical `Arc<OutputLayout>` map — the single
+    /// oracle consumed by the Output arm to honor `include_unmapped`
+    /// projection semantics (Option W Amendment A7). Complete at
+    /// plan-compile time: seeded from `CompileArtifacts.output_layouts`
+    /// (user-facing nodes) and augmented with synthesized-node
+    /// inheritance (Route, Merge, Sort — planner passthrough nodes
+    /// inherit upstream's layout). No runtime derivation; executor
+    /// reads and consults.
+    pub output_layouts: HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
 }
 
 impl ExecutionPlanDag {
@@ -713,7 +723,7 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
     ) -> Result<Self, PlanError> {
-        Self::compile_with_runtime_schema(config, compiled, None)
+        Self::compile_with_bound_schemas(config, compiled, None, None, None)
     }
 
     /// Variant of [`compile`] that accepts the actual runtime Arrow
@@ -726,6 +736,38 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         compiled: &[(&str, &TypedProgram)],
         runtime_input_schema: Option<&[String]>,
+    ) -> Result<Self, PlanError> {
+        Self::compile_with_bound_schemas(config, compiled, None, runtime_input_schema, None)
+    }
+
+    /// Option-W variant: resolves aggregate `group_by_indices` against
+    /// the upstream node's bound output row (from `bind_schema`).
+    ///
+    /// This is the correct plan-time schema oracle: the runtime record
+    /// entering an aggregate carries the upstream node's bound output
+    /// schema positionally, so indices resolved against that schema
+    /// match the runtime `Record::values` layout exactly. Replaces the
+    /// Task 16.3.13 TODO — the reconciliation that never landed —
+    /// with the final Option-W contract.
+    ///
+    /// `bound_schemas` is `None` only for legacy test paths that do
+    /// not run `bind_schema`; in that case we fall back to the Arrow
+    /// runtime schema (`runtime_input_schema`) or the typed-program's
+    /// declared field set.
+    pub fn compile_with_bound_schemas(
+        config: &PipelineConfig,
+        compiled: &[(&str, &TypedProgram)],
+        bound_schemas: Option<&BoundSchemas>,
+        runtime_input_schema: Option<&[String]>,
+        // Bind-time `CompileArtifacts.output_layouts` map: keyed by
+        // user-facing node names, one `Arc<OutputLayout>` per
+        // top-level Source/Transform/Aggregate/Route/Merge. The
+        // planner augments this map with inherited layouts for any
+        // synthesized Route/Merge/Sort nodes it creates, storing the
+        // complete result in `ExecutionPlanDag.output_layouts`. When
+        // `None`, no augmentation runs and the plan's output_layouts
+        // stays empty (legacy / test paths without bind_schema).
+        bind_time_output_layouts: Option<&HashMap<String, Arc<cxl::typecheck::OutputLayout>>>,
     ) -> Result<Self, PlanError> {
         // D3a part2: collect source/output configs from the unified
         // `nodes:` topology once, then use the owned Vecs throughout.
@@ -895,6 +937,12 @@ impl ExecutionPlanDag {
             )?;
         }
 
+        // Declaration-order "chain predecessor" for `ResolvedInput::Chain`.
+        // Tracks the most recent spec name so that a `Chain`-wired
+        // aggregate can resolve its upstream for `BoundSchemas` lookup.
+        // Matches the Phase-2 edge-wiring `prev_transform_key` logic.
+        let mut prev_chain_name: Option<String> = None;
+
         // Transform nodes in declaration order (deterministic toposort per V-7-2)
         for (i, tc) in specs.iter().enumerate() {
             let analysis = &report.transforms[i];
@@ -960,23 +1008,44 @@ impl ExecutionPlanDag {
                 }
 
                 let typed = compiled[i].1;
-                // Synthetic input schema: deterministic ordering of every
-                // field referenced by the CXL program. Task 16.3.13 will
-                // reconcile this with the upstream node's true schema; for
-                // unit-test scope the projection is the identity since the
-                // executor projects records into this same order before
-                // passing them into the hash aggregator.
-                // Phase 16b Task 16b.9: prefer the runtime Arrow
-                // schema when available. `typed.field_types` now comes
-                // from the author-declared source schema which may
-                // contain columns not present in the actual file; the
-                // aggregator projects records by positional index, so
-                // group_by_indices must be resolved against the
-                // runtime layout, not the declared superset.
-                let input_schema: Vec<String> = match runtime_input_schema {
-                    Some(rt) => rt.to_vec(),
-                    None => typed.field_types.keys().cloned().collect(),
+                // Option W — resolve the aggregator's input schema
+                // against the **upstream node's bound output row**. This
+                // is the positional slot table for records flowing into
+                // the aggregator: at runtime every record carries the
+                // upstream's bound output schema on `Record::schema`
+                // with `values` aligned to it, so `group_by_indices`
+                // derived here point at the right slots at
+                // `add_record` time.
+                //
+                // Replaces the stale Task-16.3.13 reconciliation that
+                // fed the aggregator the source's Arrow schema (or the
+                // typed program's declared field set) — both of which
+                // drift whenever an upstream transform emits new
+                // columns (e.g. `emit priority = ...` then
+                // `group_by: [priority]`).
+                let upstream_name: Option<&str> = match &tc.input {
+                    ResolvedInput::Single(name) => {
+                        // `Single("route_name.branch_name")` shares the
+                        // route's bound output row (routes pass their
+                        // upstream schema through unchanged per
+                        // bind_schema).
+                        Some(name.split('.').next().unwrap_or(name.as_str()))
+                    }
+                    ResolvedInput::Chain => prev_chain_name.as_deref().or({
+                        if primary_source.is_empty() {
+                            None
+                        } else {
+                            Some(primary_source.as_str())
+                        }
+                    }),
+                    // `Multi` was rejected above.
+                    ResolvedInput::Multi(_) => unreachable!("aggregate with multi-input rejected"),
                 };
+
+                let input_schema: Vec<String> = bound_schemas
+                    .and_then(|bs| upstream_name.and_then(|n| bs.columns_of(n)))
+                    .or_else(|| runtime_input_schema.map(|rt| rt.to_vec()))
+                    .unwrap_or_else(|| typed.field_types.keys().cloned().collect());
 
                 let compiled_agg =
                     cxl::plan::extract_aggregates(typed, &agg_cfg.group_by, &input_schema)
@@ -985,21 +1054,25 @@ impl ExecutionPlanDag {
                             diagnostics: diags.into_iter().map(|d| d.message).collect(),
                         })?;
 
-                // Output schema: non-meta emit names in declaration order.
-                let output_columns: Vec<Box<str>> = typed
-                    .program
-                    .statements
-                    .iter()
-                    .filter_map(|s| match s {
-                        Statement::Emit {
-                            name,
-                            is_meta: false,
-                            ..
-                        } => Some(name.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                let output_schema = Arc::new(Schema::new(output_columns));
+                // Option-W oracle: the Aggregate node's output_schema is
+                // sourced from `BoundSchemas` — the single canonical
+                // `Arc<Schema>` built by `bind_schema::propagate_aggregate`
+                // (group_by cols + emits, in that order). Re-deriving it
+                // here from `typed.program.statements` would diverge: that
+                // gave emits-only in declaration order, which mismatched
+                // the true aggregate output row and misaligned positional
+                // slots downstream. (Plan agent's Amendment A3.)
+                let output_schema = bound_schemas
+                    .and_then(|bs| bs.schema_of(&tc.name))
+                    .or_else(|| Some(Arc::clone(&typed.output_layout.schema)))
+                    .ok_or_else(|| PlanError::AggregateExtractionFailed {
+                        transform: tc.name.clone(),
+                        diagnostics: vec![format!(
+                            "Option-W: no bound schema available for aggregate {:?} — \
+                             bind_schema must have run before execution plan compilation",
+                            tc.name
+                        )],
+                    })?;
 
                 add_node(
                     &mut graph,
@@ -1017,6 +1090,10 @@ impl ExecutionPlanDag {
                     &mut node_by_name,
                     &mut slug_set,
                 )?;
+
+                // Track this aggregate as the chain predecessor for a
+                // subsequent `ResolvedInput::Chain` downstream node.
+                prev_chain_name = Some(tc.name.clone());
 
                 continue;
             }
@@ -1072,6 +1149,10 @@ impl ExecutionPlanDag {
                     &mut slug_set,
                 )?;
             }
+
+            // Track this transform as the chain predecessor for a
+            // subsequent `ResolvedInput::Chain` downstream node.
+            prev_chain_name = Some(tc.name.clone());
         }
 
         // Output nodes
@@ -1198,7 +1279,15 @@ impl ExecutionPlanDag {
             prev_transform_key = Some(transform_key);
         }
 
-        // Wire output nodes to last transform
+        // Wire output nodes to the last transform — or to a
+        // synthesized `route_{transform}` Route node if the last
+        // transform carries a route config. Option-W unified dispatch:
+        // the Route node sits between the transform and the outputs in
+        // the data flow so the unified DAG walker's Route arm is
+        // responsible for multi-output splitting. (Previously, outputs
+        // connected directly to the transform and a now-deleted
+        // streaming path dispatched via `compiled_route`; that
+        // streaming path is gone, so the Route node must be in-line.)
         for output in &output_configs_owned {
             let output_key = format!("output.{}", output.name);
             let output_idx = node_by_name[&output_key];
@@ -1206,8 +1295,18 @@ impl ExecutionPlanDag {
             if let Some(ref prev_key) = prev_transform_key
                 && let Some(&prev_idx) = node_by_name.get(prev_key)
             {
+                // If the last transform had a route config, wire the
+                // output to the synthesized Route node instead.
+                let route_key_opt = prev_key
+                    .strip_prefix("transform.")
+                    .map(|base| format!("route.route_{base}"));
+                let data_src = route_key_opt
+                    .as_ref()
+                    .and_then(|k| node_by_name.get(k.as_str()))
+                    .copied()
+                    .unwrap_or(prev_idx);
                 graph.add_edge(
-                    prev_idx,
+                    data_src,
                     output_idx,
                     PlanEdge {
                         dependency_type: DependencyType::Data,
@@ -1254,6 +1353,9 @@ impl ExecutionPlanDag {
             parallelism,
             correlation_sort_note: None,
             node_properties: HashMap::new(),
+            // Populated after correlation-sort + enforcer-sort
+            // injection (below) so synthesised nodes are accounted for.
+            output_layouts: HashMap::new(),
         };
 
         // Task 16.0.5.10: enforcer-insertion → property derivation, in that
@@ -1293,6 +1395,39 @@ impl ExecutionPlanDag {
         // graph topology.
         dag.select_aggregation_strategies()
             .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
+
+        // E150: reject correlation_key + arena-required plans. Per-group
+        // Arena construction is documented follow-up work (see
+        // docs/internal/FOLLOWUP-correlation-with-arena.md).
+        if config.error_handling.correlation_key.is_some() && dag.required_arena() {
+            return Err(PlanError::CorrelationKeyWithArena);
+        }
+
+        // Populate `dag.output_layouts`: seed from bind-time entries
+        // (user-facing nodes) and walk the topo order to inherit
+        // layouts for planner-synthesized passthrough nodes (Route,
+        // Merge, Sort, etc.). Complete at this point; executor reads
+        // without further derivation.
+        if let Some(seed) = bind_time_output_layouts {
+            dag.output_layouts = seed.clone();
+            for &node_idx in &dag.topo_order {
+                let node_name = dag.graph[node_idx].name().to_string();
+                if dag.output_layouts.contains_key(&node_name) {
+                    continue;
+                }
+                let inherited = dag
+                    .graph
+                    .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+                    .find_map(|p| dag.output_layouts.get(dag.graph[p].name()).cloned());
+                if let Some(layout) = inherited {
+                    dag.output_layouts.insert(node_name, layout);
+                }
+                // Nodes with no upstream layout (e.g., an Output
+                // directly downstream of a Source with no wired edge)
+                // remain absent. The executor's Output arm handles
+                // that case by continuing without writing.
+            }
+        }
 
         Ok(dag)
     }
@@ -2819,6 +2954,11 @@ pub enum PlanError {
     AggregateWithMultipleInputs {
         transform: String,
     },
+    /// E150: `error_handling.correlation_key` is not supported for
+    /// pipelines that require an Arena (window operations). Per-group
+    /// arena construction is documented follow-up work. Emitted at
+    /// plan-compile time.
+    CorrelationKeyWithArena,
 }
 
 impl std::fmt::Display for PlanError {
@@ -2891,6 +3031,17 @@ impl std::fmt::Display for PlanError {
                     f,
                     "aggregate transform '{}' cannot consume multiple inputs",
                     transform
+                )
+            }
+            PlanError::CorrelationKeyWithArena => {
+                write!(
+                    f,
+                    "E150: error_handling.correlation_key is not supported for \
+                     pipelines with window operations or other arena-required \
+                     nodes; per-group arena construction is planned work (see \
+                     docs/internal/FOLLOWUP-correlation-with-arena.md). \
+                     To proceed, either remove correlation_key or remove the \
+                     window/arena operation."
                 )
             }
         }

@@ -1,65 +1,56 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
+use cxl::typecheck::OutputLayout;
 use indexmap::IndexMap;
 
 use crate::config::{ConfigError, IncludeMetadata, OutputConfig};
 use crate::error::PipelineError;
 
-/// Apply schema aliases to emitted fields: rename keys from original to alias names.
+/// Apply output projection to a fully-materialized positional record
+/// (Option-W): gather → exclude → mapping. No per-record emitted map —
+/// the record already carries all output columns in their planner-
+/// allocated slots; the producing node's `OutputLayout` identifies
+/// which of those columns are CXL-named (emits) vs passthroughs.
 ///
-/// Alias creates an identity boundary (SQL model): CXL uses original field names,
-/// but output-facing code (mapping, writers) sees the post-alias names.
-pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<String, String>) {
-    if aliases.is_empty() {
-        return;
-    }
-    let entries: Vec<(String, Value)> = emitted.drain(..).collect();
-    for (name, value) in entries {
-        let output_name = aliases.get(&name).cloned().unwrap_or(name);
-        emitted.insert(output_name, value);
-    }
-}
-
-/// Apply output projection: gather → exclude → mapping.
-///
-/// 1. **Gather**: Start with CXL-emitted fields. If `include_unmapped`,
-///    add all input fields not already emitted.
+/// 1. **Gather**: Start with CXL-named columns (positional slots in
+///    `layout.emit_slots`). If `include_unmapped`, add all remaining
+///    columns of `record.schema()` (passthroughs).
 /// 2. **Exclude**: Remove any field in `exclude` list (by current name).
 /// 3. **Mapping**: Rename surviving fields per `mapping` table.
 pub fn project_output(
     input_record: &Record,
-    emitted: &IndexMap<String, Value>,
+    layout: &OutputLayout,
     config: &OutputConfig,
 ) -> Record {
-    project_output_with_meta(input_record, emitted, &IndexMap::new(), config)
+    project_output_with_meta(input_record, layout, &IndexMap::new(), config)
 }
 
 /// Project output with explicit metadata map (from EvalResult::Emit).
 ///
-/// Metadata is sourced from the `metadata` parameter, not from `input_record.iter_meta()`,
-/// because `evaluate_record` works on a clone and the original input record has no metadata.
+/// Metadata is sourced from the `metadata` parameter, not from
+/// `input_record.iter_meta()`, because `evaluate_record` works on a
+/// clone and the original input record has no metadata.
 pub fn project_output_with_meta(
     input_record: &Record,
-    emitted: &IndexMap<String, Value>,
+    layout: &OutputLayout,
     metadata: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
-    // Step 1: Gather
-    let mut fields: IndexMap<String, Value> = IndexMap::new();
-
-    // CXL-emitted fields first
-    for (name, value) in emitted {
-        fields.insert(name.clone(), value.clone());
+    // Precompute: which positional slots in `layout.schema` correspond
+    // to CXL-named emits vs passthroughs. `layout.emit_slots` is
+    // indexed by Statement position; we project it to "is this column
+    // slot an emit?" as a fast `Vec<bool>` keyed by column slot.
+    let mut is_emit: Vec<bool> = vec![false; layout.schema.column_count()];
+    for slot in layout.emit_slots.iter().flatten() {
+        is_emit[*slot as usize] = true;
     }
 
-    // If include_unmapped, add input fields not already present
-    if config.include_unmapped {
-        for (name, value) in input_record.iter_all_fields() {
-            if !fields.contains_key(name) {
-                fields.insert(name.to_string(), value.clone());
-            }
+    // Step 1: Gather — walk the record positionally using layout.schema.
+    let mut fields: IndexMap<String, Value> = IndexMap::new();
+    for (i, col) in layout.schema.columns().iter().enumerate() {
+        if is_emit[i] || config.include_unmapped {
+            fields.insert(col.as_ref().to_string(), input_record.values()[i].clone());
         }
     }
 
@@ -145,27 +136,58 @@ pub fn merge_metadata_into_output(
 mod tests {
     use super::*;
 
-    fn make_input() -> Record {
+    /// Build a test layout where `full_name` is the CXL-emitted column
+    /// (slot 3) and `first_name`/`last_name`/`secret` are passthroughs
+    /// (slots 0/1/2 from the input).
+    fn make_layout_with_full_name_emit() -> OutputLayout {
+        // Output schema: input cols (passthroughs) followed by `full_name` emit.
         let schema = Arc::new(Schema::new(vec![
             "first_name".into(),
             "last_name".into(),
             "secret".into(),
+            "full_name".into(),
         ]));
-        Record::new(
+        // One statement: Emit full_name. emit_slots[0] = Some(3).
+        OutputLayout {
             schema,
-            vec![
-                Value::String("Alice".into()),
-                Value::String("Smith".into()),
-                Value::String("password123".into()),
-            ],
-        )
+            emit_slots: vec![Some(3)],
+            passthroughs: vec![(0, 0), (1, 1), (2, 2)],
+        }
+    }
+
+    fn make_identity_layout(schema: Arc<Schema>) -> OutputLayout {
+        // Pure passthrough — no emits, upstream == output.
+        let n = schema.column_count() as u32;
+        OutputLayout {
+            schema,
+            emit_slots: vec![],
+            passthroughs: (0..n).map(|i| (i, i)).collect(),
+        }
+    }
+
+    /// Input record aligned to the layout's schema (Option-W: record
+    /// carries the producing node's bound output schema). For the
+    /// `full_name` emit case this means a 4-column record.
+    fn make_record_for_layout(layout: &OutputLayout) -> Record {
+        let n = layout.schema.column_count();
+        let mut values = Vec::with_capacity(n);
+        for col in layout.schema.columns() {
+            let v = match col.as_ref() {
+                "first_name" => Value::String("Alice".into()),
+                "last_name" => Value::String("Smith".into()),
+                "secret" => Value::String("password123".into()),
+                "full_name" => Value::String("Alice Smith".into()),
+                _ => Value::Null,
+            };
+            values.push(v);
+        }
+        Record::new(Arc::clone(&layout.schema), values)
     }
 
     #[test]
     fn test_gather_emitted_plus_unmapped() {
-        let input = make_input();
-        let mut emitted = IndexMap::new();
-        emitted.insert("full_name".to_string(), Value::String("Alice Smith".into()));
+        let layout = make_layout_with_full_name_emit();
+        let input = make_record_for_layout(&layout);
 
         let config = OutputConfig {
             name: "out".into(),
@@ -183,7 +205,7 @@ mod tests {
             notes: None,
         };
 
-        let result = project_output(&input, &emitted, &config);
+        let result = project_output(&input, &layout, &config);
         assert_eq!(
             result.get("full_name"),
             Some(&Value::String("Alice Smith".into()))
@@ -200,8 +222,20 @@ mod tests {
 
     #[test]
     fn test_exclude_removes_fields() {
-        let input = make_input();
-        let emitted = IndexMap::new();
+        let schema = Arc::new(Schema::new(vec![
+            "first_name".into(),
+            "last_name".into(),
+            "secret".into(),
+        ]));
+        let layout = make_identity_layout(Arc::clone(&schema));
+        let input = Record::new(
+            schema,
+            vec![
+                Value::String("Alice".into()),
+                Value::String("Smith".into()),
+                Value::String("password123".into()),
+            ],
+        );
 
         let config = OutputConfig {
             name: "out".into(),
@@ -219,15 +253,27 @@ mod tests {
             notes: None,
         };
 
-        let result = project_output(&input, &emitted, &config);
+        let result = project_output(&input, &layout, &config);
         assert!(result.get("secret").is_none());
         assert!(result.get("first_name").is_some());
     }
 
     #[test]
     fn test_mapping_renames() {
-        let input = make_input();
-        let emitted = IndexMap::new();
+        let schema = Arc::new(Schema::new(vec![
+            "first_name".into(),
+            "last_name".into(),
+            "secret".into(),
+        ]));
+        let layout = make_identity_layout(Arc::clone(&schema));
+        let input = Record::new(
+            schema,
+            vec![
+                Value::String("Alice".into()),
+                Value::String("Smith".into()),
+                Value::String("password123".into()),
+            ],
+        );
 
         let mut mapping = IndexMap::new();
         mapping.insert("first_name".to_string(), "given_name".to_string());
@@ -248,7 +294,7 @@ mod tests {
             notes: None,
         };
 
-        let result = project_output(&input, &emitted, &config);
+        let result = project_output(&input, &layout, &config);
         assert!(result.get("first_name").is_none());
         assert_eq!(
             result.get("given_name"),

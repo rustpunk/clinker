@@ -518,12 +518,21 @@ mod tests {
         let resolver = TestResolver;
         let stable = eval::StableEvalContext::test_default();
         let ctx = eval::EvalContext::test_default_borrowed(&stable);
-        let result =
-            eval::eval_program::<crate::pipeline::arena::Arena>(&typed, &ctx, &resolver, None)
-                .unwrap();
+        let empty_schema = std::sync::Arc::new(clinker_record::Schema::new(Vec::<Box<str>>::new()));
+        let empty_input = clinker_record::Record::new(empty_schema, Vec::new());
+        let layout = std::sync::Arc::clone(&typed.output_layout);
+        let mut evaluator = eval::ProgramEvaluator::new(std::sync::Arc::new(typed), false);
+        let result = evaluator
+            .eval_record::<crate::pipeline::arena::Arena>(&ctx, &empty_input, &resolver, None)
+            .unwrap();
+        let values = match result {
+            eval::EvalResult::Emit { values, .. } => values,
+            eval::EvalResult::Skip(_) => panic!("expected Emit"),
+        };
+        let slot = layout.schema.index("x").expect("x slot");
         assert_eq!(
-            result.get("x"),
-            Some(&Value::String("EMP001".into())),
+            values[slot],
+            Value::String("EMP001".into()),
             "three-part path should resolve to EMP001"
         );
     }

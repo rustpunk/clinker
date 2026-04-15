@@ -110,19 +110,12 @@ impl<P: Serialize> SpillWriter<P> {
     pub fn write_pair(&mut self, record: &Record, payload: &P) -> Result<(), SpillError> {
         use serde_json::{Map, Value as JsonValue};
 
+        // Option-W: the record's schema *is* the complete field set.
+        // There is no overflow side-channel to persist.
         let mut record_obj = Map::with_capacity(record.total_field_count());
-
-        // Schema fields
         for (i, col) in self.schema.columns().iter().enumerate() {
             let val = record.values().get(i).unwrap_or(&Value::Null);
             record_obj.insert(col.to_string(), value_to_json(val));
-        }
-
-        // Overflow fields (CXL-emitted, not in schema)
-        if let Some(overflow) = record.overflow_fields() {
-            for (key, val) in overflow {
-                record_obj.insert(key.to_string(), value_to_json(val));
-            }
         }
 
         let payload_json = serde_json::to_value(payload)?;
@@ -258,14 +251,7 @@ impl<P: DeserializeOwned> SpillReader<P> {
             values.push(val);
         }
 
-        let mut record = Record::new(Arc::clone(&self.schema), values);
-
-        // Extract overflow fields (keys not in schema)
-        for (key, json_val) in obj {
-            if self.schema.index(key).is_none() {
-                record.set_overflow(key.clone().into_boxed_str(), json_to_value(json_val));
-            }
-        }
+        let record = Record::new(Arc::clone(&self.schema), values);
 
         let payload: P = serde_json::from_value(payload_json.clone())?;
         Ok((record, payload))
@@ -458,31 +444,6 @@ mod tests {
         let reader = spill_file.reader().unwrap();
         let records: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
         assert!(records.is_empty());
-    }
-
-    #[test]
-    fn test_spill_overflow_fields_preserved() {
-        let schema = test_schema();
-        let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
-
-        let mut record = make_record(&schema, "Alice", 100, true);
-        record.set_overflow("extra_field".into(), Value::String("bonus".into()));
-        record.set_overflow("score".into(), Value::Integer(42));
-        writer.write_record(&record).unwrap();
-
-        let spill_file = writer.finish().unwrap();
-        let reader = spill_file.reader().unwrap();
-        let records: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
-
-        assert_eq!(records.len(), 1);
-        // Schema fields
-        assert_eq!(records[0].get("name"), Some(&Value::String("Alice".into())));
-        // Overflow fields
-        assert_eq!(
-            records[0].get("extra_field"),
-            Some(&Value::String("bonus".into()))
-        );
-        assert_eq!(records[0].get("score"), Some(&Value::Integer(42)));
     }
 
     #[test]

@@ -475,6 +475,7 @@ mod tests {
             },
             correlation_sort_note: None,
             node_properties: Default::default(),
+            output_layouts: Default::default(),
         }
     }
 
