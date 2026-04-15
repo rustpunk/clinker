@@ -1,0 +1,31 @@
+# INVALID fixture: combine with only one declared input.
+# Expected: E300 at compile time (combine requires >= 2 inputs).
+# This fixture exists to exercise the validation failure path in C.0/C.1.
+name: error_one_input
+nodes:
+  - type: source
+    name: orders
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: combine
+    name: lonely
+    input:
+      orders: orders
+    config:
+      where: "orders.amount > 0"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id;
+        emit amount = orders.amount;
+  - type: output
+    name: lonely_out
+    input: lonely
+    config:
+      format: csv
+      path: /tmp/lonely_error_one_input.csv

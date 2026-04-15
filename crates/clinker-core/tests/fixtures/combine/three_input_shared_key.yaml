@@ -1,0 +1,55 @@
+# 3-input combine, shared equi key across all inputs.
+# Pattern: orders joined with products AND a per-product categories lookup,
+# all on product_id equality.
+# Input order is significant — IndexMap preserves insertion order (C.0.1 test).
+name: three_input_shared_key
+nodes:
+  - type: source
+    name: orders
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: source
+    name: categories
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: fully_enriched
+    input:
+      orders: orders
+      products: products
+      categories: categories
+    config:
+      where: "orders.product_id == products.product_id and products.product_id == categories.product_id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id;
+        emit product_id = orders.product_id;
+        emit product_name = products.name;
+        emit category = categories.category;
+        emit amount = orders.amount;
+  - type: output
+    name: fully_enriched_out
+    input: fully_enriched
+    config:
+      format: csv
+      path: /tmp/fully_enriched_three_input_shared_key.csv

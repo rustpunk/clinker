@@ -1,0 +1,46 @@
+# 2-input combine, explicit `drive:` hint selecting the build-side input as
+# the driving (probe) stream. The planner would default to orders (larger
+# input); `drive: products` overrides that to emit one row per product
+# enriched with the first matching order.
+name: drive_hint
+nodes:
+  - type: source
+    name: orders
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: product_driven
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      drive: products
+      cxl: |
+        emit product_id = products.product_id;
+        emit product_name = products.name;
+        emit category = products.category;
+        emit sample_order_id = orders.order_id;
+        emit sample_amount = orders.amount;
+  - type: output
+    name: product_driven_out
+    input: product_driven
+    config:
+      format: csv
+      path: /tmp/product_driven_drive_hint.csv

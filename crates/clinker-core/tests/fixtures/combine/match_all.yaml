@@ -1,0 +1,44 @@
+# 2-input combine, match: all — fan-out semantics.
+# For each order, emit one row per matching product entry. When the build side
+# has multiple rows per key this is 1:N; here products is unique per key so
+# the cardinality matches match:first, but the compile path is distinct.
+name: match_all
+nodes:
+  - type: source
+    name: orders
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: fanned
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: all
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id;
+        emit product_id = orders.product_id;
+        emit product_name = products.name;
+        emit amount = orders.amount;
+  - type: output
+    name: fanned_out
+    input: fanned
+    config:
+      format: csv
+      path: /tmp/fanned_match_all.csv

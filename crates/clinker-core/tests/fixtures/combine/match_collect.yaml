@@ -1,0 +1,42 @@
+# 2-input combine, match: collect — aggregates matches into a list field.
+# For each order row emit one output row with all matching products collected
+# into a single list-typed field (products_list).
+name: match_collect
+nodes:
+  - type: source
+    name: orders
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      format: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id;
+        emit amount = orders.amount;
+        emit products_list = products;
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      format: csv
+      path: /tmp/collected_match_collect.csv
