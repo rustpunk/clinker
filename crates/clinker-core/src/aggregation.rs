@@ -1046,8 +1046,15 @@ impl HashAggregator {
             .collect();
         let factory = AccumulatorFactory::new(compiled);
         let estimated = estimated_bytes_per_group(&factory, group_by_indices.len());
+        // `.max(1)` clamp: `(memory_budget * 60 / 100) / estimated` integer-
+        // divides to 0 when a single group's estimated footprint exceeds the
+        // 60% share of the budget. Without the clamp the downstream check
+        // `self.groups.len() >= self.max_groups` is `usize >= 0` — always
+        // true — and spill fires on every single record insertion. Clamping
+        // to 1 means "allow at least one group before spilling", the minimum
+        // sensible semantics at pathologically small budgets.
         let max_groups = if memory_budget > 0 && estimated > 0 {
-            (memory_budget * 60 / 100) / estimated
+            ((memory_budget * 60 / 100) / estimated).max(1)
         } else {
             usize::MAX
         };
@@ -1255,13 +1262,15 @@ impl HashAggregator {
         Ok(())
     }
 
-    /// Spill the in-memory groups to disk as bincode + LZ4.
+    /// Spill the in-memory groups to disk as length-prefixed postcard
+    /// records inside an LZ4 frame.
     ///
     /// 1. Drain `self.groups` into a Vec.
     /// 2. Encode sort keys and sort by memcmp bytes so the k-way merge
     ///    can walk entries in group-key order.
     /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) via
-    ///    bincode into an LZ4 frame-compressed temp file.
+    ///    postcard into an LZ4 frame-compressed temp file with a
+    ///    little-endian `u32` length prefix per entry.
     /// 4. Push the resulting `AggSpillFile` onto `self.spill_files`.
     /// 5. Reset `value_heap_bytes = 0`.
     fn spill(&mut self) -> Result<(), HashAggError> {
@@ -1290,7 +1299,7 @@ impl HashAggregator {
         }
         prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // 3. Write sorted entries as bincode + LZ4.
+        // 3. Write sorted entries as length-prefixed postcard + LZ4.
         let mut writer = AggSpillWriter::new(self.spill_dir.as_deref())?;
         for (sort_key, idx) in prepared {
             let (key, state) = &drained[idx];
@@ -1539,7 +1548,16 @@ pub(crate) fn finalize_group_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Binary aggregation spill infrastructure (Phase 2: bincode + LZ4)
+// Binary aggregation spill infrastructure (postcard + length-prefix + LZ4).
+//
+// Framing: each entry is written as a little-endian `u32` payload length
+// followed by that many postcard-encoded bytes. bincode — the prior
+// choice — is unmaintained as of the bincode 3.0.0 release notice (see
+// https://docs.rs/bincode/latest/bincode/ and research notes at
+// `docs/internal/research/RESEARCH-spill-format.md`). postcard is the
+// maintained serde-compatible successor; the explicit length prefix
+// mirrors the per-record framing used by Vector, Fluent Bit, and NiFi
+// so arbitrary-size entries stream with bounded per-entry memory.
 // ---------------------------------------------------------------------------
 
 /// Merge entry for the binary aggregation spill path. Ordered by
@@ -1567,7 +1585,7 @@ impl Ord for AggMergeEntry {
     }
 }
 
-/// Binary spill entry serialized to disk via bincode + LZ4.
+/// Binary spill entry serialized to disk via postcard + LZ4.
 #[derive(Serialize, Deserialize)]
 struct AggSpillEntry {
     sort_key: Vec<u8>,
@@ -1575,9 +1593,10 @@ struct AggSpillEntry {
     state: AggregatorGroupState,
 }
 
-/// Binary aggregation spill writer. Writes `AggSpillEntry` via bincode
-/// into an LZ4 frame-compressed temp file. No schema header — the
-/// caller knows the group-by layout at construction time.
+/// Binary aggregation spill writer. Writes `AggSpillEntry` via postcard
+/// into an LZ4 frame-compressed temp file with a per-entry little-endian
+/// `u32` length prefix. No schema header — the caller knows the
+/// group-by layout at construction time.
 struct AggSpillWriter {
     encoder: lz4_flex::frame::FrameEncoder<std::io::BufWriter<tempfile::NamedTempFile>>,
 }
@@ -1596,8 +1615,25 @@ impl AggSpillWriter {
     }
 
     fn write_entry(&mut self, entry: &AggSpillEntry) -> Result<(), HashAggError> {
-        bincode::serialize_into(&mut self.encoder, entry)
-            .map_err(|e| HashAggError::Spill(e.to_string()))
+        use std::io::Write;
+        let payload = postcard::to_stdvec(entry)
+            .map_err(|e| HashAggError::Spill(format!("postcard encode: {e}")))?;
+        // `u32` payload length is sufficient: a single `AggregatorGroupState`
+        // larger than 4 GiB would itself be an OOM-class bug well before
+        // reaching the spill writer.
+        let len = u32::try_from(payload.len()).map_err(|_| {
+            HashAggError::Spill(format!(
+                "spill entry exceeds u32 length prefix ({} bytes)",
+                payload.len()
+            ))
+        })?;
+        self.encoder
+            .write_all(&len.to_le_bytes())
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        self.encoder
+            .write_all(&payload)
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        Ok(())
     }
 
     fn finish(self) -> Result<AggSpillFile, HashAggError> {
@@ -1624,34 +1660,49 @@ impl AggSpillFile {
             std::fs::File::open(&self.path).map_err(|e| HashAggError::Spill(e.to_string()))?;
         let decoder = lz4_flex::frame::FrameDecoder::new(file);
         let buf_reader = std::io::BufReader::new(decoder);
-        Ok(AggSpillReader { reader: buf_reader })
+        Ok(AggSpillReader {
+            reader: buf_reader,
+            payload: Vec::new(),
+        })
     }
 }
 
-/// Binary aggregation spill reader. Yields `AggMergeEntry` via bincode
-/// deserialization from an LZ4 frame-compressed file.
+/// Binary aggregation spill reader. Yields `AggMergeEntry` values by
+/// reading a little-endian `u32` length prefix followed by that many
+/// postcard-encoded bytes from an LZ4 frame-compressed file. `payload`
+/// is reused across entries to avoid reallocating the decode scratch.
 struct AggSpillReader {
     reader: std::io::BufReader<lz4_flex::frame::FrameDecoder<std::fs::File>>,
+    payload: Vec<u8>,
 }
 
 impl AggSpillReader {
     fn next_entry(&mut self) -> Result<Option<AggMergeEntry>, HashAggError> {
-        match bincode::deserialize_from::<_, AggSpillEntry>(&mut self.reader) {
-            Ok(entry) => Ok(Some(AggMergeEntry {
-                sort_key: entry.sort_key,
-                group_key: entry.group_key,
-                state: entry.state,
-            })),
-            Err(e) => {
-                // bincode returns an Io error with UnexpectedEof at end of stream.
-                if let bincode::ErrorKind::Io(ref io_err) = *e
-                    && io_err.kind() == std::io::ErrorKind::UnexpectedEof
-                {
-                    return Ok(None);
-                }
-                Err(HashAggError::Spill(e.to_string()))
-            }
+        use std::io::Read;
+
+        // Clean EOF at an entry boundary is the expected terminator:
+        // `read_exact` on the length prefix returns `UnexpectedEof` when
+        // the frame decoder has exhausted the file, which we translate
+        // to `Ok(None)`. Any other IO error (or a partial read inside
+        // the payload) is propagated as a spill error.
+        let mut len_buf = [0u8; 4];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(HashAggError::Spill(e.to_string())),
         }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        self.payload.resize(len, 0);
+        self.reader
+            .read_exact(&mut self.payload)
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let entry: AggSpillEntry = postcard::from_bytes(&self.payload)
+            .map_err(|e| HashAggError::Spill(format!("postcard decode: {e}")))?;
+        Ok(Some(AggMergeEntry {
+            sort_key: entry.sort_key,
+            group_key: entry.group_key,
+            state: entry.state,
+        }))
     }
 }
 
@@ -2985,35 +3036,63 @@ mod spill_trigger_tests {
     }
 
     // ------------------------------------------------------------------
-    // RSS backstop: tiny budget triggers spill via RSS check
+    // RSS backstop fires exclusively — neither the group-count nor
+    // value-heap thresholds are reachable under the configured budget
+    // and workload, so the only path that can spill is the RSS check.
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_rss_backstop_with_tiny_budget() {
+    fn test_rss_backstop_fires_exclusively() {
         if crate::pipeline::memory::rss_bytes().is_none() {
             return; // Skip on unsupported platforms
         }
         let tmp = tempfile::tempdir().expect("tempdir");
         let input = make_schema(&["k"]);
-        // Budget of 1 byte — RSS always exceeds 85% of 1 byte.
+        // 1 MB budget:
+        //   - max_groups resolves to hundreds (>> the 10 unique keys below),
+        //     so the primary group-count threshold cannot fire.
+        //   - value_heap_bytes stays ~0 (count(*) is i64-per-group),
+        //     so the 40% value-heap threshold cannot fire.
+        //   - RSS of any real test process is tens of MB >> 85% of 1 MB,
+        //     so the RSS backstop is the only path that can spill.
+        const BUDGET: usize = 1024 * 1024;
         let mut agg = build_test_aggregator(
             &[("k", Type::String)],
             &["k"],
             "emit k = k\nemit n = count(*)",
-            1,
+            BUDGET,
             Some(tmp.path().to_path_buf()),
         );
+        // Precondition assertions make the test self-documenting about
+        // which branch it claims to exercise.
+        assert!(
+            agg.max_groups() >= 100,
+            "precondition: max_groups={} must dwarf the 10-key workload \
+             (otherwise the primary group-count threshold fires and this \
+             test is not exercising the RSS backstop)",
+            agg.max_groups()
+        );
+
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("t.csv");
-        // Feed enough records to trigger the RSS check (>= 4096).
-        for i in 0..5000u64 {
-            let r = make_record(&input, vec![Value::String(format!("rss_{i}").into())]);
+        // Feed > 4096 records across only 10 unique keys so the group-count
+        // primary threshold stays inert (groups.len() plateaus at 10).
+        for i in 0..5_000u64 {
+            let key = format!("k{}", i % 10);
+            let r = make_record(&input, vec![Value::String(key.into())]);
             agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
                 .expect("add_record");
         }
         assert!(
+            agg.value_heap_bytes() < BUDGET * 40 / 100,
+            "precondition: value_heap_bytes={} must stay under 40% of budget \
+             (otherwise the secondary value-heap threshold fires and this \
+             test is not exercising the RSS backstop)",
+            agg.value_heap_bytes()
+        );
+        assert!(
             !agg.spill_files().is_empty(),
-            "RSS backstop should trigger spill with 1-byte budget"
+            "RSS backstop should spill when process RSS exceeds 85% of a 1 MB budget"
         );
     }
 }

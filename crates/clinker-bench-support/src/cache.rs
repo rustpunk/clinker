@@ -293,36 +293,42 @@ fn wrap_nested(data: Vec<u8>, format: DataFormat, wrapper: &NestedWrapper) -> Ve
             // and close them after </records>.
             // Current XML format: `<?xml ...?>\n<records>\n...\n</records>\n`
             // We replace `<records>` with `<parent1><parent2>` and keep <record> as-is.
+            //
+            // Every structural marker the wrapper depends on (`?>\n`,
+            // `<records>\n`, `</records>\n`) is guarded up front with a
+            // `let-else` so a future format change falls through to the
+            // same unchanged-bytes fallback instead of panicking in a
+            // subsequent `.unwrap()`.
             let data_str = String::from_utf8(data).expect("XML is UTF-8");
-            let mut buf = Vec::with_capacity(data_str.len() + parent_elements.len() * 30);
-            // Find the end of the prolog line
-            if let Some(prolog_end) = data_str.find("?>\n") {
-                buf.extend_from_slice(&data_str.as_bytes()[..prolog_end + 3]);
-                // Open parent elements
-                for elem in parent_elements {
-                    buf.extend_from_slice(b"<");
-                    buf.extend_from_slice(elem.as_bytes());
-                    buf.extend_from_slice(b">");
-                }
-                buf.push(b'\n');
-                // Skip the original `<records>\n` and `</records>\n`
-                let records_start = data_str.find("<records>\n").unwrap();
-                let records_end = data_str.find("</records>\n").unwrap();
-                // Emit the record elements (between <records>\n and </records>\n)
-                buf.extend_from_slice(
-                    &data_str.as_bytes()[records_start + "<records>\n".len()..records_end],
-                );
-                // Close parent elements in reverse
-                for elem in parent_elements.iter().rev() {
-                    buf.extend_from_slice(b"</");
-                    buf.extend_from_slice(elem.as_bytes());
-                    buf.extend_from_slice(b">");
-                }
-                buf.push(b'\n');
-            } else {
-                // Fallback: return data unchanged
+            let Some(prolog_end) = data_str.find("?>\n") else {
                 return data_str.into_bytes();
+            };
+            let Some(records_start) = data_str.find("<records>\n") else {
+                return data_str.into_bytes();
+            };
+            let Some(records_end) = data_str.find("</records>\n") else {
+                return data_str.into_bytes();
+            };
+            let mut buf = Vec::with_capacity(data_str.len() + parent_elements.len() * 30);
+            buf.extend_from_slice(&data_str.as_bytes()[..prolog_end + 3]);
+            // Open parent elements
+            for elem in parent_elements {
+                buf.extend_from_slice(b"<");
+                buf.extend_from_slice(elem.as_bytes());
+                buf.extend_from_slice(b">");
             }
+            buf.push(b'\n');
+            // Emit the record elements (between <records>\n and </records>\n)
+            buf.extend_from_slice(
+                &data_str.as_bytes()[records_start + "<records>\n".len()..records_end],
+            );
+            // Close parent elements in reverse
+            for elem in parent_elements.iter().rev() {
+                buf.extend_from_slice(b"</");
+                buf.extend_from_slice(elem.as_bytes());
+                buf.extend_from_slice(b">");
+            }
+            buf.push(b'\n');
             buf
         }
         _ => data, // No wrapping for other format/wrapper combinations
