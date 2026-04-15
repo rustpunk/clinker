@@ -1407,12 +1407,30 @@ impl PipelineConfig {
                         }
                     }
                 }
-                // Phase Combine C.0.1: edges for Combine nodes are wired in a
-                // dedicated block added by Task C.0.4 (paralleling Merge edge
-                // wiring). Until then, Combine nodes have no upstream edges
-                // in the DAG — which is harmless because PlanNode::Combine
-                // doesn't exist yet (lands in C.0.2).
-                PipelineNode::Combine { .. } => {}
+                // Phase Combine C.0.4: wire one Data edge per named input.
+                // Mirrors the Merge arm's silent-skip policy when a producer
+                // is not yet in `name_to_idx` — stage 3's topology validation
+                // already caught undeclared upstream refs with node-level
+                // spans, so a missed lookup here would be a double-report.
+                // The legacy path (`ExecutionPlanDag::compile_with_runtime_schema`
+                // in `plan/execution.rs`) emits E307 via `PlanError` and is
+                // the codepath exercised by the executor and the C.0.4 gate
+                // tests; this Stage 5 block keeps the two DAG-construction
+                // paths structurally in sync.
+                PipelineNode::Combine { header, .. } => {
+                    for node_input in header.input.values() {
+                        let producer = input_target(node_input);
+                        if let Some(&producer_idx) = name_to_idx.get(producer) {
+                            graph.add_edge(
+                                producer_idx,
+                                consumer_idx,
+                                PlanEdge {
+                                    dependency_type: DependencyType::Data,
+                                },
+                            );
+                        }
+                    }
+                }
             }
         }
 

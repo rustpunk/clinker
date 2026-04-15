@@ -1143,6 +1143,48 @@ impl ExecutionPlanDag {
             )?;
         }
 
+        // Combine nodes (Phase Combine C.0.4). `build_specs` skips
+        // `PipelineNode::Combine` deliberately — combine does not lower
+        // to a `PlanTransformSpec`, so the spec-driven loops above never
+        // emit a `PlanNode::Combine`. Walk `config.nodes` directly here
+        // for the structural Phase-1 insertion; Phase-2 below wires edges
+        // paralleling the Merge block. `lower_node_to_plan_node`'s
+        // Combine arm (config/mod.rs) is the authoritative source for
+        // the non-topological fields — inline the same construction so
+        // both the `PipelineConfig::compile_with_diagnostics` path (which
+        // uses `lower_node_to_plan_node` directly) and this legacy
+        // `ExecutionPlanDag::compile_with_runtime_schema` path emit the
+        // same `PlanNode::Combine` shape at C.0. C.1 bind_schema
+        // populates the CompileArtifacts side-tables; neither the
+        // strategy default nor the driving_input is final at C.0 —
+        // both are overwritten by the C.2 post-pass.
+        {
+            use crate::config::PipelineNode;
+            use crate::plan::combine::CombineStrategy;
+            for spanned in &config.nodes {
+                if let PipelineNode::Combine {
+                    header,
+                    config: body,
+                } = &spanned.value
+                {
+                    add_node(
+                        &mut graph,
+                        PlanNode::Combine {
+                            name: header.name.clone(),
+                            span: span_for(&header.name),
+                            strategy: CombineStrategy::HashBuildProbe,
+                            driving_input: String::new(),
+                            match_mode: body.match_mode,
+                            on_miss: body.on_miss,
+                            decomposed_from: None,
+                        },
+                        &mut node_by_name,
+                        &mut slug_set,
+                    )?;
+                }
+            }
+        }
+
         // --- Phase 2: Wire all edges ---
         let mut prev_transform_key: Option<String> = None;
 
@@ -1268,6 +1310,55 @@ impl ExecutionPlanDag {
                         dependency_type: DependencyType::Data,
                     },
                 );
+            }
+        }
+
+        // Combine edges (Phase Combine C.0.4). Parallels the Merge
+        // edge-wiring block above: for each entry in the combine
+        // header's named `input:` map, add one `DependencyType::Data`
+        // edge from the resolved upstream `NodeIndex` to the combine
+        // node. Per drill D5 the qualifier string is NOT stored on the
+        // edge — qualifier→NodeIndex mapping lives on
+        // `CompileArtifacts.combine_inputs` (populated at C.1 by
+        // bind_schema). Resolution uses `resolve_any_node` (RESOLUTION
+        // W-2) because combine inputs can reference any producer type
+        // (source, transform, aggregation, route, merge, output,
+        // composition, or another combine) — not just the
+        // transform-like set `resolve_input_reference` handles. E307
+        // fires when the upstream is undeclared.
+        {
+            use crate::config::PipelineNode;
+            use crate::config::node_header::NodeInput;
+            for spanned in &config.nodes {
+                if let PipelineNode::Combine { header, .. } = &spanned.value {
+                    let combine_key = format!("combine.{}", header.name);
+                    let combine_idx = node_by_name[&combine_key];
+                    for (qualifier, node_input) in &header.input {
+                        let upstream_name: String = match node_input {
+                            NodeInput::Single(s) => s.clone(),
+                            // Mirrors the `resolve_header_input` helper in
+                            // `build_specs` (execution.rs ~line 364): a
+                            // `node.port` reference flattens to a dotted
+                            // key so it can round-trip through
+                            // `resolve_any_node`'s bare-name lookup and
+                            // be found by route-branch fallback callers.
+                            NodeInput::Port { node, port } => format!("{node}.{port}"),
+                        };
+                        let upstream_idx = resolve_any_node(&upstream_name, &node_by_name)
+                            .ok_or_else(|| PlanError::CombineInputUndeclared {
+                                combine: header.name.clone(),
+                                qualifier: qualifier.clone(),
+                                reference: upstream_name.clone(),
+                            })?;
+                        graph.add_edge(
+                            upstream_idx,
+                            combine_idx,
+                            PlanEdge {
+                                dependency_type: DependencyType::Data,
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -1778,6 +1869,46 @@ fn resolve_input_reference(
         transform: current_transform.to_string(),
         available,
     })
+}
+
+/// Resolve a node name to its `NodeIndex` by trying all node-type prefix
+/// conventions used by the DAG builder's `node_by_name` map.
+///
+/// Unlike [`resolve_input_reference`] — which only recognises
+/// transform-like prefixes (`transform.X`, `aggregation.X`, route branches)
+/// and consults a `&[PlanTransformSpec]` — this helper tries every
+/// producer-type prefix the planner registers: source, transform,
+/// aggregate, route, merge, output, composition, combine. Used by the
+/// Combine edge-wiring block (RESOLUTION W-2) because a combine input
+/// can reference any upstream producer regardless of type.
+///
+/// The unqualified bare-name lookup runs first for defensive coverage in
+/// case a caller has already namespaced its keys — the DAG builder at
+/// the call site always registers prefixed keys via `add_node`, so the
+/// prefix loop is the path that actually fires for combine wiring.
+///
+/// Returns `None` when no prefix match resolves; callers surface this as
+/// `PlanError::CombineInputUndeclared` (code E307).
+fn resolve_any_node(name: &str, node_by_name: &HashMap<String, NodeIndex>) -> Option<NodeIndex> {
+    if let Some(&idx) = node_by_name.get(name) {
+        return Some(idx);
+    }
+    for prefix in &[
+        "source.",
+        "transform.",
+        "aggregation.",
+        "route.",
+        "merge.",
+        "output.",
+        "composition.",
+        "combine.",
+    ] {
+        let key = format!("{prefix}{name}");
+        if let Some(&idx) = node_by_name.get(&key) {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 /// Extract the cycle path from a DFS back-edge detection.
@@ -2891,6 +3022,17 @@ pub enum PlanError {
     AggregateWithMultipleInputs {
         transform: String,
     },
+    /// E307 — a combine node's `input:` value references a name that is
+    /// not declared anywhere in the pipeline. Unlike
+    /// `InvalidInputReference` (which scopes to transform-like
+    /// prefixes), combine inputs can reference any producer node type,
+    /// so this variant carries the combine node name, the qualifier,
+    /// and the unresolved upstream reference verbatim (RESOLUTION W-2).
+    CombineInputUndeclared {
+        combine: String,
+        qualifier: String,
+        reference: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -2963,6 +3105,17 @@ impl std::fmt::Display for PlanError {
                     f,
                     "aggregate transform '{}' cannot consume multiple inputs",
                     transform
+                )
+            }
+            PlanError::CombineInputUndeclared {
+                combine,
+                qualifier,
+                reference,
+            } => {
+                write!(
+                    f,
+                    "E307: combine '{}' input '{}' references undeclared upstream '{}'",
+                    combine, qualifier, reference
                 )
             }
         }
