@@ -43,6 +43,12 @@ transform.classify_route:
   partitioning: Single
   partitioning_provenance: SingleStream
 
+route.route_classify_route:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
 output.low:
   ordering: <none>
   ordering_provenance: NoOrdering
@@ -50,12 +56,6 @@ output.low:
   partitioning_provenance: SingleStream
 
 output.high:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-
-route.route_classify_route:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -88,8 +88,8 @@ Worker threads: 4
   ● [source] orders (line:5)
   │ [transform] classify (line:17)
   │ [transform] classify_route (line:25)
-  │ [output] low (line:42)
-  │ [output] high (line:34)
   ◆ FORK [route:exclusive] 'route_classify_route' (line:25)
   ├──> high → high
   ├──> default → low
+  │ [output] low (line:42)
+  │ [output] high (line:34)

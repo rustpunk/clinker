@@ -74,6 +74,12 @@ mod tests {
                 | PipelineError::ThreadPool(_)
                 | PipelineError::Multiple(_),
             ) => 4,
+            // CorrelationGroupOverflow is a non-fatal diagnostic
+            // carrier used by per-group correlation-key DLQ accounting;
+            // it is attached to DLQ entries rather than returned as Err,
+            // so this arm is practically unreachable. If it ever IS
+            // returned, treat as partial success (records DLQ'd).
+            Err(PipelineError::CorrelationGroupOverflow { .. }) => 2,
         }
     }
 

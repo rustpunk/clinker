@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::Datelike;
-use clinker_record::{RecordStorage, Value};
+use clinker_record::{Record, RecordStorage, Schema, Value};
 
 use super::*;
 use crate::lexer::Span;
@@ -32,6 +33,12 @@ impl RecordStorage for NullStorage {
     }
 }
 
+/// Test helper: evaluate via `ProgramEvaluator::eval_record` (the single
+/// evaluator; `eval_program` was deleted) and return a name-keyed IndexMap
+/// by zipping the positional result with the standalone layout's schema.
+///
+/// Used exclusively by tests — production executors consume the positional
+/// `values: Vec<Value>` directly via Option-W's `Record::new(schema, values)`.
 fn eval_ok(
     src: &str,
     fields: &[&str],
@@ -58,8 +65,31 @@ fn eval_ok(
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(record);
-    eval_program::<NullStorage>(&typed, &ctx, &resolver, None)
-        .unwrap_or_else(|e| panic!("Eval error: {}", e))
+    // Standalone layout has empty passthroughs; `input_record` is unused
+    // for field reads (resolver handles expressions). Pass a zero-column
+    // Record as the positional source.
+    let empty_schema = Arc::new(Schema::new(Vec::<Box<str>>::new()));
+    let empty_input = Record::new(empty_schema, Vec::new());
+    let has_distinct = typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Distinct { .. }));
+    let layout = Arc::clone(&typed.output_layout);
+    let mut evaluator = ProgramEvaluator::new(Arc::new(typed), has_distinct);
+    let result = evaluator
+        .eval_record::<NullStorage>(&ctx, &empty_input, &resolver, None)
+        .unwrap_or_else(|e| panic!("Eval error: {}", e));
+    match result {
+        EvalResult::Emit { values, .. } => {
+            let mut out = indexmap::IndexMap::with_capacity(values.len());
+            for (i, col) in layout.schema.columns().iter().enumerate() {
+                out.insert(col.as_ref().to_string(), values[i].clone());
+            }
+            out
+        }
+        EvalResult::Skip(_) => indexmap::IndexMap::new(),
+    }
 }
 
 fn eval_single(src: &str, fields: &[&str], record: HashMap<String, Value>) -> Value {
@@ -319,7 +349,10 @@ fn test_eval_conversion_strict() {
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
-    let result = eval_program::<NullStorage>(&typed, &ctx, &resolver, None);
+    let empty_schema = Arc::new(Schema::new(Vec::<Box<str>>::new()));
+    let empty_input = Record::new(empty_schema, Vec::new());
+    let mut evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+    let result = evaluator.eval_record::<NullStorage>(&ctx, &empty_input, &resolver, None);
     assert!(
         result.is_err(),
         "Expected conversion error for \"abc\".to_int()"
@@ -371,8 +404,19 @@ fn test_eval_regex_precompiled() {
     let stable = StableEvalContext::test_default();
     let ctx = EvalContext::test_default_borrowed(&stable);
     let resolver = HashMapResolver::new(HashMap::new());
-    let output = eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
-    assert_eq!(output.get("val"), Some(&Value::Bool(true)));
+    let empty_schema = Arc::new(Schema::new(Vec::<Box<str>>::new()));
+    let empty_input = Record::new(empty_schema, Vec::new());
+    let layout = Arc::clone(&typed.output_layout);
+    let mut evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+    let result = evaluator
+        .eval_record::<NullStorage>(&ctx, &empty_input, &resolver, None)
+        .unwrap();
+    let values = match result {
+        EvalResult::Emit { values, .. } => values,
+        EvalResult::Skip(_) => panic!("expected Emit"),
+    };
+    let val_slot = layout.schema.index("val").expect("val slot");
+    assert_eq!(values[val_slot], Value::Bool(true));
 }
 
 #[test]

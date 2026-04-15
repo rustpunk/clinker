@@ -919,3 +919,115 @@ nodes:
         "standard should not have Alice: {standard}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Option W Amendment A7: include_unmapped projection semantics
+// ═══════════════════════════════════════════════════════════════════
+//
+// Verify that at the Output boundary:
+//   include_unmapped: false → only CXL-named emit columns appear
+//   include_unmapped: true  → every column of the record appears
+//
+// Before the Option W shortcut fix, the Output arm synthesised an
+// "all-emit" layout that made these two settings indistinguishable.
+// Now the Output arm consults the predecessor Transform's bound
+// `OutputLayout` (which knows which columns are CXL emits vs
+// upstream passthroughs), restoring the documented semantic.
+
+#[test]
+fn test_e2e_output_include_unmapped_false() {
+    let yaml = r#"
+pipeline:
+  name: include_unmapped_false
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: a, type: int }
+      - { name: b, type: int }
+      - { name: c, type: int }
+- type: transform
+  name: compute
+  input: src
+  config:
+    cxl: "emit x = a + 1\nemit y = b"
+- type: output
+  name: dest
+  input: compute
+  config:
+    name: dest
+    path: out.csv
+    type: csv
+    include_unmapped: false
+"#;
+    let csv = "a,b,c\n1,2,3\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.counters.ok_count, 1);
+
+    // include_unmapped: false → only x, y (the CXL emits). c (pure
+    // passthrough) must NOT appear. a and b are upstream columns, but
+    // `emit y = b` and `emit x = a + 1` do not shadow (different names)
+    // — so a/b remain upstream-only passthroughs and are filtered out.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "x,y", "header must be exactly x,y, got: {output}");
+    assert_eq!(
+        lines[1], "2,2",
+        "row must be exactly x=2,y=2, got: {output}"
+    );
+    assert!(
+        !output.contains("c,"),
+        "include_unmapped: false must drop c (pure passthrough): {output}"
+    );
+}
+
+#[test]
+fn test_e2e_output_include_unmapped_true() {
+    let yaml = r#"
+pipeline:
+  name: include_unmapped_true
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: a, type: int }
+      - { name: b, type: int }
+      - { name: c, type: int }
+- type: transform
+  name: compute
+  input: src
+  config:
+    cxl: "emit x = a + 1\nemit y = b"
+- type: output
+  name: dest
+  input: compute
+  config:
+    name: dest
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "a,b,c\n1,2,3\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.counters.ok_count, 1);
+
+    // include_unmapped: true → every record column appears. Positional
+    // schema per Option W: upstream columns first (a, b, c), then emits
+    // that don't shadow (x, y) → header a,b,c,x,y.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines[0], "a,b,c,x,y",
+        "header must include all record columns, got: {output}"
+    );
+    assert_eq!(
+        lines[1], "1,2,3,2,2",
+        "row values: a=1,b=2,c=3,x=2,y=2 — got: {output}"
+    );
+}

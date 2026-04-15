@@ -685,11 +685,6 @@ pub struct AggregatorGroupState {
     /// global-fold empty-input case (D12) emits `0` because no record
     /// ever updates this field.
     pub min_row_num: u64,
-    /// D57 sidecar — intersection of every record's `emitted` IndexMap
-    /// (the executor's per-record "accumulated emitted" sidecar). `None`
-    /// before the first record; `Some(...)` after, narrowing on each
-    /// add. Empty IndexMap means "no common keys".
-    pub common_emitted: Option<IndexMap<String, Value>>,
     /// D57 sidecar — union of every record's `accumulated` IndexMap
     /// (the executor's per-record "accumulated metadata" sidecar). On
     /// key conflicts the **first** value wins (insertion order); this
@@ -703,28 +698,9 @@ impl AggregatorGroupState {
             row,
             meta_tracker: MetadataCommonTracker::new(),
             min_row_num: u64::MAX,
-            common_emitted: None,
             union_accumulated: IndexMap::new(),
         }
     }
-}
-
-/// D57 helper — narrow `prev` to keys present in `incoming` whose values
-/// match. Used to fold the per-record `emitted` sidecar into a per-group
-/// intersection.
-fn intersect_emitted(
-    prev: IndexMap<String, Value>,
-    incoming: &IndexMap<String, Value>,
-) -> IndexMap<String, Value> {
-    let mut out = IndexMap::with_capacity(prev.len().min(incoming.len()));
-    for (k, v) in prev {
-        if let Some(other) = incoming.get(&k)
-            && other == &v
-        {
-            out.insert(k, v);
-        }
-    }
-    out
 }
 
 /// D57 helper — first-seen union: keep `dst` values where they exist,
@@ -739,14 +715,11 @@ fn union_accumulated_into(dst: &mut IndexMap<String, Value>, src: &IndexMap<Stri
 }
 
 /// Per-node-buffer row produced by every executor node that emits into
-/// `node_buffers`. Mirrors the local 4-tuple type alias used by
-/// `PlanNode::Sort` and `execute_dag_branching`.
-pub type SortRow = (
-    Record,
-    u64,
-    IndexMap<String, Value>,
-    IndexMap<String, Value>,
-);
+/// `node_buffers`. Option-W collapse: emits live on the Record
+/// positionally (via its bound schema); the per-record sidecar that
+/// remains is just the accumulated metadata (genuinely sparse, not
+/// schema-bound).
+pub type SortRow = (Record, u64, IndexMap<String, Value>);
 
 /// Errors raised by the hash aggregator hot loop. The 16.3.13 dispatch
 /// arm wraps these into `PipelineError` for DLQ routing; until then the
@@ -976,7 +949,6 @@ impl AggregateStream {
         &mut self,
         record: &Record,
         row_num: u64,
-        emitted: &IndexMap<String, Value>,
         accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
@@ -984,9 +956,9 @@ impl AggregateStream {
         match self {
             Self::Hash(h) => {
                 let _ = &out; // Hash defers emission to finalize.
-                h.add_record(record, row_num, emitted, accumulated, ctx)
+                h.add_record(record, row_num, accumulated, ctx)
             }
-            Self::Streaming(s) => s.add_record(record, row_num, emitted, accumulated, ctx, out),
+            Self::Streaming(s) => s.add_record(record, row_num, accumulated, ctx, out),
         }
     }
 
@@ -1144,7 +1116,6 @@ impl HashAggregator {
         &mut self,
         record: &Record,
         row_num: u64,
-        emitted: &IndexMap<String, Value>,
         accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
     ) -> Result<(), HashAggError> {
@@ -1201,16 +1172,15 @@ impl HashAggregator {
             .entry(key)
             .or_insert_with(|| AggregatorGroupState::new(self.factory.create_accumulators()));
 
-        // D57 sidecar reductions — fold the per-record (row_num, emitted,
-        // accumulated) triple into the per-group state. These three values
-        // become the SortRow tuple's last three slots at finalize time.
+        // D57 sidecar reductions — fold the per-record (row_num, accumulated)
+        // pair into the per-group state. Under Option W, "emitted" is no
+        // longer carried as a per-record side-map (the record itself is
+        // positional against the upstream's OutputLayout); the old
+        // `common_emitted` intersection was dead state (finalize rebuilt
+        // from the output record) and has been removed.
         if row_num < group_state.min_row_num {
             group_state.min_row_num = row_num;
         }
-        group_state.common_emitted = Some(match group_state.common_emitted.take() {
-            None => emitted.clone(),
-            Some(prev) => intersect_emitted(prev, emitted),
-        });
         union_accumulated_into(&mut group_state.union_accumulated, accumulated);
 
         // 5. BindingArg dispatch hot loop (D1).
@@ -1368,7 +1338,7 @@ impl HashAggregator {
         if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
-            out.push((record, 0, IndexMap::new(), IndexMap::new()));
+            out.push((record, 0, IndexMap::new()));
             return Ok(());
         }
 
@@ -1383,23 +1353,14 @@ impl HashAggregator {
                 } else {
                     state.min_row_num
                 };
-                // Phase 16b.8: the downstream output stage consumes
-                // `emitted` as the per-record field map (merged with the
-                // raw record under `include_unmapped`). Upstream
-                // `common_emitted` leaks pre-aggregation transform fields
-                // into the post-aggregate output, which is a hash-order-
-                // dependent flake (columns present or absent depending on
-                // whether the first-iterated group's intersection retained
-                // them). Downstream from an aggregate, the aggregate's
-                // output record IS the authoritative emitted field set.
-                let emitted: IndexMap<String, Value> = record
-                    .schema()
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.to_string(), record.values()[i].clone()))
-                    .collect();
-                out.push((record, row_num, emitted, IndexMap::new()));
+                // Option W: downstream reads emits positionally from the
+                // record via the Aggregate node's OutputLayout. No
+                // per-record emitted side-map is carried forward —
+                // single oracle (Failure mode #5). Metadata on the
+                // output SortRow starts empty; any aggregator-emitted
+                // `$meta.*` is already set on `record` itself via
+                // set_meta by finalize_group_inner.
+                out.push((record, row_num, IndexMap::new()));
             }
             Ok(())
         } else {
@@ -1491,14 +1452,7 @@ impl HashAggregator {
                     } else {
                         state.min_row_num
                     };
-                    let emitted: IndexMap<String, Value> = record
-                        .schema()
-                        .columns()
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| (c.to_string(), record.values()[i].clone()))
-                        .collect();
-                    out.push((record, row_num, emitted, IndexMap::new()));
+                    out.push((record, row_num, IndexMap::new()));
                 }
                 // Start new group from the winner.
                 current_key = Some(winner.sort_key.clone());
@@ -1519,14 +1473,7 @@ impl HashAggregator {
             } else {
                 state.min_row_num
             };
-            let emitted: IndexMap<String, Value> = record
-                .schema()
-                .columns()
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.to_string(), record.values()[i].clone()))
-                .collect();
-            out.push((record, row_num, emitted, IndexMap::new()));
+            out.push((record, row_num, IndexMap::new()));
         }
 
         let _ = ctx; // reserved for future per-group eval scope
@@ -1956,8 +1903,8 @@ impl AccumulatorOp for MergeState {
     }
 }
 
-/// Associative merge of the three D57 sidecar fields plus the
-/// metadata common tracker. Operates on a currently-open group's
+/// Associative merge of the D57 sidecar fields plus the metadata
+/// common tracker. Operates on a currently-open group's
 /// `AggregatorGroupState` and folds another state's sidecars in.
 ///
 /// Separated out so both the `GroupBoundary` state machine (for the
@@ -1968,13 +1915,6 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
     if src.min_row_num < dst.min_row_num {
         dst.min_row_num = src.min_row_num;
     }
-    // `common_emitted`: set-intersection of keys where values agree.
-    dst.common_emitted = Some(match (dst.common_emitted.take(), src.common_emitted) {
-        (None, None) => IndexMap::new(),
-        (Some(prev), None) => prev,
-        (None, Some(s)) => s,
-        (Some(prev), Some(s)) => intersect_emitted(prev, &s),
-    });
     // `union_accumulated`: first-seen-wins union.
     union_accumulated_into(&mut dst.union_accumulated, &src.union_accumulated);
     // `MetadataCommonTracker`: associative merge per D11 revised.
@@ -2076,12 +2016,10 @@ impl StreamingAggregator<AddRaw> {
     ///    boundary the previous group's finalized `SortRow` lands in
     ///    `self.pending`. A strictly lesser key is routed through
     ///    `HashAggError::SortOrderViolation` → hard abort.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_record(
         &mut self,
         record: &Record,
         row_num: u64,
-        emitted: &IndexMap<String, Value>,
         accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
@@ -2164,11 +2102,6 @@ impl StreamingAggregator<AddRaw> {
         // the freshly-constructed per-group state. `GroupBoundary`'s
         // `push` merges these in per-group once the key is installed.
         state.min_row_num = row_num;
-        if !emitted.is_empty() {
-            state.common_emitted = Some(emitted.clone());
-        } else {
-            state.common_emitted = Some(IndexMap::new());
-        }
         state.union_accumulated = accumulated.clone();
 
         // Encode the group-by columns into boundary.current via the
@@ -2222,7 +2155,7 @@ impl StreamingAggregator<AddRaw> {
         self.boundary.push(
             state,
             record.clone(),
-            (row_num, emitted.clone(), accumulated.clone()),
+            (row_num, accumulated.clone()),
             &finalize_closure,
             out,
         )?;
@@ -2239,7 +2172,7 @@ impl StreamingAggregator<AddRaw> {
         if self.rows_seen == 0 && self.group_by_indices.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
-            out.push((record, 0, IndexMap::new(), IndexMap::new()));
+            out.push((record, 0, IndexMap::new()));
             return Ok(());
         }
         if !self.pending.is_empty() {
@@ -2537,26 +2470,11 @@ mod accumulator_op_tests {
         assert_eq!(dst.min_row_num, 7, "u64::MAX must act as identity");
     }
 
-    #[test]
-    fn test_merge_sidecars_emitted_intersect_keeps_agreeing_keys() {
-        let mut dst = state_with_row(Vec::new());
-        let mut a = IndexMap::new();
-        a.insert("k1".to_string(), sv("v1"));
-        a.insert("k2".to_string(), sv("v2"));
-        dst.common_emitted = Some(a);
-
-        let mut src = state_with_row(Vec::new());
-        let mut b = IndexMap::new();
-        b.insert("k1".to_string(), sv("v1")); // agrees
-        b.insert("k2".to_string(), sv("DIFFERENT")); // conflicts → dropped
-        b.insert("k3".to_string(), sv("v3")); // not in dst → dropped
-        src.common_emitted = Some(b);
-
-        merge_group_sidecars(&mut dst, src);
-        let out = dst.common_emitted.expect("present");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out.get("k1"), Some(&sv("v1")));
-    }
+    // Removed test_merge_sidecars_emitted_intersect_keeps_agreeing_keys —
+    // the `common_emitted` per-record intersection was dead state under
+    // Option W (finalize rebuilt emits from the output record, not
+    // from the sidecar), and has been removed along with the `emitted`
+    // parameter to add_record.
 
     #[test]
     fn test_merge_sidecars_accumulated_union_first_seen_wins() {
@@ -2656,7 +2574,6 @@ mod accumulator_op_tests {
         // `Input` type — if they are missing this line fails to
         // compile.
         let _ = input.1.min_row_num;
-        let _ = &input.1.common_emitted;
         let _ = &input.1.union_accumulated;
         let _ = &input.1.meta_tracker;
     }
@@ -2944,14 +2861,8 @@ mod spill_trigger_tests {
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..500u64 {
             let r = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .expect("add_record");
+            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+                .expect("add_record");
         }
         assert!(
             !agg.spill_files().is_empty(),
@@ -2978,14 +2889,8 @@ mod spill_trigger_tests {
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..10u64 {
             let r = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+                .unwrap();
         }
         assert!(
             agg.spill_files().is_empty(),
@@ -3014,14 +2919,8 @@ mod spill_trigger_tests {
         for i in 0..64u64 {
             let k = keys[(i as usize) % keys.len()];
             let r = make_record(&input, vec![Value::String(k.into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+                .unwrap();
         }
         assert!(
             !agg.spill_files().is_empty(),
@@ -3032,7 +2931,7 @@ mod spill_trigger_tests {
         let mut out: Vec<SortRow> = Vec::new();
         agg.finalize(&ctx, &mut out).expect("finalize after spill");
         assert_eq!(out.len(), 4, "four distinct groups after spill-merge");
-        for (rec, _row_num, _e, _a) in &out {
+        for (rec, _row_num, _a) in &out {
             assert_eq!(
                 rec.values()[1],
                 Value::Integer(16),
@@ -3062,14 +2961,8 @@ mod spill_trigger_tests {
         for i in 0..256u64 {
             let k = keys[(i as usize) % keys.len()];
             let r = make_record(&input, vec![Value::String(k.into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+                .unwrap();
         }
         assert!(
             agg.spill_files().len() >= 2,
@@ -3082,7 +2975,7 @@ mod spill_trigger_tests {
         agg.finalize(&ctx, &mut out)
             .expect("multi-spill finalize merges correctly");
         assert_eq!(out.len(), 8, "eight distinct groups after k-way merge");
-        for (rec, _, _, _) in &out {
+        for (rec, _, _) in &out {
             assert_eq!(
                 rec.values()[1],
                 Value::Integer(32),
@@ -3115,14 +3008,8 @@ mod spill_trigger_tests {
         // Feed enough records to trigger the RSS check (>= 4096).
         for i in 0..5000u64 {
             let r = make_record(&input, vec![Value::String(format!("rss_{i}").into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .expect("add_record");
+            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+                .expect("add_record");
         }
         assert!(
             !agg.spill_files().is_empty(),

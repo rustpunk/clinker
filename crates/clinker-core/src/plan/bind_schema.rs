@@ -21,7 +21,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cxl::typecheck::{AggregateMode, Row, RowTail, Type, TypedProgram};
+use cxl::typecheck::{AggregateMode, OutputLayout, Row, RowTail, Type, TypedProgram};
 use indexmap::IndexMap;
 
 use crate::config::compile_context::CompileContext;
@@ -43,11 +43,48 @@ const MAX_COMPOSITION_DEPTH: u32 = 50;
 /// whose CXL body successfully type-checked, plus per-node row types.
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
+    /// TypedPrograms for TOP-LEVEL DAG nodes only (depth == 0).
+    ///
+    /// Invariant: every entry's `output_layout` has a closed-tail,
+    /// upstream-aware layout produced by `build_output_layout` or
+    /// `build_aggregate_output_layout`. `Arc<Schema>` identity equal
+    /// to `canonical_schemas[name]` and `bound_schemas.schema_of(name)`.
+    /// These are the ONLY runtime-canonical layouts.
     pub typed: HashMap<String, Arc<TypedProgram>>,
+    /// TypedPrograms for composition BODY nodes (depth > 0).
+    ///
+    /// Invariant: every entry's `output_layout` is the standalone
+    /// layout produced by `type_check_with_mode` (no upstream context;
+    /// `passthroughs` empty). Valid for isolated-scope evaluation and
+    /// --explain; NOT runtime-canonical. Body upstream rows are
+    /// open-tailed (row-polymorphic composition port rows) so
+    /// `build_output_layout`'s closed-tail invariant intentionally
+    /// never applies here. Split prevents accidental cross-use with
+    /// top-level runtime-canonical entries.
+    pub composition_body_typed: HashMap<String, Arc<TypedProgram>>,
+    /// Per-top-level-node canonical `Arc<OutputLayout>` for the
+    /// executor's Output arm predecessor-lookup. Populated for every
+    /// top-level DAG node (Source, Transform, Aggregate, Route, Merge).
+    /// Composition and Output nodes have NO entry.
+    ///
+    /// For Transform/Aggregate/Route: `Arc::clone(&typed[name].output_layout)`
+    /// — ptr-equal, single-oracle, zero drift. For Source/Merge:
+    /// synthesised identity-passthrough layout (`emit_slots: all None`,
+    /// `passthroughs: identity`) because Source/Merge columns are
+    /// passthroughs by nature — no CXL-emitted columns exist at those
+    /// boundaries.
+    pub output_layouts: HashMap<String, Arc<OutputLayout>>,
     /// Per-node bound row types (LD-16c-23). Populated during the
     /// `bind_schema` walk; persisted on `CompiledPlan` for downstream
     /// phases to consume.
     pub bound_schemas: BoundSchemas,
+    /// Pre-materialized canonical `Arc<Schema>` per node, keyed by name.
+    /// Populated inline during `bind_schema_inner` for EVERY top-level
+    /// node type (Source/Transform/Aggregate/Route/Merge) so every
+    /// node's `OutputLayout.schema` shares `Arc` identity with
+    /// `BoundSchemas.schema_of(name)`. One oracle — the executor
+    /// `Arc::ptr_eq` drift guardrail holds.
+    pub canonical_schemas: HashMap<String, Arc<clinker_record::Schema>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -149,12 +186,206 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
-    // Persist all bound rows into BoundSchemas (LD-16c-23).
+    // Persist all bound rows into BoundSchemas (LD-16c-23). When the
+    // node has a pre-materialized canonical `Arc<Schema>` from
+    // layout construction (CXL-bearing Transform/Aggregate/Route), reuse
+    // that exact Arc so `BoundSchemas::schema_of(name)` ptr-equals the
+    // node's `OutputLayout::schema`. One oracle. For Source/Merge/Output
+    // nodes that have no TypedProgram, we fall through to `set_output`
+    // which materializes a fresh Arc.
     for (node_name, row) in schema_by_name {
-        artifacts.bound_schemas.set_output(node_name, row);
+        if let Some(canonical) = artifacts.canonical_schemas.remove(&node_name) {
+            artifacts
+                .bound_schemas
+                .set_output_with_schema(node_name, row, canonical);
+        } else {
+            artifacts.bound_schemas.set_output(node_name, row);
+        }
     }
 
     artifacts
+}
+
+// ─── OutputLayout construction (Option-W codegen) ──────────────────────
+
+/// Materialize an `Arc<Schema>` from a bound output `Row`'s declared
+/// columns. The resulting Arc is the canonical schema for records
+/// produced by the node; it is shared with the node's
+/// [`cxl::typecheck::OutputLayout::schema`] and (at top-level flush) with
+/// [`BoundSchemas::schema_of`].
+fn materialize_schema(row: &Row) -> Arc<clinker_record::Schema> {
+    let cols: Vec<Box<str>> = row
+        .declared
+        .keys()
+        .map(|k| Box::<str>::from(k.as_str()))
+        .collect();
+    Arc::new(clinker_record::Schema::new(cols))
+}
+
+/// Build the Option-W positional layout for a Transform/Route node:
+///
+/// - `emit_slots[i]` = position of the i-th statement's name in `out` if it
+///   is a non-meta Emit, else `None`.
+/// - `passthroughs` = `(upstream_slot, out_slot)` copies for every upstream
+///   column NOT shadowed by a non-meta emit (emit-name shadowing matches
+///   `propagate_row`'s IndexMap::insert semantics).
+///
+/// Invariant: `out.tail == RowTail::Closed`. Open-tailed rows are a
+/// composition-scope concern and never reach the layout constructor for
+/// the top-level DAG.
+fn build_output_layout(
+    upstream: &Row,
+    out: &Row,
+    typed: &TypedProgram,
+    schema: Arc<clinker_record::Schema>,
+) -> OutputLayout {
+    // Amendment A1 (restored): closed-row outputs are the only
+    // architecturally-valid inputs to this layout constructor.
+    // Open-tailed rows are a composition-body concern and are routed
+    // via `CompileArtifacts.composition_body_typed` without layout
+    // replacement — they never reach this constructor.
+    debug_assert!(
+        matches!(out.tail, RowTail::Closed),
+        "build_output_layout requires a closed-tail output row; \
+         open-tailed rows arise only in composition bodies and must \
+         route to composition_body_typed without layout replacement"
+    );
+    debug_assert_eq!(
+        out.declared.len(),
+        schema.column_count(),
+        "out.declared.len() != schema.column_count()"
+    );
+
+    // Out-column name → slot index (positional in schema).
+    let out_index: HashMap<&str, u32> = out
+        .declared
+        .keys()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i as u32))
+        .collect();
+
+    // Collect non-meta emit names for passthrough shadow detection.
+    let mut emit_name_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for stmt in &typed.program.statements {
+        if let cxl::ast::Statement::Emit {
+            name,
+            is_meta: false,
+            ..
+        } = stmt
+        {
+            emit_name_set.insert(name.as_ref());
+        }
+    }
+
+    // emit_slots: per-statement positional slot, or None.
+    let mut emit_slots: Vec<Option<u32>> = Vec::with_capacity(typed.program.statements.len());
+    for stmt in &typed.program.statements {
+        match stmt {
+            cxl::ast::Statement::Emit {
+                name,
+                is_meta: false,
+                ..
+            } => {
+                let slot = out_index
+                    .get(name.as_ref())
+                    .copied()
+                    .expect("emit name must be present in out row");
+                emit_slots.push(Some(slot));
+            }
+            _ => emit_slots.push(None),
+        }
+    }
+
+    // passthroughs: upstream_slot → out_slot for every upstream column not
+    // shadowed by an emit with the same name.
+    let mut passthroughs: Vec<(u32, u32)> = Vec::new();
+    for (upstream_slot, upstream_name) in upstream.declared.keys().enumerate() {
+        if emit_name_set.contains(upstream_name.as_str()) {
+            continue;
+        }
+        if let Some(&out_slot) = out_index.get(upstream_name.as_str()) {
+            passthroughs.push((upstream_slot as u32, out_slot));
+        }
+    }
+
+    OutputLayout {
+        schema,
+        emit_slots,
+        passthroughs,
+    }
+}
+
+/// Build the Option-W layout for an Aggregate node. The aggregate's
+/// output row is `group_by ++ emits` (fresh — no passthroughs from the
+/// upstream record; aggregate finalize constructs values from
+/// accumulator state). `emit_slots` still maps non-meta Emit statements
+/// to their positional slot in the output schema, used by any
+/// post-finalize residual evaluation path.
+fn build_aggregate_output_layout(
+    out: &Row,
+    typed: &TypedProgram,
+    schema: Arc<clinker_record::Schema>,
+) -> OutputLayout {
+    debug_assert!(matches!(out.tail, RowTail::Closed));
+    debug_assert_eq!(out.declared.len(), schema.column_count());
+
+    let out_index: HashMap<&str, u32> = out
+        .declared
+        .keys()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i as u32))
+        .collect();
+
+    let mut emit_slots: Vec<Option<u32>> = Vec::with_capacity(typed.program.statements.len());
+    for stmt in &typed.program.statements {
+        match stmt {
+            cxl::ast::Statement::Emit {
+                name,
+                is_meta: false,
+                ..
+            } => {
+                let slot = out_index
+                    .get(name.as_ref())
+                    .copied()
+                    .expect("aggregate emit name must be present in out row");
+                emit_slots.push(Some(slot));
+            }
+            _ => emit_slots.push(None),
+        }
+    }
+
+    OutputLayout {
+        schema,
+        emit_slots,
+        passthroughs: Vec::new(),
+    }
+}
+
+/// Synthesise an identity-passthrough `OutputLayout` for Source and
+/// Merge nodes. Source/Merge columns are all passthroughs by nature
+/// — no CXL `emit` statement produces them — so `emit_slots` is all
+/// `None` and `passthroughs` is the identity mapping `(i, i)` for
+/// every column of the node's bound output schema.
+///
+/// The inserted layout's `schema` field shares `Arc` identity with
+/// `artifacts.canonical_schemas[name]` (and therefore with
+/// `bound_schemas.schema_of(name)` at finalisation). This upholds the
+/// Option W ptr-eq drift guardrail uniformly across all top-level node
+/// types.
+fn insert_identity_layout(
+    artifacts: &mut CompileArtifacts,
+    name: &str,
+    schema: &Arc<clinker_record::Schema>,
+) {
+    let n = schema.column_count();
+    let layout = OutputLayout {
+        schema: Arc::clone(schema),
+        emit_slots: vec![None; n],
+        passthroughs: (0..n as u32).map(|i| (i, i)).collect(),
+    };
+    artifacts
+        .output_layouts
+        .insert(name.to_string(), Arc::new(layout));
 }
 
 // ─── Internal recursive bind_schema ─────────────────────────────────
@@ -188,7 +419,22 @@ fn bind_schema_inner(
                 let schema_decl: &SchemaDecl = &config.schema;
                 let columns = columns_from_decl(schema_decl);
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
-                schema_by_name.insert(name, Row::closed(columns, cxl_span));
+                let row = Row::closed(columns, cxl_span);
+                if bind_ctx.depth == 0 {
+                    // Option W: populate canonical_schemas and
+                    // output_layouts for every top-level node so the
+                    // executor's uniform Arc<OutputLayout> lookup works
+                    // across Source/Transform/Aggregate/Route/Merge.
+                    // Sources' columns are all passthroughs (no CXL
+                    // emits), so the synthesised layout has
+                    // emit_slots: all None, passthroughs: identity.
+                    let out_schema = materialize_schema(&row);
+                    artifacts
+                        .canonical_schemas
+                        .insert(name.clone(), Arc::clone(&out_schema));
+                    insert_identity_layout(artifacts, &name, &out_schema);
+                }
+                schema_by_name.insert(name, row);
             }
             PipelineNode::Transform { header, config } => {
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
@@ -219,8 +465,38 @@ fn bind_schema_inner(
                 ) {
                     Ok(typed) => {
                         let out = propagate_row(&upstream, &typed);
-                        schema_by_name.insert(name.clone(), out);
-                        artifacts.typed.insert(name, Arc::new(typed));
+                        if bind_ctx.depth == 0 {
+                            // Top-level: build upstream-aware layout
+                            // (closed-tail invariant structurally
+                            // guaranteed); insert into runtime-canonical
+                            // `typed` + populate output_layouts.
+                            let out_schema = materialize_schema(&out);
+                            let layout = build_output_layout(
+                                &upstream,
+                                &out,
+                                &typed,
+                                Arc::clone(&out_schema),
+                            );
+                            let typed_with_layout = typed.with_output_layout(Arc::new(layout));
+                            artifacts.canonical_schemas.insert(name.clone(), out_schema);
+                            artifacts
+                                .output_layouts
+                                .insert(name.clone(), Arc::clone(&typed_with_layout.output_layout));
+                            schema_by_name.insert(name.clone(), out);
+                            artifacts.typed.insert(name, Arc::new(typed_with_layout));
+                        } else {
+                            // Composition body: upstream row is
+                            // open-tailed (row-polymorphic port row).
+                            // Keep the standalone layout built by
+                            // `type_check_with_mode`; insert into
+                            // composition_body_typed. `build_output_layout`
+                            // is NOT called — its closed-tail invariant
+                            // would fire on open upstream.
+                            schema_by_name.insert(name.clone(), out);
+                            artifacts
+                                .composition_body_typed
+                                .insert(name, Arc::new(typed));
+                        }
                     }
                     Err(d) => diags.push(d),
                 }
@@ -260,8 +536,36 @@ fn bind_schema_inner(
                 match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
                     Ok(typed) => {
                         let out = propagate_aggregate(&config.group_by, &upstream, &typed);
-                        schema_by_name.insert(name.clone(), out);
-                        artifacts.typed.insert(name, Arc::new(typed));
+                        if bind_ctx.depth == 0 {
+                            // Top-level: build aggregate output layout
+                            // (closed-tail invariant structurally
+                            // guaranteed); insert into `typed` +
+                            // populate output_layouts.
+                            let out_schema = materialize_schema(&out);
+                            let layout = build_aggregate_output_layout(
+                                &out,
+                                &typed,
+                                Arc::clone(&out_schema),
+                            );
+                            let typed_with_layout = typed.with_output_layout(Arc::new(layout));
+                            artifacts.canonical_schemas.insert(name.clone(), out_schema);
+                            artifacts
+                                .output_layouts
+                                .insert(name.clone(), Arc::clone(&typed_with_layout.output_layout));
+                            schema_by_name.insert(name.clone(), out);
+                            artifacts.typed.insert(name, Arc::new(typed_with_layout));
+                        } else {
+                            // Composition body aggregate: keep
+                            // standalone layout from type_check; insert
+                            // into composition_body_typed. (Note:
+                            // body Aggregates are W100-deferred at
+                            // lowering today — pre-existing latent
+                            // issue, out of scope for this fix.)
+                            schema_by_name.insert(name.clone(), out);
+                            artifacts
+                                .composition_body_typed
+                                .insert(name, Arc::new(typed));
+                        }
                     }
                     Err(d) => diags.push(d),
                 }
@@ -270,16 +574,147 @@ fn bind_schema_inner(
                 if let Some(upstream) = upstream_schema(&header.input, schema_by_name) {
                     let cloned = upstream.clone();
                     if let Ok(empty) = typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span) {
-                        artifacts.typed.insert(name.clone(), Arc::new(empty));
+                        if bind_ctx.depth == 0 {
+                            // Top-level: Route is transparent — it
+                            // dispatches to branches without changing
+                            // record shape. We maintain TWO layouts with
+                            // distinct purposes:
+                            //
+                            // 1. `artifacts.typed[route].output_layout`:
+                            //    RUNTIME EVALUATOR layout. Must match the
+                            //    upstream schema column-wise so the
+                            //    ProgramEvaluator produces correctly-sized
+                            //    output records (Route's CXL is empty —
+                            //    no emits, identity passthroughs copy all
+                            //    upstream columns through).
+                            //
+                            // 2. `artifacts.output_layouts[route]`:
+                            //    PROJECTION layout for the Output arm.
+                            //    Inherits the upstream's layout (emit
+                            //    semantics preserved through transparent
+                            //    Route). Using an identity layout here
+                            //    would drop upstream's CXL-named emit
+                            //    slots and break `include_unmapped: false`
+                            //    semantics.
+                            //
+                            // Both purposes are architecturally distinct
+                            // (evaluator record construction vs
+                            // projection filtering); having them diverge
+                            // at Route/Merge boundaries is not a
+                            // single-oracle violation.
+                            let out_schema = materialize_schema(&cloned);
+                            // (1) Evaluator layout = identity passthrough.
+                            let eval_layout = build_output_layout(
+                                &cloned,
+                                &cloned,
+                                &empty,
+                                Arc::clone(&out_schema),
+                            );
+                            let typed_with_layout = empty.with_output_layout(Arc::new(eval_layout));
+                            // (2) Projection layout = upstream's layout.
+                            let upstream_name = input_target(&header.input);
+                            let projection_layout = artifacts
+                                .output_layouts
+                                .get(upstream_name)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    // Upstream has no emits (e.g., Source);
+                                    // fall back to evaluator layout (they
+                                    // coincide in the emit-free case).
+                                    Arc::clone(&typed_with_layout.output_layout)
+                                });
+                            artifacts.canonical_schemas.insert(name.clone(), out_schema);
+                            artifacts
+                                .output_layouts
+                                .insert(name.clone(), projection_layout);
+                            artifacts
+                                .typed
+                                .insert(name.clone(), Arc::new(typed_with_layout));
+                        } else {
+                            // Composition body route: keep standalone
+                            // layout; insert into composition_body_typed.
+                            artifacts
+                                .composition_body_typed
+                                .insert(name.clone(), Arc::new(empty));
+                        }
                     }
                     schema_by_name.insert(name, cloned);
                 }
             }
             PipelineNode::Merge { header, .. } => {
+                // Option-W invariant: under positional records, every
+                // predecessor of a Merge must share the same bound output
+                // schema. If branches emitted divergent columns, records
+                // would arrive with incompatible Arc<Schema>s and
+                // positional access would be wrong. Enforce row equality
+                // on the declared key set; type-level differences are
+                // tolerated (typecheck upstream has already unified).
+                let expected_keys: Option<Vec<&String>> = header
+                    .inputs
+                    .first()
+                    .and_then(|first| schema_by_name.get(input_target(first)))
+                    .map(|row| row.declared.keys().collect());
+                let mut divergent = false;
+                if let Some(ref expected) = expected_keys {
+                    for inp in header.inputs.iter().skip(1) {
+                        if let Some(row) = schema_by_name.get(input_target(inp)) {
+                            let keys: Vec<&String> = row.declared.keys().collect();
+                            if keys != *expected {
+                                divergent = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if divergent {
+                    diags.push(
+                        Diagnostic::error(
+                            "E202",
+                            format!(
+                                "merge {name:?}: predecessor output rows differ — \
+                                 Option-W positional records require all inputs to a \
+                                 Merge node to share identical declared column sets in \
+                                 the same order"
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help(
+                            "ensure each upstream transform emits the same columns in \
+                             the same order, or insert a reshaping transform before the merge",
+                        ),
+                    );
+                    continue;
+                }
                 if let Some(first) = header.inputs.first()
                     && let Some(upstream) = schema_by_name.get(input_target(first))
                 {
-                    schema_by_name.insert(name, upstream.clone());
+                    let cloned = upstream.clone();
+                    if bind_ctx.depth == 0 {
+                        // Option W: Merge is a TRANSPARENT passthrough
+                        // (concatenates predecessors without changing
+                        // shape; Amendment A5 enforces predecessors share
+                        // declared row). Its runtime output layout
+                        // inherits from ANY input's layout — they are
+                        // equivalent. Using an identity-passthrough layout
+                        // here would drop upstream emit information.
+                        let first_input_name = input_target(first);
+                        let upstream_layout =
+                            artifacts.output_layouts.get(first_input_name).cloned();
+                        let out_schema = materialize_schema(&cloned);
+                        artifacts
+                            .canonical_schemas
+                            .insert(name.clone(), Arc::clone(&out_schema));
+                        if let Some(upstream_layout) = upstream_layout {
+                            artifacts
+                                .output_layouts
+                                .insert(name.clone(), upstream_layout);
+                        } else {
+                            // All Merge inputs are Source-like (no
+                            // emits): synthesise identity layout.
+                            insert_identity_layout(artifacts, &name, &out_schema);
+                        }
+                    }
+                    schema_by_name.insert(name, cloned);
                 }
             }
             PipelineNode::Output { header, .. } => {
@@ -526,7 +961,14 @@ fn bind_composition(
             };
             let n = &spanned.value;
             let n_name = n.name().to_string();
-            crate::config::lower_node_to_plan_node(n, &n_name, body_span, artifacts, diags)
+            crate::config::lower_node_to_plan_node(
+                n,
+                &n_name,
+                body_span,
+                artifacts,
+                crate::config::LowerScope::Body,
+                diags,
+            )
         })
         .collect();
 

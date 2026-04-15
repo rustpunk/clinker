@@ -114,7 +114,7 @@ impl GroupBoundary {
         &mut self,
         state: AggregatorGroupState,
         record: Record,
-        sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
+        sidecar: (u64, IndexMap<String, Value>),
         finalize: &F,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError>
@@ -162,18 +162,11 @@ impl GroupBoundary {
                 } else {
                     prev_state.min_row_num
                 };
-                // Phase 16b.8: emit post-aggregate record fields, not the
-                // upstream transform's common_emitted (which leaks
-                // pre-aggregation columns via include_unmapped). See
-                // `HashAggregator::finalize` for the rationale.
-                let emitted: IndexMap<String, Value> = out_record
-                    .schema()
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.to_string(), out_record.values()[i].clone()))
-                    .collect();
-                out.push((out_record, row_num, emitted, IndexMap::new()));
+                // Option W: downstream reads emits positionally from the
+                // record via the Aggregate node's OutputLayout. The
+                // per-record sidecar collapses to metadata only — one
+                // oracle (Failure mode #5 of RESEARCH-runtime-record-layout).
+                out.push((out_record, row_num, IndexMap::new()));
 
                 // Install the new open group.
                 let mut new_state = state;
@@ -222,34 +215,19 @@ impl GroupBoundary {
             } else {
                 state.min_row_num
             };
-            // Phase 16b.8: see the boundary-emit site above for rationale.
-            let emitted: IndexMap<String, Value> = out_record
-                .schema()
-                .columns()
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.to_string(), out_record.values()[i].clone()))
-                .collect();
-            out.push((out_record, row_num, emitted, IndexMap::new()));
+            // Option W: see boundary emit site above for rationale.
+            out.push((out_record, row_num, IndexMap::new()));
         }
         Ok(())
     }
 }
 
-fn seed_sidecars(
-    state: &mut AggregatorGroupState,
-    sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
-) {
+fn seed_sidecars(state: &mut AggregatorGroupState, sidecar: (u64, IndexMap<String, Value>)) {
     if state.min_row_num == u64::MAX {
         state.min_row_num = sidecar.0;
     }
-    if state.common_emitted.is_none() && !sidecar.1.is_empty() {
-        state.common_emitted = Some(sidecar.1);
-    } else if state.common_emitted.is_none() {
-        state.common_emitted = Some(IndexMap::new());
-    }
     if state.union_accumulated.is_empty() {
-        state.union_accumulated = sidecar.2;
+        state.union_accumulated = sidecar.1;
     }
 }
 
