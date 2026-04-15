@@ -30,6 +30,25 @@
 //! | `W100`      | warning  | Aggregate lowering deferred (Phase 16b Wave 3 stub)  |
 //! | `W101`      | warning  | Pass-through column shadowed by composition body column |
 //! | `W102`      | warning  | Composition signature validation (required+default contradiction, suspicious port) |
+//!
+//! Combine node diagnostics (Phase C.0+):
+//!
+//! | Code        | Severity | Meaning                                              |
+//! |-------------|----------|------------------------------------------------------|
+//! | `E300`      | error    | Combine requires at least 2 inputs                   |
+//! | `E301`      | error    | Combine input qualifier collides with reserved namespace |
+//! | `E302`      | error    | Qualified field collision across combine inputs      |
+//! | `E303`      | error    | Combine where-clause is not boolean                  |
+//! | `E304`      | error    | Field not in combine merged row                      |
+//! | `E305`      | error    | Combine where-clause has no cross-input comparisons  |
+//! | `E306`      | error    | Combine drive hint references unknown input          |
+//! | `E307`      | error    | Combine input references undeclared upstream         |
+//! | `E308`      | error    | Combine cxl body references unknown field            |
+//! | `E309`      | error    | Combine output schema is empty                       |
+//! | `E310`      | error    | Combine runtime exceeded hard memory limit           |
+//! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
+//! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
+//! | `W306`      | warning  | Combine planner cannot determine optimal driving input |
 
 use std::fmt;
 
@@ -333,5 +352,26 @@ mod diagnostic_tests {
             source.contains("`W101`"),
             "error.rs registry missing entry for W101"
         );
+    }
+
+    #[test]
+    fn test_error_registry_e300_through_e310_documented() {
+        let source = include_str!("error.rs");
+        for code in [
+            "E300", "E301", "E302", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310",
+        ] {
+            let pattern = format!("`{code}`");
+            assert!(
+                source.contains(&pattern),
+                "error.rs registry missing entry for {code}"
+            );
+        }
+        for code in ["W302", "W305", "W306"] {
+            let pattern = format!("`{code}`");
+            assert!(
+                source.contains(&pattern),
+                "error.rs registry missing entry for {code}"
+            );
+        }
     }
 }
