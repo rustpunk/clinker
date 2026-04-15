@@ -94,9 +94,11 @@ fn rss_bytes_impl() -> Option<u64> {
 /// Streaming: RSS is the only signal. Blocking stage spill triggers
 /// (sort, distinct) are implemented in Phase 8.
 pub struct MemoryBudget {
-    /// Total memory limit in bytes. Default: 512MB.
+    /// Total memory limit in bytes (the hard limit). Default: 512MB.
     pub limit: u64,
-    /// Fraction of limit at which spill triggers. Default: 0.60.
+    /// Fraction of limit at which proactive spill triggers (the soft limit).
+    /// Default: 0.80. Dual-threshold model: 80% soft / 100% hard / 20% spike
+    /// allowance — OTel Memory Limiter consensus.
     pub spill_threshold_pct: f64,
     /// Peak RSS observed across all `observe()` / `should_spill()` calls.
     /// `None` on platforms where RSS measurement is unavailable.
@@ -113,9 +115,12 @@ impl MemoryBudget {
     }
 
     /// Build from config memory_limit string ("512M", "2G", raw bytes).
+    ///
+    /// Uses the 0.80 default for `spill_threshold_pct` (dual-threshold model:
+    /// 80% soft / 100% hard / 20% spike allowance).
     pub fn from_config(memory_limit: Option<&str>) -> Self {
         let limit = parse_memory_limit_bytes(memory_limit);
-        Self::new(limit, 0.60)
+        Self::new(limit, 0.80)
     }
 
     /// Poll current RSS and update `peak_rss` if it exceeds the recorded peak.
@@ -138,6 +143,29 @@ impl MemoryBudget {
     /// Spill threshold in absolute bytes.
     pub fn spill_threshold_bytes(&self) -> u64 {
         (self.limit as f64 * self.spill_threshold_pct) as u64
+    }
+
+    /// Soft limit: point at which proactive spill begins.
+    /// Equals limit * spill_threshold_pct (default 0.80).
+    pub fn soft_limit(&self) -> u64 {
+        (self.limit as f64 * self.spill_threshold_pct) as u64
+    }
+
+    /// Hard limit: the absolute budget. RSS above this = abort.
+    pub fn hard_limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Spike allowance between soft and hard limits (default 20%).
+    pub fn spike_allowance(&self) -> u64 {
+        self.hard_limit() - self.soft_limit()
+    }
+
+    /// True when RSS exceeds hard limit. Check periodically in probe loops
+    /// (every 10K output records) to prevent unbounded fan-out.
+    pub fn should_abort(&mut self) -> bool {
+        self.observe();
+        self.peak_rss.is_some_and(|rss| rss > self.limit)
     }
 }
 
@@ -193,8 +221,8 @@ mod tests {
 
     #[test]
     fn test_memory_budget_below_threshold() {
-        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
-        // Test process RSS should be well under 307MB (60% of 512MB)
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
+        // Test process RSS should be well under 410MB (80% of 512MB)
         if rss_bytes().is_some() {
             assert!(!budget.should_spill());
         }
@@ -203,7 +231,7 @@ mod tests {
     #[test]
     fn test_memory_budget_above_threshold() {
         // Budget of 1MB — any running process exceeds this
-        let mut budget = MemoryBudget::new(1024 * 1024, 0.60);
+        let mut budget = MemoryBudget::new(1024 * 1024, 0.80);
         if rss_bytes().is_some() {
             assert!(budget.should_spill());
         }
@@ -211,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_memory_budget_peak_rss_tracked() {
-        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
         if rss_bytes().is_none() {
             return; // Skip on unsupported platforms
         }
@@ -230,7 +258,7 @@ mod tests {
     fn test_memory_budget_default_values() {
         let budget = MemoryBudget::from_config(None);
         assert_eq!(budget.limit, 512 * 1024 * 1024);
-        assert!((budget.spill_threshold_pct - 0.60).abs() < f64::EPSILON);
+        assert!((budget.spill_threshold_pct - 0.80).abs() < f64::EPSILON);
     }
 
     #[test]
