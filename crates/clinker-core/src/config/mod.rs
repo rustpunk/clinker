@@ -1585,10 +1585,28 @@ pub(crate) fn lower_node_to_plan_node(
             ));
             None
         }
-        // Phase Combine C.0.1: Combine lowering lands in Task C.0.2 when
-        // `PlanNode::Combine` is added. For now, skip to keep `build_specs`
-        // exhaustive without emitting a half-formed plan node.
-        PipelineNode::Combine { .. } => None,
+        // Phase Combine C.0.2: Combine lowers to PlanNode::Combine.
+        // V-1-1 side-table architecture: only --explain-visible and
+        // parse-time-available fields live inline. strategy defaults
+        // to HashBuildProbe (C.2 post-pass overwrites via
+        // select_combine_strategies); driving_input is empty until
+        // C.2 selects; decomposed_from is always None for
+        // user-authored nodes (C.4 sets it for synthetic binary nodes
+        // produced by N-ary decomposition). typed::where / typed::body
+        // and DecomposedPredicate / CombineInput live in
+        // CompileArtifacts side-tables, populated by C.1 bind_schema.
+        PipelineNode::Combine { config, .. } => {
+            use crate::plan::combine::CombineStrategy;
+            Some(crate::plan::execution::PlanNode::Combine {
+                name: name.to_string(),
+                span,
+                strategy: CombineStrategy::HashBuildProbe,
+                driving_input: String::new(),
+                match_mode: config.match_mode,
+                on_miss: config.on_miss,
+                decomposed_from: None,
+            })
+        }
     }
 }
 

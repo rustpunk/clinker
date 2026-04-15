@@ -3503,6 +3503,20 @@ impl PipelineExecutor {
                         .unwrap_or_default();
                     node_buffers.insert(node_idx, input_records);
                 }
+
+                PlanNode::Combine { ref name, .. } => {
+                    // Phase Combine C.0: no executor code yet. C.2 wires up
+                    // the multi-input build/probe dispatch arm. Reaching this
+                    // arm in C.0 is a planner bug (a Combine node escaped
+                    // into the DAG without C.0.4 DAG-edge wiring or with
+                    // premature execution). Fail loud.
+                    return Err(PipelineError::Internal {
+                        op: "combine",
+                        node: name.clone(),
+                        detail: "combine executor dispatch not implemented until Phase Combine C.2"
+                            .to_string(),
+                    });
+                }
             }
         }
 

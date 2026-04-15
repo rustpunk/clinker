@@ -600,6 +600,9 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
             PlanNode::Composition { name, .. } => {
                 (name.clone(), StageKind::Composition, String::new())
             }
+            PlanNode::Combine { name, strategy, .. } => {
+                (name.clone(), StageKind::Combine, format!("{strategy:?}"))
+            }
         };
 
         stages.push(StageView {

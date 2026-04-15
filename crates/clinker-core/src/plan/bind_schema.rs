@@ -32,6 +32,7 @@ use crate::config::composition::{
 use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::bound_schemas::BoundSchemas;
+use crate::plan::combine::{CombineInput, DecomposedPredicate};
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
@@ -64,6 +65,16 @@ pub struct CompileArtifacts {
     /// Side-table of provenance-tracked config values (D-H.5 / LD-16c-11).
     /// Populated by `bind_composition` for each composition node's config params.
     pub provenance: ProvenanceDb,
+    /// Phase Combine C.0.2 — decomposed `where:` predicates per combine
+    /// node, keyed by combine node name. Populated by C.1 predicate
+    /// decomposition; consumed by C.2 strategy selection. Side-table
+    /// architecture per V-1-1 / RESOLUTION B-4.
+    pub combine_predicates: HashMap<String, DecomposedPredicate>,
+    /// Phase Combine C.0.2 — per-input metadata per combine node, keyed
+    /// by combine node name. The inner `IndexMap` preserves declaration
+    /// order of the inputs (matches `CombineHeader.input` iteration
+    /// order). Populated by C.1 schema propagation.
+    pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
 }
 
 impl CompileArtifacts {

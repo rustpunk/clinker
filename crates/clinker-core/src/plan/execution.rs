@@ -187,6 +187,34 @@ pub enum PlanNode {
         /// `CompositionBodyId::SENTINEL` before binding runs.
         body: CompositionBodyId,
     },
+    /// N-ary combine node (Phase Combine, task C.0.2).
+    ///
+    /// V-1-1 side-table architecture: this variant carries ONLY --explain-
+    /// visible and parse-time-available fields inline. The late-populated
+    /// compile state lives in `CompileArtifacts` side-tables
+    /// (`typed["{name}::where"]`, `typed["{name}::body"]`,
+    /// `combine_predicates`, `combine_inputs`). See
+    /// `crates/clinker-core/src/plan/combine.rs`.
+    Combine {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Planner-selected strategy. Defaults to `HashBuildProbe`;
+        /// overwritten by `select_combine_strategies` post-pass (C.2).
+        /// Follows `PlanNode::Aggregation.strategy` precedent.
+        strategy: crate::plan::combine::CombineStrategy,
+        /// Driving input qualifier. Empty string until the planner
+        /// selects it (C.2).
+        driving_input: String,
+        match_mode: crate::config::pipeline_node::MatchMode,
+        on_miss: crate::config::pipeline_node::OnMiss,
+        /// For synthetic binary combine nodes created by N-ary
+        /// decomposition (C.4): name of the original N-ary combine node
+        /// this was decomposed from. `None` for user-authored combine
+        /// nodes. Populated in C.4.0.3; consumed by C.5.1 `--explain`
+        /// grouping (RESOLUTION W-1).
+        decomposed_from: Option<String>,
+    },
 }
 
 /// Phase 16b Wave 2 — fully-resolved Source payload, populated by the new
@@ -460,7 +488,8 @@ impl PlanNode {
             | PlanNode::Output { name, .. }
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. }
-            | PlanNode::Composition { name, .. } => name,
+            | PlanNode::Composition { name, .. }
+            | PlanNode::Combine { name, .. } => name,
         }
     }
 
@@ -475,7 +504,8 @@ impl PlanNode {
             | PlanNode::Output { span, .. }
             | PlanNode::Sort { span, .. }
             | PlanNode::Aggregation { span, .. }
-            | PlanNode::Composition { span, .. } => *span,
+            | PlanNode::Composition { span, .. }
+            | PlanNode::Combine { span, .. } => *span,
         }
     }
 
@@ -490,6 +520,7 @@ impl PlanNode {
             PlanNode::Sort { .. } => "sort",
             PlanNode::Aggregation { .. } => "aggregation",
             PlanNode::Composition { .. } => "composition",
+            PlanNode::Combine { .. } => "combine",
         }
     }
 
@@ -522,6 +553,16 @@ impl PlanNode {
             }
             PlanNode::Composition { name, body, .. } => {
                 format!("[composition:body={}] {name}", body.0)
+            }
+            PlanNode::Combine {
+                name,
+                strategy,
+                driving_input,
+                ..
+            } => {
+                // Minimal display for C.0; C.5.1 enriches --explain rendering
+                // with strategy details and per-input annotations.
+                format!("[combine strategy={strategy:?} drive={driving_input}] {name}")
             }
         }
     }
@@ -677,6 +718,17 @@ impl ExecutionPlanDag {
             .graph
             .node_weights()
             .any(|n| matches!(n, PlanNode::Aggregation { .. }))
+        {
+            return true;
+        }
+        // Combine nodes are multi-input and require the DAG-walk executor
+        // path (V-1-3 hard requirement). Without this, combine pipelines
+        // would route through the single-input streaming path and silently
+        // skip the combine dispatch arm.
+        if self
+            .graph
+            .node_weights()
+            .any(|n| matches!(n, PlanNode::Combine { .. }))
         {
             return true;
         }
@@ -1560,6 +1612,12 @@ impl ExecutionPlanDag {
                     // Sibling rendering: Aggregation gets its own topo
                     // line, not nested inside an upstream Transform.
                     out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
+                }
+                PlanNode::Combine { .. } => {
+                    // Combine renders as a sibling topo line. C.5.1 enriches
+                    // this with per-input dependency trace and strategy
+                    // details; C.0 keeps it minimal.
+                    out.push_str(&format!("  ◈ {}{line_suffix}\n", node.display_name()));
                 }
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
@@ -2687,6 +2745,17 @@ fn compute_one(
                 },
                 partitioning: parent.partitioning.clone(),
             }
+        }
+
+        PlanNode::Combine { .. } => {
+            // C.0: conservative default — combine destroys parent ordering
+            // and yields a single stream. C.1 replaces this with a proper
+            // `DestroyedByCombine { at_node, confidence: Proven }` ordering
+            // provenance once the provenance enum gains that variant
+            // (drill D20).
+            // TODO(C.1): add `OrderingProvenance::DestroyedByCombine` and
+            // emit it from here with `at_node = name.clone()`.
+            NodeProperties::unordered_single()
         }
     }
 }

@@ -1,5 +1,6 @@
 pub mod bind_schema;
 pub mod bound_schemas;
+pub mod combine;
 pub mod compiled;
 pub mod composition_body;
 pub mod execution;
