@@ -225,6 +225,12 @@ fn bench_lookup_baseline(c: &mut Criterion) {
     // Lookup pipeline: products (10K reference table) × orders (100K
     // driving source) joined on `key`. `on_miss: null_fields` preserves
     // all probe rows (miss rate is ~10%).
+    //
+    // IMPORTANT: `orders` must be declared FIRST. `run_with_readers_writers`
+    // treats `source_configs[0]` as the primary driving input (drains its
+    // reader up front); remaining readers flow into `build_lookup_tables`
+    // for the lookup stage. Reversing the order would consume the
+    // products reader as the primary input and starve the lookup.
     let yaml = r#"
 pipeline:
   name: bench_lookup_baseline
@@ -232,10 +238,10 @@ error_handling:
   strategy: continue
 nodes:
 - type: source
-  name: products
+  name: orders
   config:
-    name: products
-    path: products.csv
+    name: orders
+    path: orders.csv
     type: csv
     options:
       has_header: true
@@ -246,10 +252,10 @@ nodes:
       - { name: c2, type: string }
 
 - type: source
-  name: orders
+  name: products
   config:
-    name: orders
-    path: orders.csv
+    name: products
+    path: products.csv
     type: csv
     options:
       has_header: true
