@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use petgraph::graph::NodeIndex;
 use serde::Serialize;
 
@@ -118,11 +117,6 @@ pub struct CombineInput {
     pub row: Row,
     pub estimated_cardinality: Option<u64>,
 }
-
-// Keep `IndexMap` live as a re-export hint for downstream consumers that
-// reach into `CompileArtifacts.combine_inputs`. Doc-only — no API surface.
-#[allow(dead_code)]
-type _CombineInputMap = IndexMap<String, CombineInput>;
 
 #[cfg(test)]
 mod tests {
