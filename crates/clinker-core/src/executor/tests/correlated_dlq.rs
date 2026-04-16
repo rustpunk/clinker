@@ -27,8 +27,9 @@ fn run_correlated_pipeline(
         shutdown_token: None,
     };
 
+    let primary = config.source_configs().next().unwrap().name.clone();
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.source_configs().next().unwrap().name.clone(),
+        primary.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
@@ -39,7 +40,9 @@ fn run_correlated_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config, &primary, readers, writers, &params,
+    )?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 

@@ -310,8 +310,9 @@ fn run_multi_output(
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params(&config);
 
+    let primary = config.source_configs().next().unwrap().name.clone();
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.source_configs().next().unwrap().name.clone(),
+        primary.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
@@ -325,7 +326,9 @@ fn run_multi_output(
         })
         .collect();
 
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config, &primary, readers, writers, &params,
+    )?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -696,7 +699,8 @@ nodes:
         ),
     ]);
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     assert!(result.is_err(), "should propagate writer error");
 }
 
@@ -974,7 +978,7 @@ nodes:
 
     // Panic should be caught and propagated, not hang or abort
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params)
     }));
 
     // The panic is re-raised via resume_unwind, so catch_unwind catches it
@@ -1144,7 +1148,8 @@ nodes:
     ]);
 
     // Should not deadlock — producer handles SendError::Disconnected
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     // Either error (from the dying writer) or success if the writer survived long enough
     // The key assertion: no deadlock, no hang — the test completes
     let _ = result;
@@ -1231,7 +1236,8 @@ nodes:
         ),
     ]);
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     match result {
         Err(PipelineError::Multiple(errors)) => {
             assert_eq!(errors.len(), 2, "should collect both flush errors");
@@ -1638,7 +1644,8 @@ nodes:
         })
         .collect();
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     assert!(
         result.is_ok(),
         "single-writer HashMap should work: {result:?}"
@@ -1701,7 +1708,8 @@ nodes:
         })
         .collect();
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     assert!(
         result.is_ok(),
         "single-reader HashMap should work: {result:?}"

@@ -18,7 +18,7 @@ mod tests {
         let first_source = config.source_configs().next().unwrap().name.clone();
         let first_output = config.output_configs().next().unwrap().name.clone();
         let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-            first_source,
+            first_source.clone(),
             Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
                 as Box<dyn std::io::Read + Send>,
         )]);
@@ -40,8 +40,13 @@ mod tests {
             shutdown_token: None,
         };
 
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+        let report = PipelineExecutor::run_with_readers_writers(
+            &config,
+            &first_source,
+            readers,
+            writers,
+            &params,
+        )?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
@@ -790,6 +795,8 @@ emit out_code = code"#,
     // ── Lookup enrichment tests ──
 
     /// Helper: run executor with multiple named in-memory CSV sources.
+    /// The first entry in `sources` is treated as the primary driving
+    /// input; remaining entries flow into lookup build.
     fn run_multi_source_pipeline(
         yaml: &str,
         sources: &[(&str, &str)],
@@ -805,6 +812,11 @@ emit out_code = code"#,
                     as Box<dyn std::io::Read + Send>,
             );
         }
+
+        let primary = sources
+            .first()
+            .expect("run_multi_source_pipeline needs at least one source")
+            .0;
 
         let first_output = config.output_configs().next().unwrap().name.clone();
         let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -825,8 +837,9 @@ emit out_code = code"#,
             shutdown_token: None,
         };
 
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+        let report = PipelineExecutor::run_with_readers_writers(
+            &config, primary, readers, writers, &params,
+        )?;
 
         let output = output_buf.as_string();
         Ok((report.counters, report.dlq_entries, output))
@@ -1176,6 +1189,274 @@ nodes:
         assert!(
             !output.contains("legal"),
             "legal should be skipped: {output}"
+        );
+    }
+
+    // ── Explicit-primary contract tests ──
+    //
+    // These three gate tests pin down the contract introduced when
+    // `PipelineExecutor::run_with_readers_writers` took an explicit
+    // `primary: &str` parameter (replacing the implicit
+    // `source_configs[0]`-as-primary convention). See
+    // `crates/clinker-core/src/executor/mod.rs`.
+
+    /// Passing a `primary` name that does not match any declared
+    /// source in the pipeline config must surface as a
+    /// `Config(ConfigError::Validation(..))` error — no panic, no
+    /// silent coercion.
+    #[test]
+    fn test_run_with_readers_writers_rejects_unknown_primary() {
+        let yaml = r#"
+pipeline:
+  name: single_source
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: input.csv
+    schema:
+      - { name: id, type: string }
+- type: transform
+  name: identity
+  input: src
+  config:
+    cxl: 'emit id = id'
+- type: output
+  name: dest
+  input: identity
+  config:
+    name: dest
+    type: csv
+    path: output.csv
+"#;
+        let config = config::parse_config(yaml).unwrap();
+
+        // `src` is registered, but we pass "nonexistent" as primary.
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+            "src".to_string(),
+            Box::new(std::io::Cursor::new(b"id\n1\n".to_vec())) as Box<dyn std::io::Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            "dest".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars: Default::default(),
+            shutdown_token: None,
+        };
+
+        let result = PipelineExecutor::run_with_readers_writers(
+            &config,
+            "nonexistent",
+            readers,
+            writers,
+            &params,
+        );
+
+        match result {
+            Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
+                assert!(
+                    msg.contains("primary source 'nonexistent'") && msg.contains("not declared"),
+                    "expected 'primary source \\'nonexistent\\' not declared...' message, got: {msg}"
+                );
+            }
+            other => panic!("expected Config(Validation) for unknown primary, got: {other:?}"),
+        }
+    }
+
+    /// Passing a `primary` that IS declared in the pipeline config
+    /// but is missing from the `readers` HashMap must surface as a
+    /// `Config(ConfigError::Validation(..))` error — the same clear
+    /// error the old implementation already produced for the
+    /// positionally-selected primary.
+    #[test]
+    fn test_run_with_readers_writers_rejects_primary_missing_from_readers() {
+        let yaml = r#"
+pipeline:
+  name: single_source
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: input.csv
+    schema:
+      - { name: id, type: string }
+- type: transform
+  name: identity
+  input: src
+  config:
+    cxl: 'emit id = id'
+- type: output
+  name: dest
+  input: identity
+  config:
+    name: dest
+    type: csv
+    path: output.csv
+"#;
+        let config = config::parse_config(yaml).unwrap();
+
+        // Readers map is EMPTY — the primary is declared in config
+        // but no reader is registered for it.
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::new();
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            "dest".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars: Default::default(),
+            shutdown_token: None,
+        };
+
+        let result =
+            PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+
+        match result {
+            Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
+                assert!(
+                    msg.contains("no reader registered for input 'src'"),
+                    "expected missing-reader message, got: {msg}"
+                );
+            }
+            other => panic!("expected Config(Validation) for missing reader, got: {other:?}"),
+        }
+    }
+
+    /// Key regression-proofing test: declare sources in the order
+    /// `[lookup, driving]` (so `source_configs[0]` is the LOOKUP
+    /// table, not the driving input), pass `primary = "orders"`
+    /// explicitly, and verify the pipeline runs correctly end-to-end.
+    ///
+    /// Under the old positional-primary convention this configuration
+    /// would have consumed the `products` reader as the driving input
+    /// and starved the lookup stage. With the explicit-primary
+    /// contract, declaration order is irrelevant — not just for
+    /// reader extraction but also for downstream provenance
+    /// (`source_file` on every emitted record) and arena-field
+    /// scoping inside `execute_dag` / `execute_dag_branching`.
+    #[test]
+    fn test_run_with_readers_writers_primary_is_not_first_source() {
+        let yaml = r#"
+pipeline:
+  name: primary_not_first
+nodes:
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "product_id == products.product_id"
+      cxl: |
+        emit order_id = order_id
+        emit product_name = products.product_name
+        emit quantity = quantity
+
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: output.csv
+"#;
+        let config = config::parse_config(yaml).unwrap();
+
+        // Confirm the test's premise: declaration order is
+        // [products, orders], i.e. source 0 is the lookup table, not
+        // the driving input. Under the old positional convention this
+        // would have been broken.
+        let source_names: Vec<String> = config.source_configs().map(|s| s.name.clone()).collect();
+        assert_eq!(
+            source_names,
+            vec!["products".to_string(), "orders".to_string()],
+            "test setup invariant: lookup source must be declared before driving source"
+        );
+
+        let orders = "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\n";
+        let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
+
+        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+            (
+                "products".to_string(),
+                Box::new(std::io::Cursor::new(products.as_bytes().to_vec()))
+                    as Box<dyn std::io::Read + Send>,
+            ),
+            (
+                "orders".to_string(),
+                Box::new(std::io::Cursor::new(orders.as_bytes().to_vec()))
+                    as Box<dyn std::io::Read + Send>,
+            ),
+        ]);
+        let out_buf = SharedBuffer::new();
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            "result".to_string(),
+            Box::new(out_buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars: Default::default(),
+            shutdown_token: None,
+        };
+
+        let report = PipelineExecutor::run_with_readers_writers(
+            &config, "orders", // explicit primary — NOT the first-declared source
+            readers, writers, &params,
+        )
+        .expect("pipeline must execute when primary is declared second");
+
+        assert_eq!(
+            report.counters.total_count, 2,
+            "both orders rows must be read as the driving input"
+        );
+        assert_eq!(
+            report.counters.ok_count, 2,
+            "both orders rows must enrich successfully against products"
+        );
+        assert!(report.dlq_entries.is_empty(), "no DLQ entries expected");
+
+        let output = out_buf.as_string();
+        assert!(
+            output.contains("Widget"),
+            "enriched output must include lookup-table value 'Widget': {output}"
+        );
+        assert!(
+            output.contains("Gadget"),
+            "enriched output must include lookup-table value 'Gadget': {output}"
+        );
+        assert!(
+            output.contains("ORD-1") && output.contains("ORD-2"),
+            "output must include both order IDs: {output}"
         );
     }
 }

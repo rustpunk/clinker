@@ -13,8 +13,9 @@ fn run_branch_test(
     let config = crate::config::parse_config(yaml).unwrap();
     let output_buf = crate::test_helpers::SharedBuffer::new();
 
+    let primary = config.source_configs().next().unwrap().name.clone();
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.source_configs().next().unwrap().name.clone(),
+        primary.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
@@ -36,7 +37,9 @@ fn run_branch_test(
         shutdown_token: None,
     };
 
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config, &primary, readers, writers, &params,
+    )?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))

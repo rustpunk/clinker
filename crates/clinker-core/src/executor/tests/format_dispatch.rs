@@ -107,7 +107,9 @@ fn run_format_test(
     )]);
 
     let params = test_params();
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config, input_name, readers, writers, &params,
+    )?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))

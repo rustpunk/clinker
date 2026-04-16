@@ -567,6 +567,14 @@ impl PipelineExecutor {
     /// the legacy `&PipelineConfig`-consuming variant is retained
     /// pending the full executor-internal cutover in a follow-up.
     ///
+    /// The primary (driving) source is the first source node in
+    /// declaration order (`config.source_configs().next()`). Callers
+    /// that need to drive the pipeline from a non-first declared
+    /// source must use
+    /// [`Self::run_plan_with_readers_writers_with_primary`] instead —
+    /// declaration-order-as-primary is a convenience of this wrapper,
+    /// not a contract of the executor itself.
+    ///
     /// D3b compile-fail guarantee — `&PipelineConfig` is NOT accepted:
     ///
     /// ```compile_fail
@@ -588,7 +596,38 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), readers, writers, params)
+        let config = plan.config();
+        let primary_name = config
+            .source_configs()
+            .next()
+            .map(|s| s.name.clone())
+            .ok_or_else(|| {
+                PipelineError::Config(crate::config::ConfigError::Validation(
+                    "pipeline declares no source nodes; cannot infer primary driving input"
+                        .to_string(),
+                ))
+            })?;
+        Self::run_with_readers_writers(config, &primary_name, readers, writers, params)
+    }
+
+    /// Same as [`Self::run_plan_with_readers_writers`] but with an
+    /// explicit `primary` driving-source name. Use this when the
+    /// driving input is not the first-declared source — e.g., lookup
+    /// baselines that put the reference table earlier in YAML for
+    /// readability but drive the pipeline from the probe source.
+    ///
+    /// `primary` must match the `name` of one of the source nodes
+    /// declared in the pipeline config, and a reader for that name
+    /// must be present in `readers`. Violations surface as
+    /// `PipelineError::Config(ConfigError::Validation(..))`.
+    pub fn run_plan_with_readers_writers_with_primary(
+        plan: &crate::plan::CompiledPlan,
+        primary: &str,
+        readers: HashMap<String, Box<dyn Read + Send>>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
+        params: &PipelineRunParams,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers(plan.config(), primary, readers, writers, params)
     }
 
     /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` text entry.
@@ -609,20 +648,40 @@ impl PipelineExecutor {
     /// the pipeline config. For single-input/output pipelines, pass single-entry
     /// HashMaps.
     ///
+    /// `primary` is the name of the source node that drives the
+    /// pipeline: its reader is consumed as the streaming input, and
+    /// every other entry in `readers` flows into `build_lookup_tables`
+    /// for lookup-stage build. Source declaration order in YAML is
+    /// irrelevant — `primary` is chosen explicitly. If `primary` does
+    /// not match a declared source name, or no reader is registered
+    /// under that name, the function returns
+    /// `PipelineError::Config(ConfigError::Validation(..))`.
+    ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
+        primary: &str,
         mut readers: HashMap<String, Box<dyn Read + Send>>,
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
-        // Extract the primary reader from the registry
+        // Resolve the primary source config by name. The driving
+        // input is chosen explicitly via `primary` — declaration
+        // order in `config.source_configs()` plays no role.
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let input = &source_configs[0];
+        let primary_idx = source_configs
+            .iter()
+            .position(|s| s.name == primary)
+            .ok_or_else(|| {
+                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                    "primary source '{primary}' is not declared in the pipeline config",
+                )))
+            })?;
+        let input = &source_configs[primary_idx];
         let reader = readers.remove(&input.name).ok_or_else(|| {
             PipelineError::Config(crate::config::ConfigError::Validation(format!(
                 "no reader registered for input '{}'",
@@ -748,6 +807,7 @@ impl PipelineExecutor {
 
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
+            input,
             format_reader,
             writers,
             &compiled_transforms,
@@ -1102,6 +1162,7 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_dag(
         config: &PipelineConfig,
+        input: &crate::config::SourceConfig,
         mut format_reader: Box<dyn FormatReader>,
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
@@ -1111,9 +1172,7 @@ impl PipelineExecutor {
         collector: &mut stage_metrics::StageCollector,
         lookup_tables: HashMap<String, RuntimeLookup>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let input = &source_configs[0];
         let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
@@ -1712,6 +1771,7 @@ impl PipelineExecutor {
         if plan.has_branching() {
             return Self::execute_dag_branching(
                 config,
+                input,
                 all_records,
                 writers,
                 transforms,
@@ -2675,6 +2735,7 @@ impl PipelineExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_dag_branching(
         config: &PipelineConfig,
+        input: &crate::config::SourceConfig,
         all_records: Vec<(Record, u64)>,
         mut writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
@@ -2688,9 +2749,7 @@ impl PipelineExecutor {
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         use petgraph::graph::NodeIndex;
 
-        let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let input = &source_configs[0];
         let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
