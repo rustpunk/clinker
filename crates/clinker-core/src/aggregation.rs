@@ -2497,6 +2497,9 @@ fn ordering_provenance_summary(p: &crate::plan::properties::OrderingProvenance) 
         OP::DestroyedByMergeMismatch { at_node, .. } => {
             format!("destroyed by merge mismatch at `{}`", at_node)
         }
+        OP::DestroyedByCombine { at_node, .. } => {
+            format!("destroyed by combine `{}`", at_node)
+        }
         OP::IntroducedByStreamingAggregate { at_node, .. } => {
             format!("introduced by streaming aggregate `{}`", at_node)
         }

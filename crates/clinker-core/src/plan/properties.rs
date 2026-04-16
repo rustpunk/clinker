@@ -89,6 +89,17 @@ pub enum OrderingProvenance {
         parent_orderings: Vec<Option<Vec<SortField>>>,
         confidence: Confidence,
     },
+    /// Destroyed by a combine node: hash-build/probe (and IEJoin, grace
+    /// hash, etc.) does not preserve driving-input order. Combine always
+    /// emits unordered output at `at_node`; if a downstream consumer
+    /// requires sorted input, a sort must be inserted between the
+    /// combine and the consumer.
+    ///
+    /// Resolves Phase Combine §OQ-6.
+    DestroyedByCombine {
+        at_node: String,
+        confidence: Confidence,
+    },
     /// Source has no declared sort order.
     NoOrdering,
     /// Ordering asserted by a streaming aggregate's group-by prefix at
@@ -256,6 +267,16 @@ pub fn render_unordered_streaming_error(
                 ));
                 break;
             }
+            OrderingProvenance::DestroyedByCombine {
+                at_node,
+                confidence,
+            } => {
+                let (caret, hedge) = caret_and_hedge(*confidence);
+                out.push_str(&format!(
+                    "  note: ordering {hedge}destroyed by combine `{at_node}`\n        {caret}\n"
+                ));
+                break;
+            }
         }
         hops += 1;
         if hops > 32 {
@@ -305,6 +326,12 @@ pub fn render_unordered_streaming_error(
             out.push_str(&format!(
                 "  help: parent orderings disagree at merge `{at_node}`; \
                  align them upstream or sort below the merge\n"
+            ));
+        }
+        OrderingProvenance::DestroyedByCombine { at_node, .. } => {
+            out.push_str(&format!(
+                "  help: combine `{at_node}` produces unordered output; \
+                 add a sort step between `{at_node}` and `{agg_name}`\n"
             ));
         }
         OrderingProvenance::Preserved { .. }
@@ -417,6 +444,27 @@ mod render_tests {
         );
         assert!(s.contains("destroyed by hash aggregate `ha`"));
         assert!(s.contains("add a sort step between `ha` and `agg`"));
+    }
+
+    /// C.1.4 gate (V-5-5): combine destruction renders as a
+    /// `DestroyedBy*`-shaped note + primary help, matching the other
+    /// `DestroyedBy*` render tests.
+    #[test]
+    fn test_render_destroyed_by_combine() {
+        let s = render_unordered_streaming_error(
+            &props(OrderingProvenance::DestroyedByCombine {
+                at_node: "enriched".to_string(),
+                confidence: Confidence::Proven,
+            }),
+            &["k".to_string()],
+            "agg",
+        );
+        assert!(s.contains("CXL0419"));
+        assert!(s.contains("destroyed by combine `enriched`"));
+        assert!(s.contains("^^^"));
+        assert!(s.contains("add a sort step between `enriched` and `agg`"));
+        assert!(s.contains("insert a sort step upstream of `agg`"));
+        assert!(s.contains("relax to `strategy: auto`"));
     }
 
     #[test]

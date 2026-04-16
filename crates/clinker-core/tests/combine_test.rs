@@ -1012,4 +1012,60 @@ nodes:
             );
         }
     }
+
+    // --- C.1.4 gate tests ------------------------------------------------
+
+    /// Gate (C.1.4): a compiled Combine node carries
+    /// `OrderingProvenance::DestroyedByCombine { confidence: Proven }` in
+    /// its `NodeProperties`. Hash-build/probe (and IEJoin, grace hash) do
+    /// not preserve driving-input order; the property-derivation pass
+    /// must mark the combine as destructive so downstream streaming-agg
+    /// eligibility, `--explain`, and Kiln canvas overlays can chain
+    /// through. Resolves Phase Combine §OQ-6 and drill D12.
+    ///
+    /// Uses `two_input_equi.yaml` (combine 'enriched' over sources
+    /// 'orders' and 'products'). The combine lands through full
+    /// `ExecutionPlanDag::compile`, which invokes
+    /// `compute_node_properties` internally.
+    #[test]
+    fn test_combine_destroys_ordering() {
+        use clinker_core::plan::properties::{Confidence, OrderingProvenance};
+
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+
+        let combine_idx = find_combine_node(&plan, "enriched");
+        let props = plan
+            .node_properties
+            .get(&combine_idx)
+            .expect("combine node must have NodeProperties populated by compile()");
+
+        // No sort_order — combine output is unordered.
+        assert!(
+            props.ordering.sort_order.is_none(),
+            "combine output sort_order must be None, got {:?}",
+            props.ordering.sort_order
+        );
+
+        match &props.ordering.provenance {
+            OrderingProvenance::DestroyedByCombine {
+                at_node,
+                confidence,
+            } => {
+                assert_eq!(
+                    at_node, "enriched",
+                    "DestroyedByCombine.at_node must identify the combine node"
+                );
+                assert_eq!(
+                    *confidence,
+                    Confidence::Proven,
+                    "Combine destruction is structural — confidence must be Proven"
+                );
+            }
+            other => panic!(
+                "combine 'enriched' must produce DestroyedByCombine provenance; got {other:?}"
+            ),
+        }
+    }
 }

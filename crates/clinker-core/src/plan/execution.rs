@@ -2906,15 +2906,24 @@ fn compute_one(
             }
         }
 
-        PlanNode::Combine { .. } => {
-            // C.0: conservative default — combine destroys parent ordering
-            // and yields a single stream. C.1 replaces this with a proper
-            // `DestroyedByCombine { at_node, confidence: Proven }` ordering
-            // provenance once the provenance enum gains that variant
-            // (drill D20).
-            // TODO(C.1): add `OrderingProvenance::DestroyedByCombine` and
-            // emit it from here with `at_node = name.clone()`.
-            NodeProperties::unordered_single()
+        PlanNode::Combine { name, .. } => {
+            // Combine always destroys parent ordering: hash-build/probe
+            // (and IEJoin, grace hash) do not preserve driving-input
+            // order. Emit `DestroyedByCombine { Proven }` so downstream
+            // streaming-agg eligibility / `--explain` / Kiln overlays
+            // can chain through and suggest "add a sort step between
+            // `{combine}` and `{consumer}`". Resolves Phase Combine
+            // §OQ-6 and drill D12.
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: None,
+                    provenance: OrderingProvenance::DestroyedByCombine {
+                        at_node: name.clone(),
+                        confidence: crate::plan::properties::Confidence::Proven,
+                    },
+                },
+                partitioning: single_stream_partitioning(),
+            }
         }
     }
 }
