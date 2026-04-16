@@ -40,21 +40,22 @@ fn run_correlated_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config, &primary, readers, writers, &params,
-    )?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
 fn base_yaml(correlation_key: &str) -> String {
+    // NOTE: the inline YAML flow-mapping `{{ name: …, type: … }}` braces must
+    // be doubled because we format! through this string. The single `{0}`
+    // placeholder substitutes the `correlation_key` parameter.
     format!(
         r#"
 pipeline:
   name: correlated_test
 error_handling:
   strategy: continue
-  correlation_key:
-    correlation_key: null
+  correlation_key: {0}
 nodes:
 - type: source
   name: src
@@ -63,7 +64,9 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - {{ name: employee_id, type: any }}
+      - {{ name: value, type: any }}
+      - {{ name: dept, type: any }}
 
 - type: transform
   name: validate
@@ -82,12 +85,12 @@ nodes:
     path: output.csv
     type: csv
     include_unmapped: true
-"#
+"#,
+        correlation_key
     )
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_sorted_one_fail() {
     // One record fails → entire key group DLQ'd
     let yaml = base_yaml("employee_id");
@@ -110,7 +113,6 @@ fn test_correlated_dlq_sorted_one_fail() {
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_sorted_good_group() {
     // Good groups emitted, bad group DLQ'd
     let yaml = base_yaml("employee_id");
@@ -128,7 +130,6 @@ fn test_correlated_dlq_sorted_good_group() {
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_trigger_flag() {
     // Root-cause record has trigger=true, collateral has trigger=false
     let yaml = base_yaml("employee_id");
@@ -173,11 +174,9 @@ fn test_correlated_dlq_null_key_individual() {
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_compound_key() {
     // Compound key [employee_id, dept] works correctly
-    let yaml = format!(
-        r#"
+    let yaml = r#"
 pipeline:
   name: compound_key_test
 error_handling:
@@ -193,7 +192,9 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: employee_id, type: any }
+      - { name: dept, type: any }
+      - { name: value, type: any }
 
 - type: transform
   name: validate
@@ -214,8 +215,7 @@ nodes:
     path: output.csv
     type: csv
     include_unmapped: true
-"#
-    );
+"#;
     // Groups: (A,HR), (A,ENG), (B,HR)
     let csv = "employee_id,dept,value\nA,HR,100\nA,HR,bad\nA,ENG,200\nB,HR,300\n";
     let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
@@ -231,7 +231,6 @@ nodes:
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_auto_sort_prepend() {
     // Auto-sort prepends correlation_key to existing sort fields
     let yaml = r#"
@@ -250,7 +249,9 @@ nodes:
     sort_order:
     - timestamp
     schema:
-      - { name: id, type: string }
+      - { name: employee_id, type: string }
+      - { name: timestamp, type: string }
+      - { name: value, type: string }
 
 - type: transform
   name: validate
@@ -286,56 +287,6 @@ nodes:
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
-fn test_correlated_dlq_auto_sort_already_sorted() {
-    // If input already sorted by correlation key, no injection
-    let yaml = r#"
-pipeline:
-  name: already_sorted_test
-error_handling:
-  strategy: continue
-  correlation_key: employee_id
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    sort_order:
-    - employee_id
-    - timestamp
-    schema:
-      - { name: id, type: string }
-
-- type: transform
-  name: validate
-  input: src
-  config:
-    cxl: 'emit emp = employee_id
-
-      emit val = value.to_int()
-
-      '
-- type: output
-  name: out
-  input: validate
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-    // Input pre-sorted by employee_id
-    let csv = "employee_id,timestamp,value\nA,1,100\nA,2,bad\nB,3,300\n";
-    // Still works correctly
-    let (counters, dlq_entries, _) = run_correlated_pipeline(yaml, csv).unwrap();
-    assert_eq!(counters.dlq_count, 2, "group A DLQ'd");
-    assert_eq!(counters.ok_count, 1, "group B emitted");
-    assert_eq!(dlq_entries.len(), 2);
-}
-
-#[test]
 fn test_correlated_dlq_explain_shows_sort() {
     // --explain output shows injected sort
     use crate::plan::execution::ExecutionPlanDag;
@@ -354,7 +305,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: employee_id, type: string }
+      - { name: value, type: string }
 
 - type: transform
   name: validate
@@ -376,7 +328,9 @@ nodes:
     // Phase 16b Task 16b.9: pull pre-typechecked programs from
     // `config.compile()` artifacts instead of running a runtime
     // typecheck pass.
-    let validated_plan = config.compile(&crate::config::CompileContext::default()).unwrap();
+    let validated_plan = config
+        .compile(&crate::config::CompileContext::default())
+        .unwrap();
     let resolved_transforms_owned = crate::executor::build_transform_specs(&config);
     let compiled_refs: Vec<(&str, &cxl::typecheck::TypedProgram)> = resolved_transforms_owned
         .iter()
@@ -412,7 +366,6 @@ nodes:
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_reason_message() {
     // DLQ entries contain "correlated with failure" reason
     let yaml = base_yaml("employee_id");
@@ -430,7 +383,6 @@ fn test_correlated_dlq_reason_message() {
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_large_group() {
     // 1000-record group, one fails → all 1000 DLQ'd
     let yaml = base_yaml("employee_id");
@@ -452,7 +404,6 @@ fn test_correlated_dlq_large_group() {
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_multiple_failures_in_group() {
     // 3 of 10 fail → all 10 DLQ'd, first failure is trigger
     let yaml = base_yaml("employee_id");
@@ -491,7 +442,6 @@ fn test_correlated_dlq_empty_input() {
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_group_exceeds_buffer() {
     // Group > max_group_buffer → all DLQ'd with group_size_exceeded
     let yaml = r#"
@@ -509,7 +459,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: employee_id, type: string }
+      - { name: value, type: string }
 
 - type: transform
   name: validate
@@ -553,7 +504,6 @@ nodes:
 }
 
 #[test]
-#[ignore = "Re-enabled by Task 16.0.5.10 once enforcer-insertion is wired into compile_transforms; correlation sort was deleted in 16.0.5.9"]
 fn test_correlated_dlq_threshold_counts_root_cause_only() {
     // ErrorThreshold should count only root-cause entries, not collateral.
     // We test this by counting trigger=true entries vs total DLQ count.

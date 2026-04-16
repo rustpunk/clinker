@@ -326,9 +326,8 @@ fn run_multi_output(
         })
         .collect();
 
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config, &primary, readers, writers, &params,
-    )?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -351,7 +350,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -419,7 +419,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -484,7 +485,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -545,7 +547,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -644,7 +647,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -717,7 +721,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -829,7 +834,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -921,7 +927,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -1007,7 +1014,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -1090,7 +1098,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -1182,7 +1191,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -1287,7 +1297,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -1329,8 +1340,8 @@ nodes:
     assert_eq!(dlq.len(), 1);
     assert_eq!(
         dlq[0].stage,
-        Some("transform:classify".to_string()),
-        "stage should be transform:classify"
+        Some("transform:classify_emit".to_string()),
+        "stage should be transform:classify_emit"
     );
     assert_eq!(
         dlq[0].route, None,
@@ -1354,7 +1365,9 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
+      - { name: zero, type: any }
 
 - type: transform
   name: calc_emit
@@ -1441,7 +1454,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -1544,7 +1558,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: calc
@@ -1605,7 +1620,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: name, type: any }
 
 - type: transform
   name: identity
@@ -1669,7 +1685,7 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: x, type: any }
 
 - type: transform
   name: identity

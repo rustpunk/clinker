@@ -4836,3 +4836,67 @@ pub(crate) struct RuntimeLookup {
     pub match_mode: crate::config::pipeline_node::MatchMode,
     pub equality_index: Option<crate::pipeline::lookup::EqualityIndex>,
 }
+
+#[cfg(test)]
+mod tests {
+    //! Executor-level tests — submodules below each target a specific
+    //! executor concern (aggregation dispatch, multi-output routing,
+    //! branching/DAG, format dispatch, correlated DLQ).
+    //!
+    //! Each submodule starts with `use super::*;` and expects the
+    //! executor's public-in-crate symbols (`PipelineExecutor`,
+    //! `PipelineRunParams`, `DlqEntry`, `CompiledRoute`, `PipelineError`,
+    //! etc.) plus a shared `run_test(yaml, csv)` helper (defined here).
+
+    use super::*;
+
+    /// Run a single-source, single-output pipeline with the given YAML
+    /// config and CSV input. Returns `(counters, dlq_entries, output_csv)`.
+    ///
+    /// This mirrors `integration_tests::run_pipeline` but lives inside
+    /// the `executor` module so submodules can reference it via
+    /// `crate::executor::tests::run_test`.
+    pub(super) fn run_test(
+        yaml: &str,
+        csv_input: &str,
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+        let config = crate::config::parse_config(yaml).unwrap();
+        let output_buf = crate::test_helpers::SharedBuffer::new();
+
+        let primary = config.source_configs().next().unwrap().name.clone();
+        let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
+            primary.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+            config.output_configs().next().unwrap().name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn Write + Send>,
+        )]);
+
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(crate::config::convert_pipeline_vars)
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+            shutdown_token: None,
+        };
+
+        let report = PipelineExecutor::run_with_readers_writers(
+            &config, &primary, readers, writers, &params,
+        )?;
+
+        let output = output_buf.as_string();
+        Ok((report.counters, report.dlq_entries, output))
+    }
+
+    mod aggregation;
+    mod branching;
+    mod correlated_dlq;
+    mod format_dispatch;
+    mod multi_output;
+}

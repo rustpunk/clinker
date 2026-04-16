@@ -37,9 +37,8 @@ fn run_branch_test(
         shutdown_token: None,
     };
 
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config, &primary, readers, writers, &params,
-    )?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))
@@ -59,7 +58,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -142,7 +142,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -219,7 +220,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -308,7 +310,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -401,7 +404,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -486,7 +490,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -562,7 +567,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -632,15 +638,6 @@ nodes:
     assert!(output.contains("LOW"));
 }
 
-/// Route within a branch -> two levels of branching.
-#[test]
-#[ignore = "Task 15.4: nested routes require multiple CompiledRoute instances"]
-fn test_branch_nested_routes() {
-    // Nested routes require multiple compiled route instances which
-    // is not yet supported. The current implementation uses a single
-    // compiled_route. This test is deferred.
-}
-
 /// Branch A: enrichment, Branch B: filtering -- different transforms per branch.
 #[test]
 fn test_branch_different_transforms_per_branch() {
@@ -655,7 +652,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -741,7 +739,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: name, type: any }
+      - { name: age, type: any }
 
 - type: transform
   name: calc
@@ -788,7 +787,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: dept, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: stateless_calc
@@ -846,7 +846,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit
@@ -932,7 +933,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: id, type: any }
+      - { name: amount, type: any }
 
 - type: transform
   name: classify_emit

@@ -37,46 +37,6 @@ fn fixed_width_input(lines: &[&str]) -> Cursor<Vec<u8>> {
     Cursor::new(lines.join("\n").into_bytes())
 }
 
-/// Compute `Vec<FieldDef>` with `start` as running sum of preceding widths.
-///
-/// Fixed-width reader requires `start` on every `FieldDef`. This helper takes
-/// `(name, width, field_type)` tuples and produces positioned `FieldDef`s.
-fn compute_field_layout(
-    fields: &[(&str, usize, clinker_record::schema_def::FieldType)],
-) -> Vec<clinker_record::schema_def::FieldDef> {
-    let mut start = 0;
-    fields
-        .iter()
-        .map(|(name, width, ftype)| {
-            let field = clinker_record::schema_def::FieldDef {
-                name: name.to_string(),
-                field_type: Some(ftype.clone()),
-                start: Some(start),
-                width: Some(*width),
-                required: None,
-                format: None,
-                coerce: None,
-                default: None,
-                allowed_values: None,
-                alias: None,
-                inherits: None,
-                end: None,
-                justify: None,
-                pad: None,
-                trim: None,
-                truncation: None,
-                precision: None,
-                scale: None,
-                path: None,
-                drop: None,
-                record: None,
-            };
-            start += width;
-            field
-        })
-        .collect()
-}
-
 /// Build a PipelineRunParams with test defaults.
 fn test_params() -> PipelineRunParams {
     PipelineRunParams {
@@ -107,9 +67,8 @@ fn run_format_test(
     )]);
 
     let params = test_params();
-    let report = PipelineExecutor::run_with_readers_writers(
-        &config, input_name, readers, writers, &params,
-    )?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, input_name, readers, writers, &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))
@@ -411,7 +370,7 @@ nodes:
     name: src
     type: fixed_width
     path: input.dat
-    schema:
+    format_schema:
       fields:
       - name: name
         type: string
@@ -422,7 +381,8 @@ nodes:
         start: 10
         width: 5
     schema:
-      - { name: id, type: string }
+      - { name: name, type: any }
+      - { name: age, type: any }
 
 - type: output
   name: dest

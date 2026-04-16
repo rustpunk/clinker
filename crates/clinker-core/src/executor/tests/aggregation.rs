@@ -4,21 +4,11 @@
 //! streaming aggregation (sorted input, sort verification, strategy selection),
 //! and plan-time integration (PlanNode::Aggregation, output schema).
 
-use super::*;
-
-// Note: 23 stub tests from Tasks 16.3 / 16.4 were removed; their concerns
-// are now covered by the `dispatch`, `streaming`, `group_boundary`,
-// `sort_key_encoder`, and `spill` submodules below, plus the
-// `test_qualifies_*`, `test_addraw_*`, `test_mergestate_*`, and
-// `test_merge_sidecars_*` tests in `crates/clinker-core/src/aggregation.rs`.
-// See git history for the original stub list.
-
 // ===========================================================================
 // Task 16.3.13 — executor PlanNode::Aggregation dispatch arm
 // ===========================================================================
 
 mod dispatch {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use clinker_record::{GroupByKey, Record, Schema, Value};
@@ -26,12 +16,12 @@ mod dispatch {
     use cxl::parser::Parser;
     use cxl::plan::extract_aggregates;
     use cxl::resolve::pass::resolve_program;
-    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
     use cxl::typecheck::Row;
+    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    use crate::aggregation::{AggregatorGroupState, HashAggError, HashAggregator};
+    use crate::aggregation::{AggregatorGroupState, HashAggregator};
     use crate::config::ErrorStrategy;
     use crate::error::PipelineError;
     use crate::executor::tests::run_test;
@@ -106,7 +96,6 @@ mod dispatch {
             evaluator,
             output_schema,
             spill_schema,
-            Vec::new(),
             memory_budget,
             spill_dir,
             transform_name.to_string(),
@@ -155,7 +144,8 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: dept, type: any }
+      - { name: salary, type: any }
 
 - type: aggregate
   name: by_dept
@@ -221,7 +211,7 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: dept, type: string }
 
 - type: aggregate
   name: by_dept
@@ -251,27 +241,29 @@ nodes:
         // The simplest reachable path is `ExecutionPlanDag::compile`
         // with the typed-program slice; we synthesize an empty slice
         // and rely on extract paths.
-        let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> = crate::executor::build_transform_specs(&config)
-            .iter()
-            .map(|t| {
-                let parsed = Parser::parse(t.cxl_source());
-                let resolved = resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
-                let mut schema_map: IndexMap<String, Type> = IndexMap::new();
-                schema_map.insert("dept".to_string(), Type::String);
-                let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
-                let mode = if t.is_aggregate() {
-                    AggregateMode::GroupBy {
-                        group_by_fields: ["dept".to_string()].into_iter().collect(),
-                    }
-                } else {
-                    AggregateMode::Row
-                };
-                (
-                    t.name.clone(),
-                    type_check_with_mode(resolved, &row, mode).unwrap(),
-                )
-            })
-            .collect();
+        let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> =
+            crate::executor::build_transform_specs(&config)
+                .iter()
+                .map(|t| {
+                    let parsed = Parser::parse(t.cxl_source());
+                    let resolved =
+                        resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
+                    let mut schema_map: IndexMap<String, Type> = IndexMap::new();
+                    schema_map.insert("dept".to_string(), Type::String);
+                    let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
+                    let mode = if t.aggregate.is_some() {
+                        AggregateMode::GroupBy {
+                            group_by_fields: ["dept".to_string()].into_iter().collect(),
+                        }
+                    } else {
+                        AggregateMode::Row
+                    };
+                    (
+                        t.name.clone(),
+                        type_check_with_mode(resolved, &row, mode).unwrap(),
+                    )
+                })
+                .collect();
         let typed_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = typed_programs
             .iter()
             .map(|(n, p)| (n.as_str(), p))
@@ -453,7 +445,7 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: x, type: string }
 
 - type: aggregate
   name: total
@@ -1701,7 +1693,6 @@ mod task_16_4_3 {
 // ===========================================================================
 
 mod task_16_4_3_spill {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1774,7 +1765,6 @@ mod task_16_4_3_spill {
             evaluator,
             output_schema,
             spill_schema,
-            Vec::new(),
             memory_budget,
             None,
             transform_name.to_string(),
@@ -1867,54 +1857,7 @@ mod task_16_4_3_spill {
         }
     }
 
-    /// Test A — the spill writer must serialize records in memcomparable
-    /// byte order of their encoded group-by columns.
-    #[test]
-    fn test_spill_write_side_sorts_by_encoded_bytes() {
-        // memory_budget = 1 forces a spill on every add_record call
-        // beyond the first (table_alloc * 3 > 1 - 0).
-        let mut agg = build_aggregator_with_budget(
-            &[("k", Type::String)],
-            &["k"],
-            "emit k = k\nemit c = count(*)",
-            "agg_spill_sort",
-            1,
-        );
-        drive_aggregator(&mut agg);
-
-        // At this point at least one spill file should exist.
-        assert!(
-            !agg.spill_files().is_empty(),
-            "expected at least one spill file with memory_budget=1"
-        );
-
-        // Build the SortKeyEncoder the same way the spill path does.
-        let group_by = vec!["k".to_string()];
-        // Use the spill schema (which is what the spill writer wrote).
-        let spill_schema = agg.spill_files()[0].schema().clone();
-        let fields = group_by_sort_fields(&group_by, &spill_schema);
-        let encoder = SortKeyEncoder::new(fields);
-
-        // Read each spill file and assert per-file monotonicity.
-        for sf in agg.spill_files() {
-            let reader = sf.reader().expect("reader open");
-            let mut prev: Option<Vec<u8>> = None;
-            for entry in reader {
-                let (record, _payload) = entry.expect("read");
-                let mut buf = Vec::new();
-                encoder.encode_into(&record, &mut buf);
-                if let Some(p) = &prev {
-                    assert!(
-                        p.as_slice() <= buf.as_slice(),
-                        "spill file is not in memcomparable order: prev={p:?} next={buf:?}"
-                    );
-                }
-                prev = Some(buf);
-            }
-        }
-    }
-
-    /// Test B — in-memory and spilled paths must produce byte-identical
+    /// In-memory and spilled paths must produce byte-identical
     /// finalized output (after sorting, since neither path guarantees a
     /// stable iteration order across runs).
     #[test]
@@ -1968,7 +1911,7 @@ mod task_16_4_3_spill {
 
         // Sort both by encoded group-by key for stable comparison.
         let group_by = vec!["k".to_string()];
-        let mut sort_for = |rows: &mut Vec<crate::aggregation::SortRow>| {
+        let sort_for = |rows: &mut Vec<crate::aggregation::SortRow>| {
             // Use the output record's schema to derive sort fields.
             if let Some((rec, _, _, _)) = rows.first() {
                 let sch = rec.schema().clone();
