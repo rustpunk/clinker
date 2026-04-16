@@ -37,7 +37,6 @@
 //! |-------------|----------|------------------------------------------------------|
 //! | `E300`      | error    | Combine requires at least 2 inputs                   |
 //! | `E301`      | error    | Combine input qualifier collides with reserved namespace |
-//! | `E302`      | error    | Qualified field collision across combine inputs      |
 //! | `E303`      | error    | Combine where-clause is not boolean                  |
 //! | `E304`      | error    | Field not in combine merged row                      |
 //! | `E305`      | error    | Combine where-clause has no cross-input comparisons  |
@@ -357,8 +356,12 @@ mod diagnostic_tests {
     #[test]
     fn test_error_registry_e300_through_e310_documented() {
         let source = include_str!("error.rs");
+        // E302 was removed in the C.1.0 corrective commit — the code was
+        // structurally unreachable with `QualifiedField`-keyed merged
+        // rows. The sweep below enumerates the live combine codes; any
+        // re-addition must be added here explicitly.
         for code in [
-            "E300", "E301", "E302", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310",
+            "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310",
         ] {
             let pattern = format!("`{code}`");
             assert!(

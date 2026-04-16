@@ -243,7 +243,6 @@ mod tests {
             // C.1.1 error fixtures
             "error_reserved_namespace.yaml",
             "error_dotted_qualifier.yaml",
-            "error_field_collision.yaml",
             // C.1.2 fixtures (errors + decomposition cases)
             "error_where_not_bool.yaml",
             "error_unknown_field.yaml",
@@ -257,8 +256,6 @@ mod tests {
             "error_body_unknown_field.yaml",
             "error_no_emit.yaml",
             "combine_then_transform.yaml",
-            // C.1.4 fixture
-            "combine_then_sorted_transform.yaml",
         ];
         for name in c1_fixtures {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

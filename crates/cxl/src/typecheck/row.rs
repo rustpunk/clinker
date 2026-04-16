@@ -74,11 +74,6 @@ impl QualifiedField {
             name: name.into(),
         }
     }
-
-    /// Whether this field carries a qualifier.
-    pub fn is_qualified(&self) -> bool {
-        self.qualifier.is_some()
-    }
 }
 
 impl fmt::Display for QualifiedField {
@@ -154,12 +149,13 @@ pub enum ColumnLookup<'a> {
     PassThrough(TailVarId),
     /// The column is not declared and the row is closed — this is an error.
     Unknown,
-    /// Multiple declared fields match the unqualified name with different
-    /// qualifiers. Carries the list of qualifying input names so the
-    /// caller can render a precise "field 'id' is ambiguous — found in
-    /// 'orders' and 'products'" diagnostic. Only produced by combine
-    /// merged rows.
-    Ambiguous(Vec<Arc<str>>),
+    /// Multiple declared fields match the unqualified name. Carries the
+    /// full list of matching `QualifiedField`s (qualified + bare) so
+    /// the caller can render a precise "ambiguous — try `orders.id` or
+    /// `products.id`" diagnostic. Only produced by combine merged rows;
+    /// in all other contexts every field has a unique bare name so
+    /// `lookup` resolves to `Declared` or tails out.
+    Ambiguous(Vec<QualifiedField>),
 }
 
 impl Row {
@@ -206,39 +202,24 @@ impl Row {
     /// - Zero matches: falls through to the row's tail — `Unknown` for a
     ///   closed row, `PassThrough(id)` for an open row.
     /// - Exactly one match: returns `Declared(&ty)`.
-    /// - Multiple matches (same name under different qualifiers):
-    ///   returns `Ambiguous(qualifying_input_names)`. This only arises
-    ///   for combine merged rows; the caller should render an
-    ///   "ambiguous" diagnostic.
+    /// - Multiple matches: returns
+    ///   `Ambiguous(matching_fields)` carrying every matching field
+    ///   (qualified or bare) so the caller can render a precise
+    ///   "ambiguous — try `orders.id` or `products.id`" diagnostic.
+    ///   This only arises for combine merged rows.
     pub fn lookup(&self, name: &str) -> ColumnLookup<'_> {
-        let mut first_match: Option<&Type> = None;
-        let mut qualifiers: Vec<Arc<str>> = Vec::new();
-        for (qf, ty) in &self.declared {
-            if qf.name.as_ref() == name {
-                if first_match.is_none() {
-                    first_match = Some(ty);
-                }
-                if let Some(q) = &qf.qualifier {
-                    qualifiers.push(q.clone());
-                }
-            }
-        }
-        match (first_match, qualifiers.len()) {
-            (None, _) => match &self.tail {
+        let matches: Vec<(&QualifiedField, &Type)> = self
+            .declared
+            .iter()
+            .filter(|(qf, _)| qf.name.as_ref() == name)
+            .collect();
+        match matches.len() {
+            0 => match &self.tail {
                 RowTail::Closed => ColumnLookup::Unknown,
                 RowTail::Open(id) => ColumnLookup::PassThrough(*id),
             },
-            (Some(ty), 0) | (Some(ty), 1) => {
-                // Zero qualifiers = bare field (first_match is that field);
-                // one qualifier = exactly one qualified match.
-                if qualifiers.len() == 1 && first_match_was_bare(&self.declared, name) {
-                    // One qualified + one bare match: ambiguous.
-                    ColumnLookup::Ambiguous(qualifiers)
-                } else {
-                    ColumnLookup::Declared(ty)
-                }
-            }
-            (Some(_), _) => ColumnLookup::Ambiguous(qualifiers),
+            1 => ColumnLookup::Declared(matches[0].1),
+            _ => ColumnLookup::Ambiguous(matches.iter().map(|(qf, _)| (*qf).clone()).collect()),
         }
     }
 
@@ -269,11 +250,6 @@ impl Row {
         self.declared.len()
     }
 
-    /// True if the row has no declared fields.
-    pub fn is_empty(&self) -> bool {
-        self.declared.is_empty()
-    }
-
     /// Iterate over `(QualifiedField, Type)` pairs in declaration order.
     pub fn fields(&self) -> indexmap::map::Iter<'_, QualifiedField, Type> {
         self.declared.iter()
@@ -297,16 +273,6 @@ impl Row {
     pub fn declared_map(&self) -> &IndexMap<QualifiedField, Type> {
         &self.declared
     }
-}
-
-/// Helper for `Row::lookup`: true when the declared map contains a bare
-/// field with the given name. Used to disambiguate "one qualified match
-/// vs one bare match" — that case is ambiguous because CXL does not
-/// know whether the caller meant the bare field or the qualified one.
-fn first_match_was_bare(declared: &IndexMap<QualifiedField, Type>, name: &str) -> bool {
-    declared
-        .keys()
-        .any(|qf| qf.qualifier.is_none() && qf.name.as_ref() == name)
 }
 
 #[cfg(test)]
@@ -408,7 +374,8 @@ mod tests {
 
     /// C.1.0 gate: unqualified `lookup` over a merged row with two
     /// fields sharing the same name under different qualifiers returns
-    /// `ColumnLookup::Ambiguous` carrying both qualifying input names.
+    /// `ColumnLookup::Ambiguous` carrying the full `QualifiedField`
+    /// entries for every match (qualified + bare).
     #[test]
     fn test_qualified_field_ambiguous_unqualified() {
         let mut cols = IndexMap::new();
@@ -416,11 +383,31 @@ mod tests {
         cols.insert(QualifiedField::qualified("products", "id"), Type::Int);
         let row = Row::closed(cols, span());
         match row.lookup("id") {
-            ColumnLookup::Ambiguous(qualifiers) => {
-                assert_eq!(qualifiers.len(), 2);
-                let names: Vec<&str> = qualifiers.iter().map(|q| q.as_ref()).collect();
-                assert!(names.contains(&"orders"));
-                assert!(names.contains(&"products"));
+            ColumnLookup::Ambiguous(matches) => {
+                assert_eq!(matches.len(), 2);
+                let labels: Vec<String> = matches.iter().map(|qf| qf.to_string()).collect();
+                assert!(labels.contains(&"orders.id".to_string()));
+                assert!(labels.contains(&"products.id".to_string()));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// Ambiguous also fires when one match is bare and one is qualified
+    /// — the carried list includes BOTH so the diagnostic can suggest
+    /// both paths.
+    #[test]
+    fn test_lookup_ambiguous_mixed_bare_and_qualified() {
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::bare("id"), Type::Int);
+        cols.insert(QualifiedField::qualified("orders", "id"), Type::Int);
+        let row = Row::closed(cols, span());
+        match row.lookup("id") {
+            ColumnLookup::Ambiguous(matches) => {
+                assert_eq!(matches.len(), 2);
+                let labels: Vec<String> = matches.iter().map(|qf| qf.to_string()).collect();
+                assert!(labels.contains(&"id".to_string()));
+                assert!(labels.contains(&"orders.id".to_string()));
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }

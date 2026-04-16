@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use regex::Regex;
 
-use super::row::{ColumnLookup, Row};
+use super::row::{ColumnLookup, QualifiedField, Row};
 use super::types::Type;
 use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement, UnaryOp};
 use crate::builtins::BuiltinRegistry;
@@ -85,8 +85,15 @@ pub struct TypedProgram {
     pub bindings: Vec<Option<ResolvedBinding>>,
     /// Per-node type annotation, indexed by NodeId.
     pub types: Vec<Option<Type>>,
-    /// Inferred field types for runtime DLQ validation. Deterministic iteration order.
-    pub field_types: IndexMap<String, Type>,
+    /// Inferred field types for runtime DLQ validation. Deterministic
+    /// iteration order.
+    ///
+    /// Keyed by `QualifiedField` to match the `Row.declared`
+    /// representation — schema-declared fields may carry a qualifier
+    /// (combine merged rows, Phase Combine C.1.0). For non-combine
+    /// nodes every entry is bare. Callers that need a flat string list
+    /// should use `.keys().map(|qf| qf.name.to_string())`.
+    pub field_types: IndexMap<QualifiedField, Type>,
     /// Pre-compiled regex literals, indexed by NodeId.
     pub regexes: Vec<Option<Regex>>,
     /// Total node count.
@@ -310,13 +317,25 @@ impl<'a> TypeChecker<'a> {
                                 Type::Any
                             }
                             ColumnLookup::Unknown => Type::Any, // Will be inferred from usage
-                            ColumnLookup::Ambiguous(_) => {
-                                // Bare `FieldRef` over a combine merged row that has
-                                // the same name under multiple qualifiers. The combine
-                                // bind_schema arm (C.1.1+) emits E304/E308 with a
-                                // precise "ambiguous — qualify with 'orders' or
-                                // 'products'" message; the typechecker degrades to
-                                // `Any` to avoid masking that diagnostic.
+                            ColumnLookup::Ambiguous(matches) => {
+                                // Bare `FieldRef` over a combine merged row
+                                // where `name` resolves to multiple declared
+                                // fields. Emit a loud error with a precise
+                                // "qualify with X or Y" suggestion rather
+                                // than silently typing as Any. Reachable only
+                                // from combine body typechecks (C.1.3).
+                                let suggestions: Vec<String> =
+                                    matches.iter().map(|qf| qf.to_string()).collect();
+                                self.error(
+                                    *span,
+                                    format!(
+                                        "field '{name}' is ambiguous — matches multiple inputs"
+                                    ),
+                                    Some(format!(
+                                        "qualify the reference: `{}`",
+                                        suggestions.join("` or `")
+                                    )),
+                                );
                                 Type::Any
                             }
                         }
@@ -332,15 +351,19 @@ impl<'a> TypeChecker<'a> {
 
             Expr::QualifiedFieldRef { node_id, parts, .. } => {
                 // Phase Combine C.1.0.4 — resolve 2-part refs against the
-                // input row via `lookup_qualified`. 3+ part refs are not
-                // decomposable (e.g. multi-record `source.record_type.field`);
-                // they stay `Type::Any` and will surface as E304 / E308 in
-                // the combine bind_schema arm (C.1.1 / C.1.3).
+                // input row via `lookup_qualified`. Exact match on the
+                // `(qualifier, name)` pair means `Ambiguous` is
+                // structurally unreachable (defensively flattened to
+                // `Any`). 3+ part refs are not decomposable (e.g.
+                // multi-record `source.record_type.field`); they stay
+                // `Type::Any` and will surface as E304 / E308 in the
+                // combine bind_schema arm (C.1.1 / C.1.3).
                 let ty = if parts.len() == 2 {
                     match self.schema.lookup_qualified(&parts[0], &parts[1]) {
                         ColumnLookup::Declared(declared) => declared.clone(),
-                        ColumnLookup::PassThrough(_tail_id) => Type::Any,
-                        ColumnLookup::Ambiguous(_) | ColumnLookup::Unknown => Type::Any,
+                        ColumnLookup::PassThrough(_)
+                        | ColumnLookup::Unknown
+                        | ColumnLookup::Ambiguous(_) => Type::Any,
                     }
                 } else {
                     Type::Any
@@ -1052,24 +1075,24 @@ impl<'a> TypeChecker<'a> {
 
     /// Build the FieldTypeMap from collected constraints and schema.
     ///
-    /// Note (Phase Combine C.1.0): keyed by bare field name (`String`)
-    /// for runtime DLQ validation and aggregate input-schema derivation.
-    /// For combine merged rows, qualified fields collapse to their bare
-    /// `.name`; same-named fields under different qualifiers produce an
-    /// IndexMap collision (last-write-wins). This is intentional —
-    /// combine execution consults `DecomposedPredicate` and the merged
-    /// Row directly, not `TypedProgram::field_types`.
-    fn build_field_type_map(&self) -> IndexMap<String, Type> {
+    /// Keyed by `QualifiedField` — matches `Row.declared` representation
+    /// so combine merged rows (Phase Combine C.1) do not collapse
+    /// qualified fields to bare names. Inferred constraints from the
+    /// body (collected during the walk) are always bare; schema fields
+    /// carry whatever qualification the upstream row carried.
+    fn build_field_type_map(&self) -> IndexMap<QualifiedField, Type> {
         let mut map = IndexMap::new();
 
         // Schema-declared types first (authoritative)
         for (field, ty) in self.schema.fields() {
-            map.insert(field.name.to_string(), ty.clone());
+            map.insert(field.clone(), ty.clone());
         }
 
-        // Inferred types from constraints
+        // Inferred types from constraints (always bare — `field_constraints`
+        // keys are the raw names from `Expr::FieldRef`)
         for (field, constraints) in &self.field_constraints {
-            if map.contains_key(field) {
+            let qf = QualifiedField::bare(field.as_str());
+            if map.contains_key(&qf) {
                 continue; // Schema takes precedence
             }
             // Use the first constraint's type (they should all be unified by now)
@@ -1081,7 +1104,7 @@ impl<'a> TypeChecker<'a> {
                         unified = u;
                     }
                 }
-                map.insert(field.clone(), unified);
+                map.insert(qf, unified);
             }
         }
 
@@ -1285,12 +1308,16 @@ mod tests {
         );
         // amount should be inferred as Numeric, name as String
         assert!(
-            typed.field_types.contains_key("amount"),
+            typed
+                .field_types
+                .contains_key(&QualifiedField::bare("amount")),
             "Expected amount in field_types, got: {:?}",
             typed.field_types
         );
         assert!(
-            typed.field_types.contains_key("name"),
+            typed
+                .field_types
+                .contains_key(&QualifiedField::bare("name")),
             "Expected name in field_types, got: {:?}",
             typed.field_types
         );
@@ -1744,7 +1771,7 @@ mod tests {
         // `emit x = a` should succeed — `a` is declared.
         let typed = typecheck_ok("emit x = a", &["a"], &schema);
         assert!(
-            typed.field_types.contains_key("a"),
+            typed.field_types.contains_key(&QualifiedField::bare("a")),
             "expected 'a' in field_types"
         );
     }
@@ -1803,6 +1830,44 @@ mod tests {
     }
 
     // --- Phase Combine C.1.0 gate: qualified field ref resolution --------
+
+    /// C.1.0 corrective: a bare `FieldRef` against a merged row where
+    /// the name is ambiguous (matches multiple declared fields under
+    /// different qualifiers) must produce a loud typecheck error
+    /// suggesting `qualifier.name` — NOT silently degrade to Type::Any.
+    #[test]
+    fn test_bare_fieldref_ambiguous_errors() {
+        use super::super::row::QualifiedField;
+
+        // Merged row with two `id` fields under different qualifiers.
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::qualified("orders", "id"), Type::Int);
+        cols.insert(QualifiedField::qualified("products", "id"), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+
+        // `emit v = id` — bare ref that resolves ambiguously.
+        let parsed = Parser::parse("emit v = id");
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = resolve_program(parsed.ast, &["id"], parsed.node_count).unwrap();
+        let result = type_check(resolved, &schema);
+
+        let diags = result.expect_err("ambiguous bare ref must error");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("ambiguous") && d.message.contains("'id'")),
+            "expected 'ambiguous' diagnostic mentioning 'id'; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // Suggestion mentions both qualified alternatives.
+        let help_msgs: Vec<&String> = diags.iter().filter_map(|d| d.help.as_ref()).collect();
+        assert!(
+            help_msgs
+                .iter()
+                .any(|h| h.contains("orders.id") && h.contains("products.id")),
+            "expected help mentioning both `orders.id` and `products.id`; got: {help_msgs:?}"
+        );
+    }
 
     /// C.1.0 gate (RESOLUTION T-5): a 2-part `QualifiedFieldRef` against
     /// a row containing qualified fields resolves via `lookup_qualified`

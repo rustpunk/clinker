@@ -1030,7 +1030,15 @@ impl ExecutionPlanDag {
                 // runtime layout, not the declared superset.
                 let input_schema: Vec<String> = match runtime_input_schema {
                     Some(rt) => rt.to_vec(),
-                    None => typed.field_types.keys().cloned().collect(),
+                    // Phase Combine C.1.0: `field_types` keys are now
+                    // `QualifiedField`. Aggregate never consumes qualified
+                    // upstream fields (combine's output row is bare per
+                    // drill D10), so `.name` is the correct projection.
+                    None => typed
+                        .field_types
+                        .keys()
+                        .map(|qf| qf.name.to_string())
+                        .collect(),
                 };
 
                 let compiled_agg =
