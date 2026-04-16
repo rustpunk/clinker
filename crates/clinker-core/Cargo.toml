@@ -87,3 +87,7 @@ harness = false
 name = "composition"
 harness = false
 
+[[bench]]
+name = "combine"
+harness = false
+

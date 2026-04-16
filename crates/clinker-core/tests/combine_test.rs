@@ -22,6 +22,52 @@ mod tests {
         // the signal is "this test ran", not any runtime assertion.
     }
 
+    /// Gate test for C.0.5.1: `benches/combine.rs` exists, is non-empty,
+    /// and defines all 6 scaffold functions named in the phase plan.
+    ///
+    /// Criterion benches are not discovered by `cargo test`, so this is
+    /// the only in-`cargo test` signal that the bench file is authored
+    /// correctly. Compile-time verification is covered separately by
+    /// `cargo check --benches --workspace` in the pre-commit checklist.
+    #[test]
+    fn test_bench_combine_scaffold_compiles() {
+        let bench_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/combine.rs");
+        assert!(
+            bench_path.exists(),
+            "missing bench file: {}",
+            bench_path.display()
+        );
+        let source = std::fs::read_to_string(&bench_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", bench_path.display()));
+        assert!(!source.is_empty(), "empty bench file");
+
+        // All six functions required by the Phase C.0.5 spec.
+        for func in [
+            "fn bench_combine_equi_2input",
+            "fn bench_combine_iejoin",
+            "fn bench_combine_nary_3input",
+            "fn bench_predicate_decomposition",
+            "fn bench_combine_grace_hash",
+            "fn bench_lookup_baseline",
+        ] {
+            assert!(
+                source.contains(func),
+                "benches/combine.rs missing required fn: {func}"
+            );
+        }
+
+        // `criterion_group!` wires all 6 into the registered suite.
+        assert!(
+            source.contains("criterion_group!"),
+            "benches/combine.rs missing criterion_group! macro"
+        );
+        assert!(
+            source.contains("criterion_main!"),
+            "benches/combine.rs missing criterion_main! macro"
+        );
+    }
+
     /// Verifies all 10 fixture YAML files exist and are readable.
     #[test]
     fn test_combine_fixtures_exist() {

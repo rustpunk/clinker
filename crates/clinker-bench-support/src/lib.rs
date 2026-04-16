@@ -6,6 +6,7 @@
 pub mod alloc;
 
 pub mod cache;
+pub mod combine;
 pub mod generators;
 
 use clinker_record::{Record, Schema, Value};
@@ -84,6 +85,7 @@ pub fn discover_pipeline_configs(base: &Path) -> Vec<ConfigEntry> {
 
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
 pub use cache::DataSpec;
+pub use combine::CombineDataGen;
 pub use generators::csv::CsvPayload;
 pub use generators::fixed_width::{
     BenchFieldSpec, BenchFieldType, BenchJustify, field_specs_for, generate_fixed_width,
