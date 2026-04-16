@@ -36,7 +36,7 @@ nodes:
     config:
       where: "orders.product_id == products.product_id or orders.order_id == products.name"
       cxl: |
-        emit order_id = orders.order_id;
+        emit order_id = orders.order_id
         emit product_name = products.name
   - type: output
     name: combine_or_out

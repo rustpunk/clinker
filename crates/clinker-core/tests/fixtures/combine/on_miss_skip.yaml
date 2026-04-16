@@ -33,10 +33,10 @@ nodes:
       match: first
       on_miss: skip
       cxl: |
-        emit order_id = orders.order_id;
-        emit product_id = orders.product_id;
-        emit product_name = products.name;
-        emit amount = orders.amount;
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit amount = orders.amount
   - type: output
     name: matched_only_out
     input: matched_only

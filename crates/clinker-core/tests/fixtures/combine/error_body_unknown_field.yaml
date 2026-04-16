@@ -29,7 +29,7 @@ nodes:
     config:
       where: "orders.product_id == products.product_id"
       cxl: |
-        emit order_id = orders.order_id;
+        emit order_id = orders.order_id
         emit bogus = products.nonexistent_field
   - type: output
     name: bad_out

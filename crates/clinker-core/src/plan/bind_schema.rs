@@ -21,7 +21,10 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cxl::typecheck::{AggregateMode, QualifiedField, Row, RowTail, Type, TypedProgram};
+use cxl::ast::{Expr, Statement};
+use cxl::typecheck::{
+    AggregateMode, ColumnLookup, QualifiedField, Row, RowTail, Type, TypedProgram,
+};
 use indexmap::IndexMap;
 
 use crate::config::compile_context::CompileContext;
@@ -29,10 +32,11 @@ use crate::config::composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, OutputAlias,
     PortDecl, ProvenanceDb, ResolvedValue,
 };
-use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
+use crate::config::node_header::CombineHeader;
+use crate::config::pipeline_node::{CombineBody, PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::bound_schemas::BoundSchemas;
-use crate::plan::combine::{CombineInput, DecomposedPredicate};
+use crate::plan::combine::{CombineInput, DecomposedPredicate, decompose_predicate};
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
@@ -298,11 +302,27 @@ fn bind_schema_inner(
                     schema_by_name.insert(name, upstream.clone());
                 }
             }
-            // Phase Combine C.0.1: schema binding for Combine nodes lands in
-            // Phase C.1 (plan/combine.rs with predicate decomposition and
-            // per-input schema propagation). For now, skip — downstream nodes
-            // referencing a Combine will not yet resolve its output schema.
-            PipelineNode::Combine { .. } => {}
+            // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
+            //
+            // The entire combine compile work lives in `bind_combine`
+            // rather than split across three phase tasks. Rationale:
+            // `RESEARCH-combine-compile-architecture.md` documents that
+            // every mature engine does merged-schema build, predicate
+            // typecheck, body typecheck, and output-row publication as
+            // a single bottom-up traversal. Splitting them into three
+            // side-table handoffs is the pattern Spark SPIP-49834 is
+            // actively migrating away from.
+            PipelineNode::Combine { header, config } => {
+                bind_combine(
+                    &name,
+                    header,
+                    config,
+                    span,
+                    diags,
+                    artifacts,
+                    schema_by_name,
+                );
+            }
             PipelineNode::Composition {
                 r#use,
                 inputs,
@@ -1170,6 +1190,703 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
         }
     }
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
+}
+
+// ─── Combine arm (Phase Combine C.1.1 + C.1.2 + C.1.3) ──────────────
+
+/// Bind a `PipelineNode::Combine` node in one bottom-up traversal.
+///
+/// Architecture: a single pass does merged-schema construction (C.1.1),
+/// where-clause typecheck + predicate decomposition (C.1.2), body
+/// typecheck + output-row publication (C.1.3). Splitting these into
+/// three passes with intermediate side-table handoffs is the pattern
+/// Spark SPIP-49834 is actively migrating away from; see
+/// `RESEARCH-combine-compile-architecture.md` §Design insights.
+///
+/// Per-input metadata is keyed by node-visible upstream NAME (not a
+/// graph-layer `NodeIndex`) because `bind_schema` runs before
+/// `ExecutionPlanDag` is built. See `CombineInput` rustdoc for the full
+/// rationale.
+///
+/// Diagnostics emitted:
+/// - E300 — fewer than 2 inputs
+/// - E301 — reserved-namespace or dotted qualifier
+/// - E303 — where-clause does not evaluate to Bool
+/// - E304 — where-clause references unknown or 3+ part qualified field
+/// - E305 — no cross-input equality/range extractable from predicate
+/// - E308 — cxl body references unknown or 3+ part qualified field
+/// - E309 — cxl body has no emit statements
+///
+/// E307 (undeclared upstream reference) is NOT emitted here — it fires
+/// from `ExecutionPlanDag::compile` during DAG wiring.
+#[allow(clippy::too_many_arguments)]
+fn bind_combine(
+    name: &str,
+    header: &CombineHeader,
+    config: &CombineBody,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+    artifacts: &mut CompileArtifacts,
+    schema_by_name: &mut HashMap<String, Row>,
+) {
+    // E300: combine requires at least 2 inputs.
+    if header.input.len() < 2 {
+        diags.push(combine_e300(name, header.input.len(), span));
+        return;
+    }
+
+    // Build merged row + collect per-input metadata. Any E301 violation
+    // short-circuits this combine's downstream processing — cascading
+    // E303/E304/E305/E308 errors from a partly-broken merged row are
+    // pure noise. Callers who want to see multiple E301 errors can fix
+    // them and re-run.
+    let mut merged_declared: IndexMap<QualifiedField, Type> = IndexMap::new();
+    let mut combine_inputs_entries: IndexMap<String, CombineInput> = IndexMap::new();
+    let mut e301_fired = false;
+
+    for (qualifier, node_input_spanned) in &header.input {
+        if qualifier.starts_with('$') {
+            diags.push(combine_e301_reserved(name, qualifier, span));
+            e301_fired = true;
+            continue;
+        }
+        if qualifier.contains('.') {
+            diags.push(combine_e301_dotted(name, qualifier, span));
+            e301_fired = true;
+            continue;
+        }
+        let upstream_target = input_target(&node_input_spanned.value);
+        // E307 (undeclared upstream) fires at DAG wiring time. In the
+        // standalone bind_schema path missing upstreams are silently
+        // skipped — DAG-level reporting owns that diagnostic.
+        let upstream_row = match schema_by_name.get(upstream_target) {
+            Some(r) => r,
+            None => continue,
+        };
+        for (field, ty) in upstream_row.fields() {
+            let qf = QualifiedField::qualified(qualifier.as_str(), field.name.clone());
+            // Collision is structurally impossible: outer qualifier
+            // uniqueness (IndexMap in CombineHeader.input) + inner field
+            // uniqueness (IndexMap per upstream Row) → combined
+            // `(qualifier, name)` key is always fresh. E302 was retired
+            // in the C.1.0 corrective (Decisions Log #15).
+            merged_declared.insert(qf, ty.clone());
+        }
+        combine_inputs_entries.insert(
+            qualifier.clone(),
+            CombineInput {
+                upstream_name: Arc::from(upstream_target),
+                row: upstream_row.clone(),
+                estimated_cardinality: None,
+            },
+        );
+    }
+
+    if e301_fired {
+        return;
+    }
+
+    artifacts
+        .combine_inputs
+        .insert(name.to_string(), combine_inputs_entries);
+
+    let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
+    let merged_row = Row::closed(merged_declared, cxl_span);
+
+    // ── Where-clause typecheck ─────────────────────────────────────
+    let typed_where =
+        match typecheck_combine_where(name, config.where_expr.as_ref(), &merged_row, span) {
+            Ok(t) => t,
+            Err(mut new_diags) => {
+                diags.append(&mut new_diags);
+                return;
+            }
+        };
+
+    // Post-walk for E304 (unknown / 3-part qualified refs in where).
+    let e304_before = diags.iter().filter(|d| d.code == "E304").count();
+    if let Some(Statement::Filter { predicate, .. }) = typed_where.program.statements.first() {
+        walk_for_unknown_refs(
+            predicate,
+            &merged_row,
+            name,
+            "E304",
+            "where-clause",
+            span,
+            diags,
+        );
+    }
+    let e304_fired = diags.iter().filter(|d| d.code == "E304").count() > e304_before;
+
+    // Decompose predicate → DecomposedPredicate.
+    let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span) {
+        Ok(d) => d,
+        Err(type_diags) => {
+            for td in type_diags {
+                if !td.is_warning {
+                    diags.push(Diagnostic::error(
+                        "E200",
+                        format!("combine {name:?} residual predicate: {}", td.message),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                }
+            }
+            return;
+        }
+    };
+
+    // E305: no extractable cross-input comparisons. Fires independently
+    // of E304 — a combine with an unknown field AND no cross-input
+    // extraction gets both diagnostics, which is correct.
+    if decomposed.equalities.is_empty() && decomposed.ranges.is_empty() {
+        diags.push(combine_e305(name, span));
+    }
+
+    artifacts
+        .combine_predicates
+        .insert(name.to_string(), decomposed);
+
+    // If the where-clause was structurally broken (E304), short-circuit
+    // to avoid cascading body errors. The body may be fine, but without
+    // a sound predicate the output isn't trustworthy.
+    if e304_fired {
+        return;
+    }
+
+    // ── Body typecheck ─────────────────────────────────────────────
+    let body_typed = match typecheck_cxl(
+        name,
+        &config.cxl.source,
+        &merged_row,
+        AggregateMode::Row,
+        span,
+    ) {
+        Ok(t) => t,
+        Err(d) => {
+            diags.push(d);
+            return;
+        }
+    };
+
+    // Post-walk for E308 (unknown / 3-part qualified refs in body).
+    for stmt in &body_typed.program.statements {
+        walk_statement_exprs(stmt, &merged_row, name, "E308", "cxl body", span, diags);
+    }
+
+    // E309: combine must produce at least one non-meta emit. Unlike
+    // Transform (which has pass-through semantics), combine's output
+    // row is defined entirely by its emits — zero emits means zero
+    // output fields.
+    let has_emit = body_typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Emit { is_meta: false, .. }));
+    if !has_emit {
+        diags.push(combine_e309(name, span));
+    }
+
+    let output_row = combine_output_row(&body_typed, cxl_span);
+    schema_by_name.insert(name.to_string(), output_row);
+    artifacts
+        .typed
+        .insert(name.to_string(), Arc::new(body_typed));
+}
+
+/// Typecheck a combine's `where:` source against the merged row,
+/// returning a `TypedProgram` whose first statement is the Filter
+/// carrying the predicate `Expr`.
+///
+/// Wraps the source as `"filter {where_src}"` so the CXL parser
+/// produces a `Statement::Filter`. Routes diagnostics by category:
+/// - Parse / name-resolution failures → E200 (general compile error)
+/// - Typecheck "filter predicate must be type Bool" → E303
+/// - Other typecheck errors → E200
+fn typecheck_combine_where(
+    combine_name: &str,
+    where_src: &str,
+    merged_row: &Row,
+    span: Span,
+) -> Result<TypedProgram, Vec<Diagnostic>> {
+    let wrapped = format!("filter {where_src}");
+    let parse_result = cxl::parser::Parser::parse(&wrapped);
+    if !parse_result.errors.is_empty() {
+        let msg = parse_result
+            .errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(vec![Diagnostic::error(
+            "E200",
+            format!("combine {combine_name:?} where-clause parse error: {msg}"),
+            LabeledSpan::primary(span, String::new()),
+        )]);
+    }
+
+    let field_refs: Vec<&str> = merged_row
+        .field_names()
+        .map(|qf| qf.name.as_ref())
+        .collect();
+    let resolved =
+        match cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
+        {
+            Ok(r) => r,
+            Err(rd) => {
+                let msg = rd
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(vec![Diagnostic::error(
+                    "E200",
+                    format!("combine {combine_name:?} where-clause name resolution: {msg}"),
+                    LabeledSpan::primary(span, String::new()),
+                )]);
+            }
+        };
+
+    match cxl::typecheck::type_check(resolved, merged_row) {
+        Ok(typed) => Ok(typed),
+        Err(type_diags) => {
+            let mut out = Vec::new();
+            for td in type_diags.into_iter().filter(|d| !d.is_warning) {
+                // Typechecker's Filter-statement check emits a specific
+                // error message when the predicate's type is neither
+                // Bool nor Any — that is exactly E303 territory.
+                if td.message.starts_with("filter predicate must be type Bool") {
+                    out.push(
+                        Diagnostic::error(
+                            "E303",
+                            format!(
+                                "combine {combine_name:?} where-clause is not boolean: {}",
+                                td.message
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help(
+                            "the `where:` predicate must return Bool — use a comparison \
+                             (e.g. `a.id == b.id`)",
+                        ),
+                    );
+                } else {
+                    out.push(Diagnostic::error(
+                        "E200",
+                        format!(
+                            "combine {combine_name:?} where-clause type error: {}",
+                            td.message
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                }
+            }
+            Err(out)
+        }
+    }
+}
+
+/// Emit E304/E308 for `QualifiedFieldRef`s that don't match the merged
+/// row, or that have 3+ parts (unsupported in combine context).
+///
+/// Bare unqualified `FieldRef`s are handled by the typechecker itself
+/// (which emits a loud `Ambiguous` error for multi-match bare refs in
+/// a qualified merged row). This walker only visits the qualified-ref
+/// forms.
+#[allow(clippy::too_many_arguments)]
+fn walk_for_unknown_refs(
+    expr: &Expr,
+    merged_row: &Row,
+    combine_name: &str,
+    err_code: &str,
+    context: &str,
+    combine_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } => {
+            if parts.len() > 2 {
+                let joined: Vec<&str> = parts.iter().map(|s| s.as_ref()).collect();
+                diags.push(
+                    Diagnostic::error(
+                        err_code.to_string(),
+                        format!(
+                            "combine {combine_name:?} {context} references {:?} ({} parts); \
+                             combine supports only 2-part qualified references \
+                             (`qualifier.field`)",
+                            joined.join("."),
+                            parts.len()
+                        ),
+                        LabeledSpan::primary(combine_span, String::new()),
+                    )
+                    .with_help(
+                        "drop the extra path segment, or move multi-record logic into a \
+                         Transform before the combine",
+                    ),
+                );
+            } else if parts.len() == 2
+                && matches!(
+                    merged_row.lookup_qualified(&parts[0], &parts[1]),
+                    ColumnLookup::Unknown
+                )
+            {
+                diags.push(
+                    Diagnostic::error(
+                        err_code.to_string(),
+                        format!(
+                            "combine {combine_name:?} {context} references unknown field \
+                             `{}.{}`",
+                            parts[0], parts[1]
+                        ),
+                        LabeledSpan::primary(combine_span, String::new()),
+                    )
+                    .with_help(
+                        "declare the field in the upstream source's `schema:` block, or \
+                         fix the qualifier name",
+                    ),
+                );
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_for_unknown_refs(
+                lhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                rhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Expr::Unary { operand, .. } => walk_for_unknown_refs(
+            operand,
+            merged_row,
+            combine_name,
+            err_code,
+            context,
+            combine_span,
+            diags,
+        ),
+        Expr::Coalesce { lhs, rhs, .. } => {
+            walk_for_unknown_refs(
+                lhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                rhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_for_unknown_refs(
+                condition,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                then_branch,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            if let Some(eb) = else_branch {
+                walk_for_unknown_refs(
+                    eb,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject {
+                walk_for_unknown_refs(
+                    s,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+            for arm in arms {
+                walk_for_unknown_refs(
+                    &arm.pattern,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+                walk_for_unknown_refs(
+                    &arm.body,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            walk_for_unknown_refs(
+                receiver,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            for a in args {
+                walk_for_unknown_refs(
+                    a,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                walk_for_unknown_refs(
+                    a,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::FieldRef { .. }
+        | Expr::Literal { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::MetaAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
+    }
+}
+
+/// Walk every `Expr` inside a `Statement` and apply the unknown-ref
+/// check. Used for the body post-walk where statements may be Emit,
+/// Let, ExprStmt, Filter, or Trace.
+#[allow(clippy::too_many_arguments)]
+fn walk_statement_exprs(
+    stmt: &Statement,
+    merged_row: &Row,
+    combine_name: &str,
+    err_code: &str,
+    context: &str,
+    combine_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match stmt {
+        Statement::Emit { expr, .. }
+        | Statement::Let { expr, .. }
+        | Statement::ExprStmt { expr, .. } => {
+            walk_for_unknown_refs(
+                expr,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Statement::Filter { predicate, .. } => {
+            walk_for_unknown_refs(
+                predicate,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Statement::Trace { guard, message, .. } => {
+            if let Some(g) = guard {
+                walk_for_unknown_refs(
+                    g,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+            walk_for_unknown_refs(
+                message,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
+    }
+}
+
+/// Build a combine's output row from its cxl body's emit statements.
+///
+/// Unlike `propagate_row` (Transform), combine's output is a FRESH
+/// closed row — no pass-through of the merged row's qualified fields.
+/// Emit LHS names are always unqualified (`QualifiedField::bare`).
+/// Meta emits (`emit $meta.x = ...`) don't contribute to the output
+/// row schema; they write to per-record metadata, not the record
+/// itself.
+fn combine_output_row(typed: &TypedProgram, span: cxl::lexer::Span) -> Row {
+    let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
+    for stmt in &typed.program.statements {
+        if let Statement::Emit {
+            name,
+            expr,
+            is_meta,
+            ..
+        } = stmt
+        {
+            if *is_meta {
+                continue;
+            }
+            let emit_type = typed
+                .types
+                .get(expr.node_id().0 as usize)
+                .and_then(|t| t.clone())
+                .unwrap_or(Type::Any);
+            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
+        }
+    }
+    Row::closed(out, span)
+}
+
+// ─── Combine diagnostics (Phase Combine C.1.1 + C.1.2 + C.1.3) ──────
+
+/// E300 — combine requires at least 2 declared inputs.
+fn combine_e300(combine_name: &str, input_count: usize, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E300",
+        format!(
+            "combine {combine_name:?} declares {input_count} input(s); combine requires at least 2"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add one or more upstream inputs under `input:`, e.g.\n  input:\n    orders: orders_source\n    products: products_source",
+    )
+}
+
+/// E301 — combine input qualifier starts with `$`, colliding with CXL
+/// system namespaces (`$pipeline`, `$window`, `$meta`).
+fn combine_e301_reserved(combine_name: &str, qualifier: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E301",
+        format!(
+            "combine {combine_name:?} input qualifier {qualifier:?} starts with `$`, which is \
+             reserved for CXL system namespaces (`$pipeline`, `$window`, `$meta`)"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help("rename the qualifier to a plain identifier (e.g. `orders`, `products`)")
+}
+
+/// E301 — combine input qualifier contains `.`, which would alias a
+/// genuine 3-part CXL reference (RESOLUTION EC-4).
+fn combine_e301_dotted(combine_name: &str, qualifier: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E301",
+        format!(
+            "combine {combine_name:?} input qualifier {qualifier:?} contains `.`; dotted \
+             qualifiers would be indistinguishable from 3-part field references in the \
+             `where:` and `cxl:` bodies"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help("rename the qualifier to avoid the `.` character")
+}
+
+/// E305 — combine where-clause has no cross-input comparisons. This
+/// fires for same-input-only predicates (`a.x == a.y`), OR-only
+/// predicates (which are always residual), literal-only predicates
+/// (`true` — V-7-1), and mixed-qualifier predicates where no conjunct
+/// is cleanly cross-input.
+fn combine_e305(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E305",
+        format!(
+            "combine {combine_name:?} where-clause has no cross-input comparisons; combine \
+             requires at least one equality or range between two different inputs"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add a cross-input comparison (e.g. `a.id == b.id`); cross joins are not supported \
+         — if all records should combine, use an explicit Merge node",
+    )
+}
+
+/// E309 — combine cxl body has no non-meta emit statements. Unlike
+/// Transform (which has pass-through semantics on an Open row), combine
+/// always produces a fresh closed row defined entirely by its emits.
+fn combine_e309(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E309",
+        format!(
+            "combine {combine_name:?} cxl body has no emit statements; combine requires at \
+             least one emit to produce an output row"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add `emit field_name = expr;` statements — combine has no pass-through semantics, \
+         so every output field must be emitted explicitly",
+    )
 }
 
 /// E201 diagnostic for a Source with no `schema:` field.

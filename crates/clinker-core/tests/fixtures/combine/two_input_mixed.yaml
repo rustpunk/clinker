@@ -30,21 +30,28 @@ nodes:
         - { name: name, type: string }
         - { name: category, type: string }
         - { name: min_order, type: int }
+        - { name: max_order, type: int }
   - type: combine
     name: qualified
     input:
       orders: orders
       products: products
     config:
-      where: "orders.product_id == products.product_id and orders.amount >= products.min_order"
+      # 1 equi + 2 range — exercises the full DecomposedPredicate shape
+      # called out in phase-c1 §RESOLUTION T-8. The strengthened
+      # `test_combine_decompose_mixed` asserts `ranges[0].op ==
+      # RangeOp::Ge` and `ranges[0].left_input == "orders"`
+      # (source-order-preserving split_conjunction).
+      where: "orders.product_id == products.product_id and orders.amount >= products.min_order and orders.amount < products.max_order"
       match: first
       on_miss: null_fields
       cxl: |
-        emit order_id = orders.order_id;
-        emit product_id = orders.product_id;
-        emit product_name = products.name;
-        emit amount = orders.amount;
-        emit min_order = products.min_order;
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit amount = orders.amount
+        emit min_order = products.min_order
+        emit max_order = products.max_order
   - type: output
     name: qualified_out
     input: qualified

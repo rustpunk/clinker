@@ -37,7 +37,7 @@ nodes:
     config:
       where: "orders.amount + products.price > orders.budget"
       cxl: |
-        emit order_id = orders.order_id;
+        emit order_id = orders.order_id
         emit total = orders.amount + products.price
   - type: output
     name: mixed_combine_out

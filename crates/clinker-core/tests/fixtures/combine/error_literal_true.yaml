@@ -33,7 +33,7 @@ nodes:
     config:
       where: "true"
       cxl: |
-        emit order_id = orders.order_id;
+        emit order_id = orders.order_id
         emit product_name = products.name
   - type: output
     name: cross_out

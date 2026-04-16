@@ -33,16 +33,16 @@ nodes:
     config:
       where: "orders.product_id == products.product_id"
       cxl: |
-        emit order_id = orders.order_id;
-        emit product_name = products.name;
+        emit order_id = orders.order_id
+        emit product_name = products.name
         emit amount = orders.amount
   - type: transform
     name: upsize
     input: enriched
     config:
       cxl: |
-        emit order_id = order_id;
-        emit product_name = product_name;
+        emit order_id = order_id
+        emit product_name = product_name
         emit doubled_amount = amount
   - type: output
     name: upsize_out

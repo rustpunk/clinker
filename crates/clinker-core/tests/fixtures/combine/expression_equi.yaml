@@ -1,9 +1,14 @@
-# Expression-based equality: `lower(a.name) == lower(b.name)` → one
+# Expression-based equality: `a.name.lower() == b.name.lower()` → one
 # equality conjunct. Tests that `EqualityConjunct.{left,right}_expr`
 # carry full expressions (not just field names), so hash partitioning
 # can run over computed keys. Matches DataFusion
 # `EquijoinPredicate = (Expr, Expr)`, DuckDB `JoinCondition`, and Spark
 # `leftKeys: Seq[Expression]`.
+#
+# CXL uses method-call syntax (`receiver.method()`), not function-call
+# syntax (`func(receiver)`); the drill-phase plan wrote the predicate
+# in the function-call shape for cross-engine parity but the actual
+# CXL surface is the method form.
 #
 # C.1.2 gate test `test_combine_decompose_expression_equality`.
 pipeline:
@@ -33,9 +38,9 @@ nodes:
       orders: orders
       products: products
     config:
-      where: "lower(orders.name) == lower(products.name)"
+      where: "orders.name.lower() == products.name.lower()"
       cxl: |
-        emit order_id = orders.order_id;
+        emit order_id = orders.order_id
         emit product_id = products.product_id
   - type: output
     name: expr_combine_out

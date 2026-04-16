@@ -34,9 +34,9 @@ nodes:
       match: collect
       on_miss: null_fields
       cxl: |
-        emit order_id = orders.order_id;
-        emit amount = orders.amount;
-        emit products_list = products;
+        emit order_id = orders.order_id
+        emit amount = orders.amount
+        emit products_list = products
   - type: output
     name: collected_out
     input: collected

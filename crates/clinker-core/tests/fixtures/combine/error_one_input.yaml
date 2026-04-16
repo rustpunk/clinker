@@ -23,8 +23,8 @@ nodes:
       match: first
       on_miss: null_fields
       cxl: |
-        emit order_id = orders.order_id;
-        emit amount = orders.amount;
+        emit order_id = orders.order_id
+        emit amount = orders.amount
   - type: output
     name: lonely_out
     input: lonely

@@ -211,23 +211,18 @@ mod tests {
     // --- C.1.0 gate test -------------------------------------------------
 
     /// C.1.0 gate: `compile_combine_fixture` is invokable against a
-    /// real fixture, returns `(artifacts, diagnostics)`, and the
-    /// `two_input_equi` fixture has no diagnostics emitted at the
-    /// bind_schema level *today* (bind_schema's Combine arm is the
-    /// no-op left in place at C.0; it lands real behaviour in C.1.1+).
+    /// real fixture and returns `(artifacts, diagnostics)`.
     ///
-    /// This gate verifies the helper surface compiles and is wired up.
-    /// Downstream C.1.x tests assert on artifacts populated by the new
-    /// Combine arm as each task lands.
+    /// Post-C.1.1 the Combine arm actively builds a merged `Row` out of
+    /// the upstream schemas; `two_input_equi` still produces zero
+    /// diagnostics because both qualifiers are plain identifiers and
+    /// both upstreams are declared sources.
     #[test]
     fn test_combine_schema_scaffold_compiles() {
         let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
-        // At C.1.0, bind_schema's Combine arm is still a no-op — no
-        // diagnostics are emitted from Combine itself; upstream Source
-        // + downstream Output arms also stay clean for this fixture.
         assert!(
             diags.is_empty(),
-            "two_input_equi must bind cleanly at C.1.0; got: {:?}",
+            "two_input_equi must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
     }
@@ -267,6 +262,321 @@ mod tests {
             clinker_core::yaml::from_str::<PipelineConfig>(&yaml)
                 .unwrap_or_else(|e| panic!("fixture {name} failed to parse: {e}"));
         }
+    }
+
+    // --- C.1.1 gate tests ------------------------------------------------
+    //
+    // The merged row built inside `bind_schema_inner` for a
+    // `PipelineNode::Combine` is a LOCAL INTERMEDIATE — it feeds the
+    // where-clause typecheck in C.1.2 and the body typecheck in C.1.3,
+    // but it is not published anywhere the test can inspect it. The
+    // observable contract at C.1.1 is therefore "diagnostics match the
+    // fixture's intent": clean fixtures produce no diagnostics; error
+    // fixtures produce exactly one of E300 / E301.
+
+    /// C.1.1 gate: a 2-input combine with plain qualifiers and declared
+    /// upstreams binds with zero diagnostics. Confirms the merged-row
+    /// construction path runs end-to-end for the canonical shape.
+    #[test]
+    fn test_combine_merged_row_two_inputs() {
+        let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly at C.1.1; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate: a 3-input combine binds cleanly — qualifier/field
+    /// pairs stay unique across all three upstream rows, and no E301
+    /// fires because each qualifier is a plain identifier.
+    #[test]
+    fn test_combine_merged_row_three_inputs() {
+        let (_artifacts, diags) = compile_combine_fixture("three_input_shared_key");
+        assert!(
+            diags.is_empty(),
+            "three_input_shared_key must bind cleanly at C.1.1; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate: fewer than 2 declared inputs → E300.
+    #[test]
+    fn test_combine_e300_one_input() {
+        let (_artifacts, diags) = compile_combine_fixture("error_one_input");
+        assert!(
+            diags.iter().any(|d| d.code == "E300"),
+            "error_one_input must produce E300; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate: a `$`-prefixed qualifier collides with CXL system
+    /// namespaces (`$pipeline`, `$window`, `$meta`) → E301.
+    #[test]
+    fn test_combine_e301_reserved_namespace() {
+        let (_artifacts, diags) = compile_combine_fixture("error_reserved_namespace");
+        assert!(
+            diags.iter().any(|d| d.code == "E301"),
+            "error_reserved_namespace must produce E301; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate (RESOLUTION EC-4): a qualifier containing `.` would
+    /// alias a genuine 3-part CXL reference → E301.
+    #[test]
+    fn test_combine_e301_dotted_qualifier() {
+        let (_artifacts, diags) = compile_combine_fixture("error_dotted_qualifier");
+        assert!(
+            diags.iter().any(|d| d.code == "E301"),
+            "error_dotted_qualifier must produce E301; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    // --- C.1.2 gate tests ------------------------------------------------
+    //
+    // The where-clause is parsed, typechecked against the merged row,
+    // and decomposed into cross-input equality + range conjuncts + a
+    // residual `TypedProgram`. Residual is re-typechecked (drill D8);
+    // the original where-clause `TypedProgram` is a local intermediate
+    // that does NOT survive past `bind_schema`.
+
+    /// C.1.2 gate: a valid cross-input where-clause typechecks, decomposes,
+    /// and populates `artifacts.combine_predicates`.
+    #[test]
+    fn test_combine_where_typecheck_bool() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = artifacts
+            .combine_predicates
+            .get("enriched")
+            .expect("combine_predicates['enriched'] must exist");
+        assert!(
+            !pred.equalities.is_empty(),
+            "two_input_equi must produce at least one equality conjunct"
+        );
+    }
+
+    /// C.1.2 gate: a where-clause whose predicate is a non-Bool type → E303.
+    #[test]
+    fn test_combine_e303_where_not_bool() {
+        let (_artifacts, diags) = compile_combine_fixture("error_where_not_bool");
+        assert!(
+            diags.iter().any(|d| d.code == "E303"),
+            "error_where_not_bool must produce E303; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate: a where-clause that references a non-existent qualified
+    /// field → E304.
+    #[test]
+    fn test_combine_e304_unknown_field() {
+        let (_artifacts, diags) = compile_combine_fixture("error_unknown_field");
+        assert!(
+            diags.iter().any(|d| d.code == "E304"),
+            "error_unknown_field must produce E304; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate: a where-clause with only same-input comparisons yields
+    /// no cross-input extractables → E305.
+    #[test]
+    fn test_combine_e305_no_cross_input() {
+        let (_artifacts, diags) = compile_combine_fixture("error_no_cross_input");
+        assert!(
+            diags.iter().any(|d| d.code == "E305"),
+            "error_no_cross_input must produce E305; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate (V-7-1): a literal-only predicate (`where: "true"`) has
+    /// zero cross-input comparisons → E305. Combine does not support
+    /// cross joins; users must add a real predicate or use a Merge node.
+    #[test]
+    fn test_combine_e305_literal_true() {
+        let (_artifacts, diags) = compile_combine_fixture("error_literal_true");
+        assert!(
+            diags.iter().any(|d| d.code == "E305"),
+            "error_literal_true must produce E305; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate: pure equi predicate `a.id == b.id` → 1 equality, 0 ranges,
+    /// no residual.
+    #[test]
+    fn test_combine_decompose_pure_equi() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(diags.is_empty(), "expected clean compile");
+        let pred = &artifacts.combine_predicates["enriched"];
+        assert_eq!(pred.equalities.len(), 1, "1 equality expected");
+        assert_eq!(pred.ranges.len(), 0, "0 ranges expected");
+        assert!(
+            pred.residual.is_none(),
+            "no residual expected for pure equi"
+        );
+    }
+
+    /// C.1.2 gate (RESOLUTION T-8): mixed predicate
+    /// `a.id == b.id and a.amt >= b.min and a.amt < b.max` →
+    /// 1 equality + 2 ranges. Strengthened asserts on `ranges[0]`
+    /// verify that `split_conjunction` preserves source order and
+    /// `classify_conjunct` maps `BinOp::Gte → RangeOp::Ge` correctly.
+    #[test]
+    fn test_combine_decompose_mixed() {
+        use clinker_core::plan::combine::RangeOp;
+
+        let (artifacts, diags) = compile_combine_fixture("two_input_mixed");
+        assert!(
+            diags.is_empty(),
+            "two_input_mixed must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = &artifacts.combine_predicates["qualified"];
+        assert_eq!(pred.equalities.len(), 1, "1 equality expected");
+        assert_eq!(pred.ranges.len(), 2, "2 ranges expected");
+        assert!(matches!(pred.ranges[0].op, RangeOp::Ge));
+        assert_eq!(pred.ranges[0].left_input.as_ref(), "orders");
+        assert_eq!(pred.ranges[0].right_input.as_ref(), "products");
+    }
+
+    /// C.1.2 gate: an OR expression at the top level is NEVER decomposed
+    /// (drill D7 — universal consensus across engines) → 0 eq/range,
+    /// residual holds the whole OR.
+    #[test]
+    fn test_combine_decompose_or_is_residual() {
+        let (artifacts, _diags) = compile_combine_fixture("error_or_predicate");
+        let pred = &artifacts.combine_predicates["combine_or"];
+        assert_eq!(pred.equalities.len(), 0);
+        assert_eq!(pred.ranges.len(), 0);
+        assert!(pred.residual.is_some(), "residual must hold the OR whole");
+    }
+
+    /// C.1.2 gate: expression-based equality `a.name.lower() ==
+    /// b.name.lower()` extracts as a single equality conjunct. Verifies
+    /// that `EqualityConjunct.{left,right}_expr` can hold arbitrary
+    /// expressions per drill D5.
+    #[test]
+    fn test_combine_decompose_expression_equality() {
+        let (artifacts, diags) = compile_combine_fixture("expression_equi");
+        assert!(
+            diags.is_empty(),
+            "expression_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = &artifacts.combine_predicates["expr_combine"];
+        assert_eq!(pred.equalities.len(), 1, "1 equality expected");
+        assert_eq!(pred.equalities[0].left_input.as_ref(), "orders");
+        assert_eq!(pred.equalities[0].right_input.as_ref(), "products");
+    }
+
+    /// C.1.2 gate: a conjunct with mixed-qualifier operands (one side
+    /// references both inputs) is residual, not a cross-input conjunct.
+    /// Matches DataFusion `find_valid_equijoin_key_pair` and Spark
+    /// `canEvaluate` semantics.
+    #[test]
+    fn test_combine_decompose_mixed_qualifier_residual() {
+        let (artifacts, _diags) = compile_combine_fixture("mixed_qualifier_expr");
+        let pred = &artifacts.combine_predicates["mixed_combine"];
+        assert_eq!(pred.equalities.len(), 0);
+        assert_eq!(pred.ranges.len(), 0);
+        assert!(pred.residual.is_some());
+    }
+
+    /// C.1.2 gate (RESOLUTION EC-6): a 3-part qualified ref (`a.b.c`) in
+    /// the where-clause is not supported and produces E304 with a clear
+    /// "only 2-part references are supported" message.
+    #[test]
+    fn test_combine_3part_ref_residual() {
+        let (_artifacts, diags) = compile_combine_fixture("error_3part_ref");
+        assert!(
+            diags.iter().any(|d| d.code == "E304"),
+            "error_3part_ref must produce E304; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    // --- C.1.3 gate tests ------------------------------------------------
+    //
+    // The cxl body is typechecked against the merged row. Output fields
+    // are the LHS names of non-meta `emit` statements, always bare
+    // (`QualifiedField::bare`). The output row lands in
+    // `BoundSchemas::output_of(name)` so downstream nodes see it; the
+    // body TypedProgram lands in `artifacts.typed[name]` per drill D10.
+
+    /// C.1.3 gate: emit statements publish an output row in
+    /// `BoundSchemas` whose declared field names (bare) are exactly the
+    /// LHS emit names in source order. V-5-6: also asserts
+    /// `artifacts.typed[name]` is populated with the body TypedProgram.
+    #[test]
+    fn test_combine_output_row_from_emit() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        assert_output_row(
+            &artifacts,
+            "enriched",
+            &[
+                "order_id",
+                "product_id",
+                "product_name",
+                "category",
+                "amount",
+            ],
+        );
+        assert!(
+            artifacts.typed.contains_key("enriched"),
+            "artifacts.typed['enriched'] must be populated with body TypedProgram"
+        );
+    }
+
+    /// C.1.3 gate: a Transform after a combine resolves the combine's
+    /// emitted (bare) output fields. Proves downstream binding sees the
+    /// output row, not the internal merged qualified row.
+    #[test]
+    fn test_combine_downstream_sees_output() {
+        let (_artifacts, diags) = compile_combine_fixture("combine_then_transform");
+        assert!(
+            diags.is_empty(),
+            "combine_then_transform must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.3 gate: cxl body referencing a nonexistent qualified field
+    /// → E308.
+    #[test]
+    fn test_combine_e308_unknown_merged_field() {
+        let (_artifacts, diags) = compile_combine_fixture("error_body_unknown_field");
+        assert!(
+            diags.iter().any(|d| d.code == "E308"),
+            "error_body_unknown_field must produce E308; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.3 gate: cxl body with zero emit statements → E309. Combine
+    /// has no pass-through semantics; every output field must be emitted.
+    #[test]
+    fn test_combine_e309_no_emit() {
+        let (_artifacts, diags) = compile_combine_fixture("error_no_emit");
+        assert!(
+            diags.iter().any(|d| d.code == "E309"),
+            "error_no_emit must produce E309; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
     }
 
     /// Compile a parsed `PipelineConfig` into an `ExecutionPlanDag` via the

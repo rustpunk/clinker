@@ -35,10 +35,10 @@ nodes:
       match: all
       on_miss: null_fields
       cxl: |
-        emit order_id = orders.order_id;
-        emit product_id = orders.product_id;
-        emit product_name = products.name;
-        emit amount = orders.amount;
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit amount = orders.amount
   - type: output
     name: fanned_out
     input: fanned
