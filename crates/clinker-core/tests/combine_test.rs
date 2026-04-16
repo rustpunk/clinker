@@ -235,6 +235,276 @@ mod tests {
         }
     }
 
+    // --- Pre-C.1 field-level span gate tests ---------------------------
+    //
+    // These tests lock in the architectural contract of the Pre-C.1
+    // custom-Deserialize refactor: every consumer header carries
+    // `Spanned<NodeInput>` at field level, E307 carries a real span, and
+    // parity holds across Merge and Transform headers.
+    //
+    // See `docs/internal/research/RESEARCH-span-preserving-deser.md`
+    // (Approach A). If any of these tests regress, the refactor has
+    // leaked — do NOT weaken the asserts.
+
+    /// Gate: CombineHeader's `input: IndexMap<String, Spanned<NodeInput>>`
+    /// captures real YAML line numbers per entry. Parses the
+    /// `two_input_equi.yaml` fixture and verifies the span of the
+    /// `orders:` entry points at its actual line in the file.
+    #[test]
+    fn test_combine_input_carries_field_level_span() {
+        use clinker_core::config::PipelineNode;
+        use clinker_core::yaml::Location;
+
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+
+        let combine = config
+            .nodes
+            .iter()
+            .find_map(|s| match &s.value {
+                PipelineNode::Combine { header, .. } if header.name == "enriched" => Some(header),
+                _ => None,
+            })
+            .expect("combine node 'enriched' must be present");
+
+        let orders_entry = combine
+            .input
+            .get("orders")
+            .expect("combine must declare 'orders' qualifier");
+        let products_entry = combine
+            .input
+            .get("products")
+            .expect("combine must declare 'products' qualifier");
+
+        assert_ne!(
+            orders_entry.referenced,
+            Location::UNKNOWN,
+            "combine.input['orders'] must carry a real YAML location (pre-C.1 gate)"
+        );
+        assert_ne!(
+            products_entry.referenced,
+            Location::UNKNOWN,
+            "combine.input['products'] must carry a real YAML location (pre-C.1 gate)"
+        );
+
+        let orders_line = orders_entry.referenced.line();
+        let products_line = products_entry.referenced.line();
+        assert!(
+            orders_line >= 1,
+            "orders entry line must be >= 1, got {orders_line}"
+        );
+        // `products_line > orders_line` proves the spans are really
+        // being read from the YAML (not just a global constant).
+        assert!(
+            products_line > orders_line,
+            "products entry must come after orders in the YAML; got orders={orders_line} products={products_line}"
+        );
+
+        // Verify against the literal fixture contents: find the line
+        // whose 0-based index matches what saphyr reported (1-based).
+        let lines: Vec<&str> = yaml.lines().collect();
+        let orders_text = lines
+            .get((orders_line as usize).saturating_sub(1))
+            .copied()
+            .unwrap_or("");
+        assert!(
+            orders_text.contains("orders:") && orders_text.contains("orders"),
+            "line {orders_line} must contain the 'orders: orders' mapping; got {orders_text:?}"
+        );
+    }
+
+    /// Gate: `PlanError::CombineInputUndeclared` (E307) carries a real
+    /// `Span`. Constructs an inline combine fixture that references an
+    /// undeclared upstream and asserts the error's `span` encodes a
+    /// non-zero line number.
+    #[test]
+    fn test_combine_e307_diagnostic_has_real_span() {
+        use clinker_core::plan::execution::{ExecutionPlanDag, PlanError};
+
+        // `nowhere` is not declared as a source, transform, or any
+        // other producer — combine wiring must surface E307.
+        let yaml = r#"
+pipeline:
+  name: e307_gate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: combine
+    name: broken
+    input:
+      orders: orders
+      products: nowhere
+    config:
+      where: "orders.order_id == products.order_id"
+      cxl: |
+        emit order_id = orders.order_id
+"#;
+        let config = parse_fixture(yaml);
+        let err = ExecutionPlanDag::compile(&config, &[])
+            .expect_err("combine referencing undeclared upstream must fail");
+        match err {
+            PlanError::CombineInputUndeclared {
+                combine,
+                qualifier,
+                reference,
+                span,
+            } => {
+                assert_eq!(combine, "broken");
+                assert_eq!(qualifier, "products");
+                assert_eq!(reference, "nowhere");
+                // The span must carry a real line number, not SYNTHETIC.
+                let line = span.synthetic_line_number().unwrap_or(0);
+                assert!(
+                    line > 0,
+                    "E307 span must have a non-zero line; got synthetic_line_number={line:?}, span={span:?}"
+                );
+                // The reference is on the `products: nowhere` line. In
+                // this fixture that's line 16 of the inline YAML (1-based
+                // from the leading newline of the raw string). We assert
+                // the weaker "within reasonable bounds" property so the
+                // test doesn't brittle on whitespace tweaks, but also
+                // confirm it's in the right neighbourhood: inside the
+                // `input:` block, not on the very first line.
+                assert!(
+                    line >= 10,
+                    "E307 span line must be inside the combine input block (>= 10), got {line}"
+                );
+
+                // Display includes the line number.
+                let display = format!(
+                    "{}",
+                    PlanError::CombineInputUndeclared {
+                        combine,
+                        qualifier,
+                        reference,
+                        span,
+                    }
+                );
+                assert!(
+                    display.contains(&format!("line {line}")),
+                    "Display output must include 'line {line}', got: {display}"
+                );
+            }
+            other => panic!("expected CombineInputUndeclared, got: {other}"),
+        }
+    }
+
+    /// Gate: `MergeHeader.inputs: Vec<Spanned<NodeInput>>` — every input
+    /// in a merge fixture carries a real span. Parity with Combine.
+    #[test]
+    fn test_nodeinput_span_preserved_for_merge_header() {
+        use clinker_core::config::PipelineNode;
+        use clinker_core::yaml::Location;
+
+        let yaml = r#"
+pipeline:
+  name: merge_span_gate
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: string }
+  - type: merge
+    name: combined
+    inputs:
+      - a
+      - b
+"#;
+        let config = parse_fixture(yaml);
+        let merge = config
+            .nodes
+            .iter()
+            .find_map(|s| match &s.value {
+                PipelineNode::Merge { header, .. } if header.name == "combined" => Some(header),
+                _ => None,
+            })
+            .expect("merge 'combined' must be present");
+        assert_eq!(merge.inputs.len(), 2);
+        for (i, entry) in merge.inputs.iter().enumerate() {
+            assert_ne!(
+                entry.referenced,
+                Location::UNKNOWN,
+                "merge.inputs[{i}] must carry a real YAML location"
+            );
+            assert!(
+                entry.referenced.line() >= 1,
+                "merge.inputs[{i}] line must be >= 1, got {}",
+                entry.referenced.line()
+            );
+        }
+        // Spans must differ — proves we're reading per-entry, not a
+        // global constant.
+        assert_ne!(
+            merge.inputs[0].referenced.line(),
+            merge.inputs[1].referenced.line(),
+            "merge entries must have distinct line numbers"
+        );
+    }
+
+    /// Gate: `NodeHeader.input: Spanned<NodeInput>` on a single-input
+    /// Transform header carries a real span. Parity with Combine.
+    #[test]
+    fn test_nodeinput_span_preserved_for_transform_header() {
+        use clinker_core::config::PipelineNode;
+        use clinker_core::yaml::Location;
+
+        let yaml = r#"
+pipeline:
+  name: transform_span_gate
+nodes:
+  - type: source
+    name: raw
+    config:
+      name: raw
+      type: csv
+      path: raw.csv
+      schema:
+        - { name: id, type: string }
+  - type: transform
+    name: clean
+    input: raw
+    config:
+      cxl: "emit id = id"
+"#;
+        let config = parse_fixture(yaml);
+        let transform = config
+            .nodes
+            .iter()
+            .find_map(|s| match &s.value {
+                PipelineNode::Transform { header, .. } if header.name == "clean" => Some(header),
+                _ => None,
+            })
+            .expect("transform 'clean' must be present");
+        assert_ne!(
+            transform.input.referenced,
+            Location::UNKNOWN,
+            "transform.input must carry a real YAML location (pre-C.1)"
+        );
+        assert!(
+            transform.input.referenced.line() >= 1,
+            "transform.input line must be >= 1, got {}",
+            transform.input.referenced.line()
+        );
+    }
+
     /// Gate test: the topo order places every upstream input BEFORE the
     /// combine node. Uses `two_input_equi.yaml` (combine 'enriched' over
     /// sources 'orders' and 'products').

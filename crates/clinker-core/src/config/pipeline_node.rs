@@ -1,27 +1,50 @@
 //! Unified pipeline node enum (Phase 16b Wave 1 — Tasks 16b.2 Group A/B;
-//! two-pass deser refactor Phase Combine Task C.0.1a).
+//! custom-Deserialize refactor, pre-C.1, supersedes the C.0.1a two-pass
+//! approach).
 //!
 //! `PipelineNode` is an enum with peer variants for every node kind in
 //! the unified `nodes:` topology. Each variant carries a header struct
 //! (with `name`, optional `description`, `input` / `inputs`) and a
 //! `config:` sub-block with the operator-specific fields.
 //!
-//! Deserialization uses a two-pass approach via
-//! `#[serde(try_from = "serde_json::Value")]` — see the [`PipelineNode`]
-//! type docs for the rationale. The outer [`crate::yaml::Spanned`] wrap
-//! runs BEFORE the TryFrom conversion, so every node carries its
-//! source-span info regardless of the two-pass rewrite.
+//! # Deserialization (pre-C.1)
+//!
+//! `PipelineNode` uses a hand-written [`Deserialize`] impl built around a
+//! [`serde::de::Visitor::visit_map`] that peeks the `type:` discriminator
+//! and dispatches to a per-variant serde-saphyr-native deserializer —
+//! NOT through a `serde_json::Value` intermediate. This is the fourth
+//! application of the key-presence-dispatch pattern in this codebase
+//! (peers: [`crate::config::SortFieldSpec`], [`crate::config::SchemaSource`],
+//! [`crate::config::composition::raw::RawOutputAlias`]) — see
+//! `docs/internal/research/RESEARCH-span-preserving-deser.md` (Approach A)
+//! and `docs/internal/research/RESEARCH-transform-entry-serde.md` for the
+//! rationale.
+//!
+//! What this preserves (from C.0.1a, unchanged):
+//! - The user-facing YAML shape (`{type: combine, name: ..., config: {...}}`).
+//! - `deny_unknown_fields` semantics per variant — the visitor rejects
+//!   unknown top-level keys with the offending name in the error message.
+//! - Unknown-type-tag errors name the tag and list valid variants.
+//! - Inner `#[serde(flatten)]` on `SourceBody` keeps working because
+//!   variant deserialization is driven by serde-saphyr's native path.
+//!
+//! What this adds (over C.0.1a):
+//! - Field-level [`crate::yaml::Spanned`] at the three header input
+//!   fields ([`NodeHeader::input`], [`MergeHeader::inputs`],
+//!   [`CombineHeader::input`]). Spans survive because the native path
+//!   never goes through serde's type-erased `Content` buffer, which is
+//!   what `serde_json::Value` would have routed through. E307 and
+//!   future per-input diagnostics can now pin-point the offending
+//!   reference.
 //!
 //! Per-variant body structs use the `*Body` family suffix.
-//!
-//! See `docs/plans/cxl-engine/phase-16b-node-taxonomy-lift.md` Task 16b.2
-//! and `docs/internal/plans/cxl-engine/phase-combine-node/phase-c0-scaffolds-config.md`
-//! Task C.0.1a.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, IntoDeserializer, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::node_header::{CombineHeader, MergeHeader, NodeHeader, SourceHeader};
 use crate::yaml::CxlSource;
@@ -31,39 +54,35 @@ use crate::yaml::CxlSource;
 /// YAML `type:` field; per-variant fields are split between a header
 /// (flattened to top level) and a `config:` block.
 ///
-/// # Two-pass deserialization (C.0.1a)
+/// # Deserialization (pre-C.1)
 ///
-/// Deserialization goes through [`TryFrom<serde_json::Value>`] rather
-/// than serde's derived tagged-enum path. The tagged-enum path had two
-/// silent bugs interacting with the per-variant `#[serde(flatten)]`
-/// header structs:
+/// Uses a hand-written [`Deserialize`] impl with a
+/// [`serde::de::Visitor::visit_map`] that peeks the `type:` discriminator
+/// and dispatches each variant to a dedicated serde-saphyr-native
+/// deserializer. This supersedes the C.0.1a `#[serde(try_from =
+/// "serde_json::Value")]` approach: it keeps every win of that refactor
+/// (per-variant `deny_unknown_fields`, error messages include field
+/// names, no `#[serde(flatten)]` footprint on the enum) and adds
+/// field-level [`crate::yaml::Spanned`] preservation on consumer
+/// headers, which a `serde_json::Value` intermediate always erased. See
+/// the module-level docs and
+/// `docs/internal/research/RESEARCH-span-preserving-deser.md` for the
+/// full rationale.
 ///
-/// 1. `#[serde(deny_unknown_fields)]` on the outer enum was silently
-///    broken by `#[serde(flatten)]` in the variant bodies — unknown
-///    fields were accepted instead of rejected.
-/// 2. Flatten buffers erased field names from error messages, so
-///    unknown-field errors read as generic "unknown field" strings
-///    with no actionable detail.
-///
-/// The two-pass approach:
-/// - Pass 1: deserialize the YAML mapping to [`serde_json::Value`],
-///   which preserves every key.
-/// - Pass 2: match on the `type` tag, then use [`extract_sub`] /
-///   [`extract_field`] to feed selected keys into each variant's
-///   header and body structs (which keep their `#[serde(deny_unknown_fields)]`
-///   attributes — now functional because they deserialize standalone).
-/// - [`reject_unknown`] rejects any top-level key outside the expected
-///   set, with the offending key name in the error message.
-///
-/// The per-variant header and body structs are unchanged. Spanned<PipelineNode>
-/// at the top level continues to capture node-level source location because
-/// serde-saphyr's Spanned wrapper runs before the TryFrom conversion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "snake_case",
-    try_from = "serde_json::Value"
-)]
+/// The `Serialize` impl is still derived with `#[serde(tag = "type",
+/// rename_all = "snake_case")]` — the YAML round-trip shape is
+/// unchanged, only deserialization is re-architected.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+// Variant size is dominated by `SourceBody`/`OutputBody` (large wrapped
+// config types) and by the `Locations` field in `Spanned<NodeInput>` that
+// the pre-C.1 refactor adds to every consumer header. Boxing would force
+// every consumer site to deref through the box — a pervasive ergonomics
+// regression for a value that only lives for the lifetime of a pipeline
+// compile (PipelineConfig is typically parsed once, then owned as a
+// whole). The size cost is acceptable at config scale; the diagnostic
+// quality gain is load-bearing.
+#[allow(clippy::large_enum_variant)]
 pub enum PipelineNode {
     Source {
         #[serde(flatten)]
@@ -137,191 +156,470 @@ pub enum PipelineNode {
     },
 }
 
-impl TryFrom<serde_json::Value> for PipelineNode {
-    type Error = String;
+// ---------------------------------------------------------------------
+// Custom Deserialize impl for PipelineNode (pre-C.1)
+//
+// The visitor reads map entries one-at-a-time, looking for the `type:`
+// discriminator. Entries encountered before `type:` (the non-canonical
+// key order case) are buffered as `(String, serde_value::Value)` pairs
+// — spans on those specific entries are unavoidably lost during the
+// buffer step, but the canonical YAML convention (used by every fixture
+// in this codebase) places `type:` first, so no buffering happens in
+// practice and every entry's span survives.
+//
+// Once `type:` is known, a `DispatchMapAccess` replays buffered entries
+// first (from the lossy buffer), then drains the remaining `MapAccess`
+// (preserving spans for those). The per-variant payload struct is
+// deserialized via `MapAccessDeserializer` over this replaying adapter —
+// and because the remaining drain stays inside serde-saphyr's native
+// driver, `Spanned<T>` fields (notably `Spanned<NodeInput>` at all three
+// header-input positions) capture real locations end-to-end.
+//
+// Spike validation lives in
+// `yaml::tests::test_spanned_survives_mapaccess_deserializer_dispatch` and
+// `yaml::tests::test_spanned_at_indexmap_value_position_captures_real_spans`.
+// ---------------------------------------------------------------------
 
-    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| "pipeline node must be a YAML mapping".to_string())?;
-        let type_tag = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "pipeline node must have a 'type' field".to_string())?;
+impl<'de> Deserialize<'de> for PipelineNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PipelineNodeVisitor;
 
-        match type_tag {
-            "source" => {
-                let header: SourceHeader = extract_sub(obj, &["name", "description", "_notes"])?;
-                let config: SourceBody = extract_field(obj, "config")?;
-                reject_unknown(obj, &["type", "name", "description", "_notes", "config"])?;
-                Ok(PipelineNode::Source { header, config })
+        /// A MapAccess adapter that first yields buffered
+        /// `(String, serde_json::Value)` pairs, then drains an
+        /// underlying `MapAccess`. Used to implement the look-ahead for
+        /// `type:` dispatch without losing spans on the post-`type:`
+        /// tail. `serde_json::Value` is used for the pre-`type:` buffer
+        /// because it is already a workspace dep and sufficient for
+        /// config-time YAML scalars/maps; spans on those buffered
+        /// entries are unavoidably lost (the ONLY span loss this
+        /// refactor leaves behind, and only when users place non-
+        /// canonical keys before `type:`).
+        struct DispatchMapAccess<A> {
+            buffered: std::vec::IntoIter<(String, serde_json::Value)>,
+            tail: A,
+            /// Set during a `next_key_seed` call that yielded a
+            /// buffered key, so the follow-up `next_value_seed` can
+            /// consume the pre-pulled Value.
+            pending_value: Option<serde_json::Value>,
+        }
+
+        impl<'de, A> MapAccess<'de> for DispatchMapAccess<A>
+        where
+            A: MapAccess<'de>,
+        {
+            type Error = A::Error;
+
+            fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+            where
+                K: de::DeserializeSeed<'de>,
+            {
+                if let Some((key, value)) = self.buffered.next() {
+                    self.pending_value = Some(value);
+                    let key_de = serde::de::IntoDeserializer::<A::Error>::into_deserializer(key);
+                    return seed.deserialize(key_de).map(Some);
+                }
+                self.tail.next_key_seed(seed)
             }
-            "transform" => {
-                let header: NodeHeader =
-                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
-                let config: TransformBody = extract_field(obj, "config")?;
-                reject_unknown(
-                    obj,
-                    &["type", "name", "description", "input", "_notes", "config"],
-                )?;
-                Ok(PipelineNode::Transform { header, config })
+
+            fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+            where
+                V: de::DeserializeSeed<'de>,
+            {
+                if let Some(value) = self.pending_value.take() {
+                    // serde_json::Value implements Deserializer; route
+                    // through an Error-adapting bridge so the seed
+                    // error type matches `A::Error`.
+                    return seed
+                        .deserialize(value.into_deserializer())
+                        .map_err(|e: serde_json::Error| de::Error::custom(e.to_string()));
+                }
+                self.tail.next_value_seed(seed)
             }
-            "aggregate" => {
-                let header: NodeHeader =
-                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
-                let config: AggregateBody = extract_field(obj, "config")?;
-                reject_unknown(
-                    obj,
-                    &["type", "name", "description", "input", "_notes", "config"],
-                )?;
-                Ok(PipelineNode::Aggregate { header, config })
+
+            fn size_hint(&self) -> Option<usize> {
+                let hint = self.tail.size_hint().unwrap_or(0);
+                Some(self.buffered.len() + hint)
             }
-            "route" => {
-                let header: NodeHeader =
-                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
-                let config: RouteBody = extract_field(obj, "config")?;
-                reject_unknown(
-                    obj,
-                    &["type", "name", "description", "input", "_notes", "config"],
-                )?;
-                Ok(PipelineNode::Route { header, config })
+        }
+
+        impl<'de> Visitor<'de> for PipelineNodeVisitor {
+            type Value = PipelineNode;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    "a pipeline node mapping with a 'type' field and variant-specific fields",
+                )
             }
-            "merge" => {
-                let header: MergeHeader =
-                    extract_sub(obj, &["name", "description", "inputs", "_notes"])?;
-                // `config:` is optional on Merge — defaults to empty MergeBody.
-                let config: MergeBody = extract_optional(obj, "config")?.unwrap_or_default();
-                reject_unknown(
-                    obj,
-                    &["type", "name", "description", "inputs", "_notes", "config"],
-                )?;
-                Ok(PipelineNode::Merge { header, config })
+
+            fn visit_map<A>(self, mut map: A) -> Result<PipelineNode, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                // Look-ahead: read keys until we find `type:`. Any
+                // entries that come first are buffered (lossy for
+                // spans on just those entries) so we can replay them
+                // after dispatch. Canonical fixtures put `type:` first,
+                // so in practice nothing is buffered.
+                let mut buffered: Vec<(String, serde_json::Value)> = Vec::new();
+                let type_tag: String = loop {
+                    let key: Option<String> = map.next_key()?;
+                    match key {
+                        Some(k) if k == "type" => break map.next_value::<String>()?,
+                        Some(k) => {
+                            let value: serde_json::Value = map.next_value()?;
+                            buffered.push((k, value));
+                        }
+                        None => {
+                            return Err(de::Error::custom(
+                                "pipeline node must have a 'type' field",
+                            ));
+                        }
+                    }
+                };
+
+                // Now build a replaying MapAccess: buffered entries
+                // first (span-lossy), then the remaining tail (native
+                // saphyr, span-preserving).
+                let dispatch = DispatchMapAccess {
+                    buffered: buffered.into_iter(),
+                    tail: map,
+                    pending_value: None,
+                };
+
+                // Dispatch each `type:` tag to a dedicated variant
+                // payload struct. `MapAccessDeserializer` drives
+                // struct deserialization; where the fields come from
+                // the tail (i.e. authored after `type:`), spans survive
+                // because the deserialization stays inside the native
+                // saphyr driver.
+                match type_tag.as_str() {
+                    "source" => {
+                        let payload = SourcePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Source { header, config })
+                    }
+                    "transform" => {
+                        let payload = TransformPayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Transform { header, config })
+                    }
+                    "aggregate" => {
+                        let payload = AggregatePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Aggregate { header, config })
+                    }
+                    "route" => {
+                        let payload = RoutePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Route { header, config })
+                    }
+                    "merge" => {
+                        let payload = MergePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Merge { header, config })
+                    }
+                    "combine" => {
+                        let payload = CombinePayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Combine { header, config })
+                    }
+                    "output" => {
+                        let payload = OutputPayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        let (header, config) = payload.into_variant_parts();
+                        Ok(PipelineNode::Output { header, config })
+                    }
+                    "composition" => {
+                        let payload = CompositionPayload::deserialize(
+                            de::value::MapAccessDeserializer::new(dispatch),
+                        )?;
+                        Ok(payload.into_node())
+                    }
+                    other => Err(de::Error::unknown_variant(
+                        other,
+                        &[
+                            "source",
+                            "transform",
+                            "aggregate",
+                            "route",
+                            "merge",
+                            "combine",
+                            "output",
+                            "composition",
+                        ],
+                    )),
+                }
             }
-            "combine" => {
-                let header: CombineHeader =
-                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
-                let config: CombineBody = extract_field(obj, "config")?;
-                reject_unknown(
-                    obj,
-                    &["type", "name", "description", "input", "_notes", "config"],
-                )?;
-                Ok(PipelineNode::Combine { header, config })
-            }
-            "output" => {
-                let header: NodeHeader =
-                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
-                let config: OutputBody = extract_field(obj, "config")?;
-                reject_unknown(
-                    obj,
-                    &["type", "name", "description", "input", "_notes", "config"],
-                )?;
-                Ok(PipelineNode::Output { header, config })
-            }
-            "composition" => {
-                let header: NodeHeader =
-                    extract_sub(obj, &["name", "description", "input", "_notes"])?;
-                let r#use: PathBuf = extract_field(obj, "use")?;
-                let alias: Option<String> = extract_optional(obj, "alias")?;
-                let inputs: IndexMap<String, String> =
-                    extract_optional(obj, "inputs")?.unwrap_or_default();
-                let outputs: IndexMap<String, String> =
-                    extract_optional(obj, "outputs")?.unwrap_or_default();
-                let config: IndexMap<String, serde_json::Value> =
-                    extract_optional(obj, "config")?.unwrap_or_default();
-                let resources: IndexMap<String, serde_json::Value> =
-                    extract_optional(obj, "resources")?.unwrap_or_default();
-                reject_unknown(
-                    obj,
-                    &[
-                        "type",
-                        "name",
-                        "description",
-                        "input",
-                        "_notes",
-                        "use",
-                        "alias",
-                        "inputs",
-                        "outputs",
-                        "config",
-                        "resources",
-                    ],
-                )?;
-                Ok(PipelineNode::Composition {
-                    header,
-                    r#use,
-                    alias,
-                    inputs,
-                    outputs,
-                    config,
-                    resources,
-                    body: crate::plan::composition_body::CompositionBodyId::default(),
-                })
-            }
-            other => Err(format!(
-                "unknown node type {other:?}, expected one of: source, transform, aggregate, route, merge, combine, output, composition"
-            )),
+        }
+
+        deserializer.deserialize_map(PipelineNodeVisitor)
+    }
+}
+
+// Per-variant payload structs. Each enumerates every post-`type:` YAML
+// key explicitly — no `#[serde(flatten)]`, because flatten + the
+// type-erased Content buffer it requires would destroy `Spanned<T>`
+// field-level locations inside the header structs (the bug C.0.1a's
+// two-pass dispatch was originally meant to work around). Enumerating
+// each field explicitly keeps the per-field path through serde-saphyr's
+// native driver, preserving spans end-to-end.
+//
+// Each payload struct uses `#[serde(deny_unknown_fields)]` so typos in
+// a variant's top-level fields surface as serde errors that name the
+// offending field (the C.0.1a wording contract).
+//
+// The payload structs are then rebuilt into the variant's canonical
+// `(header, config)` shape in the Visitor above.
+
+// ---- Source ----------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: SourceBody,
+}
+
+impl SourcePayload {
+    fn into_variant_parts(self) -> (SourceHeader, SourceBody) {
+        (
+            SourceHeader {
+                name: self.name,
+                description: self.description,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
+// ---- Transform / Aggregate / Route / Output (consumer NodeHeader) ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransformPayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: TransformBody,
+}
+
+impl TransformPayload {
+    fn into_variant_parts(self) -> (NodeHeader, TransformBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AggregatePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: AggregateBody,
+}
+
+impl AggregatePayload {
+    fn into_variant_parts(self) -> (NodeHeader, AggregateBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: RouteBody,
+}
+
+impl RoutePayload {
+    fn into_variant_parts(self) -> (NodeHeader, RouteBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputPayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: OutputBody,
+}
+
+impl OutputPayload {
+    fn into_variant_parts(self) -> (NodeHeader, OutputBody) {
+        (
+            NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
+// ---- Merge -----------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    inputs: Vec<crate::yaml::Spanned<crate::config::node_header::NodeInput>>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    /// Optional on Merge — defaults to an empty `MergeBody`.
+    #[serde(default)]
+    config: Option<MergeBody>,
+}
+
+impl MergePayload {
+    fn into_variant_parts(self) -> (MergeHeader, MergeBody) {
+        (
+            MergeHeader {
+                name: self.name,
+                description: self.description,
+                inputs: self.inputs,
+                notes: self.notes,
+            },
+            self.config.unwrap_or_default(),
+        )
+    }
+}
+
+// ---- Combine ---------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CombinePayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: IndexMap<String, crate::yaml::Spanned<crate::config::node_header::NodeInput>>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    config: CombineBody,
+}
+
+impl CombinePayload {
+    fn into_variant_parts(self) -> (CombineHeader, CombineBody) {
+        (
+            CombineHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            self.config,
+        )
+    }
+}
+
+// ---- Composition -----------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompositionPayload {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    input: crate::yaml::Spanned<crate::config::node_header::NodeInput>,
+    #[serde(default, rename = "_notes")]
+    notes: Option<serde_json::Value>,
+    #[serde(rename = "use")]
+    r#use: PathBuf,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    inputs: IndexMap<String, String>,
+    #[serde(default)]
+    outputs: IndexMap<String, String>,
+    #[serde(default)]
+    config: IndexMap<String, serde_json::Value>,
+    #[serde(default)]
+    resources: IndexMap<String, serde_json::Value>,
+}
+
+impl CompositionPayload {
+    fn into_node(self) -> PipelineNode {
+        PipelineNode::Composition {
+            header: NodeHeader {
+                name: self.name,
+                description: self.description,
+                input: self.input,
+                notes: self.notes,
+            },
+            r#use: self.r#use,
+            alias: self.alias,
+            inputs: self.inputs,
+            outputs: self.outputs,
+            config: self.config,
+            resources: self.resources,
+            body: crate::plan::composition_body::CompositionBodyId::default(),
         }
     }
-}
-
-/// Build a sub-object from selected keys and deserialize into T.
-/// Reuses existing `#[derive(Deserialize)]` on header/body structs.
-/// Missing keys are simply skipped — the target type's own `#[serde(default)]`
-/// and `Option<_>` handling applies.
-fn extract_sub<T: serde::de::DeserializeOwned>(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    fields: &[&str],
-) -> Result<T, String> {
-    let mut sub = serde_json::Map::new();
-    for &f in fields {
-        if let Some(v) = obj.get(f) {
-            sub.insert(f.to_string(), v.clone());
-        }
-    }
-    serde_json::from_value(serde_json::Value::Object(sub)).map_err(|e| e.to_string())
-}
-
-/// Extract a required field and deserialize into T. Returns an error
-/// naming the missing field if absent.
-fn extract_field<T: serde::de::DeserializeOwned>(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<T, String> {
-    let val = obj
-        .get(field)
-        .ok_or_else(|| format!("missing required field '{field}'"))?;
-    serde_json::from_value(val.clone()).map_err(|e| format!("invalid '{field}': {e}"))
-}
-
-/// Extract an optional field and deserialize into `Option<T>`.
-fn extract_optional<T: serde::de::DeserializeOwned>(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<Option<T>, String> {
-    match obj.get(field) {
-        Some(val) => serde_json::from_value(val.clone())
-            .map(Some)
-            .map_err(|e| format!("invalid '{field}': {e}")),
-        None => Ok(None),
-    }
-}
-
-/// Reject any keys not in the expected set. Emits an error naming the
-/// offending key — this is the `deny_unknown_fields` replacement that
-/// actually works when headers use `#[serde(flatten)]` internally.
-fn reject_unknown(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    expected: &[&str],
-) -> Result<(), String> {
-    for key in obj.keys() {
-        if !expected.contains(&key.as_str()) {
-            return Err(format!(
-                "unknown field '{key}', expected one of: {}",
-                expected.join(", ")
-            ));
-        }
-    }
-    Ok(())
 }
 
 impl PipelineNode {
@@ -551,16 +849,21 @@ pub struct OutputBody {
 }
 
 // ---------------------------------------------------------------------
-// Task C.0.1a: Two-pass deserialization tests
+// Custom-Deserialize gate tests (pre-C.1, supersedes C.0.1a)
 //
-// Validate that the TryFrom<serde_json::Value> path correctly:
-//   - rejects unknown top-level keys with field-named errors
-//   - parses every existing variant (regression gate)
-//   - rejects unknown `type:` tags with a clear message
-//   - preserves Spanned<PipelineNode> node-level location capture
-//   - preserves CxlSource behavior (span UNKNOWN in tagged context — same
-//     as before, no regression)
-//   - preserves inner flatten on SourceBody → SourceConfig
+// These tests were originally authored against the
+// `#[serde(try_from = "serde_json::Value")]` path in C.0.1a. They
+// continue to run against the new custom-Deserialize impl; the behaviours
+// they assert are architectural contracts that must survive any future
+// refactor:
+//
+//   - unknown top-level keys are rejected with the field name in the error
+//   - every existing variant parses (regression gate)
+//   - unknown `type:` tags produce a clear error naming the tag
+//   - outer Spanned<PipelineNode> node-level location capture is preserved
+//   - SourceBody inner `#[serde(flatten)]` on `SourceConfig` still works
+//   - NEW: Spanned<NodeInput> at header-input field level captures real
+//     locations (the whole point of the pre-C.1 refactor).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -711,9 +1014,19 @@ nodes:
         );
     }
 
-    /// Spike test exercising ALL edge cases from the deep-dive analysis.
-    /// Validates: Composition variant, Spanned location capture, CxlSource
-    /// span behavior, SourceBody inner flatten, error position quality.
+    /// Architectural gate test exercising ALL edge cases from the C.0.1a
+    /// deep-dive PLUS the new span-preservation contract.
+    ///
+    /// Validates:
+    /// - Composition variant parses with all optional fields.
+    /// - Outer `Spanned<PipelineNode>` captures non-zero location.
+    /// - NEW (pre-C.1): `NodeHeader.input: Spanned<NodeInput>` carries a
+    ///   real location, not `Location::UNKNOWN` — this is the property
+    ///   the C.0.1a two-pass approach erased.
+    /// - `SourceBody` inner `#[serde(flatten)]` on `SourceConfig` keeps
+    ///   working (the custom-Deserialize path drives serde-saphyr
+    ///   natively, not through a `serde_json::Value` roundtrip).
+    /// - Unknown top-level fields produce errors that name the field.
     #[test]
     fn test_two_pass_spike_all_edge_cases() {
         use crate::config::PipelineNode;
@@ -745,17 +1058,31 @@ nodes:
             PipelineNode::Composition { .. }
         ));
 
-        // 2. Spanned captures non-zero location (before TryFrom runs)
+        // 2. Outer Spanned<PipelineNode> captures non-zero location.
         assert_ne!(
             doc.nodes[0].referenced,
             Location::UNKNOWN,
-            "Spanned must capture location before TryFrom"
+            "outer Spanned<PipelineNode> must capture location"
         );
 
-        // 3. Transform with CxlSource — Span::UNKNOWN is expected
-        // (documented behavior — CxlSource spans are UNKNOWN when buried
-        // inside a context that went through a Value roundtrip, same as
-        // the tagged-enum path).
+        // 3. NEW (pre-C.1): field-level Spanned on Composition's header
+        // input carries a real location (Composition uses NodeHeader).
+        if let PipelineNode::Composition { header, .. } = &doc.nodes[0].value {
+            assert_ne!(
+                header.input.referenced,
+                Location::UNKNOWN,
+                "NodeHeader.input: Spanned<NodeInput> must carry a real location (pre-C.1)"
+            );
+            assert!(
+                header.input.referenced.line() >= 1,
+                "NodeHeader.input line must be >= 1, got {}",
+                header.input.referenced.line()
+            );
+        } else {
+            panic!("expected composition variant");
+        }
+
+        // 4. Transform parses and SourceBody inner flatten still works.
         let yaml_transform = r#"
 pipeline:
   name: spike_xform
@@ -776,13 +1103,19 @@ nodes:
 "#;
         let doc2: crate::config::PipelineConfig =
             crate::yaml::from_str(yaml_transform).expect("transform should parse");
-        if let PipelineNode::Transform { config, .. } = &doc2.nodes[1].value {
+        if let PipelineNode::Transform { header, config } = &doc2.nodes[1].value {
             assert_eq!(config.cxl.source, "emit id = id");
+            // Transform header input also carries a real span.
+            assert_ne!(
+                header.input.referenced,
+                Location::UNKNOWN,
+                "Transform header input must carry a real span (pre-C.1)"
+            );
         } else {
             panic!("expected transform");
         }
 
-        // 4. Source with SourceBody (inner flatten on SourceConfig)
+        // SourceBody inner flatten.
         if let PipelineNode::Source { config, .. } = &doc2.nodes[0].value {
             assert!(!config.schema.columns.is_empty());
         } else {
@@ -899,9 +1232,11 @@ nodes:
         assert_eq!(header.input.len(), 2);
         let keys: Vec<&str> = header.input.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["orders", "products"]);
-        assert!(matches!(header.input.get("orders"), Some(NodeInput::Single(s)) if s == "orders"));
         assert!(
-            matches!(header.input.get("products"), Some(NodeInput::Single(s)) if s == "products")
+            matches!(header.input.get("orders").map(|s| &s.value), Some(NodeInput::Single(s)) if s == "orders")
+        );
+        assert!(
+            matches!(header.input.get("products").map(|s| &s.value), Some(NodeInput::Single(s)) if s == "products")
         );
         assert_eq!(
             body.where_expr.source,
@@ -1051,11 +1386,21 @@ nodes:
     /// `name()` returns header name; `type_tag()` returns `"combine"`.
     #[test]
     fn test_combine_name_and_type_tag() {
+        use crate::yaml::Spanned;
         use indexmap::IndexMap;
+        use serde_saphyr::Location;
 
-        let mut input_map: IndexMap<String, NodeInput> = IndexMap::new();
-        input_map.insert("a".to_string(), NodeInput::Single("src_a".to_string()));
-        input_map.insert("b".to_string(), NodeInput::Single("src_b".to_string()));
+        let mk_spanned = |ni: NodeInput| Spanned::new(ni, Location::UNKNOWN, Location::UNKNOWN);
+
+        let mut input_map: IndexMap<String, Spanned<NodeInput>> = IndexMap::new();
+        input_map.insert(
+            "a".to_string(),
+            mk_spanned(NodeInput::Single("src_a".to_string())),
+        );
+        input_map.insert(
+            "b".to_string(),
+            mk_spanned(NodeInput::Single("src_b".to_string())),
+        );
 
         let header = CombineHeader {
             name: "my_combine".to_string(),

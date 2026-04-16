@@ -137,14 +137,14 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             PipelineNode::Merge { header, .. } => header
                 .inputs
                 .iter()
-                .filter_map(|ni| name_to_idx.get(node_input_name(ni)).copied())
+                .filter_map(|ni| name_to_idx.get(node_input_name(&ni.value)).copied())
                 .map(|i| cols[i] + 1)
                 .max()
                 .unwrap_or(1),
             PipelineNode::Combine { header, .. } => header
                 .input
                 .values()
-                .filter_map(|ni| name_to_idx.get(node_input_name(ni)).copied())
+                .filter_map(|ni| name_to_idx.get(node_input_name(&ni.value)).copied())
                 .map(|i| cols[i] + 1)
                 .max()
                 .unwrap_or(1),
@@ -153,7 +153,7 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Composition { header, .. } => name_to_idx
-                .get(node_input_name(&header.input))
+                .get(node_input_name(&header.input.value))
                 .copied()
                 .map(|i| cols[i] + 1)
                 .unwrap_or(1),
@@ -188,14 +188,14 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             PipelineNode::Source { .. } => {}
             PipelineNode::Merge { header, .. } => {
                 for ni in &header.inputs {
-                    if let Some(&from) = name_to_idx.get(node_input_name(ni)) {
+                    if let Some(&from) = name_to_idx.get(node_input_name(&ni.value)) {
                         connections.push((from, idx));
                     }
                 }
             }
             PipelineNode::Combine { header, .. } => {
                 for ni in header.input.values() {
-                    if let Some(&from) = name_to_idx.get(node_input_name(ni)) {
+                    if let Some(&from) = name_to_idx.get(node_input_name(&ni.value)) {
                         connections.push((from, idx));
                     }
                 }
@@ -205,7 +205,7 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Composition { header, .. } => {
-                if let Some(&from) = name_to_idx.get(node_input_name(&header.input)) {
+                if let Some(&from) = name_to_idx.get(node_input_name(&header.input.value)) {
                     connections.push((from, idx));
                 }
             }

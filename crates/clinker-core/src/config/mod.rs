@@ -1071,17 +1071,21 @@ impl PipelineConfig {
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
                 | PipelineNode::Composition { header, .. } => {
-                    if input_target(&header.input) == name {
+                    if input_target(&header.input.value) == name {
                         self_ref = true;
                     }
                 }
                 PipelineNode::Merge { header, .. } => {
-                    if header.inputs.iter().any(|i| input_target(i) == name) {
+                    if header.inputs.iter().any(|i| input_target(&i.value) == name) {
                         self_ref = true;
                     }
                 }
                 PipelineNode::Combine { header, .. } => {
-                    if header.input.values().any(|i| input_target(i) == name) {
+                    if header
+                        .input
+                        .values()
+                        .any(|i| input_target(&i.value) == name)
+                    {
                         self_ref = true;
                     }
                 }
@@ -1110,14 +1114,14 @@ impl PipelineConfig {
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
                 | PipelineNode::Composition { header, .. } => {
-                    let producer = input_target(&header.input);
+                    let producer = input_target(&header.input.value);
                     if producer != consumer && graph.index_of(producer).is_some() {
                         graph.add_edge(producer, consumer);
                     }
                 }
                 PipelineNode::Merge { header, .. } => {
                     for i in &header.inputs {
-                        let producer = input_target(i);
+                        let producer = input_target(&i.value);
                         if producer != consumer && graph.index_of(producer).is_some() {
                             graph.add_edge(producer, consumer);
                         }
@@ -1125,7 +1129,7 @@ impl PipelineConfig {
                 }
                 PipelineNode::Combine { header, .. } => {
                     for i in header.input.values() {
-                        let producer = input_target(i);
+                        let producer = input_target(&i.value);
                         if producer != consumer && graph.index_of(producer).is_some() {
                             graph.add_edge(producer, consumer);
                         }
@@ -1382,7 +1386,7 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. } => {
-                    let producer = input_target(&header.input);
+                    let producer = input_target(&header.input.value);
                     if let Some(&producer_idx) = name_to_idx.get(producer) {
                         graph.add_edge(
                             producer_idx,
@@ -1395,7 +1399,7 @@ impl PipelineConfig {
                 }
                 PipelineNode::Merge { header, .. } => {
                     for inp in &header.inputs {
-                        let producer = input_target(inp);
+                        let producer = input_target(&inp.value);
                         if let Some(&producer_idx) = name_to_idx.get(producer) {
                             graph.add_edge(
                                 producer_idx,
@@ -1419,7 +1423,7 @@ impl PipelineConfig {
                 // paths structurally in sync.
                 PipelineNode::Combine { header, .. } => {
                     for node_input in header.input.values() {
-                        let producer = input_target(node_input);
+                        let producer = input_target(&node_input.value);
                         if let Some(&producer_idx) = name_to_idx.get(producer) {
                             graph.add_edge(
                                 producer_idx,

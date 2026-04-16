@@ -348,7 +348,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                     let inputs = header
                         .inputs
                         .iter()
-                        .map(|n| match n {
+                        .map(|n| match &n.value {
                             crate::config::node_header::NodeInput::Single(s) => s.clone(),
                             crate::config::node_header::NodeInput::Port { node, port } => {
                                 format!("{node}.{port}")
@@ -389,7 +389,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         aggregate: None,
                         route: None,
                         analytic_window: body.analytic_window.clone(),
-                        input: resolve_header_input(&header.input),
+                        input: resolve_header_input(&header.input.value),
                         line,
                     });
                 }
@@ -408,7 +408,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         aggregate: Some(agg),
                         route: None,
                         analytic_window: None,
-                        input: resolve_header_input(&header.input),
+                        input: resolve_header_input(&header.input.value),
                         line,
                     });
                 }
@@ -435,7 +435,7 @@ fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                         aggregate: None,
                         route: Some(route),
                         analytic_window: None,
-                        input: resolve_header_input(&header.input),
+                        input: resolve_header_input(&header.input.value),
                         line,
                     });
                 }
@@ -1334,7 +1334,7 @@ impl ExecutionPlanDag {
                     let combine_key = format!("combine.{}", header.name);
                     let combine_idx = node_by_name[&combine_key];
                     for (qualifier, node_input) in &header.input {
-                        let upstream_name: String = match node_input {
+                        let upstream_name: String = match &node_input.value {
                             NodeInput::Single(s) => s.clone(),
                             // Mirrors the `resolve_header_input` helper in
                             // `build_specs` (execution.rs ~line 364): a
@@ -1345,10 +1345,30 @@ impl ExecutionPlanDag {
                             NodeInput::Port { node, port } => format!("{node}.{port}"),
                         };
                         let upstream_idx = resolve_any_node(&upstream_name, &node_by_name)
-                            .ok_or_else(|| PlanError::CombineInputUndeclared {
-                                combine: header.name.clone(),
-                                qualifier: qualifier.clone(),
-                                reference: upstream_name.clone(),
+                            .ok_or_else(|| {
+                                // Pre-C.1: field-level span on the offending
+                                // input reference. The serde-saphyr span is
+                                // converted to a `line_only` synthetic span
+                                // because we don't thread a `SourceDb`
+                                // through the planner here — `line_only`
+                                // is the in-house convention (see
+                                // `crate::span::Span::line_only`) for
+                                // "we know the line but not the file-byte
+                                // offset." The full byte range is available
+                                // via `node_input.referenced` for callers
+                                // that can promote it.
+                                let line = node_input.referenced.line() as u32;
+                                let span = if line > 0 {
+                                    crate::span::Span::line_only(line)
+                                } else {
+                                    crate::span::Span::SYNTHETIC
+                                };
+                                PlanError::CombineInputUndeclared {
+                                    combine: header.name.clone(),
+                                    qualifier: qualifier.clone(),
+                                    reference: upstream_name.clone(),
+                                    span,
+                                }
                             })?;
                         graph.add_edge(
                             upstream_idx,
@@ -3027,11 +3047,18 @@ pub enum PlanError {
     /// `InvalidInputReference` (which scopes to transform-like
     /// prefixes), combine inputs can reference any producer node type,
     /// so this variant carries the combine node name, the qualifier,
-    /// and the unresolved upstream reference verbatim (RESOLUTION W-2).
+    /// the unresolved upstream reference (RESOLUTION W-2), and the
+    /// field-level [`crate::span::Span`] of the offending YAML
+    /// reference — populated from `Spanned<NodeInput>` captured by the
+    /// pre-C.1 custom Deserialize impl on `PipelineNode`. The span is
+    /// a `line_only`-flavored synthetic when the byte offset is not
+    /// available (no `SourceDb` threaded through the planner); it is
+    /// a real file-backed `Span` otherwise.
     CombineInputUndeclared {
         combine: String,
         qualifier: String,
         reference: String,
+        span: crate::span::Span,
     },
 }
 
@@ -3111,12 +3138,25 @@ impl std::fmt::Display for PlanError {
                 combine,
                 qualifier,
                 reference,
+                span,
             } => {
-                write!(
-                    f,
-                    "E307: combine '{}' input '{}' references undeclared upstream '{}'",
-                    combine, qualifier, reference
-                )
+                // Include the YAML line number when we have it (pre-C.1
+                // field-level span). The `line_only` synthetic is the
+                // common case here because the planner does not thread
+                // a `SourceDb` through; a future wire-up can swap in a
+                // real `(file:line:col)` prefix without changing the
+                // error's structural fields.
+                if let Some(line) = span.synthetic_line_number() {
+                    write!(
+                        f,
+                        "E307: at line {line}: combine '{combine}' input '{qualifier}' references undeclared upstream '{reference}'"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "E307: combine '{combine}' input '{qualifier}' references undeclared upstream '{reference}'"
+                    )
+                }
             }
         }
     }

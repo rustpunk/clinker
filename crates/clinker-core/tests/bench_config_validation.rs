@@ -247,7 +247,7 @@ fn test_multi_output_route_targets_match_outputs() {
                         PipelineNode::Output { header, .. }
                         | PipelineNode::Transform { header, .. }
                         | PipelineNode::Aggregate { header, .. }
-                        | PipelineNode::Route { header, .. } => header.input == *expected,
+                        | PipelineNode::Route { header, .. } => header.input.value == *expected,
                         _ => false,
                     })
                 };

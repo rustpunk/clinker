@@ -312,6 +312,125 @@ nodes:
         );
     }
 
+    // ---- Spike 3a: Spanned<T> at IndexMap<String, _> value position -
+    //
+    // Closes the "Key risk" noted in
+    // `docs/internal/research/RESEARCH-span-preserving-deser.md` section
+    // "Recommendation": verifies that serde-saphyr's `Spanned<T>` captures
+    // real source locations when positioned as the value of an IndexMap.
+    // This is the shape `CombineHeader.input: IndexMap<String,
+    // Spanned<NodeInput>>` relies on for E307 field-level span accuracy.
+
+    #[derive(Deserialize)]
+    struct MapHolder {
+        input: indexmap::IndexMap<String, Spanned<String>>,
+    }
+
+    // ---- Spike 3b: Spanned<T> survives a custom-Visitor dispatch -----
+    //
+    // Verifies that when a custom `Visitor::visit_map` handler delegates
+    // to an inner struct's deserialization via `MapAccessDeserializer`,
+    // `Spanned<T>` fields inside that struct still capture real spans.
+    // This is the exact mechanism the pre-C.1 `PipelineNode` custom-
+    // Deserialize impl relies on — if this fails, no amount of visitor
+    // gymnastics saves the refactor.
+
+    #[derive(Deserialize)]
+    struct InnerWithSpan {
+        #[allow(dead_code)]
+        name: String,
+        input: indexmap::IndexMap<String, Spanned<String>>,
+    }
+
+    struct DispatchHolder(InnerWithSpan);
+
+    impl<'de> Deserialize<'de> for DispatchHolder {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = DispatchHolder;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a map")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let inner = InnerWithSpan::deserialize(
+                        serde::de::value::MapAccessDeserializer::new(map),
+                    )?;
+                    Ok(DispatchHolder(inner))
+                }
+            }
+            deserializer.deserialize_map(V)
+        }
+    }
+
+    #[test]
+    fn test_spanned_survives_mapaccess_deserializer_dispatch() {
+        let yaml = "# line 1 comment\nname: dispatch_test\ninput:\n  orders: raw_orders\n  products: product_source\n";
+        let parsed: DispatchHolder = from_str(yaml).expect("parse DispatchHolder");
+        let orders = parsed.0.input.get("orders").expect("orders key present");
+        let products = parsed
+            .0
+            .input
+            .get("products")
+            .expect("products key present");
+        assert_ne!(
+            orders.referenced,
+            Location::UNKNOWN,
+            "orders value must carry a real location even through MapAccessDeserializer dispatch"
+        );
+        assert_ne!(
+            products.referenced,
+            Location::UNKNOWN,
+            "products value must carry a real location even through MapAccessDeserializer dispatch"
+        );
+        assert!(
+            orders.referenced.line() >= 1,
+            "orders value line must be >= 1, got {}",
+            orders.referenced.line()
+        );
+        assert!(
+            products.referenced.line() > orders.referenced.line(),
+            "products line must be after orders; got products={} orders={}",
+            products.referenced.line(),
+            orders.referenced.line()
+        );
+    }
+
+    #[test]
+    fn test_spanned_at_indexmap_value_position_captures_real_spans() {
+        let yaml = "# line 1 comment\ninput:\n  orders: raw_orders\n  products: product_source\n";
+        let parsed: MapHolder = from_str(yaml).expect("parse MapHolder");
+        let orders = parsed.input.get("orders").expect("orders key present");
+        let products = parsed.input.get("products").expect("products key present");
+        assert_ne!(
+            orders.referenced,
+            Location::UNKNOWN,
+            "orders value must carry a real location (got UNKNOWN — the IndexMap<String, Spanned<T>> path needs a newtype fallback)"
+        );
+        assert_ne!(
+            products.referenced,
+            Location::UNKNOWN,
+            "products value must carry a real location (got UNKNOWN — the IndexMap<String, Spanned<T>> path needs a newtype fallback)"
+        );
+        assert!(
+            orders.referenced.line() >= 1,
+            "orders value line must be >= 1, got {}",
+            orders.referenced.line()
+        );
+        assert!(
+            products.referenced.line() > orders.referenced.line(),
+            "products value line must be after orders (insertion-order preservation + different lines); got products={} orders={}",
+            products.referenced.line(),
+            orders.referenced.line()
+        );
+    }
+
     // ---- Spike 3: alias / anchor span resolution ---------------------
 
     #[test]

@@ -203,7 +203,7 @@ fn bind_schema_inner(
             }
             PipelineNode::Transform { header, config } => {
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
-                if let Some(target) = upstream_target_name(&header.input)
+                if let Some(target) = upstream_target_name(&header.input.value)
                     && !schema_by_name.contains_key(target)
                     && bind_ctx.enclosing_scope_names.contains(target)
                 {
@@ -217,7 +217,7 @@ fn bind_schema_inner(
                     ));
                     continue;
                 }
-                let upstream = match upstream_schema(&header.input, schema_by_name) {
+                let upstream = match upstream_schema(&header.input.value, schema_by_name) {
                     Some(s) => s.clone(),
                     None => continue,
                 };
@@ -237,7 +237,7 @@ fn bind_schema_inner(
                 }
             }
             PipelineNode::Aggregate { header, config } => {
-                let upstream = match upstream_schema(&header.input, schema_by_name) {
+                let upstream = match upstream_schema(&header.input.value, schema_by_name) {
                     Some(s) => s.clone(),
                     None => continue,
                 };
@@ -278,7 +278,7 @@ fn bind_schema_inner(
                 }
             }
             PipelineNode::Route { header, config: _ } => {
-                if let Some(upstream) = upstream_schema(&header.input, schema_by_name) {
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
                     if let Ok(empty) = typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span) {
                         artifacts.typed.insert(name.clone(), Arc::new(empty));
@@ -288,13 +288,13 @@ fn bind_schema_inner(
             }
             PipelineNode::Merge { header, .. } => {
                 if let Some(first) = header.inputs.first()
-                    && let Some(upstream) = schema_by_name.get(input_target(first))
+                    && let Some(upstream) = schema_by_name.get(input_target(&first.value))
                 {
                     schema_by_name.insert(name, upstream.clone());
                 }
             }
             PipelineNode::Output { header, .. } => {
-                if let Some(upstream) = upstream_schema(&header.input, schema_by_name) {
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     schema_by_name.insert(name, upstream.clone());
                 }
             }

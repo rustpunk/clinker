@@ -86,7 +86,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                 let upstreams: Vec<String> = header
                     .inputs
                     .iter()
-                    .map(|ni| match ni {
+                    .map(|spanned_ni| match &spanned_ni.value {
                         NodeInput::Single(s) => s.clone(),
                         NodeInput::Port { node, port } => format!("{node}.{port}"),
                     })
@@ -125,7 +125,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     aggregate: None,
                     local_window: body.analytic_window.clone(),
                     route: None,
-                    input: project_input(&header.input),
+                    input: project_input(&header.input.value),
                 });
             }
             PipelineNode::Aggregate {
@@ -142,7 +142,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     }),
                     local_window: None,
                     route: None,
-                    input: project_input(&header.input),
+                    input: project_input(&header.input.value),
                 });
             }
             PipelineNode::Route {
@@ -167,7 +167,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         branches,
                         default: body.default.clone(),
                     }),
-                    input: project_input(&header.input),
+                    input: project_input(&header.input.value),
                 });
             }
             _ => {}
