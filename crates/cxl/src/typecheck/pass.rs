@@ -310,6 +310,15 @@ impl<'a> TypeChecker<'a> {
                                 Type::Any
                             }
                             ColumnLookup::Unknown => Type::Any, // Will be inferred from usage
+                            ColumnLookup::Ambiguous(_) => {
+                                // Bare `FieldRef` over a combine merged row that has
+                                // the same name under multiple qualifiers. The combine
+                                // bind_schema arm (C.1.1+) emits E304/E308 with a
+                                // precise "ambiguous — qualify with 'orders' or
+                                // 'products'" message; the typechecker degrades to
+                                // `Any` to avoid masking that diagnostic.
+                                Type::Any
+                            }
                         }
                     }
                     Some(ResolvedBinding::LetVar(_)) => Type::Any, // Inferred from RHS
@@ -321,9 +330,23 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::QualifiedFieldRef { node_id, .. } => {
-                self.set_type(*node_id, Type::Any);
-                Type::Any
+            Expr::QualifiedFieldRef { node_id, parts, .. } => {
+                // Phase Combine C.1.0.4 — resolve 2-part refs against the
+                // input row via `lookup_qualified`. 3+ part refs are not
+                // decomposable (e.g. multi-record `source.record_type.field`);
+                // they stay `Type::Any` and will surface as E304 / E308 in
+                // the combine bind_schema arm (C.1.1 / C.1.3).
+                let ty = if parts.len() == 2 {
+                    match self.schema.lookup_qualified(&parts[0], &parts[1]) {
+                        ColumnLookup::Declared(declared) => declared.clone(),
+                        ColumnLookup::PassThrough(_tail_id) => Type::Any,
+                        ColumnLookup::Ambiguous(_) | ColumnLookup::Unknown => Type::Any,
+                    }
+                } else {
+                    Type::Any
+                };
+                self.set_type(*node_id, ty.clone());
+                ty
             }
 
             Expr::PipelineAccess { node_id, field, .. } => {
@@ -1028,12 +1051,20 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Build the FieldTypeMap from collected constraints and schema.
+    ///
+    /// Note (Phase Combine C.1.0): keyed by bare field name (`String`)
+    /// for runtime DLQ validation and aggregate input-schema derivation.
+    /// For combine merged rows, qualified fields collapse to their bare
+    /// `.name`; same-named fields under different qualifiers produce an
+    /// IndexMap collision (last-write-wins). This is intentional —
+    /// combine execution consults `DecomposedPredicate` and the merged
+    /// Row directly, not `TypedProgram::field_types`.
     fn build_field_type_map(&self) -> IndexMap<String, Type> {
         let mut map = IndexMap::new();
 
         // Schema-declared types first (authoritative)
-        for (field, ty) in &self.schema.declared {
-            map.insert(field.clone(), ty.clone());
+        for (field, ty) in self.schema.fields() {
+            map.insert(field.name.to_string(), ty.clone());
         }
 
         // Inferred types from constraints
@@ -1769,5 +1800,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Phase Combine C.1.0 gate: qualified field ref resolution --------
+
+    /// C.1.0 gate (RESOLUTION T-5): a 2-part `QualifiedFieldRef` against
+    /// a row containing qualified fields resolves via `lookup_qualified`
+    /// to the declared type, not `Type::Any`. Smoke test that the new
+    /// `Expr::QualifiedFieldRef` handler in pass.rs actually calls into
+    /// the new `Row::lookup_qualified` method.
+    #[test]
+    fn test_qualified_field_ref_resolves() {
+        use super::super::row::QualifiedField;
+
+        // Build a merged-row style schema: orders.product_id: Int,
+        // products.product_id: String. Two fields share bare name
+        // "product_id" under different qualifiers.
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::qualified("orders", "product_id"), Type::Int);
+        cols.insert(
+            QualifiedField::qualified("products", "product_id"),
+            Type::String,
+        );
+        let schema = Row::closed(cols, Span::new(0, 0));
+
+        // `emit v = orders.product_id` — the typechecker must resolve
+        // the 2-part ref via `lookup_qualified("orders", "product_id")`
+        // and set the expr type to Int, not Any.
+        let parsed = Parser::parse("emit v = orders.product_id");
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        // `orders` is the left-most identifier in `orders.product_id` —
+        // the resolver treats it as a field binding. Register it in the
+        // field_refs slice so resolve succeeds.
+        let resolved = resolve_program(parsed.ast, &["orders"], parsed.node_count)
+            .expect("resolve should succeed for qualified ref");
+        let typed = type_check(resolved, &schema).expect("typecheck should succeed");
+
+        assert_eq!(
+            first_emit_expr_type(&typed),
+            Type::Int,
+            "orders.product_id must resolve to Int via lookup_qualified, not Any"
+        );
+
+        // And the products.product_id side must independently resolve to
+        // String — same mechanism, different qualifier.
+        let parsed = Parser::parse("emit v = products.product_id");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program(parsed.ast, &["products"], parsed.node_count).unwrap();
+        let typed = type_check(resolved, &schema).unwrap();
+        assert_eq!(
+            first_emit_expr_type(&typed),
+            Type::String,
+            "products.product_id must resolve to String via lookup_qualified"
+        );
     }
 }

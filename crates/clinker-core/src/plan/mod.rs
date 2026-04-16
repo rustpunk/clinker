@@ -12,7 +12,7 @@ pub mod row_type;
 
 pub use compiled::{ChannelIdentity, CompiledPlan};
 pub use composition_body::{BoundBody, CompositionBodyId};
-pub use row_type::{ColumnLookup, Row, RowTail, TailVarId};
+pub use row_type::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};
 
 pub use properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,

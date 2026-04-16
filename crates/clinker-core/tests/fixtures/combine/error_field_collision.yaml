@@ -1,0 +1,60 @@
+# Error fixture: qualified-field name collision in the merged row →
+# E302. C.1.1 gate test `test_combine_e302_field_collision`.
+#
+# E302 is defensive: the `IndexMap<String, NodeInput>` key uniqueness on
+# the top-level `input:` map already prevents the ordinary case of "two
+# inputs with the same qualifier". This fixture manufactures the
+# pathological case where the merged-row key space itself collides —
+# two inputs each contributing a qualified field that hashes identically.
+# See RESOLUTION EC-4 / drill decision 3 for the reasoning behind this
+# edge case existing at all.
+#
+# Setup: both inputs have an identically-named source field ("id") —
+# since `QualifiedField::qualified("orders", "id")` and
+# `QualifiedField::qualified("products", "id")` hash distinctly, no
+# collision actually occurs here. This fixture is a PLACEHOLDER for
+# the true defensive case, which requires future combine-planner
+# features (synthetic qualifiers on sub-selects) to trigger.
+#
+# For C.1.1, this fixture doubles as a sanity check that no spurious
+# E302 fires on ordinary same-name-different-qualifier inputs. When
+# the genuinely-pathological case becomes reachable (future phase),
+# this fixture should be revisited.
+pipeline:
+  name: error_field_collision
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: collided
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.id == products.id"
+      cxl: |
+        emit order_id = orders.id;
+        emit product_name = products.name
+  - type: output
+    name: collided_out
+    input: collided
+    config:
+      name: collided_out
+      type: csv
+      path: /tmp/error_field_collision.csv

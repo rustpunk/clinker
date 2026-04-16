@@ -55,9 +55,9 @@ mod dispatch {
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
@@ -248,8 +248,9 @@ nodes:
                     let parsed = Parser::parse(t.cxl_source());
                     let resolved =
                         resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
-                    let mut schema_map: IndexMap<String, Type> = IndexMap::new();
-                    schema_map.insert("dept".to_string(), Type::String);
+                    let mut schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> =
+                        IndexMap::new();
+                    schema_map.insert(cxl::typecheck::QualifiedField::bare("dept"), Type::String);
                     let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
                     let mode = if t.aggregate.is_some() {
                         AggregateMode::GroupBy {
@@ -599,9 +600,9 @@ nodes:
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
@@ -1727,9 +1728,9 @@ mod task_16_4_3_spill {
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {

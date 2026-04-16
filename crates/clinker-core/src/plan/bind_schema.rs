@@ -21,7 +21,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cxl::typecheck::{AggregateMode, Row, RowTail, Type, TypedProgram};
+use cxl::typecheck::{AggregateMode, QualifiedField, Row, RowTail, Type, TypedProgram};
 use indexmap::IndexMap;
 
 use crate::config::compile_context::CompileContext;
@@ -244,7 +244,7 @@ fn bind_schema_inner(
                 // Validate group_by fields exist in the upstream schema.
                 let mut missing = Vec::new();
                 for gb in &config.group_by {
-                    if !upstream.declared.contains_key(gb) {
+                    if !upstream.has_field(gb) {
                         missing.push(gb.clone());
                     }
                 }
@@ -766,24 +766,25 @@ fn build_input_port_rows(
         // Validate declared minimum columns against upstream.
         let declared_columns = port_columns(port_decl);
         for (col_name, col_type) in &declared_columns {
-            match upstream_row.declared.get(col_name) {
-                None => {
-                    // Column might be available via pass-through (Open tail).
-                    if matches!(upstream_row.tail, RowTail::Closed) {
-                        diags.push(Diagnostic::error(
-                            "E102",
-                            format!(
-                                "composition node {node_name:?}: input port {port_name:?} \
-                                 requires column {col_name:?} but upstream {upstream_name:?} \
-                                 does not provide it"
-                            ),
-                            LabeledSpan::primary(span, String::new()),
-                        ));
-                        has_errors = true;
-                    }
+            let col_str = col_name.name.as_ref();
+            match upstream_row.lookup(col_str) {
+                cxl::typecheck::ColumnLookup::Unknown => {
+                    // Closed upstream, no match — required column missing.
+                    diags.push(Diagnostic::error(
+                        "E102",
+                        format!(
+                            "composition node {node_name:?}: input port {port_name:?} \
+                             requires column {col_str:?} but upstream {upstream_name:?} \
+                             does not provide it"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    has_errors = true;
+                }
+                cxl::typecheck::ColumnLookup::PassThrough(_) => {
                     // Open upstream: column may pass through — allow it.
                 }
-                Some(upstream_type) => {
+                cxl::typecheck::ColumnLookup::Declared(upstream_type) => {
                     // Type compatibility check: Any matches anything.
                     if *upstream_type != Type::Any
                         && *col_type != Type::Any
@@ -793,7 +794,7 @@ fn build_input_port_rows(
                             "E102",
                             format!(
                                 "composition node {node_name:?}: input port {port_name:?} \
-                                 declares column {col_name:?} as {col_type:?} but upstream \
+                                 declares column {col_str:?} as {col_type:?} but upstream \
                                  {upstream_name:?} provides {upstream_type:?}"
                             ),
                             LabeledSpan::primary(span, String::new()),
@@ -801,30 +802,42 @@ fn build_input_port_rows(
                         has_errors = true;
                     }
                 }
+                cxl::typecheck::ColumnLookup::Ambiguous(_) => {
+                    // Composition ports don't traffic in qualified fields —
+                    // an ambiguous match can only arise from a misconstructed
+                    // upstream row. Report as E102.
+                    diags.push(Diagnostic::error(
+                        "E102",
+                        format!(
+                            "composition node {node_name:?}: input port {port_name:?} \
+                             column {col_str:?} is ambiguous in upstream {upstream_name:?}"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    has_errors = true;
+                }
             }
         }
 
         // Build Row::open(declared, fresh_tail) for the port.
         let tail_var = bound_schemas.fresh_tail();
         let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
-        let row = Row {
-            declared: declared_columns,
-            declared_span: cxl_span,
-            tail: RowTail::Open(tail_var),
-        };
+        let row = Row::open(declared_columns, cxl_span, tail_var);
         rows.insert(port_name.clone(), row);
     }
 
     if has_errors { None } else { Some(rows) }
 }
 
-/// Extract declared columns from a `PortDecl` as an `IndexMap<String, Type>`.
-fn port_columns(decl: &PortDecl) -> IndexMap<String, Type> {
+/// Extract declared columns from a `PortDecl` as bare
+/// `IndexMap<QualifiedField, Type>`. Composition ports never carry
+/// qualifiers — qualification is a Combine-only concept.
+fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
     match &decl.schema {
         Some(schema) => schema
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.ty.clone()))
+            .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
             .collect(),
         None => IndexMap::new(),
     }
@@ -907,17 +920,20 @@ fn check_w101_shadows(
 ) {
     // Collect all columns declared in input ports (the minimum-required set).
     // Columns NOT in this set but flowing through via Open tail are pass-throughs.
+    // Composition ports are never qualified, so `.name.as_ref()` is the
+    // full identifier.
     let mut input_declared: HashSet<String> = HashSet::new();
     for row in input_port_rows.values() {
-        for col_name in row.declared.keys() {
-            input_declared.insert(col_name.clone());
+        for qf in row.field_names() {
+            input_declared.insert(qf.name.to_string());
         }
     }
 
     // For each output row, check if any body-added column has the same name
     // as a column that would pass through from the input tail.
     for (port_name, output_row) in output_port_rows {
-        for col_name in output_row.declared.keys() {
+        for col_qf in output_row.field_names() {
+            let col_name = col_qf.name.as_ref();
             // If this column is NOT in the input declared set but COULD
             // pass through via an Open tail, and the body also declares it,
             // that's a shadow. However, in practice the shadow case is:
@@ -1017,10 +1033,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 // ─── Upstream schema helpers ────────────────────────────────────────
 
-fn columns_from_decl(decl: &SchemaDecl) -> IndexMap<String, Type> {
+fn columns_from_decl(decl: &SchemaDecl) -> IndexMap<QualifiedField, Type> {
     decl.columns
         .iter()
-        .map(|c| (c.name.clone(), c.ty.clone()))
+        .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect()
 }
 
@@ -1064,7 +1080,13 @@ fn typecheck_cxl(
             LabeledSpan::primary(span, String::new()),
         ));
     }
-    let field_refs: Vec<&str> = schema.declared.keys().map(|s| s.as_str()).collect();
+    // Collect unqualified field names for CXL resolve. In the non-combine
+    // case all fields are bare; in the combine case (C.1.1+) qualified
+    // fields collapse to their `.name` — the resolver only needs to know
+    // which identifiers are "field-like," and combine bodies address
+    // qualified fields via `Expr::QualifiedFieldRef` (handled in
+    // typecheck/pass.rs, not resolve).
+    let field_refs: Vec<&str> = schema.field_names().map(|qf| qf.name.as_ref()).collect();
     let resolved =
         cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
             .map_err(|diags| {
@@ -1104,8 +1126,14 @@ fn typecheck_cxl(
     })
 }
 
+/// Propagate an upstream row through a Transform node: start with all
+/// upstream fields, then append (or overwrite) one entry per `emit`
+/// statement. Output field names come from the `emit name = expr` LHS
+/// and are always bare (`QualifiedField::bare`). Preserves the upstream
+/// tail (Closed / Open) so pass-through semantics propagate across
+/// Transform boundaries.
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
-    let mut out = upstream.declared.clone();
+    let mut out = upstream.declared_map().clone();
     for stmt in &typed.program.statements {
         if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
             let emit_type = typed
@@ -1113,21 +1141,23 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
                 .get(expr.node_id().0 as usize)
                 .and_then(|t| t.clone())
                 .unwrap_or(Type::Any);
-            out.insert(name.to_string(), emit_type);
+            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
     }
-    Row {
-        declared: out,
-        declared_span: upstream.declared_span,
-        tail: upstream.tail.clone(),
-    }
+    Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
 }
 
+/// Propagate an upstream row through an Aggregate node: start with the
+/// `group_by` fields (typed against upstream), then append one entry
+/// per `emit` statement. All output fields are bare.
 fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram) -> Row {
-    let mut out: IndexMap<String, Type> = IndexMap::new();
+    let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for gb in group_by {
-        let t = upstream.declared.get(gb).cloned().unwrap_or(Type::Any);
-        out.insert(gb.clone(), t);
+        let t = match upstream.lookup(gb) {
+            cxl::typecheck::ColumnLookup::Declared(ty) => ty.clone(),
+            _ => Type::Any,
+        };
+        out.insert(QualifiedField::bare(gb.as_str()), t);
     }
     for stmt in &typed.program.statements {
         if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
@@ -1136,14 +1166,10 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
                 .get(expr.node_id().0 as usize)
                 .and_then(|t| t.clone())
                 .unwrap_or(Type::Any);
-            out.insert(name.to_string(), emit_type);
+            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
     }
-    Row {
-        declared: out,
-        declared_span: upstream.declared_span,
-        tail: upstream.tail.clone(),
-    }
+    Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
 }
 
 /// E201 diagnostic for a Source with no `schema:` field.

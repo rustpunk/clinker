@@ -1,0 +1,46 @@
+# Expression-based equality: `lower(a.name) == lower(b.name)` → one
+# equality conjunct. Tests that `EqualityConjunct.{left,right}_expr`
+# carry full expressions (not just field names), so hash partitioning
+# can run over computed keys. Matches DataFusion
+# `EquijoinPredicate = (Expr, Expr)`, DuckDB `JoinCondition`, and Spark
+# `leftKeys: Seq[Expression]`.
+#
+# C.1.2 gate test `test_combine_decompose_expression_equality`.
+pipeline:
+  name: expression_equi
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: name, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: expr_combine
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "lower(orders.name) == lower(products.name)"
+      cxl: |
+        emit order_id = orders.order_id;
+        emit product_id = products.product_id
+  - type: output
+    name: expr_combine_out
+    input: expr_combine
+    config:
+      name: expr_combine_out
+      type: csv
+      path: /tmp/expression_equi.csv

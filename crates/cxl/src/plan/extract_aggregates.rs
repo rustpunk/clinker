@@ -725,9 +725,9 @@ mod tests {
         let field_names: Vec<&str> = schema_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let cols: IndexMap<String, Type> = schema_fields
+        let cols: IndexMap<crate::typecheck::QualifiedField, Type> = schema_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (crate::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let schema = Row::closed(cols, Span::new(0, 0));
         let mode = AggregateMode::GroupBy {

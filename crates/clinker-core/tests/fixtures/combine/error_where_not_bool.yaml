@@ -1,0 +1,39 @@
+# Error fixture: where-clause evaluates to String instead of Bool → E303.
+# C.1.2 gate test `test_combine_e303_where_not_bool`.
+pipeline:
+  name: error_where_not_bool
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: bad
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+  - type: output
+    name: bad_out
+    input: bad
+    config:
+      name: bad_out
+      type: csv
+      path: /tmp/error_where_not_bool.csv

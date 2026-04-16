@@ -111,6 +111,167 @@ mod tests {
             .unwrap_or_else(|e| panic!("parse failed: {e}"))
     }
 
+    // --- C.1.0 helpers ---------------------------------------------------
+
+    /// Compile a combine fixture through `bind_schema` and return the
+    /// resulting `CompileArtifacts` plus every diagnostic emitted. The
+    /// direct `bind_schema` path (rather than the full
+    /// `PipelineConfig::compile`) lets tests inspect `artifacts`
+    /// regardless of whether the fixture was expected to succeed or
+    /// fail — full compile short-circuits on the first error severity.
+    ///
+    /// Error fixtures (`error_*.yaml`) populate `diags` with the
+    /// expected E3xx codes; success fixtures leave `diags` empty (modulo
+    /// warnings).
+    ///
+    /// Fixture name is passed without the `.yaml` extension —
+    /// `compile_combine_fixture("two_input_equi")`.
+    #[allow(dead_code)] // Used by C.1.1+ tests; referenced here as a gate.
+    fn compile_combine_fixture(
+        name: &str,
+    ) -> (
+        clinker_core::plan::bind_schema::CompileArtifacts,
+        Vec<clinker_core::error::Diagnostic>,
+    ) {
+        let yaml = load_fixture(&format!("{name}.yaml"));
+        let config = parse_fixture(&yaml);
+        let ctx = clinker_core::config::CompileContext::default();
+        let symbol_table = indexmap::IndexMap::new();
+        let mut diags = Vec::new();
+        let artifacts = clinker_core::plan::bind_schema::bind_schema(
+            &config.nodes,
+            &mut diags,
+            &ctx,
+            &symbol_table,
+            std::path::Path::new(""),
+        );
+        (artifacts, diags)
+    }
+
+    /// Assert that the node's output row (as published in
+    /// `BoundSchemas`) has exactly the expected bare field names in
+    /// declaration order.
+    ///
+    /// Combine nodes publish their output row in C.1.3 — this helper
+    /// will be wired into the C.1.3 gate tests (`test_combine_output_
+    /// row_from_emit`). Defined in C.1.0 alongside
+    /// `compile_combine_fixture` so the test surface is one-stop.
+    #[allow(dead_code)] // Exercised by C.1.3+ tests.
+    fn assert_output_row(
+        artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
+        node_name: &str,
+        expected_fields: &[&str],
+    ) {
+        let row = artifacts
+            .bound_schemas
+            .output_of(node_name)
+            .unwrap_or_else(|| panic!("no bound output row for node {node_name:?}"));
+        let actual: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
+        let expected: Vec<String> = expected_fields.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            actual, expected,
+            "output row mismatch for {node_name:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    /// Assert the decomposed predicate recorded in
+    /// `CompileArtifacts.combine_predicates[node_name]` has the
+    /// expected `(equality, range, has_residual)` shape. Combine-side
+    /// table populated in C.1.2 — helper defined here for early
+    /// availability.
+    #[allow(dead_code)] // Exercised by C.1.2+ tests.
+    fn assert_predicate_decomposition(
+        artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
+        node_name: &str,
+        expected_equalities: usize,
+        expected_ranges: usize,
+        expected_has_residual: bool,
+    ) {
+        let pred = artifacts
+            .combine_predicates
+            .get(node_name)
+            .unwrap_or_else(|| panic!("no decomposed predicate for combine {node_name:?}"));
+        assert_eq!(
+            pred.equalities.len(),
+            expected_equalities,
+            "equalities count mismatch for {node_name:?}"
+        );
+        assert_eq!(
+            pred.ranges.len(),
+            expected_ranges,
+            "ranges count mismatch for {node_name:?}"
+        );
+        assert_eq!(
+            pred.residual.is_some(),
+            expected_has_residual,
+            "residual presence mismatch for {node_name:?}"
+        );
+    }
+
+    // --- C.1.0 gate test -------------------------------------------------
+
+    /// C.1.0 gate: `compile_combine_fixture` is invokable against a
+    /// real fixture, returns `(artifacts, diagnostics)`, and the
+    /// `two_input_equi` fixture has no diagnostics emitted at the
+    /// bind_schema level *today* (bind_schema's Combine arm is the
+    /// no-op left in place at C.0; it lands real behaviour in C.1.1+).
+    ///
+    /// This gate verifies the helper surface compiles and is wired up.
+    /// Downstream C.1.x tests assert on artifacts populated by the new
+    /// Combine arm as each task lands.
+    #[test]
+    fn test_combine_schema_scaffold_compiles() {
+        let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
+        // At C.1.0, bind_schema's Combine arm is still a no-op — no
+        // diagnostics are emitted from Combine itself; upstream Source
+        // + downstream Output arms also stay clean for this fixture.
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly at C.1.0; got: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.0 sanity sweep (not a gate): every front-loaded C.1
+    /// fixture parses through `PipelineConfig` YAML deserialization.
+    /// Catches shape/syntax errors in the new fixtures immediately so
+    /// C.1.1–C.1.4 tests don't fail for parse reasons masking real
+    /// bind_schema bugs.
+    #[test]
+    fn test_c1_fixtures_parse() {
+        let c1_fixtures = [
+            // C.1.1 error fixtures
+            "error_reserved_namespace.yaml",
+            "error_dotted_qualifier.yaml",
+            "error_field_collision.yaml",
+            // C.1.2 fixtures (errors + decomposition cases)
+            "error_where_not_bool.yaml",
+            "error_unknown_field.yaml",
+            "error_no_cross_input.yaml",
+            "error_literal_true.yaml",
+            "error_or_predicate.yaml",
+            "error_3part_ref.yaml",
+            "expression_equi.yaml",
+            "mixed_qualifier_expr.yaml",
+            // C.1.3 fixtures
+            "error_body_unknown_field.yaml",
+            "error_no_emit.yaml",
+            "combine_then_transform.yaml",
+            // C.1.4 fixture
+            "combine_then_sorted_transform.yaml",
+        ];
+        for name in c1_fixtures {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/combine")
+                .join(name);
+            assert!(path.exists(), "missing C.1 fixture: {}", path.display());
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            clinker_core::yaml::from_str::<PipelineConfig>(&yaml)
+                .unwrap_or_else(|e| panic!("fixture {name} failed to parse: {e}"));
+        }
+    }
+
     /// Compile a parsed `PipelineConfig` into an `ExecutionPlanDag` via the
     /// legacy planner path. The combine fixtures used here declare no
     /// CXL-bearing transform/aggregate/route nodes, so `compiled_refs` is

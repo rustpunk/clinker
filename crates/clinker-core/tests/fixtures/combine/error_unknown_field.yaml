@@ -1,0 +1,39 @@
+# Error fixture: where-clause references a field that does not exist in
+# the merged row → E304. C.1.2 gate test `test_combine_e304_unknown_field`.
+pipeline:
+  name: error_unknown_field
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: bad
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.nonexistent == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+  - type: output
+    name: bad_out
+    input: bad
+    config:
+      name: bad_out
+      type: csv
+      path: /tmp/error_unknown_field.csv

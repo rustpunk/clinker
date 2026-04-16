@@ -2853,9 +2853,9 @@ mod spill_trigger_tests {
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {

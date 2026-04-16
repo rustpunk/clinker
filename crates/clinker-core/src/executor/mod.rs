@@ -3616,9 +3616,9 @@ impl PipelineExecutor {
         route_config: &crate::config::RouteConfig,
         emitted_fields: &[String],
     ) -> Result<CompiledRoute, PipelineError> {
-        let type_cols: IndexMap<String, Type> = emitted_fields
+        let type_cols: IndexMap<cxl::typecheck::QualifiedField, Type> = emitted_fields
             .iter()
-            .map(|f| (f.clone(), Type::Any))
+            .map(|f| (cxl::typecheck::QualifiedField::bare(f.as_str()), Type::Any))
             .collect();
         let type_schema = cxl::typecheck::Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
         let field_refs: Vec<&str> = emitted_fields.iter().map(|s| s.as_str()).collect();

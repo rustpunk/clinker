@@ -1,0 +1,54 @@
+# Sort-dependent downstream transform after combine. Because combine
+# destroys ordering provenance (OrderingProvenance::DestroyedByCombine),
+# the plan enforcer must insert an explicit Sort node between the
+# combine and any downstream node that requires sorted input.
+#
+# C.1.4 gate test `test_combine_sort_enforcer_inserts_sort`.
+pipeline:
+  name: combine_then_sorted_transform
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id;
+        emit product_name = products.name;
+        emit amount = orders.amount
+  - type: aggregate
+    name: sorted_transform
+    input: enriched
+    config:
+      group_by:
+        - product_name
+      cxl: |
+        emit total_amount = sum(amount)
+  - type: output
+    name: sorted_out
+    input: sorted_transform
+    config:
+      name: sorted_out
+      type: csv
+      path: /tmp/combine_then_sorted_transform.csv

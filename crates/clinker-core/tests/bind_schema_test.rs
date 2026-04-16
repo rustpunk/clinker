@@ -44,9 +44,9 @@ nodes:
     let row = plan
         .schema_for_node_name("source1")
         .expect("source1 must have a bound row");
-    assert_eq!(row.declared.len(), 2);
-    assert!(row.declared.contains_key("a"), "expected column 'a'");
-    assert!(row.declared.contains_key("b"), "expected column 'b'");
+    assert_eq!(row.field_count(), 2);
+    assert!(row.has_field("a"), "expected column 'a'");
+    assert!(row.has_field("b"), "expected column 'b'");
     assert_eq!(
         row.tail,
         cxl::typecheck::row::RowTail::Closed,
@@ -88,14 +88,8 @@ nodes:
     let row = plan
         .schema_for_node_name("tx")
         .expect("transform must have a bound row");
-    assert!(
-        row.declared.contains_key("x"),
-        "upstream column 'x' must propagate"
-    );
-    assert!(
-        row.declared.contains_key("y"),
-        "emitted column 'y' must appear"
-    );
+    assert!(row.has_field("x"), "upstream column 'x' must propagate");
+    assert!(row.has_field("y"), "emitted column 'y' must appear");
 }
 
 /// Gate test: after `compile(ctx)`, `compiled_plan.schema_for_node_name("s1")`

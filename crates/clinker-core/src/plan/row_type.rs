@@ -4,4 +4,4 @@
 //! typechecker is the primary consumer, preserving the `clinker-core → cxl`
 //! dependency direction). This module provides a convenience re-export.
 
-pub use cxl::typecheck::row::{ColumnLookup, Row, RowTail, TailVarId};
+pub use cxl::typecheck::row::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};

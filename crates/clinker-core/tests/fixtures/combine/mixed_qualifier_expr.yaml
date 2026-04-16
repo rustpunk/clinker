@@ -1,0 +1,48 @@
+# Mixed-qualifier operand: a sub-expression references multiple inputs
+# on one side of a comparison → residual (not decomposable into
+# cross-input equality/range). DataFusion `find_valid_equijoin_key_pair`
+# and Spark `canEvaluate` enforce the same single-input-per-side rule.
+#
+# `orders.amount + products.price > orders.budget` — left side mixes
+# two inputs. No equality/range extraction possible.
+#
+# C.1.2 gate test `test_combine_decompose_mixed_qualifier_residual`.
+pipeline:
+  name: mixed_qualifier_expr
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: int }
+        - { name: budget, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: price, type: int }
+  - type: combine
+    name: mixed_combine
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.amount + products.price > orders.budget"
+      cxl: |
+        emit order_id = orders.order_id;
+        emit total = orders.amount + products.price
+  - type: output
+    name: mixed_combine_out
+    input: mixed_combine
+    config:
+      name: mixed_combine_out
+      type: csv
+      path: /tmp/mixed_qualifier_expr.csv

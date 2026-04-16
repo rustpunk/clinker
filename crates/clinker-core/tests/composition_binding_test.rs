@@ -243,13 +243,10 @@ nodes:
         input_row.tail
     );
     assert!(
-        input_row.declared.contains_key("customer_id"),
+        input_row.has_field("customer_id"),
         "input row should declare customer_id"
     );
-    assert!(
-        input_row.declared.contains_key("name"),
-        "input row should declare name"
-    );
+    assert!(input_row.has_field("name"), "input row should declare name");
 }
 
 /// Gate 3: Given upstream row with extra columns beyond port schema,
