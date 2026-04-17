@@ -6,13 +6,24 @@
 //!   compile through `ExecutionPlanDag::compile` with the correct number
 //!   of incoming edges and that the combine node appears after its
 //!   inputs in topological order.
+//! - C.2.0 adds end-to-end execution helpers (`run_combine_fixture`,
+//!   `assert_records_match`, `canonicalize_csv`) and captures lookup
+//!   regression snapshots as the C.2.3 migration baseline. The
+//!   lookup-baseline tests run lookup pipelines through today's runtime
+//!   and write `.snap` files to `tests/snapshots/` that PERSIST after
+//!   C.2.3 deletes the lookup infrastructure — migrated combine tests in
+//!   C.2.3.4 read these snapshots verbatim to assert output equivalence.
 
 #[cfg(test)]
 mod tests {
-    use clinker_core::config::PipelineConfig;
+    use clinker_core::config::{CompileContext, PipelineConfig};
+    use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
     use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
+    use clinker_core::test_helpers::SharedBuffer;
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
 
     /// Verifies the test module compiles and is discovered by cargo test.
     #[test]
@@ -1014,6 +1025,600 @@ nodes:
     }
 
     // --- C.1.4 gate tests ------------------------------------------------
+
+    // ─── C.2.0 helpers + execution scaffold ──────────────────────────────
+    //
+    // `run_combine_fixture` is the canonical end-to-end executor entry for
+    // combine integration tests. It wraps the public
+    // `PipelineExecutor::run_plan_with_readers_writers_with_primary` entry,
+    // providing a single `(yaml, named_inputs, primary)` signature that
+    // mirrors how lookup tests are written in `src/integration_tests.rs`
+    // but uses only the public API surface (the lookup test helper is
+    // `pub(crate)` and not visible from this `tests/` crate).
+    //
+    // Returned tuple: (execution report, captured CSV output of the first
+    // declared output node). The CSV string is the raw bytes the writer
+    // emitted — caller is responsible for canonicalization (sort, header
+    // strip) before any equality assertion. `assert_records_match`
+    // performs that canonicalization.
+
+    /// Run a combine (or lookup) pipeline end-to-end through the public
+    /// executor with the given named in-memory CSV inputs. Returns the
+    /// `ExecutionReport` and the captured output CSV string.
+    ///
+    /// `inputs` is `&[(source_name, csv_bytes_as_str)]`. The first entry
+    /// is treated as the primary driving source (consistent with the
+    /// `--primary` semantics of `run_plan_with_readers_writers_with_primary`).
+    /// `primary_override` lets a test pin a specific source as primary
+    /// without reordering `inputs` — pass `None` to default to the first
+    /// input.
+    ///
+    /// Output capture: only the FIRST output node declared in the YAML
+    /// is captured. Pipelines with multiple outputs would need the helper
+    /// extended to a `HashMap<String, String>` return; no current fixture
+    /// uses multi-output combine, so this stays simple.
+    #[allow(dead_code)] // Wired by C.2.0+ tests; gate test enforces it compiles.
+    fn run_combine_fixture(
+        yaml: &str,
+        inputs: &[(&str, &str)],
+        primary_override: Option<&str>,
+    ) -> Result<(clinker_core::executor::ExecutionReport, String), Box<dyn std::error::Error>> {
+        let config: PipelineConfig = clinker_core::yaml::from_str(yaml)?;
+        let ctx = CompileContext::default();
+        let plan = config.compile(&ctx).map_err(|diags| {
+            let messages: Vec<String> = diags.into_iter().map(|d| d.message).collect();
+            format!("compile failed: {}", messages.join("; "))
+        })?;
+
+        let primary: String = match primary_override {
+            Some(name) => name.to_string(),
+            None => inputs
+                .first()
+                .map(|(n, _)| (*n).to_string())
+                .ok_or("run_combine_fixture: no inputs provided")?,
+        };
+
+        let mut readers: HashMap<String, Box<dyn Read + Send>> = HashMap::new();
+        for (name, data) in inputs {
+            readers.insert(
+                (*name).to_string(),
+                Box::new(std::io::Cursor::new(data.as_bytes().to_vec())) as Box<dyn Read + Send>,
+            );
+        }
+
+        let first_output = plan
+            .config()
+            .output_configs()
+            .next()
+            .ok_or("run_combine_fixture: pipeline declares no output nodes")?
+            .name
+            .clone();
+        let output_buf = SharedBuffer::new();
+        let mut writers: HashMap<String, Box<dyn Write + Send>> = HashMap::new();
+        writers.insert(
+            first_output,
+            Box::new(output_buf.clone()) as Box<dyn Write + Send>,
+        );
+
+        let pipeline_vars = plan
+            .config()
+            .pipeline
+            .vars
+            .as_ref()
+            .map(|v| clinker_core::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "combine-test-exec".to_string(),
+            batch_id: "combine-test-batch".to_string(),
+            pipeline_vars,
+            shutdown_token: None,
+        };
+
+        let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
+            &plan, &primary, readers, writers, &params,
+        )?;
+
+        Ok((report, output_buf.as_string()))
+    }
+
+    /// Canonicalize a CSV string for order-independent comparison: keep
+    /// the header line as-is, sort the body lines lexicographically,
+    /// drop trailing whitespace per line, drop empty trailing lines.
+    ///
+    /// This matches how the C.2.0 lookup-baseline snapshots store their
+    /// content — combine output is unordered (hash probe) so any
+    /// equality check must canonicalize first.
+    fn canonicalize_csv(csv: &str) -> String {
+        let mut lines: Vec<&str> = csv.lines().collect();
+        // Strip trailing empty lines.
+        while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        let header = lines[0].trim_end();
+        let mut body: Vec<&str> = lines.iter().skip(1).map(|l| l.trim_end()).collect();
+        body.sort_unstable();
+        let mut out = String::with_capacity(csv.len());
+        out.push_str(header);
+        out.push('\n');
+        for line in body {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Assert two CSV outputs match record-by-record, ignoring row order
+    /// but requiring identical header and identical row content. Whitespace
+    /// at end of line is stripped before comparison; empty trailing lines
+    /// are dropped.
+    ///
+    /// This is the C.2.3.4 regression assertion that migrated combine
+    /// fixtures produce output equivalent to the C.2.0 lookup baseline.
+    #[allow(dead_code)] // Wired by C.2.0+ tests.
+    fn assert_records_match(actual: &str, expected: &str) {
+        let actual_canon = canonicalize_csv(actual);
+        let expected_canon = canonicalize_csv(expected);
+        assert_eq!(
+            actual_canon, expected_canon,
+            "record sets differ\n--- actual (canonicalized) ---\n{actual_canon}\n--- expected (canonicalized) ---\n{expected_canon}"
+        );
+    }
+
+    // ─── C.2.0.1 gate test: scaffold compiles + runs ──────────────────────
+
+    /// C.2.0.1 gate: `run_combine_fixture` compiles, executes a real
+    /// pipeline through the public executor, and returns a non-empty
+    /// `ExecutionReport`. Uses the simplest available 2-input fixture
+    /// (lookup syntax — combine executor lands in C.2.2 — but the helper
+    /// itself is mode-agnostic and exercised here for compilation only).
+    ///
+    /// THIS TEST DOES NOT yet exercise combine execution. Combine
+    /// dispatch returns `PipelineError::Internal` until C.2.2 replaces
+    /// the stub at `executor/mod.rs:3566`. The test that runs combine
+    /// fixtures end-to-end is `test_combine_exec_equi_match_first` in
+    /// C.2.2's gate suite. The C.2.0 gate is "the helper compiles and is
+    /// callable" — equivalent to the existing
+    /// `test_combine_scaffold_compiles` for the C.0 module gate.
+    #[test]
+    fn test_combine_exec_scaffold_compiles() {
+        // The simplest in-tree pipeline that exercises the helper
+        // end-to-end without depending on combine execution: a 1-source,
+        // 1-transform, 1-output pipeline. This proves the helper's
+        // compile + execute + capture path works on the public API.
+        let yaml = r#"
+pipeline:
+  name: scaffold_smoke
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      schema:
+        - { name: id, type: string }
+  - type: transform
+    name: pass_through
+    input: src
+    config:
+      cxl: |
+        emit id = id
+  - type: output
+    name: out
+    input: pass_through
+    config:
+      name: out
+      type: csv
+      path: scaffold_smoke.csv
+"#;
+        let inputs = "id\nA\nB\nC\n";
+        let (report, output) = run_combine_fixture(yaml, &[("src", inputs)], None)
+            .expect("run_combine_fixture must compile and execute the scaffold pipeline");
+        assert_eq!(
+            report.counters.total_count, 3,
+            "expected 3 records processed, got {}",
+            report.counters.total_count
+        );
+        assert!(
+            output.contains("id\n") && output.contains("A\n"),
+            "expected output to contain header + records; got: {output:?}"
+        );
+
+        // Also exercise canonicalize_csv + assert_records_match so they
+        // are statically reachable from a #[test] (kills `dead_code` warn).
+        let unsorted = "id\nC\nA\nB\n";
+        let sorted = "id\nA\nB\nC\n";
+        assert_records_match(unsorted, sorted);
+    }
+
+    // ─── C.2.0.2 lookup-baseline snapshot capture ────────────────────────
+    //
+    // Each test below runs the lookup pipeline currently exercised by
+    // `crates/clinker-core/src/integration_tests.rs::test_lookup_*` and
+    // captures its canonicalized CSV output as an `insta` snapshot. The
+    // .snap files land in `crates/clinker-core/tests/snapshots/` and are
+    // committed to git; they survive C.2.3 deletion of lookup runtime.
+    //
+    // C.2.3.4 migration tests (combine fixtures) read these snapshot
+    // files via std::fs and assert the migrated combine output
+    // canonicalizes to byte-identical CSV.
+    //
+    // Snapshot file paths (deterministic per insta defaults):
+    //   tests/snapshots/combine_test__tests__lookup_baseline_<name>.snap
+    //
+    // These functions are deleted in C.2.3.2 alongside the lookup
+    // runtime; the .snap files persist as the regression baseline.
+
+    fn lookup_yaml_equality() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_eq_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "product_id == products.product_id"
+      cxl: |
+        emit order_id = order_id
+        emit product_name = products.product_name
+        emit quantity = quantity
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: lookup_eq_baseline.csv
+"#
+    }
+
+    fn lookup_yaml_range() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_range_baseline
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: ee_group, type: string }
+        - { name: pay, type: int }
+  - type: source
+    name: rate_bands
+    config:
+      name: rate_bands
+      type: csv
+      path: rate_bands.csv
+      schema:
+        - { name: ee_group, type: string }
+        - { name: min_pay, type: int }
+        - { name: max_pay, type: int }
+        - { name: rate_class, type: string }
+  - type: transform
+    name: classify
+    input: employees
+    config:
+      lookup:
+        source: rate_bands
+        where: |
+          ee_group == rate_bands.ee_group
+          and pay >= rate_bands.min_pay
+          and pay <= rate_bands.max_pay
+      cxl: |
+        emit employee_id = employee_id
+        emit rate_class = rate_bands.rate_class
+  - type: output
+    name: result
+    input: classify
+    config:
+      name: result
+      type: csv
+      path: lookup_range_baseline.csv
+"#
+    }
+
+    fn lookup_yaml_on_miss_skip() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_skip_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "product_id == products.product_id"
+        on_miss: skip
+      cxl: |
+        emit order_id = order_id
+        emit product_name = products.product_name
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: lookup_skip_baseline.csv
+"#
+    }
+
+    fn lookup_yaml_match_all() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_match_all_baseline
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+  - type: source
+    name: assignments
+    config:
+      name: assignments
+      type: csv
+      path: assignments.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: project, type: string }
+  - type: transform
+    name: enrich
+    input: employees
+    config:
+      lookup:
+        source: assignments
+        where: "employee_id == assignments.employee_id"
+        match: all
+      cxl: |
+        emit employee_id = employee_id
+        emit department = department
+        emit project = assignments.project
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: lookup_match_all_baseline.csv
+"#
+    }
+
+    fn lookup_yaml_match_all_skip() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_match_all_skip_baseline
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+  - type: source
+    name: assignments
+    config:
+      name: assignments
+      type: csv
+      path: assignments.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: project, type: string }
+  - type: transform
+    name: enrich
+    input: employees
+    config:
+      lookup:
+        source: assignments
+        where: "employee_id == assignments.employee_id"
+        match: all
+        on_miss: skip
+      cxl: |
+        emit employee_id = employee_id
+        emit department = department
+        emit project = assignments.project
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: lookup_match_all_skip_baseline.csv
+"#
+    }
+
+    /// C.2.0.2 — capture lookup equality enrichment baseline.
+    /// 1:1 match, NullFields on miss (default).
+    #[test]
+    fn test_lookup_baseline_equality() {
+        let orders =
+            "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\nORD-3,PROD-X,7\n";
+        let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
+        let (_report, output) = run_combine_fixture(
+            lookup_yaml_equality(),
+            &[("orders", orders), ("products", products)],
+            None,
+        )
+        .expect("lookup_eq baseline must execute under current lookup runtime");
+        insta::assert_snapshot!("lookup_baseline_equality", canonicalize_csv(&output));
+    }
+
+    /// C.2.0.2 — range predicate baseline (compound and).
+    #[test]
+    fn test_lookup_baseline_range() {
+        let employees =
+            "employee_id,ee_group,pay\nE001,exempt,75000\nE002,hourly,35000\nE003,exempt,120000\n";
+        let rate_bands = "ee_group,min_pay,max_pay,rate_class\nexempt,50000,80000,tier_1\nexempt,80001,150000,tier_2\nhourly,20000,50000,tier_3\n";
+        let (_report, output) = run_combine_fixture(
+            lookup_yaml_range(),
+            &[("employees", employees), ("rate_bands", rate_bands)],
+            None,
+        )
+        .expect("lookup_range baseline must execute under current lookup runtime");
+        insta::assert_snapshot!("lookup_baseline_range", canonicalize_csv(&output));
+    }
+
+    /// C.2.0.2 — on_miss: skip baseline. Unmatched rows are dropped.
+    #[test]
+    fn test_lookup_baseline_on_miss_skip() {
+        let orders = "order_id,product_id\nORD-1,PROD-A\nORD-2,PROD-X\nORD-3,PROD-B\n";
+        let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
+        let (_report, output) = run_combine_fixture(
+            lookup_yaml_on_miss_skip(),
+            &[("orders", orders), ("products", products)],
+            None,
+        )
+        .expect("lookup_skip baseline must execute under current lookup runtime");
+        insta::assert_snapshot!("lookup_baseline_on_miss_skip", canonicalize_csv(&output));
+    }
+
+    /// C.2.0.2 — match: all (fan-out) baseline. One employee with N
+    /// assignments produces N output records.
+    #[test]
+    fn test_lookup_baseline_match_all() {
+        let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\n";
+        let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE002,Borealis\nE003,Phoenix\nE003,Atlas\nE003,Vega\n";
+        let (_report, output) = run_combine_fixture(
+            lookup_yaml_match_all(),
+            &[("employees", employees), ("assignments", assignments)],
+            None,
+        )
+        .expect("lookup_match_all baseline must execute under current lookup runtime");
+        insta::assert_snapshot!("lookup_baseline_match_all", canonicalize_csv(&output));
+    }
+
+    /// C.2.0.2 — match: all + on_miss: skip baseline. Unmatched
+    /// employees dropped; matched ones fan out.
+    #[test]
+    fn test_lookup_baseline_match_all_skip() {
+        let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\nE004,Marketing\n";
+        let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE003,Vega\n";
+        let (_report, output) = run_combine_fixture(
+            lookup_yaml_match_all_skip(),
+            &[("employees", employees), ("assignments", assignments)],
+            None,
+        )
+        .expect("lookup_match_all_skip baseline must execute under current lookup runtime");
+        insta::assert_snapshot!("lookup_baseline_match_all_skip", canonicalize_csv(&output));
+    }
+
+    /// C.2.0.2 gate: verify that all 5 lookup baseline `.snap` files
+    /// exist on disk under `tests/snapshots/`. Depends on the 5
+    /// `test_lookup_baseline_*` tests having run first to write the
+    /// snapshots; in CI that ordering is implicit because all tests in
+    /// a binary run before the binary exits.
+    ///
+    /// RESOLUTION T-13: verify snapshot CONTENT exists (non-empty file
+    /// with header + at least one body row), not just file existence.
+    /// Empty .snap files would silently pass an existence-only check.
+    #[test]
+    fn test_lookup_snapshots_captured() {
+        let snapshots_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots");
+        let expected = [
+            "combine_test__tests__lookup_baseline_equality.snap",
+            "combine_test__tests__lookup_baseline_range.snap",
+            "combine_test__tests__lookup_baseline_on_miss_skip.snap",
+            "combine_test__tests__lookup_baseline_match_all.snap",
+            "combine_test__tests__lookup_baseline_match_all_skip.snap",
+        ];
+        for name in expected {
+            let path = snapshots_dir.join(name);
+            assert!(
+                path.exists(),
+                "missing lookup baseline snapshot: {} — did the corresponding `test_lookup_baseline_*` test run? Try `cargo test --test combine_test`",
+                path.display()
+            );
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            // A captured insta snapshot is at minimum:
+            //   ---
+            //   source: tests/combine_test.rs
+            //   expression: ...
+            //   ---
+            //   <body>
+            //
+            // We require non-empty body (a header line at least). The
+            // body section starts after the second `---` separator.
+            let body_start = content.find("---\n").and_then(|i| {
+                let after = &content[i + 4..];
+                after.find("---\n").map(|j| i + 4 + j + 4)
+            });
+            let body_start = body_start.unwrap_or_else(|| {
+                panic!(
+                    "snapshot {} has no body section (malformed insta file?):\n{content}",
+                    path.display()
+                )
+            });
+            let body = content[body_start..].trim();
+            assert!(
+                !body.is_empty(),
+                "snapshot {} has empty body — lookup pipeline produced no output, regression baseline is degenerate",
+                path.display()
+            );
+            assert!(
+                body.lines().count() >= 1,
+                "snapshot {} body has zero rows — header-only baseline is degenerate",
+                path.display()
+            );
+        }
+    }
+
+    // ─── End C.2.0 ────────────────────────────────────────────────────────
 
     /// Gate (C.1.4): a compiled Combine node carries
     /// `OrderingProvenance::DestroyedByCombine { confidence: Proven }` in

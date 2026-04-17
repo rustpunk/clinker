@@ -22,7 +22,6 @@ pub mod span;
 pub mod validation;
 pub mod yaml;
 
-#[cfg(test)]
 pub mod test_helpers;
 
 pub use config::{

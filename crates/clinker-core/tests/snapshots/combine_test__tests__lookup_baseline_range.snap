@@ -1,0 +1,8 @@
+---
+source: crates/clinker-core/tests/combine_test.rs
+expression: canonicalize_csv(&output)
+---
+employee_id,rate_class
+E001,tier_1
+E002,tier_3
+E003,tier_2

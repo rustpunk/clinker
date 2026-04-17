@@ -1,0 +1,59 @@
+# C.2.0.4 (RESOLUTION EC-1) — empty build-side edge case.
+#
+# Driver has rows; build (products) has zero rows. Exercises the
+# CombineHashTable empty-input path: hash table built with capacity 0,
+# probe iter exhausted on first call, all drivers route to on_miss.
+#
+# This fixture's primary purpose is to surface any zero-record-build
+# panics in C.2.1's `CombineHashTable::build` and C.2.2's executor
+# probe loop. The CSV data files declared below are referenced by
+# the fixture's `path:` fields but are NOT loaded by the
+# `run_combine_fixture` test helper — that helper injects in-memory
+# readers keyed by source name. Tests are responsible for supplying
+# (`products`, "product_id,name,category\n") with header-only content
+# to materialize the empty-build scenario at runtime.
+pipeline:
+  name: combine_empty_build
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit category = products.category
+        emit amount = orders.amount
+  - type: output
+    name: enriched_out
+    input: enriched
+    config:
+      name: enriched_out
+      type: csv
+      path: /tmp/enriched_combine_empty_build.csv
