@@ -5,7 +5,7 @@
 //! Uses small in-memory payloads (5-10 records) for correctness, not benchmarks.
 
 use super::*;
-use crate::test_helpers::SharedBuffer;
+use clinker_bench_support::io::SharedBuffer;
 use std::io::Cursor;
 
 /// Construct a minimal NDJSON input as in-memory bytes.

@@ -3,7 +3,7 @@ name = "clinker-bench-support"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared deterministic data generators for Clinker benchmarks"
+description = "Shared test and benchmark utilities for Clinker (data generators, I/O capture, pipeline-config discovery)"
 
 [features]
 bench-alloc = []

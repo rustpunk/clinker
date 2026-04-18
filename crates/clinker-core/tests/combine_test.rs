@@ -16,10 +16,11 @@
 
 #[cfg(test)]
 mod tests {
+    use clinker_bench_support::io::SharedBuffer;
     use clinker_core::config::{CompileContext, PipelineConfig};
-    use clinker_core::executor::{PipelineExecutor, PipelineRunParams};
+    use clinker_core::error::{Diagnostic, PipelineError};
+    use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
     use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
-    use clinker_core::test_helpers::SharedBuffer;
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
     use std::collections::HashMap;
@@ -1029,53 +1030,128 @@ nodes:
     // ─── C.2.0 helpers + execution scaffold ──────────────────────────────
     //
     // `run_combine_fixture` is the canonical end-to-end executor entry for
-    // combine integration tests. It wraps the public
-    // `PipelineExecutor::run_plan_with_readers_writers_with_primary` entry,
-    // providing a single `(yaml, named_inputs, primary)` signature that
-    // mirrors how lookup tests are written in `src/integration_tests.rs`
-    // but uses only the public API surface (the lookup test helper is
-    // `pub(crate)` and not visible from this `tests/` crate).
+    // combine (and lookup, during the C.2 migration) integration tests. It
+    // wraps the public
+    // `PipelineExecutor::run_plan_with_readers_writers_with_primary` entry.
     //
-    // Returned tuple: (execution report, captured CSV output of the first
-    // declared output node). The CSV string is the raw bytes the writer
-    // emitted — caller is responsible for canonicalization (sort, header
-    // strip) before any equality assertion. `assert_records_match`
-    // performs that canonicalization.
+    // Error handling: structured `CombineFixtureError` preserves parse,
+    // compile, and run distinctions. Tests that assert on specific
+    // diagnostic codes (E306 / E311 / E312 in C.2.4's gate suite) can
+    // destructure the `Compile(Vec<Diagnostic>)` variant and inspect
+    // per-diagnostic codes rather than fuzzy-matching message strings.
+    //
+    // Output capture: every declared output node gets its own
+    // `SharedBuffer`; the returned `CombineFixtureResult.outputs` is a
+    // `HashMap<String, String>` keyed by output name. `primary_output()`
+    // returns the first-declared output for single-output tests;
+    // multi-output tests (Route downstream of combine) index by name.
+
+    /// Structured error for `run_combine_fixture`. Preserves the original
+    /// parse / compile / run signal so tests can destructure to assert on
+    /// specific diagnostic codes.
+    #[derive(Debug)]
+    #[allow(dead_code)] // Variants accessed via Debug and pattern matching.
+    pub(crate) enum CombineFixtureError {
+        /// YAML parse failure before compilation.
+        Parse(String),
+        /// Compile-time diagnostics (E2xx/E3xx codes, etc.). Full
+        /// `Vec<Diagnostic>` preserved — tests can assert on code,
+        /// severity, span, and message independently.
+        Compile(Vec<Diagnostic>),
+        /// Runtime / executor-layer failure.
+        Run(PipelineError),
+        /// Caller-provided inputs violated a helper precondition (e.g.
+        /// empty inputs and no primary override, no outputs declared).
+        Precondition(String),
+    }
+
+    impl std::fmt::Display for CombineFixtureError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Parse(msg) => write!(f, "parse failed: {msg}"),
+                Self::Compile(diags) => {
+                    writeln!(f, "compile failed with {} diagnostic(s):", diags.len())?;
+                    for d in diags {
+                        writeln!(f, "  [{}] {}", d.code, d.message)?;
+                    }
+                    Ok(())
+                }
+                Self::Run(err) => write!(f, "runtime failure: {err}"),
+                Self::Precondition(msg) => write!(f, "precondition violation: {msg}"),
+            }
+        }
+    }
+
+    impl std::error::Error for CombineFixtureError {}
+
+    /// Result of running a fixture pipeline.
+    #[derive(Debug)]
+    #[allow(dead_code)] // Fields accessed via named getters; field access is lint-silent.
+    pub(crate) struct CombineFixtureResult {
+        pub report: ExecutionReport,
+        /// Captured output bytes per declared output node, keyed by
+        /// output `name`. Every output node registered in the pipeline
+        /// YAML gets an entry — including empty buffers for outputs that
+        /// received zero records.
+        pub outputs: HashMap<String, String>,
+        /// YAML-declaration-order name of the first output. Used by
+        /// `primary_output()` for single-output tests.
+        pub primary_output_name: Option<String>,
+    }
+
+    impl CombineFixtureResult {
+        /// Single-output convenience: captured bytes from the FIRST
+        /// declared output node (by YAML declaration order). Panics if
+        /// the pipeline declared no outputs.
+        #[allow(dead_code)]
+        pub fn primary_output(&self) -> &str {
+            let name = self.primary_output_name.as_deref().expect(
+                "CombineFixtureResult::primary_output called on a pipeline with no outputs",
+            );
+            self.outputs
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or_else(|| panic!("primary_output_name {name:?} missing from outputs map"))
+        }
+
+        /// Look up a named output by its YAML `name` field. Returns
+        /// `None` for unknown names.
+        #[allow(dead_code)]
+        pub fn output(&self, name: &str) -> Option<&str> {
+            self.outputs.get(name).map(String::as_str)
+        }
+    }
 
     /// Run a combine (or lookup) pipeline end-to-end through the public
-    /// executor with the given named in-memory CSV inputs. Returns the
-    /// `ExecutionReport` and the captured output CSV string.
+    /// executor with the given named in-memory CSV inputs. Returns a
+    /// `CombineFixtureResult` containing the full `ExecutionReport` and
+    /// every declared output's captured bytes.
     ///
-    /// `inputs` is `&[(source_name, csv_bytes_as_str)]`. The first entry
-    /// is treated as the primary driving source (consistent with the
-    /// `--primary` semantics of `run_plan_with_readers_writers_with_primary`).
-    /// `primary_override` lets a test pin a specific source as primary
-    /// without reordering `inputs` — pass `None` to default to the first
-    /// input.
-    ///
-    /// Output capture: only the FIRST output node declared in the YAML
-    /// is captured. Pipelines with multiple outputs would need the helper
-    /// extended to a `HashMap<String, String>` return; no current fixture
-    /// uses multi-output combine, so this stays simple.
+    /// `inputs` is `&[(source_name, csv_bytes_as_str)]`. `primary_override`
+    /// pins a specific source as the driving input; pass `None` to
+    /// default to the first entry in `inputs`.
     #[allow(dead_code)] // Wired by C.2.0+ tests; gate test enforces it compiles.
     fn run_combine_fixture(
         yaml: &str,
         inputs: &[(&str, &str)],
         primary_override: Option<&str>,
-    ) -> Result<(clinker_core::executor::ExecutionReport, String), Box<dyn std::error::Error>> {
-        let config: PipelineConfig = clinker_core::yaml::from_str(yaml)?;
+    ) -> Result<CombineFixtureResult, CombineFixtureError> {
+        let config: PipelineConfig = clinker_core::yaml::from_str(yaml)
+            .map_err(|e| CombineFixtureError::Parse(e.to_string()))?;
         let ctx = CompileContext::default();
-        let plan = config.compile(&ctx).map_err(|diags| {
-            let messages: Vec<String> = diags.into_iter().map(|d| d.message).collect();
-            format!("compile failed: {}", messages.join("; "))
-        })?;
+        let plan = config.compile(&ctx).map_err(CombineFixtureError::Compile)?;
 
         let primary: String = match primary_override {
             Some(name) => name.to_string(),
             None => inputs
                 .first()
                 .map(|(n, _)| (*n).to_string())
-                .ok_or("run_combine_fixture: no inputs provided")?,
+                .ok_or_else(|| {
+                    CombineFixtureError::Precondition(
+                        "run_combine_fixture: no inputs provided and no primary_override set"
+                            .to_string(),
+                    )
+                })?,
         };
 
         let mut readers: HashMap<String, Box<dyn Read + Send>> = HashMap::new();
@@ -1086,19 +1162,26 @@ nodes:
             );
         }
 
-        let first_output = plan
+        // Register a SharedBuffer for EVERY declared output — multi-output
+        // pipelines (Route downstream of combine) would lose data otherwise.
+        let output_names: Vec<String> = plan
             .config()
             .output_configs()
-            .next()
-            .ok_or("run_combine_fixture: pipeline declares no output nodes")?
-            .name
-            .clone();
-        let output_buf = SharedBuffer::new();
-        let mut writers: HashMap<String, Box<dyn Write + Send>> = HashMap::new();
-        writers.insert(
-            first_output,
-            Box::new(output_buf.clone()) as Box<dyn Write + Send>,
-        );
+            .map(|cfg| cfg.name.clone())
+            .collect();
+        if output_names.is_empty() {
+            return Err(CombineFixtureError::Precondition(
+                "run_combine_fixture: pipeline declares no output nodes".to_string(),
+            ));
+        }
+        let output_buffers: HashMap<String, SharedBuffer> = output_names
+            .iter()
+            .map(|name| (name.clone(), SharedBuffer::new()))
+            .collect();
+        let writers: HashMap<String, Box<dyn Write + Send>> = output_buffers
+            .iter()
+            .map(|(name, buf)| (name.clone(), Box::new(buf.clone()) as Box<dyn Write + Send>))
+            .collect();
 
         let pipeline_vars = plan
             .config()
@@ -1116,47 +1199,73 @@ nodes:
 
         let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
             &plan, &primary, readers, writers, &params,
-        )?;
+        )
+        .map_err(CombineFixtureError::Run)?;
 
-        Ok((report, output_buf.as_string()))
+        let outputs: HashMap<String, String> = output_buffers
+            .into_iter()
+            .map(|(name, buf)| (name, buf.as_string()))
+            .collect();
+        let primary_output_name = output_names.into_iter().next();
+        Ok(CombineFixtureResult {
+            report,
+            outputs,
+            primary_output_name,
+        })
     }
 
-    /// Canonicalize a CSV string for order-independent comparison: keep
-    /// the header line as-is, sort the body lines lexicographically,
-    /// drop trailing whitespace per line, drop empty trailing lines.
+    /// Canonicalize a CSV string via the `csv` crate: parse into
+    /// `(headers, Vec<record>)`, sort records by lexicographic tuple
+    /// order, re-serialize. Robust against quoted fields, embedded
+    /// newlines, and escaped delimiters — unlike a raw line-sort that
+    /// would mis-split multiline fields.
     ///
-    /// This matches how the C.2.0 lookup-baseline snapshots store their
-    /// content — combine output is unordered (hash probe) so any
-    /// equality check must canonicalize first.
+    /// Empty-or-whitespace input → empty string.
     fn canonicalize_csv(csv: &str) -> String {
-        let mut lines: Vec<&str> = csv.lines().collect();
-        // Strip trailing empty lines.
-        while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
-            lines.pop();
-        }
-        if lines.is_empty() {
+        if csv.trim().is_empty() {
             return String::new();
         }
-        let header = lines[0].trim_end();
-        let mut body: Vec<&str> = lines.iter().skip(1).map(|l| l.trim_end()).collect();
-        body.sort_unstable();
-        let mut out = String::with_capacity(csv.len());
-        out.push_str(header);
-        out.push('\n');
-        for line in body {
-            out.push_str(line);
-            out.push('\n');
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv.as_bytes());
+        let headers: Vec<String> = match rdr.headers() {
+            Ok(h) => h.iter().map(String::from).collect(),
+            Err(e) => panic!("canonicalize_csv: failed to read headers: {e}\ninput:\n{csv}"),
+        };
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for rec in rdr.records() {
+            let rec = rec.unwrap_or_else(|e| {
+                panic!("canonicalize_csv: failed to read record: {e}\ninput:\n{csv}")
+            });
+            rows.push(rec.iter().map(String::from).collect());
         }
-        out
+        rows.sort();
+
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Vec::new());
+        wtr.write_record(&headers)
+            .expect("canonicalize_csv: writing headers failed");
+        for row in &rows {
+            wtr.write_record(row)
+                .expect("canonicalize_csv: writing row failed");
+        }
+        wtr.flush().expect("canonicalize_csv: flush failed");
+        String::from_utf8(
+            wtr.into_inner()
+                .expect("canonicalize_csv: into_inner failed"),
+        )
+        .expect("canonicalize_csv: output not utf-8")
     }
 
     /// Assert two CSV outputs match record-by-record, ignoring row order
-    /// but requiring identical header and identical row content. Whitespace
-    /// at end of line is stripped before comparison; empty trailing lines
-    /// are dropped.
+    /// but requiring identical header and identical row content. Uses the
+    /// `csv` crate for proper parsing (quoted fields, multi-line records,
+    /// escaped delimiters) rather than raw line-sorting.
     ///
-    /// This is the C.2.3.4 regression assertion that migrated combine
-    /// fixtures produce output equivalent to the C.2.0 lookup baseline.
+    /// This is the C.2.3.4 regression assertion: migrated combine
+    /// fixtures must produce output equivalent to the C.2.0 lookup
+    /// baseline.
     #[allow(dead_code)] // Wired by C.2.0+ tests.
     fn assert_records_match(actual: &str, expected: &str) {
         let actual_canon = canonicalize_csv(actual);
@@ -1215,23 +1324,36 @@ nodes:
       path: scaffold_smoke.csv
 "#;
         let inputs = "id\nA\nB\nC\n";
-        let (report, output) = run_combine_fixture(yaml, &[("src", inputs)], None)
+        let result = run_combine_fixture(yaml, &[("src", inputs)], None)
             .expect("run_combine_fixture must compile and execute the scaffold pipeline");
         assert_eq!(
-            report.counters.total_count, 3,
+            result.report.counters.total_count, 3,
             "expected 3 records processed, got {}",
-            report.counters.total_count
+            result.report.counters.total_count
         );
+        let output = result.primary_output();
         assert!(
             output.contains("id\n") && output.contains("A\n"),
             "expected output to contain header + records; got: {output:?}"
         );
 
-        // Also exercise canonicalize_csv + assert_records_match so they
-        // are statically reachable from a #[test] (kills `dead_code` warn).
+        // Exercise the secondary getters so they stay reachable from a
+        // #[test] and the `dead_code` lint stays silent.
+        assert!(result.output("out").is_some());
+        assert!(result.output("nonexistent").is_none());
+        assert_eq!(result.outputs.len(), 1);
+
+        // Exercise canonicalize_csv + assert_records_match.
         let unsorted = "id\nC\nA\nB\n";
         let sorted = "id\nA\nB\nC\n";
         assert_records_match(unsorted, sorted);
+
+        // Exercise CombineFixtureError::Display: a minimal Precondition
+        // case exercises the enum's fmt impl so clippy's dead_code
+        // heuristic doesn't flag variants as unused. No runtime assertion
+        // beyond non-empty Display output.
+        let err = CombineFixtureError::Precondition("demo".to_string());
+        assert!(!format!("{err}").is_empty());
     }
 
     // ─── C.2.0.2 lookup-baseline snapshot capture ────────────────────────
@@ -1488,13 +1610,16 @@ nodes:
         let orders =
             "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\nORD-3,PROD-X,7\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
-        let (_report, output) = run_combine_fixture(
+        let result = run_combine_fixture(
             lookup_yaml_equality(),
             &[("orders", orders), ("products", products)],
             None,
         )
         .expect("lookup_eq baseline must execute under current lookup runtime");
-        insta::assert_snapshot!("lookup_baseline_equality", canonicalize_csv(&output));
+        insta::assert_snapshot!(
+            "lookup_baseline_equality",
+            canonicalize_csv(result.primary_output())
+        );
     }
 
     /// C.2.0.2 — range predicate baseline (compound and).
@@ -1503,13 +1628,16 @@ nodes:
         let employees =
             "employee_id,ee_group,pay\nE001,exempt,75000\nE002,hourly,35000\nE003,exempt,120000\n";
         let rate_bands = "ee_group,min_pay,max_pay,rate_class\nexempt,50000,80000,tier_1\nexempt,80001,150000,tier_2\nhourly,20000,50000,tier_3\n";
-        let (_report, output) = run_combine_fixture(
+        let result = run_combine_fixture(
             lookup_yaml_range(),
             &[("employees", employees), ("rate_bands", rate_bands)],
             None,
         )
         .expect("lookup_range baseline must execute under current lookup runtime");
-        insta::assert_snapshot!("lookup_baseline_range", canonicalize_csv(&output));
+        insta::assert_snapshot!(
+            "lookup_baseline_range",
+            canonicalize_csv(result.primary_output())
+        );
     }
 
     /// C.2.0.2 — on_miss: skip baseline. Unmatched rows are dropped.
@@ -1517,13 +1645,16 @@ nodes:
     fn test_lookup_baseline_on_miss_skip() {
         let orders = "order_id,product_id\nORD-1,PROD-A\nORD-2,PROD-X\nORD-3,PROD-B\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
-        let (_report, output) = run_combine_fixture(
+        let result = run_combine_fixture(
             lookup_yaml_on_miss_skip(),
             &[("orders", orders), ("products", products)],
             None,
         )
         .expect("lookup_skip baseline must execute under current lookup runtime");
-        insta::assert_snapshot!("lookup_baseline_on_miss_skip", canonicalize_csv(&output));
+        insta::assert_snapshot!(
+            "lookup_baseline_on_miss_skip",
+            canonicalize_csv(result.primary_output())
+        );
     }
 
     /// C.2.0.2 — match: all (fan-out) baseline. One employee with N
@@ -1532,13 +1663,16 @@ nodes:
     fn test_lookup_baseline_match_all() {
         let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\n";
         let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE002,Borealis\nE003,Phoenix\nE003,Atlas\nE003,Vega\n";
-        let (_report, output) = run_combine_fixture(
+        let result = run_combine_fixture(
             lookup_yaml_match_all(),
             &[("employees", employees), ("assignments", assignments)],
             None,
         )
         .expect("lookup_match_all baseline must execute under current lookup runtime");
-        insta::assert_snapshot!("lookup_baseline_match_all", canonicalize_csv(&output));
+        insta::assert_snapshot!(
+            "lookup_baseline_match_all",
+            canonicalize_csv(result.primary_output())
+        );
     }
 
     /// C.2.0.2 — match: all + on_miss: skip baseline. Unmatched
@@ -1547,24 +1681,279 @@ nodes:
     fn test_lookup_baseline_match_all_skip() {
         let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\nE004,Marketing\n";
         let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE003,Vega\n";
-        let (_report, output) = run_combine_fixture(
+        let result = run_combine_fixture(
             lookup_yaml_match_all_skip(),
             &[("employees", employees), ("assignments", assignments)],
             None,
         )
         .expect("lookup_match_all_skip baseline must execute under current lookup runtime");
-        insta::assert_snapshot!("lookup_baseline_match_all_skip", canonicalize_csv(&output));
+        insta::assert_snapshot!(
+            "lookup_baseline_match_all_skip",
+            canonicalize_csv(result.primary_output())
+        );
     }
 
-    /// C.2.0.2 gate: verify that all 5 lookup baseline `.snap` files
-    /// exist on disk under `tests/snapshots/`. Depends on the 5
-    /// `test_lookup_baseline_*` tests having run first to write the
-    /// snapshots; in CI that ordering is implicit because all tests in
-    /// a binary run before the binary exits.
+    // ─── Multi-output lookup baselines (order_fulfillment + lookup_enrichment)
+    //
+    // These fixtures have a `route` node downstream of the lookup
+    // transform, producing TWO output streams each. The baseline captures
+    // BOTH outputs so the C.2.3.5 / C.2.3.6 migration tests can assert
+    // equivalence across every output.
+
+    /// Inline variant of `examples/pipelines/order_fulfillment.yaml`.
+    /// The ORIGINAL YAML uses a `_route`-emit-transform pattern that does
+    /// NOT deterministically split records under the current executor
+    /// (both outputs end up stale or degenerate). This baseline uses a
+    /// PROPER `type: route` node so the captured outputs are
+    /// deterministically split — which is what C.2.3.5 must match after
+    /// migration. The lookup predicate, on_miss semantics, and emit
+    /// shape are preserved byte-identical to the source file; only the
+    /// output-splitting mechanism is normalized.
+    fn lookup_yaml_order_fulfillment_baseline() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_order_fulfillment_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: order_date, type: string }
+        - { name: quantity, type: string }
+        - { name: unit_price, type: string }
+        - { name: product_code, type: string }
+        - { name: priority_level, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      options:
+        has_header: true
+      schema:
+        - { name: product_code, type: string }
+        - { name: product_name, type: string }
+        - { name: category, type: string }
+        - { name: weight_kg, type: string }
+  - type: transform
+    name: product_lookup
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "product_code == products.product_code"
+      cxl: |
+        emit order_id = order_id
+        emit priority_level = priority_level
+        emit product_code = product_code
+        emit product_name = products.product_name
+        emit category = products.category
+        emit weight_kg = products.weight_kg
+  - type: route
+    name: priority_split
+    input: product_lookup
+    config:
+      mode: exclusive
+      conditions:
+        priority_report: 'priority_level == "urgent" or priority_level == "high"'
+      default: fulfilled_orders
+  - type: output
+    name: fulfilled_orders
+    input: priority_split
+    config:
+      name: fulfilled_orders
+      type: csv
+      path: fulfilled_orders.csv
+      include_unmapped: true
+  - type: output
+    name: priority_report
+    input: priority_split
+    config:
+      name: priority_report
+      type: csv
+      path: priority_report.csv
+      include_unmapped: true
+"#
+    }
+
+    /// Inline variant of `benches/pipelines/realistic/lookup_enrichment.yaml`.
+    /// Preserves the generic `f0/f1/f2/f3` field names and the route
+    /// splitting on whether the lookup matched. Path scheme changed
+    /// from `bench://` to plain relative paths (bench:// is a
+    /// bench-runner-only scheme; the test harness injects in-memory
+    /// readers by source name). The route condition is preserved
+    /// byte-identical from the source file.
+    fn lookup_yaml_enrichment_baseline() -> &'static str {
+        r#"
+pipeline:
+  name: lookup_enrichment_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+  - type: transform
+    name: enrich
+    input: orders
+    config:
+      lookup:
+        source: products
+        where: "f1 == products.f0"
+        on_miss: null_fields
+      cxl: |
+        emit order_id = f0
+        emit product_code = f1
+        emit quantity = f2
+        emit product_name = products.f1 ?? "UNKNOWN"
+        emit priority = f3
+  - type: route
+    name: priority_split
+    input: enrich
+    config:
+      mode: exclusive
+      conditions:
+        high_priority_out: 'not product_name.is_null() and product_name != "UNKNOWN"'
+      default: standard_out
+  - type: output
+    name: high_priority_out
+    input: priority_split
+    config:
+      name: high_priority_out
+      type: csv
+      path: high_priority_out.csv
+      include_unmapped: true
+  - type: output
+    name: standard_out
+    input: priority_split
+    config:
+      name: standard_out
+      type: csv
+      path: standard_out.csv
+      include_unmapped: true
+"#
+    }
+
+    /// C.2.0.2 — multi-output baseline: order_fulfillment pattern.
+    /// Captures BOTH `fulfilled_orders` and `priority_report` outputs
+    /// as separate snapshots.
+    #[test]
+    fn test_lookup_baseline_order_fulfillment() {
+        let orders = concat!(
+            "order_id,order_date,quantity,unit_price,product_code,priority_level\n",
+            "1,2024-01-15,5,29.99,PROD-A,urgent\n",
+            "2,2024-01-16,10,15.50,PROD-B,normal\n",
+            "3,2024-01-17,2,99.99,PROD-X,high\n",
+            "4,2024-01-18,1,49.99,PROD-A,low\n",
+        );
+        let products = concat!(
+            "product_code,product_name,category,weight_kg\n",
+            "PROD-A,Widget,tools,1.5\n",
+            "PROD-B,Gadget,electronics,0.3\n",
+        );
+        let result = run_combine_fixture(
+            lookup_yaml_order_fulfillment_baseline(),
+            &[("orders", orders), ("products", products)],
+            None,
+        )
+        .expect("order_fulfillment baseline must execute under current lookup runtime");
+        let fulfilled = result
+            .output("fulfilled_orders")
+            .expect("fulfilled_orders output must be present");
+        let priority = result
+            .output("priority_report")
+            .expect("priority_report output must be present");
+        insta::assert_snapshot!(
+            "lookup_baseline_order_fulfillment_fulfilled_orders",
+            canonicalize_csv(fulfilled)
+        );
+        insta::assert_snapshot!(
+            "lookup_baseline_order_fulfillment_priority_report",
+            canonicalize_csv(priority)
+        );
+    }
+
+    /// C.2.0.2 — multi-output baseline: lookup_enrichment bench pattern.
+    /// Captures BOTH `high_priority_out` and `standard_out` outputs.
+    #[test]
+    fn test_lookup_baseline_enrichment() {
+        let orders = concat!(
+            "f0,f1,f2,f3\n",
+            "1,PROD-A,10,priority\n",
+            "2,PROD-B,5,normal\n",
+            "3,PROD-X,1,urgent\n",
+            "4,PROD-A,3,low\n",
+        );
+        let products = concat!("f0,f1\n", "PROD-A,Widget\n", "PROD-B,Gadget\n");
+        let result = run_combine_fixture(
+            lookup_yaml_enrichment_baseline(),
+            &[("orders", orders), ("products", products)],
+            None,
+        )
+        .expect("lookup_enrichment baseline must execute under current lookup runtime");
+        // Sanity: every input row should land in exactly one output. The
+        // lookup enrichment fixture has 4 inputs and we expect 3 to route
+        // to high_priority and 1 to standard (PROD-X misses the lookup,
+        // becomes "UNKNOWN", and falls into the default branch).
+        assert_eq!(
+            result.report.counters.total_count, 4,
+            "expected 4 input records processed; counters: {:?}",
+            result.report.counters
+        );
+        let high = result
+            .output("high_priority_out")
+            .expect("high_priority_out output must be present");
+        let standard = result
+            .output("standard_out")
+            .expect("standard_out output must be present");
+        assert!(
+            !(high.trim().is_empty() && standard.trim().is_empty()),
+            "both enrichment outputs empty — route dispatch is not firing. report={:?}\nhigh={high:?}\nstandard={standard:?}",
+            result.report
+        );
+        insta::assert_snapshot!(
+            "lookup_baseline_enrichment_high_priority",
+            canonicalize_csv(high)
+        );
+        insta::assert_snapshot!(
+            "lookup_baseline_enrichment_standard",
+            canonicalize_csv(standard)
+        );
+    }
+
+    /// C.2.0.2 gate: verify that every lookup baseline `.snap` file
+    /// exists on disk under `tests/snapshots/` AND has non-degenerate
+    /// content. Depends on the corresponding `test_lookup_baseline_*`
+    /// tests having run first to write the snapshots.
     ///
-    /// RESOLUTION T-13: verify snapshot CONTENT exists (non-empty file
-    /// with header + at least one body row), not just file existence.
-    /// Empty .snap files would silently pass an existence-only check.
+    /// RESOLUTION T-13: verify snapshot CONTENT exists (non-empty body
+    /// with header + at least one data row), not just file existence.
     #[test]
     fn test_lookup_snapshots_captured() {
         let snapshots_dir =
@@ -1575,6 +1964,10 @@ nodes:
             "combine_test__tests__lookup_baseline_on_miss_skip.snap",
             "combine_test__tests__lookup_baseline_match_all.snap",
             "combine_test__tests__lookup_baseline_match_all_skip.snap",
+            "combine_test__tests__lookup_baseline_order_fulfillment_fulfilled_orders.snap",
+            "combine_test__tests__lookup_baseline_order_fulfillment_priority_report.snap",
+            "combine_test__tests__lookup_baseline_enrichment_high_priority.snap",
+            "combine_test__tests__lookup_baseline_enrichment_standard.snap",
         ];
         for name in expected {
             let path = snapshots_dir.join(name);

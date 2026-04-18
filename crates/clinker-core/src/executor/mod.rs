@@ -4861,7 +4861,7 @@ mod tests {
         csv_input: &str,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
         let config = crate::config::parse_config(yaml).unwrap();
-        let output_buf = crate::test_helpers::SharedBuffer::new();
+        let output_buf = clinker_bench_support::io::SharedBuffer::new();
 
         let primary = config.source_configs().next().unwrap().name.clone();
         let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(

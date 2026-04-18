@@ -5,7 +5,7 @@
 //! buffer overflow, threshold counting.
 
 use super::*;
-use crate::test_helpers::SharedBuffer;
+use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
 /// Run a single-output pipeline with the given YAML and CSV input.

@@ -1,0 +1,7 @@
+---
+source: crates/clinker-core/tests/combine_test.rs
+expression: canonicalize_csv(fulfilled)
+---
+order_id,priority_level,product_code,product_name,category,weight_kg,order_date,quantity,unit_price
+2,normal,PROD-B,Gadget,electronics,0.3,2024-01-16,10,15.50
+4,low,PROD-A,Widget,tools,1.5,2024-01-18,1,49.99

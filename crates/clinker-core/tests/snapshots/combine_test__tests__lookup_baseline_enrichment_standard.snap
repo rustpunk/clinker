@@ -1,0 +1,6 @@
+---
+source: crates/clinker-core/tests/combine_test.rs
+expression: canonicalize_csv(standard)
+---
+order_id,product_code,quantity,product_name,priority,f0,f1,f2,f3
+3,PROD-X,1,UNKNOWN,urgent,3,PROD-X,1,urgent

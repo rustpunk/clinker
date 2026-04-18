@@ -4,7 +4,7 @@
 //! evaluation, per-output channels, and DLQ stage/route extensions.
 
 use super::*;
-use crate::test_helpers::SharedBuffer;
+use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
 /// Build a multi-output test fixture with the given YAML config.

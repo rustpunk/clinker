@@ -1,6 +1,11 @@
-//! Shared deterministic data generators for Clinker benchmarks.
+//! Shared test and benchmark utilities for Clinker.
 //!
-//! All generators use explicit seeds for reproducibility across runs.
+//! This crate consolidates cross-crate utilities used by both the
+//! integration-test suite and the Criterion benchmark harness:
+//! deterministic data generators (seeded, reproducible across runs),
+//! workspace-root discovery, pipeline-config discovery, and I/O
+//! capture helpers. Depended on via `[dev-dependencies]` — not shipped
+//! in release builds.
 
 #[cfg(feature = "bench-alloc")]
 pub mod alloc;
@@ -8,6 +13,7 @@ pub mod alloc;
 pub mod cache;
 pub mod combine;
 pub mod generators;
+pub mod io;
 
 use clinker_record::{Record, Schema, Value};
 use std::fmt;

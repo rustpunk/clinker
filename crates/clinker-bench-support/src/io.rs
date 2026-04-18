@@ -1,12 +1,19 @@
-//! Test helpers for clinker-core.
+//! I/O utilities for capturing pipeline output in tests and benchmarks.
+//!
+//! Pipelines write output through a `Box<dyn Write + Send>` registered
+//! against the output node name. Tests and benches inject a
+//! [`SharedBuffer`] so the post-run byte stream is inspectable from the
+//! test thread without touching the filesystem.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-/// Thread-safe, cloneable in-memory buffer for capturing output in tests.
+/// Thread-safe, cloneable in-memory buffer for capturing output.
 ///
 /// Two clones of the same `SharedBuffer` share the underlying `Vec<u8>`,
 /// so a writer thread and the test assertion side see the same data.
+/// `Send + Sync` via `Arc<Mutex<Vec<u8>>>` — safe to pass into any
+/// pipeline executor entry that takes `Box<dyn Write + Send>`.
 #[derive(Clone, Default)]
 pub struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -16,12 +23,15 @@ impl SharedBuffer {
         Self::default()
     }
 
-    /// Return a snapshot of the buffer contents.
+    /// Return a snapshot of the buffer contents as bytes.
     pub fn contents(&self) -> Vec<u8> {
         self.0.lock().unwrap().clone()
     }
 
-    /// Return the buffer contents as a UTF-8 string. Panics if not valid UTF-8.
+    /// Return the buffer contents as a UTF-8 string.
+    ///
+    /// Panics if the captured bytes are not valid UTF-8 — callers that
+    /// expect binary output should use [`Self::contents`] instead.
     pub fn as_string(&self) -> String {
         String::from_utf8(self.contents()).unwrap()
     }

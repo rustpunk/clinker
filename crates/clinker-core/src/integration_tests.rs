@@ -5,7 +5,7 @@ mod tests {
     use crate::config;
     use crate::error::PipelineError;
     use crate::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
-    use crate::test_helpers::SharedBuffer;
+    use clinker_bench_support::io::SharedBuffer;
 
     /// Helper: run executor with in-memory CSV input/output.
     fn run_pipeline(

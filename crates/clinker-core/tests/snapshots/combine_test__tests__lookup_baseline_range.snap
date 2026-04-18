@@ -1,6 +1,6 @@
 ---
 source: crates/clinker-core/tests/combine_test.rs
-expression: canonicalize_csv(&output)
+expression: canonicalize_csv(result.primary_output())
 ---
 employee_id,rate_class
 E001,tier_1

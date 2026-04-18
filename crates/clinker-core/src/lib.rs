@@ -22,8 +22,6 @@ pub mod span;
 pub mod validation;
 pub mod yaml;
 
-pub mod test_helpers;
-
 pub use config::{
     CompileContext, CompositionFile, CompositionSignature, CompositionSymbolTable, NodeRef,
     OutputAlias, ParamDecl, ParamName, ParamType, PortDecl, PortName, ResourceDecl, ResourceKind,
