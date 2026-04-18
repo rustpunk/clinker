@@ -36,7 +36,9 @@ use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{CombineBody, PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::bound_schemas::BoundSchemas;
-use crate::plan::combine::{CombineInput, DecomposedPredicate, decompose_predicate};
+use crate::plan::combine::{
+    CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
+};
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
@@ -79,6 +81,14 @@ pub struct CompileArtifacts {
     /// order of the inputs (matches `CombineHeader.input` iteration
     /// order). Populated by C.1 schema propagation.
     pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
+    /// Phase Combine C.2.4 — driving-input qualifier per combine node,
+    /// chosen at `bind_combine` time by [`select_driving_input`]
+    /// (explicit `drive:` → cardinality → first-in-IndexMap default).
+    /// The `select_combine_strategies` post-pass reads this to stamp
+    /// the runtime `PlanNode::Combine.driving_input` field. Combines
+    /// that fail driver selection (E306) are absent from this map and
+    /// their post-pass entry is skipped.
+    pub combine_driving: HashMap<String, String>,
 }
 
 impl CompileArtifacts {
@@ -1284,6 +1294,21 @@ fn bind_combine(
 
     if e301_fired {
         return;
+    }
+
+    // Select the driving (probe) input — explicit `drive:` hint, then
+    // cardinality, then first-in-IndexMap. E306 fires for an unknown
+    // hint; we still proceed with the rest of bind_combine so the user
+    // sees any other diagnostics in one pass, but `combine_driving`
+    // stays empty for this combine and the post-pass skips it.
+    if let Ok(driver) = select_driving_input(
+        &combine_inputs_entries,
+        config.drive.as_deref(),
+        name,
+        span,
+        diags,
+    ) {
+        artifacts.combine_driving.insert(name.to_string(), driver);
     }
 
     artifacts

@@ -25,9 +25,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use serde::Serialize;
 
+use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::row_type::Row;
+use crate::span::Span;
 use cxl::ast::{BinOp, Expr, NodeId, Program, Statement};
 use cxl::typecheck::pass::TypedProgram;
 use cxl::typecheck::{TypeDiagnostic, type_check};
@@ -498,6 +501,104 @@ pub(crate) fn decompose_predicate(
     })
 }
 
+// ─── Plan-time strategy + driving-input selection (Phase Combine C.2.4) ─
+
+/// Pick the driving (probe) input for a combine node.
+///
+/// Resolution order — universal across surveyed engines (DataFusion's
+/// `JoinSelection`, Spark's `JoinSelectionHelper`, Calcite's
+/// `JoinPushTransitivePredicatesRule`):
+///   1. **Explicit `drive:` hint** — author override. Validated against
+///      `inputs`; an unknown hint emits **E306** and returns `Err(())`
+///      so downstream sub-passes can skip the broken combine cleanly.
+///   2. **Cardinality** — pick the input with the highest
+///      `estimated_cardinality` when every input has a `Some(_)` value.
+///      Build the smaller side; probe the larger one. Matches
+///      DataFusion's "build the small side" rule and Spark's
+///      `chooseBuildSide` policy.
+///   3. **Declaration order fallback** — first qualifier in the
+///      `IndexMap`. For `inputs.len() >= 3` this also emits **W306**
+///      (planner cannot determine optimal driver). C.2 gates N>2 at
+///      `select_combine_strategies` (E312), so W306 is unreachable in
+///      C.2; it's wired now for the C.4 N-ary path.
+pub(crate) fn select_driving_input(
+    inputs: &IndexMap<String, CombineInput>,
+    explicit_drive: Option<&str>,
+    combine_name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> Result<String, ()> {
+    if let Some(d) = explicit_drive {
+        if inputs.contains_key(d) {
+            return Ok(d.to_string());
+        }
+        diags.push(combine_e306_invalid_drive(combine_name, d, inputs, span));
+        return Err(());
+    }
+
+    if inputs.values().all(|ci| ci.estimated_cardinality.is_some()) {
+        // Iterate via `IndexMap::iter` so ties resolve to the earliest
+        // declared qualifier (deterministic; `max_by_key` keeps the
+        // first max under stable ordering).
+        let (qualifier, _) = inputs
+            .iter()
+            .max_by_key(|(_, ci)| ci.estimated_cardinality.unwrap())
+            .expect("inputs non-empty (E300 guard upstream)");
+        return Ok(qualifier.clone());
+    }
+
+    if inputs.len() >= 3 {
+        diags.push(combine_w306_ambiguous_driver(combine_name, span));
+    }
+
+    Ok(inputs
+        .keys()
+        .next()
+        .expect("inputs non-empty (E300 guard upstream)")
+        .clone())
+}
+
+/// E306 — explicit `drive:` hint references an input that is not
+/// declared on the combine node.
+fn combine_e306_invalid_drive(
+    combine_name: &str,
+    requested: &str,
+    inputs: &IndexMap<String, CombineInput>,
+    span: Span,
+) -> Diagnostic {
+    let valid: Vec<&str> = inputs.keys().map(String::as_str).collect();
+    Diagnostic::error(
+        "E306",
+        format!(
+            "combine {combine_name:?} drive hint {requested:?} is not a declared input; \
+             valid inputs: {valid:?}"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "set `drive:` to one of the qualifiers declared under `input:`, or omit it to use \
+         the planner default (highest-cardinality input, or the first declared)",
+    )
+}
+
+/// W306 — planner cannot pick a single optimal driving input. Emitted
+/// for combines with 3+ inputs that lack cardinality estimates. Wired
+/// now for C.4 N-ary; unreachable in C.2 (E312 fires first).
+fn combine_w306_ambiguous_driver(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::warning(
+        "W306",
+        format!(
+            "combine {combine_name:?} planner cannot determine an optimal driving input \
+             (3+ inputs without cardinality estimates); falling back to declaration order"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add an explicit `drive:` hint to silence this warning, or attach cardinality \
+         estimates upstream",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +621,97 @@ mod tests {
             .unwrap();
         let _ = serde_json::to_string(&CombineStrategy::SortMerge).unwrap();
         let _ = serde_json::to_string(&CombineStrategy::BlockNestedLoop).unwrap();
+    }
+
+    fn synthetic_input(qualifier: &str, cardinality: Option<u64>) -> (String, CombineInput) {
+        use indexmap::IndexMap;
+        let row = Row::closed(IndexMap::new(), cxl::lexer::Span::new(0, 0));
+        (
+            qualifier.to_string(),
+            CombineInput {
+                upstream_name: Arc::from(qualifier),
+                row,
+                estimated_cardinality: cardinality,
+            },
+        )
+    }
+
+    #[test]
+    fn test_select_driving_input_explicit_drive() {
+        let mut inputs = IndexMap::new();
+        let (k, v) = synthetic_input("orders", None);
+        inputs.insert(k, v);
+        let (k, v) = synthetic_input("products", None);
+        inputs.insert(k, v);
+
+        let mut diags = Vec::new();
+        let chosen =
+            select_driving_input(&inputs, Some("products"), "c1", Span::SYNTHETIC, &mut diags)
+                .expect("explicit drive must succeed");
+        assert_eq!(chosen, "products");
+        assert!(diags.is_empty(), "no diagnostics for valid drive");
+    }
+
+    #[test]
+    fn test_select_driving_input_invalid_drive_e306() {
+        let mut inputs = IndexMap::new();
+        let (k, v) = synthetic_input("orders", None);
+        inputs.insert(k, v);
+        let (k, v) = synthetic_input("products", None);
+        inputs.insert(k, v);
+
+        let mut diags = Vec::new();
+        let result =
+            select_driving_input(&inputs, Some("ghost"), "c1", Span::SYNTHETIC, &mut diags);
+        assert!(result.is_err(), "invalid drive must return Err");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E306");
+    }
+
+    #[test]
+    fn test_select_driving_input_by_cardinality() {
+        let mut inputs = IndexMap::new();
+        let (k, v) = synthetic_input("orders", Some(100));
+        inputs.insert(k, v);
+        let (k, v) = synthetic_input("products", Some(10_000));
+        inputs.insert(k, v);
+
+        let mut diags = Vec::new();
+        let chosen = select_driving_input(&inputs, None, "c1", Span::SYNTHETIC, &mut diags)
+            .expect("cardinality path must succeed");
+        assert_eq!(chosen, "products", "highest cardinality drives");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_select_driving_input_default_first_in_indexmap() {
+        let mut inputs = IndexMap::new();
+        let (k, v) = synthetic_input("orders", None);
+        inputs.insert(k, v);
+        let (k, v) = synthetic_input("products", None);
+        inputs.insert(k, v);
+
+        let mut diags = Vec::new();
+        let chosen = select_driving_input(&inputs, None, "c1", Span::SYNTHETIC, &mut diags)
+            .expect("default path must succeed");
+        assert_eq!(chosen, "orders", "first in declaration order wins");
+        assert!(diags.is_empty(), "no W306 below 3 inputs");
+    }
+
+    #[test]
+    fn test_select_driving_input_w306_three_inputs_no_cardinality() {
+        let mut inputs = IndexMap::new();
+        for q in ["a", "b", "c"] {
+            let (k, v) = synthetic_input(q, None);
+            inputs.insert(k, v);
+        }
+
+        let mut diags = Vec::new();
+        let chosen = select_driving_input(&inputs, None, "c1", Span::SYNTHETIC, &mut diags)
+            .expect("3-input fallback must succeed");
+        assert_eq!(chosen, "a");
+        assert_eq!(diags.len(), 1, "W306 fired");
+        assert_eq!(diags[0].code, "W306");
     }
 
     #[test]

@@ -461,6 +461,60 @@ mod tests {
         assert_eq!(pred.ranges[0].right_input.as_ref(), "products");
     }
 
+    /// C.2.4.3 gate: explicit `drive: products` hint on `drive_hint.yaml`
+    /// stamps `combine_driving["product_driven"] == "products"` in
+    /// `CompileArtifacts`. Verifies that `bind_combine` calls
+    /// `select_driving_input` and threads the explicit hint through.
+    #[test]
+    fn test_combine_driving_input_explicit_drive() {
+        let (artifacts, diags) = compile_combine_fixture("drive_hint");
+        assert!(
+            diags.is_empty(),
+            "drive_hint must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let driver = artifacts
+            .combine_driving
+            .get("product_driven")
+            .expect("combine_driving entry for product_driven");
+        assert_eq!(driver, "products", "explicit drive wins over default");
+    }
+
+    /// C.2.4.3 gate: `drive: ghost` references an input not declared on
+    /// the combine → bind_combine emits E306 and skips populating
+    /// `combine_driving` for that node.
+    #[test]
+    fn test_combine_e306_invalid_drive() {
+        let (artifacts, diags) = compile_combine_fixture("error_invalid_drive");
+        assert!(
+            diags.iter().any(|d| d.code == "E306"),
+            "error_invalid_drive must emit E306; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        assert!(
+            !artifacts.combine_driving.contains_key("bad_drive"),
+            "no combine_driving entry written when drive selection fails"
+        );
+    }
+
+    /// C.2.4.3 gate: with no explicit drive and no cardinality estimates,
+    /// `select_driving_input` falls back to declaration order. For
+    /// `two_input_equi.yaml` the input map declares `orders` first.
+    #[test]
+    fn test_combine_driving_input_default_first_in_indexmap() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let driver = artifacts
+            .combine_driving
+            .get("enriched")
+            .expect("combine_driving entry for enriched");
+        assert_eq!(driver, "orders", "first declared input drives by default");
+    }
+
     /// C.2.4.1 gate: every `EqualityConjunct` produced by predicate
     /// decomposition carries an `Arc<TypedProgram>` on each side. Both
     /// sides share the where-clause TypedProgram (same `Arc`), so the

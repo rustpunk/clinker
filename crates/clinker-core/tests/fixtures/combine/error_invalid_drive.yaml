@@ -1,0 +1,38 @@
+# C.2.4.3 — `drive: ghost` references an input not declared on the
+# combine. Triggers E306 from `select_driving_input`.
+pipeline:
+  name: error_invalid_drive
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: bad_drive
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      drive: ghost
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name

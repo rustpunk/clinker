@@ -95,6 +95,31 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
 - **Pure Rust policy.** `deny.toml` bans cmake; no C build dependencies in clinker crates (Dioxus/GTK transitive deps are exempted via skip).
 - **Multi-tenant via channels.** One pipeline + multiple channels override variables/defaults. A `clinker.toml` at the workspace root anchors discovery for `clinker-channel` and `clinker-core`; channel files (`*.channel.yaml`) layer over the base pipeline.
 
+### Locked decisions
+
+Architectural rules are tracked in `docs/internal/plans/cxl-engine/LOCKED-DECISIONS.md` (gitignored). The load-bearing ones to know:
+
+- **LD-001 — YAML via `serde-saphyr`.** All YAML deserialization goes through `serde-saphyr` with a budget. `serde_yaml` (archived 2024) and `serde_yml` are forbidden; `serde_yaml_bw` points at `serde-saphyr` as its successor.
+- **LD-011 — Greenfield rip-and-replace.** Clinker has zero users. When two paths exist, pick the one that reaches the correct target architecture, even when it touches more files. Forbidden shapes: `Legacy*` / `Internal*` / `*Block` rename-instead-of-delete, `#[serde(default)]` on mandatory-post-rename fields, `#[ignore]` on tests verifying a cutover, parallel "new + old path" coexistence beyond a single commit, "pragmatic" / "incremental" / "deferred cleanup" / "lower-cascade" / "bottom-up migration" / "prep phase" / "file-by-file" justifications.
+
+Deleted symbols are tracked append-only in `docs/internal/plans/cxl-engine/RIP-LOG.md`. Never resurrect a symbol listed there without amending the log.
+
+### Refactoring policy
+
+Prefer a full rip over a shim. Prefer a bold correct refactor over a minimal patch. Prefer breaking changes over compatibility layers. Delete dead code; deleted stays deleted.
+
+When a change cascades to N files, touch all N. Library constraints (e.g. `serde-saphyr` tagged-enum + flatten span limitation) are documented as LD entries, not called shortcuts.
+
+Apply this policy to every refactor in this repo, not just the one currently in flight.
+
+### Dependency policy
+
+No new crate dependency lands without maintenance verification. The verification skill at `.claude/skills/crate-vetting/SKILL.md` auto-loads on any `Cargo.toml` edit and runs the checklist (release recency, GitHub `archived` flag, open RustSec advisories, blessed-alternatives check). `cargo deny check` at pre-commit enforces `unmaintained` and `yanked` advisories mechanically.
+
+Prefer crates with a release in the last 12 months, a non-archived repo, and zero open RustSec advisories. Workspace-blessed alternatives include `thiserror` / `anyhow` (not `failure` / `error-chain`), `std::sync::LazyLock` (not `lazy_static`), `tokio` (not legacy async runtimes).
+
+Apply the verification workflow to every new crate, not just the first one in a batch.
+
 ### Diagnostics
 
 All user-facing errors use `miette` for rich span-annotated diagnostics. CXL compilation errors, YAML parse errors, and runtime failures all carry source spans — `Spanned<PipelineNode>` covers the YAML side, `cxl::Span` covers the expression side, and they compose into a single report.
@@ -117,7 +142,12 @@ All user-facing errors use `miette` for rich span-annotated diagnostics. CXL com
 
 ### Kiln IDE
 
-Desktop app via Dioxus 0.7. Builds for both desktop (wry) and web targets from the same codebase with feature gates. Playwright tests target the web build only (cannot drive wry).
+`clinker-kiln` is the Dioxus 0.7.4 IDE for authoring Clinker YAML pipelines. One codebase, two targets:
+
+- **Desktop** — `wry` webview, runs on Linux/macOS/Windows. Default per `Dioxus.toml`. Uses `dioxus = { features = ["desktop"] }` under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`, plus `tokio` for async. Launch: `dx serve --package clinker-kiln --platform desktop`.
+- **Web** — `wasm32` target. Launch: `dx serve --package clinker-kiln`. Playwright drives this build only; it cannot drive the desktop wry webview, so all UI integration tests live on the web side.
+
+Dioxus version is pinned to `=0.7.4` to avoid silent breakage. The `dx` CLI is required — install via `cargo install dioxus-cli`.
 
 ## Rust edition & toolchain
 
