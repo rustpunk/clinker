@@ -572,7 +572,13 @@ fn bind_composition(
             };
             let n = &spanned.value;
             let n_name = n.name().to_string();
-            crate::config::lower_node_to_plan_node(n, &n_name, body_span, artifacts, diags)
+            // Body nodes are lowered with a default `LoweringCtx` — they are
+            // inspected in Kiln drill-in views but never executed through
+            // this DAG, so they don't need parallelism/index/aggregate
+            // enrichment. The top-level `compile_with_diagnostics` path
+            // supplies a populated ctx for runtime-executed nodes.
+            let ctx = crate::config::LoweringCtx::default();
+            crate::config::lower_node_to_plan_node(n, &n_name, body_span, artifacts, &ctx, diags)
         })
         .collect();
 

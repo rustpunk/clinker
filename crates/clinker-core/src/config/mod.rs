@@ -1339,22 +1339,161 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        // ── Stage 5: per-variant lowering ───────────────────────────
+        // ── Stage 5: per-variant lowering + enrichment ─────────────
+        //
+        // The lowering step produces a structurally complete
+        // `ExecutionPlanDag` that the executor can run without
+        // re-compilation. Per-variant lowering gets its enrichment
+        // inputs (analyzer report, window configs, dedup'd indices)
+        // from the helpers below, all of which were previously only
+        // exercised by the deleted `ExecutionPlanDag::compile_with_runtime_schema`
+        // path. Phase 16d converged the two compile sites onto this
+        // one.
+        let source_configs: Vec<crate::config::SourceConfig> =
+            self.source_configs().cloned().collect();
+        let output_configs: Vec<crate::config::OutputConfig> =
+            self.output_configs().cloned().collect();
+        let primary_source: String = source_configs
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+
+        // Build planner specs + analyzer report + window configs +
+        // dedup'd indices. These feed both per-variant lowering (via
+        // `LoweringCtx`) and the enrichment tail (source DAG,
+        // correlation-sort, enforcer-sort, property derivation,
+        // aggregation-strategy selection).
+        let specs: Vec<crate::plan::execution::PlanTransformSpec> =
+            crate::plan::execution::build_specs(self);
+        let mut specs_by_name: HashMap<String, usize> = HashMap::new();
+        for (i, s) in specs.iter().enumerate() {
+            specs_by_name.insert(s.name.clone(), i);
+        }
+        let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = specs
+            .iter()
+            .filter_map(|s| {
+                artifacts
+                    .typed
+                    .get(&s.name)
+                    .map(|tp| (s.name.as_str(), tp.as_ref()))
+            })
+            .collect();
+        let report = cxl::analyzer::analyze_all(&compiled_refs);
+        // Keep an analysis-by-name index so we can surface the analysis
+        // alongside its matching spec regardless of filter order.
+        let mut analysis_by_name: HashMap<String, &cxl::analyzer::TransformAnalysis> =
+            HashMap::new();
+        for a in &report.transforms {
+            analysis_by_name.insert(a.name.clone(), a);
+        }
+        let window_configs: Vec<Option<crate::plan::index::LocalWindowConfig>> = specs
+            .iter()
+            .map(crate::plan::index::parse_analytic_window_spec)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                vec![Diagnostic::error(
+                    "E003",
+                    format!("analytic_window parse error: {e}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                )]
+            })?;
+        // Validate: if a transform uses window.* but has no local_window, error.
+        for (i, analysis) in report.transforms.iter().enumerate() {
+            if !analysis.window_calls.is_empty() {
+                let spec_idx = specs_by_name.get(&analysis.name).copied().unwrap_or(i);
+                if window_configs
+                    .get(spec_idx)
+                    .map(|w| w.is_none())
+                    .unwrap_or(true)
+                {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "transform '{}' uses window.* functions but declares no local_window",
+                            analysis.name
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+            }
+        }
+        // Build raw index requests + deduplicate.
+        let mut raw_index_requests: Vec<crate::plan::index::RawIndexRequest> = Vec::new();
+        for (i, wc_opt) in window_configs.iter().enumerate() {
+            if let Some(wc) = wc_opt {
+                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
+                if !source_configs.iter().any(|inp| inp.name == source) {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "transform '{}' references unknown source '{}' in local_window",
+                            specs[i].name, source
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+                let mut arena_fields: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for gb in &wc.group_by {
+                    arena_fields.insert(gb.clone());
+                }
+                for sf in &wc.sort_by {
+                    arena_fields.insert(sf.field.clone());
+                }
+                for f in &report.transforms[i].accessed_fields {
+                    arena_fields.insert(f.clone());
+                }
+                let already_sorted = crate::plan::execution::check_already_sorted(
+                    &source_configs,
+                    &source,
+                    &wc.sort_by,
+                );
+                raw_index_requests.push(crate::plan::index::RawIndexRequest {
+                    source,
+                    group_by: wc.group_by.clone(),
+                    sort_by: wc.sort_by.clone(),
+                    arena_fields: arena_fields.into_iter().collect(),
+                    already_sorted,
+                    transform_index: i,
+                });
+            }
+        }
+        let indices = crate::plan::index::deduplicate_indices(raw_index_requests);
+        // Build source DAG + output projections.
+        let source_dag = crate::plan::execution::build_source_dag(
+            &source_configs,
+            &window_configs,
+            &primary_source,
+        )
+        .map_err(|e| {
+            vec![Diagnostic::error(
+                "E003",
+                format!("source DAG construction failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            )]
+        })?;
+        let output_projections: Vec<crate::plan::execution::OutputSpec> = output_configs
+            .iter()
+            .map(|o| crate::plan::execution::OutputSpec {
+                name: o.name.clone(),
+                mapping: o.mapping.clone().unwrap_or_default(),
+                exclude: o.exclude.clone().unwrap_or_default(),
+                include_unmapped: o.include_unmapped,
+            })
+            .collect();
+
         let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
         let mut name_to_idx: HashMap<String, NodeIndex> = HashMap::new();
 
-        // Phase 1: insert one PlanNode per source spanned-PipelineNode.
-        // Aggregate variants are deferred to Wave 3 (require CXL
-        // type-checking) — they emit a TODO diagnostic and are skipped.
+        // Phase 1: insert one PlanNode per spanned-PipelineNode.
+        // Transform + Aggregate variants draw their enrichment from
+        // the analyzer report / window configs / indices built above;
+        // other variants ignore the LoweringCtx fields.
         for spanned in &self.nodes {
             // Thread the real source line number off the saphyr
-            // `Spanned<PipelineNode>::referenced` Location. We do not
-            // yet have a `SourceDb`/`FileId` threaded through
-            // `compile()` (that lands when the CLI parses via a helper
-            // that interns into a SourceDb, Phase 16c), so we encode
-            // the line via `Span::line_only` — a synthetic span whose
-            // `start` field carries the 1-based line number.
-            //
+            // `Spanned<PipelineNode>::referenced` Location.
             // (c) If saphyr did not capture a line (the documented
             // tagged-enum + flatten edge case), fall back to
             // `Span::SYNTHETIC`.
@@ -1366,7 +1505,16 @@ impl PipelineConfig {
             };
             let node = &spanned.value;
             let name = node.name().to_string();
-            let plan_node = lower_node_to_plan_node(node, &name, span, &artifacts, &mut diags);
+            let spec_idx = specs_by_name.get(&name).copied();
+            let lowering_ctx = LoweringCtx {
+                analysis: analysis_by_name.get(name.as_str()).copied(),
+                window_config: spec_idx.and_then(|i| window_configs[i].as_ref()),
+                indices: &indices,
+                primary_source: primary_source.as_str(),
+                runtime_input_schema: ctx.runtime_input_schema.as_deref(),
+            };
+            let plan_node =
+                lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
             if let Some(pn) = plan_node {
                 let idx = graph.add_node(pn);
                 name_to_idx.insert(name, idx);
@@ -1456,32 +1604,116 @@ impl PipelineConfig {
             }
         };
 
-        // Sort enforcer adaptation: Wave 2 lowering does not yet derive
-        // `RequiresSortedInput` requirements (those come from the CXL
-        // analyzer which Wave 3 plumbs in), so the enforcer pass is a
-        // structural no-op here. The hook is wired so Wave 3 can flip
-        // it on without re-shaping the lowering pipeline.
-        // (Equivalent to legacy `insert_enforcer_sorts` over an empty
-        // requirement set.)
+        // Per-transform parallelism profile. Derived by walking the
+        // topo order; Transform nodes contribute their `parallelism_class`,
+        // everything else is skipped (matches the legacy Path B
+        // projection at `execution.rs:1404-1413`).
+        let parallelism = ParallelismProfile {
+            per_transform: topo_order
+                .iter()
+                .filter_map(|&idx| match &graph[idx] {
+                    PlanNode::Transform {
+                        parallelism_class, ..
+                    } => Some(*parallelism_class),
+                    _ => None,
+                })
+                .collect(),
+            worker_threads: self
+                .pipeline
+                .concurrency
+                .as_ref()
+                .and_then(|c| c.threads)
+                .unwrap_or(4),
+        };
 
-        let dag = ExecutionPlanDag {
+        let mut dag = ExecutionPlanDag {
             graph,
             topo_order,
-            source_dag: Vec::new(),
-            indices_to_build: Vec::new(),
-            output_projections: Vec::new(),
-            parallelism: ParallelismProfile {
-                per_transform: Vec::new(),
-                worker_threads: self
-                    .pipeline
-                    .concurrency
-                    .as_ref()
-                    .and_then(|c| c.threads)
-                    .unwrap_or(4),
-            },
+            source_dag,
+            indices_to_build: indices,
+            output_projections,
+            parallelism,
             correlation_sort_note: None,
             node_properties: HashMap::new(),
         };
+
+        // ── Enrichment pipeline ─────────────────────────────────────
+        //
+        // Pipeline-level correlation-key sort injection runs first: it
+        // materializes a planner-synthesized `PlanNode::Sort` on the
+        // primary source's outgoing edges when the pipeline declares a
+        // correlation key. This is distinct from per-operator algorithm
+        // sort requirements (enforcer sorts) and must run first because
+        // the correlation sort reshapes the graph topology that the
+        // enforcer pass + property derivation walk.
+        let inputs_map: HashMap<String, crate::config::SourceConfig> = source_configs
+            .iter()
+            .map(|i| (i.name.clone(), i.clone()))
+            .collect();
+        if let Err(e) = dag.inject_correlation_sort(&self.error_handling, &source_configs) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("correlation sort injection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        if let Err(e) = dag.insert_enforcer_sorts(&inputs_map) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("enforcer-sort insertion failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        // Enforcer insertion may have grown the graph; re-derive topo
+        // + tiers before property derivation walks it.
+        dag.topo_order = match petgraph::algo::toposort(&dag.graph, None) {
+            Ok(order) => order,
+            Err(cycle) => {
+                let cycle_path =
+                    crate::plan::execution::extract_cycle_path(&dag.graph, cycle.node_id());
+                diags.push(Diagnostic::error(
+                    "E003",
+                    format!("cycle detected post-enforcer-insertion: {cycle_path}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            }
+        };
+        crate::plan::execution::assign_tiers(&mut dag.graph, &dag.topo_order);
+        if let Err(e) = dag.compute_node_properties(&inputs_map) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("node property derivation failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        // Aggregation-strategy post-pass: resolves the user `strategy`
+        // hint on each `PlanNode::Aggregation` against upstream
+        // `OrderingProvenance` and rewrites the node's stored ordering
+        // provenance accordingly. DataFusion `PhysicalOptimizerRule`
+        // pattern: a frozen-plan walk that mutates only strategy +
+        // side-table ordering, never the graph topology.
+        if let Err(e) = dag.select_aggregation_strategies() {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("aggregation strategy selection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+
+        // Phase Combine C.2.4 — combine strategy + driving-input
+        // post-pass. Runs after the DAG is fully enriched (so every
+        // PlanNode::Combine is present and property derivation has
+        // stamped ordering provenance) and before the final fatal-error
+        // check so any E312 / E313 it raises blocks the compile. The
+        // pass mutates PlanNode::Combine in place, replacing
+        // construction-time placeholders for `strategy` and
+        // `driving_input`.
+        crate::plan::combine::select_combine_strategies(&mut dag, &artifacts, &mut diags);
 
         // If lowering accumulated any non-composition error-severity
         // diagnostics, return them. Composition binding errors
@@ -1506,26 +1738,54 @@ fn input_target(input: &node_header::NodeInput) -> &str {
     }
 }
 
+/// Cross-cutting inputs threaded into [`lower_node_to_plan_node`] for
+/// variants that need derived fields (Transform, Aggregate).
+///
+/// Top-level callers in `compile_with_diagnostics` populate every field
+/// from the already-computed analyzer report / window configs / index
+/// specs; body-node callers in `bind_composition` use
+/// [`LoweringCtx::default`] (all fields `None`/empty), which falls back
+/// to minimal placeholder lowering suitable for Kiln drill-in
+/// inspection. Body nodes are not executed directly — the top-level
+/// DAG produced by `compile_with_diagnostics` is the single source of
+/// truth for runtime planning.
+#[derive(Default)]
+pub(crate) struct LoweringCtx<'a> {
+    pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
+    pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
+    pub indices: &'a [crate::plan::index::IndexSpec],
+    pub primary_source: &'a str,
+    pub runtime_input_schema: Option<&'a [String]>,
+}
+
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
 ///
-/// Returns `None` for variants that are not yet lowered (Aggregate stub)
-/// or for compositions whose binding failed (no body assignment in
-/// `artifacts`). Called from `PipelineConfig::compile()` Stage 5 for
-/// top-level nodes and from `bind_composition` for body nodes.
+/// Returns `None` for compositions whose binding failed (no body
+/// assignment in `artifacts`) or Transforms whose typechecking failed
+/// (no typed program in `artifacts.typed`). Called from
+/// `PipelineConfig::compile_with_diagnostics` Stage 5 with a populated
+/// `LoweringCtx` for top-level nodes, and from `bind_composition` with
+/// `LoweringCtx::default()` for body nodes.
 pub(crate) fn lower_node_to_plan_node(
     node: &PipelineNode,
     name: &str,
     span: crate::span::Span,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    ctx: &LoweringCtx<'_>,
     diags: &mut Vec<crate::error::Diagnostic>,
 ) -> Option<crate::plan::execution::PlanNode> {
+    use crate::aggregation::AggregateStrategy;
     use crate::error::{Diagnostic, LabeledSpan};
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
-        NodeExecutionReqs, ParallelismClass, PlanNode, PlanOutputPayload, PlanSourcePayload,
-        PlanTransformPayload,
+        NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanOutputPayload,
+        PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
+        extract_write_set,
     };
-    use std::collections::BTreeSet;
+    use crate::plan::index::find_index_for;
+    use clinker_record::Schema;
+    use cxl::ast::Statement;
+    use std::sync::Arc;
 
     match node {
         PipelineNode::Source { config, .. } => Some(PlanNode::Source {
@@ -1543,6 +1803,56 @@ pub(crate) fn lower_node_to_plan_node(
                 Some(t) => t.clone(),
                 None => return None,
             };
+            // When the caller supplied a populated `LoweringCtx` (top-level
+            // compile path), derive every enrichment field from the
+            // analyzer report + window config + dedup'd indices. Body-node
+            // callers (`bind_composition`) pass the default ctx, which
+            // collapses all of the below to the pre-16d placeholder
+            // shape — this is fine for Kiln drill-in inspection; body
+            // nodes never execute through this DAG.
+            let (parallelism_class, execution_reqs, window_index, partition_lookup) =
+                if let Some(analysis) = ctx.analysis {
+                    let pc = derive_parallelism_class(
+                        analysis,
+                        &ctx.window_config.cloned(),
+                        ctx.primary_source,
+                    );
+                    let reqs = if ctx.window_config.is_some() {
+                        NodeExecutionReqs::RequiresArena
+                    } else {
+                        NodeExecutionReqs::Streaming
+                    };
+                    let wi = ctx.window_config.and_then(|wc| {
+                        let source = wc
+                            .source
+                            .clone()
+                            .unwrap_or_else(|| ctx.primary_source.to_string());
+                        find_index_for(ctx.indices, &source, &wc.group_by, &wc.sort_by)
+                    });
+                    let pl = ctx.window_config.map(|wc| {
+                        let source = wc
+                            .source
+                            .clone()
+                            .unwrap_or_else(|| ctx.primary_source.to_string());
+                        if source == ctx.primary_source && wc.on.is_none() {
+                            PartitionLookupKind::SameSource
+                        } else {
+                            PartitionLookupKind::CrossSource {
+                                on_expr: wc.on.clone(),
+                            }
+                        }
+                    });
+                    (pc, reqs, wi, pl)
+                } else {
+                    (
+                        ParallelismClass::Stateless,
+                        NodeExecutionReqs::Streaming,
+                        None,
+                        None,
+                    )
+                };
+            let write_set = extract_write_set(&typed);
+            let has_distinct = extract_has_distinct(&typed);
             Some(PlanNode::Transform {
                 name: name.to_string(),
                 span,
@@ -1553,13 +1863,13 @@ pub(crate) fn lower_node_to_plan_node(
                     dlq_node: None,
                     typed,
                 })),
-                parallelism_class: ParallelismClass::Stateless,
+                parallelism_class,
                 tier: 0,
-                execution_reqs: NodeExecutionReqs::Streaming,
-                window_index: None,
-                partition_lookup: None,
-                write_set: BTreeSet::new(),
-                has_distinct: false,
+                execution_reqs,
+                window_index,
+                partition_lookup,
+                write_set,
+                has_distinct,
             })
         }
         PipelineNode::Output { config, .. } => Some(PlanNode::Output {
@@ -1599,13 +1909,73 @@ pub(crate) fn lower_node_to_plan_node(
                 body: body_id,
             })
         }
-        PipelineNode::Aggregate { .. } => {
-            diags.push(Diagnostic::warning(
-                "W100",
-                format!("aggregate node {name:?} lowering deferred to Phase 16b Wave 3"),
-                LabeledSpan::primary(span, String::new()),
-            ));
-            None
+        PipelineNode::Aggregate {
+            config: agg_body, ..
+        } => {
+            // Skip if bind_schema produced no typed program (CXL error).
+            let typed = match artifacts.typed.get(name) {
+                Some(t) => t.clone(),
+                None => return None,
+            };
+            let agg_cfg = crate::config::AggregateConfig {
+                group_by: agg_body.group_by.clone(),
+                cxl: agg_body.cxl.source.as_str().to_string(),
+                strategy: agg_body.strategy,
+            };
+            // Phase 16b Task 16b.9: prefer the runtime Arrow schema
+            // when available. `typed.field_types` comes from the
+            // author-declared source schema, which may contain columns
+            // not present in the actual file; the aggregator projects
+            // records by positional index, so `group_by_indices` must
+            // resolve against the runtime layout, not the declared
+            // superset.
+            let input_schema: Vec<String> = match ctx.runtime_input_schema {
+                Some(rt) => rt.to_vec(),
+                None => typed
+                    .field_types
+                    .keys()
+                    .map(|qf| qf.name.to_string())
+                    .collect(),
+            };
+            let compiled_agg =
+                match cxl::plan::extract_aggregates(&typed, &agg_cfg.group_by, &input_schema) {
+                    Ok(c) => c,
+                    Err(errs) => {
+                        for e in errs {
+                            diags.push(Diagnostic::error(
+                                "E210",
+                                format!("aggregate extraction failed for {name:?}: {}", e.message),
+                                LabeledSpan::primary(span, String::new()),
+                            ));
+                        }
+                        return None;
+                    }
+                };
+            let output_columns: Vec<Box<str>> = typed
+                .program
+                .statements
+                .iter()
+                .filter_map(|s| match s {
+                    Statement::Emit {
+                        name,
+                        is_meta: false,
+                        ..
+                    } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let output_schema = Arc::new(Schema::new(output_columns));
+            Some(PlanNode::Aggregation {
+                name: name.to_string(),
+                span,
+                config: agg_cfg,
+                compiled: Arc::new(compiled_agg),
+                strategy: AggregateStrategy::Hash,
+                output_schema,
+                fallback_reason: None,
+                skipped_streaming_available: false,
+                qualified_sort_order: None,
+            })
         }
         // Phase Combine C.0.2: Combine lowers to PlanNode::Combine.
         // V-1-1 side-table architecture: only --explain-visible and

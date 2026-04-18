@@ -307,7 +307,7 @@ pub(crate) enum ResolvedInput {
 /// `transformations:` schema — which is the path the legacy test
 /// fixtures exercise. When the legacy types are deleted in a later
 /// checkpoint, the fallback branch dies with them.
-fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
+pub(crate) fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
     use crate::config::PipelineNode;
 
     // New-shape authorship wins when `nodes:` carries at least one
@@ -1943,7 +1943,7 @@ fn resolve_any_node(name: &str, node_by_name: &HashMap<String, NodeIndex>) -> Op
 ///
 /// Uses `depth_first_search` with `DfsEvent::BackEdge` + predecessor map
 /// to extract the full cycle path. Formats as `"A" --> "B" --> "A"`.
-fn extract_cycle_path(graph: &DiGraph<PlanNode, PlanEdge>, start: NodeIndex) -> String {
+pub(crate) fn extract_cycle_path(graph: &DiGraph<PlanNode, PlanEdge>, start: NodeIndex) -> String {
     let mut predecessors: HashMap<NodeIndex, NodeIndex> = HashMap::new();
     let mut cycle_edge: Option<(NodeIndex, NodeIndex)> = None;
 
@@ -1984,7 +1984,7 @@ fn extract_cycle_path(graph: &DiGraph<PlanNode, PlanEdge>, start: NodeIndex) -> 
 }
 
 /// Assign tiers via BFS: each node's tier = max(predecessor tiers) + 1.
-fn assign_tiers(graph: &mut DiGraph<PlanNode, PlanEdge>, topo_order: &[NodeIndex]) {
+pub(crate) fn assign_tiers(graph: &mut DiGraph<PlanNode, PlanEdge>, topo_order: &[NodeIndex]) {
     let mut tiers: HashMap<NodeIndex, u32> = HashMap::new();
 
     for &idx in topo_order {
@@ -2012,7 +2012,7 @@ fn assign_tiers(graph: &mut DiGraph<PlanNode, PlanEdge>, topo_order: &[NodeIndex
 }
 
 /// Derive ParallelismClass from analyzer output and window config.
-fn derive_parallelism_class(
+pub(crate) fn derive_parallelism_class(
     analysis: &cxl::analyzer::TransformAnalysis,
     wc: &Option<LocalWindowConfig>,
     primary_source: &str,
@@ -2087,7 +2087,7 @@ pub struct ParallelismProfile {
 ///
 /// Reference sources (those targeted by cross-source windows) must be in
 /// earlier tiers than the transforms that depend on them.
-fn build_source_dag(
+pub(crate) fn build_source_dag(
     sources: &[SourceConfig],
     window_configs: &[Option<LocalWindowConfig>],
     primary_source: &str,
@@ -2960,7 +2960,7 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
 /// write set lives directly on `PlanNode::Transform` so the property pass
 /// never has to reach into executor-private types
 /// (see `docs/research/RESEARCH-property-derivation-layering.md`).
-fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
+pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     for stmt in &typed.program.statements {
         if let Statement::Emit {
@@ -3000,7 +3000,7 @@ fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> 
 /// [`OrderingProvenance::DestroyedByDistinct`] without reaching into
 /// executor-private types (Phase 16.0.5.7, see
 /// `docs/research/RESEARCH-property-derivation-layering.md`).
-fn extract_has_distinct(typed: &TypedProgram) -> bool {
+pub(crate) fn extract_has_distinct(typed: &TypedProgram) -> bool {
     typed
         .program
         .statements
@@ -3009,7 +3009,11 @@ fn extract_has_distinct(typed: &TypedProgram) -> bool {
 }
 
 /// Check if a source's declared sort_order matches the window's sort_by.
-fn check_already_sorted(_sources: &[SourceConfig], _source: &str, _sort_by: &[SortField]) -> bool {
+pub(crate) fn check_already_sorted(
+    _sources: &[SourceConfig],
+    _source: &str,
+    _sort_by: &[SortField],
+) -> bool {
     // SourceConfig doesn't have sort_order yet (to be added in Task 5.4.1)
     // For now, always return false — runtime pre-sorted detection is the fallback
     false
