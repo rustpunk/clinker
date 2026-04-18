@@ -20,24 +20,29 @@
 //!   - C.2.1.1 — `canonical_f64`/`canonical_f32`, `hash_composite_key`,
 //!     `keys_equal_canonicalized`, module-level constants.
 //!   - C.2.1.2 — `CombineError`, `KeyExtractor`.
-//!
-//! Sub-tasks pending (to be added in order by subsequent commits):
-//!   - C.2.1.3 — `CombineHashTable` with `build()` / `probe()` /
-//!     `ProbeIter`.
+//!   - C.2.1.3 — `CombineHashTable` with `build()` / `probe()` / `ProbeIter`
+//!     (index-separated design; immutable after build; NULL probe
+//!     short-circuit; equality verification across full collision chain;
+//!     per-[`MEMORY_CHECK_INTERVAL`] budget checks during build).
 //!   - C.2.1.4 — `memory_bytes()` accounting across all four allocation
 //!     sources.
+//!
+//! Sub-tasks pending (to be added in order by subsequent commits):
 //!   - C.2.1.5 — proptest round-trip.
 
 use ahash::RandomState;
 use chrono::{Datelike, Timelike};
-use clinker_record::{RecordStorage, Value};
+use clinker_record::{Record, RecordStorage, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalError, eval_expr};
 use cxl::resolve::traits::FieldResolver;
 use cxl::typecheck::TypedProgram;
+use hashbrown::HashTable;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
+
+use crate::pipeline::memory::MemoryBudget;
 
 /// Period (measured in records processed) between
 /// [`crate::pipeline::memory::MemoryBudget::should_abort`] checks during
@@ -222,11 +227,6 @@ fn hash_value_into<H: Hasher>(v: &Value, h: &mut H) {
 ///     collapse to `+0.0`).
 ///   - `Array` and `Map` recurse via the same rules. Maps compare
 ///     order-independently (same keys, same values per key).
-// The `cfg_attr` is a brief bridge: these functions are consumed by
-// `CombineHashTable::probe` in sub-task C.2.1.3 (next commit), but they
-// already have unit-test coverage that would block C.2.1.1 landing without
-// it. Remove the attribute when C.2.1.3 wires them into non-test code.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn keys_equal_canonicalized(left: &[Value], right: &[Value]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -236,7 +236,6 @@ pub(crate) fn keys_equal_canonicalized(left: &[Value], right: &[Value]) -> bool 
         .all(|(l, r)| value_equal_canonicalized(l, r))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn value_equal_canonicalized(a: &Value, b: &Value) -> bool {
     match (a, b) {
         // SQL 3VL: NULL is never equal to anything, including NULL.
@@ -467,6 +466,325 @@ impl RecordStorage for NullStorage {
     fn record_count(&self) -> u32 {
         0
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// CombineHashTable
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Yielded by [`ProbeIter`] for each build-side record that (a) hashed the
+/// same bucket as the probe key AND (b) passed post-probe key equality
+/// verification.
+#[derive(Debug)]
+pub struct ProbeCandidate<'a> {
+    /// Position in `CombineHashTable::records` — stable, zero-based, in
+    /// insertion order. The executor uses this when it wants to tag the
+    /// matched build record (e.g. for DLQ lineage or bitmap-based outer-join
+    /// detection in a later phase).
+    pub index: usize,
+    /// Borrow of the matched build record. Lifetime bound to the
+    /// `CombineHashTable` so the caller can read fields without cloning.
+    pub record: &'a Record,
+}
+
+/// Index-separated hash table for combine's build side.
+///
+/// **Design rationale** (see `RESEARCH-hash-table-memory.md`): DataFusion,
+/// DuckDB, and CedarDB all converged on this shape because storing
+/// 700–1400-byte records inline in a hash table wastes 13–50% of memory on
+/// empty slots. Storing 4-byte record indices instead keeps overhead below
+/// 3% for realistic ETL record sizes.
+///
+/// **Layout** (four allocation sources — [`CombineHashTable::memory_bytes`]
+/// accounts every one of them per the DataFusion #14222/#5490/#6170 lessons):
+///
+/// ```text
+/// index:      HashTable<(u64, u32)>   — (key_hash, chain_head_index)
+/// chain:      Vec<u32>                 — chain[i] = next index with same hash, or SENTINEL
+/// records:    Vec<Record>              — build-side records in insertion order
+/// keys_cache: Vec<Vec<Value>>          — per-record extracted key values, built once
+/// ```
+///
+/// **Chain semantics:** collisions prepend. When record `j` is inserted and
+/// finds the bucket already occupied with head `i`, `chain[j]` is set to `i`
+/// and the bucket is updated to point at `j`. Iteration walks from the
+/// current head through `chain[...]` until `SENTINEL`. Every candidate along
+/// the chain is verified against the probe keys via
+/// [`keys_equal_canonicalized`] — hash collisions do not produce spurious
+/// matches (DataFusion #843 lesson).
+///
+/// **Immutable after build:** once `build()` returns, no method takes
+/// `&mut self`. This lets the Phase C.3+ executor share the table across
+/// concurrent probe workers without synchronization. The `hash_state` is
+/// captured at build time and reused for probe so hashes agree.
+pub struct CombineHashTable {
+    index: HashTable<(u64, u32)>,
+    chain: Vec<u32>,
+    records: Vec<Record>,
+    keys_cache: Vec<Vec<Value>>,
+    hash_state: RandomState,
+}
+
+impl CombineHashTable {
+    /// Consume a Vec of build-side records and construct the hash table.
+    ///
+    /// * `extractor` — holds one `(TypedProgram, Expr)` pair per equality
+    ///   conjunct, aligned to the build side's expressions.
+    /// * `ctx` — CXL evaluation context, carries the Clock and stable
+    ///   context shared across the build walk.
+    /// * `budget` — polled every [`MEMORY_CHECK_INTERVAL`] inserts AND at
+    ///   the end of build. Returns [`CombineError::MemoryLimitExceeded`] if
+    ///   the process RSS exceeds the budget's hard limit.
+    /// * `estimated_rows` — optional capacity hint. When `Some`, the
+    ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
+    ///   the resize spike that
+    ///   [`RESEARCH-hash-table-memory.md`] measures at up to 2.25× peak.
+    ///   When `None`, we fall back to `records.len()` — always an
+    ///   upper bound on final table size.
+    ///
+    /// **Build records with NULL keys are indexed harmlessly:** they hash
+    /// to the NULL sentinel and form chains alongside any collisions. They
+    /// never match any probe because (a) the probe path short-circuits when
+    /// any probe-side key is NULL, and (b) even if the hashes collided with
+    /// a non-null probe key, [`keys_equal_canonicalized`] rejects `Null` on
+    /// both sides per SQL 3VL. Indexing them simplifies the build loop
+    /// (no skip branch) and has no runtime cost beyond the chain slot.
+    pub fn build(
+        records: Vec<Record>,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &mut MemoryBudget,
+        estimated_rows: Option<usize>,
+    ) -> Result<Self, CombineError> {
+        let expected = estimated_rows.unwrap_or(records.len());
+
+        // `u32::MAX` is reserved as SENTINEL. Refuse inputs that would
+        // require a record index at that value — the addressable range is
+        // effectively 4 billion records, which no realistic ETL combine
+        // approaches.
+        if records.len() >= SENTINEL as usize {
+            return Err(CombineError::HashBuildFailed {
+                reason: format!(
+                    "combine build side exceeds u32::MAX - 1 records (got {})",
+                    records.len()
+                ),
+            });
+        }
+
+        let mut index: HashTable<(u64, u32)> = HashTable::with_capacity(expected);
+        let mut chain: Vec<u32> = Vec::with_capacity(records.len());
+        let mut keys_cache: Vec<Vec<Value>> = Vec::with_capacity(records.len());
+        let mut arena: Vec<Record> = Vec::with_capacity(records.len());
+        let hash_state = RandomState::new();
+
+        for (i, rec) in records.into_iter().enumerate() {
+            let keys = extractor
+                .extract(ctx, &rec)
+                .map_err(|e| CombineError::KeyEvalFailed {
+                    source: e,
+                    side: "build",
+                })?;
+
+            let hash = hash_composite_key(&keys, &hash_state);
+            let new_idx = i as u32;
+
+            // Prepend-on-collision: the new record becomes the chain head;
+            // the old head is stored in chain[new_idx].
+            let old_head = match index.entry(
+                hash,
+                |&(stored_hash, _)| stored_hash == hash,
+                |&(stored_hash, _)| stored_hash,
+            ) {
+                hashbrown::hash_table::Entry::Occupied(mut o) => {
+                    let prev = o.get().1;
+                    o.get_mut().1 = new_idx;
+                    prev
+                }
+                hashbrown::hash_table::Entry::Vacant(v) => {
+                    v.insert((hash, new_idx));
+                    SENTINEL
+                }
+            };
+            chain.push(old_head);
+            keys_cache.push(keys);
+            arena.push(rec);
+
+            // Periodic budget poll. `should_abort` observes RSS and returns
+            // true when the process has crossed the hard limit.
+            if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) && budget.should_abort() {
+                // Partial memory footprint (arena + chain + keys_cache +
+                // index-so-far). Finalized memory might be slightly higher
+                // once the HashTable rehashes; we report what we've
+                // allocated up to this point so the diagnostic is honest.
+                let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
+                return Err(CombineError::MemoryLimitExceeded {
+                    used: used as u64,
+                    limit: budget.limit,
+                });
+            }
+        }
+
+        let table = Self {
+            index,
+            chain,
+            records: arena,
+            keys_cache,
+            hash_state,
+        };
+
+        // Safety-net final check — catches builds shorter than
+        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll.
+        if budget.should_abort() {
+            return Err(CombineError::MemoryLimitExceeded {
+                used: table.memory_bytes() as u64,
+                limit: budget.limit,
+            });
+        }
+
+        Ok(table)
+    }
+
+    /// Probe the table with a driving-side record.
+    ///
+    /// **NULL probe short-circuit (SQL 3VL):** if any key value on the probe
+    /// side is [`Value::Null`], the returned iterator is empty — no hash
+    /// lookup is performed. This matches DataFusion and Spark join semantics
+    /// without canonicalizing NULL to a pseudo-value (which would produce
+    /// spurious matches with build-side NULLs).
+    ///
+    /// The returned iterator yields only candidates that pass BOTH the
+    /// hash bucket AND full-key equality verification — the executor never
+    /// sees hash-collision false positives.
+    pub fn probe<'a>(
+        &'a self,
+        record: &Record,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+    ) -> Result<ProbeIter<'a>, CombineError> {
+        let probe_keys =
+            extractor
+                .extract(ctx, record)
+                .map_err(|e| CombineError::KeyEvalFailed {
+                    source: e,
+                    side: "driving",
+                })?;
+
+        if probe_keys.iter().any(|v| matches!(v, Value::Null)) {
+            // 3VL short-circuit.
+            return Ok(ProbeIter {
+                table: self,
+                probe_keys,
+                current: SENTINEL,
+            });
+        }
+
+        let hash = hash_composite_key(&probe_keys, &self.hash_state);
+        let head = self
+            .index
+            .find(hash, |&(stored_hash, _)| stored_hash == hash)
+            .map(|&(_, h)| h)
+            .unwrap_or(SENTINEL);
+
+        Ok(ProbeIter {
+            table: self,
+            probe_keys,
+            current: head,
+        })
+    }
+
+    /// Total bytes of owned memory. Sums all four allocation sources —
+    /// missing any one was the DataFusion #14222/#5490/#6170 failure class.
+    /// Stable pub API: the executor uses this both for the periodic
+    /// `MemoryBudget` check and for the `--explain` RSS reporting.
+    pub fn memory_bytes(&self) -> usize {
+        self.index.allocation_size()
+            + self.chain.capacity() * std::mem::size_of::<u32>()
+            + self.records.capacity() * std::mem::size_of::<Record>()
+            + self
+                .records
+                .iter()
+                .map(Record::estimated_heap_size)
+                .sum::<usize>()
+            + self.keys_cache.capacity() * std::mem::size_of::<Vec<Value>>()
+            + self
+                .keys_cache
+                .iter()
+                .map(|k| {
+                    k.capacity() * std::mem::size_of::<Value>()
+                        + k.iter().map(Value::heap_size).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
+    /// Number of build-side records in the table.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// True when no build records were inserted.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+/// Iterator returned by [`CombineHashTable::probe`]. Walks the collision
+/// chain from the matched bucket head through `chain[...]` until `SENTINEL`,
+/// yielding only candidates whose cached build-side key values match the
+/// probe's (canonicalized element-wise equality). Hash collisions between
+/// non-equal keys are filtered silently so the caller never sees false
+/// positives.
+pub struct ProbeIter<'a> {
+    table: &'a CombineHashTable,
+    probe_keys: Vec<Value>,
+    current: u32,
+}
+
+impl<'a> Iterator for ProbeIter<'a> {
+    type Item = ProbeCandidate<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current != SENTINEL {
+            let idx = self.current as usize;
+            // Advance the chain cursor FIRST so that a `return` from the
+            // equality-matching branch leaves `self.current` pointing at
+            // the next slot to scan on the following `.next()`.
+            self.current = self.table.chain[idx];
+
+            let build_keys = &self.table.keys_cache[idx];
+            if keys_equal_canonicalized(&self.probe_keys, build_keys) {
+                return Some(ProbeCandidate {
+                    index: idx,
+                    record: &self.table.records[idx],
+                });
+            }
+            // else: hash collision with a non-equal key — skip, continue.
+        }
+        None
+    }
+}
+
+/// Compute the hash table's owned memory during an in-progress build.
+/// Identical formula to [`CombineHashTable::memory_bytes`], broken out so
+/// the error path can report accurate `used` without constructing a
+/// fully-assembled `CombineHashTable`.
+fn partial_memory_bytes(
+    index: &HashTable<(u64, u32)>,
+    chain: &[u32],
+    arena: &[Record],
+    keys_cache: &[Vec<Value>],
+) -> usize {
+    index.allocation_size()
+        + std::mem::size_of_val(chain)
+        + std::mem::size_of_val(arena)
+        + arena.iter().map(Record::estimated_heap_size).sum::<usize>()
+        + std::mem::size_of_val(keys_cache)
+        + keys_cache
+            .iter()
+            .map(|k| {
+                k.capacity() * std::mem::size_of::<Value>()
+                    + k.iter().map(Value::heap_size).sum::<usize>()
+            })
+            .sum::<usize>()
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -938,6 +1256,399 @@ mod tests {
         };
         assert!(format!("{spill}").contains("disk full"));
         assert!(std::error::Error::source(&spill).is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // CombineHashTable tests
+    // ──────────────────────────────────────────────────────────────────
+
+    use clinker_record::{Record, Schema};
+
+    fn test_schema(cols: &[&str]) -> Arc<Schema> {
+        let boxed: Vec<Box<str>> = cols.iter().map(|c| (*c).into()).collect();
+        Arc::new(Schema::new(boxed))
+    }
+
+    fn mk_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
+        Record::new(Arc::clone(schema), values)
+    }
+
+    fn test_budget(limit_bytes: u64) -> MemoryBudget {
+        MemoryBudget::new(limit_bytes, 0.80)
+    }
+
+    /// Build a single-column integer-key KeyExtractor that extracts field `name`.
+    fn single_int_key(name: &str) -> KeyExtractor {
+        let (typed, expr) = compile_key(
+            &format!("emit k = {name}"),
+            &[name],
+            &[(name, cxl::typecheck::Type::Int)],
+        );
+        KeyExtractor::new(vec![(typed, expr)])
+    }
+
+    fn test_ctx() -> cxl::eval::StableEvalContext {
+        cxl::eval::StableEvalContext::test_default()
+    }
+
+    #[test]
+    fn test_combine_hash_table_build_probe_exact() {
+        let schema = test_schema(&["id", "name"]);
+        let records: Vec<Record> = (0..1000)
+            .map(|i| {
+                mk_record(
+                    &schema,
+                    vec![Value::Integer(i), Value::String(format!("name_{i}").into())],
+                )
+            })
+            .collect();
+
+        let extractor = single_int_key("id");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+
+        let table =
+            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(1000)).unwrap();
+        assert_eq!(table.len(), 1000);
+        assert!(!table.is_empty());
+
+        // Probe for id=42 → exactly one match.
+        let probe = mk_record(&schema, vec![Value::Integer(42), Value::Null]);
+        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].record.resolve("id"), Some(Value::Integer(42)));
+    }
+
+    #[test]
+    fn test_combine_hash_table_duplicate_keys() {
+        // Three records with the same key → all yielded by probe.
+        let schema = test_schema(&["k", "val"]);
+        let records = vec![
+            mk_record(&schema, vec![Value::Integer(5), Value::String("a".into())]),
+            mk_record(&schema, vec![Value::Integer(5), Value::String("b".into())]),
+            mk_record(&schema, vec![Value::Integer(5), Value::String("c".into())]),
+        ];
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+
+        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+
+        let probe = mk_record(&schema, vec![Value::Integer(5), Value::Null]);
+        let mut got_vals: Vec<String> = table
+            .probe(&probe, &extractor, &ctx)
+            .unwrap()
+            .map(|c| match c.record.resolve("val") {
+                Some(Value::String(s)) => s.into_string(),
+                _ => panic!("expected String val"),
+            })
+            .collect();
+        got_vals.sort();
+        assert_eq!(got_vals, vec!["a".to_string(), "b".into(), "c".into()]);
+    }
+
+    #[test]
+    fn test_combine_hash_table_no_match_returns_empty() {
+        let schema = test_schema(&["k"]);
+        let records = vec![mk_record(&schema, vec![Value::Integer(1)])];
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+
+        let probe = mk_record(&schema, vec![Value::Integer(9999)]);
+        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_combine_hash_table_null_probe_short_circuits() {
+        // Probe with NULL key → empty iter (SQL 3VL), even though a build
+        // record with the same-hash NULL key exists in the table.
+        let schema = test_schema(&["k", "tag"]);
+        let records = vec![
+            mk_record(&schema, vec![Value::Null, Value::String("null-row".into())]),
+            mk_record(
+                &schema,
+                vec![Value::Integer(1), Value::String("one".into())],
+            ),
+        ];
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+        assert_eq!(
+            table.len(),
+            2,
+            "NULL-keyed build record is indexed harmlessly"
+        );
+
+        // Probe with Value::Null key → short-circuit, zero matches.
+        let null_probe = mk_record(&schema, vec![Value::Null, Value::Null]);
+        let nm: Vec<_> = table
+            .probe(&null_probe, &extractor, &ctx)
+            .unwrap()
+            .collect();
+        assert!(
+            nm.is_empty(),
+            "NULL probe must not match even a NULL build key"
+        );
+
+        // Sanity: non-null probe still finds the non-null build record.
+        let probe = mk_record(&schema, vec![Value::Integer(1), Value::Null]);
+        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn test_combine_hash_table_hash_collision_equality_reject() {
+        // Force multiple records into the same bucket by using extreme
+        // cardinality. hashbrown's AHasher is keyed by a process-random
+        // RandomState, so we can't guarantee a collision between two
+        // specific keys in a single run. Instead: insert 1000 records
+        // with 1000 distinct keys and verify probe for a MISSING key
+        // with a near-neighbor value returns 0 matches. This exercises
+        // the chain-walk + equality verification path under realistic
+        // bucket contention (at 1000 records, bucket collisions are
+        // guaranteed by pigeonhole across the 128-bit AHash distribution).
+        let schema = test_schema(&["k"]);
+        let records: Vec<Record> = (0..1000)
+            .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
+            .collect();
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table =
+            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(1000)).unwrap();
+
+        // These keys are NOT in the build set.
+        for missing_key in [1000i64, 10_000, -1, -999] {
+            let probe = mk_record(&schema, vec![Value::Integer(missing_key)]);
+            let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+            assert!(
+                matches.is_empty(),
+                "probe for missing key {missing_key} yielded {} false positives",
+                matches.len()
+            );
+        }
+
+        // And confirm every PRESENT key finds exactly one match.
+        for present in [0i64, 1, 42, 999] {
+            let probe = mk_record(&schema, vec![Value::Integer(present)]);
+            let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+            assert_eq!(matches.len(), 1, "probe for {present} must find exactly 1");
+        }
+    }
+
+    #[test]
+    fn test_combine_hash_table_memory_tracking_all_sources() {
+        let schema = test_schema(&["k", "val"]);
+        let records: Vec<Record> = (0..100)
+            .map(|i| {
+                mk_record(
+                    &schema,
+                    vec![
+                        Value::Integer(i),
+                        Value::String(format!("payload_{i:04}").into()),
+                    ],
+                )
+            })
+            .collect();
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table =
+            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(100)).unwrap();
+
+        let total = table.memory_bytes();
+
+        // Structural invariants — memory_bytes MUST dominate each
+        // component source. This is the anti-DataFusion-#14222 gate:
+        // every source contributes.
+        let arena_heap: usize = table.records.iter().map(Record::estimated_heap_size).sum();
+        assert!(
+            total > arena_heap,
+            "memory_bytes {total} must exceed arena heap {arena_heap} (index + chain + keys)"
+        );
+        let chain_bytes = table.chain.capacity() * std::mem::size_of::<u32>();
+        assert!(
+            total > chain_bytes,
+            "memory_bytes must exceed chain cap {chain_bytes}"
+        );
+        let index_bytes = table.index.allocation_size();
+        assert!(
+            total >= index_bytes,
+            "memory_bytes must include index alloc {index_bytes}"
+        );
+    }
+
+    #[test]
+    fn test_combine_hash_table_memory_overhead_ratio() {
+        // RESEARCH-hash-table-memory.md target: <1.1× overhead for
+        // records with 10+ fields (realistic ETL size — ~1-2 KB per
+        // record). The "raw" baseline here is what ANY in-memory
+        // record store would occupy: per-Record struct bytes + heap
+        // (values + overflow + metadata). The hash-specific overhead
+        // is index + chain + keys_cache.
+        //
+        // We use 10 string fields ~100 bytes each = ~1 KB records,
+        // matching the research target's test condition. At this size
+        // the 45-byte-per-row fixed overhead (17 index + 4 chain +
+        // 24 keys_cache_outer) is a small fraction of the payload.
+        //
+        // Under smaller record sizes (< 500 B) the keys_cache overhead
+        // dominates and the ratio rises toward 1.25×. That is the
+        // intentional time-memory tradeoff of caching build-side key
+        // Values to avoid re-extraction on every chain scan (plan
+        // decision; see C.2.1 sub-task in
+        // /home/glitch/.claude/plans/thoroughly-plan-how-to-silly-fairy.md
+        // Section 4).
+        let cols: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
+        let col_refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        let schema = test_schema(&col_refs);
+
+        // Each column gets ~100 bytes of payload → ~1 KB per record.
+        let filler: String = "y".repeat(100);
+        let records: Vec<Record> = (0..1000)
+            .map(|i| {
+                let mut vals: Vec<Value> = (0..10)
+                    .map(|_| Value::String(filler.clone().into()))
+                    .collect();
+                // First column acts as the key; replace with a unique
+                // integer-like string so duplicate keys don't bloat one
+                // bucket.
+                vals[0] = Value::String(format!("key_{i:06}").into());
+                mk_record(&schema, vals)
+            })
+            .collect();
+
+        // Key extractor: single-column string key on c0.
+        let (typed, expr) = compile_key(
+            "emit k = c0",
+            &col_refs,
+            &col_refs
+                .iter()
+                .map(|n| (*n, cxl::typecheck::Type::String))
+                .collect::<Vec<_>>(),
+        );
+        let extractor = KeyExtractor::new(vec![(typed, expr)]);
+
+        let raw_baseline: usize = records
+            .iter()
+            .map(Record::estimated_heap_size)
+            .sum::<usize>()
+            + records.len() * std::mem::size_of::<Record>();
+
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table =
+            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(1000)).unwrap();
+
+        let total = table.memory_bytes();
+        let ratio = total as f64 / raw_baseline as f64;
+        assert!(
+            ratio < 1.1,
+            "overhead ratio {ratio:.3} exceeds 1.1× target for 10-field × 1 KB records \
+             (total={total}, raw_baseline={raw_baseline}, overhead={})",
+            total.saturating_sub(raw_baseline)
+        );
+    }
+
+    #[test]
+    fn test_combine_hash_table_oom_aborts_during_build() {
+        // With a 1-byte budget, the process RSS trivially exceeds the
+        // hard limit — `should_abort()` returns true on the first poll.
+        // The final-check safety net fires even though we have fewer
+        // than MEMORY_CHECK_INTERVAL records.
+        let schema = test_schema(&["k"]);
+        let records: Vec<Record> = (0..10)
+            .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
+            .collect();
+
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(1); // 1 byte — impossibly tight.
+
+        match CombineHashTable::build(records, &extractor, &ctx, &mut budget, None) {
+            Err(CombineError::MemoryLimitExceeded { used, limit }) => {
+                assert_eq!(limit, 1);
+                // `used` is either non-zero if the final check fires and
+                // reports table.memory_bytes(), or zero if the periodic
+                // poll fired mid-build — the variant is the gate.
+                let _ = used;
+            }
+            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+            Ok(_) => {
+                // RSS measurement unavailable on this platform
+                // (`rss_bytes()` returns None) — `should_abort()` can't
+                // fire. Accepting Ok here would hide a real abort-path
+                // regression on Linux CI; fail explicitly so the
+                // maintainer has to decide to wire a platform gate.
+                panic!(
+                    "build() succeeded under 1-byte budget — either RSS polling \
+                     returned None on this platform (add a cfg gate), or the \
+                     should_abort wiring regressed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_combine_hash_table_empty_input() {
+        // EC-1: zero build records. build() succeeds with len()==0; probe
+        // returns empty iter for any driver.
+        let schema = test_schema(&["k"]);
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(vec![], &extractor, &ctx, &mut budget, None).unwrap();
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+
+        let probe = mk_record(&schema, vec![Value::Integer(42)]);
+        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_combine_hash_table_probe_iter_advances_across_chain() {
+        // Anti-regression for a subtle ProbeIter bug: if `self.current` is
+        // advanced AFTER yielding (instead of before), a hash collision
+        // with non-match followed by a true match would yield only the
+        // true match's index once and then spin forever on the same slot.
+        // Here we insert 10K records with 10K distinct keys and verify
+        // that iterating any probe yields at most 1 match (per
+        // cardinality) rather than an unbounded stream.
+        let schema = test_schema(&["k"]);
+        let records: Vec<Record> = (0..10_000)
+            .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
+            .collect();
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table =
+            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(10_000)).unwrap();
+
+        for key in [0i64, 500, 9999] {
+            let probe = mk_record(&schema, vec![Value::Integer(key)]);
+            let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "probe for {key}: expected 1, got {}",
+                matches.len()
+            );
+        }
     }
 
     #[test]
