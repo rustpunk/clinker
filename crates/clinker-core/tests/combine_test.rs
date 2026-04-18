@@ -744,13 +744,16 @@ mod tests {
     }
 
     /// Compile a parsed `PipelineConfig` into an `ExecutionPlanDag` via the
-    /// legacy planner path. The combine fixtures used here declare no
-    /// CXL-bearing transform/aggregate/route nodes, so `compiled_refs` is
-    /// empty — `build_transform_specs` produces nothing for Combine nodes
-    /// (they lower to `PlanNode::Combine` directly in C.0.4's Phase 1
-    /// block, not via `PlanTransformSpec`).
+    /// canonical Phase 16d compile path. `bind_schema` typechecks every
+    /// CXL-bearing node against the author-declared source schemas;
+    /// Combine nodes lower to `PlanNode::Combine` in stage 5 via
+    /// `lower_node_to_plan_node`.
     fn compile_plan(config: &PipelineConfig) -> ExecutionPlanDag {
-        ExecutionPlanDag::compile(config, &[]).unwrap_or_else(|e| panic!("compile failed: {e}"))
+        config
+            .compile(&clinker_core::config::CompileContext::default())
+            .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
+            .dag()
+            .clone()
     }
 
     /// Find the `NodeIndex` of the combine node named `name` in the DAG.
@@ -842,10 +845,12 @@ mod tests {
         for name in fixtures {
             let yaml = load_fixture(name);
             let config = parse_fixture(&yaml);
-            let result = ExecutionPlanDag::compile(&config, &[]);
-            let plan = result.unwrap_or_else(|e| {
-                panic!("fixture {name}: compile failed with {e}");
-            });
+            let plan = config
+                .compile(&clinker_core::config::CompileContext::default())
+                .unwrap_or_else(|diags| {
+                    panic!("fixture {name}: compile failed with {diags:?}");
+                });
+            let plan = plan.dag();
             // Each fixture has exactly one combine node; find it and assert
             // it has at least one incoming edge (one for error_one_input,
             // ≥2 for the rest).
@@ -947,14 +952,13 @@ mod tests {
 
     /// Gate: `PlanError::CombineInputUndeclared` (E307) carries a real
     /// `Span`. Constructs an inline combine fixture that references an
-    /// undeclared upstream and asserts the error's `span` encodes a
-    /// non-zero line number.
+    /// Phase 16d: combine edge wiring in `PipelineConfig::compile`
+    /// emits E307 as a `Diagnostic` when a combine input references an
+    /// undeclared upstream. The diagnostic's primary span carries the
+    /// `line_only` synthetic span of the offending `products: nowhere`
+    /// reference (populated from `Spanned<NodeInput>::referenced`).
     #[test]
     fn test_combine_e307_diagnostic_has_real_span() {
-        use clinker_core::plan::execution::{ExecutionPlanDag, PlanError};
-
-        // `nowhere` is not declared as a source, transform, or any
-        // other producer — combine wiring must surface E307.
         let yaml = r#"
 pipeline:
   name: e307_gate
@@ -978,53 +982,41 @@ nodes:
         emit order_id = orders.order_id
 "#;
         let config = parse_fixture(yaml);
-        let err = ExecutionPlanDag::compile(&config, &[])
+        let diags = config
+            .compile(&clinker_core::config::CompileContext::default())
             .expect_err("combine referencing undeclared upstream must fail");
-        match err {
-            PlanError::CombineInputUndeclared {
-                combine,
-                qualifier,
-                reference,
-                span,
-            } => {
-                assert_eq!(combine, "broken");
-                assert_eq!(qualifier, "products");
-                assert_eq!(reference, "nowhere");
-                // The span must carry a real line number, not SYNTHETIC.
-                let line = span.synthetic_line_number().unwrap_or(0);
-                assert!(
-                    line > 0,
-                    "E307 span must have a non-zero line; got synthetic_line_number={line:?}, span={span:?}"
-                );
-                // The reference is on the `products: nowhere` line. In
-                // this fixture that's line 16 of the inline YAML (1-based
-                // from the leading newline of the raw string). We assert
-                // the weaker "within reasonable bounds" property so the
-                // test doesn't brittle on whitespace tweaks, but also
-                // confirm it's in the right neighbourhood: inside the
-                // `input:` block, not on the very first line.
-                assert!(
-                    line >= 10,
-                    "E307 span line must be inside the combine input block (>= 10), got {line}"
-                );
-
-                // Display includes the line number.
-                let display = format!(
-                    "{}",
-                    PlanError::CombineInputUndeclared {
-                        combine,
-                        qualifier,
-                        reference,
-                        span,
-                    }
-                );
-                assert!(
-                    display.contains(&format!("line {line}")),
-                    "Display output must include 'line {line}', got: {display}"
-                );
-            }
-            other => panic!("expected CombineInputUndeclared, got: {other}"),
-        }
+        let e307 = diags
+            .iter()
+            .find(|d| d.code == "E307")
+            .unwrap_or_else(|| panic!("expected E307 diagnostic; got: {diags:#?}"));
+        assert!(
+            e307.message.contains("broken"),
+            "E307 message must name the combine: {}",
+            e307.message
+        );
+        assert!(
+            e307.message.contains("products"),
+            "E307 message must name the qualifier: {}",
+            e307.message
+        );
+        assert!(
+            e307.message.contains("nowhere"),
+            "E307 message must name the undeclared upstream: {}",
+            e307.message
+        );
+        // The primary span carries the real source line of the offending
+        // `products: nowhere` reference (≥ 10 lines into the fixture).
+        let line = e307.primary.span.synthetic_line_number().unwrap_or(0);
+        assert!(
+            line >= 10,
+            "E307 span must encode a non-zero line inside the combine input block; got {line} (span={:?})",
+            e307.primary.span
+        );
+        assert!(
+            e307.message.contains(&format!("line {line}")),
+            "E307 message must include 'line {line}', got: {}",
+            e307.message
+        );
     }
 
     /// Gate: `MergeHeader.inputs: Vec<Spanned<NodeInput>>` — every input

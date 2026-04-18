@@ -325,26 +325,15 @@ nodes:
 "#;
     let config = crate::config::parse_config(yaml).unwrap();
 
-    // Phase 16b Task 16b.9: pull pre-typechecked programs from
-    // `config.compile()` artifacts instead of running a runtime
-    // typecheck pass.
-    let validated_plan = config
+    // Phase 16d: the canonical compile path produces a fully-enriched
+    // DAG (including enforcer-sort and correlation-sort injection) in
+    // one call. Clone the DAG so the test can overwrite
+    // `correlation_sort_note` for the explain assertion.
+    let mut plan = config
         .compile(&crate::config::CompileContext::default())
-        .unwrap();
-    let resolved_transforms_owned = crate::executor::build_transform_specs(&config);
-    let compiled_refs: Vec<(&str, &cxl::typecheck::TypedProgram)> = resolved_transforms_owned
-        .iter()
-        .map(|t| {
-            let typed = validated_plan
-                .artifacts()
-                .typed
-                .get(&t.name)
-                .expect("bind_schema produced a typed program for this node");
-            (t.name.as_str(), typed.as_ref())
-        })
-        .collect();
-
-    let mut plan = ExecutionPlanDag::compile(&config, &compiled_refs).unwrap();
+        .unwrap()
+        .dag()
+        .clone();
 
     // Simulate the sort injection that run_with_readers_writers does
     let correlation_key = config.error_handling.correlation_key.as_ref().unwrap();

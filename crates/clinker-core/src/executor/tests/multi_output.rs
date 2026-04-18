@@ -770,7 +770,13 @@ nodes:
     let csv = "id,amount\n1,500\n2,30\n";
     let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
-    assert_eq!(counters.ok_count, 2);
+    // Phase 16d: under the unified DAG-walk runtime, `ok_count` tracks
+    // per-output writes (`records_emitted`-equivalent). Inclusive
+    // routing duplicates record 1 to {audit, report} and routes record 2
+    // to {standard} — 3 writes total. Pre-16d the test ran under the
+    // multi-output streaming path which counted per-input-record (=2);
+    // that path is gone in 16d.2 along with the divergent compile.
+    assert_eq!(counters.ok_count, 3);
 
     // Record 1 should appear in both audit and report
     assert!(outputs["audit"].contains("1,500"));
@@ -1253,9 +1259,18 @@ nodes:
             assert_eq!(errors.len(), 2, "should collect both flush errors");
         }
         Err(PipelineError::Io(_)) => {
-            // If only one error collected (order-dependent), that's also acceptable
+            // If only one error collected (order-dependent), that's also acceptable.
         }
-        other => panic!("expected Multiple or Io error, got: {other:?}"),
+        // Phase 16d: under the unified DAG-walk runtime, the first
+        // failing writer short-circuits and surfaces as
+        // `PipelineError::Format(Io(…))` (the format-writer wraps its
+        // underlying IO error). Pre-16d this test ran through the
+        // multi-output streaming path which collected errors into
+        // `Multiple`; that path is gone. Either the bare `Io` or the
+        // format-wrapped `Format(Io)` form is acceptable as a single-
+        // error signal.
+        Err(PipelineError::Format(clinker_format::FormatError::Io(_))) => {}
+        other => panic!("expected Multiple / Io / Format(Io) error, got: {other:?}"),
     }
 }
 

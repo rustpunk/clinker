@@ -234,44 +234,15 @@ nodes:
     include_unmapped: true
 "#;
         let config = crate::config::parse_config(yaml).expect("config parses");
-        // Drive the executor's compile path indirectly by parsing then
-        // hand-rolling a tiny ExecutionPlanDag isn't trivial — instead
-        // we use the public PipelineExecutor::compile_plan helper if
-        // present. Lacking that, build via the public PlanDag entry.
-        // The simplest reachable path is `ExecutionPlanDag::compile`
-        // with the typed-program slice; we synthesize an empty slice
-        // and rely on extract paths.
-        let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> =
-            crate::executor::build_transform_specs(&config)
-                .iter()
-                .map(|t| {
-                    let parsed = Parser::parse(t.cxl_source());
-                    let resolved =
-                        resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
-                    let mut schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> =
-                        IndexMap::new();
-                    schema_map.insert(cxl::typecheck::QualifiedField::bare("dept"), Type::String);
-                    let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
-                    let mode = if t.aggregate.is_some() {
-                        AggregateMode::GroupBy {
-                            group_by_fields: ["dept".to_string()].into_iter().collect(),
-                        }
-                    } else {
-                        AggregateMode::Row
-                    };
-                    (
-                        t.name.clone(),
-                        type_check_with_mode(resolved, &row, mode).unwrap(),
-                    )
-                })
-                .collect();
-        let typed_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = typed_programs
-            .iter()
-            .map(|(n, p)| (n.as_str(), p))
-            .collect();
-
-        let mut plan = crate::plan::execution::ExecutionPlanDag::compile(&config, &typed_refs)
-            .expect("plan compiles");
+        // Phase 16d: the canonical compile entry point lowers via
+        // `bind_schema` + stage-5 — no hand-rolled typed-program
+        // slice needed. Clone the resulting DAG so the test can
+        // synthesize a malformed two-predecessor shape below.
+        let mut plan = config
+            .compile(&crate::config::CompileContext::default())
+            .expect("plan compiles")
+            .dag()
+            .clone();
 
         // Find the Aggregation node and add a second incoming edge
         // from another node (the source) — synthesizing the malformed

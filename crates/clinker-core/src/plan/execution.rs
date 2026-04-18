@@ -6,7 +6,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
-use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::{Control, DfsEvent, EdgeRef, Topo, depth_first_search};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -20,7 +19,7 @@ use crate::config::{
 };
 use crate::error::PipelineError;
 use crate::plan::composition_body::CompositionBodyId;
-use crate::plan::index::{self, IndexSpec, LocalWindowConfig, PlanIndexError, RawIndexRequest};
+use crate::plan::index::{IndexSpec, LocalWindowConfig, PlanIndexError};
 use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
     PartitioningProvenance,
@@ -33,7 +32,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-use cxl::analyzer::{self, ParallelismHint};
+use cxl::analyzer::ParallelismHint;
 use cxl::ast::Statement;
 use cxl::typecheck::pass::TypedProgram;
 
@@ -266,6 +265,7 @@ pub struct PlanOutputPayload {
 /// `Option<TransformInput>` encoded implicitly (none = chain, single =
 /// explicit, multiple = merge).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct PlanTransformSpec {
     pub name: String,
     pub cxl_source: Option<String>,
@@ -273,30 +273,23 @@ pub(crate) struct PlanTransformSpec {
     pub route: Option<crate::config::RouteConfig>,
     pub analytic_window: Option<serde_json::Value>,
     pub input: ResolvedInput,
-    /// Task 16b.8 — 1-based source line of this node's YAML
-    /// declaration, threaded off `Spanned<PipelineNode>::referenced`.
-    /// Zero = unknown (legacy fallback path or a saphyr location
-    /// lost inside a tagged-enum/flatten edge case). Consumed by
-    /// `ExecutionPlanDag::compile` to populate `PlanNode::*.span` via
-    /// `crate::span::Span::line_only`.
     pub line: u32,
 }
 
-/// Resolved upstream wiring for a [`PlanTransformSpec`]. The legacy
-/// `Option<TransformInput>` encoding mapped `None` to "chain to previous
-/// declaration" and `Some(...)` to explicit single/multi wiring; this
-/// enum makes that explicit so the planner does not have to peek at
-/// declaration order to disambiguate.
+/// Resolved upstream wiring for a [`PlanTransformSpec`]. Retained
+/// post-Phase-16d as a structural marker on specs; the compile pipeline
+/// reads node inputs directly off `PipelineNode::*.header.input` and
+/// does not inspect `ResolvedInput` payloads, so the `Single` variant
+/// payload is unused but kept for future planner hooks.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) enum ResolvedInput {
     /// Implicit linear chain — wire to the previous transform (or the
     /// primary source for the first transform).
     Chain,
-    /// Explicit single upstream by name (transform, aggregate, or
-    /// dotted `route_name.branch_name`).
+    /// Explicit single upstream by name (transform, aggregate, merge,
+    /// composition, or dotted `route_name.branch_name`).
     Single(String),
-    /// Multiple upstreams unioned through a synthesized merge node.
-    Multi(Vec<String>),
 }
 
 /// Phase 16b Wave 4ab Checkpoint C: construct the planner's
@@ -335,31 +328,12 @@ pub(crate) fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
                 _ => None,
             })
             .collect();
-        // Pre-index Merge nodes by name so a downstream transform
-        // whose `input:` points at a synthesized merge resolves to
-        // `ResolvedInput::Multi(merge.inputs)` — the planner's merge-
-        // aware path then materializes the merge PlanNode from the
-        // downstream spec exactly as in the legacy path.
-        let merge_inputs_by_name: std::collections::HashMap<String, Vec<String>> = config
-            .nodes
-            .iter()
-            .filter_map(|s| match &s.value {
-                PipelineNode::Merge { header, .. } => {
-                    let inputs = header
-                        .inputs
-                        .iter()
-                        .map(|n| match &n.value {
-                            crate::config::node_header::NodeInput::Single(s) => s.clone(),
-                            crate::config::node_header::NodeInput::Port { node, port } => {
-                                format!("{node}.{port}")
-                            }
-                        })
-                        .collect();
-                    Some((header.name.clone(), inputs))
-                }
-                _ => None,
-            })
-            .collect();
+        // Under the unified taxonomy (Phase 16d), a user-declared
+        // `PipelineNode::Merge` is a first-class DAG node. A downstream
+        // Transform's `input:` referencing a Merge by name resolves to
+        // `ResolvedInput::Single(merge_name)` — the graph edge from
+        // Merge to Transform is wired normally, no synthesized
+        // per-transform Merge needed.
         let resolve_header_input = |n: &crate::config::node_header::NodeInput| -> ResolvedInput {
             use crate::config::node_header::NodeInput;
             let flat = match n {
@@ -369,8 +343,6 @@ pub(crate) fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
             let bare = flat.split('.').next().unwrap_or(&flat);
             if source_names.contains(bare) {
                 ResolvedInput::Chain
-            } else if let Some(upstreams) = merge_inputs_by_name.get(&flat) {
-                ResolvedInput::Multi(upstreams.clone())
             } else {
                 ResolvedInput::Single(flat)
             }
@@ -458,6 +430,7 @@ pub(crate) fn build_specs(config: &PipelineConfig) -> Vec<PlanTransformSpec> {
     Vec::new()
 }
 
+#[allow(dead_code)]
 impl PlanTransformSpec {
     /// CXL source text. For row-level transforms this is the top-level
     /// `cxl` field; for aggregates it is the nested `aggregate.cxl`.
@@ -601,7 +574,7 @@ pub struct PlanEdge {
 ///
 /// The single source of truth for pipeline topology and execution strategy.
 /// Custom Serialize emits flat node-list JSON for Kiln consumption.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionPlanDag {
     /// petgraph DAG of PlanNode/PlanEdge.
     pub graph: DiGraph<PlanNode, PlanEdge>,
@@ -757,718 +730,6 @@ impl ExecutionPlanDag {
         } else {
             "Streaming".to_string()
         }
-    }
-
-    /// Compile a PipelineConfig + pre-compiled transforms into a DAG plan.
-    ///
-    /// Validates all `input:` references with full config context.
-    /// Derives `NodeExecutionReqs` per transform from analyzer output.
-    /// Builds the petgraph DAG with source, transform, route, merge, and output nodes.
-    pub fn compile(
-        config: &PipelineConfig,
-        compiled: &[(&str, &TypedProgram)],
-    ) -> Result<Self, PlanError> {
-        Self::compile_with_runtime_schema(config, compiled, None)
-    }
-
-    /// Variant of [`compile`] that accepts the actual runtime Arrow
-    /// schema for aggregate index alignment. Phase 16b Task 16b.9 —
-    /// `typed.field_types` now reflects the author-declared source
-    /// schema (which may be a superset of the real file columns), so
-    /// aggregate `group_by_indices` must be resolved against the
-    /// runtime column layout instead of the declared one.
-    pub fn compile_with_runtime_schema(
-        config: &PipelineConfig,
-        compiled: &[(&str, &TypedProgram)],
-        runtime_input_schema: Option<&[String]>,
-    ) -> Result<Self, PlanError> {
-        // D3a part2: collect source/output configs from the unified
-        // `nodes:` topology once, then use the owned Vecs throughout.
-        // Walking `config.nodes` repeatedly would work but wastes
-        // allocation on every helper call that takes a slice.
-        let source_configs: Vec<SourceConfig> = config.source_configs().cloned().collect();
-        let output_configs_owned: Vec<OutputConfig> = config.output_configs().cloned().collect();
-
-        let primary_source = source_configs
-            .first()
-            .map(|i| i.name.clone())
-            .unwrap_or_default();
-
-        // Phase D: analyze all transforms
-        let report = analyzer::analyze_all(compiled);
-
-        // Phase 16b Wave 4ab Checkpoint C: build `PlanTransformSpec` directly
-        // from the unified `nodes:` enum when present; fall back to the
-        // legacy `crate::executor::build_transform_specs(config)` projection otherwise. The helpers
-        // below consume `&[PlanTransformSpec]` exclusively, so the planner
-        // body is agnostic to authorship shape.
-        let specs: Vec<PlanTransformSpec> = build_specs(config);
-
-        // Parse analytic_window configs via the spec-taking helper.
-        let window_configs: Vec<Option<LocalWindowConfig>> = specs
-            .iter()
-            .map(|s| index::parse_analytic_window_spec(s).map_err(PlanError::IndexPlanning))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Exercise spec accessors + ResolvedInput so the types are live end-to-end.
-        let _spec_probe: Vec<(&str, bool, usize)> = specs
-            .iter()
-            .map(|s| {
-                let fanin = match &s.input {
-                    ResolvedInput::Chain => 0,
-                    ResolvedInput::Single(name) => name.len().min(1),
-                    ResolvedInput::Multi(names) => names.len(),
-                };
-                (s.cxl_source(), s.is_aggregate(), fanin)
-            })
-            .collect();
-
-        // Validate: if a transform uses window.* but has no local_window, error
-        for (i, analysis) in report.transforms.iter().enumerate() {
-            if !analysis.window_calls.is_empty() && window_configs[i].is_none() {
-                return Err(PlanError::MissingLocalWindow {
-                    transform: analysis.name.clone(),
-                });
-            }
-        }
-
-        // Phase E: build raw index requests, then deduplicate
-        let mut raw_requests = Vec::new();
-        for (i, wc) in window_configs.iter().enumerate() {
-            if let Some(wc) = wc {
-                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
-
-                // Validate source exists
-                if !source_configs.iter().any(|inp| inp.name == source) {
-                    return Err(PlanError::UnknownSource {
-                        name: source,
-                        transform: report.transforms[i].name.clone(),
-                    });
-                }
-
-                // Compute arena fields: group_by + sort_by field names + window-accessed fields
-                let mut arena_fields: HashSet<String> = HashSet::new();
-                for gb in &wc.group_by {
-                    arena_fields.insert(gb.clone());
-                }
-                for sf in &wc.sort_by {
-                    arena_fields.insert(sf.field.clone());
-                }
-                for f in &report.transforms[i].accessed_fields {
-                    arena_fields.insert(f.clone());
-                }
-
-                // Check pre-sorted optimization
-                let already_sorted = check_already_sorted(&source_configs, &source, &wc.sort_by);
-
-                raw_requests.push(RawIndexRequest {
-                    source,
-                    group_by: wc.group_by.clone(),
-                    sort_by: wc.sort_by.clone(),
-                    arena_fields: arena_fields.into_iter().collect(),
-                    already_sorted,
-                    transform_index: i,
-                });
-            }
-        }
-
-        let indices = index::deduplicate_indices(raw_requests.clone());
-
-        // Build source DAG
-        let source_dag = build_source_dag(&source_configs, &window_configs, &primary_source)?;
-
-        // Build output projections
-        let output_projections = output_configs_owned
-            .iter()
-            .map(|o| OutputSpec {
-                name: o.name.clone(),
-                mapping: o.mapping.clone().unwrap_or_default(),
-                exclude: o.exclude.clone().unwrap_or_default(),
-                include_unmapped: o.include_unmapped,
-            })
-            .collect();
-
-        // --- Build the petgraph DAG ---
-        // Phase 1: Add all nodes. Phase 2: Wire all edges.
-        // Two-phase approach allows forward references and cycle detection.
-        let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
-        let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
-        let mut slug_set: HashSet<String> = HashSet::new();
-
-        // Helper to insert a node with slug uniqueness check
-        let add_node = |graph: &mut DiGraph<PlanNode, PlanEdge>,
-                        node: PlanNode,
-                        node_by_name: &mut HashMap<String, NodeIndex>,
-                        slug_set: &mut HashSet<String>|
-         -> Result<NodeIndex, PlanError> {
-            let slug = node.id_slug();
-            if !slug_set.insert(slug.clone()) {
-                return Err(PlanError::DuplicateIdSlug { slug });
-            }
-            let key = format!("{}.{}", node.type_tag(), node.name());
-            let idx = graph.add_node(node);
-            node_by_name.insert(key, idx);
-            Ok(idx)
-        };
-
-        // --- Phase 1: Add all nodes ---
-
-        // Task 16b.8 — map node name → 1-based YAML source line, used
-        // to populate `PlanNode.span` via `Span::line_only`. Built once
-        // per compile() from `config.nodes`, which carries
-        // `Spanned<PipelineNode>` entries whose `referenced.line()`
-        // is the saphyr-reported source line.
-        let line_by_name: HashMap<String, u32> = config
-            .nodes
-            .iter()
-            .map(|s| (s.value.name().to_string(), s.referenced.line() as u32))
-            .collect();
-        let span_for = |name: &str| -> Span {
-            line_by_name
-                .get(name)
-                .copied()
-                .filter(|l| *l > 0)
-                .map(Span::line_only)
-                // (c) serde-saphyr loses the top-level Mapping line
-                // when a `#[serde(tag = ...)] + #[serde(flatten)]` node
-                // header is parsed; fall back to synthetic rather than
-                // fabricating a bogus line.
-                .unwrap_or(Span::SYNTHETIC)
-        };
-
-        // Source nodes
-        for input in &source_configs {
-            add_node(
-                &mut graph,
-                PlanNode::Source {
-                    name: input.name.clone(),
-                    span: span_for(&input.name),
-                    resolved: None,
-                },
-                &mut node_by_name,
-                &mut slug_set,
-            )?;
-        }
-
-        // Transform nodes in declaration order (deterministic toposort per V-7-2)
-        for (i, tc) in specs.iter().enumerate() {
-            let analysis = &report.transforms[i];
-            let wc = &window_configs[i];
-            let parallelism_class = derive_parallelism_class(analysis, wc, &primary_source);
-
-            let execution_reqs = if wc.is_some() {
-                NodeExecutionReqs::RequiresArena
-            } else {
-                NodeExecutionReqs::Streaming
-            };
-
-            let window_index = if let Some(wc) = wc {
-                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
-                index::find_index_for(&indices, &source, &wc.group_by, &wc.sort_by)
-            } else {
-                None
-            };
-
-            let partition_lookup = wc.as_ref().map(|wc| {
-                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
-                if source == primary_source && wc.on.is_none() {
-                    PartitionLookupKind::SameSource
-                } else {
-                    PartitionLookupKind::CrossSource {
-                        on_expr: wc.on.clone(),
-                    }
-                }
-            });
-
-            // Extract the per-transform write set from the matching CXL
-            // TypedProgram. The `compiled` slice is in the same declaration
-            // order as `crate::executor::build_transform_specs(config)` (see analyzer::analyze_all).
-            let write_set = extract_write_set(compiled[i].1);
-            let has_distinct = extract_has_distinct(compiled[i].1);
-
-            // ── Phase 16 Task 16.3.6: route aggregate transforms to
-            //    `PlanNode::Aggregation` instead of `PlanNode::Transform`.
-            //    D4: aggregates use a single dedicated plan node. D6:
-            //    routes and multi-input merges are forbidden on aggregates.
-            // Convert the spec's 1-based source line to a
-            // `Span::line_only` so `--explain`'s annotation pass can
-            // render `(line:N)` against this node.
-            //
-            // (c) Zero line means the spec was built from a saphyr
-            // tagged-enum/flatten edge case where the YAML location is
-            // UNKNOWN; no real span is recoverable at this layer.
-            let spec_span = if tc.line > 0 {
-                Span::line_only(tc.line)
-            } else {
-                Span::SYNTHETIC
-            };
-            if let Some(agg_cfg) = tc.aggregate.as_ref() {
-                if tc.route.is_some() {
-                    return Err(PlanError::AggregateWithRoute {
-                        transform: tc.name.clone(),
-                    });
-                }
-                if matches!(tc.input, ResolvedInput::Multi(_)) {
-                    return Err(PlanError::AggregateWithMultipleInputs {
-                        transform: tc.name.clone(),
-                    });
-                }
-
-                let typed = compiled[i].1;
-                // Synthetic input schema: deterministic ordering of every
-                // field referenced by the CXL program. Task 16.3.13 will
-                // reconcile this with the upstream node's true schema; for
-                // unit-test scope the projection is the identity since the
-                // executor projects records into this same order before
-                // passing them into the hash aggregator.
-                // Phase 16b Task 16b.9: prefer the runtime Arrow
-                // schema when available. `typed.field_types` now comes
-                // from the author-declared source schema which may
-                // contain columns not present in the actual file; the
-                // aggregator projects records by positional index, so
-                // group_by_indices must be resolved against the
-                // runtime layout, not the declared superset.
-                let input_schema: Vec<String> = match runtime_input_schema {
-                    Some(rt) => rt.to_vec(),
-                    // Phase Combine C.1.0: `field_types` keys are now
-                    // `QualifiedField`. Aggregate never consumes qualified
-                    // upstream fields (combine's output row is bare per
-                    // drill D10), so `.name` is the correct projection.
-                    None => typed
-                        .field_types
-                        .keys()
-                        .map(|qf| qf.name.to_string())
-                        .collect(),
-                };
-
-                let compiled_agg =
-                    cxl::plan::extract_aggregates(typed, &agg_cfg.group_by, &input_schema)
-                        .map_err(|diags| PlanError::AggregateExtractionFailed {
-                            transform: tc.name.clone(),
-                            diagnostics: diags.into_iter().map(|d| d.message).collect(),
-                        })?;
-
-                // Output schema: non-meta emit names in declaration order.
-                let output_columns: Vec<Box<str>> = typed
-                    .program
-                    .statements
-                    .iter()
-                    .filter_map(|s| match s {
-                        Statement::Emit {
-                            name,
-                            is_meta: false,
-                            ..
-                        } => Some(name.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                let output_schema = Arc::new(Schema::new(output_columns));
-
-                add_node(
-                    &mut graph,
-                    PlanNode::Aggregation {
-                        name: tc.name.clone(),
-                        span: spec_span,
-                        config: agg_cfg.clone(),
-                        compiled: Arc::new(compiled_agg),
-                        strategy: AggregateStrategy::Hash,
-                        output_schema,
-                        fallback_reason: None,
-                        skipped_streaming_available: false,
-                        qualified_sort_order: None,
-                    },
-                    &mut node_by_name,
-                    &mut slug_set,
-                )?;
-
-                continue;
-            }
-
-            add_node(
-                &mut graph,
-                PlanNode::Transform {
-                    name: tc.name.clone(),
-                    span: spec_span,
-                    resolved: None,
-                    parallelism_class,
-                    tier: 0, // assigned later via BFS
-                    execution_reqs,
-                    window_index,
-                    partition_lookup,
-                    write_set,
-                    has_distinct,
-                },
-                &mut node_by_name,
-                &mut slug_set,
-            )?;
-
-            // Route node for this transform (if configured)
-            if let Some(ref rc) = tc.route {
-                add_node(
-                    &mut graph,
-                    PlanNode::Route {
-                        name: format!("route_{}", tc.name),
-                        span: spec_span,
-                        mode: rc.mode,
-                        branches: rc.branches.iter().map(|b| b.name.clone()).collect(),
-                        default: rc.default.clone(),
-                    },
-                    &mut node_by_name,
-                    &mut slug_set,
-                )?;
-            }
-
-            // Merge node for multiple inputs. Planner-synthesized:
-            // the merge PlanNode is emitted from the downstream
-            // consumer's span, since there is no source-level Merge
-            // declaration in this legacy code path (the `Multi`
-            // `ResolvedInput` was derived from the consumer's
-            // `inputs:` list upstream).
-            if let ResolvedInput::Multi(_) = &tc.input {
-                add_node(
-                    &mut graph,
-                    PlanNode::Merge {
-                        name: format!("merge_{}", tc.name),
-                        span: spec_span,
-                    },
-                    &mut node_by_name,
-                    &mut slug_set,
-                )?;
-            }
-        }
-
-        // Output nodes
-        for output in &output_configs_owned {
-            add_node(
-                &mut graph,
-                PlanNode::Output {
-                    name: output.name.clone(),
-                    span: span_for(&output.name),
-                    resolved: None,
-                },
-                &mut node_by_name,
-                &mut slug_set,
-            )?;
-        }
-
-        // Combine nodes (Phase Combine C.0.4). `build_specs` skips
-        // `PipelineNode::Combine` deliberately — combine does not lower
-        // to a `PlanTransformSpec`, so the spec-driven loops above never
-        // emit a `PlanNode::Combine`. Walk `config.nodes` directly here
-        // for the structural Phase-1 insertion; Phase-2 below wires edges
-        // paralleling the Merge block. `lower_node_to_plan_node`'s
-        // Combine arm (config/mod.rs) is the authoritative source for
-        // the non-topological fields — inline the same construction so
-        // both the `PipelineConfig::compile_with_diagnostics` path (which
-        // uses `lower_node_to_plan_node` directly) and this legacy
-        // `ExecutionPlanDag::compile_with_runtime_schema` path emit the
-        // same `PlanNode::Combine` shape at C.0. C.1 bind_schema
-        // populates the CompileArtifacts side-tables; neither the
-        // strategy default nor the driving_input is final at C.0 —
-        // both are overwritten by the C.2 post-pass.
-        {
-            use crate::config::PipelineNode;
-            use crate::plan::combine::CombineStrategy;
-            for spanned in &config.nodes {
-                if let PipelineNode::Combine {
-                    header,
-                    config: body,
-                } = &spanned.value
-                {
-                    add_node(
-                        &mut graph,
-                        PlanNode::Combine {
-                            name: header.name.clone(),
-                            span: span_for(&header.name),
-                            strategy: CombineStrategy::HashBuildProbe,
-                            driving_input: String::new(),
-                            match_mode: body.match_mode,
-                            on_miss: body.on_miss,
-                            decomposed_from: None,
-                        },
-                        &mut node_by_name,
-                        &mut slug_set,
-                    )?;
-                }
-            }
-        }
-
-        // --- Phase 2: Wire all edges ---
-        let mut prev_transform_key: Option<String> = None;
-
-        for (i, tc) in specs.iter().enumerate() {
-            let wc = &window_configs[i];
-            // Aggregate transforms register under `aggregation.{name}` instead
-            // of `transform.{name}` (Phase 16 Task 16.3.6).
-            let transform_key = if tc.aggregate.is_some() {
-                format!("aggregation.{}", tc.name)
-            } else {
-                format!("transform.{}", tc.name)
-            };
-            let transform_idx = node_by_name[&transform_key];
-
-            // Wire edges from input: or implicit linear chain
-            match &tc.input {
-                ResolvedInput::Single(upstream) => {
-                    let upstream_idx =
-                        resolve_input_reference(upstream, &node_by_name, &tc.name, &specs)?;
-                    graph.add_edge(
-                        upstream_idx,
-                        transform_idx,
-                        PlanEdge {
-                            dependency_type: DependencyType::Data,
-                        },
-                    );
-                }
-                ResolvedInput::Multi(upstreams) => {
-                    let merge_key = format!("merge.merge_{}", tc.name);
-                    let merge_idx = node_by_name[&merge_key];
-                    for upstream in upstreams {
-                        let upstream_idx =
-                            resolve_input_reference(upstream, &node_by_name, &tc.name, &specs)?;
-                        graph.add_edge(
-                            upstream_idx,
-                            merge_idx,
-                            PlanEdge {
-                                dependency_type: DependencyType::Data,
-                            },
-                        );
-                    }
-                    graph.add_edge(
-                        merge_idx,
-                        transform_idx,
-                        PlanEdge {
-                            dependency_type: DependencyType::Data,
-                        },
-                    );
-                }
-                ResolvedInput::Chain => {
-                    // Implicit linear chain: wire to previous transform or source
-                    if let Some(ref prev_key) = prev_transform_key
-                        && let Some(&prev_idx) = node_by_name.get(prev_key)
-                    {
-                        graph.add_edge(
-                            prev_idx,
-                            transform_idx,
-                            PlanEdge {
-                                dependency_type: DependencyType::Data,
-                            },
-                        );
-                    } else if prev_transform_key.is_none() {
-                        // First transform: wire to primary source
-                        let source_key = format!("source.{}", primary_source);
-                        if let Some(&source_idx) = node_by_name.get(&source_key) {
-                            graph.add_edge(
-                                source_idx,
-                                transform_idx,
-                                PlanEdge {
-                                    dependency_type: DependencyType::Data,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Cross-source Index edges from window configs
-            if let Some(wc) = wc {
-                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
-                if source != primary_source {
-                    let source_key = format!("source.{}", source);
-                    if let Some(&source_idx) = node_by_name.get(&source_key) {
-                        graph.add_edge(
-                            source_idx,
-                            transform_idx,
-                            PlanEdge {
-                                dependency_type: DependencyType::Index,
-                            },
-                        );
-                    }
-                }
-            }
-
-            // Wire transform → route if configured
-            if tc.route.is_some() {
-                let route_key = format!("route.route_{}", tc.name);
-                let route_idx = node_by_name[&route_key];
-                graph.add_edge(
-                    transform_idx,
-                    route_idx,
-                    PlanEdge {
-                        dependency_type: DependencyType::Data,
-                    },
-                );
-            }
-
-            prev_transform_key = Some(transform_key);
-        }
-
-        // Wire output nodes to last transform
-        for output in &output_configs_owned {
-            let output_key = format!("output.{}", output.name);
-            let output_idx = node_by_name[&output_key];
-
-            if let Some(ref prev_key) = prev_transform_key
-                && let Some(&prev_idx) = node_by_name.get(prev_key)
-            {
-                graph.add_edge(
-                    prev_idx,
-                    output_idx,
-                    PlanEdge {
-                        dependency_type: DependencyType::Data,
-                    },
-                );
-            }
-        }
-
-        // Combine edges (Phase Combine C.0.4). Parallels the Merge
-        // edge-wiring block above: for each entry in the combine
-        // header's named `input:` map, add one `DependencyType::Data`
-        // edge from the resolved upstream `NodeIndex` to the combine
-        // node. Per drill D5 the qualifier string is NOT stored on the
-        // edge — qualifier→NodeIndex mapping lives on
-        // `CompileArtifacts.combine_inputs` (populated at C.1 by
-        // bind_schema). Resolution uses `resolve_any_node` (RESOLUTION
-        // W-2) because combine inputs can reference any producer type
-        // (source, transform, aggregation, route, merge, output,
-        // composition, or another combine) — not just the
-        // transform-like set `resolve_input_reference` handles. E307
-        // fires when the upstream is undeclared.
-        {
-            use crate::config::PipelineNode;
-            use crate::config::node_header::NodeInput;
-            for spanned in &config.nodes {
-                if let PipelineNode::Combine { header, .. } = &spanned.value {
-                    let combine_key = format!("combine.{}", header.name);
-                    let combine_idx = node_by_name[&combine_key];
-                    for (qualifier, node_input) in &header.input {
-                        let upstream_name: String = match &node_input.value {
-                            NodeInput::Single(s) => s.clone(),
-                            // Mirrors the `resolve_header_input` helper in
-                            // `build_specs` (execution.rs ~line 364): a
-                            // `node.port` reference flattens to a dotted
-                            // key so it can round-trip through
-                            // `resolve_any_node`'s bare-name lookup and
-                            // be found by route-branch fallback callers.
-                            NodeInput::Port { node, port } => format!("{node}.{port}"),
-                        };
-                        let upstream_idx = resolve_any_node(&upstream_name, &node_by_name)
-                            .ok_or_else(|| {
-                                // Pre-C.1: field-level span on the offending
-                                // input reference. The serde-saphyr span is
-                                // converted to a `line_only` synthetic span
-                                // because we don't thread a `SourceDb`
-                                // through the planner here — `line_only`
-                                // is the in-house convention (see
-                                // `crate::span::Span::line_only`) for
-                                // "we know the line but not the file-byte
-                                // offset." The full byte range is available
-                                // via `node_input.referenced` for callers
-                                // that can promote it.
-                                let line = node_input.referenced.line() as u32;
-                                let span = if line > 0 {
-                                    crate::span::Span::line_only(line)
-                                } else {
-                                    crate::span::Span::SYNTHETIC
-                                };
-                                PlanError::CombineInputUndeclared {
-                                    combine: header.name.clone(),
-                                    qualifier: qualifier.clone(),
-                                    reference: upstream_name.clone(),
-                                    span,
-                                }
-                            })?;
-                        graph.add_edge(
-                            upstream_idx,
-                            combine_idx,
-                            PlanEdge {
-                                dependency_type: DependencyType::Data,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        // Topological sort with cycle detection
-        let topo_order = toposort(&graph, None).map_err(|cycle| {
-            // Extract cycle path using DFS
-            let cycle_path = extract_cycle_path(&graph, cycle.node_id());
-            PlanError::CycleDetected { path: cycle_path }
-        })?;
-
-        // Assign tiers via BFS: each node's tier = max(predecessor tiers) + 1
-        assign_tiers(&mut graph, &topo_order);
-
-        // Build parallelism profile from DAG graph nodes
-        let parallelism = ParallelismProfile {
-            per_transform: topo_order
-                .iter()
-                .filter_map(|&idx| match &graph[idx] {
-                    PlanNode::Transform {
-                        parallelism_class, ..
-                    } => Some(*parallelism_class),
-                    _ => None,
-                })
-                .collect(),
-            worker_threads: config
-                .pipeline
-                .concurrency
-                .as_ref()
-                .and_then(|c| c.threads)
-                .unwrap_or(4),
-        };
-
-        let mut dag = ExecutionPlanDag {
-            graph,
-            topo_order,
-            source_dag,
-            indices_to_build: indices,
-            output_projections,
-            parallelism,
-            correlation_sort_note: None,
-            node_properties: HashMap::new(),
-        };
-
-        // Task 16.0.5.10: enforcer-insertion → property derivation, in that
-        // order, exactly once, before the executor sees the DAG. D50 mandates
-        // a single sequential call chain with explicit intermediate binding
-        // (not a type-state newtype). `insert_enforcer_sorts` is structurally
-        // idempotent (prefix-guarded) and `compute_node_properties` asserts
-        // its own double-call guard, so this pair is safe but must run in
-        // order: properties derived from a DAG missing enforcer Sorts would
-        // mis-attribute ordering provenance.
-        let inputs_map: HashMap<String, SourceConfig> = source_configs
-            .iter()
-            .map(|i| (i.name.clone(), i.clone()))
-            .collect();
-        // Pipeline-level policy injection (correlation key for failure-domain
-        // DLQ batching) runs first: it materializes a `PlanNode::Sort` from
-        // declared config, distinct from per-operator algorithm requirements.
-        // See docs/research/RESEARCH-pipeline-correlation-key-placement.md.
-        dag.inject_correlation_sort(&config.error_handling, &source_configs)
-            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
-        dag.insert_enforcer_sorts(&inputs_map)
-            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
-        // Enforcer may have grown the graph; re-derive topo + tiers before
-        // property derivation walks it.
-        dag.topo_order = toposort(&dag.graph, None).map_err(|cycle| {
-            let cycle_path = extract_cycle_path(&dag.graph, cycle.node_id());
-            PlanError::CycleDetected { path: cycle_path }
-        })?;
-        assign_tiers(&mut dag.graph, &dag.topo_order);
-        dag.compute_node_properties(&inputs_map)
-            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
-        // Task 16.4.9: post-pass that resolves the user `strategy` hint on
-        // each `PlanNode::Aggregation` against upstream `OrderingProvenance`
-        // and rewrites the node's stored ordering provenance accordingly.
-        // DataFusion `PhysicalOptimizerRule` pattern: a frozen-plan walk
-        // that mutates only the strategy + side-table ordering, never the
-        // graph topology.
-        dag.select_aggregation_strategies()
-            .map_err(|e| PlanError::PropertyDerivation(e.to_string()))?;
-
-        Ok(dag)
     }
 
     /// Format the execution plan for `--explain` display.
@@ -1849,94 +1110,6 @@ struct NodeEntry<'a> {
     #[serde(flatten)]
     node: &'a PlanNode,
     depends_on: &'a Vec<String>,
-}
-
-/// Resolve an input reference to a NodeIndex.
-///
-/// Handles both plain transform names ("transform_name") and
-/// dotted branch references ("categorize.high_value").
-fn resolve_input_reference(
-    reference: &str,
-    node_by_name: &HashMap<String, NodeIndex>,
-    current_transform: &str,
-    transforms: &[PlanTransformSpec],
-) -> Result<NodeIndex, PlanError> {
-    // Self-reference check
-    if reference == current_transform {
-        return Err(PlanError::SelfReference {
-            transform: current_transform.to_string(),
-        });
-    }
-
-    // Try plain transform reference first
-    let transform_key = format!("transform.{}", reference);
-    if let Some(&idx) = node_by_name.get(&transform_key) {
-        return Ok(idx);
-    }
-
-    // Try aggregate transform reference (Phase 16 Task 16.3.6)
-    let aggregation_key = format!("aggregation.{}", reference);
-    if let Some(&idx) = node_by_name.get(&aggregation_key) {
-        return Ok(idx);
-    }
-
-    // Try dotted branch reference: "route_name.branch_name" -> route node
-    if reference.contains('.') {
-        let parts: Vec<&str> = reference.splitn(2, '.').collect();
-        let route_key = format!("route.route_{}", parts[0]);
-        if let Some(&idx) = node_by_name.get(&route_key) {
-            return Ok(idx);
-        }
-    }
-
-    // Collect available transforms and branches for error message
-    let available: Vec<String> = transforms.iter().map(|t| t.name.clone()).collect();
-
-    Err(PlanError::InvalidInputReference {
-        reference: reference.to_string(),
-        transform: current_transform.to_string(),
-        available,
-    })
-}
-
-/// Resolve a node name to its `NodeIndex` by trying all node-type prefix
-/// conventions used by the DAG builder's `node_by_name` map.
-///
-/// Unlike [`resolve_input_reference`] — which only recognises
-/// transform-like prefixes (`transform.X`, `aggregation.X`, route branches)
-/// and consults a `&[PlanTransformSpec]` — this helper tries every
-/// producer-type prefix the planner registers: source, transform,
-/// aggregate, route, merge, output, composition, combine. Used by the
-/// Combine edge-wiring block (RESOLUTION W-2) because a combine input
-/// can reference any upstream producer regardless of type.
-///
-/// The unqualified bare-name lookup runs first for defensive coverage in
-/// case a caller has already namespaced its keys — the DAG builder at
-/// the call site always registers prefixed keys via `add_node`, so the
-/// prefix loop is the path that actually fires for combine wiring.
-///
-/// Returns `None` when no prefix match resolves; callers surface this as
-/// `PlanError::CombineInputUndeclared` (code E307).
-fn resolve_any_node(name: &str, node_by_name: &HashMap<String, NodeIndex>) -> Option<NodeIndex> {
-    if let Some(&idx) = node_by_name.get(name) {
-        return Some(idx);
-    }
-    for prefix in &[
-        "source.",
-        "transform.",
-        "aggregation.",
-        "route.",
-        "merge.",
-        "output.",
-        "composition.",
-        "combine.",
-    ] {
-        let key = format!("{prefix}{name}");
-        if let Some(&idx) = node_by_name.get(&key) {
-            return Some(idx);
-        }
-    }
-    None
 }
 
 /// Extract the cycle path from a DFS back-edge detection.

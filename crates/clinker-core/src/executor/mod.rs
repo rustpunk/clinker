@@ -696,27 +696,37 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Phase 16b Task 16b.9 — compile-time CXL typecheck.
-        // `config.compile()` drives the unified nodes: pipeline
-        // through stages 1-4 (topology/path validation), then the
-        // stage-4.5 `bind_schema` pass that typechecks every CXL
-        // body against the author-declared source schema and
-        // propagates emitted columns downstream. Type errors surface
-        // as E200 diagnostics here, BEFORE any file handle opens.
+        // Phase 16d: single canonical compile path.
+        //
+        // `PipelineConfig::compile(&ctx)` drives the unified nodes
+        // pipeline through stages 1-4 (topology/path validation),
+        // stage 4.4 (workspace composition scan), stage 4.5 (CXL
+        // typecheck via `bind_schema`), and stage 5 (per-variant
+        // lowering + full enrichment: source DAG / indices / output
+        // projections / parallelism / correlation-sort / enforcer-
+        // sort / node properties / aggregation-strategy / combine-
+        // strategy post-passes). The runtime `ExecutionPlanDag` comes
+        // straight off `validated_plan.dag()` — no re-compile.
+        //
+        // `runtime_input_schema` threads the live column layout into
+        // `CompileContext` so the Aggregate lowering arm resolves
+        // `group_by_indices` against the real file columns rather
+        // than the author-declared source schema (which may be a
+        // superset). See LD-16d-1.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        // Phase 16b Task 16b.9: ALL CXL typechecking happens at
-        // `config.compile()` time via the `bind_schema` stage-4.5 pass.
-        // The runtime never re-typechecks; it pulls each transform's
-        // pre-typechecked `Arc<TypedProgram>` straight from the
-        // `CompiledPlan`'s artifacts map, keyed by node name. There is
-        // no second typecheck pass — `compile_transforms` is gone.
-        let _ = &schema;
-        let validated_plan = config
-            .compile(&crate::config::CompileContext::default())
-            .map_err(|diags| PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: diags.iter().map(|d| d.message.clone()).collect(),
-            })?;
+        let runtime_input_schema: Vec<String> =
+            schema.columns().iter().map(|c| c.to_string()).collect();
+        let compile_ctx = crate::config::CompileContext {
+            runtime_input_schema: Some(runtime_input_schema),
+            ..crate::config::CompileContext::default()
+        };
+        let validated_plan =
+            config
+                .compile(&compile_ctx)
+                .map_err(|diags| PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: diags.iter().map(|d| d.message.clone()).collect(),
+                })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
         let compiled_transforms: Vec<CompiledTransform> = resolved_transforms
@@ -767,23 +777,7 @@ impl PipelineExecutor {
             }
         };
 
-        // Build ExecutionPlanDag to determine mode
-        let compiled_refs: Vec<(&str, &TypedProgram)> = compiled_transforms
-            .iter()
-            .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
-            .collect();
-
-        let runtime_input_schema: Vec<String> =
-            schema.columns().iter().map(|c| c.to_string()).collect();
-        let plan = ExecutionPlanDag::compile_with_runtime_schema(
-            config,
-            &compiled_refs,
-            Some(&runtime_input_schema),
-        )
-        .map_err(|e| PipelineError::Compilation {
-            transform_name: String::new(),
-            messages: vec![e.to_string()],
-        })?;
+        let plan = validated_plan.dag();
         collector.record(compile_timer.finish(0, 0));
 
         let execution_summary = plan.execution_summary();
@@ -812,7 +806,7 @@ impl PipelineExecutor {
             writers,
             &compiled_transforms,
             compiled_route,
-            &plan,
+            plan,
             params,
             &mut collector,
             lookup_tables,
@@ -3073,26 +3067,60 @@ impl PipelineExecutor {
                         .collect();
 
                     // Build branch_name -> successor NodeIndex mapping.
-                    // A successor transform's `input:` field is "route_parent.branch_name".
-                    // Extract the route parent name from this Route node's name
-                    // (which is "route_{parent_transform}").
+                    //
+                    // Under the unified taxonomy (Phase 16d canonical path), a
+                    // `PlanNode::Route` is a first-class node named as the
+                    // user wrote it in YAML (e.g. `classify_route`). Successors
+                    // may be Transforms, Aggregates, Outputs, or Compositions —
+                    // any node whose `input:` is declared as
+                    // `<route_name>.<branch>` (NodeInput::Port form). We
+                    // can't use `build_transform_specs` alone because it
+                    // excludes Outputs and Compositions.
+                    //
+                    // Walk `config.nodes` once, read each node's
+                    // `header.input`, match against `<route_parent>.<branch>`,
+                    // and map the branch to the successor's NodeIndex.
                     let route_parent = name.strip_prefix("route_").unwrap_or(name);
-                    let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
+                    let mut succ_by_name: HashMap<String, NodeIndex> = HashMap::new();
                     for &succ in &successors {
-                        let succ_name = plan.graph[succ].name();
-                        // Check config transforms for matching input reference
-                        for tc in crate::executor::build_transform_specs(config) {
-                            if tc.name == succ_name
-                                && let Some(crate::config::TransformInput::Single(ref input_ref)) =
-                                    tc.input
-                            {
-                                // input_ref is "parent.branch" or just "parent"
-                                if let Some(branch) =
-                                    input_ref.strip_prefix(&format!("{}.", route_parent))
-                                {
-                                    branch_to_succ.insert(branch.to_string(), succ);
-                                }
+                        succ_by_name.insert(plan.graph[succ].name().to_string(), succ);
+                    }
+                    let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
+                    for spanned in &config.nodes {
+                        use crate::config::PipelineNode;
+                        use crate::config::node_header::NodeInput;
+                        let (node_name, input_ref) = match &spanned.value {
+                            PipelineNode::Transform { header, .. }
+                            | PipelineNode::Aggregate { header, .. }
+                            | PipelineNode::Route { header, .. }
+                            | PipelineNode::Output { header, .. } => {
+                                let ir = match &header.input.value {
+                                    NodeInput::Single(s) => s.clone(),
+                                    NodeInput::Port { node, port } => format!("{node}.{port}"),
+                                };
+                                (header.name.clone(), ir)
                             }
+                            _ => continue,
+                        };
+                        // Port form: "<route>.<branch>" — branch name comes
+                        // from the port suffix. Standard for named branches
+                        // on routes with multiple downstream consumers per
+                        // branch.
+                        if let Some(branch) = input_ref.strip_prefix(&format!("{}.", route_parent))
+                            && let Some(&succ) = succ_by_name.get(&node_name)
+                        {
+                            branch_to_succ.insert(branch.to_string(), succ);
+                            continue;
+                        }
+                        // Bare form: `input: <route>` on an Output whose
+                        // *name* matches a Route branch (or the Route
+                        // `default:`). Conventional shorthand when each
+                        // branch has exactly one downstream consumer and
+                        // the consumer's name is the branch name.
+                        if input_ref == route_parent
+                            && let Some(&succ) = succ_by_name.get(&node_name)
+                        {
+                            branch_to_succ.insert(node_name.clone(), succ);
                         }
                     }
 
@@ -3158,31 +3186,40 @@ impl PipelineExecutor {
                 }
 
                 PlanNode::Merge { ref name, .. } => {
-                    // Concatenate predecessor buffers in declaration order.
-                    // Declaration order = order in the `input:` array of the
-                    // merge's downstream transform.
+                    // Concatenate predecessor buffers in declaration order —
+                    // the order appearing in the Merge's `inputs:` YAML
+                    // array, which is stable across compile runs. Under
+                    // the unified taxonomy a Merge is a first-class node
+                    // (no "merge_<transform>" synthesis) so we read the
+                    // order straight off `PipelineNode::Merge.header.inputs`.
                     let predecessors: Vec<NodeIndex> = plan
                         .graph
                         .neighbors_directed(node_idx, Direction::Incoming)
                         .collect();
 
-                    // The Merge node is named "merge_{transform}". Find the
-                    // transform's input: array to determine declaration order.
-                    let merge_transform_name = name.strip_prefix("merge_").unwrap_or(name);
-                    let declaration_order: Vec<String> =
-                        crate::executor::build_transform_specs(config)
-                            .into_iter()
-                            .find(|tc| tc.name == merge_transform_name)
-                            .and_then(|tc| {
-                                if let Some(crate::config::TransformInput::Multiple(ref inputs)) =
-                                    tc.input
-                                {
-                                    Some(inputs.clone())
-                                } else {
-                                    None
-                                }
+                    let declaration_order: Vec<String> = {
+                        use crate::config::PipelineNode;
+                        use crate::config::node_header::NodeInput;
+                        config
+                            .nodes
+                            .iter()
+                            .find_map(|spanned| match &spanned.value {
+                                PipelineNode::Merge { header, .. } if header.name == *name => Some(
+                                    header
+                                        .inputs
+                                        .iter()
+                                        .map(|ni| match &ni.value {
+                                            NodeInput::Single(s) => s.clone(),
+                                            NodeInput::Port { node, port } => {
+                                                format!("{node}.{port}")
+                                            }
+                                        })
+                                        .collect(),
+                                ),
+                                _ => None,
                             })
-                            .unwrap_or_default();
+                            .unwrap_or_default()
+                    };
 
                     // Sort predecessors by declaration order
                     let mut sorted_preds = predecessors.clone();
@@ -3494,7 +3531,14 @@ impl PipelineExecutor {
                             .unwrap_or_default()
                     };
 
-                    // Count ok records
+                    // Count ok records — one per output WRITE. Under
+                    // inclusive Route fan-out, an input record that
+                    // matches N branches reaches N outputs and counts
+                    // N times. This aligns `ok_count` with
+                    // `records_emitted` and matches the DAG-walk's
+                    // per-node buffer semantics (Phase 16d canonical
+                    // runtime). The `test_branch_inclusive_duplication`
+                    // suite asserts this convention.
                     let output_record_count = input_records.len() as u64;
                     counters.ok_count += output_record_count;
                     records_emitted += output_record_count;
@@ -3830,43 +3874,24 @@ impl PipelineExecutor {
 
     /// Compile execution plan and return the DAG for format-specific rendering.
     ///
-    /// Phase 16b Task 16b.9: drives `config.compile()` so the
-    /// stage-4.5 `bind_schema` pass produces the typed programs;
-    /// `--explain` no longer parses CXL twice.
+    /// Phase 16d: `PipelineConfig::compile(&ctx)` is the single
+    /// canonical compile entry point. It produces a fully-enriched
+    /// `ExecutionPlanDag` via `bind_schema` (stage 4.5) and stage 5
+    /// lowering + enrichment. The runtime schema is not available
+    /// here (this path serves `--explain` which runs before readers
+    /// open), so `CompileContext::runtime_input_schema` stays
+    /// `None` — Aggregate lowering falls back to the author-declared
+    /// schema, which is fine for explain output.
     pub(crate) fn explain_dag(
         config: &PipelineConfig,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
-        // Phase 16b Task 16b.9 — compile-time typecheck via bind_schema.
-        // The validated plan gives us pre-typechecked `Arc<TypedProgram>`s
-        // per node; feed them straight into `ExecutionPlanDag::compile`
-        // (the full planner path that derives output projections,
-        // parallelism profiles, and physical properties) WITHOUT
-        // re-typechecking.
         let validated_plan = config
             .compile(&crate::config::CompileContext::default())
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),
             })?;
-        let resolved_transforms_owned = crate::executor::build_transform_specs(config);
-        let compiled_refs: Vec<(&str, &TypedProgram)> = resolved_transforms_owned
-            .iter()
-            .map(|t| {
-                let typed = validated_plan
-                    .artifacts()
-                    .typed
-                    .get(&t.name)
-                    .expect("bind_schema must produce a typed program for every transform");
-                (t.name.as_str(), typed.as_ref())
-            })
-            .collect();
-        let plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
-            PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![e.to_string()],
-            }
-        })?;
-        Ok((plan, ()))
+        Ok((validated_plan.dag().clone(), ()))
     }
 }
 

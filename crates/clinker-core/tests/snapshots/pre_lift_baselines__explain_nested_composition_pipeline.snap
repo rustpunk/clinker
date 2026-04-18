@@ -8,12 +8,18 @@ Mode: Streaming
 Indices to build: 0
 Transforms: 0
 Output projections: 1
-DAG nodes: 2
+DAG nodes: 3
 
 Source DAG:
   Tier 0: raw_src
 
 === Physical Properties ===
+
+composition.nested_process:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
 
 output.final_out:
   ordering: <none>
@@ -39,5 +45,6 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [output] final_out (line:29)
+  ● [composition:body=<ID>] nested_process (line:20)
+  │ [output] final_out (line:29)
   ● [source] raw_src (line:7)

@@ -8,7 +8,7 @@ Mode: Streaming
 Indices to build: 0
 Transforms: 0
 Output projections: 1
-DAG nodes: 3
+DAG nodes: 4
 
 Source DAG:
   Tier 0: customers_src, addresses_src
@@ -16,6 +16,12 @@ Source DAG:
 === Physical Properties ===
 
 output.enriched_out:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+composition.addr_norm:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -46,5 +52,6 @@ Worker threads: 4
 === DAG Topology ===
 
   ● [output] enriched_out (line:48)
+  ● [composition:body=<ID>] addr_norm (line:39)
   ● [source] addresses_src (line:17)
   ● [source] customers_src (line:7)

@@ -8,12 +8,18 @@ Mode: Streaming
 Indices to build: 0
 Transforms: 0
 Output projections: 1
-DAG nodes: 2
+DAG nodes: 3
 
 Source DAG:
   Tier 0: ingest_src
 
 === Physical Properties ===
+
+composition.enrich1:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
 
 output.sink:
   ordering: <none>
@@ -39,5 +45,6 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [output] sink (line:28)
+  ● [composition:body=<ID>] enrich1 (line:18)
+  │ [output] sink (line:28)
   ● [source] ingest_src (line:7)

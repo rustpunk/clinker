@@ -1146,6 +1146,68 @@ impl PipelineConfig {
             ));
         }
 
+        // ── Stage 3.5: invalid input references (E300) ──────────────
+        // Every node's declared `input:` / `inputs:` must resolve to
+        // another node in the pipeline. Stage 3 silently drops unknown
+        // edges during cycle detection, so this stage is the
+        // authoritative place to catch undeclared references for
+        // non-combine nodes. Combine emits E307 separately during
+        // stage-5 edge wiring (where the per-qualifier span is
+        // available).
+        let declared_names: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .map(|s| s.value.name().to_string())
+            .collect();
+        let strip_port = |r: &str| -> String {
+            r.split_once('.')
+                .map(|(n, _)| n.to_string())
+                .unwrap_or_else(|| r.to_string())
+        };
+        for spanned in &self.nodes {
+            let node = &spanned.value;
+            let consumer_name = node.name().to_string();
+            let check = |diags: &mut Vec<Diagnostic>, reference_full: &str| {
+                let key = strip_port(reference_full);
+                if !declared_names.contains(&key) {
+                    diags.push(Diagnostic::error(
+                        "E300",
+                        format!(
+                            "node {consumer_name:?} input {reference_full:?} references an undeclared node"
+                        ),
+                        span_for(spanned),
+                    ));
+                }
+            };
+            match node {
+                PipelineNode::Source { .. } | PipelineNode::Composition { .. } => {}
+                PipelineNode::Transform { header, .. }
+                | PipelineNode::Aggregate { header, .. }
+                | PipelineNode::Route { header, .. }
+                | PipelineNode::Output { header, .. } => {
+                    let producer = input_target(&header.input.value);
+                    check(&mut diags, producer);
+                }
+                PipelineNode::Merge { header, .. } => {
+                    for inp in &header.inputs {
+                        let producer = input_target(&inp.value);
+                        check(&mut diags, producer);
+                    }
+                }
+                PipelineNode::Combine { header, .. } => {
+                    for node_input in header.input.values() {
+                        let producer = input_target(&node_input.value);
+                        // E307 fires at stage 5 with per-qualifier span.
+                        // Here we only emit E300 for *truly* unknown
+                        // references so compile can short-circuit early
+                        // on typo-level errors. Skip: stage-5 already
+                        // handles combine E307.
+                        let _ = producer;
+                    }
+                }
+            }
+        }
+
         // ── Stage 4: path validation ────────────────────────────────
         // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
         // the legacy projection. Wave 2 walks `nodes:` directly.
@@ -1522,11 +1584,43 @@ impl PipelineConfig {
         }
 
         // Phase 2: wire edges from each consumer's input(s) to itself.
+        // Undeclared upstream references surface as E300 (invalid input
+        // reference) — stage-3 cycle detection silently drops unknown
+        // producers, so this is the authoritative place to catch them.
+        // Combine uses E307 (separately emitted below) because combine
+        // inputs can reference any producer type.
+        let available_names: Vec<String> = self
+            .nodes
+            .iter()
+            .map(|s| s.value.name().to_string())
+            .collect();
+        // Route ports are resolved via the `<route_name>.<branch>` dotted
+        // syntax — strip the port to get the node name for lookup.
+        let strip_port = |r: &str| -> String {
+            r.split_once('.')
+                .map(|(n, _)| n.to_string())
+                .unwrap_or_else(|| r.to_string())
+        };
         for spanned in &self.nodes {
             let node = &spanned.value;
             let consumer_name = node.name();
             let Some(&consumer_idx) = name_to_idx.get(consumer_name) else {
                 continue;
+            };
+            let consumer_line = spanned.referenced.line() as u32;
+            let consumer_span = if consumer_line > 0 {
+                Span::line_only(consumer_line)
+            } else {
+                Span::SYNTHETIC
+            };
+            let emit_invalid_ref = |diags: &mut Vec<Diagnostic>, reference: &str| {
+                diags.push(Diagnostic::error(
+                    "E300",
+                    format!(
+                        "node {consumer_name:?} input {reference:?} references an undeclared node (available: {available_names:?})"
+                    ),
+                    LabeledSpan::primary(consumer_span, String::new()),
+                ));
             };
             match node {
                 PipelineNode::Source { .. } | PipelineNode::Composition { .. } => {}
@@ -1534,8 +1628,9 @@ impl PipelineConfig {
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. } => {
-                    let producer = input_target(&header.input.value);
-                    if let Some(&producer_idx) = name_to_idx.get(producer) {
+                    let producer_full = input_target(&header.input.value).to_string();
+                    let producer_key = strip_port(&producer_full);
+                    if let Some(&producer_idx) = name_to_idx.get(&producer_key) {
                         graph.add_edge(
                             producer_idx,
                             consumer_idx,
@@ -1543,12 +1638,15 @@ impl PipelineConfig {
                                 dependency_type: DependencyType::Data,
                             },
                         );
+                    } else if !available_names.contains(&producer_key) {
+                        emit_invalid_ref(&mut diags, &producer_full);
                     }
                 }
                 PipelineNode::Merge { header, .. } => {
                     for inp in &header.inputs {
-                        let producer = input_target(&inp.value);
-                        if let Some(&producer_idx) = name_to_idx.get(producer) {
+                        let producer_full = input_target(&inp.value).to_string();
+                        let producer_key = strip_port(&producer_full);
+                        if let Some(&producer_idx) = name_to_idx.get(&producer_key) {
                             graph.add_edge(
                                 producer_idx,
                                 consumer_idx,
@@ -1556,21 +1654,20 @@ impl PipelineConfig {
                                     dependency_type: DependencyType::Data,
                                 },
                             );
+                        } else if !available_names.contains(&producer_key) {
+                            emit_invalid_ref(&mut diags, &producer_full);
                         }
                     }
                 }
                 // Phase Combine C.0.4: wire one Data edge per named input.
-                // Mirrors the Merge arm's silent-skip policy when a producer
-                // is not yet in `name_to_idx` — stage 3's topology validation
-                // already caught undeclared upstream refs with node-level
-                // spans, so a missed lookup here would be a double-report.
-                // The legacy path (`ExecutionPlanDag::compile_with_runtime_schema`
-                // in `plan/execution.rs`) emits E307 via `PlanError` and is
-                // the codepath exercised by the executor and the C.0.4 gate
-                // tests; this Stage 5 block keeps the two DAG-construction
-                // paths structurally in sync.
+                // Undeclared upstream references surface as **E307** — a
+                // combine node can reference any producer type (source,
+                // transform, aggregate, merge, composition, combine), and
+                // stage 3's cycle detector silently drops edges whose
+                // producer is not in the node set, so combine edge wiring
+                // is the authoritative place to catch these.
                 PipelineNode::Combine { header, .. } => {
-                    for node_input in header.input.values() {
+                    for (qualifier, node_input) in &header.input {
                         let producer = input_target(&node_input.value);
                         if let Some(&producer_idx) = name_to_idx.get(producer) {
                             graph.add_edge(
@@ -1580,6 +1677,21 @@ impl PipelineConfig {
                                     dependency_type: DependencyType::Data,
                                 },
                             );
+                        } else {
+                            let line = node_input.referenced.line() as u32;
+                            let offending_span = if line > 0 {
+                                Span::line_only(line)
+                            } else {
+                                Span::SYNTHETIC
+                            };
+                            diags.push(Diagnostic::error(
+                                "E307",
+                                format!(
+                                    "at line {line}: combine '{}' input '{qualifier}' references undeclared upstream '{producer}'",
+                                    node.name()
+                                ),
+                                LabeledSpan::primary(offending_span, String::new()),
+                            ));
                         }
                     }
                 }
