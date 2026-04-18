@@ -1301,7 +1301,7 @@ fn bind_combine(
     // hint; we still proceed with the rest of bind_combine so the user
     // sees any other diagnostics in one pass, but `combine_driving`
     // stays empty for this combine and the post-pass skips it.
-    if let Ok(driver) = select_driving_input(
+    if let Some(driver) = select_driving_input(
         &combine_inputs_entries,
         config.drive.as_deref(),
         name,

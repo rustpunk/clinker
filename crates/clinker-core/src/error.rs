@@ -46,6 +46,8 @@
 //! | `E309`      | error    | Combine output schema is empty                       |
 //! | `E310`      | error    | Combine runtime exceeded hard memory limit           |
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
+//! | `E312`      | error    | Combine has N>2 inputs (C.2 supports binary only)    |
+//! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
 //! | `W306`      | warning  | Combine planner cannot determine optimal driving input |

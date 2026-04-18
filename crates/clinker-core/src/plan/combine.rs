@@ -503,6 +503,161 @@ pub(crate) fn decompose_predicate(
 
 // ─── Plan-time strategy + driving-input selection (Phase Combine C.2.4) ─
 
+/// Cardinality threshold below which an input is considered "small" for
+/// the purposes of strategy selection. When every combine input has a
+/// cardinality estimate `<= SMALL_INPUT_THRESHOLD` and the predicate is
+/// pure-equality, the planner emits **W302** advising that
+/// `InMemoryHash` may be a better fit than `HashBuildProbe`.
+///
+/// 10,000 mirrors the C.2 module constants in
+/// `pipeline/combine.rs::COLLECT_PER_GROUP_CAP` and
+/// `MEMORY_CHECK_INTERVAL`. Aligned with DataFusion's small-side
+/// broadcast threshold (~10K rows in many practical configurations);
+/// configurable per-combine is a future knob (out of scope for C.2).
+pub(crate) const SMALL_INPUT_THRESHOLD: u64 = 10_000;
+
+/// Plan-time post-pass that finalizes every `PlanNode::Combine` in the
+/// DAG. Runs after `bind_schema` so that `CompileArtifacts` is fully
+/// populated. Mirrors `select_aggregation_strategies` in shape.
+///
+/// Per-combine work:
+///   1. **E312** — N>2 inputs are unsupported in C.2 (decomposition is
+///      Phase C.4). Emits the diagnostic and leaves the node's
+///      strategy/driving_input as construction defaults; downstream
+///      executor dispatch sees the unstamped placeholder and bails.
+///   2. **E313** — pure-range / pure-residual predicates have no
+///      equi-conjuncts and cannot run on `HashBuildProbe`. Phase C.3
+///      will downgrade this to a strategy switch (`SortMerge` /
+///      `IEJoin`); for C.2 it's a hard error.
+///   3. **W302** — pure-equi predicates with all inputs marked small
+///      (cardinality ≤ [`SMALL_INPUT_THRESHOLD`]) get an advisory
+///      hinting that `InMemoryHash` may be cheaper than
+///      `HashBuildProbe`. Non-fatal.
+///   4. Stamps `CombineStrategy::HashBuildProbe` and the driving
+///      qualifier (read from `artifacts.combine_driving`) onto the node.
+///      Combines whose driver selection failed at bind time (E306) are
+///      absent from `combine_driving` and skipped here — the prior
+///      diagnostic is the root cause.
+///
+/// Always runs to completion — the post-pass itself is infallible.
+/// Diagnostics accumulate in `diags`; callers (e.g.
+/// `compile_with_diagnostics`) inspect them to decide overall compile
+/// success.
+pub fn select_combine_strategies(
+    plan: &mut crate::plan::execution::ExecutionPlanDag,
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::plan::execution::PlanNode;
+    use petgraph::graph::NodeIndex;
+
+    let combine_nodes: Vec<(NodeIndex, String, Span)> = plan
+        .graph
+        .node_indices()
+        .filter_map(|idx| match &plan.graph[idx] {
+            PlanNode::Combine { name, span, .. } => Some((idx, name.clone(), *span)),
+            _ => None,
+        })
+        .collect();
+
+    for (idx, name, span) in combine_nodes {
+        let inputs = match artifacts.combine_inputs.get(&name) {
+            Some(i) => i,
+            None => continue,
+        };
+        let decomposed = match artifacts.combine_predicates.get(&name) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        if inputs.len() > 2 {
+            diags.push(combine_e312_nary_unsupported(&name, inputs.len(), span));
+            continue;
+        }
+        if decomposed.equalities.is_empty() {
+            diags.push(combine_e313_no_equi(&name, span));
+            continue;
+        }
+        if decomposed.ranges.is_empty()
+            && inputs
+                .values()
+                .all(|ci| matches!(ci.estimated_cardinality, Some(c) if c <= SMALL_INPUT_THRESHOLD))
+        {
+            diags.push(combine_w302_small_both(&name, span));
+        }
+
+        let driving = match artifacts.combine_driving.get(&name) {
+            Some(d) => d.clone(),
+            None => continue,
+        };
+
+        if let PlanNode::Combine {
+            strategy,
+            driving_input,
+            ..
+        } = &mut plan.graph[idx]
+        {
+            *strategy = CombineStrategy::HashBuildProbe;
+            *driving_input = driving;
+        }
+    }
+}
+
+/// E312 — combine has more than 2 inputs. C.2 supports binary combines
+/// only; N>2 is decomposed in C.4.
+fn combine_e312_nary_unsupported(combine_name: &str, input_count: usize, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E312",
+        format!(
+            "combine {combine_name:?} declares {input_count} inputs; C.2 supports binary \
+             combines only (N=2). N-ary combine decomposition lands in Phase C.4."
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "split the combine into a chain of 2-input combines, or wait for the C.4 N-ary \
+         decomposition pass",
+    )
+}
+
+/// E313 — combine `where:` predicate has no extractable equality
+/// conjuncts. `HashBuildProbe` requires at least one cross-input
+/// equality; pure-range predicates need `SortMerge` / `IEJoin`
+/// (Phase C.3).
+fn combine_e313_no_equi(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E313",
+        format!(
+            "combine {combine_name:?} where-clause has no equality conjuncts; \
+             `HashBuildProbe` requires at least one cross-input `==` comparison"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add a cross-input equality (e.g. `a.id == b.id`); pure-range predicates land in \
+         Phase C.3 (`SortMerge` / `IEJoin`)",
+    )
+}
+
+/// W302 — pure-equi combine where every input has a cardinality
+/// estimate at or below [`SMALL_INPUT_THRESHOLD`]. `InMemoryHash` may
+/// be cheaper; this is advisory only.
+fn combine_w302_small_both(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::warning(
+        "W302",
+        format!(
+            "combine {combine_name:?} has pure-equality predicates and all inputs are small \
+             (cardinality ≤ {SMALL_INPUT_THRESHOLD}); consider `InMemoryHash` for lower \
+             setup cost"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "InMemoryHash skips the build/probe pipeline split when both sides fit in RAM; \
+         opt in via the planner once C.3 wires the strategy override",
+    )
+}
+
 /// Pick the driving (probe) input for a combine node.
 ///
 /// Resolution order — universal across surveyed engines (DataFusion's
@@ -527,13 +682,13 @@ pub(crate) fn select_driving_input(
     combine_name: &str,
     span: Span,
     diags: &mut Vec<Diagnostic>,
-) -> Result<String, ()> {
+) -> Option<String> {
     if let Some(d) = explicit_drive {
         if inputs.contains_key(d) {
-            return Ok(d.to_string());
+            return Some(d.to_string());
         }
         diags.push(combine_e306_invalid_drive(combine_name, d, inputs, span));
-        return Err(());
+        return None;
     }
 
     if inputs.values().all(|ci| ci.estimated_cardinality.is_some()) {
@@ -544,18 +699,20 @@ pub(crate) fn select_driving_input(
             .iter()
             .max_by_key(|(_, ci)| ci.estimated_cardinality.unwrap())
             .expect("inputs non-empty (E300 guard upstream)");
-        return Ok(qualifier.clone());
+        return Some(qualifier.clone());
     }
 
     if inputs.len() >= 3 {
         diags.push(combine_w306_ambiguous_driver(combine_name, span));
     }
 
-    Ok(inputs
-        .keys()
-        .next()
-        .expect("inputs non-empty (E300 guard upstream)")
-        .clone())
+    Some(
+        inputs
+            .keys()
+            .next()
+            .expect("inputs non-empty (E300 guard upstream)")
+            .clone(),
+    )
 }
 
 /// E306 — explicit `drive:` hint references an input that is not
@@ -663,7 +820,7 @@ mod tests {
         let mut diags = Vec::new();
         let result =
             select_driving_input(&inputs, Some("ghost"), "c1", Span::SYNTHETIC, &mut diags);
-        assert!(result.is_err(), "invalid drive must return Err");
+        assert!(result.is_none(), "invalid drive must return None");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "E306");
     }
@@ -712,6 +869,201 @@ mod tests {
         assert_eq!(chosen, "a");
         assert_eq!(diags.len(), 1, "W306 fired");
         assert_eq!(diags[0].code, "W306");
+    }
+
+    fn synthetic_combine_plan(
+        inputs: Vec<(&str, Option<u64>)>,
+        equalities: usize,
+        ranges: usize,
+        with_driver: bool,
+    ) -> (
+        crate::plan::execution::ExecutionPlanDag,
+        crate::plan::bind_schema::CompileArtifacts,
+    ) {
+        use crate::config::pipeline_node::{MatchMode, OnMiss};
+        use crate::plan::bind_schema::CompileArtifacts;
+        use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+        use crate::span::Span;
+        use cxl::ast::{Expr, LiteralValue, NodeId};
+        use cxl::lexer::Span as CxlSpan;
+        use indexmap::IndexMap;
+
+        let combine_name = "test_combine";
+        let mut artifacts = CompileArtifacts::default();
+
+        let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
+        for (qual, card) in &inputs {
+            inputs_map.insert(
+                (*qual).to_string(),
+                CombineInput {
+                    upstream_name: Arc::from(*qual),
+                    row: Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+                    estimated_cardinality: *card,
+                },
+            );
+        }
+        artifacts
+            .combine_inputs
+            .insert(combine_name.to_string(), inputs_map);
+
+        if with_driver {
+            artifacts
+                .combine_driving
+                .insert(combine_name.to_string(), inputs[0].0.to_string());
+        }
+
+        let dummy_lit = || Expr::Literal {
+            node_id: NodeId(0),
+            value: LiteralValue::Int(0),
+            span: CxlSpan::new(0, 0),
+        };
+        let dummy_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: cxl::ast::Program {
+                statements: Vec::new(),
+                span: CxlSpan::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+        });
+        let mk_eq = || EqualityConjunct {
+            left_expr: dummy_lit(),
+            left_input: Arc::from(inputs[0].0),
+            left_program: Arc::clone(&dummy_program),
+            right_expr: dummy_lit(),
+            right_input: Arc::from(inputs.get(1).map(|(q, _)| *q).unwrap_or(inputs[0].0)),
+            right_program: Arc::clone(&dummy_program),
+        };
+        let mk_range = || RangeConjunct {
+            left_expr: dummy_lit(),
+            left_input: Arc::from(inputs[0].0),
+            op: RangeOp::Lt,
+            right_expr: dummy_lit(),
+            right_input: Arc::from(inputs.get(1).map(|(q, _)| *q).unwrap_or(inputs[0].0)),
+        };
+        let decomposed = DecomposedPredicate {
+            equalities: (0..equalities).map(|_| mk_eq()).collect(),
+            ranges: (0..ranges).map(|_| mk_range()).collect(),
+            residual: None,
+        };
+        artifacts
+            .combine_predicates
+            .insert(combine_name.to_string(), decomposed);
+
+        let mut graph = petgraph::graph::DiGraph::new();
+        graph.add_node(PlanNode::Combine {
+            name: combine_name.to_string(),
+            span: Span::SYNTHETIC,
+            strategy: CombineStrategy::HashBuildProbe,
+            driving_input: String::new(),
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::NullFields,
+            decomposed_from: None,
+        });
+        let plan = ExecutionPlanDag {
+            graph,
+            topo_order: Vec::new(),
+            source_dag: Vec::new(),
+            indices_to_build: Vec::new(),
+            output_projections: Vec::new(),
+            parallelism: crate::plan::execution::ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+            correlation_sort_note: None,
+            node_properties: std::collections::HashMap::new(),
+        };
+        (plan, artifacts)
+    }
+
+    fn first_combine(
+        plan: &crate::plan::execution::ExecutionPlanDag,
+    ) -> &crate::plan::execution::PlanNode {
+        plan.graph
+            .node_weights()
+            .find(|n| matches!(n, crate::plan::execution::PlanNode::Combine { .. }))
+            .expect("plan has a combine node")
+    }
+
+    #[test]
+    fn test_combine_strategy_selects_hash_build_probe() {
+        let (mut plan, artifacts) =
+            synthetic_combine_plan(vec![("orders", None), ("products", None)], 1, 0, true);
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        assert!(diags.is_empty(), "no diagnostics expected; got {diags:?}");
+        if let crate::plan::execution::PlanNode::Combine {
+            strategy,
+            driving_input,
+            ..
+        } = first_combine(&plan)
+        {
+            assert!(matches!(strategy, CombineStrategy::HashBuildProbe));
+            assert_eq!(driving_input, "orders");
+        } else {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_combine_strategy_e312_nary_unsupported() {
+        let (mut plan, artifacts) =
+            synthetic_combine_plan(vec![("a", None), ("b", None), ("c", None)], 1, 0, true);
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E312");
+        if let crate::plan::execution::PlanNode::Combine { driving_input, .. } =
+            first_combine(&plan)
+        {
+            assert!(driving_input.is_empty(), "no driver stamped on E312");
+        }
+    }
+
+    #[test]
+    fn test_combine_strategy_e313_no_equi() {
+        let (mut plan, artifacts) =
+            synthetic_combine_plan(vec![("orders", None), ("products", None)], 0, 1, true);
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E313");
+    }
+
+    #[test]
+    fn test_combine_strategy_w302_small_both_advisory() {
+        let (mut plan, artifacts) = synthetic_combine_plan(
+            vec![("orders", Some(100)), ("products", Some(500))],
+            1,
+            0,
+            true,
+        );
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "W302");
+        // Strategy still stamped — W302 is advisory.
+        if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
+            assert!(matches!(strategy, CombineStrategy::HashBuildProbe));
+        }
+    }
+
+    #[test]
+    fn test_combine_strategy_skips_when_no_driver() {
+        let (mut plan, artifacts) =
+            synthetic_combine_plan(vec![("orders", None), ("products", None)], 1, 0, false);
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        // E306 is the root cause and was already in diags before this pass;
+        // this pass should NOT add a new diagnostic for the missing driver.
+        assert!(diags.is_empty());
+        if let crate::plan::execution::PlanNode::Combine { driving_input, .. } =
+            first_combine(&plan)
+        {
+            assert!(driving_input.is_empty(), "no stamp without driver");
+        }
     }
 
     #[test]
