@@ -79,13 +79,26 @@ pub struct DecomposedPredicate {
 /// Stores full [`Expr`] pairs (drill D14), not field names — enables
 /// expression-based hash keys (e.g. `lower(orders.region) ==
 /// lower(products.region)`) from day one. C.2 `KeyExtractor` evaluates
-/// these `Expr` nodes at build/probe time.
+/// these `Expr` nodes at build/probe time via `cxl::eval::eval_expr`,
+/// which routes regex-cache lookups through the supplied
+/// [`TypedProgram`].
+///
+/// Both sides share a single [`Arc<TypedProgram>`] — the original
+/// where-clause program. The where-typecheck establishes regex caches
+/// over the entire predicate's `NodeId` range, and equality sub-`Expr`s
+/// preserve their original `NodeId`s (no re-resolve), so a single typed
+/// program covers both sides without re-compilation. Each side carries
+/// its own `Arc` clone (cheap atomic) to keep the consumer-facing shape
+/// symmetric and to leave room for per-side specialization in later
+/// phases (e.g. C.3 IEJoin's per-input compiled regex caches).
 #[derive(Debug, Clone)]
 pub struct EqualityConjunct {
     pub left_expr: Expr,
     pub left_input: Arc<str>,
+    pub left_program: Arc<TypedProgram>,
     pub right_expr: Expr,
     pub right_input: Arc<str>,
+    pub right_program: Arc<TypedProgram>,
 }
 
 /// Range conjunct between two inputs with an operator.
@@ -306,7 +319,7 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
 /// lower(b.name)` classifies as equality because each side's qualifier
 /// set has exactly one element (drill D5, matches DataFusion
 /// `EquijoinPredicate`).
-fn classify_conjunct(conjunct: &Expr) -> ConjunctClass {
+fn classify_conjunct(conjunct: &Expr, typed: &Arc<TypedProgram>) -> ConjunctClass {
     let Expr::Binary { op, lhs, rhs, .. } = conjunct else {
         return ConjunctClass::Residual;
     };
@@ -337,8 +350,10 @@ fn classify_conjunct(conjunct: &Expr) -> ConjunctClass {
         None => ConjunctClass::Equality(EqualityConjunct {
             left_expr,
             left_input,
+            left_program: Arc::clone(typed),
             right_expr,
             right_input,
+            right_program: Arc::clone(typed),
         }),
         Some(op) => ConjunctClass::Range(RangeConjunct {
             left_expr,
@@ -438,7 +453,7 @@ fn build_residual_program(
 /// the function returns a trivially-residual decomposition; the caller
 /// is responsible for emitting a higher-level diagnostic in that case.
 pub(crate) fn decompose_predicate(
-    typed_where: &TypedProgram,
+    typed_where: &Arc<TypedProgram>,
     merged_row: &Row,
     filter_span: cxl::lexer::Span,
 ) -> Result<DecomposedPredicate, Vec<TypeDiagnostic>> {
@@ -458,7 +473,7 @@ pub(crate) fn decompose_predicate(
     let mut ranges = Vec::new();
     let mut residual_exprs = Vec::new();
     for c in conjuncts {
-        match classify_conjunct(c) {
+        match classify_conjunct(c, typed_where) {
             ConjunctClass::Equality(eq) => equalities.push(eq),
             ConjunctClass::Range(r) => ranges.push(r),
             ConjunctClass::Residual => residual_exprs.push(c.clone()),

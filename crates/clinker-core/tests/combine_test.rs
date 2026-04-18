@@ -461,6 +461,37 @@ mod tests {
         assert_eq!(pred.ranges[0].right_input.as_ref(), "products");
     }
 
+    /// C.2.4.1 gate: every `EqualityConjunct` produced by predicate
+    /// decomposition carries an `Arc<TypedProgram>` on each side. Both
+    /// sides share the where-clause TypedProgram (same `Arc`), so the
+    /// runtime `KeyExtractor` can call `cxl::eval::eval_expr` against
+    /// the shared regex cache without per-side re-typecheck.
+    #[test]
+    fn test_combine_equality_program_compiled() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = &artifacts.combine_predicates["enriched"];
+        assert!(!pred.equalities.is_empty(), "expected at least 1 equality");
+        for eq in &pred.equalities {
+            assert!(
+                std::sync::Arc::ptr_eq(&eq.left_program, &eq.right_program),
+                "left/right_program must share the same Arc<TypedProgram> (where-clause)"
+            );
+            assert!(
+                !eq.left_program.program.statements.is_empty(),
+                "left_program must contain the where-clause Filter statement"
+            );
+            assert!(
+                eq.left_program.node_count > 0,
+                "left_program node_count must cover the predicate AST"
+            );
+        }
+    }
+
     /// C.1.2 gate: an OR expression at the top level is NEVER decomposed
     /// (drill D7 — universal consensus across engines) → 0 eq/range,
     /// residual holds the whole OR.

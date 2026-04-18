@@ -1296,7 +1296,7 @@ fn bind_combine(
     // ── Where-clause typecheck ─────────────────────────────────────
     let typed_where =
         match typecheck_combine_where(name, config.where_expr.as_ref(), &merged_row, span) {
-            Ok(t) => t,
+            Ok(t) => Arc::new(t),
             Err(mut new_diags) => {
                 diags.append(&mut new_diags);
                 return;
@@ -1318,7 +1318,11 @@ fn bind_combine(
     }
     let e304_fired = diags.iter().filter(|d| d.code == "E304").count() > e304_before;
 
-    // Decompose predicate → DecomposedPredicate.
+    // Decompose predicate → DecomposedPredicate. The shared typed_where
+    // Arc is threaded through so each EqualityConjunct captures the
+    // typed program needed by `cxl::eval::eval_expr` at runtime — no
+    // re-typecheck per side, since equality sub-`Expr`s preserve their
+    // NodeIds and the where-program's regex cache covers them.
     let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span) {
         Ok(d) => d,
         Err(type_diags) => {
