@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod combine;
 pub mod dispatch;
 pub mod index;
 pub mod ingestion;
