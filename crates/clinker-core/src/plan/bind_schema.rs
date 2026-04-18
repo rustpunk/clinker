@@ -33,7 +33,7 @@ use crate::config::composition::{
     PortDecl, ProvenanceDb, ResolvedValue,
 };
 use crate::config::node_header::CombineHeader;
-use crate::config::pipeline_node::{CombineBody, PipelineNode, SchemaDecl};
+use crate::config::pipeline_node::{CombineBody, MatchMode, PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::bound_schemas::BoundSchemas;
 use crate::plan::combine::{
@@ -1382,6 +1382,52 @@ fn bind_combine(
         return;
     }
 
+    // ── Collect-mode short-circuit (R1) ────────────────────────────
+    // Per Phase Combine R1, `match: collect` REJECTS any non-empty
+    // `cxl:` body at compile time (E311). The output row is auto-
+    // derived from `(driver fields ++ build_qualifier as Array)` so
+    // downstream nodes can bind against it without an emit. The
+    // executor synthesizes the output record at probe time; no body
+    // evaluator runs for Collect.
+    //
+    // Auto-derivation is only meaningful for N=2 (the only shape that
+    // survives the C.2.4.4 post-pass; E312 rejects N>2 outright). For
+    // pathological N≥3 + Collect fixtures we skip output row insertion
+    // and let the post-pass surface E312 as the root-cause diagnostic.
+    if matches!(config.match_mode, MatchMode::Collect) {
+        if !config.cxl.source.trim().is_empty() {
+            diags.push(combine_e311_collect_with_body(name, span));
+            return;
+        }
+        let driving = match artifacts.combine_driving.get(name).cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let inputs = artifacts
+            .combine_inputs
+            .get(name)
+            .expect("combine_inputs populated above");
+        if inputs.len() != 2 {
+            return;
+        }
+        let driver_input = inputs
+            .get(&driving)
+            .expect("driving qualifier present in combine_inputs");
+        let build_qualifier = inputs
+            .keys()
+            .find(|k| k.as_str() != driving)
+            .expect("N=2 guarantees a non-driver qualifier");
+
+        let mut output_decl: IndexMap<QualifiedField, Type> = IndexMap::new();
+        for (qf, ty) in driver_input.row.fields() {
+            output_decl.insert(qf.clone(), ty.clone());
+        }
+        output_decl.insert(QualifiedField::bare(build_qualifier.as_str()), Type::Array);
+        let output_row = Row::closed(output_decl, cxl_span);
+        schema_by_name.insert(name.to_string(), output_row);
+        return;
+    }
+
     // ── Body typecheck ─────────────────────────────────────────────
     let body_typed = match typecheck_cxl(
         name,
@@ -1897,6 +1943,26 @@ fn combine_e305(combine_name: &str, span: Span) -> Diagnostic {
     .with_help(
         "add a cross-input comparison (e.g. `a.id == b.id`); cross joins are not supported \
          — if all records should combine, use an explicit Merge node",
+    )
+}
+
+/// E311 — `match: collect` rejects any non-empty `cxl:` body. The
+/// Collect output row is auto-derived as `{ driver fields,
+/// <build_qualifier>: Array }`; downstream Transform composes any
+/// projection once CXL grows array primitives. Per Phase Combine R1.
+fn combine_e311_collect_with_body(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E311",
+        format!(
+            "combine {combine_name:?} has `match: collect` AND a non-empty `cxl:` body; \
+             collect mode auto-derives the output row as \
+             `{{ driver fields, <build_qualifier>: Array }}` and runs no body"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "remove the `cxl:` body, or change `match:` to `first` / `all` to evaluate per-match \
+         emit statements",
     )
 }
 

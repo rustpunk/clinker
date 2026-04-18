@@ -45,6 +45,7 @@
 //! | `E308`      | error    | Combine cxl body references unknown field            |
 //! | `E309`      | error    | Combine output schema is empty                       |
 //! | `E310`      | error    | Combine runtime exceeded hard memory limit           |
+//! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
 //! | `W306`      | warning  | Combine planner cannot determine optimal driving input |

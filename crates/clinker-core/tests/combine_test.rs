@@ -302,13 +302,23 @@ mod tests {
     /// C.1.1 gate: a 3-input combine binds cleanly — qualifier/field
     /// pairs stay unique across all three upstream rows, and no E301
     /// fires because each qualifier is a plain identifier.
+    ///
+    /// C.2.4.3 update: W306 is an expected planner warning for 3+
+    /// inputs without cardinality estimates (no `drive:` hint either),
+    /// emitted by `select_driving_input`. The C.1.1 invariant is that
+    /// no *errors* fire during merged-row construction — informational
+    /// warnings are out of scope for this gate.
     #[test]
     fn test_combine_merged_row_three_inputs() {
         let (_artifacts, diags) = compile_combine_fixture("three_input_shared_key");
+        let errors: Vec<&str> = diags
+            .iter()
+            .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+            .map(|d| d.code.as_str())
+            .collect();
         assert!(
-            diags.is_empty(),
-            "three_input_shared_key must bind cleanly at C.1.1; got codes: {:?}",
-            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+            errors.is_empty(),
+            "three_input_shared_key must bind without errors at C.1.1; got error codes: {errors:?}"
         );
     }
 
@@ -459,6 +469,63 @@ mod tests {
         assert!(matches!(pred.ranges[0].op, RangeOp::Ge));
         assert_eq!(pred.ranges[0].left_input.as_ref(), "orders");
         assert_eq!(pred.ranges[0].right_input.as_ref(), "products");
+    }
+
+    /// C.2.4.2 gate (R1): `match: collect` with a non-empty `cxl:` body
+    /// is a structural error. `bind_combine` emits E311 and stops
+    /// processing the combine.
+    #[test]
+    fn test_combine_e311_collect_with_body() {
+        let (artifacts, diags) = compile_combine_fixture("error_collect_with_body");
+        assert!(
+            diags.iter().any(|d| d.code == "E311"),
+            "error_collect_with_body must emit E311; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        assert!(
+            artifacts.bound_schemas.output_of("bad_collect").is_none(),
+            "no output row published when E311 fires"
+        );
+    }
+
+    /// C.2.4.2 gate (R1): `match: collect` with an empty `cxl:` body
+    /// auto-derives the output row as `{ driver fields,
+    /// <build_qualifier>: Array }`. The build qualifier becomes one
+    /// new bare field carrying the gathered records.
+    #[test]
+    fn test_combine_collect_output_row_auto_derived() {
+        use cxl::typecheck::{QualifiedField, Type};
+
+        let (artifacts, diags) = compile_combine_fixture("match_collect");
+        assert!(
+            diags.is_empty(),
+            "match_collect must bind cleanly under R1; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let row = artifacts
+            .bound_schemas
+            .output_of("collected")
+            .expect("collected publishes a bound output row");
+
+        // Driver = orders (default first-in-IndexMap, no `drive:` hint).
+        // Driver fields: order_id, product_id, amount. Plus auto-added
+        // `products` field of Type::Array.
+        let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "order_id".to_string(),
+                "product_id".to_string(),
+                "amount".to_string(),
+                "products".to_string(),
+            ],
+            "auto-derived row = driver fields + (build_qualifier: Array)"
+        );
+        let array_type = row
+            .fields()
+            .find(|(qf, _)| qf == &&QualifiedField::bare("products"))
+            .map(|(_, t)| t.clone());
+        assert_eq!(array_type, Some(Type::Array));
     }
 
     /// C.2.4.3 gate: explicit `drive: products` hint on `drive_hint.yaml`

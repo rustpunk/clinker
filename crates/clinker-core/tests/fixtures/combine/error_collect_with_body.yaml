@@ -1,11 +1,10 @@
-# 2-input combine, match: collect — gathers every matching build record
-# for each driver record into one Array-typed field on the output. Per
-# Phase Combine R1 (E311), the `cxl:` body MUST be empty under
-# `match: collect`; the output row is auto-derived as
-# `{ driver fields, <build_qualifier>: Array }`. The executor synthesizes
-# the output record at probe time; no body evaluator runs.
+# C.2.4.2 — `match: collect` with a non-empty `cxl:` body must trigger
+# E311 at compile time. Per Phase Combine R1, Collect mode auto-derives
+# the output row as `{ driver fields, <build_qualifier>: Array }` and
+# runs no body; declaring emit statements is therefore a structural
+# error.
 pipeline:
-  name: match_collect
+  name: error_collect_with_body
 nodes:
   - type: source
     name: orders
@@ -28,7 +27,7 @@ nodes:
         - { name: name, type: string }
         - { name: category, type: string }
   - type: combine
-    name: collected
+    name: bad_collect
     input:
       orders: orders
       products: products
@@ -36,11 +35,6 @@ nodes:
       where: "orders.product_id == products.product_id"
       match: collect
       on_miss: null_fields
-      cxl: ""
-  - type: output
-    name: collected_out
-    input: collected
-    config:
-      name: collected_out
-      type: csv
-      path: /tmp/collected_match_collect.csv
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
