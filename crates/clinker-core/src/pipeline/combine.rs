@@ -28,7 +28,8 @@
 //!     sources.
 //!
 //! Sub-tasks pending (to be added in order by subsequent commits):
-//!   - C.2.1.5 — proptest round-trip.
+//!   - (none — Phase C.2.1 complete; C.2.4 is next per the execution
+//!     plan's reordered sequence C.2.1 → C.2.4 → C.2.2 → C.2.3 → C.2.5).
 
 use ahash::RandomState;
 use chrono::{Datelike, Timelike};
@@ -1648,6 +1649,119 @@ mod tests {
                 "probe for {key}: expected 1, got {}",
                 matches.len()
             );
+        }
+    }
+
+    #[test]
+    fn test_combine_hash_table_randomized_roundtrip() {
+        // C.2.1.5: randomized round-trip. Builds random (key, payload)
+        // records into the hash table, then verifies that for every key
+        // (whether or not present in the build set) the probe yields
+        // EXACTLY the set of build records with that key — no false
+        // positives, no missed matches, regardless of chain walk order.
+        //
+        // A hand-rolled randomized test (seeded `fastrand`) rather than
+        // proptest to avoid a workspace dep. Seeds are deterministic so
+        // failures reproduce; iteration count is bounded so CI time stays
+        // under a second.
+        //
+        // "Gold" answer: linear scan of build records with
+        // `keys_equal_canonicalized`. Our hash-table answer must match
+        // as a multiset (order is not contractual).
+        let schema = test_schema(&["k", "tag"]);
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+
+        let seeds: [u64; 8] = [1, 2, 42, 9999, 0xDEAD_BEEF, 0xCAFE_F00D, 12345, 7];
+        for seed in seeds {
+            let mut rng = fastrand::Rng::with_seed(seed);
+
+            // Draw N records with keys in a small universe (forces many
+            // duplicates → exercises chain walks with length > 1).
+            let n = 50 + (rng.u64(0..200) as usize); // 50..250
+            let key_universe_size: i64 = 5 + rng.i64(0..15); // 5..20 → guaranteed duplicates
+
+            let mut build: Vec<(i64, u64)> = Vec::with_capacity(n); // (key, unique_tag)
+            for i in 0..n {
+                let key = rng.i64(0..key_universe_size);
+                build.push((key, i as u64));
+            }
+
+            let records: Vec<Record> = build
+                .iter()
+                .map(|(k, tag)| {
+                    mk_record(
+                        &schema,
+                        vec![Value::Integer(*k), Value::Integer(*tag as i64)],
+                    )
+                })
+                .collect();
+            let mut budget = test_budget(256 * 1024 * 1024);
+            let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None)
+                .expect("build");
+            assert_eq!(table.len(), n);
+
+            // For every key in the universe PLUS a few definitely-missing
+            // keys, probe and compare to the gold set.
+            let mut probe_keys: Vec<i64> = (0..key_universe_size).collect();
+            probe_keys.extend([
+                key_universe_size,       // just out of range
+                key_universe_size + 100, // far out of range
+                -1,                      // negative, never inserted
+            ]);
+
+            for probe_k in probe_keys {
+                // Gold: set of tags whose record has key == probe_k.
+                let mut expected_tags: Vec<u64> = build
+                    .iter()
+                    .filter(|(bk, _)| *bk == probe_k)
+                    .map(|(_, t)| *t)
+                    .collect();
+                expected_tags.sort_unstable();
+
+                let probe = mk_record(&schema, vec![Value::Integer(probe_k), Value::Null]);
+                let matches: Vec<ProbeCandidate> = table
+                    .probe(&probe, &extractor, &ctx)
+                    .expect("probe")
+                    .collect();
+
+                // Cardinality check first — catches both phantom matches
+                // and missed matches.
+                assert_eq!(
+                    matches.len(),
+                    expected_tags.len(),
+                    "seed={seed} probe_k={probe_k}: got {} matches, expected {}",
+                    matches.len(),
+                    expected_tags.len()
+                );
+
+                // Multi-set equality on extracted tags.
+                let mut got_tags: Vec<u64> = matches
+                    .iter()
+                    .map(|m| match m.record.resolve("tag") {
+                        Some(Value::Integer(t)) => t as u64,
+                        other => panic!("tag must be Integer, got {other:?}"),
+                    })
+                    .collect();
+                got_tags.sort_unstable();
+                assert_eq!(
+                    got_tags, expected_tags,
+                    "seed={seed} probe_k={probe_k}: tag multiset mismatch"
+                );
+
+                // Every yielded record's key must canonicalize-equal
+                // the probe key — anti-regression for post-probe
+                // equality verification.
+                for c in &matches {
+                    let build_key = c.record.resolve("k");
+                    assert_eq!(
+                        build_key,
+                        Some(Value::Integer(probe_k)),
+                        "seed={seed} probe_k={probe_k}: matched record has wrong key {build_key:?}"
+                    );
+                }
+            }
         }
     }
 
