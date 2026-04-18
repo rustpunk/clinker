@@ -19,9 +19,9 @@
 //! Sub-tasks currently landed in this module:
 //!   - C.2.1.1 — `canonical_f64`/`canonical_f32`, `hash_composite_key`,
 //!     `keys_equal_canonicalized`, module-level constants.
+//!   - C.2.1.2 — `CombineError`, `KeyExtractor`.
 //!
 //! Sub-tasks pending (to be added in order by subsequent commits):
-//!   - C.2.1.2 — `KeyExtractor` (holds `Vec<Arc<TypedProgram>>`).
 //!   - C.2.1.3 — `CombineHashTable` with `build()` / `probe()` /
 //!     `ProbeIter`.
 //!   - C.2.1.4 — `memory_bytes()` accounting across all four allocation
@@ -30,8 +30,14 @@
 
 use ahash::RandomState;
 use chrono::{Datelike, Timelike};
-use clinker_record::Value;
+use clinker_record::{RecordStorage, Value};
+use cxl::ast::Expr;
+use cxl::eval::{EvalContext, EvalError, eval_expr};
+use cxl::resolve::traits::FieldResolver;
+use cxl::typecheck::TypedProgram;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::Arc;
 
 /// Period (measured in records processed) between
 /// [`crate::pipeline::memory::MemoryBudget::should_abort`] checks during
@@ -261,6 +267,205 @@ fn value_equal_canonicalized(a: &Value, b: &Value) -> bool {
             })
         }
         _ => false, // cross-type
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// CombineError
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Every runtime failure originating inside the combine operator.
+///
+/// The executor arm (C.2.2) converts these into `PipelineError` (typically
+/// `PipelineError::Internal` for build/probe failures, or an E310 runtime
+/// diagnostic for memory/unmatched-driver cases). Callers outside the
+/// executor generally do not observe this type directly.
+#[derive(Debug)]
+pub enum CombineError {
+    /// The hash build phase could not complete. Typically wraps an
+    /// expression-evaluation failure on a build-side record (e.g. a
+    /// malformed cast in the key expression) that was not caught by the
+    /// plan-time typechecker.
+    HashBuildFailed { reason: String },
+
+    /// The probe phase aborted mid-stream. Reserved for cases where probe
+    /// iteration hit a non-memory terminal error (e.g. downstream writer
+    /// back-pressure shutdown).
+    ProbeAborted { reason: String },
+
+    /// Memory budget was exhausted while building or probing. `used` is
+    /// the hash table's self-reported footprint at the moment of the
+    /// check; `limit` is the configured budget. Emitted after
+    /// `MemoryBudget::should_abort` returns true (checked every
+    /// [`MEMORY_CHECK_INTERVAL`] records; see `RESEARCH-c2-preimplementation-gaps.md`
+    /// Q1 for the rationale).
+    MemoryLimitExceeded { used: u64, limit: u64 },
+
+    /// Key-expression evaluation failed. `side` is `"driving"` or
+    /// `"build"` so the executor can produce an accurate diagnostic.
+    KeyEvalFailed {
+        source: EvalError,
+        side: &'static str,
+    },
+
+    /// Disk spill failed. Wired into the error surface now so Phase C.4
+    /// can populate it without an API break; unused in C.2.
+    SpillFailed { reason: String },
+}
+
+impl std::fmt::Display for CombineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CombineError::HashBuildFailed { reason } => {
+                write!(f, "combine hash build failed: {reason}")
+            }
+            CombineError::ProbeAborted { reason } => {
+                write!(f, "combine probe aborted: {reason}")
+            }
+            CombineError::MemoryLimitExceeded { used, limit } => write!(
+                f,
+                "combine memory limit exceeded: used {used} bytes, limit {limit} bytes"
+            ),
+            CombineError::KeyEvalFailed { source, side } => {
+                write!(f, "combine {side}-side key evaluation failed: {source}")
+            }
+            CombineError::SpillFailed { reason } => {
+                write!(f, "combine spill failed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CombineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CombineError::KeyEvalFailed { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// KeyExtractor
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Evaluates the scalar key expression for one side of a combine's equality
+/// conjuncts against a single `Record`.
+///
+/// **Why two fields per program, not one:** CXL's `eval_expr` takes `(&Expr,
+/// &TypedProgram, …)` — the `TypedProgram` provides the type/resolution
+/// context (NodeId table, regex cache, binding table) while the `Expr`
+/// identifies the specific expression node to evaluate. Because each
+/// `EqualityConjunct` is compiled as a trivial single-emit wrapper at
+/// `bind_combine` time (C.2.4), the extractor stores each `(typed, expr)`
+/// pair side-by-side and replays them through the free `eval_expr` entry
+/// point — the same hot-path primitive used by the hash aggregator. No
+/// `ProgramEvaluator` allocation per extraction, no `IndexMap` churn.
+///
+/// **One extractor per side:** the driving side and the build side each get
+/// their own `KeyExtractor`. Same number of programs (one per equality
+/// conjunct) but different expressions and different type contexts — each
+/// side's expressions are typed against that side's input `Row`. The
+/// executor (C.2.2) builds both at dispatch time from
+/// `DecomposedPredicate.equalities[i].left_program / .left_expr` (driving)
+/// and `.right_program / .right_expr` (build).
+///
+/// **Stateless:** `extract` takes `&self`. No interior mutability, no
+/// `&mut [ProgramEvaluator]` parameter. Key extraction is pure expression
+/// evaluation — no `distinct` state, no `let` bindings that survive the
+/// call, no `$meta.*` mutations. This is what lets the built
+/// `CombineHashTable` be safely shared across concurrent probe workers in
+/// Phase C.3+.
+pub struct KeyExtractor {
+    programs: Vec<KeyProgram>,
+}
+
+/// One (typed program, key expression) pair. Holds `typed` as an `Arc` so
+/// multiple `KeyExtractor`s or concurrent extraction workers can share the
+/// compiled artifact without cloning it.
+struct KeyProgram {
+    typed: Arc<TypedProgram>,
+    expr: Expr,
+}
+
+impl KeyExtractor {
+    /// Build an extractor from an ordered list of `(typed_program, key_expr)`
+    /// pairs. Order is preserved; the i-th pair produces the i-th `Value`
+    /// in the result of [`KeyExtractor::extract`].
+    pub fn new(programs: Vec<(Arc<TypedProgram>, Expr)>) -> Self {
+        Self {
+            programs: programs
+                .into_iter()
+                .map(|(typed, expr)| KeyProgram { typed, expr })
+                .collect(),
+        }
+    }
+
+    /// Number of key columns this extractor produces.
+    pub fn len(&self) -> usize {
+        self.programs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.programs.is_empty()
+    }
+
+    /// Evaluate every key expression in order against `resolver + ctx`.
+    /// Returns one `Value` per expression. Propagates the first
+    /// [`EvalError`] unchanged — the executor is responsible for wrapping
+    /// it with `side: "driving"` / `side: "build"` context via
+    /// [`CombineError::KeyEvalFailed`].
+    ///
+    /// **Window context:** combine's key extraction runs outside any
+    /// window, so `window: None` is passed through. The `NullStorage` type
+    /// parameter satisfies the generic bound without materializing any
+    /// storage — identical to the pattern used by the aggregator's free
+    /// `eval_expr` calls (`crates/clinker-core/src/aggregation.rs`).
+    pub fn extract(
+        &self,
+        ctx: &EvalContext<'_>,
+        resolver: &dyn FieldResolver,
+    ) -> Result<Vec<Value>, EvalError> {
+        let env: HashMap<String, Value> = HashMap::new();
+        let meta_state: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        let mut out = Vec::with_capacity(self.programs.len());
+        for kp in &self.programs {
+            let v = eval_expr::<NullStorage>(
+                &kp.expr,
+                &kp.typed,
+                ctx,
+                resolver,
+                None,
+                &env,
+                &meta_state,
+            )?;
+            out.push(v);
+        }
+        Ok(out)
+    }
+}
+
+/// Placeholder `RecordStorage` for windowless expression evaluation. Every
+/// method returns an empty result; the trait object is never queried
+/// because `KeyExtractor::extract` passes `window: None`. This satisfies
+/// the `S: RecordStorage` type parameter on [`eval_expr`] the same way
+/// `executor/mod.rs:260` and `aggregation.rs:49` do for their own
+/// windowless call sites — each module declares its own zero-sized type
+/// rather than exposing a shared one from cxl.
+struct NullStorage;
+
+impl RecordStorage for NullStorage {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+        None
+    }
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+        None
+    }
+    fn available_fields(&self, _: u32) -> Vec<&str> {
+        vec![]
+    }
+    fn record_count(&self) -> u32 {
+        0
     }
 }
 
@@ -520,6 +725,219 @@ mod tests {
             &[Value::Map(Box::new(m1))],
             &[Value::Map(Box::new(m2))]
         ));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // KeyExtractor tests
+    // ──────────────────────────────────────────────────────────────────
+
+    // The cxl-compile test helper below uses cxl's public compiler
+    // pipeline (parser → resolve → typecheck) to produce a real
+    // TypedProgram per test. This is NOT duplicating bind_combine's C.2.4
+    // work — bind_combine will call the same underlying `type_check` entry
+    // against the appropriate per-side Row. Here we build the Row
+    // manually because unit tests can't reach through bind_combine.
+    fn compile_key(
+        src: &str,
+        fields: &[&str],
+        row_fields: &[(&str, cxl::typecheck::Type)],
+    ) -> (Arc<TypedProgram>, cxl::ast::Expr) {
+        use cxl::ast::Statement;
+        use cxl::lexer::Span;
+        use cxl::parser::Parser;
+        use cxl::resolve::pass::resolve_program;
+        use cxl::typecheck::pass::type_check;
+        use cxl::typecheck::row::{QualifiedField, Row};
+        use indexmap::IndexMap;
+
+        let parsed = Parser::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved = resolve_program(parsed.ast, fields, parsed.node_count)
+            .unwrap_or_else(|d| panic!("resolve errors: {d:?}"));
+        let mut cols: IndexMap<QualifiedField, cxl::typecheck::Type> = IndexMap::new();
+        for (name, ty) in row_fields {
+            cols.insert(QualifiedField::bare(*name), ty.clone());
+        }
+        let row = Row::closed(cols, Span::new(0, 0));
+        let typed = type_check(resolved, &row).unwrap_or_else(|d| panic!("type errors: {d:?}"));
+        let expr = match &typed.program.statements[0] {
+            Statement::Emit { expr, .. } => expr.clone(),
+            other => panic!("expected Emit, got {other:?}"),
+        };
+        (Arc::new(typed), expr)
+    }
+
+    fn eval_ctx() -> (cxl::eval::StableEvalContext, ()) {
+        // The StableEvalContext is returned to the caller; the unit type
+        // is a scaffolding-placeholder so the caller can bind via
+        // destructuring and drop it.
+        (cxl::eval::StableEvalContext::test_default(), ())
+    }
+
+    #[test]
+    fn test_key_extractor_len_and_empty() {
+        let extractor = KeyExtractor::new(vec![]);
+        assert_eq!(extractor.len(), 0);
+        assert!(extractor.is_empty());
+
+        let (typed, expr) = compile_key("emit k = x", &["x"], &[("x", cxl::typecheck::Type::Int)]);
+        let extractor2 = KeyExtractor::new(vec![(typed, expr)]);
+        assert_eq!(extractor2.len(), 1);
+        assert!(!extractor2.is_empty());
+    }
+
+    #[test]
+    fn test_key_extractor_extracts_field_ref() {
+        use cxl::resolve::HashMapResolver;
+        let (typed, expr) = compile_key("emit k = x", &["x"], &[("x", cxl::typecheck::Type::Int)]);
+        let extractor = KeyExtractor::new(vec![(typed, expr)]);
+
+        let (stable, _) = eval_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut record = std::collections::HashMap::new();
+        record.insert("x".to_string(), Value::Integer(42));
+        let resolver = HashMapResolver::new(record);
+
+        let values = extractor.extract(&ctx, &resolver).unwrap();
+        assert_eq!(values, vec![Value::Integer(42)]);
+    }
+
+    #[test]
+    fn test_key_extractor_extracts_computed_expression() {
+        use cxl::resolve::HashMapResolver;
+        let (typed, expr) = compile_key(
+            "emit k = x + 1",
+            &["x"],
+            &[("x", cxl::typecheck::Type::Int)],
+        );
+        let extractor = KeyExtractor::new(vec![(typed, expr)]);
+
+        let (stable, _) = eval_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut record = std::collections::HashMap::new();
+        record.insert("x".to_string(), Value::Integer(41));
+        let resolver = HashMapResolver::new(record);
+
+        let values = extractor.extract(&ctx, &resolver).unwrap();
+        assert_eq!(values, vec![Value::Integer(42)]);
+    }
+
+    #[test]
+    fn test_key_extractor_multi_column() {
+        use cxl::resolve::HashMapResolver;
+        let (t1, e1) = compile_key(
+            "emit k = region",
+            &["region", "product_id"],
+            &[
+                ("region", cxl::typecheck::Type::String),
+                ("product_id", cxl::typecheck::Type::Int),
+            ],
+        );
+        let (t2, e2) = compile_key(
+            "emit k = product_id",
+            &["region", "product_id"],
+            &[
+                ("region", cxl::typecheck::Type::String),
+                ("product_id", cxl::typecheck::Type::Int),
+            ],
+        );
+        let extractor = KeyExtractor::new(vec![(t1, e1), (t2, e2)]);
+        assert_eq!(extractor.len(), 2);
+
+        let (stable, _) = eval_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut record = std::collections::HashMap::new();
+        record.insert("region".to_string(), Value::String("US".into()));
+        record.insert("product_id".to_string(), Value::Integer(101));
+        let resolver = HashMapResolver::new(record);
+
+        let values = extractor.extract(&ctx, &resolver).unwrap();
+        assert_eq!(
+            values,
+            vec![Value::String("US".into()), Value::Integer(101)]
+        );
+    }
+
+    #[test]
+    fn test_key_extractor_missing_field_resolves_to_null() {
+        // CXL's FieldRef semantics per eval_expr line 399:
+        //   `resolver.resolve(name).unwrap_or(Value::Null)`.
+        // So a missing field yields Null — the hash path treats this as
+        // a NULL key and the probe short-circuits (3VL).
+        use cxl::resolve::HashMapResolver;
+        let (typed, expr) = compile_key("emit k = x", &["x"], &[("x", cxl::typecheck::Type::Int)]);
+        let extractor = KeyExtractor::new(vec![(typed, expr)]);
+
+        let (stable, _) = eval_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        // Record has no "x" field.
+        let resolver = HashMapResolver::new(std::collections::HashMap::new());
+
+        let values = extractor.extract(&ctx, &resolver).unwrap();
+        assert_eq!(values, vec![Value::Null]);
+    }
+
+    #[test]
+    fn test_key_extractor_preserves_value_order() {
+        // Anti-regression: if the order of programs in the extractor
+        // swaps, downstream hashing + equality will collide across
+        // conjuncts.
+        use cxl::resolve::HashMapResolver;
+        let (t_a, e_a) = compile_key(
+            "emit k = a",
+            &["a", "b"],
+            &[
+                ("a", cxl::typecheck::Type::Int),
+                ("b", cxl::typecheck::Type::Int),
+            ],
+        );
+        let (t_b, e_b) = compile_key(
+            "emit k = b",
+            &["a", "b"],
+            &[
+                ("a", cxl::typecheck::Type::Int),
+                ("b", cxl::typecheck::Type::Int),
+            ],
+        );
+        let extractor_ab =
+            KeyExtractor::new(vec![(t_a.clone(), e_a.clone()), (t_b.clone(), e_b.clone())]);
+        let extractor_ba = KeyExtractor::new(vec![(t_b, e_b), (t_a, e_a)]);
+
+        let (stable, _) = eval_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut rec = std::collections::HashMap::new();
+        rec.insert("a".to_string(), Value::Integer(1));
+        rec.insert("b".to_string(), Value::Integer(2));
+        let resolver = HashMapResolver::new(rec);
+
+        let ab = extractor_ab.extract(&ctx, &resolver).unwrap();
+        let ba = extractor_ba.extract(&ctx, &resolver).unwrap();
+        assert_eq!(ab, vec![Value::Integer(1), Value::Integer(2)]);
+        assert_eq!(ba, vec![Value::Integer(2), Value::Integer(1)]);
+    }
+
+    #[test]
+    fn test_combine_error_display_and_source() {
+        // Anchors the Display format and the fact that source() chains
+        // for KeyEvalFailed. The executor depends on both (for diagnostic
+        // messages and for error-chain walking).
+        let e = CombineError::MemoryLimitExceeded {
+            used: 1024,
+            limit: 512,
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("1024"));
+        assert!(msg.contains("512"));
+
+        let spill = CombineError::SpillFailed {
+            reason: "disk full".to_string(),
+        };
+        assert!(format!("{spill}").contains("disk full"));
+        assert!(std::error::Error::source(&spill).is_none());
     }
 
     #[test]
