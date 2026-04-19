@@ -1,6 +1,6 @@
 pub mod stage_metrics;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
@@ -938,6 +938,7 @@ impl PipelineExecutor {
                                             .push(projected);
                                     }
                                     counters.ok_count += 1;
+                                    counters.records_written += targets.len() as u64;
                                 }
                                 Err(route_err) => {
                                     if strategy == ErrorStrategy::FailFast {
@@ -977,6 +978,7 @@ impl PipelineExecutor {
                                 .or_default()
                                 .push(projected);
                             counters.ok_count += 1;
+                            counters.records_written += 1;
                         }
                     }
                     Ok(EvalResult::Skip(SkipReason::Filtered)) => {
@@ -1071,6 +1073,7 @@ impl PipelineExecutor {
                         let projected = project_output(&record, &emitted, primary_output);
                         writer.write_record(&projected)?;
                         counters.ok_count += 1;
+                        counters.records_written += 1;
                     }
                     Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                         counters.filtered_count += 1;
@@ -1118,7 +1121,12 @@ impl PipelineExecutor {
                             .or_default()
                             .push(projected);
                     }
+                    // LD-16d-1 dual counter: one source record reaching
+                    // N inclusive-route targets counts ONCE toward
+                    // `ok_count` (input succeeded) and N times toward
+                    // `records_written` (one per Output write).
                     counters.ok_count += 1;
+                    counters.records_written += targets.len() as u64;
                 }
                 Err(route_err) => {
                     counters.dlq_count += 1;
@@ -1139,7 +1147,9 @@ impl PipelineExecutor {
                 .entry(primary_output.name.clone())
                 .or_default()
                 .push(projected);
+            // Single-output direct path: one input → one write.
             counters.ok_count += 1;
+            counters.records_written += 1;
         }
     }
 
@@ -1319,6 +1329,7 @@ impl PipelineExecutor {
                         first_emitted = Some((record, emitted, metadata));
                         first_emit_pos = Some(pos);
                         counters.ok_count += 1;
+                        counters.records_written += 1;
                         break;
                     }
                     Ok(EvalResult::Skip(SkipReason::Filtered)) => {
@@ -1537,6 +1548,7 @@ impl PipelineExecutor {
                                                 .push(projected);
                                         }
                                         counters.ok_count += 1;
+                                        counters.records_written += targets.len() as u64;
                                         records_emitted += 1;
                                     }
                                     Err(route_err) => {
@@ -1677,6 +1689,7 @@ impl PipelineExecutor {
                                     csv_writer.write_record(&projected)?;
                                 }
                                 counters.ok_count += 1;
+                                counters.records_written += 1;
                                 records_emitted += 1;
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {
@@ -2092,6 +2105,7 @@ impl PipelineExecutor {
                                                 csv_writer.write_record(&projected)?;
                                             }
                                             counters.ok_count += 1;
+                                            counters.records_written += 1;
                                             records_emitted += 1;
                                         }
                                         EvalResult::Skip(SkipReason::Filtered) => {
@@ -2280,11 +2294,13 @@ impl PipelineExecutor {
                         {
                             if !found_first {
                                 counters.ok_count += 1;
+                                counters.records_written += 1;
                                 first_emitted =
                                     Some((record.clone(), emitted.clone(), metadata.clone()));
                                 found_first = true;
                             } else {
                                 counters.ok_count += 1;
+                                counters.records_written += 1;
                                 first_record_extra_emits.push((emitted.clone(), metadata.clone()));
                             }
                         }
@@ -2473,6 +2489,7 @@ impl PipelineExecutor {
                                                     .push(projected);
                                             }
                                             counters.ok_count += 1;
+                                            counters.records_written += targets.len() as u64;
                                             records_emitted += 1;
                                         }
                                         Err(route_err) => {
@@ -2660,6 +2677,7 @@ impl PipelineExecutor {
                                         csv_writer.write_record(&projected)?;
                                     }
                                     counters.ok_count += 1;
+                                    counters.records_written += 1;
                                     records_emitted += 1;
                                 }
                                 EvalResult::Skip(SkipReason::Filtered) => {
@@ -2766,6 +2784,13 @@ impl PipelineExecutor {
         let mut write_timer = stage_metrics::CumulativeTimer::new();
         let total_records = all_records.len() as u64;
         let mut records_emitted: u64 = 0;
+
+        // Track distinct source rows that reached at least one Output —
+        // backs `counters.ok_count` per the Phase 16d / LD-16d-1 dual
+        // counter semantic. Populated in the Output arm. Single-source
+        // pipelines see no row_num collisions; multi-source via Merge
+        // is the documented limitation in `PipelineCounters` docs.
+        let mut ok_source_rows: HashSet<u64> = HashSet::new();
 
         // Build transform name -> index map for looking up CompiledTransform by name
         let transform_by_name: HashMap<&str, usize> = transforms
@@ -3531,16 +3556,31 @@ impl PipelineExecutor {
                             .unwrap_or_default()
                     };
 
-                    // Count ok records — one per output WRITE. Under
-                    // inclusive Route fan-out, an input record that
-                    // matches N branches reaches N outputs and counts
-                    // N times. This aligns `ok_count` with
-                    // `records_emitted` and matches the DAG-walk's
-                    // per-node buffer semantics (Phase 16d canonical
-                    // runtime). The `test_branch_inclusive_duplication`
-                    // suite asserts this convention.
+                    // Phase 16d / LD-16d-1 dual counters:
+                    //
+                    // * `records_written` increments per WRITE — under
+                    //   inclusive Route fan-out, one input matching N
+                    //   branches counts N (one per Output that received
+                    //   it). Aligns with per-Output throughput and the
+                    //   `records_emitted` local that drives stage-metric
+                    //   reporting.
+                    //
+                    // * `ok_count` increments by the number of DISTINCT
+                    //   source rows reaching this Output that haven't
+                    //   already been counted at another Output during
+                    //   the same DAG walk. Source identity is
+                    //   `row_num` (per-source counter), tracked across
+                    //   all Output arms via the `ok_source_rows` set
+                    //   declared at function scope.
                     let output_record_count = input_records.len() as u64;
-                    counters.ok_count += output_record_count;
+                    let mut newly_ok: u64 = 0;
+                    for (_, row_num, _, _) in &input_records {
+                        if ok_source_rows.insert(*row_num) {
+                            newly_ok += 1;
+                        }
+                    }
+                    counters.ok_count += newly_ok;
+                    counters.records_written += output_record_count;
                     records_emitted += output_record_count;
 
                     // Derive output schema from first emitted record
@@ -4822,6 +4862,7 @@ fn handle_error(
             let projected = project_output(record, &emitted, output);
             writer.write_record(&projected)?;
             counters.ok_count += 1;
+            counters.records_written += 1;
         }
     }
     Ok(())

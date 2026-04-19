@@ -350,8 +350,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -419,8 +419,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -485,8 +485,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -547,8 +547,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -647,8 +647,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -721,8 +721,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -770,13 +770,18 @@ nodes:
     let csv = "id,amount\n1,500\n2,30\n";
     let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
-    // Phase 16d: under the unified DAG-walk runtime, `ok_count` tracks
-    // per-output writes (`records_emitted`-equivalent). Inclusive
-    // routing duplicates record 1 to {audit, report} and routes record 2
-    // to {standard} — 3 writes total. Pre-16d the test ran under the
-    // multi-output streaming path which counted per-input-record (=2);
-    // that path is gone in 16d.2 along with the divergent compile.
-    assert_eq!(counters.ok_count, 3);
+    // Phase 16d / LD-16d-1 dual counters:
+    //   ok_count = 2 (both input records reached at least one Output)
+    //   records_written = 3 (record 1 fans out to {audit, report},
+    //                        record 2 routes to {standard})
+    assert_eq!(
+        counters.ok_count, 2,
+        "ok_count should be 2 distinct successful inputs"
+    );
+    assert_eq!(
+        counters.records_written, 3,
+        "records_written should be 3 — record 1 written to 2 sinks + record 2 to 1 sink"
+    );
 
     // Record 1 should appear in both audit and report
     assert!(outputs["audit"].contains("1,500"));
@@ -840,8 +845,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -933,8 +938,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1020,8 +1025,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1104,8 +1109,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1197,8 +1202,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1312,8 +1317,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1380,9 +1385,9 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
-      - { name: zero, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
+      - { name: zero, type: string }
 
 - type: transform
   name: calc_emit
@@ -1469,8 +1474,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1573,8 +1578,8 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: any }
-      - { name: amount, type: any }
+      - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: calc
@@ -1635,8 +1640,8 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: any }
-      - { name: name, type: any }
+      - { name: id, type: string }
+      - { name: name, type: string }
 
 - type: transform
   name: identity
@@ -1700,7 +1705,7 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: x, type: any }
+      - { name: x, type: string }
 
 - type: transform
   name: identity

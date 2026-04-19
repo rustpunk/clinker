@@ -1420,37 +1420,68 @@ impl PipelineConfig {
             .map(|s| s.name.clone())
             .unwrap_or_default();
 
-        // Build planner specs + analyzer report + window configs +
-        // dedup'd indices. These feed both per-variant lowering (via
-        // `LoweringCtx`) and the enrichment tail (source DAG,
-        // correlation-sort, enforcer-sort, property derivation,
-        // aggregation-strategy selection).
-        let specs: Vec<crate::plan::execution::PlanTransformSpec> =
-            crate::plan::execution::build_specs(self);
-        let mut specs_by_name: HashMap<String, usize> = HashMap::new();
-        for (i, s) in specs.iter().enumerate() {
-            specs_by_name.insert(s.name.clone(), i);
+        // Harvest planner entries (name + analytic_window) directly off
+        // Transform/Aggregate/Route nodes in declaration order. The
+        // resulting `entries` array is parallel to `window_configs`;
+        // its index is reused as the `transform_index` in raw index
+        // requests and the `spec_idx` lookup below feeds `LoweringCtx`.
+        // Source/Output/Merge/Composition/Combine variants do not
+        // contribute (they don't carry `analytic_window` or CXL
+        // programs the analyzer pass would consume).
+        struct PlannerEntry {
+            name: String,
+            analytic_window: Option<serde_json::Value>,
         }
-        let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = specs
+        let entries: Vec<PlannerEntry> = self
+            .nodes
             .iter()
-            .filter_map(|s| {
+            .filter_map(|spanned| match &spanned.value {
+                PipelineNode::Transform {
+                    header,
+                    config: body,
+                } => Some(PlannerEntry {
+                    name: header.name.clone(),
+                    analytic_window: body.analytic_window.clone(),
+                }),
+                PipelineNode::Aggregate { header, .. } => Some(PlannerEntry {
+                    name: header.name.clone(),
+                    analytic_window: None,
+                }),
+                PipelineNode::Route { header, .. } => Some(PlannerEntry {
+                    name: header.name.clone(),
+                    analytic_window: None,
+                }),
+                PipelineNode::Source { .. }
+                | PipelineNode::Output { .. }
+                | PipelineNode::Merge { .. }
+                | PipelineNode::Composition { .. }
+                | PipelineNode::Combine { .. } => None,
+            })
+            .collect();
+        let mut entries_by_name: HashMap<String, usize> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            entries_by_name.insert(e.name.clone(), i);
+        }
+        let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = entries
+            .iter()
+            .filter_map(|e| {
                 artifacts
                     .typed
-                    .get(&s.name)
-                    .map(|tp| (s.name.as_str(), tp.as_ref()))
+                    .get(&e.name)
+                    .map(|tp| (e.name.as_str(), tp.as_ref()))
             })
             .collect();
         let report = cxl::analyzer::analyze_all(&compiled_refs);
         // Keep an analysis-by-name index so we can surface the analysis
-        // alongside its matching spec regardless of filter order.
+        // alongside its matching entry regardless of filter order.
         let mut analysis_by_name: HashMap<String, &cxl::analyzer::TransformAnalysis> =
             HashMap::new();
         for a in &report.transforms {
             analysis_by_name.insert(a.name.clone(), a);
         }
-        let window_configs: Vec<Option<crate::plan::index::LocalWindowConfig>> = specs
+        let window_configs: Vec<Option<crate::plan::index::LocalWindowConfig>> = entries
             .iter()
-            .map(crate::plan::index::parse_analytic_window_spec)
+            .map(|e| crate::plan::index::parse_analytic_window_value(&e.analytic_window, &e.name))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 vec![Diagnostic::error(
@@ -1462,9 +1493,9 @@ impl PipelineConfig {
         // Validate: if a transform uses window.* but has no local_window, error.
         for (i, analysis) in report.transforms.iter().enumerate() {
             if !analysis.window_calls.is_empty() {
-                let spec_idx = specs_by_name.get(&analysis.name).copied().unwrap_or(i);
+                let entry_idx = entries_by_name.get(&analysis.name).copied().unwrap_or(i);
                 if window_configs
-                    .get(spec_idx)
+                    .get(entry_idx)
                     .map(|w| w.is_none())
                     .unwrap_or(true)
                 {
@@ -1490,7 +1521,7 @@ impl PipelineConfig {
                         "E003",
                         format!(
                             "transform '{}' references unknown source '{}' in local_window",
-                            specs[i].name, source
+                            entries[i].name, source
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                     ));
@@ -1567,10 +1598,10 @@ impl PipelineConfig {
             };
             let node = &spanned.value;
             let name = node.name().to_string();
-            let spec_idx = specs_by_name.get(&name).copied();
+            let entry_idx = entries_by_name.get(&name).copied();
             let lowering_ctx = LoweringCtx {
                 analysis: analysis_by_name.get(name.as_str()).copied(),
-                window_config: spec_idx.and_then(|i| window_configs[i].as_ref()),
+                window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 indices: &indices,
                 primary_source: primary_source.as_str(),
                 runtime_input_schema: ctx.runtime_input_schema.as_deref(),

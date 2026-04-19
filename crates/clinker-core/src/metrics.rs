@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 pub struct ExecutionMetrics {
     /// UUID v7 identifying this execution. Reuses `RecordProvenance.source_batch`.
     pub execution_id: String,
-    /// Schema version for forward/backward compatibility. Currently `1`.
+    /// Schema version for forward/backward compatibility. Currently `2`
+    /// (Phase 16d / LD-16d-1 introduced `records_written` to split the
+    /// previously-overloaded `records_ok` into two distinct semantics).
     pub schema_version: u32,
     /// Pipeline name from `pipeline.name` in the YAML config.
     pub pipeline_name: String,
@@ -47,8 +49,14 @@ pub struct ExecutionMetrics {
     pub exit_code: u8,
     /// Total records read from the primary source.
     pub records_total: u64,
-    /// Records successfully written to the output.
+    /// Distinct source records that successfully reached at least one
+    /// Output. Per LD-16d-1 dual counter — under inclusive Route fan-out
+    /// one input matching N branches counts ONCE here.
     pub records_ok: u64,
+    /// Total writes across all sinks. Equals `records_ok` for single-
+    /// Output exclusive pipelines; exceeds it under inclusive Route
+    /// fan-out or multi-Output sinks. Per LD-16d-1 dual counter.
+    pub records_written: u64,
     /// Records routed to the DLQ.
     pub records_dlq: u64,
     /// DAG-derived execution summary from `ExecutionReport.execution_summary`.
@@ -144,7 +152,7 @@ pub fn collect_spool(spool_dir: &Path) -> io::Result<impl Iterator<Item = SpoolE
             }
         };
 
-        if metrics.schema_version != 1 {
+        if metrics.schema_version != 2 {
             tracing::warn!(
                 path = %path.display(),
                 schema_version = metrics.schema_version,
@@ -204,7 +212,7 @@ mod tests {
         let now = Utc::now();
         ExecutionMetrics {
             execution_id: id.to_string(),
-            schema_version: 1,
+            schema_version: 2,
             pipeline_name: "test-pipeline".into(),
             config_path: "/tmp/pipeline.yaml".into(),
             hostname: "test-host".into(),
@@ -214,6 +222,7 @@ mod tests {
             exit_code: 0,
             records_total: 100,
             records_ok: 99,
+            records_written: 99,
             records_dlq: 1,
             execution_mode: "Streaming".into(),
             peak_rss_bytes: Some(52_428_800),
@@ -258,10 +267,11 @@ mod tests {
         let parsed: ExecutionMetrics = serde_json::from_reader(file).unwrap();
 
         assert_eq!(parsed.execution_id, id);
-        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.schema_version, 2);
         assert_eq!(parsed.pipeline_name, "test-pipeline");
         assert_eq!(parsed.records_total, 100);
         assert_eq!(parsed.records_ok, 99);
+        assert_eq!(parsed.records_written, 99);
         assert_eq!(parsed.records_dlq, 1);
         assert_eq!(parsed.exit_code, 0);
         assert_eq!(parsed.peak_rss_bytes, Some(52_428_800));

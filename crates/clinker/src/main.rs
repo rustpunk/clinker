@@ -563,9 +563,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     tracing::info!(
-        "Pipeline complete: {} total, {} ok, {} dlq",
+        "Pipeline complete: {} total, {} ok, {} written, {} dlq",
         counters.total_count,
         counters.ok_count,
+        counters.records_written,
         counters.dlq_count
     );
 
@@ -585,7 +586,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
         let execution_metrics = ExecutionMetrics {
             execution_id: execution_id.clone(),
-            schema_version: 1,
+            schema_version: 2,
             pipeline_name: pipeline_config.pipeline.name.clone(),
             config_path: args.config.to_string_lossy().into_owned(),
             hostname,
@@ -595,6 +596,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             exit_code,
             records_total: counters.total_count,
             records_ok: counters.ok_count,
+            records_written: counters.records_written,
             records_dlq: counters.dlq_count,
             execution_mode: report.execution_summary.clone(),
             peak_rss_bytes: report.peak_rss_bytes,
@@ -619,6 +621,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 pipeline_name = %execution_metrics.pipeline_name,
                 records_total = execution_metrics.records_total,
                 records_ok = execution_metrics.records_ok,
+                records_written = execution_metrics.records_written,
                 records_dlq = execution_metrics.records_dlq,
                 duration_ms = execution_metrics.duration_ms,
                 exit_code = execution_metrics.exit_code,

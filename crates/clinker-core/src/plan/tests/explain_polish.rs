@@ -36,40 +36,6 @@ fn compile_legacy(config: &PipelineConfig, _fields: &[&str]) -> ExecutionPlanDag
         .clone()
 }
 
-fn compile_cxl_for_spec(
-    spec: &crate::executor::TransformSpec,
-    fields: &[&str],
-) -> cxl::typecheck::pass::TypedProgram {
-    let source = spec.cxl_source();
-    let parsed = cxl::parser::Parser::parse(source);
-    assert!(
-        parsed.errors.is_empty(),
-        "parse errors: {:?}",
-        parsed.errors
-    );
-    let resolved =
-        cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let cols: indexmap::IndexMap<cxl::typecheck::QualifiedField, cxl::typecheck::types::Type> =
-        fields
-            .iter()
-            .map(|f| {
-                (
-                    cxl::typecheck::QualifiedField::bare(*f),
-                    cxl::typecheck::types::Type::Any,
-                )
-            })
-            .collect();
-    let schema = cxl::typecheck::Row::closed(cols, cxl::lexer::Span::new(0, 0));
-    let mode = if let Some(agg) = &spec.aggregate {
-        cxl::typecheck::AggregateMode::GroupBy {
-            group_by_fields: agg.group_by.iter().cloned().collect(),
-        }
-    } else {
-        cxl::typecheck::AggregateMode::Row
-    };
-    cxl::typecheck::type_check_with_mode(resolved, &schema, mode).unwrap()
-}
-
 /// Fixture with a single aggregate node and an upstream source.
 fn aggregate_fixture_yaml() -> &'static str {
     r#"
@@ -84,7 +50,7 @@ nodes:
       path: data.csv
       schema:
         - { name: amount, type: int }
-        - { name: dept, type: any }
+        - { name: dept, type: string }
 
   - type: aggregate
     name: by_dept

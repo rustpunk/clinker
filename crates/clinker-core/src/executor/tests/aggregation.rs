@@ -144,8 +144,8 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: dept, type: any }
-      - { name: salary, type: any }
+      - { name: dept, type: string }
+      - { name: salary, type: float }
 
 - type: aggregate
   name: by_dept
@@ -175,14 +175,12 @@ nodes:
         assert_eq!(counters.ok_count, 2, "two output groups");
 
         // Set-equality on output rows (order is hash-table arbitrary).
-        // Note: CSV strings are Type::Any at runtime so `sum(salary)` over
-        // string values surfaces as null in the dispatch arm's Field path —
-        // typed coercion lives outside 16.3.13. We assert the group key + the
-        // count(*) leg, which exercises the full dispatch loop end-to-end.
+        // With salary declared as float, `sum(salary)` produces the real
+        // numeric total per group — eng = 100+200 = 300, sales = 50.
         let mut lines: Vec<&str> = output.lines().skip(1).collect();
         lines.sort();
-        let expected_a = "eng,,2";
-        let expected_b = "sales,,1";
+        let expected_a = "eng,300,2";
+        let expected_b = "sales,50,1";
         assert!(
             lines.contains(&expected_a) && lines.contains(&expected_b),
             "got lines = {lines:?}"

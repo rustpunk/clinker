@@ -64,9 +64,9 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - {{ name: employee_id, type: any }}
-      - {{ name: value, type: any }}
-      - {{ name: dept, type: any }}
+      - {{ name: employee_id, type: string }}
+      - {{ name: value, type: string }}
+      - {{ name: dept, type: string }}
 
 - type: transform
   name: validate
@@ -192,9 +192,9 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: employee_id, type: any }
-      - { name: dept, type: any }
-      - { name: value, type: any }
+      - { name: employee_id, type: string }
+      - { name: dept, type: string }
+      - { name: value, type: string }
 
 - type: transform
   name: validate

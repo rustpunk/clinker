@@ -381,8 +381,8 @@ nodes:
         start: 10
         width: 5
     schema:
-      - { name: name, type: any }
-      - { name: age, type: any }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest

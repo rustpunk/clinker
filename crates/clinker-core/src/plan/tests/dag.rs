@@ -25,7 +25,7 @@ nodes:
       type: csv
       path: data.csv
       schema:
-        - { name: amount, type: int }
+        - { name: amount, type: float }
 
   - type: transform
     name: categorize_emit
@@ -87,7 +87,7 @@ nodes:
       type: csv
       path: data.csv
       schema:
-        - { name: amount, type: int }
+        - { name: amount, type: float }
 
   - type: transform
     name: step_one
@@ -115,21 +115,6 @@ nodes:
 /// Parse a YAML string into a PipelineConfig for test use.
 pub(crate) fn parse_fixture(yaml: &str) -> PipelineConfig {
     crate::config::parse_config(yaml).unwrap()
-}
-
-/// Compile CXL source to TypedProgram for test use.
-fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProgram {
-    let parsed = cxl::parser::Parser::parse(source);
-    assert!(
-        parsed.errors.is_empty(),
-        "Parse errors: {:?}",
-        parsed.errors
-    );
-    let resolved =
-        cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let schema =
-        cxl::typecheck::Row::closed(indexmap::IndexMap::new(), cxl::lexer::Span::new(0, 0));
-    cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
 }
 
 /// Helper: compile a fixture config into an ExecutionPlanDag.
@@ -198,7 +183,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: alpha
@@ -286,7 +271,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: router_emit
@@ -342,7 +327,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: branch_a
@@ -419,7 +404,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: only
@@ -487,7 +472,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: step
@@ -550,7 +535,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: agg
@@ -693,7 +678,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: loopy
@@ -740,7 +725,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: any }
+      - { name: amount, type: float }
 
 - type: transform
   name: categorize_emit

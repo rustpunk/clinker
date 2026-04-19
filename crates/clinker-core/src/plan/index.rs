@@ -1,6 +1,6 @@
 //! Phase E: Index planning.
 //!
-//! Extracts `local_window` configs from `TransformSpec`, combines with
+//! Extracts `analytic_window` configs from pipeline nodes, combines with
 //! `AnalysisReport` field sets, deduplicates into `Vec<IndexSpec>`.
 
 use std::collections::HashSet;
@@ -8,10 +8,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::config::SortField;
-use crate::executor::TransformSpec;
 
-/// Typed representation of the `local_window` YAML block on a transform.
-/// Deserialized from `TransformSpec.local_window: Option<serde_json::Value>`.
+/// Typed representation of the `analytic_window` YAML block on a transform.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalWindowConfig {
     /// Reference source name. If None or same as primary input, it's a same-source window.
@@ -25,26 +23,11 @@ pub struct LocalWindowConfig {
     pub on: Option<String>,
 }
 
-/// Parse the analytic-window block (formerly `local_window`) from the
-/// raw JSON value on a TransformSpec. Renamed in Phase 16b to match
-/// the `analytic_window` field on `TransformBody`; the legacy
-/// `local_window` YAML key is still accepted by the legacy planner path.
-pub fn parse_analytic_window(
-    transform: &TransformSpec,
-) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
-    parse_analytic_window_value(&transform.local_window, &transform.name)
-}
-
-/// Phase 16b Wave 4ab — parse the analytic-window block from a
-/// `PlanTransformSpec`. Decoupled from `TransformSpec` so the planner
-/// can call into index planning without dragging the legacy type in.
-pub(crate) fn parse_analytic_window_spec(
-    spec: &crate::plan::execution::PlanTransformSpec,
-) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
-    parse_analytic_window_value(&spec.analytic_window, &spec.name)
-}
-
-fn parse_analytic_window_value(
+/// Parse a transform's `analytic_window` JSON value into a typed
+/// [`LocalWindowConfig`]. `None` raw value yields `Ok(None)`. Used by
+/// `PipelineConfig::compile_with_diagnostics` while building per-node
+/// window configs in declaration order.
+pub(crate) fn parse_analytic_window_value(
     raw: &Option<serde_json::Value>,
     transform_name: &str,
 ) -> Result<Option<LocalWindowConfig>, PlanIndexError> {
