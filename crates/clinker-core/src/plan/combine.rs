@@ -501,7 +501,18 @@ pub(crate) fn decompose_predicate(
     for c in conjuncts {
         match classify_conjunct(c, typed_where) {
             ConjunctClass::Equality(eq) => equalities.push(eq),
-            ConjunctClass::Range(r) => ranges.push(r),
+            ConjunctClass::Range(r) => {
+                // Ranges are preserved as typed range conjuncts for
+                // strategy selection (a future IEJoin / sort-merge
+                // strategy reads them directly). But they are also
+                // folded into the residual program so that the current
+                // HashBuildProbe executor — which only consults the
+                // residual — applies them as post-match filters. Once
+                // IEJoin lands, the strategy-selection post-pass can
+                // split ranges back out for that strategy.
+                ranges.push(r);
+                residual_exprs.push(c.clone());
+            }
             ConjunctClass::Residual => residual_exprs.push(c.clone()),
         }
     }

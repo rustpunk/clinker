@@ -706,56 +706,27 @@ pub struct TransformBody {
     /// CXL `$window.*` runtime binding, which is orthogonal.
     #[serde(default)]
     pub analytic_window: Option<AnalyticWindowSpec>,
-    /// Reference table lookup enrichment. Loads a secondary source into
-    /// memory and matches each input record against it using a CXL
-    /// predicate. Matched fields are available in the `cxl:` block as
-    /// `source_name.field_name`.
-    #[serde(default)]
-    pub lookup: Option<LookupConfig>,
     #[serde(default)]
     pub log: Option<Vec<crate::config::LogDirective>>,
     #[serde(default)]
     pub validations: Option<Vec<crate::config::ValidationEntry>>,
 }
 
-/// Configuration for reference table lookup enrichment on a transform.
-///
-/// The `where` predicate is a CXL boolean expression evaluated against
-/// each candidate row in the lookup source. Bare field names reference
-/// the primary input record; qualified names (`source_name.field`)
-/// reference the lookup source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LookupConfig {
-    /// Name of the source node providing the reference table.
-    pub source: String,
-    /// CXL boolean expression evaluated per candidate lookup row.
-    /// Both primary input fields (bare) and lookup fields
-    /// (`source.field`) are in scope.
-    #[serde(rename = "where")]
-    pub where_expr: String,
-    /// Behavior when no lookup row matches the predicate.
-    #[serde(default)]
-    pub on_miss: OnMiss,
-    /// Whether to take the first matching row or all matching rows.
-    #[serde(default, rename = "match")]
-    pub match_mode: MatchMode,
-}
-
-/// Behavior when a lookup finds no matching rows.
+/// Miss handling for combine: how a driver record with no matching
+/// build-side records is treated.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OnMiss {
-    /// All lookup fields resolve to null. Record is still emitted.
+    /// Build-side fields resolve to null. Driver record is still emitted.
     #[default]
     NullFields,
-    /// Record is silently skipped (not emitted).
+    /// Driver record is silently skipped (not emitted).
     Skip,
-    /// Pipeline errors on the first unmatched record.
+    /// Pipeline errors on the first unmatched driver record.
     Error,
 }
 
-/// Match cardinality for lookup/combine enrichment.
+/// Match cardinality for combine enrichment.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {

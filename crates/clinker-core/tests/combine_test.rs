@@ -1646,10 +1646,8 @@ nodes:
     /// `csv` crate for proper parsing (quoted fields, multi-line records,
     /// escaped delimiters) rather than raw line-sorting.
     ///
-    /// This is the C.2.3.4 regression assertion: migrated combine
-    /// fixtures must produce output equivalent to the C.2.0 lookup
-    /// baseline.
-    #[allow(dead_code)] // Wired by C.2.0+ tests.
+    /// Used by the `combine_baseline_*` migrated tests to assert the
+    /// combine output canonicalizes to the stored baseline snapshot.
     fn assert_records_match(actual: &str, expected: &str) {
         let actual_canon = canonicalize_csv(actual);
         let expected_canon = canonicalize_csv(expected);
@@ -1739,28 +1737,51 @@ nodes:
         assert!(!format!("{err}").is_empty());
     }
 
-    // ─── C.2.0.2 lookup-baseline snapshot capture ────────────────────────
+    // ─── combine migrations against stored baseline snapshots ───────────
     //
-    // Each test below runs the lookup pipeline currently exercised by
-    // `crates/clinker-core/src/integration_tests.rs::test_lookup_*` and
-    // captures its canonicalized CSV output as an `insta` snapshot. The
-    // .snap files land in `crates/clinker-core/tests/snapshots/` and are
-    // committed to git; they survive C.2.3 deletion of lookup runtime.
+    // Each test below runs a `type: combine` pipeline through the
+    // executor and asserts that its canonicalized CSV output matches the
+    // stored `.snap` file at
+    // `tests/snapshots/combine_test__tests__lookup_baseline_<name>.snap`.
+    // The snapshot files are pre-captured oracles (2-input equi/range
+    // joins, fan-out, multi-output route split). They are read raw via
+    // `std::fs`, the insta header is stripped, and the body is compared
+    // via `assert_records_match` (order-independent record equality).
     //
-    // C.2.3.4 migration tests (combine fixtures) read these snapshot
-    // files via std::fs and assert the migrated combine output
-    // canonicalizes to byte-identical CSV.
-    //
-    // Snapshot file paths (deterministic per insta defaults):
-    //   tests/snapshots/combine_test__tests__lookup_baseline_<name>.snap
-    //
-    // These functions are deleted in C.2.3.2 alongside the lookup
-    // runtime; the .snap files persist as the regression baseline.
+    // The snapshot filenames still carry the `lookup_baseline_` prefix
+    // — renaming them would add diff noise with zero semantic value.
+    // They encode "regression baseline for 2-input equi/range combine
+    // enrichment patterns" regardless of the legacy name.
 
-    fn lookup_yaml_equality() -> &'static str {
+    /// Load a baseline `.snap` file and return its body (the captured
+    /// CSV payload), with the insta YAML header stripped. Panics if the
+    /// file is missing or malformed.
+    fn load_baseline_snapshot(name: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/snapshots")
+            .join(format!("combine_test__tests__{name}.snap"));
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        // An insta snapshot file is:
+        //   ---
+        //   <yaml metadata>
+        //   ---
+        //   <body>
+        // Find the second `---\n` separator; everything after is the body.
+        let first = content
+            .find("---\n")
+            .unwrap_or_else(|| panic!("snapshot {} missing first `---` separator", path.display()));
+        let after_first = &content[first + 4..];
+        let second = after_first.find("---\n").unwrap_or_else(|| {
+            panic!("snapshot {} missing second `---` separator", path.display())
+        });
+        content[first + 4 + second + 4..].trim().to_string()
+    }
+
+    fn combine_yaml_equality() -> &'static str {
         r#"
 pipeline:
-  name: lookup_eq_baseline
+  name: combine_eq_baseline
 nodes:
   - type: source
     name: orders
@@ -1781,31 +1802,31 @@ nodes:
       schema:
         - { name: product_id, type: string }
         - { name: product_name, type: string }
-  - type: transform
+  - type: combine
     name: enrich
-    input: orders
+    input:
+      orders: orders
+      products: products
     config:
-      lookup:
-        source: products
-        where: "product_id == products.product_id"
+      where: "orders.product_id == products.product_id"
       cxl: |
-        emit order_id = order_id
+        emit order_id = orders.order_id
         emit product_name = products.product_name
-        emit quantity = quantity
+        emit quantity = orders.quantity
   - type: output
     name: result
     input: enrich
     config:
       name: result
       type: csv
-      path: lookup_eq_baseline.csv
+      path: combine_eq_baseline.csv
 "#
     }
 
-    fn lookup_yaml_range() -> &'static str {
+    fn combine_yaml_range() -> &'static str {
         r#"
 pipeline:
-  name: lookup_range_baseline
+  name: combine_range_baseline
 nodes:
   - type: source
     name: employees
@@ -1828,18 +1849,15 @@ nodes:
         - { name: min_pay, type: int }
         - { name: max_pay, type: int }
         - { name: rate_class, type: string }
-  - type: transform
+  - type: combine
     name: classify
-    input: employees
+    input:
+      employees: employees
+      rate_bands: rate_bands
     config:
-      lookup:
-        source: rate_bands
-        where: |
-          ee_group == rate_bands.ee_group
-          and pay >= rate_bands.min_pay
-          and pay <= rate_bands.max_pay
+      where: "employees.ee_group == rate_bands.ee_group and employees.pay >= rate_bands.min_pay and employees.pay <= rate_bands.max_pay"
       cxl: |
-        emit employee_id = employee_id
+        emit employee_id = employees.employee_id
         emit rate_class = rate_bands.rate_class
   - type: output
     name: result
@@ -1847,14 +1865,14 @@ nodes:
     config:
       name: result
       type: csv
-      path: lookup_range_baseline.csv
+      path: combine_range_baseline.csv
 "#
     }
 
-    fn lookup_yaml_on_miss_skip() -> &'static str {
+    fn combine_yaml_on_miss_skip() -> &'static str {
         r#"
 pipeline:
-  name: lookup_skip_baseline
+  name: combine_skip_baseline
 nodes:
   - type: source
     name: orders
@@ -1874,16 +1892,16 @@ nodes:
       schema:
         - { name: product_id, type: string }
         - { name: product_name, type: string }
-  - type: transform
+  - type: combine
     name: enrich
-    input: orders
+    input:
+      orders: orders
+      products: products
     config:
-      lookup:
-        source: products
-        where: "product_id == products.product_id"
-        on_miss: skip
+      where: "orders.product_id == products.product_id"
+      on_miss: skip
       cxl: |
-        emit order_id = order_id
+        emit order_id = orders.order_id
         emit product_name = products.product_name
   - type: output
     name: result
@@ -1891,14 +1909,14 @@ nodes:
     config:
       name: result
       type: csv
-      path: lookup_skip_baseline.csv
+      path: combine_skip_baseline.csv
 "#
     }
 
-    fn lookup_yaml_match_all() -> &'static str {
+    fn combine_yaml_match_all() -> &'static str {
         r#"
 pipeline:
-  name: lookup_match_all_baseline
+  name: combine_match_all_baseline
 nodes:
   - type: source
     name: employees
@@ -1918,17 +1936,17 @@ nodes:
       schema:
         - { name: employee_id, type: string }
         - { name: project, type: string }
-  - type: transform
+  - type: combine
     name: enrich
-    input: employees
+    input:
+      employees: employees
+      assignments: assignments
     config:
-      lookup:
-        source: assignments
-        where: "employee_id == assignments.employee_id"
-        match: all
+      where: "employees.employee_id == assignments.employee_id"
+      match: all
       cxl: |
-        emit employee_id = employee_id
-        emit department = department
+        emit employee_id = employees.employee_id
+        emit department = employees.department
         emit project = assignments.project
   - type: output
     name: result
@@ -1936,14 +1954,14 @@ nodes:
     config:
       name: result
       type: csv
-      path: lookup_match_all_baseline.csv
+      path: combine_match_all_baseline.csv
 "#
     }
 
-    fn lookup_yaml_match_all_skip() -> &'static str {
+    fn combine_yaml_match_all_skip() -> &'static str {
         r#"
 pipeline:
-  name: lookup_match_all_skip_baseline
+  name: combine_match_all_skip_baseline
 nodes:
   - type: source
     name: employees
@@ -1963,18 +1981,18 @@ nodes:
       schema:
         - { name: employee_id, type: string }
         - { name: project, type: string }
-  - type: transform
+  - type: combine
     name: enrich
-    input: employees
+    input:
+      employees: employees
+      assignments: assignments
     config:
-      lookup:
-        source: assignments
-        where: "employee_id == assignments.employee_id"
-        match: all
-        on_miss: skip
+      where: "employees.employee_id == assignments.employee_id"
+      match: all
+      on_miss: skip
       cxl: |
-        emit employee_id = employee_id
-        emit department = department
+        emit employee_id = employees.employee_id
+        emit department = employees.department
         emit project = assignments.project
   - type: output
     name: result
@@ -1982,120 +2000,107 @@ nodes:
     config:
       name: result
       type: csv
-      path: lookup_match_all_skip_baseline.csv
+      path: combine_match_all_skip_baseline.csv
 "#
     }
 
-    /// C.2.0.2 — capture lookup equality enrichment baseline.
-    /// 1:1 match, NullFields on miss (default).
+    /// Equality enrichment: 1:1 match, NullFields on miss (default).
+    /// Asserts byte-identical output (modulo row order) against the
+    /// stored `lookup_baseline_equality` snapshot.
     #[test]
-    fn test_lookup_baseline_equality() {
+    fn test_combine_baseline_equality() {
         let orders =
             "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\nORD-3,PROD-X,7\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
         let result = run_combine_fixture(
-            lookup_yaml_equality(),
+            combine_yaml_equality(),
             &[("orders", orders), ("products", products)],
-            None,
+            Some("orders"),
         )
-        .expect("lookup_eq baseline must execute under current lookup runtime");
-        insta::assert_snapshot!(
-            "lookup_baseline_equality",
-            canonicalize_csv(result.primary_output())
-        );
+        .expect("combine equality baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_equality");
+        assert_records_match(result.primary_output(), &expected);
     }
 
-    /// C.2.0.2 — range predicate baseline (compound and).
+    /// Range enrichment: compound `and` across equi + range predicates.
+    /// Asserts against the stored `lookup_baseline_range` snapshot.
     #[test]
-    fn test_lookup_baseline_range() {
+    fn test_combine_baseline_range() {
         let employees =
             "employee_id,ee_group,pay\nE001,exempt,75000\nE002,hourly,35000\nE003,exempt,120000\n";
         let rate_bands = "ee_group,min_pay,max_pay,rate_class\nexempt,50000,80000,tier_1\nexempt,80001,150000,tier_2\nhourly,20000,50000,tier_3\n";
         let result = run_combine_fixture(
-            lookup_yaml_range(),
+            combine_yaml_range(),
             &[("employees", employees), ("rate_bands", rate_bands)],
-            None,
+            Some("employees"),
         )
-        .expect("lookup_range baseline must execute under current lookup runtime");
-        insta::assert_snapshot!(
-            "lookup_baseline_range",
-            canonicalize_csv(result.primary_output())
-        );
+        .expect("combine range baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_range");
+        assert_records_match(result.primary_output(), &expected);
     }
 
-    /// C.2.0.2 — on_miss: skip baseline. Unmatched rows are dropped.
+    /// on_miss: skip — unmatched driver rows are dropped. Asserts
+    /// against `lookup_baseline_on_miss_skip`.
     #[test]
-    fn test_lookup_baseline_on_miss_skip() {
+    fn test_combine_baseline_on_miss_skip() {
         let orders = "order_id,product_id\nORD-1,PROD-A\nORD-2,PROD-X\nORD-3,PROD-B\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
         let result = run_combine_fixture(
-            lookup_yaml_on_miss_skip(),
+            combine_yaml_on_miss_skip(),
             &[("orders", orders), ("products", products)],
-            None,
+            Some("orders"),
         )
-        .expect("lookup_skip baseline must execute under current lookup runtime");
-        insta::assert_snapshot!(
-            "lookup_baseline_on_miss_skip",
-            canonicalize_csv(result.primary_output())
-        );
+        .expect("combine on_miss:skip baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_on_miss_skip");
+        assert_records_match(result.primary_output(), &expected);
     }
 
-    /// C.2.0.2 — match: all (fan-out) baseline. One employee with N
-    /// assignments produces N output records.
+    /// match: all — one driver row fans out to N output rows, one per
+    /// matching build-side row. Asserts against
+    /// `lookup_baseline_match_all`.
     #[test]
-    fn test_lookup_baseline_match_all() {
+    fn test_combine_baseline_match_all() {
         let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\n";
         let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE002,Borealis\nE003,Phoenix\nE003,Atlas\nE003,Vega\n";
         let result = run_combine_fixture(
-            lookup_yaml_match_all(),
+            combine_yaml_match_all(),
             &[("employees", employees), ("assignments", assignments)],
-            None,
+            Some("employees"),
         )
-        .expect("lookup_match_all baseline must execute under current lookup runtime");
-        insta::assert_snapshot!(
-            "lookup_baseline_match_all",
-            canonicalize_csv(result.primary_output())
-        );
+        .expect("combine match:all baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_match_all");
+        assert_records_match(result.primary_output(), &expected);
     }
 
-    /// C.2.0.2 — match: all + on_miss: skip baseline. Unmatched
-    /// employees dropped; matched ones fan out.
+    /// match: all + on_miss: skip — unmatched driver rows dropped;
+    /// matched ones fan out. Asserts against
+    /// `lookup_baseline_match_all_skip`.
     #[test]
-    fn test_lookup_baseline_match_all_skip() {
+    fn test_combine_baseline_match_all_skip() {
         let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\nE004,Marketing\n";
         let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE003,Vega\n";
         let result = run_combine_fixture(
-            lookup_yaml_match_all_skip(),
+            combine_yaml_match_all_skip(),
             &[("employees", employees), ("assignments", assignments)],
-            None,
+            Some("employees"),
         )
-        .expect("lookup_match_all_skip baseline must execute under current lookup runtime");
-        insta::assert_snapshot!(
-            "lookup_baseline_match_all_skip",
-            canonicalize_csv(result.primary_output())
-        );
+        .expect("combine match:all+skip baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_match_all_skip");
+        assert_records_match(result.primary_output(), &expected);
     }
 
-    // ─── Multi-output lookup baselines (order_fulfillment + lookup_enrichment)
+    // ─── Multi-output baselines: route fan-out downstream of combine ─────
     //
-    // These fixtures have a `route` node downstream of the lookup
-    // transform, producing TWO output streams each. The baseline captures
-    // BOTH outputs so the C.2.3.5 / C.2.3.6 migration tests can assert
-    // equivalence across every output.
+    // These fixtures have a `type: route` node downstream of the
+    // combine, producing two output streams each. The captured
+    // baselines assert equivalence across every output.
 
-    /// Inline variant of `examples/pipelines/order_fulfillment.yaml`.
-    /// The ORIGINAL YAML uses a `_route`-emit-transform pattern that does
-    /// NOT deterministically split records under the current executor
-    /// (both outputs end up stale or degenerate). This baseline uses a
-    /// PROPER `type: route` node so the captured outputs are
-    /// deterministically split — which is what C.2.3.5 must match after
-    /// migration. The lookup predicate, on_miss semantics, and emit
-    /// shape are preserved byte-identical to the source file; only the
-    /// output-splitting mechanism is normalized.
-    fn lookup_yaml_order_fulfillment_baseline() -> &'static str {
+    /// Inline variant of the `examples/pipelines/order_fulfillment.yaml`
+    /// pattern, normalized to use `type: route` for deterministic split.
+    fn combine_yaml_order_fulfillment_baseline() -> &'static str {
         r#"
 pipeline:
-  name: lookup_order_fulfillment_baseline
+  name: combine_order_fulfillment_baseline
 nodes:
   - type: source
     name: orders
@@ -2125,17 +2130,17 @@ nodes:
         - { name: product_name, type: string }
         - { name: category, type: string }
         - { name: weight_kg, type: string }
-  - type: transform
+  - type: combine
     name: product_lookup
-    input: orders
+    input:
+      orders: orders
+      products: products
     config:
-      lookup:
-        source: products
-        where: "product_code == products.product_code"
+      where: "orders.product_code == products.product_code"
       cxl: |
-        emit order_id = order_id
-        emit priority_level = priority_level
-        emit product_code = product_code
+        emit order_id = orders.order_id
+        emit priority_level = orders.priority_level
+        emit product_code = orders.product_code
         emit product_name = products.product_name
         emit category = products.category
         emit weight_kg = products.weight_kg
@@ -2166,17 +2171,14 @@ nodes:
 "#
     }
 
-    /// Inline variant of `benches/pipelines/realistic/lookup_enrichment.yaml`.
-    /// Preserves the generic `f0/f1/f2/f3` field names and the route
-    /// splitting on whether the lookup matched. Path scheme changed
-    /// from `bench://` to plain relative paths (bench:// is a
-    /// bench-runner-only scheme; the test harness injects in-memory
-    /// readers by source name). The route condition is preserved
-    /// byte-identical from the source file.
-    fn lookup_yaml_enrichment_baseline() -> &'static str {
+    /// Inline variant of the `benches/pipelines/realistic/lookup_enrichment.yaml`
+    /// pattern with route splitting on whether a match was found.
+    /// Path scheme changed from `bench://` to plain relative paths
+    /// (the test harness injects in-memory readers by source name).
+    fn combine_yaml_enrichment_baseline() -> &'static str {
         r#"
 pipeline:
-  name: lookup_enrichment_baseline
+  name: combine_enrichment_baseline
 nodes:
   - type: source
     name: orders
@@ -2202,20 +2204,20 @@ nodes:
       schema:
         - { name: f0, type: string }
         - { name: f1, type: string }
-  - type: transform
+  - type: combine
     name: enrich
-    input: orders
+    input:
+      orders: orders
+      products: products
     config:
-      lookup:
-        source: products
-        where: "f1 == products.f0"
-        on_miss: null_fields
+      where: "orders.f1 == products.f0"
+      on_miss: null_fields
       cxl: |
-        emit order_id = f0
-        emit product_code = f1
-        emit quantity = f2
+        emit order_id = orders.f0
+        emit product_code = orders.f1
+        emit quantity = orders.f2
         emit product_name = products.f1 ?? "UNKNOWN"
-        emit priority = f3
+        emit priority = orders.f3
   - type: route
     name: priority_split
     input: enrich
@@ -2243,11 +2245,11 @@ nodes:
 "#
     }
 
-    /// C.2.0.2 — multi-output baseline: order_fulfillment pattern.
-    /// Captures BOTH `fulfilled_orders` and `priority_report` outputs
-    /// as separate snapshots.
+    /// Multi-output order_fulfillment pattern — combine output split
+    /// by route into fulfilled + priority buckets. Asserts both
+    /// outputs against the stored baselines.
     #[test]
-    fn test_lookup_baseline_order_fulfillment() {
+    fn test_combine_baseline_order_fulfillment() {
         let orders = concat!(
             "order_id,order_date,quantity,unit_price,product_code,priority_level\n",
             "1,2024-01-15,5,29.99,PROD-A,urgent\n",
@@ -2261,31 +2263,30 @@ nodes:
             "PROD-B,Gadget,electronics,0.3\n",
         );
         let result = run_combine_fixture(
-            lookup_yaml_order_fulfillment_baseline(),
+            combine_yaml_order_fulfillment_baseline(),
             &[("orders", orders), ("products", products)],
-            None,
+            Some("orders"),
         )
-        .expect("order_fulfillment baseline must execute under current lookup runtime");
+        .expect("combine order_fulfillment baseline must execute");
         let fulfilled = result
             .output("fulfilled_orders")
             .expect("fulfilled_orders output must be present");
         let priority = result
             .output("priority_report")
             .expect("priority_report output must be present");
-        insta::assert_snapshot!(
-            "lookup_baseline_order_fulfillment_fulfilled_orders",
-            canonicalize_csv(fulfilled)
-        );
-        insta::assert_snapshot!(
-            "lookup_baseline_order_fulfillment_priority_report",
-            canonicalize_csv(priority)
-        );
+        let expected_fulfilled =
+            load_baseline_snapshot("lookup_baseline_order_fulfillment_fulfilled_orders");
+        let expected_priority =
+            load_baseline_snapshot("lookup_baseline_order_fulfillment_priority_report");
+        assert_records_match(fulfilled, &expected_fulfilled);
+        assert_records_match(priority, &expected_priority);
     }
 
-    /// C.2.0.2 — multi-output baseline: lookup_enrichment bench pattern.
-    /// Captures BOTH `high_priority_out` and `standard_out` outputs.
+    /// Multi-output lookup_enrichment bench pattern — combine output
+    /// split by route on whether the match produced a non-UNKNOWN
+    /// product_name. Asserts both outputs against the stored baselines.
     #[test]
-    fn test_lookup_baseline_enrichment() {
+    fn test_combine_baseline_enrichment() {
         let orders = concat!(
             "f0,f1,f2,f3\n",
             "1,PROD-A,10,priority\n",
@@ -2295,15 +2296,11 @@ nodes:
         );
         let products = concat!("f0,f1\n", "PROD-A,Widget\n", "PROD-B,Gadget\n");
         let result = run_combine_fixture(
-            lookup_yaml_enrichment_baseline(),
+            combine_yaml_enrichment_baseline(),
             &[("orders", orders), ("products", products)],
-            None,
+            Some("orders"),
         )
-        .expect("lookup_enrichment baseline must execute under current lookup runtime");
-        // Sanity: every input row should land in exactly one output. The
-        // lookup enrichment fixture has 4 inputs and we expect 3 to route
-        // to high_priority and 1 to standard (PROD-X misses the lookup,
-        // becomes "UNKNOWN", and falls into the default branch).
+        .expect("combine enrichment baseline must execute");
         assert_eq!(
             result.report.counters.total_count, 4,
             "expected 4 input records processed; counters: {:?}",
@@ -2320,25 +2317,19 @@ nodes:
             "both enrichment outputs empty — route dispatch is not firing. report={:?}\nhigh={high:?}\nstandard={standard:?}",
             result.report
         );
-        insta::assert_snapshot!(
-            "lookup_baseline_enrichment_high_priority",
-            canonicalize_csv(high)
-        );
-        insta::assert_snapshot!(
-            "lookup_baseline_enrichment_standard",
-            canonicalize_csv(standard)
-        );
+        let expected_high = load_baseline_snapshot("lookup_baseline_enrichment_high_priority");
+        let expected_standard = load_baseline_snapshot("lookup_baseline_enrichment_standard");
+        assert_records_match(high, &expected_high);
+        assert_records_match(standard, &expected_standard);
     }
 
-    /// C.2.0.2 gate: verify that every lookup baseline `.snap` file
-    /// exists on disk under `tests/snapshots/` AND has non-degenerate
-    /// content. Depends on the corresponding `test_lookup_baseline_*`
-    /// tests having run first to write the snapshots.
-    ///
-    /// RESOLUTION T-13: verify snapshot CONTENT exists (non-empty body
-    /// with header + at least one data row), not just file existence.
+    /// Gate test: verify every baseline `.snap` file exists on disk
+    /// with a non-degenerate body (header + at least one data row).
+    /// These snapshots are the regression oracle for the migrated
+    /// combine tests above — they ship as committed fixtures; their
+    /// absence turns every migrated test into a vacuous assertion.
     #[test]
-    fn test_lookup_snapshots_captured() {
+    fn test_combine_baseline_snapshots_present() {
         let snapshots_dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots");
         let expected = [
@@ -2356,20 +2347,12 @@ nodes:
             let path = snapshots_dir.join(name);
             assert!(
                 path.exists(),
-                "missing lookup baseline snapshot: {} — did the corresponding `test_lookup_baseline_*` test run? Try `cargo test --test combine_test`",
+                "missing baseline snapshot: {}",
                 path.display()
             );
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            // A captured insta snapshot is at minimum:
-            //   ---
-            //   source: tests/combine_test.rs
-            //   expression: ...
-            //   ---
-            //   <body>
-            //
-            // We require non-empty body (a header line at least). The
-            // body section starts after the second `---` separator.
+            // An insta snapshot body starts after the second `---`.
             let body_start = content.find("---\n").and_then(|i| {
                 let after = &content[i + 4..];
                 after.find("---\n").map(|j| i + 4 + j + 4)
@@ -2383,7 +2366,7 @@ nodes:
             let body = content[body_start..].trim();
             assert!(
                 !body.is_empty(),
-                "snapshot {} has empty body — lookup pipeline produced no output, regression baseline is degenerate",
+                "snapshot {} has empty body — regression baseline is degenerate",
                 path.display()
             );
             assert!(
@@ -2394,7 +2377,81 @@ nodes:
         }
     }
 
-    // ─── End C.2.0 ────────────────────────────────────────────────────────
+    /// Verify the lookup runtime is fully ripped from the codebase.
+    /// Every Rust source file under `crates/` must be free of the
+    /// lookup type names and functions that used to live in the
+    /// deleted `crates/clinker-core/src/pipeline/lookup.rs` and its
+    /// dispatch sites in the executor.
+    ///
+    /// Tokens are assembled at runtime from two halves so this test
+    /// source file itself does not trip the check.
+    #[test]
+    fn test_no_lookup_references_in_codebase() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has parent")
+            .parent()
+            .expect("crates dir has parent")
+            .to_path_buf();
+        let crates_dir = workspace_root.join("crates");
+        assert!(
+            crates_dir.is_dir(),
+            "crates/ not found under workspace root: {}",
+            workspace_root.display()
+        );
+        // Tokens are built from two halves at runtime so this file
+        // itself does not match its own check.
+        let banned: [String; 5] = [
+            format!("{}{}", "Lookup", "Config"),
+            format!("{}{}", "Runtime", "Lookup"),
+            format!("{}{}", "Lookup", "Table"),
+            format!("{}{}", "Equality", "Index"),
+            format!("{}{}", "build_lookup", "_tables"),
+        ];
+        let mut hits: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+        for entry in walkdir::WalkDir::new(&crates_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            // Skip target/ — cargo artifacts aren't source.
+            if path.components().any(|c| c.as_os_str() == "target") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for token in &banned {
+                if content.contains(token.as_str()) {
+                    // Find the first hit line for a useful failure message.
+                    for line in content.lines() {
+                        if line.contains(token.as_str()) {
+                            hits.push((path.to_path_buf(), line.trim().to_string(), token.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "lookup runtime token survived in {} place(s):\n{}",
+            hits.len(),
+            hits.iter()
+                .map(|(p, line, token)| format!("  {} [{token}]: {line}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ─── End migrated combine baselines ──────────────────────────────────
 
     /// Gate (C.1.4): a compiled Combine node carries
     /// `OrderingProvenance::DestroyedByCombine { confidence: Proven }` in

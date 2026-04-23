@@ -3,7 +3,6 @@ pub mod combine;
 pub mod dispatch;
 pub mod index;
 pub mod ingestion;
-pub mod lookup;
 pub mod loser_tree;
 pub mod memory;
 pub mod schema_coerce;

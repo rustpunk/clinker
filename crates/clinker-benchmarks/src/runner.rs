@@ -2,7 +2,7 @@
 //!
 //! Executes benchmark pipeline configs against cached generated data.
 //! Streaming: reads from cached file, writes to in-memory buffer.
-//! Supports multi-source pipelines (lookup, merge) and nested formats.
+//! Supports multi-source pipelines (combine, merge) and nested formats.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
@@ -293,15 +293,6 @@ mod tests {
     fn test_runner_etl_classic() {
         let runner = test_runner();
         let path = pipelines_dir().join("realistic/etl_classic.yaml");
-        let report = runner.run(&path, Scale::Small).unwrap();
-        assert!(!report.stages.is_empty());
-    }
-
-    /// Runner executes a multi-source lookup pipeline.
-    #[test]
-    fn test_runner_multi_source_lookup() {
-        let runner = test_runner();
-        let path = pipelines_dir().join("realistic/lookup_enrichment.yaml");
         let report = runner.run(&path, Scale::Small).unwrap();
         assert!(!report.stages.is_empty());
     }

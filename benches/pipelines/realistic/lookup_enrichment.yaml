@@ -28,20 +28,20 @@ nodes:
         - { name: f0, type: string }
         - { name: f1, type: string }
 
-  - type: transform
+  - type: combine
     name: enrich
-    input: orders
+    input:
+      orders: orders
+      products: products
     config:
-      lookup:
-        source: products
-        where: "f1 == products.f0"
-        on_miss: null_fields
+      where: "orders.f1 == products.f0"
+      on_miss: null_fields
       cxl: |
-        emit order_id = f0
-        emit product_code = f1
-        emit quantity = f2
+        emit order_id = orders.f0
+        emit product_code = orders.f1
+        emit quantity = orders.f2
         emit product_name = products.f1 ?? "UNKNOWN"
-        emit priority = f3
+        emit priority = orders.f3
 
   - type: route
     name: priority_split
