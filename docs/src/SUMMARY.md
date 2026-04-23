@@ -56,7 +56,7 @@
 # Cookbook
 
 - [CSV-to-CSV Transform](cookbook/csv-transform.md)
-- [Multi-Source Lookup](cookbook/lookup.md)
+- [Multi-Input Combine](cookbook/combine.md)
 - [Routing to Multiple Outputs](cookbook/routing.md)
 - [Aggregation & Rollups](cookbook/aggregation.md)
 - [File Splitting](cookbook/file-splitting.md)
