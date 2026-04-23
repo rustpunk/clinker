@@ -809,10 +809,38 @@ mod tests {
     }
 
     /// The planner only supports binary (2-input) combines. A fixture
-    /// declaring 3 inputs must be rejected at compile time with E312
+    /// declaring 3 inputs must be rejected by the post-bind combine
+    /// strategy pass with E312 — NOT by any bind_schema-phase check —
     /// until N-ary decomposition support lands. When that support does
     /// land, this test will start failing and needs to be rewritten to
     /// assert the 3-incoming-edge DAG shape directly.
+    ///
+    /// The assertion splits the two phases:
+    ///
+    /// 1. bind_schema must succeed on this fixture — none of the
+    ///    combine-authoring diagnostics (E300, E301, E303, E304, E305,
+    ///    E306, E307, E308, E309) fire, because the 3-input predicate
+    ///    decomposition, qualifier binding, and output-row merging are
+    ///    themselves well-formed.
+    /// 2. `select_combine_strategies` is the sole source of the E312
+    ///    rejection.
+    ///
+    /// This is Shape B (single compile() call) rather than Shape A
+    /// (call bind_schema + select_combine_strategies separately)
+    /// because driving `select_combine_strategies` from a test requires
+    /// a fully enriched `ExecutionPlanDag` — reproducing Stage 5 of
+    /// `PipelineConfig::compile_with_diagnostics` outside compile
+    /// would be speculative API surface rather than a fair test of the
+    /// existing wiring.
+    ///
+    /// Shape B remains strict despite the single entry point because
+    /// `select_combine_strategies` is invoked inside
+    /// `compile_with_diagnostics` after bind_schema runs; any
+    /// bind_schema-phase error in the E300–E309 block would be
+    /// collected into the same `diags` vec returned on failure. So
+    /// asserting that none of E300–E309 appear in the returned vec,
+    /// AND that E312 does appear, proves bind_schema bound cleanly
+    /// and that the post-pass is the rejection source.
     #[test]
     fn test_combine_e312_three_input_rejected() {
         let yaml = load_fixture("three_input_shared_key.yaml");
@@ -822,9 +850,33 @@ mod tests {
         let diags = config
             .compile(&ctx)
             .expect_err("3-input combine must be rejected while planner is binary-only");
+
+        // Phase 1: bind_schema must succeed — the fixture is itself
+        // well-formed as an N-ary combine; only the binary-only planner
+        // rejects it. Any E300–E309 here would mean the fixture broke
+        // at bind_schema instead, defeating this test's regression
+        // purpose.
+        const BIND_PHASE_COMBINE_CODES: &[&str] = &[
+            "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309",
+        ];
+        let bind_phase_errors: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| {
+                matches!(d.severity, clinker_core::error::Severity::Error)
+                    && BIND_PHASE_COMBINE_CODES.contains(&d.code.as_str())
+            })
+            .collect();
+        assert!(
+            bind_phase_errors.is_empty(),
+            "bind_schema must bind the 3-input fixture cleanly; got \
+             bind-phase combine errors: {bind_phase_errors:?}"
+        );
+
+        // Phase 2: the post-pass (`select_combine_strategies`) must be
+        // the source of the rejection.
         assert!(
             diags.iter().any(|d| d.code == "E312"),
-            "expected E312 for 3-input combine; got {diags:?}"
+            "expected E312 from the post-bind combine strategy pass; got {diags:?}"
         );
     }
 
