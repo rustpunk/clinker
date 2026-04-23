@@ -1,14 +1,14 @@
-//! Phase 16d gate tests — assert that `PipelineConfig::compile` (the
-//! canonical compile path) produces a fully-enriched `ExecutionPlanDag`.
+//! Gate tests — assert that `PipelineConfig::compile` (the canonical
+//! compile path) produces a fully-enriched `ExecutionPlanDag`.
 //!
-//! These tests lock in the invariants established by Phase 16d: one
+//! These tests lock in the invariants of the canonical path: one
 //! compile path, one enrichment pipeline, one DAG. They fire if someone
-//! ever regresses the canonical path to the pre-16d minimal shape
-//! (empty `source_dag`, empty `indices_to_build`, empty
-//! `node_properties`, hardcoded `ParallelismClass::Stateless`,
-//! `None`-returning Aggregate arm, etc.).
+//! ever regresses the canonical path to a minimal shape (empty
+//! `source_dag`, empty `indices_to_build`, empty `node_properties`,
+//! hardcoded `ParallelismClass::Stateless`, `None`-returning Aggregate
+//! arm, etc.).
 //!
-//! Fixtures are the existing `examples/pipelines/tests/16b_baseline/`
+//! Fixtures are the existing `examples/pipelines/tests/baseline/`
 //! corpus (already used by `pre_lift_baselines.rs`) plus one combine
 //! fixture from `crates/clinker-core/tests/fixtures/combine/`.
 
@@ -53,10 +53,10 @@ fn compile_fixture_with(
 
 #[test]
 fn test_path_a_aggregate_lowered_no_w100() {
-    // aggregate_windowed.yaml has a user-declared Aggregate. The
-    // pre-16d minimal Path A returned `None + W100` here; the enriched
-    // path lowers it to `PlanNode::Aggregation`.
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/aggregate_windowed.yaml");
+    // aggregate_windowed.yaml has a user-declared Aggregate. A
+    // previous minimal compile path returned `None + W100` here; the
+    // enriched path lowers it to `PlanNode::Aggregation`.
+    let plan = compile_fixture("examples/pipelines/tests/baseline/aggregate_windowed.yaml");
     let dag = plan.dag();
     let has_aggregation = dag
         .graph
@@ -72,13 +72,13 @@ fn test_path_a_aggregate_lowered_no_w100() {
 
 #[test]
 fn test_path_a_transform_has_derived_fields() {
-    // csv_transform_sink.yaml has a simple stateless Transform. The
-    // pre-16d minimal Path A hardcoded every Transform to
+    // csv_transform_sink.yaml has a simple stateless Transform. A
+    // previous minimal compile path hardcoded every Transform to
     // `ParallelismClass::Stateless` + `NodeExecutionReqs::Streaming`
-    // regardless of analyzer output. After 16d the fields are derived
-    // from the analyzer; `Stateless` + `Streaming` is still correct
-    // for this fixture, but the derivation path must be exercised.
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/csv_transform_sink.yaml");
+    // regardless of analyzer output; now the fields are derived from
+    // the analyzer. `Stateless` + `Streaming` is still correct for
+    // this fixture, but the derivation path must be exercised.
+    let plan = compile_fixture("examples/pipelines/tests/baseline/csv_transform_sink.yaml");
     let dag = plan.dag();
     let transform = dag
         .graph
@@ -107,9 +107,8 @@ fn test_path_a_transform_has_derived_fields() {
 #[test]
 fn test_path_a_transform_write_set_non_empty_for_emitter() {
     // csv_transform_sink.yaml emits several fields. `write_set`
-    // extracted from the TypedProgram must be populated — pre-16d Path A
-    // always left it empty.
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/csv_transform_sink.yaml");
+    // extracted from the TypedProgram must be populated.
+    let plan = compile_fixture("examples/pipelines/tests/baseline/csv_transform_sink.yaml");
     let dag = plan.dag();
     let write_set_populated = dag.graph.node_weights().any(|n| match n {
         PlanNode::Transform { write_set, .. } => !write_set.is_empty(),
@@ -125,17 +124,17 @@ fn test_path_a_transform_write_set_non_empty_for_emitter() {
 
 #[test]
 fn test_path_a_source_dag_populated() {
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/csv_transform_sink.yaml");
+    let plan = compile_fixture("examples/pipelines/tests/baseline/csv_transform_sink.yaml");
     let dag = plan.dag();
     assert!(
         !dag.source_dag.is_empty(),
-        "source_dag must be populated by build_source_dag; was empty (pre-16d shape)"
+        "source_dag must be populated by build_source_dag; was empty"
     );
 }
 
 #[test]
 fn test_path_a_output_projections_populated() {
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/csv_transform_sink.yaml");
+    let plan = compile_fixture("examples/pipelines/tests/baseline/csv_transform_sink.yaml");
     let dag = plan.dag();
     assert!(
         !dag.output_projections.is_empty(),
@@ -145,7 +144,7 @@ fn test_path_a_output_projections_populated() {
 
 #[test]
 fn test_path_a_parallelism_profile_populated() {
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/csv_transform_sink.yaml");
+    let plan = compile_fixture("examples/pipelines/tests/baseline/csv_transform_sink.yaml");
     let dag = plan.dag();
     assert!(
         !dag.parallelism.per_transform.is_empty(),
@@ -156,8 +155,8 @@ fn test_path_a_parallelism_profile_populated() {
 #[test]
 fn test_path_a_node_properties_populated_for_every_node() {
     // compute_node_properties walks the graph topologically and
-    // populates an entry per node. Pre-16d Path A left it empty.
-    let plan = compile_fixture("examples/pipelines/tests/16b_baseline/csv_transform_sink.yaml");
+    // populates an entry per node.
+    let plan = compile_fixture("examples/pipelines/tests/baseline/csv_transform_sink.yaml");
     let dag = plan.dag();
     assert_eq!(
         dag.node_properties.len(),
@@ -172,8 +171,8 @@ fn test_path_a_node_properties_populated_for_every_node() {
 fn test_path_a_preserves_user_declared_merge() {
     // Under the unified taxonomy a user-declared `- type: merge` with
     // `inputs: [a, b]` lowers to a single `PlanNode::Merge` with N
-    // fan-in edges — distinct from the pre-16b synthetic-Merge-per-
-    // transform shape in the deleted Path B.
+    // fan-in edges — distinct from the old synthetic-Merge-per-transform
+    // shape that a prior compile path emitted.
     let yaml = r#"
 pipeline:
   name: merge_parity
@@ -255,12 +254,10 @@ nodes:
 fn test_path_a_combine_strategies_selected_on_enriched_dag() {
     // After select_combine_strategies runs, every PlanNode::Combine has
     // a populated `driving_input` (empty string = pre-pass placeholder).
-    // The pass runs AFTER compute_node_properties per Phase 16d's D4
-    // strategy-pass ordering, so this test also serves as a lock
-    // against regressing the pass order (if someone moves
-    // select_combine_strategies back above the enrichment pipeline, the
-    // DAG will still be enriched when the pass runs because Phase 16d
-    // placed it at the end of the canonical path).
+    // The pass runs AFTER compute_node_properties, so this test also
+    // serves as a lock against regressing the pass order — moving
+    // select_combine_strategies above the enrichment pipeline would
+    // leave it observing an un-enriched DAG.
     let plan = compile_fixture_with(
         "crates/clinker-core/tests/fixtures/combine/combine_empty_build.yaml",
         |c| c.allow_absolute_paths = true,

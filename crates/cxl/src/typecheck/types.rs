@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 /// Serde representation: lowercase snake-case tag for the atomic variants
 /// (`string`, `int`, `float`, `bool`, `date`, `date_time`, `null`, `array`,
 /// `numeric`, `any`) plus a `nullable: <inner>` mapping form for `Nullable`.
-/// Used by `SourceBody.schema` for compile-time CXL typecheck (Phase 16b
-/// Task 16b.9) to declare source column types inline in YAML.
+/// Used by `SourceBody.schema` for compile-time CXL typecheck to declare
+/// source column types inline in YAML.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Type {

@@ -1,5 +1,5 @@
 //! Shared streaming-merge boundary detector — "Single-Encoder Two-Phase
-//! Bytes" architecture (Phase 16 Task 16.4.3).
+//! Bytes" architecture.
 //!
 //! The boundary detector owns one [`SortKeyEncoder`] and two scratch
 //! `Vec<u8>` buffers (`current`, `last`). On every call to
@@ -19,8 +19,7 @@
 //! Steady-state allocation is zero: `encode_into` clears+reuses the
 //! incoming buffer's capacity, and `mem::swap` rotates the two buffers
 //! without copying. This is the DataFusion `GroupValuesFullyOrdered`
-//! (PR #9662) + Polars streaming sorted group-by pattern, validated by
-//! the drill pass 9 audit (`RESEARCH-phase-16.4.3-spill-write-unification.md`).
+//! (PR #9662) + Polars streaming sorted group-by pattern.
 
 use clinker_record::{Record, Value, accumulator::AccumulatorEnum};
 use indexmap::IndexMap;
@@ -85,7 +84,7 @@ impl GroupBoundary {
 
     /// Whether a per-group state is currently open (i.e. at least one
     /// record has been pushed and the group has not yet been flushed).
-    /// Powers `StreamingAggregator::current_row_count()` (Task 16.4.10).
+    /// Powers `StreamingAggregator::current_row_count()`.
     pub(crate) fn is_group_open(&self) -> bool {
         self.open_state.is_some()
     }
@@ -162,9 +161,9 @@ impl GroupBoundary {
                 } else {
                     prev_state.min_row_num
                 };
-                // Phase 16b.8: emit post-aggregate record fields, not the
-                // upstream transform's common_emitted (which leaks
-                // pre-aggregation columns via include_unmapped). See
+                // Emit post-aggregate record fields, not the upstream
+                // transform's common_emitted (which leaks pre-aggregation
+                // columns via include_unmapped). See
                 // `HashAggregator::finalize` for the rationale.
                 let emitted: IndexMap<String, Value> = out_record
                     .schema()
@@ -222,7 +221,7 @@ impl GroupBoundary {
             } else {
                 state.min_row_num
             };
-            // Phase 16b.8: see the boundary-emit site above for rationale.
+            // See the boundary-emit site above for rationale.
             let emitted: IndexMap<String, Value> = out_record
                 .schema()
                 .columns()

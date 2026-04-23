@@ -29,9 +29,6 @@ pub struct IngestionOutput {
 }
 
 /// Collect all `Source` nodes from the unified `config.nodes` list.
-///
-/// Phase 16b Wave 4ab Checkpoint B: readers source from `nodes:` instead
-/// of the legacy top-level `inputs:` field.
 fn collect_source_nodes(config: &PipelineConfig) -> Vec<&SourceConfig> {
     config
         .nodes

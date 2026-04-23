@@ -368,8 +368,8 @@ pub fn eval_program<'w, S: RecordStorage + 'w>(
                 eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
             }
             Statement::Filter { .. } | Statement::Distinct { .. } => {
-                // Handled by ProgramEvaluator::eval_record() (Phase 12.2.5+)
-                // eval_program() is the legacy path — these statements are no-ops here.
+                // Handled by ProgramEvaluator::eval_record(). eval_program()
+                // is the legacy path — these statements are no-ops here.
             }
         }
     }
@@ -676,7 +676,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
 
         // Extractor-produced leaves. Reaching the row-level evaluator means a
         // post-extraction residual was evaluated without an aggregate scope —
-        // the aggregate finalize path has its own evaluator (Task 16.3.12).
+        // the aggregate finalize path has its own evaluator.
         Expr::AggSlot { span, .. } => Err(EvalError::new(
             EvalErrorKind::TypeMismatch {
                 expected: "row-level expression",

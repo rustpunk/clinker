@@ -1,4 +1,4 @@
-//! Task 16b.8 — `--explain` polish gate tests.
+//! `--explain` polish gate tests.
 //!
 //! These tests pin the contract for the enhanced `explain_text` output:
 //!   1. Route nodes render as a sibling line at their topo position,
@@ -25,10 +25,10 @@ use crate::plan::execution::*;
 /// `dag::compile_fixture` but honors aggregate-mode typecheck so
 /// group-by transforms lower correctly.
 fn compile_legacy(config: &PipelineConfig, _fields: &[&str]) -> ExecutionPlanDag {
-    // Phase 16d: the canonical compile entry point produces the DAG
-    // directly. `bind_schema` inside `compile_with_diagnostics`
-    // typechecks every CXL body against author-declared source schemas,
-    // so test callers no longer need to pre-build typed programs.
+    // The canonical compile entry point produces the DAG directly.
+    // `bind_schema` inside `compile_with_diagnostics` typechecks every
+    // CXL body against author-declared source schemas, so test callers
+    // no longer need to pre-build typed programs.
     config
         .compile(&crate::config::CompileContext::default())
         .expect("compile")

@@ -1,11 +1,12 @@
 /// Pipeline-wide counters for record-level outcomes.
 ///
 /// Lives in clinker-record so the cxl evaluator can reference it
-/// without depending on clinker-core. Updated at chunk boundaries
-/// during Phase 2 — all records within a chunk see the same counter
-/// values (snapshotted at chunk start).
+/// without depending on clinker-core. Updated at chunk boundaries —
+/// all records within a chunk see the same counter values
+/// (snapshotted at chunk start).
 ///
-/// Counter semantics (Phase 16d, locked decision LD-16d-1):
+/// Counter semantics — distinct-input vs write-throughput split under
+/// fan-out:
 ///
 /// * `ok_count` — distinct source records that successfully reached
 ///   at least one Output. Inclusive Route fan-out where one input
@@ -22,8 +23,8 @@
 /// Source-row identity for `ok_count` deduplication uses each
 /// record's source row number (`row_num`) as it flows through the
 /// DAG. For multi-source pipelines, row-num collisions across
-/// sources may undercount distinct inputs; LD-16d-1 documents this
-/// as a known limitation pending a globally-unique source-row stamp.
+/// sources may undercount distinct inputs — a known limitation
+/// pending a globally-unique source-row stamp.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineCounters {
     pub total_count: u64,

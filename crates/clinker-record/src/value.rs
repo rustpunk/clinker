@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(Value::empty_map().type_name(), "map");
     }
 
-    // --- Value::Map tests (Phase 13, Task 13.1) ---
+    // --- Value::Map tests ---
 
     #[test]
     fn test_map_construction() {

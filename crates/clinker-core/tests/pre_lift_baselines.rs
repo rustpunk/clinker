@@ -1,20 +1,18 @@
-//! Phase 16b Task 16b.0 — pre-lift baseline capture with tiered `BaselinePolicy`.
+//! Baseline capture with a tiered `BaselinePolicy`.
 //!
-//! Per `docs/research/RESEARCH-forward-only-baselines.md`, baselines are
-//! captured in two tiers:
+//! Baselines are captured in two tiers:
 //!
-//!   * `DualRun` — the fixture parses and runs on **both** pre-lift (current
-//!     `main`) and post-lift (Task 16b.2 onward) engines. We capture the
-//!     pre-lift byte-exact output here in 16b.0 and assert post-lift stays
-//!     byte-identical in Task 16b.4. This is the Spark PR #40496 / insta /
-//!     rustc-bless pattern: the actual refactor-safety net.
+//!   * `DualRun` — the fixture parses and runs on both the previous and
+//!     current engine. The previous engine's byte-exact output is captured
+//!     and the current engine must stay byte-identical. This is the Spark
+//!     PR #40496 / insta / rustc-bless pattern: the refactor-safety net.
 //!
 //!   * `ForwardOnly { first_captured_in }` — the fixture uses a shape the
-//!     pre-lift engine physically cannot parse (e.g. `nodes:` with a multi-
-//!     input `merge` variant). No system surveyed in the research doc attempts
-//!     to synthesize a pre-refactor baseline for such inputs. The fixture YAML
-//!     is committed here in 16b.0 so 16b.4 has a ready anchor, and the
-//!     inaugural baseline is captured on first post-lift run.
+//!     previous engine physically cannot parse (e.g. `nodes:` with a
+//!     multi-input `merge` variant). No system surveyed in prior-art
+//!     attempts to synthesize a pre-refactor baseline for such inputs.
+//!     The fixture YAML is committed and the inaugural baseline is
+//!     captured on the first current-engine run.
 //!
 //! On first run, set `UPDATE_BASELINES=1` to (re)write `.expected.*` files for
 //! every `DualRun` fixture. Default is strict byte-compare.
@@ -34,19 +32,18 @@ enum BaselinePolicy {
     /// Pre & post-lift both parse + run. Byte-compare against committed baseline(s).
     DualRun,
     /// Only the post-lift engine can parse this fixture; baseline captured later.
-    /// Cites `docs/research/RESEARCH-forward-only-baselines.md`.
     ForwardOnly { first_captured_in: &'static str },
 }
 
 struct BaselineFixture {
     /// Stable identifier used for snapshot names and baseline filenames.
     name: &'static str,
-    /// Fixture YAML filename, relative to `examples/pipelines/tests/16b_baseline/`.
+    /// Fixture YAML filename, relative to `examples/pipelines/tests/baseline/`.
     yaml: &'static str,
     policy: BaselinePolicy,
 }
 
-/// Canonical registry of the 4 Phase-16b baseline fixtures.
+/// Canonical registry of the 4 baseline fixtures.
 fn fixtures() -> Vec<BaselineFixture> {
     vec![
         BaselineFixture {
@@ -68,15 +65,15 @@ fn fixtures() -> Vec<BaselineFixture> {
             name: "merge_filter_distinct",
             yaml: "merge_filter_distinct.yaml",
             policy: BaselinePolicy::ForwardOnly {
-                first_captured_in: "16b.4",
+                first_captured_in: "initial",
             },
         },
     ]
 }
 
-// ───────────────────────── Phase 16c fixture corpus ─────────────────────────
+// ───────────────────────── Composition fixture corpus ─────────────────────────
 
-struct Phase16cFixture {
+struct CompositionFixture {
     /// Stable identifier.
     name: &'static str,
     /// Path relative to `crates/clinker-core/tests/fixtures/`.
@@ -89,100 +86,100 @@ struct Phase16cFixture {
     baseline_captured_in: Option<&'static str>,
 }
 
-/// All 14 Phase 16c fixtures: 5 compositions, 6 channels, 3 pipelines.
-fn phase_16c_fixtures() -> Vec<Phase16cFixture> {
+/// All 14 composition-era fixtures: 5 compositions, 6 channels, 3 pipelines.
+fn composition_fixtures() -> Vec<CompositionFixture> {
     vec![
-        // Compositions (5) — baselines captured in Task 16c.4.4
-        Phase16cFixture {
+        // Compositions (5)
+        CompositionFixture {
             name: "customer_enrich",
             rel_path: "compositions/customer_enrich.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "address_normalize",
             rel_path: "compositions/address_normalize.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "dlq_shape",
             rel_path: "compositions/dlq_shape.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "nested_caller",
             rel_path: "compositions/nested_caller.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "passthrough_check",
             rel_path: "compositions/passthrough_check.comp.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        // Channels (6) — baselines captured in Task 16c.4.4
-        Phase16cFixture {
+        // Channels (6)
+        CompositionFixture {
             name: "acme_prod",
             rel_path: "channels/acme_prod.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "acme_staging",
             rel_path: "channels/acme_staging.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "beta_prod",
             rel_path: "channels/beta_prod.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "beta_staging",
             rel_path: "channels/beta_staging.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "comp_direct",
             rel_path: "channels/comp_direct.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "empty_defaults",
             rel_path: "channels/empty_defaults.channel.yaml",
             is_pipeline: false,
-            baseline_captured_in: Some("16c.4.4"),
+            baseline_captured_in: Some("rev-1"),
         },
-        // Pipelines (3) — baselines captured in Task 16c.2.4
-        Phase16cFixture {
+        // Pipelines (3)
+        CompositionFixture {
             name: "composition_pipeline",
             rel_path: "pipelines/composition_pipeline.yaml",
             is_pipeline: true,
-            baseline_captured_in: Some("16c.2.4"),
+            baseline_captured_in: Some("rev-0"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "nested_composition_pipeline",
             rel_path: "pipelines/nested_composition_pipeline.yaml",
             is_pipeline: true,
-            baseline_captured_in: Some("16c.2.4"),
+            baseline_captured_in: Some("rev-0"),
         },
-        Phase16cFixture {
+        CompositionFixture {
             name: "channel_target_pipeline",
             rel_path: "pipelines/channel_target_pipeline.yaml",
             is_pipeline: true,
-            baseline_captured_in: Some("16c.2.4"),
+            baseline_captured_in: Some("rev-0"),
         },
     ]
 }
 
-fn phase_16c_fixture_root() -> PathBuf {
+fn composition_fixture_root() -> PathBuf {
     manifest_dir().join("tests").join("fixtures")
 }
 
@@ -217,7 +214,7 @@ fn test_params(config: &PipelineConfig) -> PipelineRunParams {
         .map(clinker_core::config::convert_pipeline_vars)
         .unwrap_or_default();
     PipelineRunParams {
-        execution_id: "16b-baseline".to_string(),
+        execution_id: "baseline-run".to_string(),
         batch_id: "batch-001".to_string(),
         pipeline_vars,
         shutdown_token: None,
@@ -244,7 +241,7 @@ fn fixture_root() -> PathBuf {
         .join("examples")
         .join("pipelines")
         .join("tests")
-        .join("16b_baseline")
+        .join("baseline")
 }
 
 fn read_fixture(rel_yaml: &str) -> String {
@@ -365,12 +362,12 @@ fn snapshot_explain(snap_name: &str, yaml: &str) {
 
 // ───────────────────────── gate tests ─────────────────────────
 
-/// Gate test for Task 16b.0. Verifies:
+/// Gate test for the baseline corpus. Verifies:
 ///   * every fixture YAML exists on disk (DualRun and ForwardOnly alike)
 ///   * every DualRun fixture has a committed, non-empty `.expected.*` baseline
-///   * every ForwardOnly fixture does NOT have a committed baseline (tracked
-///     so 16b.4 captures it from scratch — see research doc §"Do NOT commit a
-///     placeholder .expected.*").
+///   * every ForwardOnly fixture does NOT have a committed baseline — the
+///     inaugural capture happens on first run, and committing a placeholder
+///     would defeat the forward-only contract.
 #[test]
 fn test_baselines_loaded() {
     let fxroot = fixture_root();
@@ -405,11 +402,11 @@ fn test_baselines_loaded() {
                 }
             }
             BaselinePolicy::ForwardOnly { first_captured_in } => {
-                // Per research: no placeholder baseline file. The inaugural
-                // capture lives in the task named by first_captured_in.
+                // No placeholder baseline file — the inaugural capture
+                // lives in the task named by first_captured_in.
                 assert_eq!(
-                    first_captured_in, "16b.4",
-                    "ForwardOnly fixture {} should capture in 16b.4",
+                    first_captured_in, "initial",
+                    "ForwardOnly fixture {} should capture on first run",
                     fx.name
                 );
             }
@@ -417,17 +414,17 @@ fn test_baselines_loaded() {
     }
 }
 
-// ───────────────────────── Phase 16c gate tests ─────────────────────────
+// ───────────────────────── Composition-era gate tests ─────────────────────────
 
-/// Gate test for Task 16c.0.3. Verifies:
+/// Gate test for the composition fixture scaffold. Verifies:
 ///   * all 14 fixture files exist on disk
 ///   * all 3 pipeline fixtures deserialize as PipelineConfig
 ///   * composition and channel fixtures are valid YAML (parseable by serde_saphyr)
 #[test]
-fn test_scaffold_16c_fixture_corpus_well_formed() {
-    let root = phase_16c_fixture_root();
+fn test_composition_fixture_corpus_well_formed() {
+    let root = composition_fixture_root();
 
-    for fx in phase_16c_fixtures() {
+    for fx in composition_fixtures() {
         let path = root.join(fx.rel_path);
         assert!(
             path.is_file(),
@@ -459,13 +456,13 @@ fn test_scaffold_16c_fixture_corpus_well_formed() {
     }
 }
 
-/// Gate test for Task 16c.0.3. Verifies no ForwardOnly fixture has a
-/// premature `.expected.*` baseline file.
+/// Gate test: verifies no ForwardOnly fixture has a premature
+/// `.expected.*` baseline file.
 #[test]
-fn test_scaffold_16c_forward_only_no_baseline() {
-    let root = phase_16c_fixture_root();
+fn test_composition_forward_only_no_baseline() {
+    let root = composition_fixture_root();
 
-    for fx in phase_16c_fixtures() {
+    for fx in composition_fixtures() {
         // Check that no .expected.* file exists alongside the fixture
         let path = root.join(fx.rel_path);
         let parent = path.parent().unwrap();
@@ -486,9 +483,9 @@ fn test_scaffold_16c_forward_only_no_baseline() {
     }
 }
 
-/// Gate test for Task 16c.0.4. Verifies all explain doc stubs exist.
+/// Gate test: verifies all explain doc stubs exist.
 #[test]
-fn test_scaffold_16c_explain_docs_exist() {
+fn test_composition_explain_docs_exist() {
     let manifest = manifest_dir();
     let workspace_root = manifest.parent().unwrap().parent().unwrap();
     let explain_dir = workspace_root.join("docs").join("explain");
@@ -518,7 +515,7 @@ fn test_scaffold_16c_explain_docs_exist() {
     }
 }
 
-// ───────────────────────── Phase 16c pipeline baselines ─────────────────────────
+// ───────────────────────── Composition-era pipeline baselines ─────────────────────────
 
 /// Scrub tail variable IDs from explain text. Tail var IDs are monotonic
 /// counters per compilation, so their values are run-order-dependent.
@@ -528,10 +525,11 @@ fn scrub_tail_vars(text: &str) -> String {
     re.replace_all(text, "body=<ID>").to_string()
 }
 
-/// Compile a Phase 16c pipeline fixture and snapshot its explain text.
-/// Uses `CompileContext::with_pipeline_dir` for `use:` path resolution.
-fn snapshot_16c_pipeline(snap_name: &str, rel_path: &str) {
-    let root = phase_16c_fixture_root();
+/// Compile a composition-era pipeline fixture and snapshot its explain
+/// text. Uses `CompileContext::with_pipeline_dir` for `use:` path
+/// resolution.
+fn snapshot_composition_pipeline(snap_name: &str, rel_path: &str) {
+    let root = composition_fixture_root();
     let yaml_path = root.join(rel_path);
     let yaml = std::fs::read_to_string(&yaml_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", yaml_path.display()));
@@ -576,12 +574,12 @@ fn test_pre_lift_snapshots() {
     }
 }
 
-// ───────────────────────── Task 16c.2.4 gate tests ─────────────────────────
+// ───────────────────────── Forward-only pipeline gate tests ─────────────────────────
 
 /// Gate test: the 3 pipeline fixtures each have a captured insta baseline.
 #[test]
 fn test_forward_only_pipeline_fixtures_have_baseline() {
-    for fx in phase_16c_fixtures() {
+    for fx in composition_fixtures() {
         if !fx.is_pipeline {
             continue;
         }
@@ -591,7 +589,7 @@ fn test_forward_only_pipeline_fixtures_have_baseline() {
             fx.name
         );
         // Verify the fixture compiles successfully
-        let root = phase_16c_fixture_root();
+        let root = composition_fixture_root();
         let yaml_path = root.join(fx.rel_path);
         let yaml = std::fs::read_to_string(&yaml_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", yaml_path.display()));
@@ -605,15 +603,15 @@ fn test_forward_only_pipeline_fixtures_have_baseline() {
             clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile");
     }
     // Verify the insta snapshots exist
-    snapshot_16c_pipeline(
+    snapshot_composition_pipeline(
         "explain_composition_pipeline",
         "pipelines/composition_pipeline.yaml",
     );
-    snapshot_16c_pipeline(
+    snapshot_composition_pipeline(
         "explain_nested_composition_pipeline",
         "pipelines/nested_composition_pipeline.yaml",
     );
-    snapshot_16c_pipeline(
+    snapshot_composition_pipeline(
         "explain_channel_target_pipeline",
         "pipelines/channel_target_pipeline.yaml",
     );
@@ -624,7 +622,7 @@ fn test_forward_only_pipeline_fixtures_have_baseline() {
 /// that provides columns the body will shadow.
 #[test]
 fn test_w101_warning_emitted_end_to_end_on_passthrough_check_fixture() {
-    let root = phase_16c_fixture_root();
+    let root = composition_fixture_root();
     // Build a pipeline that uses passthrough_check.comp.yaml with upstream
     // providing {id, tag}. The body emits "tag", shadowing the pass-through.
     let yaml = r#"
@@ -677,11 +675,11 @@ nodes:
     );
 }
 
-/// Gate test: running the 16c pipeline snapshot twice produces identical
+/// Gate test: running the pipeline snapshot twice produces identical
 /// scrubbed output — verifies tail variable redaction stability.
 #[test]
 fn test_insta_baselines_are_tail_var_stable() {
-    let root = phase_16c_fixture_root();
+    let root = composition_fixture_root();
     let rel_path = "pipelines/composition_pipeline.yaml";
     let yaml_path = root.join(rel_path);
     let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
@@ -708,13 +706,17 @@ fn test_insta_baselines_are_tail_var_stable() {
     );
 }
 
-// ───────────────────────── Task 16c.4.4 gate tests ─────────────────────────
+// ───────────────────────── Baseline coverage gate tests ─────────────────────────
 
-/// Gate test: all 14 Phase 16c fixtures have a baseline_captured_in value.
+/// Gate test: all 14 composition-era fixtures have a baseline_captured_in value.
 #[test]
 fn test_all_14_fixtures_have_baseline() {
-    let fixtures = phase_16c_fixtures();
-    assert_eq!(fixtures.len(), 14, "expected exactly 14 Phase 16c fixtures");
+    let fixtures = composition_fixtures();
+    assert_eq!(
+        fixtures.len(),
+        14,
+        "expected exactly 14 composition-era fixtures"
+    );
     for fx in &fixtures {
         assert!(
             fx.baseline_captured_in.is_some(),
@@ -732,7 +734,7 @@ fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
     use clinker_channel::overlay::apply_channel_overlay;
     use clinker_core::config::composition::LayerKind;
 
-    let root = phase_16c_fixture_root();
+    let root = composition_fixture_root();
     let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
     let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
     let config = parse_config(&yaml).expect("parse_config");

@@ -1,20 +1,17 @@
-//! Shared header types for the unified `nodes:` enum (Phase 16b).
+//! Shared header types for the unified `nodes:` enum.
 //!
-//! These are the building blocks for `PipelineNode` variants. Task 16b.2
-//! will wire them into the enum itself; for now they stand alone so the
-//! foundation tests can lock their shapes in.
+//! These are the building blocks for `PipelineNode` variants.
 //!
-//! # Span-preserving input references (Pre-C.1 refactor)
+//! # Span-preserving input references
 //!
 //! Consumer headers carry their `input` / `inputs` references wrapped in
-//! [`crate::yaml::Spanned`] so field-level diagnostics (specifically E307
-//! on combine inputs referencing undeclared upstreams) can point at the
-//! exact YAML line/column of the offending reference. See
-//! `docs/internal/research/RESEARCH-span-preserving-deser.md` for the
-//! rationale — Approach A custom-Deserialize on `PipelineNode` drives
-//! serde-saphyr's native path so `Spanned<NodeInput>` captures real
-//! locations even at `IndexMap<String, _>` value position (spike
-//! validated in `yaml::tests::test_spanned_at_indexmap_value_position_captures_real_spans`).
+//! [`crate::yaml::Spanned`] so field-level diagnostics (specifically on
+//! combine inputs referencing undeclared upstreams) can point at the
+//! exact YAML line/column of the offending reference. A custom-Deserialize
+//! on `PipelineNode` drives serde-saphyr's native path so
+//! `Spanned<NodeInput>` captures real locations even at
+//! `IndexMap<String, _>` value position (spike validated in
+//! `yaml::tests::test_spanned_at_indexmap_value_position_captures_real_spans`).
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};

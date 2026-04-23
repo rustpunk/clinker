@@ -1,4 +1,4 @@
-//! Multi-output routing tests for Phase 13.
+//! Multi-output routing tests.
 //!
 //! Tests in this module exercise the multi-writer registry, route condition
 //! evaluation, per-output channels, and DLQ stage/route extensions.
@@ -770,7 +770,7 @@ nodes:
     let csv = "id,amount\n1,500\n2,30\n";
     let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
-    // Phase 16d / LD-16d-1 dual counters:
+    // Dual counters:
     //   ok_count = 2 (both input records reached at least one Output)
     //   records_written = 3 (record 1 fans out to {audit, report},
     //                        record 2 routes to {standard})
@@ -1259,13 +1259,12 @@ nodes:
 
     let result =
         PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
-    // Phase 16d remediation V2 / Q3=β: the DAG-walk Output arm now
-    // collects every Output's write/flush failure across the topo
-    // walk before aggregating into PipelineError::Multiple. With both
-    // writers failing on flush, the result MUST be Multiple with both
-    // errors — strictly tighter than the pre-remediation matcher
-    // (which accepted `Multiple | Io | Format(Io)` to tolerate the
-    // first-fail short-circuit Q3=β eliminates).
+    // The DAG-walk Output arm collects every Output's write/flush
+    // failure across the topo walk before aggregating into
+    // PipelineError::Multiple. With both writers failing on flush, the
+    // result MUST be Multiple with both errors — strictly tighter than
+    // the old matcher that accepted `Multiple | Io | Format(Io)` to
+    // tolerate a first-fail short-circuit.
     match result {
         Err(PipelineError::Multiple(errors)) => {
             assert_eq!(errors.len(), 2, "should collect both flush errors");
@@ -1276,7 +1275,7 @@ nodes:
     }
 }
 
-// --- DLQ stage/route extension tests (Task 13.6) ---
+// --- DLQ stage/route extension tests ---
 
 #[test]
 fn test_dlq_stage_source() {
@@ -1622,7 +1621,7 @@ nodes:
     assert!(header.contains("_cxl_dlq_route"));
 }
 
-// --- HashMap registry backward compat tests (Task 13.2) ---
+// --- HashMap registry backward compat tests ---
 
 #[test]
 fn test_single_writer_hashmap_backward_compat() {
@@ -1755,7 +1754,7 @@ nodes:
     );
 }
 
-// --- Route condition typecheck tests (Task 13.3) ---
+// --- Route condition typecheck tests ---
 
 #[test]
 fn test_route_config_non_boolean_condition_typecheck_error() {

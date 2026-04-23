@@ -1,6 +1,5 @@
 //! Compile-time CXL typecheck + schema propagation (`bind_schema`).
 //!
-//! Lifted from `config/cxl_compile.rs` in Phase 16c.1.4 (LD-16c-24).
 //! Walks the unified `nodes:` DAG in topological order, seeds each
 //! source's schema from its author-declared `schema:` block, typechecks
 //! every Transform/Aggregate/Route body against the upstream Row, and
@@ -10,7 +9,7 @@
 //!
 //! For `PipelineNode::Composition` nodes, `bind_composition` recursively
 //! binds the composition body at the call-site boundary using
-//! row-polymorphic type propagation (LD-16c-21, Leijen 2005).
+//! row-polymorphic type propagation (Leijen 2005).
 //!
 //! Errors surface as E200 diagnostics (CXL type error), E201
 //! diagnostics (missing source schema), and E102–E109 / W101
@@ -51,9 +50,8 @@ const MAX_COMPOSITION_DEPTH: u32 = 50;
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
     pub typed: HashMap<String, Arc<TypedProgram>>,
-    /// Per-node bound row types (LD-16c-23). Populated during the
-    /// `bind_schema` walk; persisted on `CompiledPlan` for downstream
-    /// phases to consume.
+    /// Per-node bound row types. Populated during the `bind_schema` walk;
+    /// persisted on `CompiledPlan` for downstream consumers.
     pub bound_schemas: BoundSchemas,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
@@ -68,26 +66,25 @@ pub struct CompileArtifacts {
     pub composition_body_assignments: HashMap<String, CompositionBodyId>,
     /// Monotonic counter for allocating fresh `FileId`s for body re-parses.
     next_file_id: u32,
-    /// Side-table of provenance-tracked config values (D-H.5 / LD-16c-11).
-    /// Populated by `bind_composition` for each composition node's config params.
+    /// Side-table of provenance-tracked config values. Populated by
+    /// `bind_composition` for each composition node's config params.
     pub provenance: ProvenanceDb,
-    /// Phase Combine C.0.2 — decomposed `where:` predicates per combine
-    /// node, keyed by combine node name. Populated by C.1 predicate
-    /// decomposition; consumed by C.2 strategy selection. Side-table
-    /// architecture per V-1-1 / RESOLUTION B-4.
+    /// Decomposed `where:` predicates per combine node, keyed by combine
+    /// node name. Populated by the predicate-decomposition pass; consumed
+    /// by combine strategy selection.
     pub combine_predicates: HashMap<String, DecomposedPredicate>,
-    /// Phase Combine C.0.2 — per-input metadata per combine node, keyed
-    /// by combine node name. The inner `IndexMap` preserves declaration
-    /// order of the inputs (matches `CombineHeader.input` iteration
-    /// order). Populated by C.1 schema propagation.
+    /// Per-input metadata per combine node, keyed by combine node name.
+    /// The inner `IndexMap` preserves declaration order of the inputs
+    /// (matches `CombineHeader.input` iteration order). Populated during
+    /// schema propagation.
     pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
-    /// Phase Combine C.2.4 — driving-input qualifier per combine node,
-    /// chosen at `bind_combine` time by [`select_driving_input`]
-    /// (explicit `drive:` → cardinality → first-in-IndexMap default).
-    /// The `select_combine_strategies` post-pass reads this to stamp
-    /// the runtime `PlanNode::Combine.driving_input` field. Combines
-    /// that fail driver selection (E306) are absent from this map and
-    /// their post-pass entry is skipped.
+    /// Driving-input qualifier per combine node, chosen at `bind_combine`
+    /// time by [`select_driving_input`] (explicit `drive:` → cardinality
+    /// → first-in-IndexMap default). The `select_combine_strategies`
+    /// post-pass reads this to stamp the runtime
+    /// `PlanNode::Combine.driving_input` field. Combines that fail driver
+    /// selection (E306) are absent from this map and their post-pass
+    /// entry is skipped.
     pub combine_driving: HashMap<String, String>,
 }
 
@@ -174,7 +171,7 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
-    // Persist all bound rows into BoundSchemas (LD-16c-23).
+    // Persist all bound rows into BoundSchemas.
     for (node_name, row) in schema_by_name {
         artifacts.bound_schemas.set_output(node_name, row);
     }
@@ -314,10 +311,8 @@ fn bind_schema_inner(
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
             //
-            // The entire combine compile work lives in `bind_combine`
-            // rather than split across three phase tasks. Rationale:
-            // `RESEARCH-combine-compile-architecture.md` documents that
-            // every mature engine does merged-schema build, predicate
+            // Combine compile runs as a single pass in `bind_combine`.
+            // Every mature engine does merged-schema build, predicate
             // typecheck, body typecheck, and output-row publication as
             // a single bottom-up traversal. Splitting them into three
             // side-table handoffs is the pattern Spark SPIP-49834 is
@@ -365,7 +360,7 @@ fn bind_schema_inner(
 ///
 /// This is the `PipelineNode::Composition` arm of `bind_schema_inner`.
 /// It recursively binds the body as a sub-problem within a nested scope
-/// per LD-16c-21 (preserve-and-recurse, not flatten-and-splice).
+/// (preserve-and-recurse, not flatten-and-splice).
 #[allow(clippy::too_many_arguments)]
 fn bind_composition(
     node_name: &str,
@@ -441,7 +436,7 @@ fn bind_composition(
         has_errors = true;
     }
 
-    // 5. Validate resources (stub for 16c.2).
+    // 5. Validate resources (stub pending full Resource enum).
     if !validate_resources(call_resources, signature, node_name, span, diags) {
         has_errors = true;
     }
@@ -694,8 +689,8 @@ fn validate_config(
     ok
 }
 
-/// Validate call-site `resources:` — stub for 16c.2. Real validation
-/// lands in 16c.3 when the Resource enum is fully defined.
+/// Validate call-site `resources:` — stub pending full Resource enum. Real validation
+/// lands when the Resource enum is fully defined.
 fn validate_resources(
     _call_site: &IndexMap<String, serde_json::Value>,
     _signature: &CompositionSignature,
@@ -713,7 +708,7 @@ fn validate_resources(
 /// - The signature's default if present.
 ///
 /// All values at this stage are tagged as [`LayerKind::CompositionDefault`]
-/// since channel-level resolution does not exist until 16c.4.
+/// since channel-level resolution is not yet wired.
 fn populate_config_provenance(
     call_site: &IndexMap<String, serde_json::Value>,
     signature: &CompositionSignature,
@@ -1213,11 +1208,10 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
 /// Bind a `PipelineNode::Combine` node in one bottom-up traversal.
 ///
 /// Architecture: a single pass does merged-schema construction (C.1.1),
-/// where-clause typecheck + predicate decomposition (C.1.2), body
-/// typecheck + output-row publication (C.1.3). Splitting these into
-/// three passes with intermediate side-table handoffs is the pattern
-/// Spark SPIP-49834 is actively migrating away from; see
-/// `RESEARCH-combine-compile-architecture.md` §Design insights.
+/// where-clause typecheck + predicate decomposition, body typecheck +
+/// output-row publication. Splitting these into three passes with
+/// intermediate side-table handoffs is the pattern Spark SPIP-49834 is
+/// actively migrating away from.
 ///
 /// Per-input metadata is keyed by node-visible upstream NAME (not a
 /// graph-layer `NodeIndex`) because `bind_schema` runs before

@@ -4,8 +4,8 @@
 //! and stored on [`ExecutionPlanDag`](crate::plan::execution::ExecutionPlanDag).
 //! It is consumed by:
 //!
-//! - streaming aggregation qualification (Phase 16)
-//! - Phase 14 correlated DLQ sort-order lookup
+//! - streaming aggregation qualification
+//! - correlated DLQ sort-order lookup
 //! - `--explain` text and JSON rendering
 //! - Kiln canvas edge overlays
 //!
@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Computed once after transform compilation, stored on
 /// [`ExecutionPlanDag`](crate::plan::execution::ExecutionPlanDag), consumed
-/// by streaming-agg selection, Phase 14 correlated DLQ, `--explain`
-/// rendering, and Kiln canvas edge overlays.
+/// by streaming-agg selection, correlated DLQ, `--explain` rendering,
+/// and Kiln canvas edge overlays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeProperties {
     pub ordering: Ordering,
@@ -104,8 +104,7 @@ pub enum OrderingProvenance {
     NoOrdering,
     /// Ordering asserted by a streaming aggregate's group-by prefix at
     /// `at_node`, enabled by an upstream `Ordering` provenance chain
-    /// (`enabled_by`). Phase 16 Task 16.4.0 introduces the variant; the
-    /// property-pass walker that produces it lands in Task 16.4.9a.
+    /// (`enabled_by`).
     IntroducedByStreamingAggregate {
         at_node: String,
         enabled_by: Box<OrderingProvenance>,
@@ -172,13 +171,13 @@ impl NodeProperties {
 /// `OrderingProvenance` chain hop-by-hop and emit one `note:` per
 /// destruction site, plus a primary `help:` selected on the terminal hop.
 ///
-/// The walker is also reused (Task 16.4.9) to populate
+/// The walker is also reused to populate
 /// `PlanNode::Aggregation::fallback_reason` when `Auto` resolves to `Hash`
 /// because eligibility was `HashFallback`, so Kiln canvas hover tooltips
 /// share a single source of truth with compile errors.
 ///
 /// Pure formatting — no I/O. Confidence-aware caret style is a
-/// Clinker-original UX (no prior-art precedent; see drill-pass-10 Q4).
+/// Clinker-original UX.
 pub fn render_unordered_streaming_error(
     parent_props: &NodeProperties,
     group_by: &[String],

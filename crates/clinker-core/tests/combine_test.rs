@@ -744,9 +744,9 @@ mod tests {
     }
 
     /// Compile a parsed `PipelineConfig` into an `ExecutionPlanDag` via the
-    /// canonical Phase 16d compile path. `bind_schema` typechecks every
-    /// CXL-bearing node against the author-declared source schemas;
-    /// Combine nodes lower to `PlanNode::Combine` in stage 5 via
+    /// canonical compile path. `bind_schema` typechecks every CXL-bearing
+    /// node against the author-declared source schemas; Combine nodes
+    /// lower to `PlanNode::Combine` in stage 5 via
     /// `lower_node_to_plan_node`.
     fn compile_plan(config: &PipelineConfig) -> ExecutionPlanDag {
         config
@@ -872,16 +872,13 @@ mod tests {
         }
     }
 
-    // --- Pre-C.1 field-level span gate tests ---------------------------
+    // --- Field-level span gate tests ---------------------------
     //
-    // These tests lock in the architectural contract of the Pre-C.1
-    // custom-Deserialize refactor: every consumer header carries
-    // `Spanned<NodeInput>` at field level, E307 carries a real span, and
-    // parity holds across Merge and Transform headers.
-    //
-    // See `docs/internal/research/RESEARCH-span-preserving-deser.md`
-    // (Approach A). If any of these tests regress, the refactor has
-    // leaked — do NOT weaken the asserts.
+    // These tests lock in the contract of the custom-Deserialize on
+    // consumer headers: every consumer header carries `Spanned<NodeInput>`
+    // at field level, undeclared-reference errors carry a real span, and
+    // parity holds across Merge and Transform headers. If any of these
+    // tests regress, the refactor has leaked — do NOT weaken the asserts.
 
     /// Gate: CombineHeader's `input: IndexMap<String, Spanned<NodeInput>>`
     /// captures real YAML line numbers per entry. Parses the
@@ -950,19 +947,15 @@ mod tests {
         );
     }
 
-    /// Gate: `PlanError::CombineInputUndeclared` (E307) carries a real
-    /// `Span`. Constructs an inline combine fixture that references an
-    /// Phase 16d: combine edge wiring in `PipelineConfig::compile`
-    /// emits E307 as a `Diagnostic` when a combine input references an
-    /// undeclared upstream. The diagnostic's primary span carries the
-    /// `line_only` synthetic span of the offending `products: nowhere`
-    /// reference (populated from `Spanned<NodeInput>::referenced`).
-    ///
-    /// Phase 16d remediation V2/V3 (Q7=γ + Q5=1): E307 collapsed into
-    /// E300 with a structured `DiagnosticPayload::InputRefUndeclared`
-    /// payload. The test destructures the structured payload directly
-    /// (strictly stronger than the pre-remediation substring matching
-    /// — transposed identifiers no longer pass).
+    /// Gate: combine edge wiring in `PipelineConfig::compile` emits an
+    /// E004 `Diagnostic` when a combine input references an undeclared
+    /// upstream. The diagnostic's primary span carries the `line_only`
+    /// synthetic span of the offending `products: nowhere` reference
+    /// (populated from `Spanned<NodeInput>::referenced`) and the
+    /// structured `DiagnosticPayload::InputRefUndeclared` payload pins
+    /// the consumer/qualifier/reference triple — transposing any of the
+    /// three identifiers fails the assertion (strictly stronger than
+    /// substring matching on the message).
     #[test]
     fn test_combine_undeclared_input_diagnostic_has_real_span() {
         let yaml = r#"
@@ -1023,30 +1016,25 @@ nodes:
         );
     }
 
-    /// Phase 16d remediation V2 regression: combine-undeclared input
-    /// surfaces as a structural-stage E300 with combine-arm payload
-    /// even when a sibling node would have triggered a CXL error in
-    /// bind_schema.
+    /// Regression: combine-undeclared input surfaces as a
+    /// structural-stage E004 with combine-arm payload even when a
+    /// sibling node would have triggered a CXL error in bind_schema.
     ///
-    /// Pre-remediation, combine E307 emission lived in stage-5 Phase-2
+    /// Previously combine undeclared-input emission lived in stage-5
     /// edge wiring AFTER bind_schema. A fixture with both an E200 (CXL)
     /// on one node and a combine-undeclared on another would surface
     /// ONLY the E200; the combine typo was invisible until the user
     /// fixed the unrelated CXL error first. The unified
-    /// `resolve_all_input_references` pass moves combine-undeclared up
-    /// to stage 3.5, so it fires regardless of what bind_schema would
-    /// have done.
+    /// `resolve_all_input_references` pass moves combine-undeclared
+    /// forward to the structural stage so it fires regardless of what
+    /// bind_schema would have done.
     ///
-    /// `compile_topology_only`'s stages-1-4 early return at
-    /// `config/mod.rs:1294` still short-circuits bind_schema once any
-    /// stage-3.5 E300 exists, so this fixture surfaces ONLY E300 (not
-    /// both E200 and E300 in the same pass). The "all errors in one
-    /// pass" enhancement — letting bind_schema run defensively over
-    /// nodes with broken inputs to also collect E200s — is tracked as
-    /// a follow-up under V2 in
-    /// `docs/internal/plans/cxl-engine/phase-16d-remediation.md`. The
-    /// load-bearing user-facing fix (combine typo no longer hidden by
-    /// a sibling CXL error) is what this regression locks in.
+    /// `compile_topology_only`'s early return still short-circuits
+    /// bind_schema once any structural-stage E004 exists, so this
+    /// fixture surfaces ONLY E004 (not both E200 and E004 in the same
+    /// pass). The load-bearing user-facing fix — combine typo no
+    /// longer hidden by a sibling CXL error — is what this regression
+    /// locks in.
     #[test]
     fn test_combine_undeclared_input_fires_even_when_bind_schema_would_error() {
         let yaml = r#"

@@ -5,5 +5,5 @@
 
 #[test]
 fn scaffold() {
-    // Placeholder — replaced by Playwright MCP tests in 16c.6.4
+    // Placeholder — the real extract-composition tests run through Playwright.
 }

@@ -66,10 +66,9 @@ pub enum PlanNode {
         /// has no span info to plumb through.
         #[serde(skip)]
         span: Span,
-        /// Phase 16b Wave 2 enrichment: full resolved Source payload.
-        /// Populated only by the new `PipelineConfig::compile()` lowering
-        /// from the unified `nodes:` taxonomy. Legacy planner leaves it
-        /// `None`. Boxed to keep the variant small.
+        /// Full resolved Source payload. Populated by
+        /// `PipelineConfig::compile()` from the unified `nodes:` taxonomy.
+        /// Boxed to keep the variant small.
         #[serde(skip)]
         resolved: Option<Box<PlanSourcePayload>>,
     },
@@ -77,7 +76,7 @@ pub enum PlanNode {
         name: String,
         #[serde(skip)]
         span: Span,
-        /// Phase 16b Wave 2 enrichment: full resolved Transform payload.
+        /// Full resolved Transform payload.
         #[serde(skip)]
         resolved: Option<Box<PlanTransformPayload>>,
         parallelism_class: ParallelismClass,
@@ -94,7 +93,7 @@ pub enum PlanNode {
         /// `TypedProgram`. Single source of truth for
         /// `compute_node_properties`'s `DestroyedByTransformWriteSet` rule —
         /// the property pass reads this directly off the node, no executor
-        /// coupling. See `docs/research/RESEARCH-property-derivation-layering.md`.
+        /// coupling.
         #[serde(skip_serializing_if = "BTreeSet::is_empty")]
         write_set: BTreeSet<String>,
         /// True iff the CXL transform contains a `distinct` statement. Populated
@@ -121,18 +120,18 @@ pub enum PlanNode {
         name: String,
         #[serde(skip)]
         span: Span,
-        /// Phase 16b Wave 2 enrichment: full resolved Output payload.
+        /// Full resolved Output payload.
         #[serde(skip)]
         resolved: Option<Box<PlanOutputPayload>>,
     },
-    /// Planner-synthesized sort enforcer (drill pass 3, D46/D47).
+    /// Planner-synthesized sort enforcer.
     ///
     /// Inserted by `ExecutionPlanDag::insert_enforcer_sorts` on edges feeding
     /// transforms with `RequiresSortedInput` whose upstream `Source` does not
     /// already satisfy the requirement (per `source_ordering_satisfies`).
     ///
-    /// Distinct from Phase 6 arena `sort_partition` (window-local, never lifted
-    /// into the DAG) and Phase 8 declared Source/Output sorts. The variant name
+    /// Distinct from arena-local `sort_partition` (window-local, never lifted
+    /// into the DAG) and user-declared Source/Output sorts. The variant name
     /// is reserved with the prefix `__sort_for_{consumer}`; user-declared node
     /// names starting with `__sort_for_` are rejected at compile time.
     Sort {
@@ -141,7 +140,7 @@ pub enum PlanNode {
         span: Span,
         sort_fields: Vec<SortField>,
     },
-    /// Hash / streaming GROUP BY transform (Phase 16, Task 16.3.5).
+    /// Hash / streaming GROUP BY transform.
     ///
     /// Constructed by `ExecutionPlanDag::compile()` when a `TransformSpec`
     /// has its `aggregate` block set. The plan-time extraction artifact
@@ -158,8 +157,8 @@ pub enum PlanNode {
         strategy: AggregateStrategy,
         #[serde(skip)]
         output_schema: Arc<Schema>,
-        /// Reason streaming was not selected, populated by the
-        /// `select_aggregation_strategies` post-pass (Task 16.4.9) when
+        /// Reason streaming was not selected. Populated by the
+        /// `select_aggregation_strategies` post-pass when
         /// `config.strategy == Auto` and eligibility was `HashFallback`.
         /// `None` for explicit Hash, explicit Streaming, or Auto-that-qualified.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,37 +185,35 @@ pub enum PlanNode {
         /// `CompositionBodyId::SENTINEL` before binding runs.
         body: CompositionBodyId,
     },
-    /// N-ary combine node (Phase Combine, task C.0.2).
+    /// N-ary combine node.
     ///
-    /// V-1-1 side-table architecture: this variant carries ONLY --explain-
-    /// visible and parse-time-available fields inline. The late-populated
-    /// compile state lives in `CompileArtifacts` side-tables
-    /// (`typed["{name}::where"]`, `typed["{name}::body"]`,
-    /// `combine_predicates`, `combine_inputs`). See
-    /// `crates/clinker-core/src/plan/combine.rs`.
+    /// This variant carries ONLY `--explain`-visible and parse-time-available
+    /// fields inline. The late-populated compile state lives in
+    /// `CompileArtifacts` side-tables (`typed["{name}::where"]`,
+    /// `typed["{name}::body"]`, `combine_predicates`, `combine_inputs`).
+    /// See `crates/clinker-core/src/plan/combine.rs`.
     Combine {
         name: String,
         #[serde(skip)]
         span: Span,
         /// Planner-selected strategy. Defaults to `HashBuildProbe`;
-        /// overwritten by `select_combine_strategies` post-pass (C.2).
+        /// overwritten by the `select_combine_strategies` post-pass.
         /// Follows `PlanNode::Aggregation.strategy` precedent.
         strategy: crate::plan::combine::CombineStrategy,
         /// Driving input qualifier. Empty string until the planner
-        /// selects it (C.2).
+        /// selects it.
         driving_input: String,
         match_mode: crate::config::pipeline_node::MatchMode,
         on_miss: crate::config::pipeline_node::OnMiss,
         /// For synthetic binary combine nodes created by N-ary
-        /// decomposition (C.4): name of the original N-ary combine node
-        /// this was decomposed from. `None` for user-authored combine
-        /// nodes. Populated in C.4.0.3; consumed by C.5.1 `--explain`
-        /// grouping (RESOLUTION W-1).
+        /// decomposition: name of the original N-ary combine node this
+        /// was decomposed from. `None` for user-authored combine nodes.
+        /// Consumed by `--explain` rendering for grouping.
         decomposed_from: Option<String>,
     },
 }
 
-/// Phase 16b Wave 2 — fully-resolved Source payload, populated by the new
+/// Fully-resolved Source payload, populated by the
 /// `PipelineConfig::compile()` lowering path. Wraps the parse-time
 /// `SourceConfig` plus the `ValidatedPath` (proof of pre-pass success).
 /// Stored behind `Box` on `PlanNode::Source` to keep the variant slim.
@@ -226,25 +223,24 @@ pub struct PlanSourcePayload {
     pub validated_path: Option<crate::security::ValidatedPath>,
 }
 
-/// Phase 16b Wave 2 — fully-resolved Transform payload. Holds the
-/// optional analytic-window spec (renamed from local_window), the log
-/// directives, the validations sidebar, the DLQ NodeId for downstream
-/// wiring, and the compile-time CXL `TypedProgram` (Task 16b.9).
+/// Fully-resolved Transform payload. Holds the optional analytic-window
+/// spec, the log directives, the validations sidebar, the DLQ NodeId for
+/// downstream wiring, and the compile-time CXL `TypedProgram`.
 #[derive(Debug, Clone)]
 pub struct PlanTransformPayload {
     pub analytic_window: Option<crate::config::pipeline_node::AnalyticWindowSpec>,
     pub log: Vec<crate::config::LogDirective>,
     pub validations: Vec<crate::config::ValidationEntry>,
     pub dlq_node: Option<NodeIndex>,
-    /// Phase 16b Task 16b.9 — compile-time-typechecked CXL program.
-    /// Populated by `PipelineConfig::compile` via `bind_schema::bind_schema`
-    /// and NEVER `None`: a transform whose CXL fails to typecheck
-    /// surfaces as a compile-time E200 diagnostic and the enclosing
-    /// `compile()` call returns `Err` before this payload is built.
+    /// Compile-time-typechecked CXL program. Populated by
+    /// `PipelineConfig::compile` via `bind_schema::bind_schema` and
+    /// NEVER `None`: a transform whose CXL fails to typecheck surfaces
+    /// as a compile-time E200 diagnostic and the enclosing `compile()`
+    /// call returns `Err` before this payload is built.
     pub typed: Arc<TypedProgram>,
 }
 
-/// Phase 16b Wave 2 — fully-resolved Output payload.
+/// Fully-resolved Output payload.
 #[derive(Debug, Clone)]
 pub struct PlanOutputPayload {
     pub output: OutputConfig,
@@ -407,12 +403,11 @@ impl ExecutionPlanDag {
     /// Whether the executor must dispatch the sorted-streaming path
     /// (correlation-key DLQ failure-domain batching).
     ///
-    /// Post-Task 16.0.5.11 (research-driven re-architecture): the signal is
-    /// pipeline-level — the presence of a planner-synthesized correlation
-    /// [`PlanNode::Sort`] inserted by [`Self::inject_correlation_sort`].
-    /// Operator-intrinsic sort requirements (`RequiresSortedInput`) are an
-    /// orthogonal concern reserved for future merge-join / streaming-agg.
-    /// See `docs/research/RESEARCH-pipeline-correlation-key-placement.md`.
+    /// The signal is pipeline-level — the presence of a planner-synthesized
+    /// correlation [`PlanNode::Sort`] inserted by
+    /// [`Self::inject_correlation_sort`]. Operator-intrinsic sort
+    /// requirements (`RequiresSortedInput`) are an orthogonal concern
+    /// reserved for future merge-join / streaming-agg.
     pub fn required_sorted_input(&self) -> bool {
         if self.required_arena() {
             return false;
@@ -484,8 +479,8 @@ impl ExecutionPlanDag {
         {
             return true;
         }
-        // Aggregation nodes require the DAG walk path so the dispatch arm
-        // (Task 16.3.13) handles them; the legacy streaming path would
+        // Aggregation nodes require the DAG walk path so the dispatch
+        // arm handles them; the single-input streaming path would
         // otherwise row-evaluate the aggregate program and raise
         // "row-level expression, got aggregate function call".
         if self
@@ -495,10 +490,10 @@ impl ExecutionPlanDag {
         {
             return true;
         }
-        // Combine nodes are multi-input and require the DAG-walk executor
-        // path (V-1-3 hard requirement). Without this, combine pipelines
-        // would route through the single-input streaming path and silently
-        // skip the combine dispatch arm.
+        // Combine nodes are multi-input and require the DAG-walk
+        // executor path. Without this, combine pipelines would route
+        // through the single-input streaming path and silently skip
+        // the combine dispatch arm.
         if self
             .graph
             .node_weights()
@@ -599,7 +594,7 @@ impl ExecutionPlanDag {
             }
         }
 
-        // Show planner-synthesized Sort nodes (drill pass 3, 16.0.5.12).
+        // Show planner-synthesized Sort nodes.
         for &idx in &self.topo_order {
             if let PlanNode::Sort {
                 name, sort_fields, ..
@@ -617,8 +612,8 @@ impl ExecutionPlanDag {
             }
         }
 
-        // Physical Properties (NodeProperties side-table) — task 16.0.5.12.
-        // Only emitted when the property pass has run (post-compile DAGs).
+        // Physical Properties (NodeProperties side-table). Only emitted
+        // when the property pass has run (post-compile DAGs).
         if !self.node_properties.is_empty() {
             out.push_str("=== Physical Properties ===\n\n");
             for &idx in &self.topo_order {
@@ -747,7 +742,7 @@ impl ExecutionPlanDag {
     /// Fork points show `├──>` per branch, merge points show `└──<`.
     /// Linear nodes show `│` continuation.
     ///
-    /// Task 16b.8 polish:
+    /// Rendering:
     ///   - Route and Aggregation both render as their own sibling line
     ///     at their topo position (no visual nesting).
     ///   - Each line is annotated with `(line:N)` when the underlying
@@ -1120,8 +1115,7 @@ pub const ENFORCER_SORT_PREFIX: &str = "__sort_for_";
 /// the pipeline-level `error_handling.correlation_key` failure-domain
 /// grouping policy. Distinct from [`ENFORCER_SORT_PREFIX`] because the two
 /// passes encode different concerns: operator-intrinsic algorithm needs vs.
-/// declared pipeline-level policy. See
-/// `docs/research/RESEARCH-pipeline-correlation-key-placement.md`.
+/// declared pipeline-level policy.
 pub const CORRELATION_SORT_PREFIX: &str = "__correlation_sort_";
 
 impl ExecutionPlanDag {
@@ -1131,9 +1125,7 @@ impl ExecutionPlanDag {
     /// This is the *direct compile-time injection* path for pipeline-scoped
     /// ordering policy, distinct from
     /// [`insert_enforcer_sorts`](Self::insert_enforcer_sorts) which serves
-    /// per-operator algorithm-intrinsic requirements. See
-    /// `docs/research/RESEARCH-pipeline-correlation-key-placement.md` for
-    /// the cross-ecosystem prior art motivating this split.
+    /// per-operator algorithm-intrinsic requirements.
     ///
     /// # Behavior
     /// - No-op if `error_handling.correlation_key` is unset.
@@ -1246,13 +1238,11 @@ impl ExecutionPlanDag {
             return Ok(());
         }
 
-        // Task 16b.8 — planner-synthesized correlation sort enforcer.
-        // This node has no source-level declaration; it is derived
-        // from the primary source's correlation key and inserted on
-        // every outgoing edge.
-        // (a) Planner-synthesized: correlation-sort nodes have no
-        // author-written YAML origin; `Span::SYNTHETIC` is the correct span
-        // here because no YAML node exists for it.
+        // Planner-synthesized correlation sort enforcer. This node has
+        // no source-level declaration; it is derived from the primary
+        // source's correlation key and inserted on every outgoing edge.
+        // Correlation-sort nodes have no author-written YAML origin, so
+        // `Span::SYNTHETIC` is the correct span.
         let sort_node = PlanNode::Sort {
             name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
             span: Span::SYNTHETIC,
@@ -1290,7 +1280,7 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
-    /// Phase 16.0.5 enforcer-sort insertion (drill pass 3, D46/D47).
+    /// Enforcer-sort insertion.
     ///
     /// Walks every [`PlanNode::Transform`] whose
     /// [`NodeExecutionReqs::RequiresSortedInput`] is unsatisfied by its
@@ -1344,9 +1334,9 @@ impl ExecutionPlanDag {
             .collect();
 
         for (consumer_idx, required) in consumers {
-            // Today's only requirement class (Phase 14 correlated DLQ) consumes
-            // a Source directly. Find the unique direct Source parent; skip
-            // otherwise (later phases extending this will widen the walk).
+            // The only requirement class today (correlated DLQ) consumes
+            // a Source directly. Find the unique direct Source parent;
+            // skip otherwise (future extensions will widen the walk).
             let source_idx = self
                 .graph
                 .neighbors_directed(consumer_idx, petgraph::Direction::Incoming)
@@ -1375,12 +1365,11 @@ impl ExecutionPlanDag {
             let dep_type = self.graph[edge_id].dependency_type;
             self.graph.remove_edge(edge_id);
 
-            // Task 16b.8 — planner-synthesized sort enforcer (D46/D47).
-            // No YAML node exists for it; it is derived from the
-            // consumer's `RequiresSortedInput` requirement and
-            // inserted on the edge from the upstream source.
-            // (a) Planner-synthesized: sort enforcer nodes have no
-            // author-written YAML origin; `Span::SYNTHETIC` is correct.
+            // Planner-synthesized sort enforcer. No YAML node exists
+            // for it; it is derived from the consumer's
+            // `RequiresSortedInput` requirement and inserted on the
+            // edge from the upstream source. `Span::SYNTHETIC` is
+            // correct because the node has no author-written origin.
             let consumer_name = self.graph[consumer_idx].name().to_string();
             let sort_node = PlanNode::Sort {
                 name: format!("{ENFORCER_SORT_PREFIX}{consumer_name}"),
@@ -1416,8 +1405,7 @@ impl ExecutionPlanDag {
     /// [`PlanNode::Transform`]). The pass never inspects operator
     /// implementations — it reads only what the plan node already declares,
     /// mirroring Trino's `PropertyDerivations.Visitor` and Spark's
-    /// `AliasAwareOutputExpression` (see
-    /// `docs/research/RESEARCH-property-derivation-layering.md`).
+    /// `AliasAwareOutputExpression`.
     ///
     /// # Panics / errors
     ///
@@ -1449,18 +1437,18 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
-    /// Task 16.4.9 — resolve `AggregateStrategyHint` on every
-    /// `PlanNode::Aggregation` against upstream `OrderingProvenance`,
-    /// rewrite the node's `strategy` field, populate the auxiliary
-    /// `fallback_reason` / `skipped_streaming_available` /
-    /// `qualified_sort_order` fields, and overwrite the side-table
-    /// `node_properties[idx].ordering` to reflect the resolved strategy.
+    /// Resolve `AggregateStrategyHint` on every `PlanNode::Aggregation`
+    /// against upstream `OrderingProvenance`, rewrite the node's
+    /// `strategy` field, populate the auxiliary `fallback_reason` /
+    /// `skipped_streaming_available` / `qualified_sort_order` fields,
+    /// and overwrite the side-table `node_properties[idx].ordering` to
+    /// reflect the resolved strategy.
     ///
     /// Runs as a separate post-pass inside `compile()` immediately after
-    /// `compute_node_properties()` (D75). Hard-errors at compile time
-    /// when a user explicitly requests `strategy: streaming` on an
-    /// ineligible input (D78), via the rustc-shaped walker
-    /// `render_unordered_streaming_error` shipped in 16.4.9a.
+    /// `compute_node_properties()`. Hard-errors at compile time when a
+    /// user explicitly requests `strategy: streaming` on an ineligible
+    /// input, via the rustc-shaped walker
+    /// `render_unordered_streaming_error`.
     pub(crate) fn select_aggregation_strategies(&mut self) -> Result<(), PipelineError> {
         use crate::aggregation::{
             AggregateStrategy, StreamingEligibility, qualifies_for_streaming,
@@ -1815,12 +1803,12 @@ fn compute_one(
         }
 
         PlanNode::Aggregation { .. } => {
-            // D77: aggregation node ordering is the sole responsibility of
-            // the `select_aggregation_strategies` post-pass (Task 16.4.9),
-            // which runs immediately after `compute_node_properties` and
-            // overwrites this entry based on the resolved strategy. The
-            // defensive default is "no ordering, single stream" so any
-            // bug that bypasses the post-pass produces conservative
+            // Aggregation node ordering is the sole responsibility of
+            // the `select_aggregation_strategies` post-pass, which runs
+            // immediately after `compute_node_properties` and overwrites
+            // this entry based on the resolved strategy. The defensive
+            // default is "no ordering, single stream" so any bug that
+            // bypasses the post-pass produces conservative
             // (correct-but-suboptimal) downstream eligibility decisions
             // rather than silently asserting a false ordering.
             NodeProperties {
@@ -1902,7 +1890,7 @@ fn compute_one(
     }
 }
 
-/// Idempotency predicate for Phase 16.0.5 enforcer-sort insertion.
+/// Idempotency predicate for enforcer-sort insertion.
 ///
 /// Returns true iff `declared` (the upstream source's actual ordering) is a
 /// strict prefix of, or equal to, `required` viewed the other way around: the
@@ -1930,10 +1918,9 @@ pub fn source_ordering_satisfies(declared: &[SortField], required: &[SortField])
 /// and bare expression statements do not write to fields.
 ///
 /// Consumed by `compute_node_properties` to populate the
-/// `DestroyedByTransformWriteSet` provenance variant in Phase 16.0.5.7. The
-/// write set lives directly on `PlanNode::Transform` so the property pass
-/// never has to reach into executor-private types
-/// (see `docs/research/RESEARCH-property-derivation-layering.md`).
+/// `DestroyedByTransformWriteSet` provenance variant. The write set
+/// lives directly on `PlanNode::Transform` so the property pass never
+/// has to reach into executor-private types.
 pub(crate) fn extract_write_set(typed: &TypedProgram) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     for stmt in &typed.program.statements {
@@ -1972,8 +1959,7 @@ fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> 
 /// during plan compilation. Persisted as `has_distinct` on
 /// [`PlanNode::Transform`] so the property pass can emit
 /// [`OrderingProvenance::DestroyedByDistinct`] without reaching into
-/// executor-private types (Phase 16.0.5.7, see
-/// `docs/research/RESEARCH-property-derivation-layering.md`).
+/// executor-private types.
 pub(crate) fn extract_has_distinct(typed: &TypedProgram) -> bool {
     typed
         .program
@@ -2024,16 +2010,16 @@ pub enum PlanError {
     },
     /// Enforcer-insertion or property-derivation pass failure.
     PropertyDerivation(String),
-    /// `cxl::plan::extract_aggregates` rejected the typed program (Phase 16).
+    /// `cxl::plan::extract_aggregates` rejected the typed program.
     AggregateExtractionFailed {
         transform: String,
         diagnostics: Vec<String>,
     },
-    /// Aggregate transforms cannot have a `route:` block (D6).
+    /// Aggregate transforms cannot have a `route:` block.
     AggregateWithRoute {
         transform: String,
     },
-    /// Aggregate transforms cannot have a multi-input merge (D6).
+    /// Aggregate transforms cannot have a multi-input merge.
     AggregateWithMultipleInputs {
         transform: String,
     },

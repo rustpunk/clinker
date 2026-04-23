@@ -4,8 +4,6 @@
 //! emit residuals. Group-by `Expr::FieldRef`s are likewise replaced
 //! with `Expr::GroupKey` leaves.
 //!
-//! Task 16.3.4 (drill 2026-04-06, decisions D1, D2, D8, D9, D14).
-//!
 //! Mirrors DataFusion's `find_aggregate_exprs`, DuckDB's
 //! `Binder::BindAggregate`, and Spark Catalyst's
 //! `ResolveAggregateFunctions`. Runs once at plan-compile time; the

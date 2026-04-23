@@ -1,4 +1,4 @@
-//! Phase Combine C.0.2 — plan-side types for the Combine node.
+//! Plan-side types for the Combine node.
 //!
 //! This module defines the execution-plan-layer vocabulary for combine nodes:
 //! the planner-selected execution [`CombineStrategy`], the compile-time
@@ -6,21 +6,17 @@
 //! conjuncts ([`DecomposedPredicate`], [`EqualityConjunct`], [`RangeConjunct`],
 //! [`RangeOp`]), and per-input metadata ([`CombineInput`]).
 //!
-//! Per the V-1-1 side-table architecture
-//! (`RESEARCH-plan-node-incremental-construction.md`), the late-populated
-//! compile artifacts that these types describe do NOT live inline on
-//! `PlanNode::Combine`. Instead, they live in `CompileArtifacts` side-tables:
+//! The late-populated compile artifacts that these types describe do NOT
+//! live inline on `PlanNode::Combine`. Instead, they live in
+//! `CompileArtifacts` side-tables:
 //!   - `CompileArtifacts.typed["{name}"]`     — typed cxl-body program
-//!     (same key convention as Transform; drill D10)
+//!     (same key convention as Transform)
 //!   - `CompileArtifacts.combine_predicates`  — `DecomposedPredicate`
 //!     (the residual re-typechecked program lives inside this, not in
-//!     `typed`; drill D9 — where-clause TypedProgram is a local
-//!     intermediate that doesn't survive bind_schema)
+//!     `typed` — the where-clause TypedProgram is a local intermediate
+//!     that doesn't survive bind_schema)
 //!   - `CompileArtifacts.combine_inputs`      — per-input metadata
 //!     (name-keyed; see `CombineInput` for the no-`NodeIndex` rationale)
-//!
-//! C.0 only adds the types; C.1 fills predicate decomposition, C.2 adds
-//! execution and strategy selection, C.4 adds N-ary decomposition.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -140,12 +136,11 @@ pub enum RangeOp {
 /// Downstream phases that need a graph handle call
 /// `node_by_name[&combine_input.upstream_name]` at the point of use.
 ///
-/// Research backing: `RESEARCH-combine-compile-architecture.md` (Approach
-/// A). Name-indexed compile artifacts match dbt's `depends_on.nodes`,
-/// Beam's `TupleTag`, Dagster's `AssetKey`, Calcite's digest, and every
-/// surveyed ETL tool. `NodeIndex`-keyed compile artifacts are documented
-/// to break under `petgraph::Graph` node removal (swap-remove invalidation
-/// — see petgraph issue #456) and caused the SPARK-17154 class of bugs
+/// Name-indexed compile artifacts match dbt's `depends_on.nodes`, Beam's
+/// `TupleTag`, Dagster's `AssetKey`, Calcite's digest, and every surveyed
+/// ETL tool. `NodeIndex`-keyed compile artifacts break under
+/// `petgraph::Graph` node removal (swap-remove invalidation — see petgraph
+/// issue #456) and caused the SPARK-17154 class of bugs
 /// where side-annotations went stale after optimizer rewrites. Clinker's
 /// unique-node-name invariant (E001) is the precondition that makes
 /// name-keying safe.

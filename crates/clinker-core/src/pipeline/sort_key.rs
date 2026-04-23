@@ -113,8 +113,6 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
 ///   losslessly decodable (strings, for example, lose length framing
 ///   after the terminator XOR on DESC order), so the debug renderer
 ///   reports the field list together with both hex byte sequences.
-///
-/// Phase 16 Task 16.4.1.
 #[derive(Debug, Clone)]
 pub struct SortKeyEncoder {
     sort_by: Vec<SortField>,
@@ -381,7 +379,7 @@ mod tests {
         assert!(encode_sort_key(&r_null, keys) < encode_sort_key(&r_empty, keys));
     }
 
-    // ---- SortKeyEncoder (Task 16.4.1) ----
+    // ---- SortKeyEncoder ----
 
     #[test]
     fn test_sort_key_encoder_new_stores_fields() {

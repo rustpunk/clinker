@@ -1,4 +1,4 @@
-//! Phase 14 correlated DLQ tests — grouped rejection with sort-and-group pattern.
+//! Correlated DLQ tests — grouped rejection with sort-and-group pattern.
 //!
 //! Tests: one-fail-DLQs-group, trigger flag, null key individual rejection,
 //! compound keys, auto-sort injection, --explain output, large groups,
@@ -323,10 +323,10 @@ nodes:
 "#;
     let config = crate::config::parse_config(yaml).unwrap();
 
-    // Phase 16d: the canonical compile path produces a fully-enriched
-    // DAG (including enforcer-sort and correlation-sort injection) in
-    // one call. Clone the DAG so the test can overwrite
-    // `correlation_sort_note` for the explain assertion.
+    // The canonical compile path produces a fully-enriched DAG (including
+    // enforcer-sort and correlation-sort injection) in one call. Clone
+    // the DAG so the test can overwrite `correlation_sort_note` for the
+    // explain assertion.
     let mut plan = config
         .compile(&crate::config::CompileContext::default())
         .unwrap()

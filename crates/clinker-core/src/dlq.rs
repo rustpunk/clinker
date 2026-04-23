@@ -19,7 +19,7 @@ pub enum DlqErrorCategory {
     ValidationFailure,
     /// Aggregate finalize-time failure (e.g. SumOverflow during finalize()).
     /// Distinct from `AggregateTypeError`, which fires during the per-record
-    /// add path. Routed by the Phase 16 executor dispatch arm (Task 16.3.13).
+    /// add path. Routed by the executor's aggregation dispatch arm.
     AggregateFinalize,
 }
 
@@ -37,7 +37,7 @@ impl DlqErrorCategory {
     }
 }
 
-/// Stage label helper for aggregate-transform DLQ entries (Task 16.3.13).
+/// Stage label helper for aggregate-transform DLQ entries.
 pub fn stage_aggregate(transform: &str) -> String {
     format!("aggregate:{transform}")
 }

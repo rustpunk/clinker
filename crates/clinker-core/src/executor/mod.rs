@@ -41,13 +41,13 @@ use cxl::eval::{
 use cxl::typecheck::{Type, TypedProgram};
 use petgraph::Direction;
 
-/// Phase 16b Task 16b.7 — executor-internal transform spec.
+/// Executor-internal transform spec.
 ///
 /// Produced by walking `PipelineConfig::nodes` directly and matching on
-/// `PipelineNode::{Transform, Aggregate, Route}` variants. Replaces the
-/// deleted `TransformSpec` for executor read paths that still
-/// consume a flat Vec-of-transforms view. The fields are the superset
-/// that executor sites read from; see `build_transform_specs`.
+/// `PipelineNode::{Transform, Aggregate, Route}` variants. Used by
+/// executor read paths that still consume a flat Vec-of-transforms view.
+/// The fields are the superset that executor sites read from; see
+/// `build_transform_specs`.
 #[derive(Debug, Clone)]
 pub struct TransformSpec {
     pub name: String,
@@ -558,14 +558,12 @@ fn extract_correlation_key(
 pub struct PipelineExecutor;
 
 impl PipelineExecutor {
-    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming public entry point.
+    /// `&CompiledPlan`-consuming public entry point.
     ///
     /// Accepts the typed `CompiledPlan` handle returned by
     /// [`crate::config::PipelineConfig::compile`] and forwards to
     /// [`Self::run_with_readers_writers`] using the plan's embedded
-    /// [`PipelineConfig`]. This is the forward-compatible entry point;
-    /// the legacy `&PipelineConfig`-consuming variant is retained
-    /// pending the full executor-internal cutover in a follow-up.
+    /// [`PipelineConfig`].
     ///
     /// The primary (driving) source is the first source node in
     /// declaration order (`config.source_configs().next()`). Callers
@@ -575,7 +573,7 @@ impl PipelineExecutor {
     /// declaration-order-as-primary is a convenience of this wrapper,
     /// not a contract of the executor itself.
     ///
-    /// D3b compile-fail guarantee — `&PipelineConfig` is NOT accepted:
+    /// Compile-fail guarantee — `&PipelineConfig` is NOT accepted:
     ///
     /// ```compile_fail
     /// use clinker_core::executor::PipelineExecutor;
@@ -630,12 +628,12 @@ impl PipelineExecutor {
         Self::run_with_readers_writers(plan.config(), primary, readers, writers, params)
     }
 
-    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` text entry.
+    /// `&CompiledPlan`-consuming `--explain` text entry.
     pub fn explain_plan(plan: &crate::plan::CompiledPlan) -> Result<String, PipelineError> {
         Self::explain(plan.config())
     }
 
-    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` DAG entry.
+    /// `&CompiledPlan`-consuming `--explain` DAG entry.
     pub fn explain_plan_dag(
         plan: &crate::plan::CompiledPlan,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
@@ -696,7 +694,7 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Phase 16d: single canonical compile path.
+        // Single canonical compile path.
         //
         // `PipelineConfig::compile(&ctx)` drives the unified nodes
         // pipeline through stages 1-4 (topology/path validation),
@@ -712,7 +710,7 @@ impl PipelineExecutor {
         // `CompileContext` so the Aggregate lowering arm resolves
         // `group_by_indices` against the real file columns rather
         // than the author-declared source schema (which may be a
-        // superset). See LD-16d-1.
+        // superset).
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let runtime_input_schema: Vec<String> =
             schema.columns().iter().map(|c| c.to_string()).collect();
@@ -1121,8 +1119,8 @@ impl PipelineExecutor {
                             .or_default()
                             .push(projected);
                     }
-                    // LD-16d-1 dual counter: one source record reaching
-                    // N inclusive-route targets counts ONCE toward
+                    // Dual counter: one source record reaching N
+                    // inclusive-route targets counts ONCE toward
                     // `ok_count` (input succeeded) and N times toward
                     // `records_written` (one per Output write).
                     counters.ok_count += 1;
@@ -1180,8 +1178,8 @@ impl PipelineExecutor {
         let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
-        // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
-        // here, reused (via borrow) at every per-record dispatch site below.
+        // Pipeline-stable evaluation context. Built once here, reused
+        // (via borrow) at every per-record dispatch site below.
         let stable = build_stable_eval_context(
             config,
             pipeline_start_time,
@@ -1791,12 +1789,6 @@ impl PipelineExecutor {
                 &lookup_tables,
             );
         }
-
-        // Legacy non-arena sort block deleted by Task 16.0.5.8.
-        // Sorts now flow through the planner-synthesized `PlanNode::Sort`
-        // enforcer node, dispatched in the DAG topo walk via
-        // `SortBuffer<P>` (Pattern B; see
-        // docs/research/RESEARCH-sort-node-sidecar-payload.md).
 
         // Phase 3: Schema derivation (scan for first emitting record)
         let mut evaluators = build_evaluators(transforms);
@@ -2765,8 +2757,8 @@ impl PipelineExecutor {
         let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
-        // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
-        // here, reused (via borrow) at every per-record dispatch site below.
+        // Pipeline-stable evaluation context. Built once here, reused
+        // (via borrow) at every per-record dispatch site below.
         let stable = build_stable_eval_context(
             config,
             pipeline_start_time,
@@ -2786,18 +2778,17 @@ impl PipelineExecutor {
         let mut records_emitted: u64 = 0;
 
         // Track distinct source rows that reached at least one Output —
-        // backs `counters.ok_count` per the Phase 16d / LD-16d-1 dual
-        // counter semantic. Populated in the Output arm. Single-source
-        // pipelines see no row_num collisions; multi-source via Merge
-        // is the documented limitation in `PipelineCounters` docs.
+        // backs `counters.ok_count` under the dual-counter semantic.
+        // Populated in the Output arm. Single-source pipelines see no
+        // row_num collisions; multi-source via Merge is the documented
+        // limitation in `PipelineCounters` docs.
         let mut ok_source_rows: HashSet<u64> = HashSet::new();
 
-        // Phase 16d remediation V2 / Q3=β: collect every Output's
-        // write/flush failure across the topo walk instead of
-        // short-circuiting on the first `?`. After the walk, aggregate
-        // into `PipelineError::Multiple` (≥2 errors), the bare error
-        // (1 error), or proceed (0 errors) — matches DataFusion's
-        // collection-pattern (PR #14439) and the pre-16d behavior the
+        // Collect every Output's write/flush failure across the topo walk
+        // instead of short-circuiting on the first `?`. After the walk,
+        // aggregate into `PipelineError::Multiple` (≥2 errors), the bare
+        // error (1 error), or proceed (0 errors) — matches DataFusion's
+        // collection-pattern (PR #14439) and the behavior the
         // streaming-writer-channel path retained via
         // `join_writer_threads`.
         let mut output_errors: Vec<PipelineError> = Vec::new();
@@ -3103,7 +3094,7 @@ impl PipelineExecutor {
 
                     // Build branch_name -> successor NodeIndex mapping.
                     //
-                    // Under the unified taxonomy (Phase 16d canonical path), a
+                    // Under the unified taxonomy, a
                     // `PlanNode::Route` is a first-class node named as the
                     // user wrote it in YAML (e.g. `classify_route`). Successors
                     // may be Transforms, Aggregates, Outputs, or Compositions —
@@ -3284,11 +3275,10 @@ impl PipelineExecutor {
                     ref sort_fields,
                     ..
                 } => {
-                    // Enforcer-sort dispatch (Task 16.0.5.8). Reuses the
-                    // generalized `SortBuffer<P>` carrying per-record sidecar
-                    // (row_num + emitted/accumulated metadata maps) through
-                    // the sort permutation. See
-                    // docs/research/RESEARCH-sort-node-sidecar-payload.md.
+                    // Enforcer-sort dispatch. Reuses the generalized
+                    // `SortBuffer<P>` carrying per-record sidecar (row_num
+                    // + emitted/accumulated metadata maps) through the
+                    // sort permutation.
                     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 
                     type SortPayload = (u64, IndexMap<String, Value>, IndexMap<String, Value>);
@@ -3386,7 +3376,7 @@ impl PipelineExecutor {
                     ref output_schema,
                     ..
                 } => {
-                    // Task 16.3.13 — hash-aggregation dispatch arm.
+                    // Hash-aggregation dispatch arm.
                     //
                     // DataFusion PR #9241 / #12086 lesson: any
                     // `PipelineError::Internal` raised here (e.g. via
@@ -3566,7 +3556,7 @@ impl PipelineExecutor {
                             .unwrap_or_default()
                     };
 
-                    // Phase 16d / LD-16d-1 dual counters:
+                    // Dual counters:
                     //
                     // * `records_written` increments per WRITE — under
                     //   inclusive Route fan-out, one input matching N
@@ -3655,9 +3645,9 @@ impl PipelineExecutor {
                 }
 
                 PlanNode::Composition { ref name, body, .. } => {
-                    // Composition runtime expansion deferred to Phase 16c.3.
-                    // For now, pass records through unchanged — the body is
-                    // lowered for --explain and property derivation only.
+                    // Composition runtime expansion is deferred — the body
+                    // is lowered for `--explain` and property derivation
+                    // only; for now pass records through unchanged.
                     debug_assert_ne!(
                         body,
                         crate::plan::composition_body::CompositionBodyId::SENTINEL,
@@ -3711,10 +3701,10 @@ impl PipelineExecutor {
             records_emitted,
         ));
 
-        // Phase 16d remediation V2 / Q3=β: aggregate Output errors
-        // collected during the topo walk. Single error → bare error;
-        // ≥2 errors → `PipelineError::Multiple` (the pre-16d / DataFusion
-        // collection-pattern shape). Zero errors → fall through to Ok.
+        // Aggregate Output errors collected during the topo walk.
+        // Single error → bare error; ≥2 errors →
+        // `PipelineError::Multiple` (the DataFusion collection-pattern
+        // shape). Zero errors → fall through to Ok.
         match output_errors.len() {
             0 => {}
             1 => return Err(output_errors.into_iter().next().unwrap()),
@@ -3951,12 +3941,12 @@ impl PipelineExecutor {
 
     /// Compile execution plan and return the DAG for format-specific rendering.
     ///
-    /// Phase 16d: `PipelineConfig::compile(&ctx)` is the single
-    /// canonical compile entry point. It produces a fully-enriched
-    /// `ExecutionPlanDag` via `bind_schema` (stage 4.5) and stage 5
-    /// lowering + enrichment. The runtime schema is not available
-    /// here (this path serves `--explain` which runs before readers
-    /// open), so `CompileContext::runtime_input_schema` stays
+    /// `PipelineConfig::compile(&ctx)` is the single canonical compile
+    /// entry point. It produces a fully-enriched `ExecutionPlanDag` via
+    /// `bind_schema` (stage 4.5) and stage 5 lowering + enrichment. The
+    /// runtime schema is not available here (this path serves `--explain`
+    /// which runs before readers open), so
+    /// `CompileContext::runtime_input_schema` stays
     /// `None` — Aggregate lowering falls back to the author-declared
     /// schema, which is fine for explain output.
     pub(crate) fn explain_dag(
@@ -4457,7 +4447,7 @@ fn can_parallelize(plan: &ExecutionPlanDag) -> bool {
     })
 }
 
-/// Build the pipeline-stable evaluation context (D59 / Task 16.3.13a).
+/// Build the pipeline-stable evaluation context.
 ///
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
 /// returned `StableEvalContext` is reused (via borrow) at every per-record
@@ -4809,7 +4799,7 @@ fn evaluate_single_transform(
 /// Plan-invariant predecessor lookup for nodes that require exactly one
 /// upstream input (currently `PlanNode::Aggregation`). Returns
 /// `PipelineError::Internal` on misshapen plans — never panics. Mirrors
-/// DataFusion's `internal_err!` macro per drill pass 7 D58.
+/// DataFusion's `internal_err!` macro.
 pub(crate) fn single_predecessor(
     plan: &ExecutionPlanDag,
     node_idx: petgraph::graph::NodeIndex,

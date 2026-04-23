@@ -1,11 +1,11 @@
-//! Aggregation engine tests for Phase 16.
+//! Aggregation engine tests.
 //!
 //! Covers: hash aggregation (basic, multi-key, NULL keys, spill, memory tracking),
 //! streaming aggregation (sorted input, sort verification, strategy selection),
 //! and plan-time integration (PlanNode::Aggregation, output schema).
 
 // ===========================================================================
-// Task 16.3.13 — executor PlanNode::Aggregation dispatch arm
+// Executor PlanNode::Aggregation dispatch arm
 // ===========================================================================
 
 mod dispatch {
@@ -232,10 +232,10 @@ nodes:
     include_unmapped: true
 "#;
         let config = crate::config::parse_config(yaml).expect("config parses");
-        // Phase 16d: the canonical compile entry point lowers via
-        // `bind_schema` + stage-5 — no hand-rolled typed-program
-        // slice needed. Clone the resulting DAG so the test can
-        // synthesize a malformed two-predecessor shape below.
+        // The canonical compile entry point lowers via `bind_schema` +
+        // stage-5, so no hand-rolled typed-program slice is needed.
+        // Clone the resulting DAG so the test can synthesize a malformed
+        // two-predecessor shape below.
         let mut plan = config
             .compile(&crate::config::CompileContext::default())
             .expect("plan compiles")
@@ -552,7 +552,7 @@ nodes:
         let _ = ErrorStrategy::FailFast;
     }
 
-    // ----- Task 16.4.0 smoke test: StreamingAggregator<AddRaw> -----
+    // ----- Smoke test: StreamingAggregator<AddRaw> -----
 
     /// Build a [`StreamingAggregator`](crate::aggregation::StreamingAggregator)
     /// over the `AddRaw` mode using the same real Parser → resolve →
@@ -658,7 +658,7 @@ nodes:
     fn test_streaming_aggregator_out_of_order_is_sort_violation() {
         // Second record's key < first record's key → GroupBoundary must
         // raise HashAggError::SortOrderViolation, which maps to
-        // PipelineError::SortOrderViolation via the From impl (Task 16.4.0).
+        // PipelineError::SortOrderViolation via the From impl.
         let input_schema = make_schema(&["k"]);
         let mut agg = build_streaming_aggregator(
             &[("k", Type::String)],
@@ -693,7 +693,7 @@ nodes:
         }
     }
 
-    // ── Phase 16 Task 16.4.10 — current_row_count() debug-inspect ──────────
+    // ── current_row_count() debug-inspect ──────────
 
     #[test]
     fn test_current_row_count_starts_at_zero_then_one_then_zero_after_flush() {
@@ -757,7 +757,7 @@ nodes:
     }
 
     // ====================================================================
-    // Phase 16 Task 16.3 backfill — hash-aggregation data shapes & spill
+    // Hash-aggregation data shapes & spill
     // ====================================================================
 
     /// NULL group keys all collapse into a single `GroupByKey::Null` bucket.
@@ -1081,7 +1081,7 @@ nodes:
     }
 
     // ====================================================================
-    // Phase 16 Task 16.4 backfill — streaming-aggregation extras
+    // Streaming-aggregation extras
     // ====================================================================
 
     /// NULL group key in streaming mode: a run of NULL-keyed records
@@ -1251,9 +1251,9 @@ nodes:
     }
 }
 
-// ----- Phase 16 Task 16.4.3 — Single-Encoder Two-Phase Bytes tests -----
+// ----- Single-Encoder Two-Phase Bytes tests -----
 
-mod task_16_4_3 {
+mod two_phase_bytes_encoder {
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1659,10 +1659,10 @@ mod task_16_4_3 {
 }
 
 // ===========================================================================
-// Phase 16 Task 16.4.3 — spill round-trip backfills
+// Spill round-trip backfills
 // ===========================================================================
 
-mod task_16_4_3_spill {
+mod two_phase_bytes_spill {
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1909,13 +1909,11 @@ mod task_16_4_3_spill {
     }
 }
 
-mod task_16_4_5 {
-    //! Task 16.4.5 — prove that sort-order verification in
-    //! `GroupBoundary::push` is unconditional, not gated on
-    //! `debug_assertions`. The verification mechanism itself landed
-    //! structurally as sub-change 6 of Task 16.4.3; this test gates
-    //! the always-on contract so a future refactor can't quietly
-    //! demote it to `debug_assert!` without turning red.
+mod group_boundary_sort_order {
+    //! Prove that sort-order verification in `GroupBoundary::push` is
+    //! unconditional, not gated on `debug_assertions`. This test gates
+    //! the always-on contract so a future refactor can't quietly demote
+    //! it to `debug_assert!` without turning red.
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -2009,7 +2007,7 @@ mod task_16_4_5 {
         assert!(
             !code.contains("debug_assert"),
             "GroupBoundary verification must not be gated on debug_assertions \
-             (Task 16.4.5 always-on contract)"
+             — sort-order enforcement is an always-on contract"
         );
     }
 }

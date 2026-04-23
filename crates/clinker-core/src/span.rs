@@ -67,8 +67,8 @@ impl Span {
         }
     }
 
-    /// Task 16b.8 — synthetic span carrying a known 1-based source line
-    /// but no interned `SourceDb`/byte-offset. Used by
+    /// Synthetic span carrying a known 1-based source line but no
+    /// interned `SourceDb`/byte-offset. Used by
     /// `PipelineConfig::compile()` stage 5 so `--explain` can render
     /// `(line:N)` annotations against each lowered node without
     /// requiring a `SourceDb` to be threaded through the compile path.

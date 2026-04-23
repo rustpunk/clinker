@@ -334,9 +334,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Task 16b.8 — render a `PipelineError` via miette with the YAML
-/// source attached as a `NamedSource`, falling back to plain-text
-/// output when the config file is unreadable.
+/// Renders a `PipelineError` via miette with the YAML source attached
+/// as a `NamedSource`, falling back to plain-text output when the
+/// config file is unreadable.
 ///
 /// Every rendered diagnostic carries the source filename so CLI
 /// output contains the `.yaml` path as part of the message or the
@@ -410,8 +410,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    // Load pipeline YAML directly. Composition/channel features are gone in
-    // Phase 16b; Phase 16c will rebuild them.
+    // Load pipeline YAML directly — single-model scan, no composition or
+    // channel overlay at this entry point.
     let yaml = std::fs::read_to_string(&args.config).map_err(PipelineError::Io)?;
     let interpolated = clinker_core::config::interpolate_env_vars(&yaml, &[]).map_err(|e| {
         PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
@@ -421,8 +421,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
         })?;
 
-    // 7. Existing logic: explain / dry_run / execute
-    // LD-16c-12: resolve workspace_root ONCE at the entry point.
+    // Resolve workspace_root ONCE at the entry point.
     // Production CLI path — never call env::current_dir() inside compile().
     let mut compile_ctx = clinker_core::config::CompileContext::new(
         std::env::current_dir()

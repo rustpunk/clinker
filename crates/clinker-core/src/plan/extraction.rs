@@ -1,4 +1,4 @@
-//! Extract-as-composition boundary analysis and YAML serialization (Phase 16c.6).
+//! Extract-as-composition boundary analysis and YAML serialization.
 //!
 //! Provides [`analyze_extraction_boundary`] to identify crossing edges when
 //! extracting a subgraph into a composition, and [`write_extracted_composition`]
@@ -195,7 +195,7 @@ pub fn analyze_extraction_boundary(
 }
 
 // =========================================================================
-// Composition writer (Task 16c.6.3)
+// Composition writer
 // =========================================================================
 
 /// Error from writing an extracted composition.
@@ -607,7 +607,7 @@ mod tests {
         assert!(errors[0].message.contains("nonexistent"));
     }
 
-    // ---- Writer tests (Task 16c.6.3) ----
+    // ---- Writer tests ----
 
     /// Helper: build a PipelineConfig from a YAML fixture path.
     fn load_fixture_config(fixture_name: &str) -> PipelineConfig {

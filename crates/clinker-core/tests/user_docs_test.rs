@@ -1,5 +1,5 @@
-//! Gate test for Phase 16c.7.1: verify user-facing rustdoc exists on
-//! key modules with required topic coverage.
+//! Gate test: verify user-facing rustdoc exists on key modules with
+//! required topic coverage.
 
 use std::path::PathBuf;
 

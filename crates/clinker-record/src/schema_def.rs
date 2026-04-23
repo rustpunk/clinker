@@ -101,7 +101,7 @@ pub struct RecordTypeDef {
     pub fields: Vec<FieldDef>,
 }
 
-/// Structural ordering constraint (parsed, validated in Phase 11).
+/// Structural ordering constraint (parsed here, validated downstream).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructureConstraint {

@@ -1,4 +1,4 @@
-//! Channel overlay merge (Phase 16c.4 Task 16c.4.3).
+//! Channel overlay merge.
 //!
 //! Applies a [`ChannelBinding`] to a [`CompiledPlan`], overlaying config
 //! values as `ChannelDefault` or `ChannelFixed` provenance layers on the

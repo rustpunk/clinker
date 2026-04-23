@@ -1,4 +1,4 @@
-//! Phase 14 metadata tests — per-record `$meta.*` key-value map.
+//! Per-record `$meta.*` key-value map tests.
 //!
 //! Tests: get_meta/set_meta round-trip, lazy init, clone independence,
 //! multiple keys, overwrite, Send+Sync.

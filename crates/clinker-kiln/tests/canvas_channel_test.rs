@@ -5,5 +5,5 @@
 
 #[test]
 fn scaffold() {
-    // Placeholder — replaced by Playwright MCP tests in 16c.5.1+
+    // Placeholder — the real canvas-channel tests run through Playwright.
 }

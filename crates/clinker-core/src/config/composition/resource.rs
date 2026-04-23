@@ -1,4 +1,4 @@
-//! Resource enum with typed payload variants (Phase 16c.3).
+//! Resource enum with typed payload variants.
 //!
 //! [`Resource`] carries the runtime data needed to resolve a resource at
 //! execution time. [`ResourceKind`](super::ResourceKind) remains the
@@ -11,10 +11,10 @@ use std::path::PathBuf;
 ///
 /// Each variant carries the data needed to locate and open the resource at
 /// execution time, plus a [`Span`] anchoring the value back to its YAML
-/// source location for diagnostics (LD-003).
+/// source location for diagnostics.
 ///
-/// File-only per LD-16c-3 (amended). No `#[non_exhaustive]` — add variants
-/// when real implementations arrive.
+/// File-only for now. No `#[non_exhaustive]` — add variants when real
+/// implementations arrive.
 #[derive(Debug, Clone)]
 pub enum Resource {
     File {

@@ -1,4 +1,4 @@
-//! Pure graph utilities for pipeline DAG validation (Phase 16b Task 16b.2).
+//! Pure graph utilities for pipeline DAG validation.
 //!
 //! Cycle detection uses [`petgraph::algo::tarjan_scc`] (battle-tested, O(V+E),
 //! correctly handles diamonds). Topological sort uses Kahn's algorithm via
@@ -6,9 +6,8 @@
 //!
 //! These utilities operate on a name-keyed adjacency representation built
 //! from `PipelineNode` headers — they do **not** know about
-//! `PlanNode`/`ExecutionPlanDag`. The Phase 16b lowering pipeline calls these
-//! to fail fast on duplicates / self-loops / cycles before any CXL parsing
-//! happens.
+//! `PlanNode`/`ExecutionPlanDag`. The lowering pipeline calls these to fail
+//! fast on duplicates / self-loops / cycles before any CXL parsing happens.
 
 use std::collections::BTreeMap;
 
@@ -65,8 +64,8 @@ impl NameGraph {
     /// names in the order Tarjan returned them.
     ///
     /// Self-loops show up as single-node SCCs that have a self-edge — those
-    /// are filtered out here because the dedicated self-loop pass
-    /// (E002, see Task 16b.2) reports them with a more actionable message.
+    /// are filtered out here because the dedicated self-loop pass (E002)
+    /// reports them with a more actionable message.
     pub fn detect_cycle(&self) -> Option<Vec<String>> {
         for scc in tarjan_scc(&self.inner) {
             if scc.len() > 1 {

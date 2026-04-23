@@ -1,4 +1,4 @@
-//! DAG construction tests for Phase 15.
+//! DAG construction tests.
 //!
 //! Tests in this module exercise the petgraph-based ExecutionPlanDag:
 //! topology construction, topological ordering, cycle detection,
@@ -11,8 +11,7 @@ use crate::plan::execution::*;
 ///
 /// Topology: Source → categorize (route: high_value / low_value) → merge → Output
 ///
-/// This fixture will be used once `TransformInput` and `ExecutionPlanDag`
-/// are implemented in Tasks 15.1 and 15.2.
+/// This fixture exercises `TransformInput` and `ExecutionPlanDag`.
 pub(crate) fn diamond_fixture_yaml() -> &'static str {
     r#"
 pipeline:
@@ -119,12 +118,10 @@ pub(crate) fn parse_fixture(yaml: &str) -> PipelineConfig {
 
 /// Helper: compile a fixture config into an ExecutionPlanDag.
 ///
-/// Phase 16d: `PipelineConfig::compile(&ctx)` is the canonical compile
-/// entry point. The legacy `ExecutionPlanDag::compile(&config, &[…])`
-/// that manually pre-built typed programs is gone — `bind_schema`
-/// inside `compile_with_diagnostics` produces the typed programs as a
-/// side effect. Fixture fields are threaded in via the pipeline's
-/// source schemas (already declared in the YAML fixtures above).
+/// `PipelineConfig::compile(&ctx)` is the canonical compile entry point.
+/// `bind_schema` inside `compile_with_diagnostics` produces the typed
+/// programs as a side effect, so fixture fields are threaded in via the
+/// pipeline's source schemas (already declared in the YAML fixtures above).
 fn compile_fixture(config: &PipelineConfig, _fields: &[&str]) -> ExecutionPlanDag {
     config
         .compile(&crate::config::CompileContext::default())
@@ -133,7 +130,7 @@ fn compile_fixture(config: &PipelineConfig, _fields: &[&str]) -> ExecutionPlanDa
         .clone()
 }
 
-// --- Task 15.2 tests ---
+// --- DAG compilation tests ---
 
 /// Linear chain: Source → T1 → T2 → Output produces correct topo order.
 #[test]
@@ -592,7 +589,7 @@ fn test_dag_execution_reqs_streaming() {
 
 /// NodeExecutionReqs for RequiresSortedInput derivation.
 #[test]
-#[ignore = "Task 15.2: RequiresSortedInput derivation not yet wired (correlation key)"]
+#[ignore = "RequiresSortedInput derivation not yet wired for correlation keys"]
 fn test_dag_execution_reqs_sorted_input() {}
 
 /// JSON serialization roundtrip: schema_version, nodes, depends_on.
@@ -710,7 +707,7 @@ nodes:
     );
 }
 
-// --- Task 15.3 tests: --explain format extensions ---
+// --- `--explain` format extension tests ---
 
 /// Fixture with full branch wiring: route → branch transforms → merge.
 fn wired_diamond_yaml() -> &'static str {

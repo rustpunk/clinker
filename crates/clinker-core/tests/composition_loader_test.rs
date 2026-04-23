@@ -1,5 +1,4 @@
-//! Integration tests for the Phase 1 composition workspace scanner
-//! (Task 16c.1.3).
+//! Integration tests for the composition workspace scanner.
 //!
 //! Uses on-disk fixture files to drive [`scan_workspace_signatures`] through
 //! its complete code path: filesystem walk, YAML parse, signature
@@ -14,14 +13,13 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Path to the committed 5-fixture corpus rewritten in Task 16c.1.3 to
-/// match the drill-canonical composition signature shape.
+/// Path to the committed 5-fixture corpus.
 fn fixture_workspace_root() -> PathBuf {
     manifest_dir().join("tests").join("fixtures")
 }
 
 // ---------------------------------------------------------------------
-// Task 16c.1.3 hard-gate tests
+// Scanner tests
 // ---------------------------------------------------------------------
 
 /// Gate 1: loading the committed `tests/fixtures/compositions/` dir
@@ -79,7 +77,7 @@ fn test_phase1_scanner_emits_e101_on_malformed() {
 }
 
 /// Gate 3: exceeding the [`WORKSPACE_COMPOSITION_BUDGET`] returns an
-/// `Err` — budget enforced DURING the walk per LD-16c-17, not after.
+/// `Err` — budget enforced DURING the walk, not after.
 #[test]
 fn test_phase1_scanner_enforces_50_file_budget() {
     let tmp = tempfile::tempdir().expect("tempdir");

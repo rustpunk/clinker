@@ -13,7 +13,7 @@
 //! | `bench_lookup_baseline`        | C.0 (real pipeline; **baseline**) |
 //!
 //! `bench_lookup_baseline` runs a full end-to-end lookup pipeline at
-//! 10K × 100K (drill D10 workload) against the current `lookup` path.
+//! 10K × 100K against the current `lookup` path.
 //! Run it manually with `--save-baseline lookup-v1` before C.2 execution
 //! so it becomes the regression gate when combine replaces lookup:
 //!

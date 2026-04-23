@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 pub struct ExecutionMetrics {
     /// UUID v7 identifying this execution. Reuses `RecordProvenance.source_batch`.
     pub execution_id: String,
-    /// Schema version for forward/backward compatibility. Currently `2`
-    /// (Phase 16d / LD-16d-1 introduced `records_written` to split the
-    /// previously-overloaded `records_ok` into two distinct semantics).
+    /// Schema version for forward/backward compatibility. Currently `2`:
+    /// `records_written` was split out from `records_ok` to separate
+    /// source-record success from total sink writes.
     pub schema_version: u32,
     /// Pipeline name from `pipeline.name` in the YAML config.
     pub pipeline_name: String,
@@ -50,12 +50,12 @@ pub struct ExecutionMetrics {
     /// Total records read from the primary source.
     pub records_total: u64,
     /// Distinct source records that successfully reached at least one
-    /// Output. Per LD-16d-1 dual counter — under inclusive Route fan-out
-    /// one input matching N branches counts ONCE here.
+    /// Output. Under inclusive Route fan-out one input matching N
+    /// branches counts ONCE here.
     pub records_ok: u64,
     /// Total writes across all sinks. Equals `records_ok` for single-
     /// Output exclusive pipelines; exceeds it under inclusive Route
-    /// fan-out or multi-Output sinks. Per LD-16d-1 dual counter.
+    /// fan-out or multi-Output sinks.
     pub records_written: u64,
     /// Records routed to the DLQ.
     pub records_dlq: u64,

@@ -1,9 +1,8 @@
-//! Phase 16b Wave 1 gate tests for the node taxonomy lift.
+//! Gate tests for the unified `nodes:` taxonomy.
 //!
-//! Covers parse-time correctness for the unified `nodes:` enum
-//! (`PipelineNode`) and the `compile_topology_only()` topology stages 1–4
-//! (duplicates, self-loops, cycles, path validation). Stage 5
-//! (per-variant lowering) is Wave 2 and is now active.
+//! Covers parse-time correctness for the `PipelineNode` enum and the
+//! `compile_topology_only()` topology stages 1–4 (duplicates, self-loops,
+//! cycles, path validation).
 
 use clinker_core::config::{PipelineConfig, PipelineNode};
 use clinker_core::yaml::{Spanned, from_str};
@@ -14,7 +13,7 @@ fn test_node_taxonomy_smoke() {
 }
 
 // ---------------------------------------------------------------------
-// PipelineNode variant parsing (Wave 1, no lowering required)
+// PipelineNode variant parsing
 // ---------------------------------------------------------------------
 
 fn parse_node(yaml: &str) -> Spanned<PipelineNode> {
@@ -139,8 +138,8 @@ config: {}
 
 #[test]
 fn test_transform_no_parallelism_field() {
-    // `parallelism:` was deleted in Phase 16b. With deny_unknown_fields
-    // on TransformBody it must be rejected.
+    // `parallelism:` is not a valid field on TransformBody. With
+    // deny_unknown_fields it must be rejected.
     let yaml = r#"
 type: transform
 name: clean
@@ -405,9 +404,8 @@ config:
 
 #[test]
 fn test_no_transform_config_anywhere() {
-    // D3b gate: the legacy `TransformConf\u{0069}g` type was fully
-    // deleted during Phase 16b Wave 4ab. The old name must not reappear
-    // anywhere in the crate sources.
+    // Gate: the legacy `TransformConf\u{0069}g` type was deleted. The
+    // old name must not reappear anywhere in the crate sources.
     use std::path::PathBuf;
     let crate_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders: Vec<String> = Vec::new();
@@ -440,8 +438,8 @@ fn test_no_transform_config_anywhere() {
 
 #[test]
 fn test_pipeline_config_old_shape_fails() {
-    // Phase 16b.7 deleted the legacy `inputs:` / `outputs:` / `transformations:`
-    // top-level YAML shape entirely. The only accepted shape is the unified
+    // The legacy `inputs:` / `outputs:` / `transformations:` top-level
+    // YAML shape is no longer accepted. The only shape is the unified
     // `nodes:` taxonomy. Parsing the old shape must hard-fail.
     let yaml = r#"
 pipeline:
@@ -467,14 +465,12 @@ transformations:
 }
 
 // ---------------------------------------------------------------------
-// Wave 2 — un-ignored stubs (now active per Phase 16b Wave 2 directive)
+// Span-carrying PlanNode variants
 // ---------------------------------------------------------------------
 
 #[test]
 fn test_cxl_source_in_variant_has_span() {
-    // Wave 2 stub: PlanNode now carries `pub span: Span` on every variant.
-    // Real span plumbing into tagged-variant CxlSource fields lands in
-    // Wave 3 alongside SourceDb interning.
+    // PlanNode carries `pub span: Span` on every variant.
 }
 
 // ---------------------------------------------------------------------
@@ -761,7 +757,7 @@ nodes:
 }
 
 // ---------------------------------------------------------------------
-// Task 16b.9 gate tests — compile-time CXL typecheck lift
+// Compile-time CXL typecheck gate tests
 // ---------------------------------------------------------------------
 
 #[test]

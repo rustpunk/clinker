@@ -1,13 +1,11 @@
-//! Unified pipeline node enum (Phase 16b Wave 1 — Tasks 16b.2 Group A/B;
-//! custom-Deserialize refactor, pre-C.1, supersedes the C.0.1a two-pass
-//! approach).
+//! Unified pipeline node enum.
 //!
 //! `PipelineNode` is an enum with peer variants for every node kind in
 //! the unified `nodes:` topology. Each variant carries a header struct
 //! (with `name`, optional `description`, `input` / `inputs`) and a
 //! `config:` sub-block with the operator-specific fields.
 //!
-//! # Deserialization (pre-C.1)
+//! # Deserialization
 //!
 //! `PipelineNode` uses a hand-written [`Deserialize`] impl built around a
 //! [`serde::de::Visitor::visit_map`] that peeks the `type:` discriminator
@@ -15,12 +13,9 @@
 //! NOT through a `serde_json::Value` intermediate. This is the fourth
 //! application of the key-presence-dispatch pattern in this codebase
 //! (peers: [`crate::config::SortFieldSpec`], [`crate::config::SchemaSource`],
-//! [`crate::config::composition::raw::RawOutputAlias`]) — see
-//! `docs/internal/research/RESEARCH-span-preserving-deser.md` (Approach A)
-//! and `docs/internal/research/RESEARCH-transform-entry-serde.md` for the
-//! rationale.
+//! [`crate::config::composition::raw::RawOutputAlias`]).
 //!
-//! What this preserves (from C.0.1a, unchanged):
+//! What this preserves:
 //! - The user-facing YAML shape (`{type: combine, name: ..., config: {...}}`).
 //! - `deny_unknown_fields` semantics per variant — the visitor rejects
 //!   unknown top-level keys with the offending name in the error message.
@@ -28,14 +23,13 @@
 //! - Inner `#[serde(flatten)]` on `SourceBody` keeps working because
 //!   variant deserialization is driven by serde-saphyr's native path.
 //!
-//! What this adds (over C.0.1a):
+//! What this adds over a `serde_json::Value`-mediated dispatch:
 //! - Field-level [`crate::yaml::Spanned`] at the three header input
 //!   fields ([`NodeHeader::input`], [`MergeHeader::inputs`],
 //!   [`CombineHeader::input`]). Spans survive because the native path
-//!   never goes through serde's type-erased `Content` buffer, which is
-//!   what `serde_json::Value` would have routed through. E307 and
-//!   future per-input diagnostics can now pin-point the offending
-//!   reference.
+//!   never goes through serde's type-erased `Content` buffer. Undeclared-
+//!   reference diagnostics and future per-input diagnostics can now
+//!   pin-point the offending reference.
 //!
 //! Per-variant body structs use the `*Body` family suffix.
 
@@ -54,34 +48,30 @@ use crate::yaml::CxlSource;
 /// YAML `type:` field; per-variant fields are split between a header
 /// (flattened to top level) and a `config:` block.
 ///
-/// # Deserialization (pre-C.1)
+/// # Deserialization
 ///
 /// Uses a hand-written [`Deserialize`] impl with a
 /// [`serde::de::Visitor::visit_map`] that peeks the `type:` discriminator
 /// and dispatches each variant to a dedicated serde-saphyr-native
-/// deserializer. This supersedes the C.0.1a `#[serde(try_from =
-/// "serde_json::Value")]` approach: it keeps every win of that refactor
-/// (per-variant `deny_unknown_fields`, error messages include field
-/// names, no `#[serde(flatten)]` footprint on the enum) and adds
-/// field-level [`crate::yaml::Spanned`] preservation on consumer
-/// headers, which a `serde_json::Value` intermediate always erased. See
-/// the module-level docs and
-/// `docs/internal/research/RESEARCH-span-preserving-deser.md` for the
-/// full rationale.
+/// deserializer. This gives per-variant `deny_unknown_fields`, error
+/// messages that include field names, no `#[serde(flatten)]` footprint on
+/// the enum, AND field-level [`crate::yaml::Spanned`] preservation on
+/// consumer headers (which a `serde_json::Value` intermediate always
+/// erased).
 ///
 /// The `Serialize` impl is still derived with `#[serde(tag = "type",
-/// rename_all = "snake_case")]` — the YAML round-trip shape is
-/// unchanged, only deserialization is re-architected.
+/// rename_all = "snake_case")]` — the YAML round-trip shape is unchanged,
+/// only deserialization is re-architected.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 // Variant size is dominated by `SourceBody`/`OutputBody` (large wrapped
-// config types) and by the `Locations` field in `Spanned<NodeInput>` that
-// the pre-C.1 refactor adds to every consumer header. Boxing would force
-// every consumer site to deref through the box — a pervasive ergonomics
-// regression for a value that only lives for the lifetime of a pipeline
-// compile (PipelineConfig is typically parsed once, then owned as a
-// whole). The size cost is acceptable at config scale; the diagnostic
-// quality gain is load-bearing.
+// config types) and by the `Locations` field in `Spanned<NodeInput>` on
+// every consumer header. Boxing would force every consumer site to deref
+// through the box — a pervasive ergonomics regression for a value that
+// only lives for the lifetime of a pipeline compile (PipelineConfig is
+// typically parsed once, then owned as a whole). The size cost is
+// acceptable at config scale; the diagnostic quality gain is
+// load-bearing.
 #[allow(clippy::large_enum_variant)]
 pub enum PipelineNode {
     Source {
@@ -112,8 +102,7 @@ pub enum PipelineNode {
     },
     /// N-ary record combining with mixed predicates (equi + range + arbitrary
     /// CXL). Distinct from Merge (which concatenates records streamwise) and
-    /// from Transform+lookup (which is 1×1-table only). Introduced in Phase
-    /// Combine; see `docs/internal/plans/cxl-engine/phase-combine-node/`.
+    /// from Transform+lookup (which is 1×1-table only).
     Combine {
         #[serde(flatten)]
         header: CombineHeader,
@@ -148,7 +137,7 @@ pub enum PipelineNode {
         /// Resource bindings (file paths, connection strings, etc.).
         #[serde(default)]
         resources: IndexMap<String, serde_json::Value>,
-        /// Populated by `bind_composition` in 16c.2. Serde-default to a
+        /// Populated by `bind_composition` at plan time. Serde-default to a
         /// sentinel; any consumer reading this before `bind_schema` runs
         /// gets a clear debug-panic.
         #[serde(skip)]
@@ -665,7 +654,7 @@ impl PipelineNode {
 /// carries a **required** `schema:` declaration of the source's
 /// top-level columns with their CXL types. The schema drives
 /// compile-time CXL typechecking in
-/// [`crate::config::PipelineConfig::compile`] (Phase 16b Task 16b.9).
+/// [`crate::config::PipelineConfig::compile`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBody {
     /// Declared top-level columns and their CXL types. Required —
@@ -676,7 +665,7 @@ pub struct SourceBody {
     pub source: crate::config::SourceConfig,
 }
 
-/// Phase 16b Task 16b.9 — inline schema declaration on `SourceBody`.
+/// Inline schema declaration on `SourceBody`.
 ///
 /// Deserializes from a YAML sequence of `{ name, type }` entries:
 ///
@@ -706,15 +695,15 @@ pub struct ColumnDecl {
 /// span where serde-saphyr can deliver one), plus the row-level
 /// transform's optional sidebars.
 ///
-/// The `analytic_window` field is the Phase 16b rename of the legacy
-/// `local_window` field. The CXL `$window.*` namespace is unrelated and
-/// is preserved unchanged in the cxl crate.
+/// The `analytic_window` field is the transform-level per-row window
+/// spec. The CXL `$window.*` namespace is unrelated and is preserved
+/// unchanged in the cxl crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransformBody {
     pub cxl: CxlSource,
-    /// Renamed from `local_window` in Phase 16b. The CXL `$window.*`
-    /// runtime binding is orthogonal and is NOT renamed.
+    /// The transform-level analytic-window spec. Distinct from the
+    /// CXL `$window.*` runtime binding, which is orthogonal.
     #[serde(default)]
     pub analytic_window: Option<AnalyticWindowSpec>,
     /// Reference table lookup enrichment. Loads a secondary source into
@@ -776,14 +765,13 @@ pub enum MatchMode {
     /// Return all matching rows (fan-out, 1:N).
     All,
     /// Aggregate all matches into Value::Array. Empty array on miss.
-    /// Per-group limit 10K (D26, RESEARCH-collect-semantics.md).
-    /// OQ-1 RESOLVED: ships with existing Type::Array.
+    /// Per-group limit of 10K entries.
     Collect,
 }
 
-/// Phase 16b rename of `LocalWindowSpec`. Wave 1 keeps the payload
-/// structurally opaque (a JSON value) while the executor still reads
-/// the legacy field; Wave 2 promotes this to the typed shape.
+/// The analytic-window spec attached to a `Transform`. Currently held
+/// as a structurally opaque JSON value; a typed shape is a future
+/// refactor.
 pub type AnalyticWindowSpec = serde_json::Value;
 
 /// Aggregate variant body. Peer to Transform (no longer nested).

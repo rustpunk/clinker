@@ -28,11 +28,11 @@
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
 //! | `W002`      | warning  | Node names differ only in case                       |
-//! | `W100`      | warning  | Aggregate lowering deferred (Phase 16b Wave 3 stub)  |
+//! | `W100`      | warning  | Aggregate lowering deferred (stub)                   |
 //! | `W101`      | warning  | Pass-through column shadowed by composition body column |
 //! | `W102`      | warning  | Composition signature validation (required+default contradiction, suspicious port) |
 //!
-//! Combine node diagnostics (Phase C.0+):
+//! Combine node diagnostics:
 //!
 //! | Code        | Severity | Meaning                                              |
 //! |-------------|----------|------------------------------------------------------|
@@ -47,7 +47,7 @@
 //! | `E309`      | error    | Combine output schema is empty                       |
 //! | `E310`      | error    | Combine runtime exceeded hard memory limit           |
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
-//! | `E312`      | error    | Combine has N>2 inputs (C.2 supports binary only)    |
+//! | `E312`      | error    | Combine has N>2 inputs (binary only, for now)        |
 //! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
@@ -102,9 +102,9 @@ impl LabeledSpan {
 /// Variants are append-only — removing one is a breaking change to any
 /// test or downstream consumer that destructures it.
 ///
-/// Phase 16d remediation V3 / Q5=1 introduced this enum to back the
-/// unified input-reference resolution diagnostic (E300, post-Q7=γ
-/// E307 collapse). See LD-16d-1.
+/// Backs the unified input-reference resolution diagnostic so every
+/// undeclared-reference case (standalone node or combine arm) emits a
+/// single error code with machine-readable structure.
 #[derive(Clone, Debug)]
 pub enum DiagnosticPayload {
     /// E004 — a node's declared `input` field references a producer
@@ -202,9 +202,7 @@ impl Diagnostic {
     /// reported byte offset (if any) is carried through on the primary span;
     /// callers are responsible for supplying the owning [`crate::span::FileId`].
     ///
-    /// Task 16b.2 will tighten this once call sites are wired up; for now we
-    /// take the file id and a message-bearing error and record a zero-length
-    /// primary span at offset 0.
+    /// Currently records a zero-length primary span at offset 0.
     pub fn from_serde_saphyr_error(file: crate::span::FileId, err: &serde_saphyr::Error) -> Self {
         let message = err.to_string();
         Self::error(
@@ -267,8 +265,7 @@ pub enum PipelineError {
     /// Streaming aggregation detected an out-of-order group key on the
     /// USER-INPUT path (`StreamingAggregator<AddRaw>`). ALWAYS hard-aborts
     /// regardless of error strategy — the user's declared sort order was
-    /// wrong. Surfaced to the user as a DLQ-styled error. Phase 16 Task
-    /// 16.4.3.
+    /// wrong. Surfaced to the user as a DLQ-styled error.
     SortOrderViolation {
         message: String,
     },
@@ -276,7 +273,7 @@ pub enum PipelineError {
     /// **Clinker bug** because the LoserTree should never produce
     /// out-of-order keys; the only way to reach this variant is an
     /// internal invariant violation in the spill-recovery path. ALWAYS
-    /// hard-aborts. Phase 16 Task 16.4.3 (D70/D72).
+    /// hard-aborts.
     MergeSortOrderViolation {
         message: String,
     },

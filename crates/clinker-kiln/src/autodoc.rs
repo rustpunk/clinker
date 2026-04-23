@@ -221,8 +221,8 @@ pub struct ProvenanceSection {
 
 // ── Channel override section ────────────────────────────────────────────────
 
-/// Channel override provenance placeholder. Composition/channel features are
-/// removed in Phase 16b; the type is kept as a transparent stub for the UI.
+/// Channel override provenance placeholder — transparent stub kept for the
+/// UI while composition/channel override tracking is not wired up.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelOverrideSection {
     pub channel_id: String,

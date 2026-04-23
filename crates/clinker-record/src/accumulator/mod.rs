@@ -9,10 +9,7 @@
 //! Blocking: hash aggregation buffers one accumulator set per group.
 //!
 //! Serde derive on `AccumulatorEnum` and all state structs enables spill
-//! serialization without manual state/restore code (Decision #10).
-//!
-//! Research: RESEARCH-accumulator-merge-pattern.md, RESEARCH-sum-overflow.md,
-//! RESEARCH-accumulator-memory-tracking.md.
+//! serialization without manual state/restore code.
 
 use std::cmp::Ordering;
 
@@ -25,7 +22,8 @@ pub use error::AccumulatorError;
 
 /// One row of accumulators — one entry per `AggregateBinding` in the
 /// owning `CompiledAggregate`. Cloned from a prototype on group
-/// insertion. Phase 16 Task 16.3.7 / 16.3.2.
+/// insertion; `Vec` preserves binding insertion order so finalize
+/// output columns match the authored aggregate order.
 pub type AccumulatorRow = Vec<AccumulatorEnum>;
 
 #[cfg(test)]
@@ -37,9 +35,9 @@ mod tests;
 
 /// Sum accumulator state: i128 integer path + Kahan compensated f64 path.
 ///
-/// Research: RESEARCH-sum-overflow.md — DuckDB HUGEINT pattern. i128 cannot
-/// overflow at ETL scale (>2×10^19 rows at i64::MAX needed). Finalize via
-/// `i64::try_from` — NEVER `as i64`.
+/// Uses the DuckDB HUGEINT pattern: i128 internal accumulation cannot overflow
+/// at ETL scale (would need >2×10^19 rows at i64::MAX each). Finalize via
+/// `i64::try_from` — NEVER `as i64`, which silently wraps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SumState {
     /// i128 internal accumulation for integer inputs. Infallible at ETL scale.
@@ -99,7 +97,7 @@ impl SumState {
             }
             _ => {
                 // Non-numeric: skip (SQL SUM on non-numeric is undefined;
-                // typecheck rejects at plan time per Task 16.2).
+                // typecheck rejects at plan time, so this is defence-in-depth).
             }
         }
     }
@@ -256,7 +254,7 @@ impl AvgState {
         }
     }
 
-    /// Avg always returns Float per typecheck rule (Task 16.2).
+    /// Avg always returns Float per typecheck rule.
     fn finalize(&self) -> Value {
         if !self.has_value || self.count == 0 {
             return Value::Null;
@@ -288,8 +286,8 @@ impl MinMaxState {
         match &self.current {
             None => self.current = Some(value.clone()),
             Some(cur) => {
-                // Cross-type comparisons return None; Task 16.3 DLQs those.
-                // For Task 16.1 we just skip the incomparable value.
+                // Cross-type comparisons return None — skip the incomparable
+                // value here; the executor DLQs records with type conflicts.
                 if let Some(cmp) = value.partial_cmp(cur)
                     && cmp == keep_if
                 {
@@ -644,8 +642,8 @@ impl AccumulatorEnum {
     /// `size_of::<Self>()` (inline enum footprint, no heap). Collect reports
     /// `Vec` capacity × `size_of::<Value>()` plus each value's own heap.
     ///
-    /// Research: RESEARCH-accumulator-memory-tracking.md — DataFusion issue
-    /// #13831 (19x undercount from len-based reporting). Report capacity.
+    /// Report `Vec` capacity, not `len()` — len-based reporting has caused up
+    /// to 19× undercounts in DataFusion (arrow-rs issue #13831).
     pub fn heap_size(&self) -> usize {
         match self {
             Self::Collect(s) => s.heap_size(),

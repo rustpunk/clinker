@@ -366,8 +366,6 @@ pub fn structural_search(
             }
         }
 
-        // Composition/import/override tags removed in Phase 16b.
-
         // Check inputs
         for input in config.source_configs() {
             if stage_matches_tags(tags, "input", &input.name, &content_for_input(input)) {

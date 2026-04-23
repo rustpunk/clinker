@@ -5,14 +5,12 @@
 //! The buffer tracks its own memory usage and spills sorted chunks to
 //! NDJSON+LZ4 temp files when the budget is exceeded.
 //!
-//! Generic over per-record payload `P`. Phase 8 source/output sort uses
+//! Generic over per-record payload `P`. Source/output sort uses
 //! `SortBuffer<()>`; the DAG executor's `PlanNode::Sort` dispatch arm uses
 //! `SortBuffer<(u64, IndexMap<String,Value>, IndexMap<String,Value>)>` to
-//! carry row number and metadata maps through the sort permutation.
-//!
-//! See `docs/research/RESEARCH-sort-node-sidecar-payload.md` for the
-//! architectural rationale (Pattern B: bundled-tuple sort with payload in
-//! the spill envelope).
+//! carry row number and metadata maps through the sort permutation. Payload
+//! travels inside the spill envelope (bundled-tuple sort), not on a parallel
+//! array, to avoid permutation-reindex bugs.
 
 use std::path::PathBuf;
 use std::sync::Arc;

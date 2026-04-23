@@ -8,7 +8,7 @@ const MAX_DEPTH: u32 = 256;
 /// NUD lookahead in `parse_nud()` to branch to `parse_agg_call()` instead of
 /// treating the identifier as a field reference.
 ///
-/// Phase 16 set (7): sum, count, avg, min, max, collect, weighted_avg.
+/// Aggregate function set: sum, count, avg, min, max, collect, weighted_avg.
 /// `first`/`last` are window-only (spec grammar) and are NOT aggregate names.
 pub(crate) fn is_aggregate_name(name: &str) -> bool {
     matches!(
@@ -1080,7 +1080,8 @@ impl Parser {
         let end = self.prev_span();
 
         // `count()` with no args is sugar for `count(*)` — emit a Wildcard arg.
-        // `collect()` with no args is deferred to Phase 17 (window aggregates).
+        // `collect()` with no args is reserved for window aggregates and is
+        // not yet implemented.
         let args = if args.is_empty() && &*name == "count" {
             let wnid = self.alloc_id();
             vec![Expr::Wildcard {
@@ -1921,7 +1922,7 @@ mod tests {
         );
     }
 
-    // ── Phase 16 Task 16.2 — aggregate function parsing ─────────────────
+    // ── aggregate function parsing ─────────────────────────────────────
 
     fn emit_expr(r: &ParseResult) -> &Expr {
         match &r.ast.statements[0] {

@@ -3,15 +3,14 @@
 //! `SpillWriter<P>` serializes (record, payload) pairs to a temp file;
 //! `SpillReader<P>` reads them back. Parameterized over per-record payload
 //! type `P` so DAG-walk sites can carry sidecar data (row number, metadata
-//! maps) through sort permutation. Phase 8 source/output sort callsites use
+//! maps) through sort permutation. Source/output sort callsites use
 //! `P = ()` (zero spill bytes for the unit type).
 //!
-//! Generalization rationale: see
-//! `docs/research/RESEARCH-sort-node-sidecar-payload.md` — every production
-//! row-oriented ETL system (Miller, Beam Sorter, Flink ExternalSorter,
-//! Differential Dataflow `Batcher`, `extsort` crate) carries payload inside
-//! the spill envelope. Position-indexed parallel arrays are contraindicated
-//! (Vector RFC, KAFKA-9408 postmortem).
+//! Generalization rationale: every production row-oriented ETL system
+//! (Miller, Beam Sorter, Flink ExternalSorter, Differential Dataflow
+//! `Batcher`, `extsort` crate) carries payload inside the spill envelope.
+//! Position-indexed parallel arrays are contraindicated — see the Vector
+//! RFC and the KAFKA-9408 postmortem.
 //!
 //! File format:
 //!   Line 0: JSON array of column names (schema)

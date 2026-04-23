@@ -1,12 +1,11 @@
-//! Serde-derived raw shapes for `.comp.yaml` deserialization (Task 16c.1.2).
+//! Serde-derived raw shapes for `.comp.yaml` deserialization.
 //!
 //! Separated from the canonical public types in `mod.rs` because the canonical
 //! [`crate::config::composition::CompositionSignature`] holds
-//! [`crate::span::Span`] values (LD-003). serde-saphyr natively produces
+//! [`crate::span::Span`] values. serde-saphyr natively produces
 //! [`serde_saphyr::Span`], so we deserialize into this raw layer, capture
 //! saphyr spans via [`serde_saphyr::Spanned`], then convert to the canonical
-//! form via [`Span::from_saphyr`] at the YAML chokepoint boundary — exactly
-//! the pattern prescribed by LD-003 and CONVENTIONS.md §Span usage.
+//! form via [`Span::from_saphyr`] at the YAML chokepoint boundary.
 //!
 //! Nothing in this module is exported outside the `composition` module.
 
@@ -47,8 +46,8 @@ pub(super) struct RawCompositionSignature {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawPortDecl {
-    /// Minimum-required column set (LD-16c-2). YAML form: a list of
-    /// `{ name, type }` entries matching the 16b `SchemaDecl` convention.
+    /// Minimum-required column set. YAML form: a list of
+    /// `{ name, type }` entries matching the `SchemaDecl` convention.
     /// Absence means accept-any.
     #[serde(default)]
     pub schema: Option<SchemaDecl>,

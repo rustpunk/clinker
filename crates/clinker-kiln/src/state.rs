@@ -313,7 +313,7 @@ use clinker_schema::{SchemaIndex, SchemaWarning};
 
 // ── Channel state ──────────────────────────────────────────────────────
 
-/// Discovered channel workspace state based on the 16c ChannelBinding model.
+/// Discovered channel workspace state based on the ChannelBinding model.
 ///
 /// Populated when a workspace has `.channel.yaml` files in its channels
 /// directory. None when no workspace is loaded or no channels are found.

@@ -1,9 +1,9 @@
-//! Per-node row type persistence (LD-16c-23).
+//! Per-node row type persistence.
 //!
 //! `BoundSchemas` stores the `Row` type bound at each node's output
 //! during the `bind_schema` pass. It is carried on `CompileArtifacts`
-//! and persisted on `CompiledPlan` so that downstream phases (16c.2+)
-//! never need to recompute schema propagation.
+//! and persisted on `CompiledPlan` so downstream consumers never need
+//! to recompute schema propagation.
 
 use std::collections::HashMap;
 

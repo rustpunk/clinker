@@ -1,7 +1,6 @@
-//! Hash + streaming aggregation engine for Phase 16.
+//! Hash + streaming aggregation engine.
 //!
-//! Task 16.3.7 introduces the runtime types referenced by
-//! `PlanNode::Aggregation`'s executor dispatch (16.3.13):
+//! Runtime types referenced by `PlanNode::Aggregation`'s executor dispatch:
 //!
 //! * [`AggregateStrategy`] — plan-time enum (also surfaced on the plan
 //!   node) selecting the per-group hash table or the streaming
@@ -63,10 +62,9 @@ impl RecordStorage for NullStorage {
 
 /// Aggregation strategy selected at plan-compile time.
 ///
-/// `Hash` is the universal default. `Streaming` is wired by Task 16.4
-/// when the input is provably sorted on the full group-by prefix —
-/// allowing a one-group-at-a-time fold that never materializes a hash
-/// table.
+/// `Hash` is the universal default. `Streaming` is used when the input
+/// is provably sorted on the full group-by prefix — allowing a
+/// one-group-at-a-time fold that never materializes a hash table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateStrategy {
@@ -76,8 +74,7 @@ pub enum AggregateStrategy {
 
 /// Input to an aggregator's `add` path. Live input records and
 /// recovered spilled state both flow through the same dispatch so the
-/// merge phase (Task 16.3.11) can reuse the hash table without a
-/// separate code path.
+/// merge phase can reuse the hash table without a separate code path.
 pub enum AggregateInput {
     /// A freshly produced input record from the upstream stage.
     RawRecord(Record),
@@ -184,9 +181,7 @@ pub struct AggregateEvalScope<'a> {
 }
 
 /// Errors that can arise while evaluating a residual in aggregate
-/// scope. The full taxonomy lands with Task 16.3.13 (`PipelineError`
-/// integration); for the 16.3.7 surface area we need just enough to
-/// compile.
+/// scope.
 #[derive(Debug, Clone)]
 pub enum AggregateEvalError {
     /// `Expr::AggSlot { slot }` referenced a slot index outside the
@@ -197,9 +192,8 @@ pub enum AggregateEvalError {
     /// the key tuple.
     GroupKeyOutOfRange { slot: u32, key_count: usize },
     /// A residual contained a construct that the finalize-time
-    /// evaluator does not yet support. Task 16.3.12 expands the
-    /// supported surface area; until then any unsupported expression
-    /// is reported via this variant rather than panicking.
+    /// evaluator does not yet support. Unsupported expressions are
+    /// reported via this variant rather than panicking.
     UnsupportedResidual { what: &'static str },
 }
 
@@ -230,8 +224,7 @@ impl std::error::Error for AggregateEvalError {}
 /// coalesce / `if` / unary nodes recursively. Constructs that need a
 /// row context (`FieldRef`, `MethodCall`, `WindowCall`, `Match`,
 /// metadata access) are surfaced as
-/// [`AggregateEvalError::UnsupportedResidual`] until Task 16.3.12
-/// extends the surface area in lockstep with the executor dispatch.
+/// [`AggregateEvalError::UnsupportedResidual`].
 pub fn eval_expr_in_agg_scope(
     expr: &Expr,
     scope: &AggregateEvalScope<'_>,
@@ -377,7 +370,7 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, AggregateEvalError> {
 }
 
 // ---------------------------------------------------------------------------
-// MetadataCommonTracker (Task 16.3.8a, Decision D11 revised)
+// MetadataCommonTracker
 // ---------------------------------------------------------------------------
 
 /// Per-key state inside a [`MetadataCommonTracker`].
@@ -406,7 +399,7 @@ pub struct CommonState {
 /// emitted; everything else is dropped (visible by absence).
 ///
 /// The tracker is serde-derived because it travels with the per-group
-/// `AccumulatorRow` through the spill path — see Task 16.3.10.
+/// `AccumulatorRow` through the spill path.
 /// Recovery merges partial trackers via [`MetadataCommonTracker::merge`]
 /// which is associative: any disagreement on either side, or any
 /// already-`conflicting` slot, transitions the merged slot to
@@ -421,10 +414,8 @@ pub struct MetadataCommonTracker {
 /// Both pieces of information are needed by the hash aggregator hot
 /// loop: `heap_delta` is folded into `value_heap_bytes` for memory
 /// accounting, while `became_conflict` triggers a one-shot structured
-/// WARN log via `meta_conflict_logged`. The phase-16 spec quotes both
-/// behaviors but is internally inconsistent on a single return type;
-/// the struct surfaces them together to satisfy both call sites without
-/// a hidden second lookup.
+/// WARN log via `meta_conflict_logged`. The struct surfaces both
+/// together so the caller never does a hidden second lookup.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ObserveResult {
     /// Bytes added to `value_heap_bytes` by this observation. Always
@@ -665,7 +656,7 @@ mod tracker_tests {
 }
 
 // ---------------------------------------------------------------------------
-// HashAggregator (Task 16.3.8)
+// HashAggregator
 // ---------------------------------------------------------------------------
 
 /// Per-group state held inside the hash table.
@@ -785,9 +776,8 @@ pub enum HashAggError {
     /// either the upstream ordering contract was wrong or the plan
     /// property pass qualified streaming aggregation on a node whose
     /// output was not actually sorted (DataFusion #12086-class bug).
-    /// Phase 16 Task 16.4.3 — widened from `{ message: String }` so the
-    /// `GroupBoundary` can hand the executor both pre/next encoded keys
-    /// for diagnostics. The user-input vs spill-merge distinction is
+    /// `GroupBoundary` hands the executor both pre/next encoded keys for
+    /// diagnostics. The user-input vs spill-merge distinction is
     /// captured in two separate variants because the two cases route
     /// differently through `From<HashAggError> for PipelineError`.
     SortOrderViolation {
@@ -795,7 +785,7 @@ pub enum HashAggError {
         next_key_debug: String,
     },
     /// Spill-merge produced an out-of-order key — Clinker bug, not a
-    /// user data error. Always hard-aborts. Phase 16 Task 16.4.3.
+    /// user data error. Always hard-aborts.
     MergeSortOrderViolation {
         prev_key_debug: String,
         next_key_debug: String,
@@ -907,22 +897,18 @@ impl From<HashAggError> for PipelineError {
 }
 
 // ---------------------------------------------------------------------------
-// AggregateStream wrapper enum (Task 16.3.13)
+// AggregateStream wrapper enum
 // ---------------------------------------------------------------------------
 
 /// Executor-facing aggregation dispatch wrapper.
 ///
-/// Single variant in 16.3.13. The `#[non_exhaustive]` attribute lets
-/// Task 16.4 add a `Streaming(StreamingAggregator<AddRaw>)` variant
-/// non-breakingly, in the same commit that introduces the real
-/// `AccumulatorOp` / `AddRaw` types — avoiding the DataFusion #12086
-/// failure mode of placeholder generic parameters in dispatch enums.
+/// The `#[non_exhaustive]` attribute reserves the option of adding new
+/// variants non-breakingly — avoiding the DataFusion #12086 failure
+/// mode of placeholder generic parameters in dispatch enums.
 #[non_exhaustive]
 pub enum AggregateStream {
     Hash(Box<HashAggregator>),
-    /// Streaming aggregation over a pre-sorted upstream. Landed in
-    /// Phase 16 Task 16.4.0 alongside the real `AccumulatorOp` /
-    /// `AddRaw` types and the shared streaming-merge module.
+    /// Streaming aggregation over a pre-sorted upstream.
     Streaming(Box<StreamingAggregator<AddRaw>>),
 }
 
@@ -932,8 +918,7 @@ impl AggregateStream {
     /// Streaming strategy is rejected with a fallible
     /// `PipelineError::Internal` (NOT `todo!()` / `unreachable!()`) per
     /// the DataFusion #12086 lesson on unreachable arms in long-lived
-    /// executor dispatch tables. The real `Streaming` arm lands in Task
-    /// 16.4 alongside its inner `StreamingAggregator<AddRaw>`.
+    /// executor dispatch tables.
     #[allow(clippy::too_many_arguments)]
     pub fn for_node(
         compiled: Arc<CompiledAggregate>,
@@ -970,7 +955,7 @@ impl AggregateStream {
     /// Drive one input record through the wrapper. The Hash arm ignores
     /// `out` (it defers all emission to `finalize`). The Streaming arm
     /// pushes one finalized `SortRow` into `out` for every key boundary
-    /// crossed by this record. Phase 16 Task 16.4.3 (D-α/D-γ debt).
+    /// crossed by this record.
     #[allow(clippy::too_many_arguments)]
     pub fn add_record(
         &mut self,
@@ -1362,9 +1347,9 @@ impl HashAggregator {
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
-        // D12: global-fold empty-input special case. Delegated to the
-        // shared `empty_global_fold_row` helper so the streaming path
-        // produces a byte-identical record (Phase 16 Task 16.4.3).
+        // Global-fold empty-input special case. Delegated to the shared
+        // `empty_global_fold_row` helper so the streaming path produces
+        // a byte-identical record.
         if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
@@ -1383,10 +1368,10 @@ impl HashAggregator {
                 } else {
                     state.min_row_num
                 };
-                // Phase 16b.8: the downstream output stage consumes
-                // `emitted` as the per-record field map (merged with the
-                // raw record under `include_unmapped`). Upstream
-                // `common_emitted` leaks pre-aggregation transform fields
+                // The downstream output stage consumes `emitted` as the
+                // per-record field map (merged with the raw record under
+                // `include_unmapped`). Upstream `common_emitted` leaks
+                // pre-aggregation transform fields
                 // into the post-aggregate output, which is a hash-order-
                 // dependent flake (columns present or absent depending on
                 // whether the first-iterated group's intersection retained
@@ -1710,7 +1695,7 @@ impl AggSpillReader {
 
 /// Single source of truth for the `Vec<SortField>` configuration used
 /// to encode group-by columns for the streaming aggregator and the
-/// spill write/read paths. Phase 16 Task 16.4.3 (D74).
+/// spill write/read paths.
 ///
 /// Returns one ASC nulls-first `SortField` per group-by column. The
 /// schema parameter is currently unused but is plumbed so a future
@@ -1727,13 +1712,13 @@ pub(crate) fn group_by_sort_fields(group_by_fields: &[String], _schema: &Schema)
         .collect()
 }
 
-/// Single source of truth for the empty-input global-fold record (D12).
+/// Single source of truth for the empty-input global-fold record.
 ///
 /// Both the hash path (`HashAggregator::finalize`) and the streaming
 /// path (`StreamingAggregator::flush`) call this to produce one
 /// defaulted output record when an empty stream and an empty group-by
 /// would otherwise yield zero rows. Mirrors DataFusion's
-/// `AggregateStream` empty-input branch. Phase 16 Task 16.4.3 (D73).
+/// `AggregateStream` empty-input branch.
 pub(crate) fn empty_global_fold_row(
     factory: &AccumulatorFactory,
     output_schema: &Arc<Schema>,
@@ -1816,11 +1801,11 @@ fn eval_binding_arg_value(
 }
 
 // ---------------------------------------------------------------------------
-// StreamingAggregator<Op: AccumulatorOp> — raw + merge modes (Task 16.4.0)
+// StreamingAggregator<Op: AccumulatorOp> — raw + merge modes
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// AccumulatorOp trait + AddRaw / MergeState impls (Task 16.4.2)
+// AccumulatorOp trait + AddRaw / MergeState impls
 // ---------------------------------------------------------------------------
 //
 // The trait lives here in `clinker-core/src/aggregation.rs` (NOT
@@ -1828,8 +1813,7 @@ fn eval_binding_arg_value(
 // `AggregatorGroupState`, which in turn holds a `MetadataCommonTracker`
 // defined alongside the hash aggregator. `clinker-record` has no
 // dependency on `cxl`, so the `apply_row` signature — which takes
-// `&[AggregateBinding]` — would also be unexpressible there. Phase 16
-// Task 16.4.2 explicitly specifies `aggregation.rs` as the location.
+// `&[AggregateBinding]` — would also be unexpressible there.
 
 /// Monomorphization marker trait for the streaming aggregator's
 /// ingestion hot loop.
@@ -1878,7 +1862,7 @@ pub trait AccumulatorOp: Default + 'static {
 }
 
 /// Ingestion mode: raw upstream `Record` values arriving in verified
-/// pre-sorted order on the group-by prefix. Phase 16 Task 16.4.2.
+/// pre-sorted order on the group-by prefix.
 #[derive(Debug, Default)]
 pub struct AddRaw;
 
@@ -1893,9 +1877,9 @@ impl AccumulatorOp for AddRaw {
         // an `EvalContext` + `ProgramEvaluator`, which this narrow
         // trait signature intentionally does not plumb — callers that
         // hit those variants drop to the general `dispatch_binding`
-        // path. This fast-path specialization is what Task 16.4.2
-        // reserves for future hot-loop optimization (DataFusion
-        // blog 2023-08-05 per-record allocation pattern).
+        // path. This fast-path specialization is reserved for future
+        // hot-loop optimization (DataFusion blog 2023-08-05 per-record
+        // allocation pattern).
         for (binding, acc) in bindings.iter().zip(row.iter_mut()) {
             match &binding.arg {
                 BindingArg::Field(idx) => {
@@ -1924,7 +1908,7 @@ impl AccumulatorOp for AddRaw {
 
 /// Ingestion mode: merge pre-aggregated per-group state coming from a
 /// spill file (or any upstream that already folded rows into an
-/// `AggregatorGroupState`). Phase 16 Task 16.4.2.
+/// `AggregatorGroupState`).
 ///
 /// `Input` carries the **full** state so sidecar reductions (D57) and
 /// the metadata common tracker (D11 revised) survive spill recovery
@@ -1935,7 +1919,7 @@ pub struct MergeState;
 impl AccumulatorOp for MergeState {
     /// Encoded sort key (read by the LoserTree comparator) + the full
     /// per-group state. The sort key is produced by `SortKeyEncoder`
-    /// (Task 16.4.1) and matches the declared sort-order direction.
+    /// and matches the declared sort-order direction.
     type Input = (Vec<u8>, AggregatorGroupState);
 
     #[inline(always)]
@@ -1993,7 +1977,7 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
 ///   pre-aggregated partials. The spill-recovery path currently lives
 ///   in `HashAggregator::finalize_with_spill`, which is what the
 ///   executor actually uses; the `MergeState` inherent impl exists so
-///   the decisions-log type surface survives for Phase 17+ work.
+///   the type surface survives for future out-of-core work.
 ///
 /// Both variants share the [`GroupBoundary`](crate::pipeline::streaming_merge::GroupBoundary)
 /// state machine (DataFusion PR #4301 pattern), guaranteeing that all
@@ -2232,10 +2216,9 @@ impl StreamingAggregator<AddRaw> {
     }
 
     /// Drain all emitted boundary rows plus the final open group.
-    /// Phase 16 Task 16.4.3 — D12 special case.
     pub fn flush(mut self, _ctx: &EvalContext, out: &mut Vec<SortRow>) -> Result<(), HashAggError> {
-        // D12 special case: empty input + empty group_by → emit one
-        // defaulted global-fold row.
+        // Empty input + empty group_by → emit one defaulted global-fold
+        // row.
         if self.rows_seen == 0 && self.group_by_indices.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
@@ -2281,8 +2264,8 @@ impl StreamingAggregator<AddRaw> {
 
 impl StreamingAggregator<MergeState> {
     /// Construct a merge-mode streaming aggregator. Retained as a
-    /// forward-compat stub for Phase 17+ out-of-core merge recovery;
-    /// the executor's spill-recovery path currently lives inside
+    /// forward-compat stub for future out-of-core merge recovery; the
+    /// executor's spill-recovery path currently lives inside
     /// `HashAggregator::finalize_with_spill`.
     pub fn new_for_merge(
         compiled: Arc<CompiledAggregate>,
@@ -2325,9 +2308,9 @@ impl StreamingAggregator<MergeState> {
 }
 
 impl<Op: AccumulatorOp> StreamingAggregator<Op> {
-    /// Task 16.4.10 — debug-inspect accessor used by the structural O(1)
-    /// memory test (G7) and by the Kiln debugger's streaming-agg state
-    /// overlay. Returns 1 when a per-group state is currently open
+    /// Debug-inspect accessor used by the structural O(1) memory test
+    /// and by the Kiln debugger's streaming-agg state overlay. Returns
+    /// 1 when a per-group state is currently open
     /// (between key boundaries), 0 when no group is open (before the
     /// first record or immediately after a flush).
     ///
@@ -2341,13 +2324,13 @@ impl<Op: AccumulatorOp> StreamingAggregator<Op> {
 }
 
 // ---------------------------------------------------------------------------
-// Task 16.4.6 — plan-time streaming eligibility
+// Plan-time streaming eligibility
 // ---------------------------------------------------------------------------
 
 /// Outcome of evaluating whether an aggregation can run in streaming mode
 /// given its parent node's physical properties. Returned by
-/// [`qualifies_for_streaming`] and consumed by the planner lowering in
-/// Task 16.4.9a to pick between `PlanNode::StreamingAggregation` and
+/// [`qualifies_for_streaming`] and consumed by the planner lowering to
+/// pick between `PlanNode::StreamingAggregation` and
 /// `PlanNode::HashAggregation`.
 #[derive(Debug, Clone)]
 pub enum StreamingEligibility {
@@ -2369,7 +2352,7 @@ pub enum StreamingEligibility {
 /// [`StreamingEligibility`] describing whether streaming is allowed and, if
 /// so, the effective group-by order and qualified sort prefix.
 ///
-/// Rules (see phase-16-aggregation.md Task 16.4.6 for provenance):
+/// Rules:
 /// - Global fold (`group_by` empty) always streams — a single output row
 ///   with no sort requirement.
 /// - `Single` partitioning passes; `HashPartitioned` passes iff its keys
@@ -2649,8 +2632,8 @@ mod accumulator_op_tests {
     fn test_mergestate_input_type_carries_full_group_state() {
         // Compile-time proof that the `Input` associated type is the
         // full `(Vec<u8>, AggregatorGroupState)` (audit fix Gap B).
-        // If Task 16.4.2 ever regresses to `(Vec<u8>, AccumulatorRow)`
-        // this test stops compiling.
+        // If `MergeState::Input` ever regresses to
+        // `(Vec<u8>, AccumulatorRow)` this test stops compiling.
         fn assert_input_is_full_state(_: &<MergeState as AccumulatorOp>::Input) {}
         let st = state_with_row(Vec::new());
         let input: (Vec<u8>, AggregatorGroupState) = (Vec::new(), st);
@@ -2664,7 +2647,7 @@ mod accumulator_op_tests {
         let _ = &input.1.meta_tracker;
     }
 
-    // ----- qualifies_for_streaming (Task 16.4.6) -----
+    // ----- qualifies_for_streaming -----
 
     use crate::config::SortOrder as SO;
     use crate::plan::properties::{

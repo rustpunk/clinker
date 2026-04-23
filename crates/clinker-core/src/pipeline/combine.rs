@@ -2,8 +2,8 @@
 //! later sub-tasks) the index-separated build-side hash table.
 //!
 //! **Scope of this module:** runtime data structures consumed by the
-//! `PlanNode::Combine` executor arm (wired up in C.2.2). Plan-time vocabulary
-//! — `CombineStrategy`, `DecomposedPredicate`, `EqualityConjunct`,
+//! `PlanNode::Combine` executor arm. Plan-time vocabulary —
+//! `CombineStrategy`, `DecomposedPredicate`, `EqualityConjunct`,
 //! `CombineInput` — lives in `crate::plan::combine`. Do not cross-pollinate.
 //!
 //! **Concurrency model (spec §Concurrency Model):** every public struct
@@ -16,20 +16,15 @@
 //! #5490, #6170): hash index, chain vector, record arena, cached build-side
 //! key values.
 //!
-//! Sub-tasks currently landed in this module:
-//!   - C.2.1.1 — `canonical_f64`/`canonical_f32`, `hash_composite_key`,
+//! Primitives provided here:
+//!   - `canonical_f64`/`canonical_f32`, `hash_composite_key`,
 //!     `keys_equal_canonicalized`, module-level constants.
-//!   - C.2.1.2 — `CombineError`, `KeyExtractor`.
-//!   - C.2.1.3 — `CombineHashTable` with `build()` / `probe()` / `ProbeIter`
+//!   - `CombineError`, `KeyExtractor`.
+//!   - `CombineHashTable` with `build()` / `probe()` / `ProbeIter`
 //!     (index-separated design; immutable after build; NULL probe
 //!     short-circuit; equality verification across full collision chain;
 //!     per-[`MEMORY_CHECK_INTERVAL`] budget checks during build).
-//!   - C.2.1.4 — `memory_bytes()` accounting across all four allocation
-//!     sources.
-//!
-//! Sub-tasks pending (to be added in order by subsequent commits):
-//!   - (none — Phase C.2.1 complete; C.2.4 is next per the execution
-//!     plan's reordered sequence C.2.1 → C.2.4 → C.2.2 → C.2.3 → C.2.5).
+//!   - `memory_bytes()` accounting across all four allocation sources.
 
 use ahash::RandomState;
 use chrono::{Datelike, Timelike};
@@ -49,8 +44,7 @@ use crate::pipeline::memory::MemoryBudget;
 /// [`crate::pipeline::memory::MemoryBudget::should_abort`] checks during
 /// `CombineHashTable::build` AND during probe-side fan-out emission.
 ///
-/// Chosen by research (`docs/internal/research/RESEARCH-c2-preimplementation-gaps.md`
-/// Q1): matches ClickHouse per-block cadence and is the same order of
+/// Matches ClickHouse per-block cadence and is the same order of
 /// magnitude as DataFusion's default 8192-row RecordBatch. Per-row RSS
 /// polling is infeasible (~10 µs per `/proc/self/status` read ⇒ ~10 s/sec
 /// overhead at 1 M rec/sec).
@@ -60,10 +54,10 @@ pub const MEMORY_CHECK_INTERVAL: usize = 10_000;
 /// `Value::Array` under `MatchMode::Collect`. Overflow truncates and emits a
 /// W-level diagnostic once per driver record.
 ///
-/// Chosen by research (`RESEARCH-collect-semantics.md`): no ETL tool has a
-/// built-in cap and every surveyed SQL engine (DuckDB, Spark, Polars) has
-/// documented OOMs at hot keys under `collect_list`. Clinker sets its own
-/// default; per-combine configurability is a future knob, out of C.2 scope.
+/// No ETL tool surveyed has a built-in cap and every SQL engine
+/// (DuckDB, Spark, Polars) has documented OOMs at hot keys under
+/// `collect_list`. Clinker sets its own default; per-combine
+/// configurability is a future knob.
 pub const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
 /// End-of-chain sentinel for `CombineHashTable::chain`. Selected so the entire
@@ -297,8 +291,7 @@ pub enum CombineError {
     /// the hash table's self-reported footprint at the moment of the
     /// check; `limit` is the configured budget. Emitted after
     /// `MemoryBudget::should_abort` returns true (checked every
-    /// [`MEMORY_CHECK_INTERVAL`] records; see `RESEARCH-c2-preimplementation-gaps.md`
-    /// Q1 for the rationale).
+    /// [`MEMORY_CHECK_INTERVAL`] records to amortize the cost).
     MemoryLimitExceeded { used: u64, limit: u64 },
 
     /// Key-expression evaluation failed. `side` is `"driving"` or
@@ -490,11 +483,10 @@ pub struct ProbeCandidate<'a> {
 
 /// Index-separated hash table for combine's build side.
 ///
-/// **Design rationale** (see `RESEARCH-hash-table-memory.md`): DataFusion,
-/// DuckDB, and CedarDB all converged on this shape because storing
-/// 700–1400-byte records inline in a hash table wastes 13–50% of memory on
-/// empty slots. Storing 4-byte record indices instead keeps overhead below
-/// 3% for realistic ETL record sizes.
+/// **Design rationale**: DataFusion, DuckDB, and CedarDB all converged on
+/// this shape because storing 700–1400-byte records inline in a hash table
+/// wastes 13–50% of memory on empty slots. Storing 4-byte record indices
+/// instead keeps overhead below 3% for realistic ETL record sizes.
 ///
 /// **Layout** (four allocation sources — [`CombineHashTable::memory_bytes`]
 /// accounts every one of them per the DataFusion #14222/#5490/#6170 lessons):
@@ -538,10 +530,9 @@ impl CombineHashTable {
     ///   the process RSS exceeds the budget's hard limit.
     /// * `estimated_rows` — optional capacity hint. When `Some`, the
     ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
-    ///   the resize spike that
-    ///   [`RESEARCH-hash-table-memory.md`] measures at up to 2.25× peak.
-    ///   When `None`, we fall back to `records.len()` — always an
-    ///   upper bound on final table size.
+    ///   the resize spike, which can reach 2.25× peak footprint during
+    ///   the rehash. When `None`, we fall back to `records.len()` —
+    ///   always an upper bound on final table size.
     ///
     /// **Build records with NULL keys are indexed harmlessly:** they hash
     /// to the NULL sentinel and form chains alongside any collisions. They
@@ -1491,12 +1482,11 @@ mod tests {
 
     #[test]
     fn test_combine_hash_table_memory_overhead_ratio() {
-        // RESEARCH-hash-table-memory.md target: <1.1× overhead for
-        // records with 10+ fields (realistic ETL size — ~1-2 KB per
-        // record). The "raw" baseline here is what ANY in-memory
-        // record store would occupy: per-Record struct bytes + heap
-        // (values + overflow + metadata). The hash-specific overhead
-        // is index + chain + keys_cache.
+        // Target: <1.1× overhead for records with 10+ fields (realistic
+        // ETL size — ~1-2 KB per record). The "raw" baseline here is
+        // what ANY in-memory record store would occupy: per-Record struct
+        // bytes + heap (values + overflow + metadata). The hash-specific
+        // overhead is index + chain + keys_cache.
         //
         // We use 10 string fields ~100 bytes each = ~1 KB records,
         // matching the research target's test condition. At this size

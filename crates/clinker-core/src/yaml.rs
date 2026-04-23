@@ -1,4 +1,4 @@
-//! YAML parser chokepoint (Phase 16b Task 16b.0.5).
+//! YAML parser chokepoint.
 //!
 //! This module is the **single** entry point for YAML parsing in clinker.
 //! No other code path is permitted to call `serde_saphyr::from_str*` or
@@ -8,14 +8,13 @@
 //!    upstream maintainer. If we ever need to fork or replace it, this
 //!    file is the only thing that has to change.
 //! 2. **DoS-defense chokepoint.** A single [`Budget`] keeps depth /
-//!    size / alias-expansion / include limits aligned with the Phase 11
-//!    threat model (assumption #66). Tightening the limits is a one-file
-//!    edit.
+//!    size / alias-expansion / include limits aligned with the
+//!    documented threat model. Tightening the limits is a one-file edit.
 //!
 //! ## Span support
 //!
 //! Re-exports [`serde_saphyr::Spanned`], [`serde_saphyr::Location`], and
-//! [`serde_saphyr::Span`]. The Phase 16b lift carries
+//! [`serde_saphyr::Span`]. Pipeline configs carry
 //! `Vec<Spanned<PipelineNode>>` at the top level — wrapping the **whole**
 //! enum (not the inner fields) is the documented workaround for
 //! `Spanned<T>` losing location info inside `#[serde(tag = "...")]`
@@ -124,7 +123,7 @@ fn make_oversize_error(actual: usize) -> serde_saphyr::Error {
 
 /// A CXL expression source string carrying its YAML origin span.
 ///
-/// `CxlSource` is the per-CXL-string span vehicle for Phase 16b. It
+/// `CxlSource` is the per-CXL-string span vehicle. It
 /// piggybacks on [`Spanned<String>`]'s deserializer so the field captures
 /// non-zero span information whenever it appears in a normal struct
 /// context. When buried inside a `#[serde(tag = "...")]` enum variant
@@ -204,7 +203,7 @@ impl PartialEq for CxlSource {
 impl Eq for CxlSource {}
 
 // ---------------------------------------------------------------------
-// Spike + budget tests (Task 16b.0.5 hard gate)
+// Spike + budget tests
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -314,12 +313,10 @@ nodes:
 
     // ---- Spike 3a: Spanned<T> at IndexMap<String, _> value position -
     //
-    // Closes the "Key risk" noted in
-    // `docs/internal/research/RESEARCH-span-preserving-deser.md` section
-    // "Recommendation": verifies that serde-saphyr's `Spanned<T>` captures
-    // real source locations when positioned as the value of an IndexMap.
-    // This is the shape `CombineHeader.input: IndexMap<String,
-    // Spanned<NodeInput>>` relies on for E307 field-level span accuracy.
+    // Verifies that serde-saphyr's `Spanned<T>` captures real source
+    // locations when positioned as the value of an IndexMap. This is
+    // the shape `CombineHeader.input: IndexMap<String, Spanned<NodeInput>>`
+    // relies on for field-level span accuracy on combine input references.
 
     #[derive(Deserialize)]
     struct MapHolder {
@@ -498,7 +495,7 @@ nodes:
                 };
                 // Use the raw saphyr value type to confirm the bytes
                 // parse without imposing a schema (fixture shape changes
-                // are validated by Phase 16b downstream tests).
+                // are validated by downstream tests).
                 let parsed: Result<serde_json::Value, _> = from_str(&text);
                 // Either it parses, or it fails on a *schema* mismatch
                 // (which is fine here — we only care that the parser

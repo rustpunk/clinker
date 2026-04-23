@@ -21,7 +21,7 @@ fn build_symbol_table() -> clinker_core::config::composition::CompositionSymbolT
     std::sync::Arc::try_unwrap(table).unwrap_or_else(|arc| (*arc).clone())
 }
 
-// ── Gate tests for Task 16c.4.1 ─────────────────────────────────────────
+// ── Channel binding parse tests ─────────────────────────────────────────
 
 #[test]
 fn test_channel_binding_deserializes_pipeline_target() {
@@ -200,7 +200,7 @@ fn test_comp_direct_fixture_has_no_default() {
     assert!(matches!(binding.target, ChannelTarget::Composition(_)));
 }
 
-// ── Gate tests for Task 16c.4.2: Channel validation ─────────────────────
+// ── Channel validation tests ────────────────────────────────────────────
 
 #[test]
 fn test_channel_validation_emits_e105_for_undeclared_config_key() {

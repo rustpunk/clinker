@@ -19,7 +19,7 @@ fn parse_pipeline(yaml: &str) -> clinker_core::config::PipelineConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Existing scaffold tests (from 16c.2.0 + 16c.2.1)
+// Scaffold tests for composition binding.
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -89,7 +89,7 @@ fn test_pipeline_node_composition_serde_skips_body_field() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Task 16c.2.2 hard-gate tests
+// Composition-binding gate tests
 // ─────────────────────────────────────────────────────────────────────
 
 /// Gate 1: A pipeline with one composition call site, after compile(ctx),
@@ -959,7 +959,7 @@ nodes:
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Task 16c.2.3 hard-gate tests
+// E100 eradication gate tests
 // ─────────────────────────────────────────────────────────────────────
 
 /// Gate 1: No "E100" string literal anywhere in crates/.

@@ -1,4 +1,4 @@
-//! Integration tests for the `bind_schema` pass (Phase 16c.1.4).
+//! Integration tests for the `bind_schema` pass.
 //!
 //! These tests verify that:
 //! - Source rows are seeded from SchemaDecl as Row::closed

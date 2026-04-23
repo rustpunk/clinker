@@ -1,11 +1,10 @@
 /// Derives canvas-renderable stage data from a `PipelineConfig`.
 ///
-/// Phase 16b Task 16b.5: the canvas dispatches on `PipelineNode` variants
-/// directly. Every variant — Source, Transform, Aggregate, Route, Merge,
-/// Output, Composition — maps 1:1 to a [`StageKind`] via an exhaustive
-/// `match` in [`stage_kind_for_node`], so adding a new variant to
-/// `PipelineNode` is a compile-time break. Composition renders as a
-/// placeholder badge until Phase 16c supplies real rendering.
+/// The canvas dispatches on `PipelineNode` variants directly. Every variant —
+/// Source, Transform, Aggregate, Route, Merge, Output, Composition — maps 1:1
+/// to a [`StageKind`] via an exhaustive `match` in [`stage_kind_for_node`], so
+/// adding a new variant to `PipelineNode` is a compile-time break. Composition
+/// currently renders as a placeholder badge pending full sub-canvas rendering.
 use clinker_core::config::node_header::NodeInput;
 use clinker_core::config::{PipelineConfig, PipelineNode};
 
@@ -117,12 +116,11 @@ pub struct PipelineView {
     pub connections: Vec<(usize, usize)>,
 }
 
-/// Phase 16b Task 16b.5: walk `config.nodes` in declaration order and
-/// dispatch on `PipelineNode` variant to produce a [`StageView`] for every
-/// node. Connections are derived from each consumer's `input:` / `inputs:`
-/// header field. The match arms here mirror [`stage_kind_for_node`]; both
-/// are compile-time exhaustive, so adding a new `PipelineNode` variant is
-/// a build error.
+/// Walk `config.nodes` in declaration order and dispatch on `PipelineNode`
+/// variant to produce a [`StageView`] for every node. Connections are derived
+/// from each consumer's `input:` / `inputs:` header field. The match arms
+/// here mirror [`stage_kind_for_node`]; both are compile-time exhaustive, so
+/// adding a new `PipelineNode` variant is a build error.
 pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
     use std::collections::HashMap;
 
@@ -344,7 +342,7 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             id: header.name.clone(),
             label: header.name.clone(),
             kind,
-            subtitle: format!("use: {} (Phase 16c)", r#use.display()),
+            subtitle: format!("use: {}", r#use.display()),
             canvas_x: x,
             canvas_y: y,
             cxl_source: None,
@@ -634,10 +632,10 @@ mod task_16b_5_tests {
     use super::*;
     use clinker_core::config::parse_config;
 
-    /// Phase 16b Task 16b.5 gate test: compile-time exhaustiveness of the
-    /// variant dispatch. This function returns a distinct `StageKind` for
-    /// every `PipelineNode` variant; adding a new variant without updating
-    /// [`stage_kind_for_node`] is a build error.
+    /// Compile-time exhaustiveness of the variant dispatch: this function
+    /// returns a distinct `StageKind` for every `PipelineNode` variant;
+    /// adding a new variant without updating [`stage_kind_for_node`] is a
+    /// build error.
     #[test]
     fn test_canvas_node_dispatches_on_variant() {
         // Use a minimal unified-shape YAML exercising every variant so the
@@ -702,9 +700,9 @@ nodes:
         assert!(has(&StageKind::Output));
     }
 
-    /// Phase 16b Task 16b.5 gate test: a legacy-shape fixture lifted into
-    /// the unified `nodes:` topology still renders via the variant-dispatch
-    /// code path and produces the expected stage count.
+    /// A legacy-shape fixture lifted into the unified `nodes:` topology
+    /// still renders via the variant-dispatch code path and produces the
+    /// expected stage count.
     #[test]
     fn test_kiln_loads_migrated_fixture() {
         let yaml = r#"
@@ -775,9 +773,8 @@ nodes:
         assert!(!view.connections.is_empty());
     }
 
-    /// Phase 16b Task 16b.5 gate test: a pipeline containing a
-    /// `PipelineNode::Composition` stub renders it as a placeholder stage
-    /// (Phase 16c badge subtitle) without panic.
+    /// A pipeline containing a `PipelineNode::Composition` stub renders it
+    /// as a placeholder stage (badge subtitle) without panic.
     #[test]
     fn test_kiln_composition_placeholder_renders() {
         let yaml = r#"
@@ -808,8 +805,8 @@ nodes:
             .expect("composition stage present");
         assert_eq!(comp.label, "sub");
         assert!(
-            comp.subtitle.contains("Phase 16c"),
-            "placeholder subtitle should mention Phase 16c, got: {}",
+            comp.subtitle.starts_with("use: "),
+            "composition subtitle should show the `use:` path, got: {}",
             comp.subtitle
         );
         // Badge text is the authoritative kind label.

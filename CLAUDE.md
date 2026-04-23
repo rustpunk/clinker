@@ -112,6 +112,38 @@ When a change cascades to N files, touch all N. Library constraints (e.g. `serde
 
 Apply this policy to every refactor in this repo, not just the one currently in flight.
 
+### Comment policy
+
+Comments explain WHY the code is the way it is. A short WHAT is fine when
+it adds precision the signature can't express (invariants, units, streaming
+vs blocking, memory model) or orients a reader to a non-obvious idiom.
+Detailed rules plus before/after worked examples live in
+`.claude/skills/comment-style/SKILL.md`, which auto-loads on `.rs` edits.
+
+**Every public item gets a `///` summary** in third-person present
+indicative. Include `# Errors` / `# Panics` / `# Safety` when applicable.
+Module/crate `//!` blocks earn their keep only when they frame a subsystem
+— never when they restate the module path.
+
+**Banned in both source comments AND commit messages** (these are public
+on GitHub; the artifacts they point at are not):
+
+- Phase / task / wave / drill-pass labels (`Phase 16b`, `Task 16c.4.3`, `Wave 3`, `D59`, `Q7=γ`).
+- Locked-decision codes (`LD-16c-17`), RIP-LOG pointers, `hard-gate` / `drill pass` tags.
+- Paths into gitignored planning artifacts: `docs/internal/research/*`, `docs/internal/plans/*`, `RIP-LOG.md`, `LOCKED-DECISIONS.md`.
+- Deletion tombstones (global rule).
+
+**Allowed references**: stable public artifacts (RFCs, CVEs, vendor-bug
+URLs, published specs, GitHub issues on upstream crates). Cite the URL,
+not an internal ticket.
+
+**If you feel the need to cite a phase or LD code, distill the actual
+reasoning from that phase item and write *that* into the comment or
+commit message instead.** The phase label is a pointer to a real
+rationale; replace the pointer with the rationale itself. A reader on
+GitHub can then understand the change without needing access to any
+internal doc.
+
 ### Dependency policy
 
 No new crate dependency lands without maintenance verification. The verification skill at `.claude/skills/crate-vetting/SKILL.md` auto-loads on any `Cargo.toml` edit and runs the checklist (release recency, GitHub `archived` flag, open RustSec advisories, blessed-alternatives check). `cargo deny check` at pre-commit enforces `unmaintained` and `yanked` advisories mechanically.

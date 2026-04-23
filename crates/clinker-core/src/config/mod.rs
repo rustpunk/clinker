@@ -26,14 +26,14 @@ use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
 ///
-/// Phase 16b Task 16b.7: only the unified `nodes:` YAML shape parses.
-/// Legacy top-level `inputs:`/`outputs:`/`transformations:` sections are
-/// rejected by serde at deserialization time.
+/// Only the unified `nodes:` YAML shape parses. Legacy top-level
+/// `inputs:`/`outputs:`/`transformations:` sections are rejected by
+/// serde at deserialization time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
-    /// Unified pipeline node taxonomy (Phase 16b). Each node carries its
+    /// Unified pipeline node taxonomy. Each node carries its
     /// YAML source span via the [`Spanned`] outer wrap.
     #[serde(skip_serializing)]
     pub nodes: Vec<Spanned<PipelineNode>>,
@@ -106,7 +106,7 @@ pub struct SourceConfig {
     /// Distinct from the CXL-type-level `SourceBody.schema` declared
     /// at the parent `SourceBody` scope — this one points at on-disk
     /// format metadata, the other declares column CXL types for
-    /// compile-time typecheck (Phase 16b Task 16b.9).
+    /// compile-time typecheck.
     #[serde(rename = "format_schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -712,12 +712,12 @@ impl<'de> Deserialize<'de> for TransformInput {
 /// User-supplied hint for aggregation execution strategy.
 ///
 /// `Auto` (default) lets the optimizer pick Hash vs Streaming based on
-/// upstream `OrderingProvenance` and the `qualifies_for_streaming` rules
-/// (see Task 16.4.6 / 16.4.9). `Hash` and `Streaming` are user overrides
-/// modeled on Informatica's `sorted_input` flag — `Streaming` is a
-/// declared performance contract: if the input is not provably sorted
-/// for the group-by keys, the planner hard-errors at compile time
-/// rather than silently inserting a sort (D78).
+/// upstream `OrderingProvenance` and the `qualifies_for_streaming` rules.
+/// `Hash` and `Streaming` are user overrides modeled on Informatica's
+/// `sorted_input` flag — `Streaming` is a declared performance contract:
+/// if the input is not provably sorted for the group-by keys, the
+/// planner hard-errors at compile time rather than silently inserting
+/// a sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateStrategyHint {
@@ -733,8 +733,8 @@ pub enum AggregateStrategyHint {
 
 /// Configuration for GROUP BY aggregation on a transform.
 ///
-/// Research: RESEARCH-aggregate-yaml-config.md — nested block is universal ETL
-/// pattern (Beam YAML Combine, SOPE group_by, Informatica Aggregator).
+/// Nested `aggregate:` block follows the universal ETL pattern (Beam YAML
+/// Combine, SOPE `group_by`, Informatica Aggregator).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregateConfig {
@@ -827,8 +827,8 @@ pub enum LogLevel {
     Error,
 }
 
-/// Phase 16b Wave 4ab D3a — lightweight read-only view over a
-/// transform-like node (`Transform`, `Aggregate`, `Route`) yielded by
+/// Lightweight read-only view over a transform-like node
+/// (`Transform`, `Aggregate`, `Route`) yielded by
 /// [`PipelineConfig::transform_views`]. Carries the fields the Kiln IDE
 /// and schema-validation passes need; callers that need variant-specific
 /// bodies (`TransformBody`, `AggregateBody`, etc.) should walk
@@ -856,7 +856,7 @@ impl<'a> TransformView<'a> {
 }
 
 impl PipelineConfig {
-    /// Phase 16b Wave 4ab D3a — public iterator over source nodes.
+    /// Public iterator over source nodes.
     pub fn source_configs(&self) -> impl Iterator<Item = &SourceConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
             PipelineNode::Source { config: body, .. } => Some(&body.source),
@@ -864,7 +864,7 @@ impl PipelineConfig {
         })
     }
 
-    /// Phase 16b Wave 4ab D3a — public iterator over output nodes.
+    /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
             PipelineNode::Output { config: body, .. } => Some(&body.output),
@@ -982,19 +982,18 @@ impl PipelineConfig {
             .count()
     }
 
-    /// Phase 16b Wave 1: validation pre-pass over the unified `nodes:`
-    /// taxonomy. Runs the four name/topology stages in fixed order,
-    /// accumulating diagnostics:
+    /// Validation pre-pass over the unified `nodes:` taxonomy. Runs the
+    /// four name/topology stages in fixed order, accumulating diagnostics:
     ///
     ///   1. Duplicate names (`E001` exact dup, `W002` case-only dup)
     ///   2. Self-loops (`E002`)
     ///   3. General cycles (`E003` via `tarjan_scc`)
     ///   4. Path validation (delegates to `security::validate_all_config_paths`)
     ///
-    /// Stage 5 (per-variant lowering to `PlanNode`) is Wave 2 work and
-    /// is intentionally omitted here. This method returns either an
-    /// empty diagnostics vector (the unified topology is consistent)
-    /// or a populated one (caller decides whether to abort).
+    /// Stage 5 (per-variant lowering to `PlanNode`) is intentionally
+    /// omitted here. This method returns either an empty diagnostics
+    /// vector (the unified topology is consistent) or a populated one
+    /// (caller decides whether to abort).
     ///
     /// Stages run to completion and append rather than short-circuit,
     /// matching the rustc `Session::has_errors` pattern. Self-loops
@@ -1147,14 +1146,10 @@ impl PipelineConfig {
         }
 
         // ── Stage 3.5: unified input-reference resolution (E004) ────
-        // Phase 16d remediation V2 / Q7=γ: a single pass walks every
-        // node's declared input(s), looks them up in the unified
-        // node-name table, and emits E004 with a structured payload
-        // for each undeclared reference. Replaces the pre-remediation
-        // split where E300 fired here (incorrectly — E300 is the
-        // combine-arity code) for non-combine nodes and E307 fired in
-        // stage-5 Phase-2 edge wiring for combine nodes. Both old
-        // codes collapsed into E004 (see RIP-LOG; LD-16d-1).
+        // A single pass walks every node's declared input(s), looks them
+        // up in the unified node-name table, and emits E004 with a
+        // structured payload for each undeclared reference (covering
+        // both standalone-node and combine-arm references with one code).
         //
         // This pass runs BEFORE bind_schema so undeclared-input
         // diagnostics surface even when a sibling node has a CXL
@@ -1162,8 +1157,6 @@ impl PipelineConfig {
         resolve_all_input_references(&self.nodes, &mut diags);
 
         // ── Stage 4: path validation ────────────────────────────────
-        // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
-        // the legacy projection. Wave 2 walks `nodes:` directly.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let allow_absolute =
             ctx.allow_absolute_paths || std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
@@ -1236,22 +1229,15 @@ impl PipelineConfig {
         diags
     }
 
-    /// Phase 16b Wave 2 — parallel stage-5 lowering path.
+    /// Compile `self.nodes` into a [`crate::plan::CompiledPlan`].
     ///
-    /// Walks `self.nodes` (the unified `nodes:` taxonomy ONLY — legacy
-    /// `inputs:`/`outputs:`/`transformations:` are ignored here) and
-    /// builds a [`crate::plan::CompiledPlan`]. The returned plan wraps
-    /// an [`crate::plan::execution::ExecutionPlanDag`] populated with
+    /// Walks the unified `nodes:` taxonomy and builds a
+    /// [`crate::plan::CompiledPlan`] wrapping an
+    /// [`crate::plan::execution::ExecutionPlanDag`] populated with
     /// enriched [`crate::plan::execution::PlanNode`] variants whose
     /// `span` fields point back into the originating YAML document and
     /// whose `resolved` payloads carry the fully-resolved per-variant
     /// configuration.
-    ///
-    /// Wave 2 lives alongside the legacy
-    /// [`crate::plan::execution::ExecutionPlanDag::compile`] entry-point;
-    /// the executor signature is unchanged. Wave 3 cuts the executor
-    /// over to consume `&CompiledPlan` exclusively and deletes the
-    /// legacy planner.
     ///
     /// On error, returns the accumulated diagnostics from the topology
     /// pre-pass plus any per-variant lowering errors. Composition binding
@@ -1296,7 +1282,7 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        // Stage 4.4: Phase 16c.1 Task 16c.1.3 — workspace composition scan.
+        // Stage 4.4: workspace composition scan.
         // If this pipeline has any composition nodes, scan the workspace
         // root resolved in `ctx` for `.comp.yaml` signatures and append
         // any scan-level diagnostics (E101) to the compile diagnostics
@@ -1304,8 +1290,8 @@ impl PipelineConfig {
         // non-composition tests and benches are not coupled to workspace
         // fixture validity.
         //
-        // The resulting symbol table is built and dropped here — Phase 2
-        // body resolution (16c.2) will carry it forward onto CompiledPlan.
+        // The resulting symbol table is built and dropped here — body
+        // resolution carries it forward onto CompiledPlan.
         let has_compositions = self
             .nodes
             .iter()
@@ -1328,14 +1314,14 @@ impl PipelineConfig {
             indexmap::IndexMap::new()
         };
 
-        // Stage 4.5: Phase 16b Task 16b.9 — compile-time CXL typecheck.
+        // Stage 4.5: compile-time CXL typecheck.
         // Walks `self.nodes` in declaration order (topologically sound
         // per stage-3 validation), seeds each source's schema from its
         // author-declared `schema:` block, and typechecks every
         // CXL-bearing node against the propagated upstream schema.
-        // E200 diagnostics surface here with per-node spans.
-        // Phase 16c.2: also recurses into composition bodies via
-        // bind_composition, populating CompileArtifacts.composition_bodies.
+        // E200 diagnostics surface here with per-node spans. Also
+        // recurses into composition bodies via bind_composition,
+        // populating CompileArtifacts.composition_bodies.
         let artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
@@ -1361,9 +1347,9 @@ impl PipelineConfig {
         // re-compilation. Per-variant lowering gets its enrichment
         // inputs (analyzer report, window configs, dedup'd indices)
         // from the helpers below, all of which were previously only
-        // exercised by the deleted `ExecutionPlanDag::compile_with_runtime_schema`
-        // path. Phase 16d converged the two compile sites onto this
-        // one.
+        // exercised by the deleted
+        // `ExecutionPlanDag::compile_with_runtime_schema` path — the
+        // two compile sites have converged onto this one.
         let source_configs: Vec<crate::config::SourceConfig> =
             self.source_configs().cloned().collect();
         let output_configs: Vec<crate::config::OutputConfig> =
@@ -1569,10 +1555,9 @@ impl PipelineConfig {
 
         // Phase 2: wire edges from each consumer's input(s) to itself.
         // Undeclared producer references were already diagnosed by the
-        // unified `resolve_all_input_references` pass at stage 3.5
-        // (Phase 16d remediation V2 / Q7=γ). This loop only adds graph
-        // edges; missing producers are silently skipped here because
-        // the diagnostic has already fired.
+        // unified `resolve_all_input_references` pass at stage 3.5.
+        // This loop only adds graph edges; missing producers are
+        // silently skipped here because the diagnostic has already fired.
         fn strip_port_for_edge(r: &str) -> &str {
             r.split('.').next().unwrap_or(r)
         }
@@ -1635,8 +1620,7 @@ impl PipelineConfig {
 
         // Per-transform parallelism profile. Derived by walking the
         // topo order; Transform nodes contribute their `parallelism_class`,
-        // everything else is skipped (matches the legacy Path B
-        // projection at `execution.rs:1404-1413`).
+        // everything else is skipped.
         let parallelism = ParallelismProfile {
             per_transform: topo_order
                 .iter()
@@ -1778,24 +1762,17 @@ fn input_full_reference(input: &node_header::NodeInput) -> String {
     }
 }
 
-/// Phase 16d remediation V2 / Q7=γ — unified input-reference
-/// resolution pass. Walks every node's declared input(s) and emits
-/// [`Diagnostic`] code `E004` with a structured
-/// [`crate::error::DiagnosticPayload::InputRefUndeclared`] payload
-/// for each reference that doesn't resolve to a declared node name.
-///
-/// Replaces the pre-remediation split where the structural E300
-/// fired in stage-3.5 for non-combine nodes (incorrectly — E300 is
-/// the combine-arity code) and E307 fired in stage-5 Phase-2 edge
-/// wiring for combine nodes. Both old codes are collapsed into the
-/// freshly-allocated structural code E004 (logged in RIP-LOG;
-/// canonical decision in LD-16d-1).
+/// Unified input-reference resolution pass. Walks every node's
+/// declared input(s) and emits [`Diagnostic`] code `E004` with a
+/// structured [`crate::error::DiagnosticPayload::InputRefUndeclared`]
+/// payload for each reference that doesn't resolve to a declared node
+/// name — covering both standalone-node `input:` references and
+/// combine-arm per-port references with a single code.
 ///
 /// Runs BEFORE `bind_schema` so undeclared-input diagnostics surface
 /// independently of CXL errors. Per-input spans
 /// (`Spanned<NodeInput>::referenced.line()`) are preserved on the
-/// emitted diagnostic so test_combine_undeclared_input_diagnostic_has_real_span
-/// and equivalent assertions can verify span placement.
+/// emitted diagnostic so span-level assertions can verify placement.
 fn resolve_all_input_references(
     nodes: &[Spanned<PipelineNode>],
     diags: &mut Vec<crate::error::Diagnostic>,
@@ -1936,7 +1913,7 @@ pub(crate) fn lower_node_to_plan_node(
             // compile path), derive every enrichment field from the
             // analyzer report + window config + dedup'd indices. Body-node
             // callers (`bind_composition`) pass the default ctx, which
-            // collapses all of the below to the pre-16d placeholder
+            // collapses all of the below to the unified-diagnostic placeholder
             // shape — this is fine for Kiln drill-in inspection; body
             // nodes never execute through this DAG.
             let (parallelism_class, execution_reqs, window_index, partition_lookup) =
@@ -2051,13 +2028,12 @@ pub(crate) fn lower_node_to_plan_node(
                 cxl: agg_body.cxl.source.as_str().to_string(),
                 strategy: agg_body.strategy,
             };
-            // Phase 16b Task 16b.9: prefer the runtime Arrow schema
-            // when available. `typed.field_types` comes from the
-            // author-declared source schema, which may contain columns
-            // not present in the actual file; the aggregator projects
-            // records by positional index, so `group_by_indices` must
-            // resolve against the runtime layout, not the declared
-            // superset.
+            // Prefer the runtime Arrow schema when available.
+            // `typed.field_types` comes from the author-declared source
+            // schema, which may contain columns not present in the actual
+            // file; the aggregator projects records by positional index,
+            // so `group_by_indices` must resolve against the runtime
+            // layout, not the declared superset.
             let input_schema: Vec<String> = match ctx.runtime_input_schema {
                 Some(rt) => rt.to_vec(),
                 None => typed

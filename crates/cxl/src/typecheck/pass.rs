@@ -10,13 +10,13 @@ use crate::builtins::BuiltinRegistry;
 use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
 
-/// Return type inference for aggregate function calls (Phase 16).
+/// Return type inference for aggregate function calls.
 ///
 /// - `sum(Integer)` → Integer, `sum(Float)` → Float, `sum(Numeric/Any)` → Numeric
 /// - `count(...)` → Integer (always)
 /// - `avg(...)` → Float
 /// - `min(T)` / `max(T)` → T (preserving input type)
-/// - `collect(T)` → Array (Phase 16 treats it as Array; element type is erased)
+/// - `collect(T)` → Array (element type is currently erased)
 /// - `weighted_avg(_, _)` → Float
 /// - Unknown names → Any (caller emits a diagnostic via the parser lookahead set)
 fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
@@ -46,8 +46,9 @@ fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
 /// `aggregate:` YAML block and additionally enforces that bare field
 /// references outside an aggregate call appear in the `group_by` field set.
 ///
-/// Research: RESEARCH-aggregate-typecheck-context.md — PostgreSQL
-/// `parseCheckAggregates` + Spark `CheckAnalysis` pattern.
+/// Mirrors the PostgreSQL `parseCheckAggregates` / Spark `CheckAnalysis`
+/// two-mode pattern: aggregate-context typecheck is a separate pass gated by
+/// this flag.
 #[derive(Debug, Clone)]
 pub enum AggregateMode {
     /// Row-level transform. Any `Expr::AggCall` is an error.
@@ -312,8 +313,8 @@ impl<'a> TypeChecker<'a> {
                         match self.schema.lookup(name) {
                             ColumnLookup::Declared(declared) => declared.clone(),
                             ColumnLookup::PassThrough(_tail_id) => {
-                                // TODO: LD-16c-22 — upgrade to Type::PassThrough(TailVarId)
-                                // when 16c.2 needs tail identity for composition unification.
+                                // TODO: upgrade to Type::PassThrough(TailVarId)
+                                // once composition unification needs tail identity.
                                 Type::Any
                             }
                             ColumnLookup::Unknown => Type::Any, // Will be inferred from usage
@@ -786,9 +787,9 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            // D59 / Task 16.3.13a: per-record provenance fields
-            // (`pipeline.source_row` / `pipeline.source_file`) cannot appear
-            // outside an aggregate function inside an aggregate transform —
+            // Per-record provenance fields (`pipeline.source_row` /
+            // `pipeline.source_file`) cannot appear outside an aggregate
+            // function inside an aggregate transform —
             // the residual evaluator at finalize() does not have a current
             // record. Universal SQL practice (Postgres SQLSTATE 42803,
             // DuckDB binder, Trino `$row_id` scan-only, Spark functional-
@@ -1370,7 +1371,7 @@ mod tests {
         );
     }
 
-    // ── Phase 16 Task 16.2 — aggregate typecheck tests ─────────────────
+    // ── aggregate typecheck tests ──────────────────────────────────────
 
     fn agg_mode(keys: &[&str]) -> AggregateMode {
         AggregateMode::GroupBy {
@@ -1548,8 +1549,8 @@ mod tests {
         let _ = agg_ok("emit run = $pipeline.execution_id", &["dept"], &["dept"]);
     }
 
-    // D59 / Task 16.3.13a: per-record provenance fields cannot appear
-    // bare in an aggregate residual; must be wrapped in an aggregate.
+    // Per-record provenance fields cannot appear bare in an aggregate
+    // residual; must be wrapped in an aggregate.
     #[test]
     fn test_typecheck_rejects_pipeline_source_row_in_agg_residual() {
         let errs = agg_err("emit row = $pipeline.source_row", &["dept"], &["dept"]);
@@ -1761,7 +1762,7 @@ mod tests {
         assert_eq!(first_emit_expr_type(&typed), Type::Float);
     }
 
-    // ── Phase 16c.1.4 hard-gate tests — Row integration ──────────────
+    // ── Row integration tests ─────────────────────────────────────────
 
     #[test]
     fn test_cxl_type_check_accepts_row_closed() {

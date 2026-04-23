@@ -17,7 +17,7 @@
 //!
 //! - **`channel.name:`** — human-readable channel identifier.
 //! - **`channel.target:`** — path to the target pipeline or composition
-//!   (exactly one target per file, per LD-16c-4).
+//!   (each channel file declares exactly one target).
 //! - **`config.default:`** — values applied as `ChannelDefault` provenance
 //!   layer. These can be overridden by `ChannelFixed` or `InspectorEdit`.
 //! - **`config.fixed:`** — values applied as `ChannelFixed` provenance layer.
@@ -28,9 +28,9 @@
 //! `ChannelFixed` is the highest-priority override — it represents a
 //! hard-pinned value that the channel author does not want changed.
 //! `ChannelDefault` provides a fallback that can still be overridden by
-//! higher-priority layers. The provenance chain is bounded at 4 layers:
-//! `CompositionDefault → ChannelDefault → ChannelFixed → InspectorEdit`
-//! (LD-16c-8).
+//! higher-priority layers. The provenance chain is bounded at 4 layers,
+//! applied in strict precedence order (later layers win):
+//! `CompositionDefault → ChannelDefault → ChannelFixed → InspectorEdit`.
 //!
 //! ## Sealed composition internals
 //!
@@ -54,7 +54,7 @@ pub mod binding;
 pub mod error;
 pub mod overlay;
 
-// LD-009: explicit re-exports at crate root.
+// Explicit re-exports at crate root.
 pub use binding::{
     ChannelBinding, ChannelTarget, DottedPath, scan_workspace_channels, validate_channel_bindings,
 };

@@ -113,11 +113,9 @@ nodes:
 
     #[test]
     fn test_exit_code_1_config_error() {
-        // Bad YAML — required field missing.
-        // Phase 16b Wave 1: `inputs`/`outputs`/`transformations` are
-        // `#[serde(default)]` to coexist with the new `nodes:` schema,
-        // so an empty pipeline now parses. Force a real error with an
-        // unknown top-level key (`deny_unknown_fields` still applies).
+        // Bad YAML — required field missing. An empty pipeline parses,
+        // so force a real error with an unknown top-level key
+        // (`deny_unknown_fields` still applies).
         let yaml = "pipeline:\n  name: broken\nbogus: 1\n";
         let result = config::parse_config(yaml);
         assert!(result.is_err());
@@ -360,7 +358,7 @@ nodes:
     }
 
     // ══════════════════════════════════════════════════════════════
-    // Phase 12: Filter + Distinct integration tests
+    // Filter + Distinct integration tests
     // ══════════════════════════════════════════════════════════════
 
     fn filter_yaml(cxl: &str) -> String {

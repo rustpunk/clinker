@@ -5,15 +5,15 @@
 //! with scoped labels": `declared` is the required minimum; `tail` is
 //! either `Closed` (unknown columns are errors — used for Source rows with
 //! declared `SchemaDecl`) or `Open(TailVarId)` (unknown columns bind to a
-//! row variable and pass through — used at composition port boundaries per
-//! LD-16c-2 / LD-16c-21).
+//! row variable and pass through — used at composition port boundaries
+//! where the caller's extra columns must flow through unchanged).
 //!
 //! The authoritative definition lives here in the `cxl` crate because the
 //! CXL typechecker is the primary consumer (preserves the existing
 //! `clinker-core → cxl` dependency direction). `clinker-core` re-exports
 //! via `plan::row_type`.
 //!
-//! # QualifiedField (Phase Combine C.1.0)
+//! # QualifiedField
 //!
 //! `Row.declared` is keyed by `QualifiedField { qualifier, name }` rather
 //! than raw `String`. For non-combine nodes (Source / Transform /
@@ -104,7 +104,7 @@ impl From<&String> for QualifiedField {
 }
 
 /// A compile-time row type carried on every node's input/output via
-/// `BoundSchemas` (LD-16c-23).
+/// `BoundSchemas`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     /// Declared (minimum-required) columns and their types.

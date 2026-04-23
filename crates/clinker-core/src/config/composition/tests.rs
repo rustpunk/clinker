@@ -1,6 +1,5 @@
-//! Unit tests for the composition type system and Phase 1 loader.
+//! Unit tests for the composition type system and loader.
 //!
-//! 16c.1.1 tests live here; 16c.1.2 / 16c.1.4 add more as those tasks land.
 //! The integration test file `tests/composition_loader_test.rs` hosts
 //! fixture-driven tests that need on-disk `.comp.yaml` files.
 
@@ -31,7 +30,7 @@ fn dummy_signature(name: &str) -> CompositionSignature {
     }
 }
 
-/// Gate test for 16c.1.2 unlock: `CompositionSymbolTable` is keyed by
+/// Verifies `CompositionSymbolTable` is keyed by
 /// `PathBuf` and supports insert / retrieve.
 #[test]
 fn test_composition_signature_is_indexmap_keyed() {
@@ -48,7 +47,7 @@ fn test_composition_signature_is_indexmap_keyed() {
     assert_eq!(table.len(), 1);
 }
 
-/// Gate test for 16c.1.2 unlock: `ParamDecl` has a readable `required: bool`
+/// Verifies `ParamDecl` has a readable `required: bool`
 /// field. Deliberately constructs the struct with `required: true` to lock
 /// in the field name and type.
 #[test]
@@ -69,7 +68,7 @@ fn test_param_decl_required_field_present() {
 }
 
 // ---------------------------------------------------------------------
-// Task 16c.1.2 gate tests — CompositionFile deserialization
+// CompositionFile deserialization tests
 // ---------------------------------------------------------------------
 
 fn dummy_file_id() -> FileId {
@@ -240,7 +239,7 @@ nodes: []
 }
 
 // ---------------------------------------------------------------------
-// Task 16c.3.1 gate tests — Resource enum
+// Resource enum tests
 // ---------------------------------------------------------------------
 
 #[test]

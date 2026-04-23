@@ -1,4 +1,4 @@
-//! Phase 16 end-to-end integration tests for GROUP BY aggregation.
+//! End-to-end integration tests for GROUP BY aggregation.
 //!
 //! Tests full pipeline execution with aggregate transforms: YAML config parsing,
 //! CXL aggregate function evaluation, hash/streaming strategy selection, output

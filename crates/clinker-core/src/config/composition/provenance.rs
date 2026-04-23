@@ -1,4 +1,4 @@
-//! Provenance tracking for resolved configuration values (Phase 16c.3).
+//! Provenance tracking for resolved configuration values.
 //!
 //! Each config value in a compiled pipeline carries a [`ResolvedValue`] wrapper
 //! that records which configuration layer (composition default, channel default,
@@ -11,7 +11,8 @@ use std::fmt;
 
 use crate::span::Span;
 
-// D-H.5 / LD-16c-11: ProvenanceLayer must fit in 64 bytes.
+// Keep ProvenanceLayer at or under 64 bytes — the provenance side-table
+// is sized for this footprint.
 const _: () = assert!(std::mem::size_of::<ProvenanceLayer>() <= 64);
 
 /// Which configuration layer contributed a value.
@@ -45,8 +46,8 @@ impl fmt::Display for LayerKind {
 /// in a [`ResolvedValue`]'s provenance chain has `won == true`.
 #[derive(Debug, Clone)]
 pub struct ProvenanceLayer {
-    /// Source span of the value's origin in the YAML file (LD-003).
-    /// File identity resolved via `SourceDb.path(span.file)` at render time.
+    /// Source span of the value's origin in the YAML file. File identity
+    /// is resolved via `SourceDb.path(span.file)` at render time.
     pub span: Span,
     /// Which configuration layer this value came from.
     pub kind: LayerKind,
@@ -60,8 +61,7 @@ pub struct ProvenanceLayer {
 /// addition — it makes the winning layer explicit for the Kiln inspector
 /// panel without requiring the inspector to re-run priority logic.
 ///
-/// The provenance chain is bounded at 4 entries (one per [`LayerKind`])
-/// by the LD-16c-8 no-layering decision.
+/// The provenance chain is bounded at 4 entries (one per [`LayerKind`]).
 #[derive(Debug, Clone)]
 pub struct ResolvedValue<T> {
     /// The winning value after all layers have been applied.
@@ -77,7 +77,7 @@ pub struct ResolvedValue<T> {
 
 impl<T: Clone> ResolvedValue<T> {
     /// Create a new resolved value with a single provenance layer.
-    /// The initial layer is always the winner (V-7-3).
+    /// The initial layer is always the winner.
     pub fn new(value: T, kind: LayerKind, span: Span) -> Self {
         let mut layer_values = HashMap::new();
         layer_values.insert(kind, value.clone());
@@ -100,12 +100,12 @@ impl<T: Clone> ResolvedValue<T> {
     /// Apply a new layer on top. The new layer wins if its [`LayerKind`]
     /// is >= the current winner's kind (higher or equal priority wins).
     ///
-    /// Same-kind layers replace in place (V-7-4): the span is updated and
+    /// Same-kind layers replace in place: the span is updated and
     /// the value is replaced if the new layer wins.
     pub fn apply_layer(&mut self, value: T, kind: LayerKind, span: Span) {
         debug_assert!(
             self.provenance.len() <= 4,
-            "provenance chain exceeds 4-layer bound (LD-16c-8)"
+            "provenance chain exceeds 4-layer bound"
         );
 
         // Store this layer's value before any winner computation.
@@ -158,7 +158,7 @@ impl<T: Clone> ResolvedValue<T> {
 /// to avoid polluting the hot typecheck path. Only populated for
 /// `PipelineNode::Composition` nodes that have config params.
 ///
-/// Part of the `CompileOutput { plan, provenance }` separation per D-H.5 / LD-16c-11.
+/// Part of the `CompileOutput { plan, provenance }` separation.
 #[derive(Debug, Default, Clone)]
 pub struct ProvenanceDb {
     entries: HashMap<(String, String), ResolvedValue<serde_json::Value>>,

@@ -6,16 +6,16 @@
 //!
 //! ## Composition browser
 //!
-//! The workspace scanner discovers all `.comp.yaml` files (LD-16c-5) and
-//! presents them in the activity bar's composition browser. Click any
-//! composition to open it in the YAML editor or navigate to its canvas node.
+//! The workspace scanner discovers all `.comp.yaml` files and presents them
+//! in the activity bar's composition browser. Click any composition to open
+//! it in the YAML editor or navigate to its canvas node.
 //!
 //! ## Composition drill-in and breadcrumb navigation
 //!
-//! Compositions render as collapsed nodes on the parent canvas (LD-16c-9).
-//! Clicking a composition node descends into a sub-canvas showing the
-//! composition body. A breadcrumb bar at the top tracks the navigation stack
-//! and allows jumping back to any ancestor level.
+//! Compositions render as collapsed nodes on the parent canvas. Clicking a
+//! composition node descends into a sub-canvas showing the composition body.
+//! A breadcrumb bar at the top tracks the navigation stack and allows
+//! jumping back to any ancestor level.
 //!
 //! ## Channel loading and Raw/Resolved toggle
 //!

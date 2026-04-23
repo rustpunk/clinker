@@ -1,5 +1,4 @@
-//! Task 16b.8 — CLI integration gate test for miette-rendered
-//! diagnostics.
+//! CLI integration test for miette-rendered pipeline errors.
 //!
 //! The `clinker run <bad.yaml>` path must surface errors via the
 //! miette graphical reporter with the source file attached. This
@@ -68,8 +67,8 @@ fn test_diagnostic_renders_via_miette_in_cli() {
 
 #[test]
 fn test_explain_cxl_type_error_renders_via_miette() {
-    // Task 16b.9: compile-time CXL typecheck must surface through the
-    // `--explain` path as well. A transform that references an unknown
+    // Compile-time CXL typecheck must surface through the `--explain`
+    // path as well. A transform that references an unknown
     // column against the declared schema is rejected at compile() time,
     // BEFORE any file on disk is read. The resulting diagnostic must
     // render via miette with the config filename in the header.

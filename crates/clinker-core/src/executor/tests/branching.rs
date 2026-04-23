@@ -1,4 +1,4 @@
-//! Branch execution tests for Phase 15.
+//! Branch execution tests.
 //!
 //! Tests in this module exercise the DAG executor's branch dispatch,
 //! merge semantics, record conservation, and per-node execution strategy.
@@ -289,7 +289,7 @@ nodes:
     // id=1 (200): matches over_50 AND over_100 -> 2 writes
     // id=2 (50): matches nothing -> default (low) -> 1 write
     // id=3 (75): matches over_50 only -> 1 write
-    // Phase 16d / LD-16d-1 dual counters:
+    // Dual counters:
     //   ok_count = 3 (3 distinct input records all reached at least one Output)
     //   records_written = 4 (id=1 fans out to 2 sinks, others to 1 each)
     assert_eq!(
@@ -998,7 +998,7 @@ nodes:
     let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
 
     // id=1 matches both branches (inclusive) -> 2 writes from 1 input record.
-    // Per LD-16d-1 dual counters:
+    // Dual counters:
     //   ok_count = 1 (one distinct input reached at least one Output)
     //   records_written = 2 (one write per branch reached)
     assert_eq!(
