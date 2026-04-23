@@ -112,6 +112,8 @@ When a change cascades to N files, touch all N. Library constraints (e.g. `serde
 
 Apply this policy to every refactor in this repo, not just the one currently in flight.
 
+Concrete shortcut signatures — the patterns this policy forbids and the architecturally correct alternative for each — live in `.claude/policies/architectural-rigor.md`. That file is the single source of truth read by the `audit-shortcuts` skill, the `shortcut-auditor` subagent, and the PreToolUse pre-commit hook.
+
 ### Comment policy
 
 Comments explain WHY the code is the way it is. A short WHAT is fine when
