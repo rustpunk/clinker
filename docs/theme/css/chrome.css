@@ -122,7 +122,7 @@ html:not(.js) .left-buttons button {
     font-family: "Rajdhani", sans-serif;
 }
 .blueprint .menu-title {
-    font-family: "Share Tech Mono", monospace;
+    font-family: "Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
     font-weight: 400;
     letter-spacing: 0.15em;
 }
@@ -486,7 +486,7 @@ ul#mdbook-searchresults span.teaser em {
 }
 .blueprint .sidebar,
 .blueprint .sidebar-iframe-inner {
-    font-family: "Share Tech Mono", monospace;
+    font-family: "Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
     letter-spacing: 0.02em;
 }
 .sidebar-iframe-outer {
