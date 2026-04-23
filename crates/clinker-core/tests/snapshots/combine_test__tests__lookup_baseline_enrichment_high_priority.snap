@@ -2,7 +2,7 @@
 source: crates/clinker-core/tests/combine_test.rs
 expression: canonicalize_csv(high)
 ---
-order_id,product_code,quantity,product_name,priority,f0,f1,f2,f3
-1,PROD-A,10,Widget,priority,1,PROD-A,10,priority
-2,PROD-B,5,Gadget,normal,2,PROD-B,5,normal
-4,PROD-A,3,Widget,low,4,PROD-A,3,low
+f0,f1,f2,f3,order_id,product_code,quantity,product_name,priority
+1,PROD-A,10,priority,1,PROD-A,10,Widget,priority
+2,PROD-B,5,normal,2,PROD-B,5,Gadget,normal
+4,PROD-A,3,low,4,PROD-A,3,Widget,low

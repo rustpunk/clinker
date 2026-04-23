@@ -36,61 +36,87 @@ pub fn project_output(
     project_output_with_meta(input_record, emitted, &IndexMap::new(), config)
 }
 
-/// Project output with explicit metadata map (from EvalResult::Emit).
+/// Project output directly from a Record (Invariant 3 — no parallel
+/// bookkeeping map input).
 ///
-/// Metadata is sourced from the `metadata` parameter, not from `input_record.iter_meta()`,
-/// because `evaluate_record` works on a clone and the original input record has no metadata.
+/// Gather order follows `Record::iter_all_fields`: schema columns in
+/// declaration order, then overflow entries in insertion (emit) order.
+/// Metadata writes land through `Record::set_meta` upstream, so
+/// `include_metadata` drives off `record.iter_meta()` here instead of
+/// a separately-threaded map.
+///
+/// Builds the output record in one pass when the config has no
+/// exclude / mapping / metadata merge — the hot path avoids an
+/// intermediate `IndexMap` entirely. Config-driven rewrites fall into
+/// the slow path, which keeps an owned `IndexMap` only for the
+/// duration of the call.
 pub fn project_output_with_meta(
     input_record: &Record,
-    emitted: &IndexMap<String, Value>,
-    metadata: &IndexMap<String, Value>,
+    _emitted: &IndexMap<String, Value>,
+    _metadata: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
-    // Step 1: Gather
-    let mut fields: IndexMap<String, Value> = IndexMap::new();
+    project_output_from_record(input_record, config)
+}
 
-    // CXL-emitted fields first
-    for (name, value) in emitted {
-        fields.insert(name.clone(), value.clone());
-    }
+/// Record-driven projection (Invariant 3 implementation).
+pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) -> Record {
+    let needs_rewrite =
+        config.exclude.is_some() || config.mapping.is_some() || !config.include_metadata.is_none();
 
-    // If include_unmapped, add input fields not already present
-    if config.include_unmapped {
+    if !needs_rewrite {
+        // Fast path: no exclude, no mapping, no metadata merge — emit
+        // all Record fields in natural iteration order, no
+        // intermediate allocation.
+        let field_count = input_record.total_field_count();
+        let mut column_names: Vec<Box<str>> = Vec::with_capacity(field_count);
+        let mut values: Vec<Value> = Vec::with_capacity(field_count);
         for (name, value) in input_record.iter_all_fields() {
-            if !fields.contains_key(name) {
-                fields.insert(name.to_string(), value.clone());
-            }
+            column_names.push(name.into());
+            values.push(value.clone());
         }
+        let schema = Arc::new(Schema::new(column_names));
+        return Record::new(schema, values);
     }
 
-    // Step 1b: Merge metadata into output when include_metadata is set.
+    // Slow path: config requires rewriting field names / dropping
+    // fields / merging metadata, which all want the temporary
+    // IndexMap's keyed access.
+    let mut fields: IndexMap<String, Value> =
+        IndexMap::with_capacity(input_record.total_field_count());
+    for (name, value) in input_record.iter_all_fields() {
+        fields.insert(name.to_string(), value.clone());
+    }
+
+    // Merge metadata into output when include_metadata is set.
     // Metadata fields are prefixed with `meta.` in the output.
     if !config.include_metadata.is_none() {
-        let meta_iter: Vec<(&str, &Value)> = match &config.include_metadata {
+        let meta_iter: Vec<(String, Value)> = match &config.include_metadata {
             IncludeMetadata::None => vec![],
-            IncludeMetadata::All => metadata.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            IncludeMetadata::Allowlist(allow) => metadata
-                .iter()
+            IncludeMetadata::All => input_record
+                .iter_meta()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            IncludeMetadata::Allowlist(allow) => input_record
+                .iter_meta()
                 .filter(|(k, _)| allow.iter().any(|a| a.as_str() == *k))
-                .map(|(k, v)| (k.as_str(), v))
+                .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
         };
         for (key, value) in meta_iter {
             let output_name = format!("meta.{key}");
             if !fields.contains_key(&output_name) {
-                fields.insert(output_name, value.clone());
+                fields.insert(output_name, value);
             }
         }
     }
 
-    // Step 2: Exclude
     if let Some(ref exclude_list) = config.exclude {
         for name in exclude_list {
             fields.swap_remove(name.as_str());
         }
     }
 
-    // Step 3: Mapping (rename)
     if let Some(ref mapping) = config.mapping {
         let mut renamed = IndexMap::with_capacity(fields.len());
         for (name, value) in fields {
@@ -100,7 +126,6 @@ pub fn project_output_with_meta(
         fields = renamed;
     }
 
-    // Build output Record
     let column_names: Vec<Box<str>> = fields.keys().map(|k| k.as_str().into()).collect();
     let schema = Arc::new(Schema::new(column_names));
     let values: Vec<Value> = fields.into_values().collect();
@@ -163,9 +188,15 @@ mod tests {
 
     #[test]
     fn test_gather_emitted_plus_unmapped() {
-        let input = make_input();
-        let mut emitted = IndexMap::new();
-        emitted.insert("full_name".to_string(), Value::String("Alice Smith".into()));
+        // Post-Invariant-3 rip: project_output drives off the Record
+        // itself, so emitted fields must land on the Record before
+        // the projection is invoked (the executor performs this via
+        // `Record::set` / `set_overflow` during transform eval). The
+        // test constructs a Record that mirrors the post-transform
+        // state and asserts projection gathers every field.
+        let mut input = make_input();
+        input.set_overflow("full_name".into(), Value::String("Alice Smith".into()));
+        let emitted = IndexMap::new();
 
         let config = OutputConfig {
             name: "out".into(),

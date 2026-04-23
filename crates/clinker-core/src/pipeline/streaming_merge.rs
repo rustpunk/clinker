@@ -21,8 +21,7 @@
 //! without copying. This is the DataFusion `GroupValuesFullyOrdered`
 //! (PR #9662) + Polars streaming sorted group-by pattern.
 
-use clinker_record::{Record, Value, accumulator::AccumulatorEnum};
-use indexmap::IndexMap;
+use clinker_record::{Record, accumulator::AccumulatorEnum};
 
 use crate::aggregation::{AggregatorGroupState, HashAggError, SortRow};
 use crate::pipeline::sort_key::SortKeyEncoder;
@@ -94,11 +93,10 @@ impl GroupBoundary {
     /// record. On a key boundary the previous group is finalized via
     /// `finalize` and pushed into `out`.
     ///
-    /// `sidecar` — `(row_num, emitted, accumulated)` — is the executor's
-    /// per-record metadata. For the streaming-raw path it comes from the
-    /// input record's SortRow; for the spill-recovery path the sidecars
-    /// were lost at spill time and the caller supplies identity values
-    /// (`0`, empty, empty).
+    /// `row_num` is the incoming record's row number; the boundary
+    /// tracks the minimum across all records folded into a group so
+    /// downstream sort-stable operators preserve the earliest input
+    /// row's position.
     ///
     /// **Sort-order verification is always on in release builds (Task
     /// 16.4.5).** The `Ordering::Less` arm below uses an unconditional
@@ -111,9 +109,9 @@ impl GroupBoundary {
     /// always-on contract is free in steady state.
     pub(crate) fn push<F>(
         &mut self,
-        state: AggregatorGroupState,
+        mut state: AggregatorGroupState,
         record: Record,
-        sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
+        row_num: u64,
         finalize: &F,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError>
@@ -122,11 +120,13 @@ impl GroupBoundary {
     {
         use std::cmp::Ordering;
 
+        if row_num < state.min_row_num {
+            state.min_row_num = row_num;
+        }
+
         if self.open_state.is_none() {
             // First record — install as the open group and swap buffers.
-            let mut new_state = state;
-            seed_sidecars(&mut new_state, sidecar);
-            self.open_state = Some(new_state);
+            self.open_state = Some(state);
             self.open_record = Some(record);
             std::mem::swap(&mut self.last, &mut self.current);
             self.current.clear();
@@ -141,7 +141,6 @@ impl GroupBoundary {
                     AccumulatorEnum::merge(a, b);
                 }
                 let mut src = state;
-                seed_sidecars(&mut src, sidecar);
                 src.row.clear(); // already merged above
                 crate::aggregation::merge_group_sidecars(cur_state, src);
                 self.current.clear();
@@ -156,28 +155,15 @@ impl GroupBoundary {
                     .take()
                     .expect("open_record must be Some whenever open_state is Some");
                 let out_record = finalize(&prev_record, &prev_state)?;
-                let row_num = if prev_state.min_row_num == u64::MAX {
+                let prev_row_num = if prev_state.min_row_num == u64::MAX {
                     0
                 } else {
                     prev_state.min_row_num
                 };
-                // Emit post-aggregate record fields, not the upstream
-                // transform's common_emitted (which leaks pre-aggregation
-                // columns via include_unmapped). See
-                // `HashAggregator::finalize` for the rationale.
-                let emitted: IndexMap<String, Value> = out_record
-                    .schema()
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.to_string(), out_record.values()[i].clone()))
-                    .collect();
-                out.push((out_record, row_num, emitted, IndexMap::new()));
+                out.push((out_record, prev_row_num));
 
                 // Install the new open group.
-                let mut new_state = state;
-                seed_sidecars(&mut new_state, sidecar);
-                self.open_state = Some(new_state);
+                self.open_state = Some(state);
                 self.open_record = Some(record);
                 std::mem::swap(&mut self.last, &mut self.current);
                 self.current.clear();
@@ -221,34 +207,9 @@ impl GroupBoundary {
             } else {
                 state.min_row_num
             };
-            // See the boundary-emit site above for rationale.
-            let emitted: IndexMap<String, Value> = out_record
-                .schema()
-                .columns()
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.to_string(), out_record.values()[i].clone()))
-                .collect();
-            out.push((out_record, row_num, emitted, IndexMap::new()));
+            out.push((out_record, row_num));
         }
         Ok(())
-    }
-}
-
-fn seed_sidecars(
-    state: &mut AggregatorGroupState,
-    sidecar: (u64, IndexMap<String, Value>, IndexMap<String, Value>),
-) {
-    if state.min_row_num == u64::MAX {
-        state.min_row_num = sidecar.0;
-    }
-    if state.common_emitted.is_none() && !sidecar.1.is_empty() {
-        state.common_emitted = Some(sidecar.1);
-    } else if state.common_emitted.is_none() {
-        state.common_emitted = Some(IndexMap::new());
-    }
-    if state.union_accumulated.is_empty() {
-        state.union_accumulated = sidecar.2;
     }
 }
 

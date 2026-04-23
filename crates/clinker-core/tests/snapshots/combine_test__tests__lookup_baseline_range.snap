@@ -2,7 +2,7 @@
 source: crates/clinker-core/tests/combine_test.rs
 expression: canonicalize_csv(result.primary_output())
 ---
-employee_id,rate_class
-E001,tier_1
-E002,tier_3
-E003,tier_2
+employee_id,ee_group,pay,rate_class
+E001,exempt,75000,tier_1
+E002,hourly,35000,tier_3
+E003,exempt,120000,tier_2

@@ -20,7 +20,7 @@ use crate::pipeline::memory::{MemoryBudget, rss_bytes};
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
 use crate::plan::execution::{ExecutionPlanDag, ParallelismClass, PlanNode};
-use crate::projection::{project_output, project_output_with_meta};
+use crate::projection::{project_output, project_output_from_record, project_output_with_meta};
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
@@ -313,34 +313,27 @@ struct CompiledRoute {
 }
 
 impl CompiledRoute {
-    /// Evaluate route conditions against emitted fields.
+    /// Evaluate route conditions against the authoritative Record.
     ///
     /// Returns the list of output names the record should be dispatched to.
     /// In Exclusive mode: first matching branch (or default).
     /// In Inclusive mode: all matching branches (or default if none match).
+    ///
+    /// Branch predicates resolve field references through the Record's
+    /// own [`FieldResolver`] impl — schema + overflow for bare names,
+    /// `$meta.*` prefix stripping for per-record metadata. No parallel
+    /// bookkeeping map is required (Invariant 3).
     fn evaluate(
         &mut self,
-        emitted: &IndexMap<String, Value>,
-        metadata: &IndexMap<String, Value>,
+        record: &Record,
         ctx: &EvalContext,
     ) -> Result<Vec<String>, cxl::eval::EvalError> {
-        // Convert emitted IndexMap to HashMap for HashMapResolver.
-        // Include $meta.* entries so route conditions can reference metadata.
-        let mut hash_fields: HashMap<String, Value> = emitted
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (key, value) in metadata {
-            hash_fields.insert(format!("$meta.{key}"), value.clone());
-        }
-        let resolver = clinker_record::HashMapResolver::new(hash_fields);
-
         match self.mode {
             crate::config::RouteMode::Exclusive => {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
-                        .eval_record::<NullStorage>(ctx, &resolver, None)?
+                        .eval_record::<NullStorage>(ctx, record, None)?
                     {
                         EvalResult::Emit { .. } => return Ok(vec![branch.name.clone()]),
                         EvalResult::Skip(_) => continue,
@@ -353,7 +346,7 @@ impl CompiledRoute {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
-                        .eval_record::<NullStorage>(ctx, &resolver, None)?
+                        .eval_record::<NullStorage>(ctx, record, None)?
                     {
                         EvalResult::Emit { .. } => matched.push(branch.name.clone()),
                         EvalResult::Skip(_) => {}
@@ -902,7 +895,14 @@ impl PipelineExecutor {
                     first_failure_message = Some(eval_err.to_string());
                 }
             }
-            results.push((record, rn, result));
+            // Preserve the mutated record from a successful evaluation
+            // so the downstream projection sees every emit and
+            // `$meta.*` write the Record already carries.
+            let (out_record, flat_result) = match result {
+                Ok((rec, res)) => (rec, Ok(res)),
+                Err(e) => (record, Err(e)),
+            };
+            results.push((out_record, rn, flat_result));
         }
 
         if any_failed {
@@ -943,7 +943,7 @@ impl PipelineExecutor {
                                 source_file: &source_file_arc,
                                 source_row: rn,
                             };
-                            match route.evaluate(&emitted, &metadata, &ctx) {
+                            match route.evaluate(&record, &ctx) {
                                 Ok(targets) => {
                                     for target in &targets {
                                         let out_cfg = output_configs
@@ -1059,7 +1059,14 @@ impl PipelineExecutor {
                     first_failure_message = Some(eval_err.to_string());
                 }
             }
-            results.push((record, rn, result));
+            // Preserve the mutated record from a successful evaluation
+            // so the downstream projection sees every emit and
+            // `$meta.*` write the Record already carries.
+            let (out_record, flat_result) = match result {
+                Ok((rec, res)) => (rec, Ok(res)),
+                Err(e) => (record, Err(e)),
+            };
+            results.push((out_record, rn, flat_result));
         }
 
         if any_failed {
@@ -1128,7 +1135,7 @@ impl PipelineExecutor {
         row_num: u64,
     ) {
         if let Some(route) = compiled_route {
-            match route.evaluate(emitted, metadata, ctx) {
+            match route.evaluate(record, ctx) {
                 Ok(targets) => {
                     for target in &targets {
                         let out_cfg = output_configs
@@ -1350,20 +1357,23 @@ impl PipelineExecutor {
                 );
                 counters.total_count += 1;
                 match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
-                        first_emitted = Some((record, emitted, metadata));
+                    Ok((
+                        mutated,
+                        EvalResult::Emit {
+                            fields: emitted,
+                            metadata,
+                        },
+                    )) => {
+                        first_emitted = Some((mutated, emitted, metadata));
                         first_emit_pos = Some(pos);
                         counters.ok_count += 1;
                         counters.records_written += 1;
                         break;
                     }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                    Ok((_, EvalResult::Skip(SkipReason::Filtered))) => {
                         counters.filtered_count += 1;
                     }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                    Ok((_, EvalResult::Skip(SkipReason::Duplicate))) => {
                         counters.distinct_count += 1;
                     }
                     Err((transform_name, eval_err)) => {
@@ -1419,16 +1429,24 @@ impl PipelineExecutor {
                                         source_row: *pos as u64 + 1,
                                     };
                                     let mut local_evals = build_evaluators(transforms);
-                                    *result = Some(evaluate_record_with_window(
-                                        record,
-                                        &transform_names,
-                                        &mut local_evals,
-                                        &ctx,
-                                        plan,
-                                        &arena,
-                                        &indices,
-                                        *pos,
-                                    ));
+                                    *result = Some(
+                                        evaluate_record_with_window(
+                                            record,
+                                            &transform_names,
+                                            &mut local_evals,
+                                            &ctx,
+                                            plan,
+                                            &arena,
+                                            &indices,
+                                            *pos,
+                                        )
+                                        .map(
+                                            |(mutated, res)| {
+                                                *record = mutated;
+                                                res
+                                            },
+                                        ),
+                                    );
                                     timers.transform_eval += start.elapsed();
                                     timers
                                 },
@@ -1445,16 +1463,22 @@ impl PipelineExecutor {
                             source_file: &source_file_arc,
                             source_row: *pos as u64 + 1,
                         };
-                        *result = Some(evaluate_record_with_window(
-                            record,
-                            &transform_names,
-                            evaluators,
-                            &ctx,
-                            plan,
-                            &arena,
-                            &indices,
-                            *pos,
-                        ));
+                        *result = Some(
+                            evaluate_record_with_window(
+                                record,
+                                &transform_names,
+                                evaluators,
+                                &ctx,
+                                plan,
+                                &arena,
+                                &indices,
+                                *pos,
+                            )
+                            .map(|(mutated, res)| {
+                                *record = mutated;
+                                res
+                            }),
+                        );
                         elapsed += start.elapsed();
                     }
                     elapsed
@@ -1479,7 +1503,7 @@ impl PipelineExecutor {
                         source_file: &source_file_arc,
                         source_row: first_emit_pos.unwrap() as u64 + 1,
                     };
-                    match route.evaluate(&emitted, &metadata, &ctx) {
+                    match route.evaluate(&record, &ctx) {
                         Ok(targets) => {
                             let mut per_output_batches: HashMap<String, Vec<Record>> =
                                 HashMap::new();
@@ -1555,7 +1579,7 @@ impl PipelineExecutor {
                                 };
                                 let route_result = {
                                     let _guard = route_timer.guard();
-                                    route.evaluate(emitted, metadata, &ctx)
+                                    route.evaluate(record, &ctx)
                                 };
                                 match route_result {
                                     Ok(targets) => {
@@ -1885,11 +1909,14 @@ impl PipelineExecutor {
                     source_file: &source_file_arc,
                     source_row: *rn,
                 };
-                if let Ok(EvalResult::Emit {
-                    fields: emitted, ..
-                }) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
+                if let Ok((
+                    mutated,
+                    EvalResult::Emit {
+                        fields: emitted, ..
+                    },
+                )) = evaluate_record(record, &transform_names, &mut evaluators, &ctx)
                 {
-                    let projected = project_output(record, &emitted, primary_output);
+                    let projected = project_output(&mutated, &emitted, primary_output);
                     first_emitted_schema = Some(Arc::clone(projected.schema()));
                     break;
                 }
@@ -1944,15 +1971,18 @@ impl PipelineExecutor {
                             evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
                         };
                         match result {
-                            Ok(EvalResult::Emit {
-                                fields: emitted,
-                                metadata,
-                            }) => {
+                            Ok((
+                                mutated,
+                                EvalResult::Emit {
+                                    fields: emitted,
+                                    metadata,
+                                },
+                            )) => {
                                 {
                                     let _guard = route_timer.guard();
                                     let _guard2 = projection_timer.guard();
                                     Self::dispatch_to_outputs(
-                                        &record,
+                                        &mutated,
                                         &emitted,
                                         &metadata,
                                         config,
@@ -1969,10 +1999,10 @@ impl PipelineExecutor {
                                 }
                                 records_emitted += 1;
                             }
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                            Ok((_, EvalResult::Skip(SkipReason::Filtered))) => {
                                 counters.filtered_count += 1;
                             }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                            Ok((_, EvalResult::Skip(SkipReason::Duplicate))) => {
                                 counters.distinct_count += 1;
                             }
                             Err((transform_name, eval_err)) => {
@@ -2143,12 +2173,15 @@ impl PipelineExecutor {
                             evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
                         };
                         match result {
-                            Ok(EvalResult::Emit {
-                                fields: emitted, ..
-                            }) => {
+                            Ok((
+                                mutated,
+                                EvalResult::Emit {
+                                    fields: emitted, ..
+                                },
+                            )) => {
                                 let projected = {
                                     let _guard = projection_timer.guard();
-                                    project_output(&record, &emitted, primary_output)
+                                    project_output(&mutated, &emitted, primary_output)
                                 };
                                 {
                                     let _guard = write_timer.guard();
@@ -2158,10 +2191,10 @@ impl PipelineExecutor {
                                 counters.records_written += 1;
                                 records_emitted += 1;
                             }
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                            Ok((_, EvalResult::Skip(SkipReason::Filtered))) => {
                                 counters.filtered_count += 1;
                             }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                            Ok((_, EvalResult::Skip(SkipReason::Duplicate))) => {
                                 counters.distinct_count += 1;
                             }
                             Err((transform_name, eval_err)) => {
@@ -2317,22 +2350,25 @@ impl PipelineExecutor {
                 source_row: *rn,
             };
             let result = evaluate_record(record, &transform_names, &mut evaluators, &ctx);
-            match &result {
-                Ok(EvalResult::Emit {
-                    fields: emitted,
-                    metadata,
-                }) => {
+            match result {
+                Ok((
+                    mutated,
+                    EvalResult::Emit {
+                        fields: emitted,
+                        metadata,
+                    },
+                )) => {
                     counters.ok_count += 1;
                     counters.records_written += 1;
-                    first_emitted = Some((record.clone(), emitted.clone(), metadata.clone()));
+                    first_emitted = Some((mutated, emitted, metadata));
                     break;
                 }
-                Ok(EvalResult::Skip(_)) => {
+                Ok((_, skip @ EvalResult::Skip(_))) => {
                     // All results are Skips — defer (counters updated in pending processing)
-                    pending_skips_and_errors.push((*rn, record.clone(), result));
+                    pending_skips_and_errors.push((*rn, record.clone(), Ok(skip)));
                 }
-                Err(_) => {
-                    pending_skips_and_errors.push((*rn, record.clone(), result));
+                Err(e) => {
+                    pending_skips_and_errors.push((*rn, record.clone(), Err(e)));
                 }
             }
         }
@@ -2395,7 +2431,7 @@ impl PipelineExecutor {
                     source_row: 1,
                 };
                 let mut per_output_batches: HashMap<String, Vec<Record>> = HashMap::new();
-                match route.evaluate(emitted, metadata, &ctx) {
+                match route.evaluate(record, &ctx) {
                     Ok(targets) => {
                         for target in &targets {
                             let out_cfg = output_configs
@@ -2452,13 +2488,16 @@ impl PipelineExecutor {
                     evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
                 };
                 match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
+                    Ok((
+                        mutated,
+                        EvalResult::Emit {
+                            fields: emitted,
+                            metadata,
+                        },
+                    )) => {
                         let route_result = {
                             let _guard = route_timer.guard();
-                            route.evaluate(&emitted, &metadata, &ctx)
+                            route.evaluate(&mutated, &ctx)
                         };
                         match route_result {
                             Ok(targets) => {
@@ -2470,7 +2509,7 @@ impl PipelineExecutor {
                                     let projected = {
                                         let _guard = projection_timer.guard();
                                         project_output_with_meta(
-                                            &record, &emitted, &metadata, out_cfg,
+                                            &mutated, &emitted, &metadata, out_cfg,
                                         )
                                     };
                                     per_output_batches
@@ -2492,7 +2531,7 @@ impl PipelineExecutor {
                                     source_row: rn,
                                     category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
                                     error_message: route_err.to_string(),
-                                    original_record: record.clone(),
+                                    original_record: mutated.clone(),
                                     stage: Some(DlqEntry::stage_route_eval()),
                                     route: None,
                                     trigger: true,
@@ -2500,10 +2539,10 @@ impl PipelineExecutor {
                             }
                         }
                     }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                    Ok((_, EvalResult::Skip(SkipReason::Filtered))) => {
                         counters.filtered_count += 1;
                     }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                    Ok((_, EvalResult::Skip(SkipReason::Duplicate))) => {
                         counters.distinct_count += 1;
                     }
                     Err((transform_name, eval_err)) => {
@@ -2623,13 +2662,16 @@ impl PipelineExecutor {
                     evaluate_record(&record, &transform_names, &mut evaluators, &ctx)
                 };
                 match result {
-                    Ok(EvalResult::Emit {
-                        fields: emitted,
-                        metadata,
-                    }) => {
+                    Ok((
+                        mutated,
+                        EvalResult::Emit {
+                            fields: emitted,
+                            metadata,
+                        },
+                    )) => {
                         let projected = {
                             let _guard = projection_timer.guard();
-                            project_output_with_meta(&record, &emitted, &metadata, output)
+                            project_output_with_meta(&mutated, &emitted, &metadata, output)
                         };
                         {
                             let _guard = write_timer.guard();
@@ -2639,10 +2681,10 @@ impl PipelineExecutor {
                         counters.records_written += 1;
                         records_emitted += 1;
                     }
-                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                    Ok((_, EvalResult::Skip(SkipReason::Filtered))) => {
                         counters.filtered_count += 1;
                     }
-                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                    Ok((_, EvalResult::Skip(SkipReason::Duplicate))) => {
                         counters.distinct_count += 1;
                     }
                     Err((transform_name, eval_err)) => {
@@ -2766,17 +2808,12 @@ impl PipelineExecutor {
             .collect();
 
         // Inter-node buffers: each node produces records into its buffer.
-        // Records are (Record, row_number, accumulated_emitted, accumulated_metadata).
-        #[allow(clippy::type_complexity)]
-        let mut node_buffers: HashMap<
-            NodeIndex,
-            Vec<(
-                Record,
-                u64,
-                IndexMap<String, Value>,
-                IndexMap<String, Value>,
-            )>,
-        > = HashMap::new();
+        // Each row is `(Record, row_number)` — the Record is authoritative
+        // (emitted fields via `Record::set` / `set_overflow`, `$meta.*`
+        // via `set_meta`). Downstream nodes resolve field references
+        // against the Record directly (Invariant 3 — no parallel
+        // bookkeeping threading).
+        let mut node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>> = HashMap::new();
 
         // Walk DAG in topological order
         for &node_idx in &plan.topo_order {
@@ -2788,15 +2825,9 @@ impl PipelineExecutor {
                     // primary driving reader's stream.
                     let records: Vec<_> =
                         if let Some(src_recs) = combine_source_records.get(name.as_str()) {
-                            src_recs
-                                .iter()
-                                .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
-                                .collect()
+                            src_recs.iter().map(|(r, rn)| (r.clone(), *rn)).collect()
                         } else {
-                            all_records
-                                .iter()
-                                .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
-                                .collect()
+                            all_records.iter().map(|(r, rn)| (r.clone(), *rn)).collect()
                         };
                     node_buffers.insert(node_idx, records);
                 }
@@ -2838,7 +2869,7 @@ impl PipelineExecutor {
 
                     let mut output_records = Vec::with_capacity(input_records.len());
 
-                    for (record, rn, mut all_emitted, mut all_metadata) in input_records {
+                    for (record, rn) in input_records {
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
@@ -2850,15 +2881,8 @@ impl PipelineExecutor {
                             evaluate_single_transform(&record, name, &mut evaluator, &ctx)
                         };
                         match eval_result {
-                            Ok((modified_record, Ok((emitted, metadata)))) => {
-                                all_emitted.extend(emitted);
-                                all_metadata.extend(metadata);
-                                output_records.push((
-                                    modified_record,
-                                    rn,
-                                    all_emitted,
-                                    all_metadata,
-                                ));
+                            Ok((modified_record, Ok(()))) => {
+                                output_records.push((modified_record, rn));
                             }
                             Ok((_record, Err(SkipReason::Filtered))) => {
                                 counters.filtered_count += 1;
@@ -2976,7 +3000,7 @@ impl PipelineExecutor {
 
                     // Use compiled_route to evaluate conditions
                     if let Some(ref mut route) = compiled_route {
-                        for (record, rn, all_emitted, all_metadata) in input_records {
+                        for (record, rn) in input_records {
                             let ctx = EvalContext {
                                 stable: &stable,
                                 source_file: &source_file_arc,
@@ -2985,18 +3009,16 @@ impl PipelineExecutor {
 
                             let route_result = {
                                 let _guard = route_timer.guard();
-                                route.evaluate(&all_emitted, &all_metadata, &ctx)
+                                route.evaluate(&record, &ctx)
                             };
                             match route_result {
                                 Ok(targets) => {
                                     for target in &targets {
                                         if let Some(&succ) = branch_to_succ.get(target.as_str()) {
-                                            branch_buffers.entry(succ).or_default().push((
-                                                record.clone(),
-                                                rn,
-                                                all_emitted.clone(),
-                                                all_metadata.clone(),
-                                            ));
+                                            branch_buffers
+                                                .entry(succ)
+                                                .or_default()
+                                                .push((record.clone(), rn));
                                         }
                                         // Exclusive mode: stop after first match
                                         if mode == crate::config::RouteMode::Exclusive {
@@ -3093,19 +3115,12 @@ impl PipelineExecutor {
                     ref sort_fields,
                     ..
                 } => {
-                    // Enforcer-sort dispatch. Reuses the generalized
-                    // `SortBuffer<P>` carrying per-record sidecar (row_num
-                    // + emitted/accumulated metadata maps) through the
-                    // sort permutation.
+                    // Enforcer-sort dispatch. Carries `row_num` through
+                    // the sort permutation as the `SortBuffer<u64>`
+                    // payload — the Record itself carries every field
+                    // value, emitted content, and metadata, so no
+                    // parallel bookkeeping map rides alongside.
                     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-
-                    type SortPayload = (u64, IndexMap<String, Value>, IndexMap<String, Value>);
-                    type SortRow = (
-                        Record,
-                        u64,
-                        IndexMap<String, Value>,
-                        IndexMap<String, Value>,
-                    );
 
                     let predecessors: Vec<NodeIndex> = plan
                         .graph
@@ -3123,13 +3138,13 @@ impl PipelineExecutor {
 
                     let schema = input_records[0].0.schema().clone();
                     let memory_limit = parse_memory_limit(config);
-                    let mut buf: SortBuffer<SortPayload> =
+                    let mut buf: SortBuffer<u64> =
                         SortBuffer::new(sort_fields.clone(), memory_limit, None, schema);
 
                     let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
                     let sort_count = input_records.len() as u64;
-                    for (record, row_num, emitted, accumulated) in input_records {
-                        buf.push(record, (row_num, emitted, accumulated));
+                    for (record, row_num) in input_records {
+                        buf.push(record, row_num);
                         if buf.should_spill() {
                             buf.sort_and_spill().map_err(|e| {
                                 PipelineError::Io(std::io::Error::other(format!(
@@ -3145,11 +3160,11 @@ impl PipelineExecutor {
                         )))
                     })?;
 
-                    let mut out: Vec<SortRow> = Vec::with_capacity(sort_count as usize);
+                    let mut out: Vec<(Record, u64)> = Vec::with_capacity(sort_count as usize);
                     match sorted {
                         SortedOutput::InMemory(pairs) => {
-                            for (record, (row_num, emitted, accumulated)) in pairs {
-                                out.push((record, row_num, emitted, accumulated));
+                            for (record, row_num) in pairs {
+                                out.push((record, row_num));
                             }
                         }
                         SortedOutput::Spilled(files) => {
@@ -3172,13 +3187,12 @@ impl PipelineExecutor {
                                     )))
                                 })?;
                                 for entry in reader {
-                                    let (record, (row_num, emitted, accumulated)) =
-                                        entry.map_err(|e| {
-                                            PipelineError::Io(std::io::Error::other(format!(
-                                                "sort enforcer '{name}' spill decode failed: {e}"
-                                            )))
-                                        })?;
-                                    out.push((record, row_num, emitted, accumulated));
+                                    let (record, row_num) = entry.map_err(|e| {
+                                        PipelineError::Io(std::io::Error::other(format!(
+                                            "sort enforcer '{name}' spill decode failed: {e}"
+                                        )))
+                                    })?;
+                                    out.push((record, row_num));
                                 }
                             }
                         }
@@ -3259,20 +3273,14 @@ impl PipelineExecutor {
                     let input_count = input.len() as u64;
 
                     let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-                    for (record, row_num, emitted, accumulated) in &input {
+                    for (record, row_num) in &input {
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
                             source_row: *row_num,
                         };
-                        if let Err(e) = stream.add_record(
-                            record,
-                            *row_num,
-                            emitted,
-                            accumulated,
-                            &ctx,
-                            &mut emitted_rows,
-                        ) {
+                        if let Err(e) = stream.add_record(record, *row_num, &ctx, &mut emitted_rows)
+                        {
                             match config.error_handling.strategy {
                                 ErrorStrategy::FailFast => return Err(e.into()),
                                 ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
@@ -3317,7 +3325,7 @@ impl PipelineExecutor {
                             }
                             ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
                                 counters.dlq_count += 1;
-                                let synthetic = if let Some((rec, _, _, _)) = input.first() {
+                                let synthetic = if let Some((rec, _)) = input.first() {
                                     rec.clone()
                                 } else {
                                     Record::new(Arc::clone(output_schema), Vec::new())
@@ -3392,7 +3400,7 @@ impl PipelineExecutor {
                     //   declared at function scope.
                     let output_record_count = input_records.len() as u64;
                     let mut newly_ok: u64 = 0;
-                    for (_, row_num, _, _) in &input_records {
+                    for (_, row_num) in &input_records {
                         if ok_source_rows.insert(*row_num) {
                             newly_ok += 1;
                         }
@@ -3401,7 +3409,13 @@ impl PipelineExecutor {
                     counters.records_written += output_record_count;
                     records_emitted += output_record_count;
 
-                    // Derive output schema from first emitted record
+                    // Derive output schema from first emitted record.
+                    // The Record is authoritative post-rip; materialize
+                    // the output-projection's `emitted` / `metadata`
+                    // maps from it on demand at this boundary. That
+                    // pays the bucket-insert cost once per record
+                    // reaching the writer, not every intermediate node
+                    // transition (Invariant 3).
                     let scan_timer =
                         stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
                     let out_cfg = output_configs
@@ -3409,18 +3423,17 @@ impl PipelineExecutor {
                         .find(|o| o.name == *name)
                         .unwrap_or(primary_output);
 
-                    let output_schema =
-                        if let Some((rec, _, emitted, metadata)) = input_records.first() {
-                            let projected = {
-                                let _guard = projection_timer.guard();
-                                project_output_with_meta(rec, emitted, metadata, out_cfg)
-                            };
-                            Arc::clone(projected.schema())
-                        } else {
-                            // No records to write — use empty schema
-                            collector.record(scan_timer.finish(0, 0));
-                            continue;
+                    let output_schema = if let Some((rec, _)) = input_records.first() {
+                        let projected = {
+                            let _guard = projection_timer.guard();
+                            project_output_from_record(rec, out_cfg)
                         };
+                        Arc::clone(projected.schema())
+                    } else {
+                        // No records to write — use empty schema
+                        collector.record(scan_timer.finish(0, 0));
+                        continue;
+                    };
 
                     // Find and take the writer for this output. Errors
                     // from build_format_writer / write_record / flush are
@@ -3432,10 +3445,10 @@ impl PipelineExecutor {
                             Ok(mut csv_writer) => {
                                 collector.record(scan_timer.finish(1, 1));
                                 let mut write_failed = false;
-                                for (record, _rn, emitted, metadata) in &input_records {
+                                for (record, _rn) in &input_records {
                                     let projected = {
                                         let _guard = projection_timer.guard();
-                                        project_output_with_meta(record, emitted, metadata, out_cfg)
+                                        project_output_from_record(record, out_cfg)
                                     };
                                     let write_result = {
                                         let _guard = write_timer.guard();
@@ -3657,7 +3670,7 @@ impl PipelineExecutor {
                     let mut budget =
                         MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
                     let build_records: Vec<Record> =
-                        build_buf.into_iter().map(|(r, _, _, _)| r).collect();
+                        build_buf.into_iter().map(|(r, _)| r).collect();
                     let build_records_in = build_records.len() as u64;
                     let estimated_rows = Some(build_records.len());
                     let hash_table_ctx = EvalContext {
@@ -3706,7 +3719,7 @@ impl PipelineExecutor {
                     // pushes into the end; we clear before each call.
                     let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
 
-                    for (probe_record, rn, prior_emitted, prior_metadata) in driver_buf {
+                    for (probe_record, rn) in driver_buf {
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
@@ -3779,24 +3792,18 @@ impl PipelineExecutor {
                                 }
 
                                 // Output record uses the probe record
-                                // as its base; append the driver's
-                                // fields and the `<build_qualifier>`
-                                // array as an overflow entry.
+                                // as its base; append the `<build_qualifier>`
+                                // array (either at its schema position or as
+                                // an overflow entry).
                                 let mut rec = probe_record.clone();
-                                let mut all_emitted = prior_emitted.clone();
-                                let all_metadata = prior_metadata.clone();
-                                for (fname, val) in probe_record.iter_all_fields() {
-                                    all_emitted.insert(fname.to_string(), val.clone());
-                                }
                                 let arr_val = Value::Array(arr);
                                 if !rec.set(&build_qualifier, arr_val.clone()) {
                                     rec.set_overflow(
                                         build_qualifier.clone().into_boxed_str(),
-                                        arr_val.clone(),
+                                        arr_val,
                                     );
                                 }
-                                all_emitted.insert(build_qualifier.clone(), arr_val);
-                                output_records.push((rec, rn, all_emitted, all_metadata));
+                                output_records.push((rec, rn));
                                 emitted_since_check += 1;
                             }
 
@@ -3880,22 +3887,15 @@ impl PipelineExecutor {
                                                     metadata,
                                                 }) => {
                                                     let mut rec = probe_record.clone();
-                                                    for (n, v) in &emitted {
-                                                        if !rec.set(n, v.clone()) {
-                                                            rec.set_overflow(
-                                                                n.clone().into_boxed_str(),
-                                                                v.clone(),
-                                                            );
+                                                    for (n, v) in emitted {
+                                                        if !rec.set(&n, v.clone()) {
+                                                            rec.set_overflow(n.into_boxed_str(), v);
                                                         }
                                                     }
-                                                    for (k, v) in &metadata {
-                                                        let _ = rec.set_meta(k, v.clone());
+                                                    for (k, v) in metadata {
+                                                        let _ = rec.set_meta(&k, v);
                                                     }
-                                                    let mut em = prior_emitted.clone();
-                                                    let mut mt = prior_metadata.clone();
-                                                    em.extend(emitted);
-                                                    mt.extend(metadata);
-                                                    output_records.push((rec, rn, em, mt));
+                                                    output_records.push((rec, rn));
                                                     emitted_since_check += 1;
                                                 }
                                                 Ok(EvalResult::Skip(SkipReason::Filtered)) => {
@@ -3935,22 +3935,15 @@ impl PipelineExecutor {
                                                 metadata,
                                             }) => {
                                                 let mut rec = probe_record.clone();
-                                                for (n, v) in &emitted {
-                                                    if !rec.set(n, v.clone()) {
-                                                        rec.set_overflow(
-                                                            n.clone().into_boxed_str(),
-                                                            v.clone(),
-                                                        );
+                                                for (n, v) in emitted {
+                                                    if !rec.set(&n, v.clone()) {
+                                                        rec.set_overflow(n.into_boxed_str(), v);
                                                     }
                                                 }
-                                                for (k, v) in &metadata {
-                                                    let _ = rec.set_meta(k, v.clone());
+                                                for (k, v) in metadata {
+                                                    let _ = rec.set_meta(&k, v);
                                                 }
-                                                let mut em = prior_emitted.clone();
-                                                let mut mt = prior_metadata.clone();
-                                                em.extend(emitted);
-                                                mt.extend(metadata);
-                                                output_records.push((rec, rn, em, mt));
+                                                output_records.push((rec, rn));
                                                 emitted_since_check += 1;
                                             }
                                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {
@@ -4664,7 +4657,7 @@ fn evaluate_record(
     transform_names: &[&str],
     evaluators: &mut [ProgramEvaluator],
     ctx: &EvalContext,
-) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
+) -> Result<(Record, EvalResult), (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
     let mut all_metadata = IndexMap::new();
@@ -4690,14 +4683,17 @@ fn evaluate_record(
                 all_emitted.extend(emitted);
                 all_metadata.extend(metadata);
             }
-            skip @ EvalResult::Skip(_) => return Ok(skip),
+            skip @ EvalResult::Skip(_) => return Ok((record, skip)),
         }
     }
 
-    Ok(EvalResult::Emit {
-        fields: all_emitted,
-        metadata: all_metadata,
-    })
+    Ok((
+        record,
+        EvalResult::Emit {
+            fields: all_emitted,
+            metadata: all_metadata,
+        },
+    ))
 }
 
 /// Evaluate all transforms with window context, accumulating emitted fields.
@@ -4717,7 +4713,7 @@ fn evaluate_record_with_window(
     arena: &Arena,
     indices: &[SecondaryIndex],
     record_pos: u32,
-) -> Result<EvalResult, (String, cxl::eval::EvalError)> {
+) -> Result<(Record, EvalResult), (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     let mut all_emitted = IndexMap::new();
     let mut all_metadata = IndexMap::new();
@@ -4784,36 +4780,37 @@ fn evaluate_record_with_window(
                 all_emitted.extend(emitted);
                 all_metadata.extend(metadata);
             }
-            skip @ EvalResult::Skip(_) => return Ok(skip),
+            skip @ EvalResult::Skip(_) => return Ok((record, skip)),
         }
     }
 
-    Ok(EvalResult::Emit {
-        fields: all_emitted,
-        metadata: all_metadata,
-    })
+    Ok((
+        record,
+        EvalResult::Emit {
+            fields: all_emitted,
+            metadata: all_metadata,
+        },
+    ))
 }
 
-/// Evaluate a single transform against a record, returning the modified record
-/// with emitted fields merged in.
+/// Evaluate a single transform against a record, returning the
+/// modified record with emitted fields and metadata merged in.
 ///
-/// Used by the DAG-walking executor for per-node evaluation.
-/// Returns `Ok((modified_record, emitted, metadata))` on emit,
-/// `Ok` with `EvalResult::Skip` variant on skip.
-/// On error, returns `(transform_name, EvalError)`.
-#[allow(clippy::type_complexity)]
+/// Used by the DAG-walking executor for per-node evaluation. Emitted
+/// fields land at their schema position via `Record::set` or in the
+/// overflow map via `Record::set_overflow`; metadata writes via
+/// `Record::set_meta`. The returned Record is authoritative for every
+/// downstream node — no parallel bookkeeping map is produced.
+///
+/// Returns `Ok((modified_record, Ok(())))` on emit,
+/// `Ok((record, Err(SkipReason)))` on skip. On error, returns
+/// `(transform_name, EvalError)`.
 fn evaluate_single_transform(
     record: &Record,
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
-) -> Result<
-    (
-        Record,
-        Result<(IndexMap<String, Value>, IndexMap<String, Value>), SkipReason>,
-    ),
-    (String, cxl::eval::EvalError),
-> {
+) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
     match evaluator
         .eval_record::<NullStorage>(ctx, &record, None)
@@ -4831,7 +4828,7 @@ fn evaluate_single_transform(
             for (key, value) in &metadata {
                 let _ = record.set_meta(key, value.clone());
             }
-            Ok((record, Ok((emitted, metadata))))
+            Ok((record, Ok(())))
         }
         EvalResult::Skip(reason) => Ok((record, Err(reason))),
     }

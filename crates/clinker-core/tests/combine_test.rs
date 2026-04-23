@@ -2594,10 +2594,10 @@ nodes:
         .expect("combine executor must run a pure-equi 2-input fixture");
         let canon = canonicalize_csv(result.primary_output());
         let expected = canonicalize_csv(
-            "order_id,product_id,product_name,amount\n\
-             ORD-1,PROD-A,Widget,10\n\
-             ORD-2,PROD-B,Gadget,20\n\
-             ORD-3,PROD-X,,30\n",
+            "order_id,product_id,amount,product_name\n\
+             ORD-1,PROD-A,10,Widget\n\
+             ORD-2,PROD-B,20,Gadget\n\
+             ORD-3,PROD-X,30,\n",
         );
         assert_eq!(canon, expected, "combine match:first output mismatch");
     }
@@ -2618,9 +2618,11 @@ nodes:
         .expect("match:all fan-out must run");
         let canon = canonicalize_csv(result.primary_output());
         // Two matching build rows → two output rows with the same
-        // probe fields but different product_name values.
-        assert!(canon.contains("ORD-1,PROD-A,Widget,10"), "got: {canon}");
-        assert!(canon.contains("ORD-1,PROD-A,WidgetV2,10"), "got: {canon}");
+        // probe fields but different product_name values. Column
+        // order follows Record-iteration (schema-then-overflow) per
+        // the post-IndexMap-threading emit shape.
+        assert!(canon.contains("ORD-1,PROD-A,10,Widget"), "got: {canon}");
+        assert!(canon.contains("ORD-1,PROD-A,10,WidgetV2"), "got: {canon}");
         let mut rows = 0usize;
         for line in canon.lines().skip(1) {
             if !line.is_empty() {
@@ -2860,9 +2862,11 @@ nodes:
         .expect("null_fields must run");
         let canon = canonicalize_csv(result.primary_output());
         // ORD-3 has PROD-X which has no matching product — emit row
-        // with blank product_name (Null → empty CSV cell).
+        // with blank product_name (Null → empty CSV cell). Column
+        // order follows Record-iteration (order_id, product_id,
+        // amount, then product_name from overflow).
         assert!(
-            canon.contains("ORD-3,PROD-X,,30"),
+            canon.contains("ORD-3,PROD-X,30,"),
             "null_fields must leave build-qualified fields blank; got: {canon}"
         );
     }

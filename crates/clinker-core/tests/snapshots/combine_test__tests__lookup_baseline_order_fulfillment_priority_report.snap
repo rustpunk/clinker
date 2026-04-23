@@ -2,6 +2,6 @@
 source: crates/clinker-core/tests/combine_test.rs
 expression: canonicalize_csv(priority)
 ---
-order_id,priority_level,product_code,product_name,category,weight_kg,order_date,quantity,unit_price
-1,urgent,PROD-A,Widget,tools,1.5,2024-01-15,5,29.99
-3,high,PROD-X,,,,2024-01-17,2,99.99
+order_id,order_date,quantity,unit_price,product_code,priority_level,product_name,category,weight_kg
+1,2024-01-15,5,29.99,PROD-A,urgent,Widget,tools,1.5
+3,2024-01-17,2,99.99,PROD-X,high,,,
