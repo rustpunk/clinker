@@ -1,5 +1,7 @@
 pub mod stage_metrics;
 
+pub(crate) mod combine;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::AtomicU32;
@@ -801,10 +803,13 @@ impl PipelineExecutor {
             config,
             input,
             format_reader,
+            &mut readers,
+            &source_configs,
             writers,
             &compiled_transforms,
             compiled_route,
             plan,
+            validated_plan.artifacts(),
             params,
             &mut collector,
             lookup_tables,
@@ -1166,10 +1171,13 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         input: &crate::config::SourceConfig,
         mut format_reader: Box<dyn FormatReader>,
+        readers: &mut HashMap<String, Box<dyn Read + Send>>,
+        source_configs: &[crate::config::SourceConfig],
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlanDag,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
         lookup_tables: HashMap<String, RuntimeLookup>,
@@ -1770,6 +1778,57 @@ impl PipelineExecutor {
             return Ok((counters, dlq_entries, rss_bytes()));
         }
 
+        // ── Pre-load combine build-side sources ──
+        // Every combine input whose upstream source is NOT the primary
+        // driving reader needs its records materialized before the DAG
+        // walk. `execute_dag_branching`'s `PlanNode::Source` arm consults
+        // this map first; primary-sourced entries fall back to
+        // `all_records`.
+        //
+        // Scope: every source name referenced by `artifacts.combine_inputs`
+        // as a build-side upstream whose reader is still in the `readers`
+        // registry (primary was removed at function entry). Drained here
+        // so the readers are consumed exactly once.
+        let mut combine_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        for combine_inputs in artifacts.combine_inputs.values() {
+            for combine_input in combine_inputs.values() {
+                let upstream = combine_input.upstream_name.as_ref();
+                if upstream == input.name {
+                    // Primary source — records already live in
+                    // `all_records`.
+                    continue;
+                }
+                if combine_source_records.contains_key(upstream) {
+                    continue;
+                }
+                let Some(reader) = readers.remove(upstream) else {
+                    // Either another combine already drained the reader
+                    // (safe — the map is shared across all combine
+                    // inputs) or the reader is missing (likely a
+                    // lookup-source reader consumed by
+                    // `build_lookup_tables`). Either way, skip.
+                    continue;
+                };
+                let src_cfg = source_configs
+                    .iter()
+                    .find(|s| s.name == upstream)
+                    .ok_or_else(|| {
+                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                            "combine build-side source '{upstream}' not declared in the pipeline",
+                        )))
+                    })?;
+                let raw_reader = build_format_reader(src_cfg, reader)?;
+                let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
+                let mut recs: Vec<(Record, u64)> = Vec::new();
+                let mut rn: u64 = 0;
+                while let Some(record) = src_reader.next_record()? {
+                    rn += 1;
+                    recs.push((record, rn));
+                }
+                combine_source_records.insert(upstream.to_string(), recs);
+            }
+        }
+
         // ── Branching DAG walk path ──
         // When the DAG has Route/Merge nodes, use per-node evaluation
         // instead of the sequential transform chain.
@@ -1778,10 +1837,12 @@ impl PipelineExecutor {
                 config,
                 input,
                 all_records,
+                combine_source_records,
                 writers,
                 transforms,
                 compiled_route,
                 plan,
+                artifacts,
                 params,
                 &mut counters,
                 &mut dlq_entries,
@@ -2741,10 +2802,12 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         input: &crate::config::SourceConfig,
         all_records: Vec<(Record, u64)>,
+        combine_source_records: HashMap<String, Vec<(Record, u64)>>,
         mut writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         plan: &ExecutionPlanDag,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
@@ -2817,12 +2880,22 @@ impl PipelineExecutor {
         for &node_idx in &plan.topo_order {
             let node = plan.graph[node_idx].clone();
             match node {
-                PlanNode::Source { .. } => {
-                    // Source node: populate buffer with all input records
-                    let records: Vec<_> = all_records
-                        .iter()
-                        .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
-                        .collect();
+                PlanNode::Source { ref name, .. } => {
+                    // Combine build-side sources get their own pre-loaded
+                    // records; every other source falls back to the
+                    // primary driving reader's stream.
+                    let records: Vec<_> =
+                        if let Some(src_recs) = combine_source_records.get(name.as_str()) {
+                            src_recs
+                                .iter()
+                                .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
+                                .collect()
+                        } else {
+                            all_records
+                                .iter()
+                                .map(|(r, rn)| (r.clone(), *rn, IndexMap::new(), IndexMap::new()))
+                                .collect()
+                        };
                     node_buffers.insert(node_idx, records);
                 }
 
@@ -3664,18 +3737,493 @@ impl PipelineExecutor {
                     node_buffers.insert(node_idx, input_records);
                 }
 
-                PlanNode::Combine { ref name, .. } => {
-                    // Phase Combine C.0: no executor code yet. C.2 wires up
-                    // the multi-input build/probe dispatch arm. Reaching this
-                    // arm in C.0 is a planner bug (a Combine node escaped
-                    // into the DAG without C.0.4 DAG-edge wiring or with
-                    // premature execution). Fail loud.
-                    return Err(PipelineError::Internal {
-                        op: "combine",
-                        node: name.clone(),
-                        detail: "combine executor dispatch not implemented until Phase Combine C.2"
-                            .to_string(),
-                    });
+                PlanNode::Combine {
+                    ref name,
+                    ref driving_input,
+                    ref match_mode,
+                    ref on_miss,
+                    ..
+                } => {
+                    use crate::config::pipeline_node::{MatchMode, OnMiss};
+                    use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+                    use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
+                    use crate::pipeline::memory::MemoryBudget;
+
+                    // Cap on matches collected per driver under
+                    // `match: collect` before truncation. 10K mirrors
+                    // the module constants in pipeline/combine.rs and
+                    // aligns with DataFusion's collect-list bound.
+                    const COLLECT_PER_GROUP_CAP: usize = 10_000;
+
+                    let combine_inputs = artifacts.combine_inputs.get(name).ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: "no combine_inputs entry for combine node".to_string(),
+                        }
+                    })?;
+                    let decomposed = artifacts.combine_predicates.get(name).ok_or_else(|| {
+                        PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: "no combine_predicates entry for combine node".to_string(),
+                        }
+                    })?;
+
+                    // E312 confines the executor to binary combines.
+                    // An escaped N>2 combine reaches the executor only
+                    // when the planner's post-pass skipped stamping —
+                    // that's a planner bug.
+                    if combine_inputs.len() != 2 {
+                        return Err(PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: format!(
+                                "combine executor requires binary inputs (N=2); got {}",
+                                combine_inputs.len()
+                            ),
+                        });
+                    }
+                    if driving_input.is_empty() {
+                        return Err(PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: "combine has no driving_input stamped (planner post-pass did not run)"
+                                .to_string(),
+                        });
+                    }
+
+                    // Identify the single build-side qualifier —
+                    // everything that is not the driver.
+                    let build_qualifier: String = combine_inputs
+                        .keys()
+                        .find(|q| q.as_str() != driving_input.as_str())
+                        .cloned()
+                        .ok_or_else(|| PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: "no build-side input found among combine inputs".to_string(),
+                        })?;
+                    let driver_upstream: &str = combine_inputs[driving_input.as_str()]
+                        .upstream_name
+                        .as_ref();
+                    let build_upstream: &str = combine_inputs[build_qualifier.as_str()]
+                        .upstream_name
+                        .as_ref();
+
+                    // Resolve predecessor buffers by upstream node name.
+                    // DAG edges run upstream_source -> combine (or via
+                    // an intermediate Transform chain). We search the
+                    // incoming neighbors and match by the node's name.
+                    let predecessors: Vec<NodeIndex> = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .collect();
+                    let driver_pred = predecessors
+                        .iter()
+                        .copied()
+                        .find(|p| plan.graph[*p].name() == driver_upstream)
+                        .ok_or_else(|| PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: format!(
+                                "combine driver upstream {driver_upstream:?} is not an \
+                                 incoming neighbor in the DAG"
+                            ),
+                        })?;
+                    let build_pred = predecessors
+                        .iter()
+                        .copied()
+                        .find(|p| plan.graph[*p].name() == build_upstream)
+                        .ok_or_else(|| PipelineError::Internal {
+                            op: "combine",
+                            node: name.clone(),
+                            detail: format!(
+                                "combine build upstream {build_upstream:?} is not an \
+                                 incoming neighbor in the DAG"
+                            ),
+                        })?;
+
+                    let driver_buf = node_buffers.remove(&driver_pred).unwrap_or_default();
+                    let build_buf = node_buffers.remove(&build_pred).unwrap_or_default();
+
+                    // Build the KeyExtractor pair: one side aligned to
+                    // the build qualifier, the other to the driver. The
+                    // i-th equality conjunct contributes one key column
+                    // to each extractor — the expression whose
+                    // `*_input` matches the side we're extracting for.
+                    let mut build_progs: Vec<(Arc<TypedProgram>, cxl::ast::Expr)> = Vec::new();
+                    let mut probe_progs: Vec<(Arc<TypedProgram>, cxl::ast::Expr)> = Vec::new();
+                    for eq in &decomposed.equalities {
+                        let (build_expr, build_prog, probe_expr, probe_prog) = if eq
+                            .left_input
+                            .as_ref()
+                            == build_qualifier.as_str()
+                            && eq.right_input.as_ref() == driving_input.as_str()
+                        {
+                            (
+                                eq.left_expr.clone(),
+                                Arc::clone(&eq.left_program),
+                                eq.right_expr.clone(),
+                                Arc::clone(&eq.right_program),
+                            )
+                        } else if eq.left_input.as_ref() == driving_input.as_str()
+                            && eq.right_input.as_ref() == build_qualifier.as_str()
+                        {
+                            (
+                                eq.right_expr.clone(),
+                                Arc::clone(&eq.right_program),
+                                eq.left_expr.clone(),
+                                Arc::clone(&eq.left_program),
+                            )
+                        } else {
+                            // Qualifiers on this equality conjunct
+                            // do not match the combine's driver/
+                            // build pair — the plan-time
+                            // decomposition put a foreign conjunct
+                            // into `equalities`. Planner bug.
+                            return Err(PipelineError::Internal {
+                                op: "combine",
+                                node: name.clone(),
+                                detail: format!(
+                                    "equality conjunct has qualifiers ({}, {}); \
+                                         expected ({}, {})",
+                                    eq.left_input, eq.right_input, driving_input, build_qualifier,
+                                ),
+                            });
+                        };
+                        build_progs.push((build_prog, build_expr));
+                        probe_progs.push((probe_prog, probe_expr));
+                    }
+                    let build_extractor = KeyExtractor::new(build_progs);
+                    let probe_extractor = KeyExtractor::new(probe_progs);
+
+                    // Resolver mapping is built once and reused for
+                    // every probe iteration below.
+                    let resolver_mapping =
+                        CombineResolverMapping::new(combine_inputs, driving_input);
+
+                    // Hash-build phase — drain the build buffer into a
+                    // fresh MemoryBudget-governed CombineHashTable.
+                    let mut budget =
+                        MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
+                    let build_records: Vec<Record> =
+                        build_buf.into_iter().map(|(r, _, _, _)| r).collect();
+                    let estimated_rows = Some(build_records.len());
+                    let hash_table_ctx = EvalContext {
+                        stable: &stable,
+                        source_file: &source_file_arc,
+                        source_row: 0,
+                    };
+                    let hash_table = CombineHashTable::build(
+                        build_records,
+                        &build_extractor,
+                        &hash_table_ctx,
+                        &mut budget,
+                        estimated_rows,
+                    )
+                    .map_err(|e| PipelineError::Compilation {
+                        transform_name: name.clone(),
+                        messages: vec![format!("E310 combine build: {e}")],
+                    })?;
+
+                    // Body evaluator (only used when the body is not
+                    // empty — `match: collect` leaves it empty).
+                    let body_typed = artifacts.typed.get(name).cloned();
+                    let mut body_evaluator = body_typed
+                        .as_ref()
+                        .map(|bt| ProgramEvaluator::new(Arc::clone(bt), false));
+
+                    // Per-driver probe loop.
+                    let mut output_records = Vec::with_capacity(driver_buf.len());
+                    let mut emitted_since_check: usize = 0;
+
+                    for (probe_record, rn, prior_emitted, prior_metadata) in driver_buf {
+                        let ctx = EvalContext {
+                            stable: &stable,
+                            source_file: &source_file_arc,
+                            source_row: rn,
+                        };
+
+                        match match_mode {
+                            MatchMode::Collect => {
+                                // Synthesize the output directly. No
+                                // body evaluator runs. On miss, emit
+                                // an empty array (E311-guarded: the
+                                // body is enforced empty at compile
+                                // time, so on_miss policy does not
+                                // bypass emission under Collect).
+                                let mut arr: Vec<Value> = Vec::new();
+                                let mut truncated = false;
+                                let probe_iter = hash_table
+                                    .probe(&probe_record, &probe_extractor, &ctx)
+                                    .map_err(|e| PipelineError::Compilation {
+                                        transform_name: name.clone(),
+                                        messages: vec![format!("combine probe error: {e}")],
+                                    })?;
+                                for candidate in probe_iter {
+                                    // Residual filter, if any.
+                                    if let Some(residual) = decomposed.residual.as_ref() {
+                                        let resolver = CombineResolver::new(
+                                            &resolver_mapping,
+                                            &probe_record,
+                                            Some(candidate.record),
+                                        );
+                                        let mut residual_eval =
+                                            ProgramEvaluator::new(Arc::clone(residual), false);
+                                        match residual_eval
+                                            .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                        {
+                                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                                continue;
+                                            }
+                                            Ok(EvalResult::Emit { .. }) => {}
+                                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                return Err(PipelineError::from(e));
+                                            }
+                                        }
+                                    }
+                                    if arr.len() >= COLLECT_PER_GROUP_CAP {
+                                        truncated = true;
+                                        break;
+                                    }
+                                    // Build a Value::Map for every
+                                    // matched build record, preserving
+                                    // its own schema order.
+                                    let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+                                    for (fname, val) in candidate.record.iter_all_fields() {
+                                        m.insert(fname.into(), val.clone());
+                                    }
+                                    arr.push(Value::Map(Box::new(m)));
+                                }
+                                if truncated {
+                                    eprintln!(
+                                        "W: combine {:?} match: collect truncated at \
+                                         {COLLECT_PER_GROUP_CAP} matches for driver row {}",
+                                        name, rn
+                                    );
+                                }
+
+                                // Output record uses the probe record
+                                // as its base; append the driver's
+                                // fields and the `<build_qualifier>`
+                                // array as an overflow entry.
+                                let mut rec = probe_record.clone();
+                                let mut all_emitted = prior_emitted.clone();
+                                let all_metadata = prior_metadata.clone();
+                                for (fname, val) in probe_record.iter_all_fields() {
+                                    all_emitted.insert(fname.to_string(), val.clone());
+                                }
+                                let arr_val = Value::Array(arr);
+                                if !rec.set(&build_qualifier, arr_val.clone()) {
+                                    rec.set_overflow(
+                                        build_qualifier.clone().into_boxed_str(),
+                                        arr_val.clone(),
+                                    );
+                                }
+                                all_emitted.insert(build_qualifier.clone(), arr_val);
+                                output_records.push((rec, rn, all_emitted, all_metadata));
+                                emitted_since_check += 1;
+                            }
+
+                            MatchMode::First | MatchMode::All => {
+                                // Residual-filter + emit pass. We
+                                // clone each surviving build record
+                                // before dropping the iterator so the
+                                // evaluator borrow doesn't alias the
+                                // hash-table borrow.
+                                let matched_records: Vec<Record> = {
+                                    let probe_iter = hash_table
+                                        .probe(&probe_record, &probe_extractor, &ctx)
+                                        .map_err(|e| PipelineError::Compilation {
+                                            transform_name: name.clone(),
+                                            messages: vec![format!("combine probe error: {e}")],
+                                        })?;
+                                    let mut matched: Vec<Record> = Vec::new();
+                                    for candidate in probe_iter {
+                                        if let Some(residual) = decomposed.residual.as_ref() {
+                                            let resolver = CombineResolver::new(
+                                                &resolver_mapping,
+                                                &probe_record,
+                                                Some(candidate.record),
+                                            );
+                                            let mut residual_eval =
+                                                ProgramEvaluator::new(Arc::clone(residual), false);
+                                            match residual_eval
+                                                .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                            {
+                                                Ok(EvalResult::Skip(_)) => continue,
+                                                Ok(EvalResult::Emit { .. }) => {}
+                                                Err(e) => {
+                                                    return Err(PipelineError::from(e));
+                                                }
+                                            }
+                                        }
+                                        matched.push(candidate.record.clone());
+                                        if matches!(match_mode, MatchMode::First) {
+                                            break;
+                                        }
+                                    }
+                                    matched
+                                };
+
+                                if matched_records.is_empty() {
+                                    // On-miss dispatch.
+                                    match on_miss {
+                                        OnMiss::Skip => {
+                                            continue;
+                                        }
+                                        OnMiss::Error => {
+                                            return Err(PipelineError::Compilation {
+                                                transform_name: name.clone(),
+                                                messages: vec![format!(
+                                                    "E310 combine on_miss: error — no \
+                                                     matching build row for driver row {rn}"
+                                                )],
+                                            });
+                                        }
+                                        OnMiss::NullFields => {
+                                            // Evaluate body against a
+                                            // resolver whose build
+                                            // slot is None — build-
+                                            // qualified fields return
+                                            // Value::Null.
+                                            let resolver = CombineResolver::new(
+                                                &resolver_mapping,
+                                                &probe_record,
+                                                None,
+                                            );
+                                            let evaluator =
+                                                body_evaluator.as_mut().ok_or_else(|| {
+                                                    PipelineError::Internal {
+                                                        op: "combine",
+                                                        node: name.clone(),
+                                                        detail: "combine body typed program \
+                                                                 missing for on_miss: null_fields"
+                                                            .to_string(),
+                                                    }
+                                                })?;
+                                            match evaluator
+                                                .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                            {
+                                                Ok(EvalResult::Emit {
+                                                    fields: emitted,
+                                                    metadata,
+                                                }) => {
+                                                    let mut rec = probe_record.clone();
+                                                    for (n, v) in &emitted {
+                                                        if !rec.set(n, v.clone()) {
+                                                            rec.set_overflow(
+                                                                n.clone().into_boxed_str(),
+                                                                v.clone(),
+                                                            );
+                                                        }
+                                                    }
+                                                    for (k, v) in &metadata {
+                                                        let _ = rec.set_meta(k, v.clone());
+                                                    }
+                                                    let mut em = prior_emitted.clone();
+                                                    let mut mt = prior_metadata.clone();
+                                                    em.extend(emitted);
+                                                    mt.extend(metadata);
+                                                    output_records.push((rec, rn, em, mt));
+                                                    emitted_since_check += 1;
+                                                }
+                                                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                                    counters.filtered_count += 1;
+                                                }
+                                                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                                    counters.distinct_count += 1;
+                                                }
+                                                Err(e) => {
+                                                    return Err(PipelineError::from(e));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for matched in &matched_records {
+                                        let resolver = CombineResolver::new(
+                                            &resolver_mapping,
+                                            &probe_record,
+                                            Some(matched),
+                                        );
+                                        let evaluator =
+                                            body_evaluator.as_mut().ok_or_else(|| {
+                                                PipelineError::Internal {
+                                                    op: "combine",
+                                                    node: name.clone(),
+                                                    detail: "combine body typed program \
+                                                             missing for non-collect match"
+                                                        .to_string(),
+                                                }
+                                            })?;
+                                        match evaluator
+                                            .eval_record::<NullStorage>(&ctx, &resolver, None)
+                                        {
+                                            Ok(EvalResult::Emit {
+                                                fields: emitted,
+                                                metadata,
+                                            }) => {
+                                                let mut rec = probe_record.clone();
+                                                for (n, v) in &emitted {
+                                                    if !rec.set(n, v.clone()) {
+                                                        rec.set_overflow(
+                                                            n.clone().into_boxed_str(),
+                                                            v.clone(),
+                                                        );
+                                                    }
+                                                }
+                                                for (k, v) in &metadata {
+                                                    let _ = rec.set_meta(k, v.clone());
+                                                }
+                                                let mut em = prior_emitted.clone();
+                                                let mut mt = prior_metadata.clone();
+                                                em.extend(emitted);
+                                                mt.extend(metadata);
+                                                output_records.push((rec, rn, em, mt));
+                                                emitted_since_check += 1;
+                                            }
+                                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                                                counters.filtered_count += 1;
+                                            }
+                                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                                                counters.distinct_count += 1;
+                                            }
+                                            Err(e) => {
+                                                return Err(PipelineError::from(e));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Budget check every 10K emitted records to
+                        // bound memory under fan-out. Full stage-
+                        // specific MemoryBudget attribution lands in
+                        // the follow-up commit alongside the
+                        // `CombineBuild` / `CombineProbe` stage
+                        // variants.
+                        if emitted_since_check >= 10_000 && budget.should_abort() {
+                            return Err(PipelineError::Compilation {
+                                transform_name: name.clone(),
+                                messages: vec![format!(
+                                    "E310 combine probe memory limit exceeded: \
+                                     hard limit {}",
+                                    budget.hard_limit()
+                                )],
+                            });
+                        }
+                        if emitted_since_check >= 10_000 {
+                            emitted_since_check = 0;
+                        }
+                    }
+
+                    node_buffers.insert(node_idx, output_records);
                 }
             }
         }

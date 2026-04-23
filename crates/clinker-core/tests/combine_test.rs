@@ -2449,4 +2449,543 @@ nodes:
             ),
         }
     }
+
+    // ─── Combine executor gate tests ─────────────────────────────────────
+    //
+    // These tests exercise the `PlanNode::Combine` dispatch arm end-to-end
+    // through the public executor. They use small inline CSV inputs so the
+    // test surface is readable and the oracle outputs are auditable without
+    // reading a 1000-line fixture file.
+
+    const EXEC_ORDERS: &str = "\
+order_id,product_id,amount
+ORD-1,PROD-A,10
+ORD-2,PROD-B,20
+ORD-3,PROD-X,30
+";
+    const EXEC_PRODUCTS: &str = "\
+product_id,name,category
+PROD-A,Widget,cat-1
+PROD-B,Gadget,cat-2
+";
+
+    fn combine_exec_yaml(match_mode: &str, on_miss: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: combine_exec
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - {{ name: order_id, type: string }}
+        - {{ name: product_id, type: string }}
+        - {{ name: amount, type: int }}
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - {{ name: product_id, type: string }}
+        - {{ name: name, type: string }}
+        - {{ name: category, type: string }}
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: {match_mode}
+      on_miss: {on_miss}
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit amount = orders.amount
+  - type: output
+    name: enriched_out
+    input: enriched
+    config:
+      name: enriched_out
+      type: csv
+      path: enriched.csv
+"#,
+        )
+    }
+
+    /// match: first, on_miss: null_fields — a matched order enriches
+    /// with product fields; an unmatched order emits with null product
+    /// fields.
+    #[test]
+    fn test_combine_exec_equi_match_first() {
+        let yaml = combine_exec_yaml("first", "null_fields");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("combine executor must run a pure-equi 2-input fixture");
+        let canon = canonicalize_csv(result.primary_output());
+        let expected = canonicalize_csv(
+            "order_id,product_id,product_name,amount\n\
+             ORD-1,PROD-A,Widget,10\n\
+             ORD-2,PROD-B,Gadget,20\n\
+             ORD-3,PROD-X,,30\n",
+        );
+        assert_eq!(canon, expected, "combine match:first output mismatch");
+    }
+
+    /// match: all — verifies fan-out: every matching build record
+    /// produces an independent output row.
+    #[test]
+    fn test_combine_exec_equi_match_all() {
+        // Two products for the same product_id so match:all fans out.
+        let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
+        let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
+        let yaml = combine_exec_yaml("all", "null_fields");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("match:all fan-out must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // Two matching build rows → two output rows with the same
+        // probe fields but different product_name values.
+        assert!(canon.contains("ORD-1,PROD-A,Widget,10"), "got: {canon}");
+        assert!(canon.contains("ORD-1,PROD-A,WidgetV2,10"), "got: {canon}");
+        let mut rows = 0usize;
+        for line in canon.lines().skip(1) {
+            if !line.is_empty() {
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 2, "match:all must produce 2 output rows");
+    }
+
+    /// match: collect — synthesized output record carries a
+    /// `<build_qualifier>: Value::Array(Value::Map)` field per driver;
+    /// the `cxl:` body is required-empty (E311). Verify the output
+    /// contains a serialized array per order including nested maps.
+    #[test]
+    fn test_combine_exec_equi_match_collect() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_collect
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      name: collected_out
+      type: csv
+      path: collected.csv
+      include_unmapped: true
+"#;
+        let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
+        let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("match:collect must run");
+        let out = result.primary_output();
+        // The array serializes as bracketed content in CSV; each
+        // matched build record appears as a nested map representation.
+        assert!(
+            out.contains("Widget"),
+            "collect array should carry Widget; got: {out:?}"
+        );
+        assert!(
+            out.contains("WidgetV2"),
+            "collect array should carry WidgetV2; got: {out:?}"
+        );
+        // Exactly one output row per driver record under Collect.
+        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 1, "match:collect emits one row per driver");
+    }
+
+    /// match: collect on a driver with zero matches — the array field
+    /// is an empty array, not Value::Null. Verify the driver row is
+    /// emitted (no on_miss skip).
+    #[test]
+    fn test_combine_exec_collect_empty_array_on_miss() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_collect_empty
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      name: collected_out
+      type: csv
+      path: collected_empty.csv
+      include_unmapped: true
+"#;
+        // ORD-1's product_id is PROD-X — no matching build row.
+        let orders = "order_id,product_id,amount\nORD-1,PROD-X,10\n";
+        let products = "product_id,name,category\nPROD-A,Widget,cat-1\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("collect empty-array must run");
+        let out = result.primary_output();
+        // Exactly one data row (the driver row, with an empty array).
+        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 1, "collect emits the driver row even on miss");
+        // The `products` column carries the array serialization. Empty
+        // array stringifies as `[]` in Value::Display; verify we see
+        // `[]` and not `null` in the row.
+        let data = out.lines().nth(1).unwrap_or("");
+        assert!(
+            data.contains("[]"),
+            "empty-match collect must emit `[]`, not null; got row: {data:?}",
+        );
+    }
+
+    /// match: collect with 10K+1 matches on one driver record truncates
+    /// at COLLECT_PER_GROUP_CAP = 10_000. Build the build-side with
+    /// 10_001 rows that all share the same key so every one collides.
+    #[test]
+    fn test_combine_exec_collect_per_group_cap() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_collect_cap
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      name: collected_out
+      type: csv
+      path: collected_cap.csv
+      include_unmapped: true
+"#;
+        let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
+        let mut products = String::from("product_id,name,category\n");
+        for i in 0..10_001 {
+            products.push_str(&format!("PROD-A,Widget-{i},cat-1\n"));
+        }
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", &products)],
+            Some("orders"),
+        )
+        .expect("collect cap must run");
+        let out = result.primary_output();
+        // The driver row is emitted.
+        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 1, "collect emits one row per driver");
+        // Expect exactly 10_000 occurrences of the substring `Widget-`
+        // in the serialized array — the 10_001st match was truncated.
+        let widget_count = out.matches("Widget-").count();
+        assert_eq!(
+            widget_count, 10_000,
+            "collect must truncate at 10_000 matches per group"
+        );
+    }
+
+    /// on_miss: null_fields — unmatched driver row emits with
+    /// build-qualifier fields filled with Null. The `product_name`
+    /// field in the CSV output is empty for ORD-X.
+    #[test]
+    fn test_combine_exec_on_miss_null_fields() {
+        let yaml = combine_exec_yaml("first", "null_fields");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("null_fields must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // ORD-3 has PROD-X which has no matching product — emit row
+        // with blank product_name (Null → empty CSV cell).
+        assert!(
+            canon.contains("ORD-3,PROD-X,,30"),
+            "null_fields must leave build-qualified fields blank; got: {canon}"
+        );
+    }
+
+    /// on_miss: skip — unmatched driver rows are silently dropped.
+    #[test]
+    fn test_combine_exec_on_miss_skip() {
+        let yaml = combine_exec_yaml("first", "skip");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("skip must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // Two matches (ORD-1, ORD-2). Unmatched ORD-3 is dropped.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 2, "on_miss:skip drops unmatched rows");
+        assert!(!canon.contains("ORD-3"), "ORD-3 must be dropped");
+    }
+
+    /// on_miss: error — the pipeline fails on the first unmatched row.
+    /// Verify an E310-coded error surfaces.
+    #[test]
+    fn test_combine_exec_on_miss_error() {
+        let yaml = combine_exec_yaml("first", "error");
+        let err = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect_err("on_miss:error must fail the pipeline on first unmatched row");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("E310"),
+            "on_miss:error must surface E310; got: {msg}",
+        );
+    }
+
+    /// Residual predicate — equi predicate + a range residual. The
+    /// range is a cross-input comparison so it lands as a RangeConjunct
+    /// (not residual in the strict sense); build a pipeline where the
+    /// residual is same-input to force the residual path.
+    ///
+    /// Fixture: order's `amount >= 20` AND orders.product_id ==
+    /// products.product_id. The `amount >= 20` conjunct is a
+    /// single-input comparison against a literal → residual.
+    #[test]
+    fn test_combine_exec_residual_predicate() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_residual
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: filtered
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id and orders.amount >= 20"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit amount = orders.amount
+        emit product_name = products.name
+  - type: output
+    name: filtered_out
+    input: filtered
+    config:
+      name: filtered_out
+      type: csv
+      path: filtered.csv
+"#;
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("residual predicate must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // ORD-1 amount=10 is rejected by residual; ORD-2 amount=20 is
+        // accepted; ORD-3 PROD-X doesn't match the equi and on_miss:skip.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 1,
+            "residual rejects ORD-1 (amount<20); ORD-3 unmatched; only ORD-2 survives. got: {canon}"
+        );
+        assert!(canon.contains("ORD-2"), "ORD-2 must survive; got: {canon}");
+    }
+
+    /// Null key on the probe side — CXL ternary rules dictate no match.
+    /// Verify an order with NULL product_id produces no join match.
+    #[test]
+    fn test_combine_exec_null_key_no_match() {
+        // Empty product_id field on ORD-2 triggers Null after schema
+        // coercion (string type preserves it as empty string, not
+        // Null). To generate a true Null probe key, use a compare-to-
+        // nonexistent column or rely on runtime Null propagation via
+        // a residual equality that always resolves to Null. The
+        // simplest way: orders schema carries product_id as int with a
+        // blank field which coerces to Null.
+        let orders = "order_id,product_id,amount\nORD-1,1,10\nORD-2,,20\n";
+        let products = "product_id,name,category\n1,Widget,cat-1\n";
+        let yaml = r#"
+pipeline:
+  name: combine_null_key
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: int }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: int }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: joined
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+  - type: output
+    name: joined_out
+    input: joined
+    config:
+      name: joined_out
+      type: csv
+      path: joined.csv
+"#;
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("null-key fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // ORD-1 matches; ORD-2 has a Null probe key and never matches
+        // under SQL 3VL, so on_miss:skip drops it.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 1,
+            "null key must not match; only ORD-1 survives. got: {canon}"
+        );
+        assert!(canon.contains("ORD-1"), "ORD-1 must survive");
+        assert!(!canon.contains("ORD-2"), "ORD-2 null-key must be dropped");
+    }
 }
