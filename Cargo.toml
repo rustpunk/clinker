@@ -65,3 +65,8 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
