@@ -422,14 +422,14 @@ mod diagnostic_tests {
     }
 
     #[test]
-    fn test_error_registry_e300_through_e310_documented() {
+    fn test_error_registry_combine_codes_documented() {
         let source = include_str!("error.rs");
-        // E302 was removed in the C.1.0 corrective commit — the code was
-        // structurally unreachable with `QualifiedField`-keyed merged
-        // rows. The sweep below enumerates the live combine codes; any
-        // re-addition must be added here explicitly.
+        // E302 was dropped earlier: structurally unreachable with
+        // `QualifiedField`-keyed merged rows. Re-adding it requires an
+        // explicit entry both here and in the registry table above.
         for code in [
-            "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310",
+            "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
+            "E312", "E313",
         ] {
             let pattern = format!("`{code}`");
             assert!(

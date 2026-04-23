@@ -191,8 +191,10 @@ fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError>
 
 /// Look up error/warning code documentation embedded at compile time.
 ///
-/// Returns the doc content for known codes (E101–E108, E110, W101),
-/// or `None` for unknown codes.
+/// Returns the doc content for any code registered in this function's
+/// match body, or `None` for unknown codes. Every registered code must
+/// have a matching `docs/explain/<code>.md` file; the section-coverage
+/// contract is enforced by `test_explain_docs_all_have_required_sections`.
 pub fn explain_code(code: &str) -> Option<&'static str> {
     match code {
         "E101" => Some(include_str!("../../../../docs/explain/E101.md")),
@@ -203,7 +205,23 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E106" => Some(include_str!("../../../../docs/explain/E106.md")),
         "E107" => Some(include_str!("../../../../docs/explain/E107.md")),
         "E108" => Some(include_str!("../../../../docs/explain/E108.md")),
+        "E300" => Some(include_str!("../../../../docs/explain/E300.md")),
+        "E301" => Some(include_str!("../../../../docs/explain/E301.md")),
+        "E303" => Some(include_str!("../../../../docs/explain/E303.md")),
+        "E304" => Some(include_str!("../../../../docs/explain/E304.md")),
+        "E305" => Some(include_str!("../../../../docs/explain/E305.md")),
+        "E306" => Some(include_str!("../../../../docs/explain/E306.md")),
+        "E307" => Some(include_str!("../../../../docs/explain/E307.md")),
+        "E308" => Some(include_str!("../../../../docs/explain/E308.md")),
+        "E309" => Some(include_str!("../../../../docs/explain/E309.md")),
+        "E310" => Some(include_str!("../../../../docs/explain/E310.md")),
+        "E311" => Some(include_str!("../../../../docs/explain/E311.md")),
+        "E312" => Some(include_str!("../../../../docs/explain/E312.md")),
+        "E313" => Some(include_str!("../../../../docs/explain/E313.md")),
         "W101" => Some(include_str!("../../../../docs/explain/W101.md")),
+        "W302" => Some(include_str!("../../../../docs/explain/W302.md")),
+        "W305" => Some(include_str!("../../../../docs/explain/W305.md")),
+        "W306" => Some(include_str!("../../../../docs/explain/W306.md")),
         _ => None,
     }
 }
@@ -294,7 +312,9 @@ mod tests {
     #[test]
     fn test_explain_docs_all_have_required_sections() {
         let codes = [
-            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "W101",
+            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E300", "E301", "E303",
+            "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311", "E312", "E313", "W101",
+            "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

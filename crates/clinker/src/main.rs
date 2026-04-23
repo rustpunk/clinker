@@ -91,7 +91,8 @@ NDJSON archives.")]
 Inspect field-level provenance chains or look up error/warning code documentation.\n\n\
 Use --field to trace where a composition config value comes from across all \
 configuration layers (composition defaults, channel defaults, channel fixed). \
-Use --code to look up the documentation for a diagnostic code (E101–E110, W101).",
+Use --code to look up the documentation for a diagnostic code (composition codes \
+E101–E108, combine codes E300–E313 and W302/W305/W306, and W101).",
         after_long_help = "\
 EXAMPLES:
   # Show provenance for a composition config field
