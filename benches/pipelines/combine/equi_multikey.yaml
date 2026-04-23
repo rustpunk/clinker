@@ -1,0 +1,63 @@
+# 2-input equi combine with a composite (two-field) equi predicate.
+# Exercises the multi-column `hash_composite_key` path on both build
+# and probe sides. Both conjuncts must hold for a match. Driver is
+# `orders`; build side is `shipments`. `match: first`,
+# `on_miss: null_fields` (left-outer semantics).
+
+pipeline:
+  name: bench-combine-equi-multikey
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: bench://orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: source
+    name: shipments
+    config:
+      name: shipments
+      type: csv
+      path: bench://shipments.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: combine
+    name: match_shipment
+    input:
+      orders: orders
+      shipments: shipments
+    config:
+      where: "orders.f0 == shipments.f0 and orders.f2 == shipments.f2"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit customer_id = orders.f0
+        emit order_id = orders.f2
+        emit order_sku = orders.f1
+        emit order_region = orders.f3
+        emit carrier = shipments.f1 ?? "PENDING"
+        emit tracking_region = shipments.f3 ?? "unknown"
+
+  - type: output
+    name: matched_out
+    input: match_shipment
+    config:
+      name: matched_out
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

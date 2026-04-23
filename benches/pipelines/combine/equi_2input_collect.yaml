@@ -1,0 +1,58 @@
+# 2-input equi combine with `match: collect`: every driver row emits
+# once, with all matching build-side rows aggregated into a single
+# Array-typed field on the output (column name = build qualifier).
+# Stresses the Collect per-group cap and array-valued output path.
+# `cxl:` must be empty under collect — the executor synthesizes the
+# output schema as {driver fields..., <build_qualifier>: Array}.
+
+pipeline:
+  name: bench-combine-equi-2input-collect
+
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: bench://drivers.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: source
+    name: trips
+    config:
+      name: trips
+      type: csv
+      path: bench://trips.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: combine
+    name: gather_trips
+    input:
+      drivers: drivers
+      trips: trips
+    config:
+      where: "drivers.f0 == trips.f2"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+
+  - type: output
+    name: drivers_with_trips_out
+    input: gather_trips
+    config:
+      name: drivers_with_trips_out
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true
