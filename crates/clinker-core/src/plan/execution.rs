@@ -2037,24 +2037,6 @@ pub enum PlanError {
     AggregateWithMultipleInputs {
         transform: String,
     },
-    /// E307 — a combine node's `input:` value references a name that is
-    /// not declared anywhere in the pipeline. Unlike
-    /// `InvalidInputReference` (which scopes to transform-like
-    /// prefixes), combine inputs can reference any producer node type,
-    /// so this variant carries the combine node name, the qualifier,
-    /// the unresolved upstream reference (RESOLUTION W-2), and the
-    /// field-level [`crate::span::Span`] of the offending YAML
-    /// reference — populated from `Spanned<NodeInput>` captured by the
-    /// pre-C.1 custom Deserialize impl on `PipelineNode`. The span is
-    /// a `line_only`-flavored synthetic when the byte offset is not
-    /// available (no `SourceDb` threaded through the planner); it is
-    /// a real file-backed `Span` otherwise.
-    CombineInputUndeclared {
-        combine: String,
-        qualifier: String,
-        reference: String,
-        span: crate::span::Span,
-    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -2128,30 +2110,6 @@ impl std::fmt::Display for PlanError {
                     "aggregate transform '{}' cannot consume multiple inputs",
                     transform
                 )
-            }
-            PlanError::CombineInputUndeclared {
-                combine,
-                qualifier,
-                reference,
-                span,
-            } => {
-                // Include the YAML line number when we have it (pre-C.1
-                // field-level span). The `line_only` synthetic is the
-                // common case here because the planner does not thread
-                // a `SourceDb` through; a future wire-up can swap in a
-                // real `(file:line:col)` prefix without changing the
-                // error's structural fields.
-                if let Some(line) = span.synthetic_line_number() {
-                    write!(
-                        f,
-                        "E307: at line {line}: combine '{combine}' input '{qualifier}' references undeclared upstream '{reference}'"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "E307: combine '{combine}' input '{qualifier}' references undeclared upstream '{reference}'"
-                    )
-                }
             }
         }
     }

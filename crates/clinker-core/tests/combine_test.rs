@@ -957,11 +957,17 @@ mod tests {
     /// undeclared upstream. The diagnostic's primary span carries the
     /// `line_only` synthetic span of the offending `products: nowhere`
     /// reference (populated from `Spanned<NodeInput>::referenced`).
+    ///
+    /// Phase 16d remediation V2/V3 (Q7=γ + Q5=1): E307 collapsed into
+    /// E300 with a structured `DiagnosticPayload::InputRefUndeclared`
+    /// payload. The test destructures the structured payload directly
+    /// (strictly stronger than the pre-remediation substring matching
+    /// — transposed identifiers no longer pass).
     #[test]
-    fn test_combine_e307_diagnostic_has_real_span() {
+    fn test_combine_undeclared_input_diagnostic_has_real_span() {
         let yaml = r#"
 pipeline:
-  name: e307_gate
+  name: e300_gate
 nodes:
   - type: source
     name: orders
@@ -985,38 +991,123 @@ nodes:
         let diags = config
             .compile(&clinker_core::config::CompileContext::default())
             .expect_err("combine referencing undeclared upstream must fail");
-        let e307 = diags
+        let e004 = diags
             .iter()
-            .find(|d| d.code == "E307")
-            .unwrap_or_else(|| panic!("expected E307 diagnostic; got: {diags:#?}"));
-        assert!(
-            e307.message.contains("broken"),
-            "E307 message must name the combine: {}",
-            e307.message
-        );
-        assert!(
-            e307.message.contains("products"),
-            "E307 message must name the qualifier: {}",
-            e307.message
-        );
-        assert!(
-            e307.message.contains("nowhere"),
-            "E307 message must name the undeclared upstream: {}",
-            e307.message
-        );
+            .find(|d| {
+                d.code == "E004" && d.input_ref_payload().is_some_and(|(_, q, _)| q.is_some())
+            })
+            .unwrap_or_else(|| {
+                panic!("expected E004 diagnostic with combine-arm payload; got: {diags:#?}")
+            });
+        // Structured-payload assertion — strictly stronger than substring
+        // matching: transposing any of the three identifiers fails here.
+        let (consumer, qualifier, reference) = e004
+            .input_ref_payload()
+            .expect("E004 must carry InputRefUndeclared payload");
+        assert_eq!(consumer, "broken", "consumer name");
+        assert_eq!(qualifier, Some("products"), "combine qualifier");
+        assert_eq!(reference, "nowhere", "undeclared upstream");
+
         // The primary span carries the real source line of the offending
         // `products: nowhere` reference (≥ 10 lines into the fixture).
-        let line = e307.primary.span.synthetic_line_number().unwrap_or(0);
+        let line = e004.primary.span.synthetic_line_number().unwrap_or(0);
         assert!(
             line >= 10,
-            "E307 span must encode a non-zero line inside the combine input block; got {line} (span={:?})",
-            e307.primary.span
+            "E004 span must encode a non-zero line inside the combine input block; got {line} (span={:?})",
+            e004.primary.span
         );
         assert!(
-            e307.message.contains(&format!("line {line}")),
-            "E307 message must include 'line {line}', got: {}",
-            e307.message
+            e004.message.contains(&format!("line {line}")),
+            "E004 message must include 'line {line}', got: {}",
+            e004.message
         );
+    }
+
+    /// Phase 16d remediation V2 regression: combine-undeclared input
+    /// surfaces as a structural-stage E300 with combine-arm payload
+    /// even when a sibling node would have triggered a CXL error in
+    /// bind_schema.
+    ///
+    /// Pre-remediation, combine E307 emission lived in stage-5 Phase-2
+    /// edge wiring AFTER bind_schema. A fixture with both an E200 (CXL)
+    /// on one node and a combine-undeclared on another would surface
+    /// ONLY the E200; the combine typo was invisible until the user
+    /// fixed the unrelated CXL error first. The unified
+    /// `resolve_all_input_references` pass moves combine-undeclared up
+    /// to stage 3.5, so it fires regardless of what bind_schema would
+    /// have done.
+    ///
+    /// `compile_topology_only`'s stages-1-4 early return at
+    /// `config/mod.rs:1294` still short-circuits bind_schema once any
+    /// stage-3.5 E300 exists, so this fixture surfaces ONLY E300 (not
+    /// both E200 and E300 in the same pass). The "all errors in one
+    /// pass" enhancement — letting bind_schema run defensively over
+    /// nodes with broken inputs to also collect E200s — is tracked as
+    /// a follow-up under V2 in
+    /// `docs/internal/plans/cxl-engine/phase-16d-remediation.md`. The
+    /// load-bearing user-facing fix (combine typo no longer hidden by
+    /// a sibling CXL error) is what this regression locks in.
+    #[test]
+    fn test_combine_undeclared_input_fires_even_when_bind_schema_would_error() {
+        let yaml = r#"
+pipeline:
+  name: e300_independence_gate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: transform
+    name: cxl_broken
+    input: orders
+    config:
+      cxl: |
+        emit value = unknown_field + 1
+  - type: combine
+    name: broken_combine
+    input:
+      orders: orders
+      products: nowhere
+    config:
+      where: "orders.order_id == products.order_id"
+      cxl: |
+        emit order_id = orders.order_id
+"#;
+        let config = parse_fixture(yaml);
+        let diags = config
+            .compile(&clinker_core::config::CompileContext::default())
+            .expect_err("fixture has E004 (undeclared combine input) — must fail");
+
+        // The load-bearing assertion: combine-undeclared is visible
+        // here, with the structured payload identifying the broken
+        // qualifier. Pre-remediation this combine typo would have been
+        // hidden behind cxl_broken's sibling E200 (because E307 lived
+        // in stage-5 Phase-2 after bind_schema's early return).
+        let combine_e004 = diags
+            .iter()
+            .find(|d| {
+                d.code == "E004" && d.input_ref_payload().is_some_and(|(_, q, _)| q.is_some())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an E004 with combine-arm payload from \
+                     broken_combine.products → nowhere even though \
+                     cxl_broken would have triggered an E200 in bind_schema. \
+                     The unified input-reference pass at stage 3.5 must \
+                     fire BEFORE bind_schema. got: {diags:#?}"
+                )
+            });
+
+        let (consumer, qualifier, reference) = combine_e004
+            .input_ref_payload()
+            .expect("combine E004 must carry InputRefUndeclared payload");
+        assert_eq!(consumer, "broken_combine");
+        assert_eq!(qualifier, Some("products"));
+        assert_eq!(reference, "nowhere");
     }
 
     /// Gate: `MergeHeader.inputs: Vec<Spanned<NodeInput>>` — every input

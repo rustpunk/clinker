@@ -2792,6 +2792,16 @@ impl PipelineExecutor {
         // is the documented limitation in `PipelineCounters` docs.
         let mut ok_source_rows: HashSet<u64> = HashSet::new();
 
+        // Phase 16d remediation V2 / Q3=β: collect every Output's
+        // write/flush failure across the topo walk instead of
+        // short-circuiting on the first `?`. After the walk, aggregate
+        // into `PipelineError::Multiple` (≥2 errors), the bare error
+        // (1 error), or proceed (0 errors) — matches DataFusion's
+        // collection-pattern (PR #14439) and the pre-16d behavior the
+        // streaming-writer-channel path retained via
+        // `join_writer_threads`.
+        let mut output_errors: Vec<PipelineError> = Vec::new();
+
         // Build transform name -> index map for looking up CompiledTransform by name
         let transform_by_name: HashMap<&str, usize> = transforms
             .iter()
@@ -3604,25 +3614,42 @@ impl PipelineExecutor {
                             continue;
                         };
 
-                    // Find and take the writer for this output
+                    // Find and take the writer for this output. Errors
+                    // from build_format_writer / write_record / flush are
+                    // captured into `output_errors` instead of
+                    // short-circuiting via `?` so siblings still get
+                    // their chance to fail (and be reported). Q3=β.
                     if let Some(raw_writer) = writers.remove(name) {
-                        let mut csv_writer =
-                            build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema))?;
-                        collector.record(scan_timer.finish(1, 1));
-
-                        for (record, _rn, emitted, metadata) in &input_records {
-                            let projected = {
-                                let _guard = projection_timer.guard();
-                                project_output_with_meta(record, emitted, metadata, out_cfg)
-                            };
-                            {
-                                let _guard = write_timer.guard();
-                                csv_writer.write_record(&projected)?;
+                        match build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema)) {
+                            Ok(mut csv_writer) => {
+                                collector.record(scan_timer.finish(1, 1));
+                                let mut write_failed = false;
+                                for (record, _rn, emitted, metadata) in &input_records {
+                                    let projected = {
+                                        let _guard = projection_timer.guard();
+                                        project_output_with_meta(record, emitted, metadata, out_cfg)
+                                    };
+                                    let write_result = {
+                                        let _guard = write_timer.guard();
+                                        csv_writer.write_record(&projected)
+                                    };
+                                    if let Err(e) = write_result {
+                                        output_errors.push(PipelineError::from(e));
+                                        write_failed = true;
+                                        break;
+                                    }
+                                }
+                                if !write_failed {
+                                    let flush_result = {
+                                        let _guard = write_timer.guard();
+                                        csv_writer.flush()
+                                    };
+                                    if let Err(e) = flush_result {
+                                        output_errors.push(PipelineError::from(e));
+                                    }
+                                }
                             }
-                        }
-                        {
-                            let _guard = write_timer.guard();
-                            csv_writer.flush()?;
+                            Err(e) => output_errors.push(e),
                         }
                     }
                 }
@@ -3683,6 +3710,16 @@ impl PipelineExecutor {
             records_emitted,
             records_emitted,
         ));
+
+        // Phase 16d remediation V2 / Q3=β: aggregate Output errors
+        // collected during the topo walk. Single error → bare error;
+        // ≥2 errors → `PipelineError::Multiple` (the pre-16d / DataFusion
+        // collection-pattern shape). Zero errors → fall through to Ok.
+        match output_errors.len() {
+            0 => {}
+            1 => return Err(output_errors.into_iter().next().unwrap()),
+            _ => return Err(PipelineError::Multiple(output_errors)),
+        }
 
         Ok((
             std::mem::take(counters),

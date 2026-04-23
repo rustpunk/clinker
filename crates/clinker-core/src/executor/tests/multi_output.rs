@@ -1259,23 +1259,20 @@ nodes:
 
     let result =
         PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    // Phase 16d remediation V2 / Q3=β: the DAG-walk Output arm now
+    // collects every Output's write/flush failure across the topo
+    // walk before aggregating into PipelineError::Multiple. With both
+    // writers failing on flush, the result MUST be Multiple with both
+    // errors — strictly tighter than the pre-remediation matcher
+    // (which accepted `Multiple | Io | Format(Io)` to tolerate the
+    // first-fail short-circuit Q3=β eliminates).
     match result {
         Err(PipelineError::Multiple(errors)) => {
             assert_eq!(errors.len(), 2, "should collect both flush errors");
         }
-        Err(PipelineError::Io(_)) => {
-            // If only one error collected (order-dependent), that's also acceptable.
+        other => {
+            panic!("expected PipelineError::Multiple with 2 collected flush errors, got: {other:?}")
         }
-        // Phase 16d: under the unified DAG-walk runtime, the first
-        // failing writer short-circuits and surfaces as
-        // `PipelineError::Format(Io(…))` (the format-writer wraps its
-        // underlying IO error). Pre-16d this test ran through the
-        // multi-output streaming path which collected errors into
-        // `Multiple`; that path is gone. Either the bare `Io` or the
-        // format-wrapped `Format(Io)` form is acceptable as a single-
-        // error signal.
-        Err(PipelineError::Format(clinker_format::FormatError::Io(_))) => {}
-        other => panic!("expected Multiple / Io / Format(Io) error, got: {other:?}"),
     }
 }
 

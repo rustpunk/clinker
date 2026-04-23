@@ -289,8 +289,6 @@ nodes:
 #[test]
 fn test_correlated_dlq_explain_shows_sort() {
     // --explain output shows injected sort
-    use crate::plan::execution::ExecutionPlanDag;
-
     let yaml = r#"
 pipeline:
   name: explain_test

@@ -12,6 +12,7 @@
 //! | `E001`      | error    | Duplicate node name (exact match)                    |
 //! | `E002`      | error    | Self-referential node input                          |
 //! | `E003`      | error    | Cycle detected between nodes                         |
+//! | `E004`      | error    | Node input references undeclared producer (unified pass; payload `InputRefUndeclared`) |
 //! | `E010`      | error    | Dotted-name check (`.` reserved for branch refs)     |
 //! | `E011`      | error    | Log directive sanity (`every` must be valid)         |
 //! | `E101`      | error    | Composition signature parse error (malformed `.comp.yaml`) |
@@ -88,12 +89,50 @@ impl LabeledSpan {
     }
 }
 
+/// Typed structured payload for diagnostics, addressable by code.
+///
+/// Tests and downstream consumers destructure this enum directly to
+/// assert on logical structure (field values) rather than display
+/// strings. Display rendering of the diagnostic remains the
+/// `Diagnostic.message` field — `payload` is the machine-readable
+/// sibling.
+///
+/// Add a new variant when a diagnostic code carries identifying data
+/// that callers may want to assert on without parsing the human message.
+/// Variants are append-only — removing one is a breaking change to any
+/// test or downstream consumer that destructures it.
+///
+/// Phase 16d remediation V3 / Q5=1 introduced this enum to back the
+/// unified input-reference resolution diagnostic (E300, post-Q7=γ
+/// E307 collapse). See LD-16d-1.
+#[derive(Clone, Debug)]
+pub enum DiagnosticPayload {
+    /// E004 — a node's declared `input` field references a producer
+    /// name that does not exist in the unified node-name table.
+    ///
+    /// `qualifier` is `Some` only for combine-arm references (the
+    /// per-input port name in `combine.from { products: ... }`). All
+    /// other node variants (Transform/Aggregate/Route/Output/Merge)
+    /// have a single `input:` field and produce `qualifier: None`.
+    InputRefUndeclared {
+        /// The downstream node whose `input` is broken.
+        consumer: String,
+        /// For combine, the qualifier (port name) on the broken
+        /// reference — e.g. `"products"` for
+        /// `combine x { from { products: ... } }`. `None` for
+        /// single-input nodes.
+        qualifier: Option<String>,
+        /// The undeclared producer name being referenced (the typo).
+        reference: String,
+    },
+}
+
 /// A structured compile-time diagnostic.
 ///
 /// Diagnostics carry a machine-readable `code` (e.g. `"E001"`), a severity,
-/// a short `message`, a `primary` labeled span, optional secondary labels, and
-/// an optional help string. Rendering is via `miette` in the CLI and a custom
-/// renderer in the Kiln IDE.
+/// a short `message`, a `primary` labeled span, optional secondary labels,
+/// an optional help string, and an optional typed `payload` for codes
+/// that benefit from structured field-level assertion.
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub code: String,
@@ -102,6 +141,11 @@ pub struct Diagnostic {
     pub primary: LabeledSpan,
     pub secondary: Vec<LabeledSpan>,
     pub help: Option<String>,
+    /// Optional typed payload — set via [`Diagnostic::with_payload`] at
+    /// emission sites that want to expose structured fields for tests
+    /// or downstream tooling. `None` for codes that have no structured
+    /// data beyond the message string.
+    pub payload: Option<DiagnosticPayload>,
 }
 
 impl Diagnostic {
@@ -117,6 +161,7 @@ impl Diagnostic {
             primary,
             secondary: Vec::new(),
             help: None,
+            payload: None,
         }
     }
 
@@ -132,6 +177,7 @@ impl Diagnostic {
             primary,
             secondary: Vec::new(),
             help: None,
+            payload: None,
         }
     }
 
@@ -142,6 +188,13 @@ impl Diagnostic {
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
+        self
+    }
+
+    /// Attach a typed structured payload. Callers consume the diagnostic
+    /// via `Diagnostic::error(...).with_payload(payload)`.
+    pub fn with_payload(mut self, payload: DiagnosticPayload) -> Self {
+        self.payload = Some(payload);
         self
     }
 
@@ -159,6 +212,21 @@ impl Diagnostic {
             message,
             LabeledSpan::new(Span::point(file, 0), None),
         )
+    }
+}
+
+impl Diagnostic {
+    /// Convenience accessor — destructure the input-reference payload
+    /// if this diagnostic carries one. Returns `None` for diagnostics
+    /// without a payload or with a different payload variant.
+    pub fn input_ref_payload(&self) -> Option<(&str, Option<&str>, &str)> {
+        match self.payload.as_ref()? {
+            DiagnosticPayload::InputRefUndeclared {
+                consumer,
+                qualifier,
+                reference,
+            } => Some((consumer.as_str(), qualifier.as_deref(), reference.as_str())),
+        }
     }
 }
 

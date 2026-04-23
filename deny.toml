@@ -41,11 +41,12 @@ yanked = "deny"
 unmaintained = "all"
 # Dioxus desktop transitive deps: GTK3 bindings, instant, proc-macro-error
 # bincode 1.3.3: unmaintained advisory (not a vulnerability — team considers v1.3.3 complete)
-# RUSTSEC-2026-0098/0099: rustls-webpki name-constraint advisories reaching us
-# transitively through dioxus-devtools → tungstenite → rustls-webpki. Patched
-# rustls-webpki not yet adopted by tungstenite 0.28; tracked upstream. Clinker
-# does not perform certificate-name-constraint validation directly. Phase 16d
-# remediation plan documents these as tolerated transitive Dioxus advisories.
+# RUSTSEC-2026-0098/0099/0104: rustls-webpki advisories (name-constraints +
+# CRL parsing panic) reaching us transitively through dioxus-devtools →
+# tungstenite → rustls-webpki. Patched rustls-webpki not yet adopted by
+# tungstenite 0.28; tracked upstream. Clinker does not perform certificate-name-
+# constraint validation or CRL parsing directly. Phase 16d remediation plan
+# documents these as tolerated transitive Dioxus advisories.
 ignore = [
     "RUSTSEC-2024-0370",
     "RUSTSEC-2024-0384",
@@ -62,4 +63,5 @@ ignore = [
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
 ]
