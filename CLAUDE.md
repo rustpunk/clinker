@@ -114,6 +114,23 @@ Apply this policy to every refactor in this repo, not just the one currently in 
 
 Concrete shortcut signatures — the patterns this policy forbids and the architecturally correct alternative for each — live in `.claude/policies/architectural-rigor.md`. That file is the single source of truth read by the `audit-shortcuts` skill, the `shortcut-auditor` subagent, and the PreToolUse pre-commit hook.
 
+**Commit-boundary principle — atomicity matches architecture.** A new
+`pub` or `pub(crate)` item must land in the same commit as at least
+one non-test intra-crate caller. `#[cfg(test)]` references do not count
+because CI runs `cargo clippy --workspace -- -D warnings` without
+`--all-targets`, so test-only references are invisible to the dead-code
+lint. Splitting a type from the code that consumes it manufactures a
+speculative-API state (architectural-rigor policy §6) and tempts three
+shortcuts: widening visibility to silence clippy, adding `#[allow(dead_code)]`,
+or skipping the commit-level build check. The correct response when a
+plan entry reads "add type X, then add caller Y" is to collapse X and
+Y into one commit.
+
+Applies to public enums, structs, traits, trait methods, free functions,
+type aliases, and modules. "The caller lands in the next commit" is a
+forbidden rationalization in this tree — if the next commit is the
+caller, this commit is mis-scoped.
+
 ### Comment policy
 
 Comments explain WHY the code is the way it is. A short WHAT is fine when
