@@ -260,10 +260,10 @@ fn sum_cpu_io_totals(
 /// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
 struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
         None
     }
     fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -1307,7 +1307,12 @@ impl PipelineExecutor {
                 let values: Vec<Value> = schema
                     .columns()
                     .iter()
-                    .map(|col| arena.resolve_field(pos, col).unwrap_or(Value::Null))
+                    .map(|col| {
+                        arena
+                            .resolve_field(pos, col)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
                     .collect();
                 Record::new(schema, values)
             };
@@ -3696,6 +3701,10 @@ impl PipelineExecutor {
                         });
                     let mut output_records = Vec::with_capacity(driver_buf.len());
                     let mut emitted_since_check: usize = 0;
+                    // Reused across every probe iteration to avoid an
+                    // allocation per driver row. `KeyExtractor::extract`
+                    // pushes into the end; we clear before each call.
+                    let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
 
                     for (probe_record, rn, prior_emitted, prior_metadata) in driver_buf {
                         let ctx = EvalContext {
@@ -3703,6 +3712,14 @@ impl PipelineExecutor {
                             source_file: &source_file_arc,
                             source_row: rn,
                         };
+
+                        probe_keys_buf.clear();
+                        probe_extractor
+                            .extract_into(&ctx, &probe_record, &mut probe_keys_buf)
+                            .map_err(|e| PipelineError::Compilation {
+                                transform_name: name.clone(),
+                                messages: vec![format!("combine probe key eval error: {e}")],
+                            })?;
 
                         match match_mode {
                             MatchMode::Collect => {
@@ -3714,12 +3731,7 @@ impl PipelineExecutor {
                                 // bypass emission under Collect).
                                 let mut arr: Vec<Value> = Vec::new();
                                 let mut truncated = false;
-                                let probe_iter = hash_table
-                                    .probe(&probe_record, &probe_extractor, &ctx)
-                                    .map_err(|e| PipelineError::Compilation {
-                                        transform_name: name.clone(),
-                                        messages: vec![format!("combine probe error: {e}")],
-                                    })?;
+                                let probe_iter = hash_table.probe(&probe_keys_buf);
                                 for candidate in probe_iter {
                                     // Residual filter, if any.
                                     if let Some(residual) = decomposed.residual.as_ref() {
@@ -3795,12 +3807,7 @@ impl PipelineExecutor {
                                 // evaluator borrow doesn't alias the
                                 // hash-table borrow.
                                 let matched_records: Vec<Record> = {
-                                    let probe_iter = hash_table
-                                        .probe(&probe_record, &probe_extractor, &ctx)
-                                        .map_err(|e| PipelineError::Compilation {
-                                            transform_name: name.clone(),
-                                            messages: vec![format!("combine probe error: {e}")],
-                                        })?;
+                                    let probe_iter = hash_table.probe(&probe_keys_buf);
                                     let mut matched: Vec<Record> = Vec::new();
                                     for candidate in probe_iter {
                                         if let Some(residual) = decomposed.residual.as_ref() {

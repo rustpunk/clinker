@@ -249,13 +249,16 @@ impl ProgramEvaluator {
     ) -> Result<Vec<GroupByKey>, EvalError> {
         match field {
             Some(name) => {
-                // Resolve from let-bindings first, then input fields
-                let val = env
-                    .get(name)
-                    .cloned()
-                    .or_else(|| resolver.resolve(name))
-                    .unwrap_or(Value::Null);
-                match value_to_group_key(&val, name, None, 0) {
+                // Resolve from let-bindings first, then input fields.
+                // `value_to_group_key` takes `&Value`, so the env and
+                // resolver hits can feed it by borrow without cloning;
+                // the null fallback hands out a reference to the
+                // shared `clinker_record::NULL` sentinel.
+                let val: &Value = match env.get(name) {
+                    Some(v) => v,
+                    None => resolver.resolve(name).unwrap_or(&clinker_record::NULL),
+                };
+                match value_to_group_key(val, name, None, 0) {
                     Ok(Some(gk)) => Ok(vec![gk]),
                     Ok(None) => Ok(vec![GroupByKey::Null]),
                     Err(e) => Err(group_key_error_to_eval_error(e)),
@@ -265,7 +268,7 @@ impl ProgramEvaluator {
                 // Bare distinct — hash all input fields
                 let mut key = Vec::new();
                 for (name, val) in resolver.iter_fields() {
-                    match value_to_group_key(&val, &name, None, 0) {
+                    match value_to_group_key(val, name, None, 0) {
                         Ok(Some(gk)) => key.push(gk),
                         Ok(None) => key.push(GroupByKey::Null),
                         Err(e) => return Err(group_key_error_to_eval_error(e)),
@@ -395,14 +398,19 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             if let Some(val) = env.get(&**name) {
                 return Ok(val.clone());
             }
-            // Then field resolver
-            Ok(resolver.resolve(name).unwrap_or(Value::Null))
+            // Then field resolver — clone only at the eval-site that
+            // keeps the value past the next resolve() call. Short-circuits
+            // inside coalesce / filter that borrow the return don't pay
+            // the clone (they're gone by the time the owned `Value` is
+            // constructed here).
+            Ok(resolver.resolve(name).cloned().unwrap_or(Value::Null))
         }
 
         Expr::QualifiedFieldRef { parts, .. } => {
             match parts.len() {
                 2 => Ok(resolver
                     .resolve_qualified(&parts[0], &parts[1])
+                    .cloned()
                     .unwrap_or(Value::Null)),
                 3 => {
                     // Three-part path: source.record_type.field
@@ -410,6 +418,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                     let compound = format!("{}.{}", &parts[0], &parts[1]);
                     Ok(resolver
                         .resolve_qualified(&compound, &parts[2])
+                        .cloned()
                         .unwrap_or(Value::Null))
                 }
                 _ => Ok(Value::Null),
@@ -428,6 +437,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             // Fall back to Record metadata (set by earlier transforms)
             Ok(resolver
                 .resolve(&format!("$meta.{field}"))
+                .cloned()
                 .unwrap_or(Value::Null))
         }
 

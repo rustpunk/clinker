@@ -54,14 +54,16 @@ mod tests {
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", bench_path.display()));
         assert!(!source.is_empty(), "empty bench file");
 
-        // All six functions required by the Phase C.0.5 spec.
+        // Five executor-strategy benches. `bench_combine_equi_2input`
+        // doubles as the regression gate against the preserved
+        // `target/criterion/lookup_baseline/10k_x_100k/lookup-v1`
+        // saved Criterion baseline.
         for func in [
             "fn bench_combine_equi_2input",
             "fn bench_combine_iejoin",
             "fn bench_combine_nary_3input",
             "fn bench_predicate_decomposition",
             "fn bench_combine_grace_hash",
-            "fn bench_lookup_baseline",
         ] {
             assert!(
                 source.contains(func),
@@ -69,7 +71,7 @@ mod tests {
             );
         }
 
-        // `criterion_group!` wires all 6 into the registered suite.
+        // `criterion_group!` wires every bench function into the suite.
         assert!(
             source.contains("criterion_group!"),
             "benches/combine.rs missing criterion_group! macro"

@@ -174,26 +174,24 @@ impl Record {
 }
 
 impl FieldResolver for Record {
-    fn resolve(&self, name: &str) -> Option<Value> {
+    fn resolve(&self, name: &str) -> Option<&Value> {
         // Handle $meta.* namespace: resolve from per-record metadata map.
         if let Some(meta_key) = name.strip_prefix("$meta.") {
-            return self.get_meta(meta_key).cloned();
+            return self.get_meta(meta_key);
         }
-        self.get(name).cloned()
+        self.get(name)
     }
 
-    fn resolve_qualified(&self, _source: &str, field: &str) -> Option<Value> {
-        self.get(field).cloned()
+    fn resolve_qualified(&self, _source: &str, field: &str) -> Option<&Value> {
+        self.get(field)
     }
 
     fn available_fields(&self) -> Vec<&str> {
         self.schema().columns().iter().map(|c| &**c).collect()
     }
 
-    fn iter_fields(&self) -> Vec<(String, Value)> {
-        self.iter_all_fields()
-            .map(|(name, val)| (name.to_string(), val.clone()))
-            .collect()
+    fn iter_fields(&self) -> Vec<(&str, &Value)> {
+        self.iter_all_fields().collect()
     }
 }
 
@@ -331,14 +329,14 @@ mod tests {
             schema,
             vec![Value::String("Ada".into()), Value::Integer(30)],
         );
-        assert_eq!(record.resolve("name"), Some(Value::String("Ada".into())));
-        assert_eq!(record.resolve("age"), Some(Value::Integer(30)));
+        assert_eq!(record.resolve("name"), Some(&Value::String("Ada".into())));
+        assert_eq!(record.resolve("age"), Some(&Value::Integer(30)));
         assert_eq!(record.resolve("unknown"), None);
 
         // Qualified lookup delegates to unqualified
         assert_eq!(
             record.resolve_qualified("any_source", "name"),
-            Some(Value::String("Ada".into()))
+            Some(&Value::String("Ada".into()))
         );
 
         let mut fields = record.available_fields();

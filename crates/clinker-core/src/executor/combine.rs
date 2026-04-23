@@ -165,20 +165,21 @@ impl<'a> CombineResolver<'a> {
     /// Fetch a bare field from the record on `side`. For the build
     /// side, `None` on the record itself means `on_miss: null_fields`
     /// is in force — the field is present in the merged row but has
-    /// no underlying value, so we surface `Value::Null`.
-    fn fetch(&self, side: JoinSide, bare_name: &str) -> Option<Value> {
+    /// no underlying value, so we surface `&clinker_record::NULL`
+    /// (the shared sentinel defined in `clinker_record::value`).
+    fn fetch(&self, side: JoinSide, bare_name: &str) -> Option<&Value> {
         match side {
-            JoinSide::Probe => self.probe_record.get(bare_name).cloned(),
+            JoinSide::Probe => self.probe_record.get(bare_name),
             JoinSide::Build => match self.build_record {
-                Some(rec) => rec.get(bare_name).cloned(),
-                None => Some(Value::Null),
+                Some(rec) => rec.get(bare_name),
+                None => Some(&clinker_record::NULL),
             },
         }
     }
 }
 
 impl FieldResolver for CombineResolver<'_> {
-    fn resolve(&self, name: &str) -> Option<Value> {
+    fn resolve(&self, name: &str) -> Option<&Value> {
         // $meta.* routes to the probe record's metadata; combine bodies
         // operate "in the frame of" the driving record, so meta reads
         // follow the driver.
@@ -189,7 +190,7 @@ impl FieldResolver for CombineResolver<'_> {
         self.fetch(*side, bare)
     }
 
-    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
+    fn resolve_qualified(&self, source: &str, field: &str) -> Option<&Value> {
         let qf = QualifiedField::qualified(source, field);
         let (side, bare) = self.mapping.qualified.get(&qf)?;
         self.fetch(*side, bare)
@@ -199,11 +200,22 @@ impl FieldResolver for CombineResolver<'_> {
         self.mapping.available.iter().map(String::as_str).collect()
     }
 
-    fn iter_fields(&self) -> Vec<(String, Value)> {
-        let mut out = Vec::with_capacity(self.mapping.qualified.len());
-        for (qf, (side, bare)) in &self.mapping.qualified {
-            if let Some(val) = self.fetch(*side, bare) {
-                out.push((qf.to_string(), val));
+    fn iter_fields(&self) -> Vec<(&str, &Value)> {
+        // `iter_fields` returns borrowed `&str` names. The mapping's
+        // `available` vec holds rendered `qualifier.name` strings with
+        // stable addresses (populated at mapping construction), so we
+        // borrow from it to tie the returned `&str` to `&self` without
+        // allocating a fresh `String` per call.
+        let mut out = Vec::with_capacity(self.mapping.available.len());
+        for qualified_name in &self.mapping.available {
+            let (q_part, n_part) = qualified_name
+                .split_once('.')
+                .expect("CombineResolverMapping renders every entry as `qualifier.name`");
+            let qf = QualifiedField::qualified(q_part, n_part);
+            if let Some((side, bare)) = self.mapping.qualified.get(&qf)
+                && let Some(val) = self.fetch(*side, bare)
+            {
+                out.push((qualified_name.as_str(), val));
             }
         }
         out
@@ -287,19 +299,19 @@ mod tests {
 
         assert_eq!(
             resolver.resolve_qualified("orders", "order_id"),
-            Some(Value::String("O1".into()))
+            Some(&Value::String("O1".into()))
         );
         assert_eq!(
             resolver.resolve_qualified("orders", "amount"),
-            Some(Value::Integer(100))
+            Some(&Value::Integer(100))
         );
         assert_eq!(
             resolver.resolve_qualified("products", "name"),
-            Some(Value::String("Widget".into()))
+            Some(&Value::String("Widget".into()))
         );
         assert_eq!(
             resolver.resolve_qualified("products", "price"),
-            Some(Value::Integer(9))
+            Some(&Value::Integer(9))
         );
     }
 
@@ -331,17 +343,17 @@ mod tests {
         let resolver = CombineResolver::new(&mapping, &orders_rec, Some(&products_rec));
 
         // Probe-side only
-        assert_eq!(resolver.resolve("amount"), Some(Value::Integer(100)));
+        assert_eq!(resolver.resolve("amount"), Some(&Value::Integer(100)));
         assert_eq!(
             resolver.resolve("order_id"),
-            Some(Value::String("O1".into()))
+            Some(&Value::String("O1".into()))
         );
         // Build-side only
         assert_eq!(
             resolver.resolve("name"),
-            Some(Value::String("Widget".into()))
+            Some(&Value::String("Widget".into()))
         );
-        assert_eq!(resolver.resolve("price"), Some(Value::Integer(9)));
+        assert_eq!(resolver.resolve("price"), Some(&Value::Integer(9)));
     }
 
     /// Ambiguous bare name: the typechecker rejects `product_id` as
@@ -403,19 +415,19 @@ mod tests {
         // Build-side qualified → Null
         assert_eq!(
             resolver.resolve_qualified("products", "name"),
-            Some(Value::Null)
+            Some(&Value::Null)
         );
         assert_eq!(
             resolver.resolve_qualified("products", "price"),
-            Some(Value::Null)
+            Some(&Value::Null)
         );
         // Probe-side qualified → actual value
         assert_eq!(
             resolver.resolve_qualified("orders", "amount"),
-            Some(Value::Integer(100))
+            Some(&Value::Integer(100))
         );
         // Bare build-side-only name → Null (unambiguous; builds routes to None record)
-        assert_eq!(resolver.resolve("name"), Some(Value::Null));
+        assert_eq!(resolver.resolve("name"), Some(&Value::Null));
     }
 
     #[test]
@@ -525,11 +537,11 @@ mod tests {
             let resolver = CombineResolver::new(&mapping, &orders_rec, Some(&products_rec));
             assert_eq!(
                 resolver.resolve_qualified("orders", "order_id"),
-                Some(Value::String(format!("O{i}").into()))
+                Some(&Value::String(format!("O{i}").into()))
             );
             assert_eq!(
                 resolver.resolve_qualified("products", "name"),
-                Some(Value::String("Widget".into()))
+                Some(&Value::String("Widget".into()))
             );
         }
     }
@@ -562,7 +574,11 @@ mod tests {
         );
         let resolver = CombineResolver::new(&mapping, &orders_rec, Some(&products_rec));
 
-        let fields: HashMap<String, Value> = resolver.iter_fields().into_iter().collect();
+        let fields: HashMap<String, Value> = resolver
+            .iter_fields()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
         assert_eq!(fields.len(), 6);
         assert_eq!(
             fields.get("orders.order_id"),

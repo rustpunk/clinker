@@ -219,8 +219,8 @@ mod tests {
         let record = reader.next_record().unwrap().unwrap();
 
         // Use FieldResolver trait methods
-        assert_eq!(record.resolve("name"), Some(Value::String("Ada".into())));
-        assert_eq!(record.resolve("age"), Some(Value::String("30".into())));
+        assert_eq!(record.resolve("name"), Some(&Value::String("Ada".into())));
+        assert_eq!(record.resolve("age"), Some(&Value::String("30".into())));
         assert_eq!(record.resolve("missing"), None);
     }
 }

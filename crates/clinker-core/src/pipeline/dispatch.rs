@@ -480,14 +480,16 @@ mod tests {
         use cxl::eval;
         use cxl::parser::Parser;
 
-        struct TestResolver;
+        struct TestResolver {
+            emp001: Value,
+        }
         impl FieldResolver for TestResolver {
-            fn resolve(&self, _name: &str) -> Option<Value> {
+            fn resolve(&self, _name: &str) -> Option<&Value> {
                 None
             }
-            fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
+            fn resolve_qualified(&self, source: &str, field: &str) -> Option<&Value> {
                 if source == "benefits.EEID" && field == "employee_id" {
-                    Some(Value::String("EMP001".into()))
+                    Some(&self.emp001)
                 } else {
                     None
                 }
@@ -495,7 +497,7 @@ mod tests {
             fn available_fields(&self) -> Vec<&str> {
                 vec![]
             }
-            fn iter_fields(&self) -> Vec<(String, Value)> {
+            fn iter_fields(&self) -> Vec<(&str, &Value)> {
                 vec![]
             }
         }
@@ -515,7 +517,9 @@ mod tests {
             cxl::typecheck::Row::closed(indexmap::IndexMap::new(), cxl::lexer::Span::new(0, 0));
         let typed = cxl::typecheck::pass::type_check(resolved, &schema).unwrap();
 
-        let resolver = TestResolver;
+        let resolver = TestResolver {
+            emp001: Value::String("EMP001".into()),
+        };
         let stable = eval::StableEvalContext::test_default();
         let ctx = eval::EvalContext::test_default_borrowed(&stable);
         let result =

@@ -119,6 +119,16 @@ impl fmt::Display for Value {
     }
 }
 
+/// Shared `Value::Null` sentinel used by `FieldResolver` implementations
+/// that need to hand out a `&Value` for a logically-absent field.
+///
+/// Lets `CombineResolver::resolve_qualified` surface
+/// `Some(&NULL)` for build-side lookups under `on_miss: null_fields`
+/// without materializing a fresh owned `Value::Null` per call —
+/// the trait surface returns borrowed values, and a constructed
+/// `Value` has no backing storage to borrow from.
+pub static NULL: Value = Value::Null;
+
 impl Value {
     /// Returns the CXL type name as a static string.
     pub fn type_name(&self) -> &'static str {

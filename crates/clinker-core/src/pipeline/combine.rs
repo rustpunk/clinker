@@ -403,25 +403,46 @@ impl KeyExtractor {
         self.programs.is_empty()
     }
 
-    /// Evaluate every key expression in order against `resolver + ctx`.
-    /// Returns one `Value` per expression. Propagates the first
-    /// [`EvalError`] unchanged — the executor is responsible for wrapping
-    /// it with `side: "driving"` / `side: "build"` context via
-    /// [`CombineError::KeyEvalFailed`].
+    /// Evaluate every key expression in order against `resolver + ctx`,
+    /// returning a freshly allocated `Vec<Value>`.
+    ///
+    /// Prefer [`KeyExtractor::extract_into`] on the probe hot path —
+    /// the buffer-reuse variant avoids one heap allocation per driver
+    /// row. This owned-return form stays for build-side extraction
+    /// (where the keys are stored into [`CombineHashTable::keys_cache`]
+    /// directly) and for test paths that want an owned vector.
+    ///
+    /// Propagates the first [`EvalError`] unchanged — the executor is
+    /// responsible for wrapping it with `side: "driving"` / `side:
+    /// "build"` context via [`CombineError::KeyEvalFailed`].
     ///
     /// **Window context:** combine's key extraction runs outside any
-    /// window, so `window: None` is passed through. The `NullStorage` type
-    /// parameter satisfies the generic bound without materializing any
-    /// storage — identical to the pattern used by the aggregator's free
-    /// `eval_expr` calls (`crates/clinker-core/src/aggregation.rs`).
+    /// window, so `window: None` is passed through. The `NullStorage`
+    /// type parameter satisfies the generic bound without materializing
+    /// any storage — identical to the pattern used by the aggregator's
+    /// free `eval_expr` calls (`crates/clinker-core/src/aggregation.rs`).
     pub fn extract(
         &self,
         ctx: &EvalContext<'_>,
         resolver: &dyn FieldResolver,
     ) -> Result<Vec<Value>, EvalError> {
+        let mut out = Vec::with_capacity(self.programs.len());
+        self.extract_into(ctx, resolver, &mut out)?;
+        Ok(out)
+    }
+
+    /// Evaluate every key expression in order, appending the results
+    /// onto `out`. The caller is responsible for clearing `out` if a
+    /// fresh vector is desired; the probe loop reuses a single buffer
+    /// across every driver row to avoid per-row heap allocation.
+    pub fn extract_into(
+        &self,
+        ctx: &EvalContext<'_>,
+        resolver: &dyn FieldResolver,
+        out: &mut Vec<Value>,
+    ) -> Result<(), EvalError> {
         let env: HashMap<String, Value> = HashMap::new();
         let meta_state: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        let mut out = Vec::with_capacity(self.programs.len());
         for kp in &self.programs {
             let v = eval_expr::<NullStorage>(
                 &kp.expr,
@@ -434,7 +455,7 @@ impl KeyExtractor {
             )?;
             out.push(v);
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -448,10 +469,10 @@ impl KeyExtractor {
 struct NullStorage;
 
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
         None
     }
     fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -636,52 +657,44 @@ impl CombineHashTable {
         Ok(table)
     }
 
-    /// Probe the table with a driving-side record.
+    /// Probe the table with pre-extracted driving-side key values.
     ///
-    /// **NULL probe short-circuit (SQL 3VL):** if any key value on the probe
-    /// side is [`Value::Null`], the returned iterator is empty — no hash
-    /// lookup is performed. This matches DataFusion and Spark join semantics
-    /// without canonicalizing NULL to a pseudo-value (which would produce
-    /// spurious matches with build-side NULLs).
+    /// The caller owns key extraction — this keeps a single reusable
+    /// `Vec<Value>` buffer across the entire probe stream rather than
+    /// allocating a fresh vector per driver row. At 100K driver rows on
+    /// the combine_equi_2input bench this eliminated one per-row heap
+    /// allocation and the matching drop.
+    ///
+    /// **NULL probe short-circuit (SQL 3VL):** if any key value on the
+    /// probe side is [`Value::Null`], the returned iterator is empty —
+    /// no hash lookup is performed. This matches DataFusion and Spark
+    /// join semantics without canonicalizing NULL to a pseudo-value
+    /// (which would produce spurious matches with build-side NULLs).
     ///
     /// The returned iterator yields only candidates that pass BOTH the
-    /// hash bucket AND full-key equality verification — the executor never
+    /// hash bucket AND full-key equality verification — the caller never
     /// sees hash-collision false positives.
-    pub fn probe<'a>(
-        &'a self,
-        record: &Record,
-        extractor: &KeyExtractor,
-        ctx: &EvalContext<'_>,
-    ) -> Result<ProbeIter<'a>, CombineError> {
-        let probe_keys =
-            extractor
-                .extract(ctx, record)
-                .map_err(|e| CombineError::KeyEvalFailed {
-                    source: e,
-                    side: "driving",
-                })?;
-
+    pub fn probe<'a>(&'a self, probe_keys: &'a [Value]) -> ProbeIter<'a> {
         if probe_keys.iter().any(|v| matches!(v, Value::Null)) {
-            // 3VL short-circuit.
-            return Ok(ProbeIter {
+            return ProbeIter {
                 table: self,
                 probe_keys,
                 current: SENTINEL,
-            });
+            };
         }
 
-        let hash = hash_composite_key(&probe_keys, &self.hash_state);
+        let hash = hash_composite_key(probe_keys, &self.hash_state);
         let head = self
             .index
             .find(hash, |&(stored_hash, _)| stored_hash == hash)
             .map(|&(_, h)| h)
             .unwrap_or(SENTINEL);
 
-        Ok(ProbeIter {
+        ProbeIter {
             table: self,
             probe_keys,
             current: head,
-        })
+        }
     }
 
     /// Total bytes of owned memory. Sums all four allocation sources —
@@ -727,7 +740,7 @@ impl CombineHashTable {
 /// positives.
 pub struct ProbeIter<'a> {
     table: &'a CombineHashTable,
-    probe_keys: Vec<Value>,
+    probe_keys: &'a [Value],
     current: u32,
 }
 
@@ -743,7 +756,7 @@ impl<'a> Iterator for ProbeIter<'a> {
             self.current = self.table.chain[idx];
 
             let build_keys = &self.table.keys_cache[idx];
-            if keys_equal_canonicalized(&self.probe_keys, build_keys) {
+            if keys_equal_canonicalized(self.probe_keys, build_keys) {
                 return Some(ProbeCandidate {
                     index: idx,
                     record: &self.table.records[idx],
@@ -1283,6 +1296,20 @@ mod tests {
         cxl::eval::StableEvalContext::test_default()
     }
 
+    /// Extract the probe keys for `record` via `extractor` and hand them
+    /// back to the test. Tests keep the returned `Vec<Value>` alive until
+    /// after `ProbeIter` collection finishes so the iterator's
+    /// `&'a [Value]` borrow stays valid.
+    fn probe_keys_for(
+        extractor: &KeyExtractor,
+        ctx: &cxl::eval::EvalContext<'_>,
+        record: &Record,
+    ) -> Vec<Value> {
+        extractor
+            .extract(ctx, record)
+            .expect("probe key extraction")
+    }
+
     #[test]
     fn test_combine_hash_table_build_probe_exact() {
         let schema = test_schema(&["id", "name"]);
@@ -1307,9 +1334,10 @@ mod tests {
 
         // Probe for id=42 → exactly one match.
         let probe = mk_record(&schema, vec![Value::Integer(42), Value::Null]);
-        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+        let matches: Vec<_> = table.probe(&probe_keys).collect();
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].record.resolve("id"), Some(Value::Integer(42)));
+        assert_eq!(matches[0].record.resolve("id"), Some(&Value::Integer(42)));
     }
 
     #[test]
@@ -1329,11 +1357,11 @@ mod tests {
         let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(5), Value::Null]);
+        let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
         let mut got_vals: Vec<String> = table
-            .probe(&probe, &extractor, &ctx)
-            .unwrap()
+            .probe(&probe_keys)
             .map(|c| match c.record.resolve("val") {
-                Some(Value::String(s)) => s.into_string(),
+                Some(Value::String(s)) => s.to_string(),
                 _ => panic!("expected String val"),
             })
             .collect();
@@ -1352,7 +1380,8 @@ mod tests {
         let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(9999)]);
-        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+        let matches: Vec<_> = table.probe(&probe_keys).collect();
         assert!(matches.is_empty());
     }
 
@@ -1381,10 +1410,8 @@ mod tests {
 
         // Probe with Value::Null key → short-circuit, zero matches.
         let null_probe = mk_record(&schema, vec![Value::Null, Value::Null]);
-        let nm: Vec<_> = table
-            .probe(&null_probe, &extractor, &ctx)
-            .unwrap()
-            .collect();
+        let null_probe_keys = probe_keys_for(&extractor, &ctx, &null_probe);
+        let nm: Vec<_> = table.probe(&null_probe_keys).collect();
         assert!(
             nm.is_empty(),
             "NULL probe must not match even a NULL build key"
@@ -1392,7 +1419,8 @@ mod tests {
 
         // Sanity: non-null probe still finds the non-null build record.
         let probe = mk_record(&schema, vec![Value::Integer(1), Value::Null]);
-        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+        let matches: Vec<_> = table.probe(&probe_keys).collect();
         assert_eq!(matches.len(), 1);
     }
 
@@ -1421,7 +1449,8 @@ mod tests {
         // These keys are NOT in the build set.
         for missing_key in [1000i64, 10_000, -1, -999] {
             let probe = mk_record(&schema, vec![Value::Integer(missing_key)]);
-            let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+            let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+            let matches: Vec<_> = table.probe(&probe_keys).collect();
             assert!(
                 matches.is_empty(),
                 "probe for missing key {missing_key} yielded {} false positives",
@@ -1432,7 +1461,8 @@ mod tests {
         // And confirm every PRESENT key finds exactly one match.
         for present in [0i64, 1, 42, 999] {
             let probe = mk_record(&schema, vec![Value::Integer(present)]);
-            let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+            let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+            let matches: Vec<_> = table.probe(&probe_keys).collect();
             assert_eq!(matches.len(), 1, "probe for {present} must find exactly 1");
         }
     }
@@ -1606,7 +1636,8 @@ mod tests {
         assert_eq!(table.len(), 0);
 
         let probe = mk_record(&schema, vec![Value::Integer(42)]);
-        let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+        let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+        let matches: Vec<_> = table.probe(&probe_keys).collect();
         assert!(matches.is_empty());
     }
 
@@ -1632,7 +1663,8 @@ mod tests {
 
         for key in [0i64, 500, 9999] {
             let probe = mk_record(&schema, vec![Value::Integer(key)]);
-            let matches: Vec<_> = table.probe(&probe, &extractor, &ctx).unwrap().collect();
+            let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+            let matches: Vec<_> = table.probe(&probe_keys).collect();
             assert_eq!(
                 matches.len(),
                 1,
@@ -1694,14 +1726,14 @@ mod tests {
 
             // For every key in the universe PLUS a few definitely-missing
             // keys, probe and compare to the gold set.
-            let mut probe_keys: Vec<i64> = (0..key_universe_size).collect();
-            probe_keys.extend([
+            let mut probe_test_keys: Vec<i64> = (0..key_universe_size).collect();
+            probe_test_keys.extend([
                 key_universe_size,       // just out of range
                 key_universe_size + 100, // far out of range
                 -1,                      // negative, never inserted
             ]);
 
-            for probe_k in probe_keys {
+            for probe_k in probe_test_keys {
                 // Gold: set of tags whose record has key == probe_k.
                 let mut expected_tags: Vec<u64> = build
                     .iter()
@@ -1711,10 +1743,8 @@ mod tests {
                 expected_tags.sort_unstable();
 
                 let probe = mk_record(&schema, vec![Value::Integer(probe_k), Value::Null]);
-                let matches: Vec<ProbeCandidate> = table
-                    .probe(&probe, &extractor, &ctx)
-                    .expect("probe")
-                    .collect();
+                let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+                let matches: Vec<ProbeCandidate> = table.probe(&probe_keys).collect();
 
                 // Cardinality check first — catches both phantom matches
                 // and missed matches.
@@ -1730,7 +1760,7 @@ mod tests {
                 let mut got_tags: Vec<u64> = matches
                     .iter()
                     .map(|m| match m.record.resolve("tag") {
-                        Some(Value::Integer(t)) => t as u64,
+                        Some(Value::Integer(t)) => *t as u64,
                         other => panic!("tag must be Integer, got {other:?}"),
                     })
                     .collect();
@@ -1747,7 +1777,7 @@ mod tests {
                     let build_key = c.record.resolve("k");
                     assert_eq!(
                         build_key,
-                        Some(Value::Integer(probe_k)),
+                        Some(&Value::Integer(probe_k)),
                         "seed={seed} probe_k={probe_k}: matched record has wrong key {build_key:?}"
                     );
                 }

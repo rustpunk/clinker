@@ -110,12 +110,12 @@ impl Arena {
 }
 
 impl RecordStorage for Arena {
-    fn resolve_field(&self, index: u32, name: &str) -> Option<Value> {
+    fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
         let col = self.schema.index(name)?;
-        self.records.get(index as usize)?.get(col).cloned()
+        self.records.get(index as usize)?.get(col)
     }
 
-    fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<&Value> {
         None // Arena is single-source; qualified lookups go through PartitionLookup
     }
 
@@ -239,7 +239,7 @@ mod tests {
         // Projected fields resolve correctly
         assert_eq!(
             arena.resolve_field(0, "dept"),
-            Some(Value::String("A".into()))
+            Some(&Value::String("A".into()))
         );
     }
 
@@ -256,8 +256,8 @@ mod tests {
         .unwrap();
 
         let view = RecordView::new(&arena, 5);
-        assert_eq!(view.resolve("dept"), Some(Value::String("F".into())));
-        assert_eq!(view.resolve("amount"), Some(Value::String("600".into())));
+        assert_eq!(view.resolve("dept"), Some(&Value::String("F".into())));
+        assert_eq!(view.resolve("amount"), Some(&Value::String("600".into())));
     }
 
     #[test]

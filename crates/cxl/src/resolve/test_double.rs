@@ -19,7 +19,7 @@ mod tests {
             Value::String("Ada".into()),
         )]));
         let dyn_ref: &dyn FieldResolver = &resolver;
-        assert_eq!(dyn_ref.resolve("name"), Some(Value::String("Ada".into())));
+        assert_eq!(dyn_ref.resolve("name"), Some(&Value::String("Ada".into())));
     }
 
     /// WindowContext must be object-safe for dynamic dispatch in the evaluator.
@@ -29,10 +29,10 @@ mod tests {
         #[allow(dead_code)]
         struct DummyStorage;
         impl RecordStorage for DummyStorage {
-            fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+            fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
                 None
             }
-            fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+            fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
                 None
             }
             fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn test_hashmap_resolver_unqualified() {
         let resolver = HashMapResolver::new(HashMap::from([("age".into(), Value::Integer(30))]));
-        assert_eq!(resolver.resolve("age"), Some(Value::Integer(30)));
+        assert_eq!(resolver.resolve("age"), Some(&Value::Integer(30)));
     }
 
     /// Qualified lookup returns stored value.
@@ -59,7 +59,7 @@ mod tests {
             HashMapResolver::new(HashMap::new()).with_qualified("src", "field", Value::Bool(true));
         assert_eq!(
             resolver.resolve_qualified("src", "field"),
-            Some(Value::Bool(true))
+            Some(&Value::Bool(true))
         );
     }
 

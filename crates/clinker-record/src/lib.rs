@@ -26,4 +26,4 @@ pub use record_view::RecordView;
 pub use resolver::{FieldResolver, HashMapResolver, WindowContext};
 pub use schema::Schema;
 pub use storage::RecordStorage;
-pub use value::Value;
+pub use value::{NULL, Value};
