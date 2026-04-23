@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 
 use clinker_core::config::{CompileContext, PipelineConfig, parse_config};
-use clinker_core::plan::execution::{NodeExecutionReqs, ParallelismClass, PlanNode};
+use clinker_core::plan::execution::{
+    ExecutionPlanDag, NodeExecutionReqs, ParallelismClass, PlanNode,
+};
 
 fn workspace_root() -> PathBuf {
     // Crate manifest dir is `<workspace>/crates/clinker-core`; pop twice.
@@ -281,5 +283,194 @@ fn test_path_a_combine_strategies_selected_on_enriched_dag() {
         dag.node_properties.len(),
         dag.graph.node_count(),
         "combine post-pass must run after compute_node_properties"
+    );
+}
+
+// ───────────────────── Canonical DAG shape snapshots ─────────────────────
+
+/// Canonical textual rendering of an `ExecutionPlanDag`: one line per
+/// node in topological order, each line `[type] name <- pred1, pred2`.
+/// Predecessors are sorted alphabetically so the output is stable across
+/// runs regardless of petgraph's internal iteration order. This is a
+/// lossy projection — it captures the topology (node set + edges) but
+/// deliberately omits enrichment-derived fields (parallelism, indices,
+/// node_properties) that other tests in this file already assert.
+fn canonical_dag_shape(dag: &ExecutionPlanDag) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for &idx in &dag.topo_order {
+        let node = &dag.graph[idx];
+        let mut preds: Vec<&str> = dag
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .map(|p| dag.graph[p].name())
+            .collect();
+        preds.sort();
+        if preds.is_empty() {
+            writeln!(out, "[{}] {}", node.type_tag(), node.name()).unwrap();
+        } else {
+            writeln!(
+                out,
+                "[{}] {} <- {}",
+                node.type_tag(),
+                node.name(),
+                preds.join(", ")
+            )
+            .unwrap();
+        }
+    }
+    out
+}
+
+/// Canonical DAG shape for a representative corpus of pipelines.
+///
+/// Existing pre-lift baselines capture the `--explain` projection of
+/// each pipeline, which elides the raw topology behind a human-readable
+/// formatter. This snapshot captures the topology itself — node set,
+/// edges, topological order — so structural changes to the compile
+/// pipeline fail this test even when the explain formatter masks them.
+#[test]
+fn test_canonical_dag_shape_baselines() {
+    let cases = &[
+        (
+            "csv_transform_sink",
+            "examples/pipelines/tests/baseline/csv_transform_sink.yaml",
+        ),
+        (
+            "route_fanout",
+            "examples/pipelines/tests/baseline/route_fanout.yaml",
+        ),
+        (
+            "aggregate_windowed",
+            "examples/pipelines/tests/baseline/aggregate_windowed.yaml",
+        ),
+        (
+            "combine_two_input_equi",
+            "crates/clinker-core/tests/fixtures/combine/two_input_equi.yaml",
+        ),
+        (
+            "combine_two_input_mixed",
+            "crates/clinker-core/tests/fixtures/combine/two_input_mixed.yaml",
+        ),
+    ];
+    for (name, path) in cases {
+        let plan = compile_fixture_with(path, |c| c.allow_absolute_paths = true);
+        let shape = canonical_dag_shape(plan.dag());
+        insta::assert_snapshot!(format!("canonical_dag_{name}"), shape);
+    }
+}
+
+// ───────────────────── Multi-consumer Merge fan-out ─────────────────────
+
+/// A user-declared Merge with multiple downstream consumers compiles to
+/// a single `PlanNode::Merge` with one outgoing edge per consumer — not
+/// a per-consumer synthetic Merge fan-out. This guards against a
+/// prior compile path that emitted `merge_<transform>` synthetic Merge
+/// nodes per downstream Transform. Under the unified taxonomy the
+/// user's Merge is first-class; downstream consumers reference it by
+/// name.
+///
+/// Scope: compile-only. The executor's fan-out-by-clone is exercised
+/// end-to-end by other tests that share a Transform predecessor across
+/// multiple Outputs; a shared-Merge runtime assertion would require
+/// CSV writers to derive their output schema from the Merge's union
+/// inputs, which is not currently handled without an intervening
+/// projection. Covering that path is a runtime-correctness task
+/// independent of this structural gate.
+#[test]
+fn test_multi_consumer_merge_compiles_to_single_node() {
+    let yaml = r#"
+pipeline:
+  name: merge_fanout
+nodes:
+  - type: source
+    name: east
+    config:
+      name: east
+      type: csv
+      path: east.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: west
+    config:
+      name: west
+      type: csv
+      path: west.csv
+      schema:
+        - { name: id, type: string }
+  - type: merge
+    name: combined
+    inputs: [east, west]
+  - type: transform
+    name: passthrough_a
+    input: combined
+    config:
+      cxl: |
+        emit id = id
+  - type: transform
+    name: passthrough_b
+    input: combined
+    config:
+      cxl: |
+        emit id = id
+  - type: output
+    name: out_a
+    input: passthrough_a
+    config:
+      name: out_a
+      type: csv
+      path: out_a.csv
+  - type: output
+    name: out_b
+    input: passthrough_b
+    config:
+      name: out_b
+      type: csv
+      path: out_b.csv
+"#;
+    let config: PipelineConfig =
+        parse_config(yaml).unwrap_or_else(|e| panic!("parse_config: {e:?}"));
+    let mut ctx = CompileContext::default();
+    ctx.allow_absolute_paths = true;
+    let plan = config
+        .compile(&ctx)
+        .unwrap_or_else(|diags| panic!("compile merge_fanout: {diags:?}"));
+    let dag = plan.dag();
+
+    // Exactly one Merge in the compiled DAG (no per-consumer synthesis).
+    let merge_count = dag
+        .graph
+        .node_weights()
+        .filter(|n| matches!(n, PlanNode::Merge { .. }))
+        .count();
+    assert_eq!(
+        merge_count, 1,
+        "expected exactly one Merge node (shared between both consumers); got {merge_count}"
+    );
+
+    // The Merge fans out to both consumers via two outgoing edges.
+    let merge_idx = dag
+        .graph
+        .node_indices()
+        .find(|&i| matches!(&dag.graph[i], PlanNode::Merge { .. }))
+        .expect("merge node present");
+    let outgoing: Vec<&str> = dag
+        .graph
+        .neighbors_directed(merge_idx, petgraph::Direction::Outgoing)
+        .map(|c| dag.graph[c].name())
+        .collect();
+    assert_eq!(
+        outgoing.len(),
+        2,
+        "Merge must have 2 outgoing edges (one per consumer); got {outgoing:?}"
+    );
+    assert!(
+        outgoing.contains(&"passthrough_a"),
+        "Merge outgoing must include passthrough_a; got {outgoing:?}"
+    );
+    assert!(
+        outgoing.contains(&"passthrough_b"),
+        "Merge outgoing must include passthrough_b; got {outgoing:?}"
     );
 }

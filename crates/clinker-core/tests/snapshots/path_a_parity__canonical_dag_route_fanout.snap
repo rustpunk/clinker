@@ -1,0 +1,9 @@
+---
+source: crates/clinker-core/tests/path_a_parity.rs
+expression: shape
+---
+[source] orders
+[transform] classify <- orders
+[route] classify_route <- classify
+[output] low <- classify_route
+[output] high <- classify_route

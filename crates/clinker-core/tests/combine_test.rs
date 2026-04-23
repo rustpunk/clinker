@@ -749,8 +749,14 @@ mod tests {
     /// lower to `PlanNode::Combine` in stage 5 via
     /// `lower_node_to_plan_node`.
     fn compile_plan(config: &PipelineConfig) -> ExecutionPlanDag {
+        // Combine fixtures declare output paths under /tmp/ (standard test
+        // scratch directory); opt in to absolute paths so E-SEC-001 does
+        // not reject them here. Production CLI sets this via
+        // `--allow-absolute-paths` / `CLINKER_ALLOW_ABSOLUTE_PATHS`.
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
         config
-            .compile(&clinker_core::config::CompileContext::default())
+            .compile(&ctx)
             .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
             .dag()
             .clone()
@@ -802,58 +808,77 @@ mod tests {
         );
     }
 
-    /// Gate test: a 3-input combine has exactly 3 incoming `Data` edges.
-    /// Uses the `three_input_shared_key.yaml` fixture whose combine node
-    /// `fully_enriched` pulls from `orders`, `products`, and `categories`.
+    /// The planner only supports binary (2-input) combines. A fixture
+    /// declaring 3 inputs must be rejected at compile time with E312
+    /// until N-ary decomposition support lands. When that support does
+    /// land, this test will start failing and needs to be rewritten to
+    /// assert the 3-incoming-edge DAG shape directly.
     #[test]
-    fn test_combine_dag_edges_three_input() {
+    fn test_combine_e312_three_input_rejected() {
         let yaml = load_fixture("three_input_shared_key.yaml");
         let config = parse_fixture(&yaml);
-        let plan = compile_plan(&config);
-
-        let combine_idx = find_combine_node(&plan, "fully_enriched");
-        let incoming = plan
-            .graph
-            .edges_directed(combine_idx, Direction::Incoming)
-            .count();
-        assert_eq!(
-            incoming, 3,
-            "three_input_shared_key: combine 'fully_enriched' should have 3 incoming edges, got {incoming}"
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        let diags = config
+            .compile(&ctx)
+            .expect_err("3-input combine must be rejected while planner is binary-only");
+        assert!(
+            diags.iter().any(|d| d.code == "E312"),
+            "expected E312 for 3-input combine; got {diags:?}"
         );
     }
 
-    /// Sanity sweep (not a gate test): verify every combine fixture in
-    /// the corpus compiles through `ExecutionPlanDag::compile` without
-    /// emitting E307 (undeclared upstream). `error_one_input.yaml` is
-    /// structurally 1-input but that is still a valid reference — E300
-    /// ("fewer than 2 inputs") fires in C.1 via bind_schema, not at DAG
-    /// wiring. All declared upstreams resolve via `resolve_any_node`.
+    /// A combine where-clause needs at least one cross-input equality to
+    /// drive the `HashBuildProbe` planner. A pure-range fixture is
+    /// rejected at compile time with E313 until the sort-merge / iejoin
+    /// planner lands. When that support arrives, this test needs to be
+    /// rewritten or removed in favor of an end-to-end range-combine
+    /// assertion.
     #[test]
-    fn test_all_combine_fixtures_compile_through_dag() {
+    fn test_combine_e313_pure_range_rejected() {
+        let yaml = load_fixture("two_input_range.yaml");
+        let config = parse_fixture(&yaml);
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        let diags = config
+            .compile(&ctx)
+            .expect_err("pure-range combine must be rejected by the binary hash planner");
+        assert!(
+            diags.iter().any(|d| d.code == "E313"),
+            "expected E313 for pure-range combine; got {diags:?}"
+        );
+    }
+
+    /// Sweep of combine fixtures that compile all the way through the
+    /// canonical path under the current feature set: 2-input equi,
+    /// 2-input mixed-predicate, match-mode variants, on-miss variants,
+    /// and drive-hint. Pure-range, 3+-input, and 1-input fixtures are
+    /// held out in their own dedicated gate tests because they
+    /// intentionally fail to compile — the first two until the
+    /// sort-merge / iejoin and N-ary combine planners land, the last
+    /// as the fixture for the combine-requires-at-least-2-inputs rule.
+    #[test]
+    fn test_currently_supported_combine_fixtures_compile() {
         let fixtures = [
             "two_input_equi.yaml",
-            "two_input_range.yaml",
             "two_input_mixed.yaml",
-            "three_input_shared_key.yaml",
             "match_all.yaml",
             "match_collect.yaml",
             "on_miss_skip.yaml",
             "on_miss_error.yaml",
             "drive_hint.yaml",
-            "error_one_input.yaml",
         ];
+        // Combine fixture outputs live under /tmp/; opt in to absolute
+        // paths so E-SEC-001 does not reject them in test.
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
         for name in fixtures {
             let yaml = load_fixture(name);
             let config = parse_fixture(&yaml);
-            let plan = config
-                .compile(&clinker_core::config::CompileContext::default())
-                .unwrap_or_else(|diags| {
-                    panic!("fixture {name}: compile failed with {diags:?}");
-                });
+            let plan = config.compile(&ctx).unwrap_or_else(|diags| {
+                panic!("fixture {name}: compile failed with {diags:?}");
+            });
             let plan = plan.dag();
-            // Each fixture has exactly one combine node; find it and assert
-            // it has at least one incoming edge (one for error_one_input,
-            // ≥2 for the rest).
             let combine_count = plan
                 .graph
                 .node_weights()
