@@ -2842,6 +2842,90 @@ nodes:
         );
     }
 
+    /// MemoryBudget abort — a 1-byte hard limit forces
+    /// `MemoryBudget::should_abort` to return true on the first poll
+    /// inside `CombineHashTable::build` (process RSS trivially exceeds
+    /// 1 byte). The build's safety-net final check fires for the small
+    /// build set, the executor wraps `CombineError::MemoryLimitExceeded`
+    /// as `PipelineError::Compilation` with an `E310 combine build:
+    /// ...` message, and that surfaces in the run error string.
+    ///
+    /// Mirrors the build-side regression test in
+    /// `pipeline/combine.rs::test_combine_hash_table_oom_aborts_during_build`,
+    /// but exercised end-to-end through the combine executor arm so a
+    /// regression in the arm's error mapping (E310 → generic message)
+    /// is caught here.
+    ///
+    /// Skipped silently when `rss_bytes()` is unavailable on the host
+    /// platform — the same gate the unit test uses, applied via
+    /// `clinker_core::pipeline::memory::rss_bytes()`.
+    #[test]
+    fn test_combine_exec_e310_memory_abort() {
+        if clinker_core::pipeline::memory::rss_bytes().is_none() {
+            return;
+        }
+        let yaml = r#"
+pipeline:
+  name: combine_exec_e310
+  memory_limit: "1"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+  - type: output
+    name: enriched_out
+    input: enriched
+    config:
+      name: enriched_out
+      type: csv
+      path: enriched.csv
+"#;
+        let err = run_combine_fixture(
+            yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect_err("1-byte memory_limit must abort combine with E310");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("E310"),
+            "memory abort must surface E310; got: {msg}",
+        );
+        assert!(
+            msg.contains("memory limit exceeded") || msg.contains("combine build"),
+            "E310 message must mention the combine memory abort; got: {msg}",
+        );
+    }
+
     /// Residual predicate — equi predicate + a range residual. The
     /// range is a cross-input comparison so it lands as a RangeConjunct
     /// (not residual in the strict sense); build a pipeline where the

@@ -3904,17 +3904,26 @@ impl PipelineExecutor {
                         CombineResolverMapping::new(combine_inputs, driving_input);
 
                     // Hash-build phase — drain the build buffer into a
-                    // fresh MemoryBudget-governed CombineHashTable.
+                    // fresh MemoryBudget-governed CombineHashTable. The
+                    // stage timer covers the full build walk; on a
+                    // budget abort the timer is dropped without
+                    // recording (matches the `StageTimer` "no report on
+                    // error" contract documented at its definition).
                     let mut budget =
                         MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
                     let build_records: Vec<Record> =
                         build_buf.into_iter().map(|(r, _, _, _)| r).collect();
+                    let build_records_in = build_records.len() as u64;
                     let estimated_rows = Some(build_records.len());
                     let hash_table_ctx = EvalContext {
                         stable: &stable,
                         source_file: &source_file_arc,
                         source_row: 0,
                     };
+                    let build_timer =
+                        stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
+                            name: name.clone(),
+                        });
                     let hash_table = CombineHashTable::build(
                         build_records,
                         &build_extractor,
@@ -3926,6 +3935,8 @@ impl PipelineExecutor {
                         transform_name: name.clone(),
                         messages: vec![format!("E310 combine build: {e}")],
                     })?;
+                    let build_records_out = hash_table.len() as u64;
+                    collector.record(build_timer.finish(build_records_in, build_records_out));
 
                     // Body evaluator (only used when the body is not
                     // empty — `match: collect` leaves it empty).
@@ -3934,7 +3945,15 @@ impl PipelineExecutor {
                         .as_ref()
                         .map(|bt| ProgramEvaluator::new(Arc::clone(bt), false));
 
-                    // Per-driver probe loop.
+                    // Per-driver probe loop. Stage timer covers the
+                    // full per-driver iteration; on early-return via the
+                    // 10K-cadence E310 abort or a residual/body eval
+                    // error, the timer is dropped without recording.
+                    let probe_records_in = driver_buf.len() as u64;
+                    let probe_timer =
+                        stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
+                            name: name.clone(),
+                        });
                     let mut output_records = Vec::with_capacity(driver_buf.len());
                     let mut emitted_since_check: usize = 0;
 
@@ -4203,11 +4222,12 @@ impl PipelineExecutor {
                         }
 
                         // Budget check every 10K emitted records to
-                        // bound memory under fan-out. Full stage-
-                        // specific MemoryBudget attribution lands in
-                        // the follow-up commit alongside the
-                        // `CombineBuild` / `CombineProbe` stage
-                        // variants.
+                        // bound memory under fan-out. The build phase
+                        // polls `should_abort` every 10K inserts inside
+                        // `CombineHashTable::build`; this loop covers
+                        // the symmetric probe-side risk where a small
+                        // build × large driver fan-out can blow RSS
+                        // even though the table itself is bounded.
                         if emitted_since_check >= 10_000 && budget.should_abort() {
                             return Err(PipelineError::Compilation {
                                 transform_name: name.clone(),
@@ -4223,6 +4243,8 @@ impl PipelineExecutor {
                         }
                     }
 
+                    let probe_records_out = output_records.len() as u64;
+                    collector.record(probe_timer.finish(probe_records_in, probe_records_out));
                     node_buffers.insert(node_idx, output_records);
                 }
             }
