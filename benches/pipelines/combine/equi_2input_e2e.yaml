@@ -1,5 +1,5 @@
 pipeline:
-  name: bench-lookup-enrichment
+  name: bench-combine-equi-2input-e2e
 
 nodes:
   - type: source

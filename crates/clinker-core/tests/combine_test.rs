@@ -2171,7 +2171,7 @@ nodes:
 "#
     }
 
-    /// Inline variant of the `benches/pipelines/realistic/lookup_enrichment.yaml`
+    /// Inline variant of the `benches/pipelines/combine/equi_2input_e2e.yaml`
     /// pattern with route splitting on whether a match was found.
     /// Path scheme changed from `bench://` to plain relative paths
     /// (the test harness injects in-memory readers by source name).
@@ -2282,9 +2282,10 @@ nodes:
         assert_records_match(priority, &expected_priority);
     }
 
-    /// Multi-output lookup_enrichment bench pattern — combine output
-    /// split by route on whether the match produced a non-UNKNOWN
-    /// product_name. Asserts both outputs against the stored baselines.
+    /// Multi-output equi-2-input combine enrichment bench pattern —
+    /// combine output split by route on whether the match produced a
+    /// non-UNKNOWN product_name. Asserts both outputs against the
+    /// stored baselines.
     #[test]
     fn test_combine_baseline_enrichment() {
         let orders = concat!(
