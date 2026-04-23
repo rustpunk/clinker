@@ -849,6 +849,89 @@ mod tests {
         );
     }
 
+    /// Gate: serialized `ExecutionPlanDag` JSON for a 2-input equi
+    /// combine surfaces the planner-selected strategy, the chosen
+    /// driving input, the build-side inputs, and the decomposed
+    /// predicate shape. This is the contract Kiln's canvas consumes
+    /// via `clinker explain --format json`.
+    #[test]
+    fn test_combine_explain_shows_strategy() {
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+
+        let json: serde_json::Value =
+            serde_json::to_value(&plan).expect("ExecutionPlanDag must serialize cleanly");
+        let nodes = json["nodes"]
+            .as_array()
+            .expect("explain JSON carries a nodes array");
+
+        let combine = nodes
+            .iter()
+            .find(|n| n["type"] == "combine" && n["name"] == "enriched")
+            .unwrap_or_else(|| panic!("no combine node named 'enriched' in nodes: {nodes:#?}"));
+
+        assert_eq!(
+            combine["strategy"], "hash_build_probe",
+            "strategy must be hash_build_probe for pure-equi 2-input combine; got {combine:#?}"
+        );
+
+        let driving = combine["driving_input"]
+            .as_str()
+            .unwrap_or_else(|| panic!("driving_input must be a string; got {combine:#?}"));
+        assert!(
+            !driving.is_empty(),
+            "driving_input must be stamped by select_combine_strategies; got empty: {combine:#?}"
+        );
+
+        let build = combine["build_inputs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("build_inputs must be an array; got {combine:#?}"));
+        assert!(
+            !build.is_empty(),
+            "build_inputs must contain at least one non-driver input; got empty: {combine:#?}"
+        );
+        for bi in build {
+            let bi_str = bi.as_str().expect("build_inputs entries are strings");
+            assert_ne!(
+                bi_str, driving,
+                "build_inputs must not contain the driver {driving:?}; got {build:#?}"
+            );
+        }
+        // The two-input_equi fixture declares `orders` and `products`;
+        // together with the driver this must cover the full input set.
+        let mut all_inputs: Vec<&str> = build.iter().map(|v| v.as_str().unwrap()).collect();
+        all_inputs.push(driving);
+        all_inputs.sort();
+        assert_eq!(
+            all_inputs,
+            vec!["orders", "products"],
+            "driver + build_inputs must reconstruct the combine's declared inputs"
+        );
+
+        let summary = &combine["predicate_summary"];
+        assert!(
+            summary.is_object(),
+            "predicate_summary must be an object; got {summary:#?}"
+        );
+        let equalities = summary["equalities"].as_u64().unwrap_or_else(|| {
+            panic!("predicate_summary.equalities must be a number; got {summary:#?}")
+        });
+        assert!(
+            equalities >= 1,
+            "two_input_equi has one `==` conjunct so equalities must be >= 1; got {equalities}"
+        );
+        assert_eq!(
+            summary["ranges"].as_u64().unwrap(),
+            0,
+            "two_input_equi has no range conjuncts"
+        );
+        assert!(
+            !summary["has_residual"].as_bool().unwrap(),
+            "two_input_equi predicate decomposes fully; residual must be absent"
+        );
+    }
+
     /// Sweep of combine fixtures that compile all the way through the
     /// canonical path under the current feature set: 2-input equi,
     /// 2-input mixed-predicate, match-mode variants, on-miss variants,

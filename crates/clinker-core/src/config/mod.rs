@@ -2082,23 +2082,37 @@ pub(crate) fn lower_node_to_plan_node(
                 qualified_sort_order: None,
             })
         }
-        // Phase Combine C.0.2: Combine lowers to PlanNode::Combine.
-        // V-1-1 side-table architecture: only --explain-visible and
-        // parse-time-available fields live inline. strategy defaults
-        // to HashBuildProbe (C.2 post-pass overwrites via
-        // select_combine_strategies); driving_input is empty until
-        // C.2 selects; decomposed_from is always None for
-        // user-authored nodes (C.4 sets it for synthetic binary nodes
-        // produced by N-ary decomposition). typed::where / typed::body
-        // and DecomposedPredicate / CombineInput live in
-        // CompileArtifacts side-tables, populated by C.1 bind_schema.
+        // Combine lowers to PlanNode::Combine. Inline fields here are
+        // the ones the `ExecutionPlanDag` serializer (which does not see
+        // `CompileArtifacts`) must emit for `--explain`:
+        //   - `strategy` — planner default is `HashBuildProbe`; the
+        //     `select_combine_strategies` post-pass may rewrite it.
+        //   - `driving_input` / `build_inputs` — empty until that same
+        //     post-pass selects the driver.
+        //   - `predicate_summary` — filled here from
+        //     `CompileArtifacts.combine_predicates[name]` (populated by
+        //     `bind_schema` before lowering runs). Zero-valued when the
+        //     combine failed predicate decomposition; the E3xx diagnostic
+        //     is already emitted elsewhere in that case.
+        //   - `decomposed_from` — non-`None` only on synthetic binary
+        //     combines produced by N-ary decomposition; user-authored
+        //     nodes lower with `None`.
+        // The heavy decomposed programs and per-input schema rows stay
+        // in `CompileArtifacts` — no duplication.
         PipelineNode::Combine { config, .. } => {
-            use crate::plan::combine::CombineStrategy;
+            use crate::plan::combine::{CombinePredicateSummary, CombineStrategy};
+            let predicate_summary = artifacts
+                .combine_predicates
+                .get(name)
+                .map(CombinePredicateSummary::from_decomposed)
+                .unwrap_or_default();
             Some(crate::plan::execution::PlanNode::Combine {
                 name: name.to_string(),
                 span,
                 strategy: CombineStrategy::HashBuildProbe,
                 driving_input: String::new(),
+                build_inputs: Vec::new(),
+                predicate_summary,
                 match_mode: config.match_mode,
                 on_miss: config.on_miss,
                 decomposed_from: None,

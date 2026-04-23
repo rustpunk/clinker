@@ -73,6 +73,34 @@ pub struct DecomposedPredicate {
     pub residual: Option<Arc<TypedProgram>>,
 }
 
+/// Shape-only projection of [`DecomposedPredicate`] for `--explain` output.
+///
+/// Carries counts plus a `has_residual` flag — the full conjunct/program
+/// data is not serializable (holds `Arc<TypedProgram>` and raw `Expr`
+/// trees). Lives inline on `PlanNode::Combine` so the JSON/text renderers
+/// reach it without consulting `CompileArtifacts`, which is not threaded
+/// through the serializer. Populated from
+/// `CompileArtifacts.combine_predicates[name]` at combine lowering time;
+/// zero-valued on combines whose predicate decomposition failed (E3xx
+/// diagnostics; combine absent from `combine_predicates`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CombinePredicateSummary {
+    pub equalities: usize,
+    pub ranges: usize,
+    pub has_residual: bool,
+}
+
+impl CombinePredicateSummary {
+    /// Project a [`DecomposedPredicate`] to its `--explain`-visible shape.
+    pub fn from_decomposed(d: &DecomposedPredicate) -> Self {
+        Self {
+            equalities: d.equalities.len(),
+            ranges: d.ranges.len(),
+            has_residual: d.residual.is_some(),
+        }
+    }
+}
+
 /// Equality conjunct between two inputs.
 ///
 /// Stores full [`Expr`] pairs (drill D14), not field names — enables
@@ -586,14 +614,25 @@ pub fn select_combine_strategies(
             None => continue,
         };
 
+        // All non-driver input qualifiers, in declaration (IndexMap)
+        // order. The driver is singular by construction
+        // (`select_driving_input`); everything else is a build side.
+        let build: Vec<String> = inputs
+            .keys()
+            .filter(|q| q.as_str() != driving.as_str())
+            .cloned()
+            .collect();
+
         if let PlanNode::Combine {
             strategy,
             driving_input,
+            build_inputs,
             ..
         } = &mut plan.graph[idx]
         {
             *strategy = CombineStrategy::HashBuildProbe;
             *driving_input = driving;
+            *build_inputs = build;
         }
     }
 }
@@ -947,12 +986,20 @@ mod tests {
             .combine_predicates
             .insert(combine_name.to_string(), decomposed);
 
+        let predicate_summary = CombinePredicateSummary::from_decomposed(
+            artifacts
+                .combine_predicates
+                .get(combine_name)
+                .expect("synthetic_combine_plan just inserted a DecomposedPredicate"),
+        );
         let mut graph = petgraph::graph::DiGraph::new();
         graph.add_node(PlanNode::Combine {
             name: combine_name.to_string(),
             span: Span::SYNTHETIC,
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
+            build_inputs: Vec::new(),
+            predicate_summary,
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
             decomposed_from: None,
@@ -1077,6 +1124,8 @@ mod tests {
             span: Span::SYNTHETIC,
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
+            build_inputs: Vec::new(),
+            predicate_summary: CombinePredicateSummary::default(),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
             decomposed_from: None,

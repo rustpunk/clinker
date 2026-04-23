@@ -32,6 +32,22 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Compact tag for a `CombineStrategy` variant, for `display_name()` /
+/// `[combine:<tag>]` rendering. Pattern-matches `AggregateStrategy`'s
+/// `hash` / `streaming` tag convention so both operators read alike in
+/// `--explain` output.
+fn combine_strategy_tag(s: &crate::plan::combine::CombineStrategy) -> &'static str {
+    use crate::plan::combine::CombineStrategy;
+    match s {
+        CombineStrategy::HashBuildProbe => "hash_build_probe",
+        CombineStrategy::InMemoryHash => "in_memory_hash",
+        CombineStrategy::HashPartitionIEJoin { .. } => "hash_partition_iejoin",
+        CombineStrategy::SortMerge => "sort_merge",
+        CombineStrategy::GraceHash { .. } => "grace_hash",
+        CombineStrategy::BlockNestedLoop => "block_nested_loop",
+    }
+}
+
 use cxl::analyzer::ParallelismHint;
 use cxl::ast::Statement;
 use cxl::typecheck::pass::TypedProgram;
@@ -187,11 +203,13 @@ pub enum PlanNode {
     },
     /// N-ary combine node.
     ///
-    /// This variant carries ONLY `--explain`-visible and parse-time-available
-    /// fields inline. The late-populated compile state lives in
-    /// `CompileArtifacts` side-tables (`typed["{name}::where"]`,
-    /// `typed["{name}::body"]`, `combine_predicates`, `combine_inputs`).
-    /// See `crates/clinker-core/src/plan/combine.rs`.
+    /// Carries the `--explain`-visible shape of the combine inline so the
+    /// `ExecutionPlanDag` serializer — which does not see
+    /// `CompileArtifacts` — can render JSON/text without a separate side
+    /// table lookup. The heavy compile state (decomposed predicate
+    /// programs, per-input schema rows, the typechecked `where`/`body`
+    /// `TypedProgram`s) still lives in `CompileArtifacts` and is not
+    /// duplicated here.
     Combine {
         name: String,
         #[serde(skip)]
@@ -200,9 +218,23 @@ pub enum PlanNode {
         /// overwritten by the `select_combine_strategies` post-pass.
         /// Follows `PlanNode::Aggregation.strategy` precedent.
         strategy: crate::plan::combine::CombineStrategy,
-        /// Driving input qualifier. Empty string until the planner
-        /// selects it.
+        /// Driving (probe-side) input qualifier. Empty string until
+        /// the `select_combine_strategies` post-pass selects it. A
+        /// non-empty value implies `strategy` and `build_inputs` were
+        /// also filled in the same pass.
         driving_input: String,
+        /// Non-driving (build-side) input qualifiers. Populated by the
+        /// `select_combine_strategies` post-pass alongside `driving_input`:
+        /// every `CompileArtifacts.combine_inputs[name]` entry except
+        /// the driver, in declaration order. Empty when the driver has
+        /// not yet been selected.
+        build_inputs: Vec<String>,
+        /// Shape-only projection of the decomposed `where:` predicate
+        /// (equalities count, ranges count, residual presence). Populated
+        /// at lowering time from `CompileArtifacts.combine_predicates[name]`;
+        /// zero-valued when the predicate decomposition produced no entry
+        /// (E3xx combines).
+        predicate_summary: crate::plan::combine::CombinePredicateSummary,
         match_mode: crate::config::pipeline_node::MatchMode,
         on_miss: crate::config::pipeline_node::OnMiss,
         /// For synthetic binary combine nodes created by N-ary
@@ -328,11 +360,38 @@ impl PlanNode {
                 name,
                 strategy,
                 driving_input,
+                build_inputs,
+                predicate_summary,
                 ..
             } => {
-                // Minimal display for C.0; C.5.1 enriches --explain rendering
-                // with strategy details and per-input annotations.
-                format!("[combine strategy={strategy:?} drive={driving_input}] {name}")
+                // Mirror `PlanNode::Aggregation`'s `[aggregation:<strategy>]`
+                // precedent for the strategy tag; append
+                // `drive=<qualifier> build=[a, b]` plus the predicate shape
+                // so the header line carries enough context for an
+                // inspector to understand what the planner chose without
+                // cracking the JSON payload.
+                let strategy_tag = combine_strategy_tag(strategy);
+                let drive = if driving_input.is_empty() {
+                    "<unselected>"
+                } else {
+                    driving_input.as_str()
+                };
+                let build = if build_inputs.is_empty() {
+                    "[]".to_string()
+                } else {
+                    format!("[{}]", build_inputs.join(", "))
+                };
+                let residual = if predicate_summary.has_residual {
+                    " +residual"
+                } else {
+                    ""
+                };
+                format!(
+                    "[combine:{strategy_tag}] {name} drive={drive} build={build} \
+                     eq={eq} range={range}{residual}",
+                    eq = predicate_summary.equalities,
+                    range = predicate_summary.ranges,
+                )
             }
         }
     }
@@ -790,9 +849,11 @@ impl ExecutionPlanDag {
                     out.push_str(&format!("  ◇ {}{line_suffix}\n", node.display_name()));
                 }
                 PlanNode::Combine { .. } => {
-                    // Combine renders as a sibling topo line. C.5.1 enriches
-                    // this with per-input dependency trace and strategy
-                    // details; C.0 keeps it minimal.
+                    // Sibling rendering: combine appears on its own topo
+                    // line; the `◈` glyph distinguishes it from Aggregate
+                    // (`◇`), Route fork (`◆`), and Merge collector (`└──<`).
+                    // `display_name()` carries the strategy/drive/build
+                    // and predicate-shape suffix.
                     out.push_str(&format!("  ◈ {}{line_suffix}\n", node.display_name()));
                 }
                 PlanNode::Source { .. }
