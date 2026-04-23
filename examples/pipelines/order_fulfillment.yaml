@@ -16,8 +16,8 @@ nodes:
       schema:
         - { name: order_id, type: string }
         - { name: order_date, type: string }
-        - { name: quantity, type: string }
-        - { name: unit_price, type: string }
+        - { name: quantity, type: int }
+        - { name: unit_price, type: float }
         - { name: product_code, type: string }
         - { name: priority_level, type: string }
 
@@ -42,18 +42,29 @@ nodes:
     config:
       cxl: |
         emit order_ref = "ORD-" + order_id.to_string().pad_left(8, "0")
-        emit order_date_parsed = order_date.to_date("yyyy-MM-dd")
+        emit order_date_parsed = order_date.to_date("%Y-%m-%d")
         emit line_total = quantity * unit_price
 
-  - type: transform
+  - type: combine
     name: product_lookup
     description: Enrich orders with product catalog details
-    input: normalize_fields
+    input:
+      orders: normalize_fields
+      products: products
     config:
-      lookup:
-        source: products
-        where: "product_code == products.product_code"
+      where: "orders.product_code == products.product_code"
+      match: first
+      on_miss: null_fields
       cxl: |
+        emit order_id = orders.order_id
+        emit order_date = orders.order_date
+        emit quantity = orders.quantity
+        emit unit_price = orders.unit_price
+        emit product_code = orders.product_code
+        emit priority_level = orders.priority_level
+        emit order_ref = orders.order_ref
+        emit order_date_parsed = orders.order_date_parsed
+        emit line_total = orders.line_total
         emit product_name = products.product_name
         emit category = products.category
         emit weight_kg = products.weight_kg
