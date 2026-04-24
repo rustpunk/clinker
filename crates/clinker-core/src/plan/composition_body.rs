@@ -1,12 +1,12 @@
 // Bound composition body types — populated by bind_schema when it
 // recurses into a PipelineNode::Composition's body.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use cxl::typecheck::Row;
 use indexmap::IndexMap;
 
-use super::bound_schemas::BoundSchemas;
 use super::execution::PlanNode;
 
 /// Opaque handle into `CompileArtifacts.composition_bodies`. Each
@@ -30,7 +30,7 @@ impl Default for CompositionBodyId {
 }
 
 /// A bound composition body — one nested scope with its own NodeId
-/// space, its own BoundSchemas, and its own nested bodies (for
+/// space, its own per-node row map, and its own nested bodies (for
 /// composition-of-composition recursion).
 #[derive(Debug, Clone)]
 pub struct BoundBody {
@@ -43,8 +43,11 @@ pub struct BoundBody {
     /// parent scope or in sibling bodies.
     pub nodes: Vec<PlanNode>,
 
-    /// Per-node row types inside this body scope.
-    pub bound_schemas: BoundSchemas,
+    /// Per-node output row inside this body scope. Keyed by node name.
+    /// Consumers that want a public accessor go through
+    /// `CompiledPlan::typed_output_row`, which only sees top-level
+    /// names; body-scope rows are Kiln-drill-in state.
+    pub body_rows: HashMap<String, Row>,
 
     /// Output row types at the body's declared output ports, keyed
     /// by port name. These are what the parent scope sees as the

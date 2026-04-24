@@ -7,13 +7,21 @@ use std::sync::Arc;
 /// Maximum number of metadata keys per record.
 const MAX_METADATA_KEYS: usize = 64;
 
-/// Schema-indexed record with optional overflow for CXL-emitted unknown fields.
-/// Overflow uses IndexMap to preserve emit statement order in output.
+/// Schema-indexed row record.
+///
+/// Values live in a positional `Vec<Value>` whose length equals
+/// `schema.column_count()`. Every write lands at a known schema slot;
+/// there is no side map for unknown fields. Plan-time schema widening
+/// guarantees every emit site addresses a column declared on the
+/// operator's `Arc<Schema>`.
+///
+/// Per-record framing data (unknown keys discovered by readers,
+/// reader/writer context) lives in the separate `metadata` map under
+/// the `$meta.*` namespace, capped at 64 keys per record.
 #[derive(Debug, Clone)]
 pub struct Record {
     schema: Arc<Schema>,
     values: Vec<Value>,
-    overflow: Option<Box<IndexMap<Box<str>, Value>>>,
     /// Per-record metadata. Stripped from output unless `include_metadata` is set.
     /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
     metadata: Option<Box<IndexMap<Box<str>, Value>>>,
@@ -38,40 +46,33 @@ impl Record {
         Self {
             schema,
             values,
-            overflow: None,
             metadata: None,
         }
     }
 
+    /// Returns the schema-indexed value for `name`, or `None` when the
+    /// name is not declared on this record's schema.
     pub fn get(&self, name: &str) -> Option<&Value> {
-        if let Some(idx) = self.schema.index(name) {
-            return self.values.get(idx);
-        }
-        self.overflow.as_ref().and_then(|m| m.get(name))
+        self.schema.index(name).and_then(|i| self.values.get(i))
     }
 
-    pub fn set(&mut self, name: &str, value: Value) -> bool {
-        if let Some(idx) = self.schema.index(name) {
-            self.values[idx] = value;
-            return true;
+    /// Writes `value` to the schema-indexed slot for `name`. Plan-time
+    /// widening guarantees `name` is in schema at every emit site;
+    /// `debug_assert` surfaces widening bugs in debug builds. In release,
+    /// writes to unknown fields are silently dropped — this is a
+    /// defense-in-depth no-op behind the debug guard, not a recovery
+    /// mechanism.
+    pub fn set(&mut self, name: &str, value: Value) {
+        match self.schema.index(name) {
+            Some(idx) => self.values[idx] = value,
+            None => {
+                debug_assert!(
+                    false,
+                    "Record::set called with unknown field {name:?}; plan-time widening should have \
+                     added it to the operator's output schema",
+                );
+            }
         }
-        false
-    }
-
-    pub fn set_overflow(&mut self, name: Box<str>, value: Value) {
-        // If name exists in schema, redirect to schema slot
-        if let Some(idx) = self.schema.index(&name) {
-            debug_assert!(
-                false,
-                "set_overflow called with schema field '{name}'; redirecting to schema slot"
-            );
-            self.values[idx] = value;
-            return;
-        }
-        let map = self
-            .overflow
-            .get_or_insert_with(|| Box::new(IndexMap::new()));
-        map.insert(name, value);
     }
 
     pub fn schema(&self) -> &Arc<Schema> {
@@ -81,13 +82,6 @@ impl Record {
     /// Raw access to the schema-indexed values slice (positional).
     pub fn values(&self) -> &[Value] {
         &self.values
-    }
-
-    /// Iterator over overflow fields only. Returns None if no overflow exists.
-    pub fn overflow_fields(&self) -> Option<impl Iterator<Item = (&str, &Value)>> {
-        self.overflow
-            .as_ref()
-            .map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
     }
 
     // ── Metadata ────────────────────────────────────────────────────
@@ -124,37 +118,34 @@ impl Record {
 
     // ── Fields ─────────────────────────────────────────────────────
 
-    /// Iterator over ALL fields: schema fields first (in schema order), then overflow.
+    /// Iterator over every schema field in schema order. Metadata is
+    /// exposed separately via [`Record::iter_meta`]; writers that want
+    /// to include metadata in their output layer the two iterators.
     pub fn iter_all_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
-        let schema_fields = self
-            .schema
+        self.schema
             .columns()
             .iter()
             .enumerate()
-            .map(|(i, name)| (name.as_ref(), &self.values[i]));
-        let overflow_fields = self
-            .overflow
-            .as_ref()
-            .into_iter()
-            .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)));
-        schema_fields.chain(overflow_fields)
+            .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
 
-    /// Number of schema fields (not counting overflow).
+    /// Number of schema fields.
     pub fn field_count(&self) -> usize {
         self.schema.column_count()
     }
 
-    /// Total number of fields including overflow.
+    /// Total number of fields — identical to [`Record::field_count`]
+    /// now that overflow storage no longer exists. Retained as an alias
+    /// for call-site readability at heap-accounting sites.
     pub fn total_field_count(&self) -> usize {
-        self.schema.column_count() + self.overflow.as_ref().map_or(0, |m| m.len())
+        self.schema.column_count()
     }
 
     /// Estimated heap bytes owned by this record.
     ///
-    /// Includes Vec<Value> backing store + per-value heap allocations
-    /// (strings, arrays) + overflow/metadata IndexMaps if present.
-    /// Used by SortBuffer for self-tracking allocation counting.
+    /// Includes `Vec<Value>` backing store, per-value heap allocations
+    /// (strings, arrays), and the metadata IndexMap (if present). Used
+    /// by `SortBuffer` for self-tracking allocation counting.
     pub fn estimated_heap_size(&self) -> usize {
         let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
         let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
@@ -167,9 +158,8 @@ impl Record {
             let values_heap: usize = m.values().map(Value::heap_size).sum();
             map_backing + keys_heap + values_heap
         };
-        let overflow_size = self.overflow.as_ref().map_or(0, |m| indexmap_heap(m));
         let metadata_size = self.metadata.as_ref().map_or(0, |m| indexmap_heap(m));
-        values_backing + values_heap + overflow_size + metadata_size
+        values_backing + values_heap + metadata_size
     }
 }
 
@@ -230,35 +220,74 @@ mod tests {
         assert_eq!(record.get("name"), Some(&Value::String("Bob".into())));
     }
 
+    /// Structural assertion: `Record` holds exactly `schema`, `values`,
+    /// and `metadata`. Adding or renaming a field fails compilation.
     #[test]
-    fn test_record_overflow_lazy_init() {
+    fn test_record_struct_has_exactly_schema_values_metadata_fields() {
         let schema = test_schema();
         let values = vec![Value::Null; 5];
-        let mut record = Record::new(schema, values);
-
-        assert!(record.overflow.is_none());
-
-        record.set_overflow("extra_field".into(), Value::Integer(99));
-        assert!(record.overflow.is_some());
-        assert_eq!(record.get("extra_field"), Some(&Value::Integer(99)));
+        let rec = Record::new(schema, values);
+        let Record {
+            schema: _,
+            values: _,
+            metadata: _,
+        } = rec;
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, should_panic)]
-    fn test_record_overflow_no_shadow() {
+    fn test_record_set_writes_schema_slot() {
+        let schema = test_schema();
+        let values = vec![Value::Null; 5];
+        let mut record = Record::new(schema, values);
+        record.set("name", Value::String("Alice".into()));
+        assert_eq!(record.get("name"), Some(&Value::String("Alice".into())),);
+        assert_eq!(record.values()[1], Value::String("Alice".into()));
+    }
+
+    /// Writing an unknown field in debug panics via `debug_assert`.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Record::set called with unknown field")]
+    fn test_record_set_unknown_field_debug_panics() {
+        let schema = test_schema();
+        let values = vec![Value::Null; 5];
+        let mut record = Record::new(schema, values);
+        record.set("nonexistent", Value::Integer(1));
+    }
+
+    #[test]
+    fn test_record_iter_all_fields_is_schema_only() {
+        let schema = test_schema();
+        let values = vec![
+            Value::Integer(1),
+            Value::String("Alice".into()),
+            Value::Integer(30),
+            Value::String("alice@test.com".into()),
+            Value::Bool(true),
+        ];
+        let record = Record::new(schema, values);
+
+        let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0].0, "id");
+        assert_eq!(fields[4].0, "active");
+    }
+
+    /// Metadata round-trip survives the overflow rip — the metadata map
+    /// is preserved as the sole off-schema per-record storage.
+    #[test]
+    fn test_record_metadata_preserved() {
         let schema = test_schema();
         let values = vec![Value::Null; 5];
         let mut record = Record::new(schema, values);
 
-        // Setting a schema field name via set_overflow should redirect (panics in debug)
-        record.set_overflow("name".into(), Value::String("redirected".into()));
-        assert_eq!(
-            record.get("name"),
-            Some(&Value::String("redirected".into()))
-        );
-        assert!(
-            record.overflow.is_none() || !record.overflow.as_ref().unwrap().contains_key("name")
-        );
+        assert!(!record.has_meta());
+        record.set_meta("k", Value::Integer(1)).unwrap();
+        assert!(record.has_meta());
+        assert_eq!(record.get_meta("k"), Some(&Value::Integer(1)));
+        let collected: Vec<(&str, &Value)> = record.iter_meta().collect();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0, "k");
     }
 
     #[test]
@@ -279,45 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn test_record_iter_all_fields_ordering() {
-        let schema = test_schema();
-        let values = vec![
-            Value::Integer(1),
-            Value::String("Alice".into()),
-            Value::Integer(30),
-            Value::String("alice@test.com".into()),
-            Value::Bool(true),
-        ];
-        let mut record = Record::new(schema, values);
-        record.set_overflow("extra".into(), Value::String("bonus".into()));
-
-        let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
-        assert_eq!(fields[0].0, "id");
-        assert_eq!(fields[1].0, "name");
-        assert_eq!(fields[4].0, "active");
-        assert_eq!(fields[5].0, "extra");
-        assert_eq!(fields.len(), 6);
-    }
-
-    #[test]
     fn test_record_values_raw_access() {
         let schema = test_schema();
         let values = vec![Value::Integer(1); 5];
         let record = Record::new(schema, values);
         assert_eq!(record.values().len(), 5);
         assert_eq!(record.values()[0], Value::Integer(1));
-    }
-
-    #[test]
-    fn test_record_total_field_count() {
-        let schema = test_schema();
-        let values = vec![Value::Null; 5];
-        let mut record = Record::new(schema, values);
-        assert_eq!(record.total_field_count(), 5);
-        record.set_overflow("extra1".into(), Value::Integer(1));
-        record.set_overflow("extra2".into(), Value::Integer(2));
-        assert_eq!(record.total_field_count(), 7);
-        assert_eq!(record.field_count(), 5);
     }
 
     #[test]
@@ -357,40 +353,5 @@ mod tests {
         // String "hello" = 5 bytes heap, Integer = 0
         let expected_heap = 5;
         assert_eq!(size, expected_backing + expected_heap);
-    }
-
-    #[test]
-    fn test_record_estimated_heap_size_with_overflow() {
-        let schema = Arc::new(Schema::new(vec!["id".into()]));
-        let mut record = Record::new(schema, vec![Value::Integer(1)]);
-        let base_size = record.estimated_heap_size();
-        record.set_overflow("extra".into(), Value::String("test".into()));
-        let with_overflow = record.estimated_heap_size();
-        // Overflow adds: map backing + key "extra" (5 bytes) + value "test" (4 bytes)
-        assert!(with_overflow > base_size);
-    }
-
-    #[test]
-    fn test_record_set_unknown_field_returns_false() {
-        let schema = test_schema();
-        let values = vec![Value::Null; 5];
-        let mut record = Record::new(schema, values);
-        assert!(!record.set("nonexistent", Value::Integer(1)));
-    }
-
-    #[test]
-    fn test_record_overflow_preserves_emit_order() {
-        let schema = test_schema();
-        let values = vec![Value::Null; 5];
-        let mut record = Record::new(schema, values);
-
-        record.set_overflow("Zulu".into(), Value::Integer(3));
-        record.set_overflow("Alpha".into(), Value::Integer(1));
-        record.set_overflow("Mike".into(), Value::Integer(2));
-
-        let overflow: Vec<_> = record.overflow_fields().unwrap().collect();
-        assert_eq!(overflow[0].0, "Zulu");
-        assert_eq!(overflow[1].0, "Alpha");
-        assert_eq!(overflow[2].0, "Mike");
     }
 }

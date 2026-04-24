@@ -31,7 +31,11 @@ impl Default for XmlWriterConfig {
 
 pub struct XmlWriter<W: Write> {
     writer: XmlEmitter<W>,
-    schema: Arc<Schema>,
+    /// Schema pinned for the writer's lifetime. After the overflow rip
+    /// the emit path walks `Record::iter_all_fields` (schema-positional),
+    /// so the writer does not consult the schema per record — but the
+    /// Arc ownership here keeps factory callers honest.
+    _schema: Arc<Schema>,
     config: XmlWriterConfig,
     header_written: bool,
 }
@@ -40,7 +44,7 @@ impl<W: Write> XmlWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: XmlWriterConfig) -> Self {
         Self {
             writer: XmlEmitter::new(writer),
-            schema,
+            _schema: schema,
             config,
             header_written: false,
         }
@@ -57,23 +61,12 @@ impl<W: Write> XmlWriter<W> {
         Ok(())
     }
 
-    /// Collect all fields (schema + overflow) as (name, value) pairs,
-    /// then write them as nested XML elements.
+    /// Collect schema fields as (name, value) pairs, then write them as
+    /// nested XML elements. Metadata (`$meta.*`) is stripped from the
+    /// default output; the Output-node `include_metadata` flag is the
+    /// opt-in for layers that want to surface it.
     fn write_fields(&mut self, record: &Record) -> Result<(), FormatError> {
-        let mut fields: Vec<(&str, &Value)> = Vec::new();
-
-        // Schema fields in order
-        for col in self.schema.columns() {
-            let val = record.get(col).unwrap_or(&Value::Null);
-            fields.push((&**col, val));
-        }
-
-        // Overflow fields
-        if let Some(overflow) = record.overflow_fields() {
-            for (key, val) in overflow {
-                fields.push((key, val));
-            }
-        }
+        let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
 
         // Build a tree of field segments for nested expansion
         let tree = build_field_tree(&fields, self.config.preserve_nulls);
@@ -420,5 +413,29 @@ mod tests {
         assert_eq!(r1.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(r1.get("value"), Some(&Value::Integer(42)));
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
+    }
+
+    /// Default XML writer output contains only schema columns; metadata
+    /// stays in `$meta.*` unless a higher layer opts in via
+    /// `include_metadata: true` (which route-rewrites the Record
+    /// upstream of the writer).
+    #[test]
+    fn test_xml_writer_emits_schema_fields_only() {
+        let schema = test_schema();
+        let mut record = make_record(&schema, "Alice", 30);
+        record
+            .set_meta("audit", Value::String("flagged".into()))
+            .unwrap();
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert!(output.contains("<name>Alice</name>"));
+        assert!(output.contains("<age>30</age>"));
+        assert!(
+            !output.contains("audit"),
+            "default writer must strip metadata; got: {output}"
+        );
+        assert!(
+            !output.contains("flagged"),
+            "default writer must strip metadata values; got: {output}"
+        );
     }
 }

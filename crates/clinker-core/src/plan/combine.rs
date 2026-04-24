@@ -972,6 +972,7 @@ mod tests {
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,
+            output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
         });
         let mk_eq = || EqualityConjunct {
             left_expr: dummy_lit(),
@@ -1014,6 +1015,8 @@ mod tests {
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
             decomposed_from: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
+            resolved_column_map: Arc::new(std::collections::HashMap::new()),
         });
         let plan = ExecutionPlanDag {
             graph,
@@ -1140,6 +1143,8 @@ mod tests {
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
             decomposed_from: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
+            resolved_column_map: Arc::new(std::collections::HashMap::new()),
         };
         assert_eq!(node.name(), "test_combine");
         assert_eq!(node.type_tag(), "combine");

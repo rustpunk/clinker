@@ -162,23 +162,20 @@ mod tests {
         (artifacts, diags)
     }
 
-    /// Assert that the node's output row (as published in
-    /// `BoundSchemas`) has exactly the expected bare field names in
-    /// declaration order.
-    ///
-    /// Combine nodes publish their output row in C.1.3 — this helper
-    /// will be wired into the C.1.3 gate tests (`test_combine_output_
-    /// row_from_emit`). Defined in C.1.0 alongside
+    /// Assert that the node's output row (as published on
+    /// `TypedProgram.output_row`) has exactly the expected bare field
+    /// names in declaration order. Defined alongside
     /// `compile_combine_fixture` so the test surface is one-stop.
-    #[allow(dead_code)] // Exercised by C.1.3+ tests.
+    #[allow(dead_code)] // Pre-existing helper retained for combine gate tests.
     fn assert_output_row(
         artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
         node_name: &str,
         expected_fields: &[&str],
     ) {
         let row = artifacts
-            .bound_schemas
-            .output_of(node_name)
+            .typed
+            .get(node_name)
+            .map(|tp| &tp.output_row)
             .unwrap_or_else(|| panic!("no bound output row for node {node_name:?}"));
         let actual: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
         let expected: Vec<String> = expected_fields.iter().map(|s| (*s).to_string()).collect();
@@ -485,7 +482,7 @@ mod tests {
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         assert!(
-            artifacts.bound_schemas.output_of("bad_collect").is_none(),
+            artifacts.typed.get("bad_collect").is_none(),
             "no output row published when E311 fires"
         );
     }
@@ -494,6 +491,67 @@ mod tests {
     /// auto-derives the output row as `{ driver fields,
     /// <build_qualifier>: Array }`. The build qualifier becomes one
     /// new bare field carrying the gathered records.
+    /// r1.5 gate: the CXL typechecker's combine-body walk emits one
+    /// `(QualifiedField, (JoinSide, column-index))` entry per qualified
+    /// field reference. Driver-side qualifier lands on `JoinSide::Probe`;
+    /// build-side qualifier lands on `JoinSide::Build`; column index is
+    /// the field's position within its declared input row.
+    #[test]
+    fn test_typecheck_combine_resolves_qualified_field_refs_to_indices() {
+        use clinker_core::executor::combine::JoinSide;
+        use cxl::typecheck::QualifiedField;
+
+        let (artifacts, diags) = compile_combine_fixture("match_all");
+        assert!(
+            diags.is_empty(),
+            "match_all must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let resolved = artifacts
+            .combine_resolved_columns
+            .get("fanned")
+            .expect("bind_combine must publish a resolved_column_map");
+
+        // Per `match_all.yaml`, driver = orders (declared first).
+        // orders row: order_id@0, product_id@1, amount@2
+        // products row: product_id@0, name@1, category@2
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "orders",
+                std::sync::Arc::from("order_id")
+            )),
+            Some(&(JoinSide::Probe, 0))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "orders",
+                std::sync::Arc::from("product_id")
+            )),
+            Some(&(JoinSide::Probe, 1))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "orders",
+                std::sync::Arc::from("amount")
+            )),
+            Some(&(JoinSide::Probe, 2))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "products",
+                std::sync::Arc::from("product_id")
+            )),
+            Some(&(JoinSide::Build, 0))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "products",
+                std::sync::Arc::from("name")
+            )),
+            Some(&(JoinSide::Build, 1))
+        );
+    }
+
     #[test]
     fn test_combine_collect_output_row_auto_derived() {
         use cxl::typecheck::{QualifiedField, Type};
@@ -505,8 +563,9 @@ mod tests {
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         let row = artifacts
-            .bound_schemas
-            .output_of("collected")
+            .typed
+            .get("collected")
+            .map(|tp| &tp.output_row)
             .expect("collected publishes a bound output row");
 
         // Driver = orders (default first-in-IndexMap, no `drive:` hint).
@@ -675,14 +734,15 @@ mod tests {
     //
     // The cxl body is typechecked against the merged row. Output fields
     // are the LHS names of non-meta `emit` statements, always bare
-    // (`QualifiedField::bare`). The output row lands in
-    // `BoundSchemas::output_of(name)` so downstream nodes see it; the
-    // body TypedProgram lands in `artifacts.typed[name]` per drill D10.
+    // (`QualifiedField::bare`). The output row lands on
+    // `TypedProgram.output_row` so downstream nodes see it via
+    // `CompiledPlan::typed_output_row`; the body TypedProgram lives in
+    // `artifacts.typed[name]`.
 
-    /// C.1.3 gate: emit statements publish an output row in
-    /// `BoundSchemas` whose declared field names (bare) are exactly the
-    /// LHS emit names in source order. V-5-6: also asserts
-    /// `artifacts.typed[name]` is populated with the body TypedProgram.
+    /// Emit statements publish an output row whose declared field
+    /// names (bare) are exactly the LHS emit names in source order.
+    /// Also asserts `artifacts.typed[name]` is populated with the
+    /// body TypedProgram.
     #[test]
     fn test_combine_output_row_from_emit() {
         let (artifacts, diags) = compile_combine_fixture("two_input_equi");
@@ -2593,11 +2653,14 @@ nodes:
         )
         .expect("combine executor must run a pure-equi 2-input fixture");
         let canon = canonicalize_csv(result.primary_output());
+        // Post-rip: combine output_schema follows emit-statement order
+        // exactly (body emits order_id, product_id, product_name, amount
+        // in that sequence), not the upstream-then-emit pre-rip ordering.
         let expected = canonicalize_csv(
-            "order_id,product_id,amount,product_name\n\
-             ORD-1,PROD-A,10,Widget\n\
-             ORD-2,PROD-B,20,Gadget\n\
-             ORD-3,PROD-X,30,\n",
+            "order_id,product_id,product_name,amount\n\
+             ORD-1,PROD-A,Widget,10\n\
+             ORD-2,PROD-B,Gadget,20\n\
+             ORD-3,PROD-X,,30\n",
         );
         assert_eq!(canon, expected, "combine match:first output mismatch");
     }
@@ -2619,10 +2682,10 @@ nodes:
         let canon = canonicalize_csv(result.primary_output());
         // Two matching build rows → two output rows with the same
         // probe fields but different product_name values. Column
-        // order follows Record-iteration (schema-then-overflow) per
-        // the post-IndexMap-threading emit shape.
-        assert!(canon.contains("ORD-1,PROD-A,10,Widget"), "got: {canon}");
-        assert!(canon.contains("ORD-1,PROD-A,10,WidgetV2"), "got: {canon}");
+        // order follows the combine output_schema (emit-statement
+        // order: order_id, product_id, product_name, amount).
+        assert!(canon.contains("ORD-1,PROD-A,Widget,10"), "got: {canon}");
+        assert!(canon.contains("ORD-1,PROD-A,WidgetV2,10"), "got: {canon}");
         let mut rows = 0usize;
         for line in canon.lines().skip(1) {
             if !line.is_empty() {
@@ -2863,10 +2926,11 @@ nodes:
         let canon = canonicalize_csv(result.primary_output());
         // ORD-3 has PROD-X which has no matching product — emit row
         // with blank product_name (Null → empty CSV cell). Column
-        // order follows Record-iteration (order_id, product_id,
-        // amount, then product_name from overflow).
+        // order is the combine output_schema (emit order: order_id,
+        // product_id, product_name, amount), so the empty cell sits
+        // between product_id and amount.
         assert!(
-            canon.contains("ORD-3,PROD-X,30,"),
+            canon.contains("ORD-3,PROD-X,,30"),
             "null_fields must leave build-qualified fields blank; got: {canon}"
         );
     }

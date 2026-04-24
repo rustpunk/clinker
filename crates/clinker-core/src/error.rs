@@ -49,6 +49,7 @@
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
 //! | `E312`      | error    | Combine has N>2 inputs (binary only, for now)        |
 //! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
+//! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
 //! | `W306`      | warning  | Combine planner cannot determine optimal driving input |
@@ -277,6 +278,20 @@ pub enum PipelineError {
     MergeSortOrderViolation {
         message: String,
     },
+    /// E314 — a record arriving at an operator carried a schema whose
+    /// column list does not match the operator's compile-time input
+    /// schema. Surfaces at the start of every executor arm that reads
+    /// from an upstream channel (Transform, Aggregate, Combine probe/
+    /// build, Output, Route, Merge, Composition). Owns the two `Arc`s
+    /// so the diagnostic can be rendered lazily without lifetime
+    /// gymnastics.
+    SchemaMismatch {
+        expected: std::sync::Arc<clinker_record::Schema>,
+        actual: std::sync::Arc<clinker_record::Schema>,
+        operator_name: String,
+        operator_kind: &'static str,
+        upstream_name: String,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -324,6 +339,36 @@ impl fmt::Display for PipelineError {
             }
             Self::MergeSortOrderViolation { message } => {
                 write!(f, "spill-merge sort-order violation: {message}")
+            }
+            Self::SchemaMismatch {
+                expected,
+                actual,
+                operator_name,
+                operator_kind,
+                upstream_name,
+            } => {
+                let exp_list = expected
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{c}@{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let act_list = actual
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{c}@{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "E314 Schema mismatch at operator '{operator_name}' (kind={operator_kind}, \
+                     input from '{upstream_name}'): expected {} columns: [{exp_list}] \
+                     record has {} columns: [{act_list}]",
+                    expected.column_count(),
+                    actual.column_count(),
+                )
             }
         }
     }
@@ -429,7 +474,7 @@ mod diagnostic_tests {
         // explicit entry both here and in the registry table above.
         for code in [
             "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E312", "E313",
+            "E312", "E313", "E314",
         ] {
             let pattern = format!("`{code}`");
             assert!(

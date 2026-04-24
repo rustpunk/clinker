@@ -1,101 +1,134 @@
-//! Schema-based type coercion for source records.
+//! Schema-based type coercion + declared-schema reprojection for source records.
 //!
-//! Wraps a `FormatReader` and coerces each record's field values to
-//! the types declared in the source's `schema:` block. This ensures
-//! downstream CXL expressions operate on properly typed values
-//! (`Value::Integer`, `Value::Float`, etc.) without requiring explicit
-//! `.to_int()` / `.to_float()` calls for every field reference.
+//! Wraps a `FormatReader` and returns records whose `Arc<Schema>` is
+//! the author-declared schema from the YAML `schema:` block. Declared
+//! columns missing from the underlying reader surface as `Value::Null`;
+//! reader columns missing from the declaration route to `$meta.*`.
 //!
-//! The `to_*` / `try_*` CXL builtins remain available for derived
-//! fields computed during the pipeline.
+//! This single Arc is the plan-time ground truth: downstream operators
+//! (bind_schema, Aggregation group_by_indices, `check_input_schema`)
+//! all resolve against the same `Arc<Schema>` that actually flows on
+//! records.
+//!
+//! Values declared with a concrete type (`Type::Int`, `Type::Float`,
+//! `Type::Bool`, etc.) are coerced; `Type::String` / `Type::Any` skip
+//! coercion. The `to_*` / `try_*` CXL builtins remain available for
+//! derived fields computed during the pipeline.
 
 use std::sync::Arc;
 
 use clinker_format::error::FormatError;
 use clinker_format::traits::FormatReader;
-use clinker_record::{Record, Schema, Value, coercion};
+use clinker_record::{Record, Schema, SchemaBuilder, Value, coercion};
 use cxl::typecheck::Type;
 
 use crate::config::pipeline_node::ColumnDecl;
 
-/// A coercion plan for one field: column index + target type.
-struct FieldCoercion {
-    col_index: usize,
-    target: Type,
-}
-
-/// Wraps a `FormatReader` and coerces values to declared schema types.
+/// Wraps a `FormatReader` and reprojects every record onto the
+/// author-declared `Arc<Schema>`.
 pub struct CoercingReader {
     inner: Box<dyn FormatReader>,
-    coercions: Vec<FieldCoercion>,
-    schema: Option<Arc<Schema>>,
+    /// Declared schema — the single `Arc<Schema>` every reprojected
+    /// record carries. Shared via `Arc::clone` so downstream
+    /// `Arc::ptr_eq` checks hit the fast path.
+    declared_schema: Arc<Schema>,
+    /// Per-declared-column coercion target (`None` for pass-through).
+    /// Indexed by position in the declared schema.
+    targets: Vec<Option<Type>>,
 }
 
 impl CoercingReader {
     /// Build a coercing reader from a format reader and schema declaration.
     ///
-    /// Fields not declared in the schema pass through unchanged.
-    /// Fields declared as `type: string` or `type: any` skip coercion.
+    /// Declared columns missing from the underlying reader materialize
+    /// as `Value::Null`; reader columns missing from the declaration
+    /// route to `$meta.*`. Fields declared as `type: string` or
+    /// `type: any` skip value coercion.
     pub fn new(
         mut inner: Box<dyn FormatReader>,
         schema_decl: &[ColumnDecl],
     ) -> Result<Self, FormatError> {
-        let reader_schema = inner.schema()?;
-        let mut coercions = Vec::new();
+        // Trigger schema discovery on the inner reader so the first
+        // record isn't gated behind an on-demand schema call.
+        inner.schema()?;
 
-        for decl in schema_decl {
-            let target = unwrap_nullable(&decl.ty);
-            if matches!(target, Type::String | Type::Any | Type::Null) {
-                continue;
-            }
-            if let Some(idx) = reader_schema.index(&decl.name) {
-                coercions.push(FieldCoercion {
-                    col_index: idx,
-                    target: target.clone(),
-                });
-            }
-        }
+        let declared_schema: Arc<Schema> = schema_decl
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<SchemaBuilder>()
+            .build();
+        let targets: Vec<Option<Type>> = schema_decl
+            .iter()
+            .map(|c| {
+                let target = unwrap_nullable(&c.ty);
+                match target {
+                    Type::String | Type::Any | Type::Null => None,
+                    other => Some(other.clone()),
+                }
+            })
+            .collect();
 
         Ok(CoercingReader {
             inner,
-            coercions,
-            schema: None,
+            declared_schema,
+            targets,
         })
     }
 
-    /// Apply coercions to a record's values in-place.
-    fn coerce_record(&self, record: &mut Record) {
-        for fc in &self.coercions {
-            let field_name = record.schema().columns().get(fc.col_index);
-            if let Some(name) = field_name {
-                let name = name.clone();
-                if let Some(val) = record.get(&name) {
-                    let coerced = coerce_value(val, &fc.target);
-                    if let Some(new_val) = coerced {
-                        record.set(&name, new_val);
-                    }
+    /// Reproject `record` onto the declared schema Arc.
+    ///
+    /// For each declared column, pull the value from the underlying
+    /// record (by name), coerce if the declaration has a target type,
+    /// and write at the declared position. Reader columns absent from
+    /// the declaration move to `$meta.*` via `Record::set_meta`; the
+    /// first 64 such keys are captured, the 65th raises
+    /// `FormatError::MetadataCapExceeded` carrying the partial record.
+    fn reproject(&self, record: &Record) -> Result<Record, FormatError> {
+        let mut values: Vec<Value> = Vec::with_capacity(self.declared_schema.column_count());
+        for (i, col) in self.declared_schema.columns().iter().enumerate() {
+            let raw = record.get(col).cloned().unwrap_or(Value::Null);
+            let coerced = match &self.targets[i] {
+                Some(target) => coerce_value(&raw, target).unwrap_or(raw),
+                None => raw,
+            };
+            values.push(coerced);
+        }
+        let mut out = Record::new(Arc::clone(&self.declared_schema), values);
+        // Carry forward any pre-existing metadata the inner reader set
+        // (XML/JSON readers route unknown elements here already).
+        for (k, v) in record.iter_meta() {
+            let _ = out.set_meta(k, v.clone());
+        }
+        // Route reader columns absent from the declared schema into
+        // metadata too, preserving evidence of source drift.
+        let mut meta_count: usize = out.iter_meta().count();
+        for (name, value) in record.iter_all_fields() {
+            if self.declared_schema.index(name).is_some() {
+                continue;
+            }
+            match out.set_meta(name, value.clone()) {
+                Ok(()) => meta_count += 1,
+                Err(_) => {
+                    return Err(FormatError::MetadataCapExceeded {
+                        record: out,
+                        key: name.to_string(),
+                        count: meta_count,
+                    });
                 }
             }
         }
+        Ok(out)
     }
 }
 
 impl FormatReader for CoercingReader {
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
-        if let Some(ref s) = self.schema {
-            return Ok(Arc::clone(s));
-        }
-        let s = self.inner.schema()?;
-        self.schema = Some(Arc::clone(&s));
-        Ok(s)
+        Ok(Arc::clone(&self.declared_schema))
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         match self.inner.next_record()? {
-            Some(mut record) => {
-                self.coerce_record(&mut record);
-                Ok(Some(record))
-            }
+            Some(record) => Ok(Some(self.reproject(&record)?)),
             None => Ok(None),
         }
     }

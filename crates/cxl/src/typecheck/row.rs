@@ -103,8 +103,10 @@ impl From<&String> for QualifiedField {
     }
 }
 
-/// A compile-time row type carried on every node's input/output via
-/// `BoundSchemas`.
+/// A compile-time row type threaded through the `bind_schema` walk
+/// and attached to each node's `TypedProgram.output_row`. Carries the
+/// declared-columns map plus the `Open`/`Closed` tail that governs
+/// pass-through semantics for unknown columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     /// Declared (minimum-required) columns and their types.

@@ -75,8 +75,8 @@ impl CompiledPlan {
     ///
     /// Returns `None` for nodes that didn't participate in `bind_schema`
     /// (e.g. compositions whose binding failed).
-    pub fn schema_for_node_name(&self, name: &str) -> Option<&Row> {
-        self.artifacts.bound_schemas.output_of(name)
+    pub fn typed_output_row(&self, name: &str) -> Option<&Row> {
+        self.artifacts.typed.get(name).map(|tp| &tp.output_row)
     }
 
     /// Side-table of provenance-tracked config values for composition nodes.

@@ -34,7 +34,6 @@ use crate::config::composition::{
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{CombineBody, MatchMode, PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
-use crate::plan::bound_schemas::BoundSchemas;
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
 };
@@ -50,9 +49,6 @@ const MAX_COMPOSITION_DEPTH: u32 = 50;
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
     pub typed: HashMap<String, Arc<TypedProgram>>,
-    /// Per-node bound row types. Populated during the `bind_schema` walk;
-    /// persisted on `CompiledPlan` for downstream consumers.
-    pub bound_schemas: BoundSchemas,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -86,6 +82,18 @@ pub struct CompileArtifacts {
     /// selection (E306) are absent from this map and their post-pass
     /// entry is skipped.
     pub combine_driving: HashMap<String, String>,
+    /// Per-combine pre-resolved column map produced by the CXL
+    /// typechecker's combine-body walk. Key is the combine node's
+    /// name; value is the `ResolvedColumnMap` shape expected by
+    /// `CombineResolverMapping::from_pre_resolved`. Combines that fail
+    /// body typecheck (or the collect-mode path, which has no body)
+    /// surface an empty map here.
+    pub combine_resolved_columns: HashMap<String, crate::plan::execution::ResolvedColumnMap>,
+    /// Monotonic counter for fresh tail-variable IDs allocated during
+    /// row-polymorphic propagation (composition input-port binding).
+    /// Threaded as `&mut u32` into `build_input_port_rows`; IDs are
+    /// only comparable within a single `compile()` run.
+    pub next_tail_var: u32,
 }
 
 impl CompileArtifacts {
@@ -171,12 +179,24 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
-    // Persist all bound rows into BoundSchemas.
-    for (node_name, row) in schema_by_name {
-        artifacts.bound_schemas.set_output(node_name, row);
-    }
-
     artifacts
+}
+
+/// Build a placeholder `TypedProgram` carrying only `output_row`, for
+/// node variants without a CXL body (Source/Merge/Output/Composition).
+fn synthetic_typed_program(output_row: Row) -> TypedProgram {
+    TypedProgram {
+        program: cxl::ast::Program {
+            statements: Vec::new(),
+            span: cxl::lexer::Span::default(),
+        },
+        bindings: Vec::new(),
+        types: Vec::new(),
+        field_types: IndexMap::new(),
+        regexes: Vec::new(),
+        node_count: 0,
+        output_row,
+    }
 }
 
 // ─── Internal recursive bind_schema ─────────────────────────────────
@@ -210,7 +230,11 @@ fn bind_schema_inner(
                 let schema_decl: &SchemaDecl = &config.schema;
                 let columns = columns_from_decl(schema_decl);
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
-                schema_by_name.insert(name, Row::closed(columns, cxl_span));
+                let row = Row::closed(columns, cxl_span);
+                schema_by_name.insert(name.clone(), row.clone());
+                artifacts
+                    .typed
+                    .insert(name, Arc::new(synthetic_typed_program(row)));
             }
             PipelineNode::Transform { header, config } => {
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
@@ -239,9 +263,10 @@ fn bind_schema_inner(
                     AggregateMode::Row,
                     span,
                 ) {
-                    Ok(typed) => {
+                    Ok(mut typed) => {
                         let out = propagate_row(&upstream, &typed);
-                        schema_by_name.insert(name.clone(), out);
+                        schema_by_name.insert(name.clone(), out.clone());
+                        typed.output_row = out;
                         artifacts.typed.insert(name, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
@@ -280,9 +305,10 @@ fn bind_schema_inner(
                     group_by_fields: config.group_by.iter().cloned().collect(),
                 };
                 match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
-                    Ok(typed) => {
+                    Ok(mut typed) => {
                         let out = propagate_aggregate(&config.group_by, &upstream, &typed);
-                        schema_by_name.insert(name.clone(), out);
+                        schema_by_name.insert(name.clone(), out.clone());
+                        typed.output_row = out;
                         artifacts.typed.insert(name, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
@@ -291,7 +317,10 @@ fn bind_schema_inner(
             PipelineNode::Route { header, config: _ } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
-                    if let Ok(empty) = typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span) {
+                    if let Ok(mut empty) =
+                        typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span)
+                    {
+                        empty.output_row = cloned.clone();
                         artifacts.typed.insert(name.clone(), Arc::new(empty));
                     }
                     schema_by_name.insert(name, cloned);
@@ -301,12 +330,20 @@ fn bind_schema_inner(
                 if let Some(first) = header.inputs.first()
                     && let Some(upstream) = schema_by_name.get(input_target(&first.value))
                 {
-                    schema_by_name.insert(name, upstream.clone());
+                    let row = upstream.clone();
+                    schema_by_name.insert(name.clone(), row.clone());
+                    artifacts
+                        .typed
+                        .insert(name, Arc::new(synthetic_typed_program(row)));
                 }
             }
             PipelineNode::Output { header, .. } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
-                    schema_by_name.insert(name, upstream.clone());
+                    let row = upstream.clone();
+                    schema_by_name.insert(name.clone(), row.clone());
+                    artifacts
+                        .typed
+                        .insert(name, Arc::new(synthetic_typed_program(row)));
                 }
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
@@ -460,7 +497,7 @@ fn bind_composition(
         call_inputs,
         signature,
         parent_schema_by_name,
-        &mut artifacts.bound_schemas,
+        &mut artifacts.next_tail_var,
         node_name,
         span,
         diags,
@@ -548,11 +585,8 @@ fn bind_composition(
         })
         .collect();
 
-    // 12. Persist body BoundSchemas from body_schema_by_name.
-    let mut body_bound_schemas = BoundSchemas::default();
-    for (node_name, row) in &body_schema_by_name {
-        body_bound_schemas.set_output(node_name.clone(), row.clone());
-    }
+    // 12. Persist body per-node rows.
+    let body_rows: HashMap<String, Row> = body_schema_by_name.clone();
 
     // 13. Lower body nodes to PlanNodes via the shared lowering function.
     let body_plan_nodes: Vec<crate::plan::execution::PlanNode> = body_file
@@ -581,7 +615,7 @@ fn bind_composition(
     let bound_body = BoundBody {
         signature_path: resolved_path,
         nodes: body_plan_nodes,
-        bound_schemas: body_bound_schemas,
+        body_rows,
         output_port_rows: output_port_rows.clone(),
         input_port_rows,
         nested_body_ids,
@@ -755,7 +789,7 @@ fn build_input_port_rows(
     call_inputs: &IndexMap<String, String>,
     signature: &CompositionSignature,
     parent_schemas: &HashMap<String, Row>,
-    bound_schemas: &mut BoundSchemas,
+    next_tail_var: &mut u32,
     node_name: &str,
     span: Span,
     diags: &mut Vec<Diagnostic>,
@@ -851,7 +885,8 @@ fn build_input_port_rows(
         }
 
         // Build Row::open(declared, fresh_tail) for the port.
-        let tail_var = bound_schemas.fresh_tail();
+        let tail_var = cxl::typecheck::row::TailVarId(*next_tail_var);
+        *next_tail_var += 1;
         let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
         let row = Row::open(declared_columns, cxl_span, tail_var);
         rows.insert(port_name.clone(), row);
@@ -1166,7 +1201,20 @@ fn typecheck_cxl(
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared_map().clone();
     for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
+        if let cxl::ast::Statement::Emit {
+            name,
+            expr,
+            is_meta,
+            ..
+        } = stmt
+        {
+            // Meta emits write to per-record metadata (`$meta.*`), not
+            // to the output row — skip them so the row/schema view
+            // downstream operators see only reflects user-visible data
+            // fields.
+            if *is_meta {
+                continue;
+            }
             let emit_type = typed
                 .types
                 .get(expr.node_id().0 as usize)
@@ -1191,7 +1239,16 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
         out.insert(QualifiedField::bare(gb.as_str()), t);
     }
     for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
+        if let cxl::ast::Statement::Emit {
+            name,
+            expr,
+            is_meta,
+            ..
+        } = stmt
+        {
+            if *is_meta {
+                continue;
+            }
             let emit_type = typed
                 .types
                 .get(expr.node_id().0 as usize)
@@ -1418,13 +1475,32 @@ fn bind_combine(
             .find(|k| k.as_str() != driving)
             .expect("N=2 guarantees a non-driver qualifier");
 
+        // Pre-resolve qualified field references that appear in the
+        // where-clause — collect mode has no body, but the residual
+        // predicate (if any) still drives a `CombineResolver` at
+        // probe time.
+        let mut resolved_map: HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> =
+            HashMap::new();
+        for stmt in &typed_where.program.statements {
+            for sub in statement_exprs(stmt) {
+                walk_expr_for_qualified_refs(Some(sub), inputs, Some(&driving), &mut resolved_map);
+            }
+        }
+        artifacts
+            .combine_resolved_columns
+            .insert(name.to_string(), Arc::new(resolved_map));
+
         let mut output_decl: IndexMap<QualifiedField, Type> = IndexMap::new();
         for (qf, ty) in driver_input.row.fields() {
             output_decl.insert(qf.clone(), ty.clone());
         }
         output_decl.insert(QualifiedField::bare(build_qualifier.as_str()), Type::Array);
         let output_row = Row::closed(output_decl, cxl_span);
-        schema_by_name.insert(name.to_string(), output_row);
+        schema_by_name.insert(name.to_string(), output_row.clone());
+        artifacts.typed.insert(
+            name.to_string(),
+            Arc::new(synthetic_typed_program(output_row)),
+        );
         return;
     }
 
@@ -1462,10 +1538,170 @@ fn bind_combine(
     }
 
     let output_row = combine_output_row(&body_typed, cxl_span);
-    schema_by_name.insert(name.to_string(), output_row);
+    schema_by_name.insert(name.to_string(), output_row.clone());
+    let mut body_typed = body_typed;
+    body_typed.output_row = output_row;
+
+    // Resolve every qualified field reference in the body AND in the
+    // where-clause into `(JoinSide, column-index)` against each input's
+    // declared schema. The executor's
+    // `CombineResolverMapping::from_pre_resolved` consumes this map so
+    // probe-time field resolution is a direct `Vec<Value>` index read
+    // rather than a name-keyed hash lookup. `combine_driving` is
+    // `None` only when driver selection failed upstream (E306); in
+    // that case every qualifier lands on `JoinSide::Build`, which is
+    // harmless because the post-pass skips stamping the combine's
+    // runtime fields and the executor never reaches it.
+    let driver_qualifier = artifacts.combine_driving.get(name).cloned();
+    let inputs_for_resolve = artifacts
+        .combine_inputs
+        .get(name)
+        .expect("combine_inputs populated above");
+    let mut resolved_map =
+        resolve_combine_body_columns(&body_typed, inputs_for_resolve, driver_qualifier.as_deref());
+    for stmt in &typed_where.program.statements {
+        for sub in statement_exprs(stmt) {
+            walk_expr_for_qualified_refs(
+                Some(sub),
+                inputs_for_resolve,
+                driver_qualifier.as_deref(),
+                &mut resolved_map,
+            );
+        }
+    }
+    artifacts
+        .combine_resolved_columns
+        .insert(name.to_string(), Arc::new(resolved_map));
+
     artifacts
         .typed
         .insert(name.to_string(), Arc::new(body_typed));
+}
+
+/// Walk every `Expr::QualifiedFieldRef { parts: [qualifier, name] }` in
+/// `typed.program` and emit `(QualifiedField, (JoinSide, column-index))`
+/// entries resolved against the combine's per-input declared rows.
+///
+/// Qualifiers that match `driver_qualifier` land on `JoinSide::Probe`;
+/// all others land on `JoinSide::Build`. The column index is the
+/// qualified field's position within that input's declared row —
+/// exactly what the executor needs to pull the value out of the
+/// positional `Vec<Value>` without a name-keyed hash lookup.
+fn resolve_combine_body_columns(
+    typed: &TypedProgram,
+    inputs: &IndexMap<String, crate::plan::combine::CombineInput>,
+    driver_qualifier: Option<&str>,
+) -> HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> {
+    use crate::executor::combine::JoinSide;
+
+    let mut out: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
+    for stmt in &typed.program.statements {
+        for sub in statement_exprs(stmt) {
+            walk_expr_for_qualified_refs(Some(sub), inputs, driver_qualifier, &mut out);
+        }
+    }
+    out
+}
+
+/// Every top-level `Expr` sub-tree owned by a CXL statement. The outer
+/// recursion in `walk_expr_for_qualified_refs` handles the descent;
+/// this just surfaces the roots so statements with multiple expression
+/// slots (trace guard + message) don't lose the guard.
+fn statement_exprs(stmt: &Statement) -> Vec<&Expr> {
+    match stmt {
+        Statement::Let { expr, .. } => vec![expr],
+        Statement::Emit { expr, .. } => vec![expr],
+        Statement::Filter { predicate, .. } => vec![predicate],
+        Statement::ExprStmt { expr, .. } => vec![expr],
+        Statement::Trace { guard, message, .. } => {
+            let mut v = vec![message];
+            if let Some(g) = guard.as_deref() {
+                v.push(g);
+            }
+            v
+        }
+        Statement::Distinct { .. } | Statement::UseStmt { .. } => Vec::new(),
+    }
+}
+
+/// Recursive descent over `Expr` emitting `(QualifiedField,
+/// (JoinSide, idx))` entries for every 2-part qualified reference.
+///
+/// 3-part references (namespaces like `$pipeline.x.y`) are skipped —
+/// they're accepted by the typechecker only for system namespaces
+/// that the executor resolves elsewhere.
+fn walk_expr_for_qualified_refs(
+    expr: Option<&Expr>,
+    inputs: &IndexMap<String, crate::plan::combine::CombineInput>,
+    driver_qualifier: Option<&str>,
+    out: &mut HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)>,
+) {
+    use crate::executor::combine::JoinSide;
+
+    let Some(expr) = expr else {
+        return;
+    };
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } => {
+            if parts.len() == 2 {
+                let qualifier = parts[0].as_ref();
+                let field_name = parts[1].as_ref();
+                if let Some(input) = inputs.get(qualifier)
+                    && let Some(idx) = input
+                        .row
+                        .fields()
+                        .position(|(qf, _)| qf.name.as_ref() == field_name)
+                {
+                    let side = match driver_qualifier {
+                        Some(d) if d == qualifier => JoinSide::Probe,
+                        _ => JoinSide::Build,
+                    };
+                    let qf = QualifiedField::qualified(qualifier, Arc::from(field_name));
+                    out.insert(qf, (side, idx as u32));
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            walk_expr_for_qualified_refs(Some(lhs), inputs, driver_qualifier, out);
+            walk_expr_for_qualified_refs(Some(rhs), inputs, driver_qualifier, out);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_expr_for_qualified_refs(Some(operand), inputs, driver_qualifier, out);
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            walk_expr_for_qualified_refs(Some(receiver), inputs, driver_qualifier, out);
+            for a in args {
+                walk_expr_for_qualified_refs(Some(a), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_expr_for_qualified_refs(Some(condition), inputs, driver_qualifier, out);
+            walk_expr_for_qualified_refs(Some(then_branch), inputs, driver_qualifier, out);
+            if let Some(e) = else_branch.as_ref() {
+                walk_expr_for_qualified_refs(Some(e), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject.as_deref() {
+                walk_expr_for_qualified_refs(Some(s), inputs, driver_qualifier, out);
+            }
+            for arm in arms {
+                walk_expr_for_qualified_refs(Some(&arm.pattern), inputs, driver_qualifier, out);
+                walk_expr_for_qualified_refs(Some(&arm.body), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                walk_expr_for_qualified_refs(Some(a), inputs, driver_qualifier, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Typecheck a combine's `where:` source against the merged row,

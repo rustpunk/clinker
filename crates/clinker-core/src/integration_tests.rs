@@ -70,7 +70,8 @@ mod tests {
                 | PipelineError::Compilation { .. }
                 | PipelineError::Internal { .. }
                 | PipelineError::SortOrderViolation { .. }
-                | PipelineError::MergeSortOrderViolation { .. },
+                | PipelineError::MergeSortOrderViolation { .. }
+                | PipelineError::SchemaMismatch { .. },
             ) => 1,
             Err(PipelineError::Eval(_) | PipelineError::Accumulator { .. }) => 3,
             Err(

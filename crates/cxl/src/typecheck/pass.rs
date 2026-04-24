@@ -99,6 +99,13 @@ pub struct TypedProgram {
     pub regexes: Vec<Option<Regex>>,
     /// Total node count.
     pub node_count: u32,
+    /// Bound output row for the node this program was typechecked for.
+    /// Populated by `bind_schema` after running shape-specific row
+    /// propagation (Transform widens, Aggregate projects group-by +
+    /// aggregates, Combine emits a fresh body row). The input-seeded
+    /// value is `Row::closed(IndexMap::new(), Span::default())`;
+    /// consumers observe the populated row after `bind_schema` completes.
+    pub output_row: Row,
 }
 
 /// Run Phase C: type-check a resolved program in row-level mode (the
@@ -172,6 +179,7 @@ pub fn type_check_with_mode(
         field_types,
         regexes,
         node_count,
+        output_row: Row::closed(IndexMap::new(), Span::default()),
     })
 }
 

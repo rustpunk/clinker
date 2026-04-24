@@ -1,6 +1,9 @@
 pub mod stage_metrics;
 
-pub(crate) mod combine;
+pub mod combine;
+mod schema_check;
+
+pub(crate) use schema_check::check_input_schema;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
@@ -1810,10 +1813,41 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         let mut all_records: Vec<(Record, u64)> = Vec::new();
         let mut row_num: u64 = 0;
-        while let Some(record) = format_reader.next_record()? {
-            row_num += 1;
-            counters.total_count += 1;
-            all_records.push((record, row_num));
+        loop {
+            match format_reader.next_record() {
+                Ok(Some(record)) => {
+                    row_num += 1;
+                    counters.total_count += 1;
+                    all_records.push((record, row_num));
+                }
+                Ok(None) => break,
+                Err(clinker_format::error::FormatError::MetadataCapExceeded {
+                    record,
+                    key,
+                    count,
+                }) => {
+                    // Reader captured 64 off-schema keys into `$meta.*`
+                    // and surfaced the 65th — quarantine the partial
+                    // record and continue reading subsequent records.
+                    // The pipeline summary aggregates this per-category
+                    // via the standard source-stage DLQ counters.
+                    row_num += 1;
+                    counters.total_count += 1;
+                    counters.dlq_count += 1;
+                    dlq_entries.push(DlqEntry {
+                        source_row: row_num,
+                        category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
+                        error_message: format!(
+                            "per-record metadata cap exceeded at key {key:?} (count={count})"
+                        ),
+                        original_record: record,
+                        stage: Some(DlqEntry::stage_source()),
+                        route: None,
+                        trigger: true,
+                    });
+                }
+                Err(other) => return Err(other.into()),
+            }
         }
 
         // D12: a global-fold aggregate (group_by: []) must still emit one
@@ -1864,9 +1898,36 @@ impl PipelineExecutor {
                 let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
                 let mut recs: Vec<(Record, u64)> = Vec::new();
                 let mut rn: u64 = 0;
-                while let Some(record) = src_reader.next_record()? {
-                    rn += 1;
-                    recs.push((record, rn));
+                loop {
+                    match src_reader.next_record() {
+                        Ok(Some(record)) => {
+                            rn += 1;
+                            recs.push((record, rn));
+                        }
+                        Ok(None) => break,
+                        Err(clinker_format::error::FormatError::MetadataCapExceeded {
+                            record,
+                            key,
+                            count,
+                        }) => {
+                            rn += 1;
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: rn,
+                                category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
+                                error_message: format!(
+                                    "per-record metadata cap exceeded at key {key:?} \
+                                     (count={count}) reading combine build-side source \
+                                     {upstream:?}"
+                                ),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_source()),
+                                route: None,
+                                trigger: true,
+                            });
+                        }
+                        Err(other) => return Err(other.into()),
+                    }
                 }
                 combine_source_records.insert(upstream.to_string(), recs);
             }
@@ -2809,10 +2870,9 @@ impl PipelineExecutor {
 
         // Inter-node buffers: each node produces records into its buffer.
         // Each row is `(Record, row_number)` — the Record is authoritative
-        // (emitted fields via `Record::set` / `set_overflow`, `$meta.*`
-        // via `set_meta`). Downstream nodes resolve field references
-        // against the Record directly (Invariant 3 — no parallel
-        // bookkeeping threading).
+        // (emitted fields via `Record::set` onto the widened schema,
+        // `$meta.*` via `set_meta`). Downstream nodes resolve field
+        // references against the Record directly (no parallel bookkeeping).
         let mut node_buffers: HashMap<NodeIndex, Vec<(Record, u64)>> = HashMap::new();
 
         // Walk DAG in topological order
@@ -2822,12 +2882,48 @@ impl PipelineExecutor {
                 PlanNode::Source { ref name, .. } => {
                     // Combine build-side sources get their own pre-loaded
                     // records; every other source falls back to the
-                    // primary driving reader's stream.
+                    // primary driving reader's stream. Records are
+                    // canonicalized onto the Source's plan-time
+                    // `Arc<Schema>` so every downstream operator hits
+                    // the `Arc::ptr_eq` fast path on the first record.
+                    // Structural equality holds by construction:
+                    // `CoercingReader` builds its Arc from the same
+                    // declared `schema:` block that `bind_schema` reads
+                    // to populate `PlanNode::Source.output_schema`.
+                    let source_schema = plan.graph[node_idx].stored_output_schema().cloned();
+                    let canonicalize = |r: &Record| -> Record {
+                        match source_schema.as_ref() {
+                            Some(target) => {
+                                if Arc::ptr_eq(r.schema(), target) {
+                                    r.clone()
+                                } else {
+                                    debug_assert_eq!(
+                                        r.schema().columns(),
+                                        target.columns(),
+                                        "Source reader Arc must match plan-time declared columns",
+                                    );
+                                    let mut rebuilt =
+                                        Record::new(Arc::clone(target), r.values().to_vec());
+                                    for (k, v) in r.iter_meta() {
+                                        let _ = rebuilt.set_meta(k, v.clone());
+                                    }
+                                    rebuilt
+                                }
+                            }
+                            None => r.clone(),
+                        }
+                    };
                     let records: Vec<_> =
                         if let Some(src_recs) = combine_source_records.get(name.as_str()) {
-                            src_recs.iter().map(|(r, rn)| (r.clone(), *rn)).collect()
+                            src_recs
+                                .iter()
+                                .map(|(r, rn)| (canonicalize(r), *rn))
+                                .collect()
                         } else {
-                            all_records.iter().map(|(r, rn)| (r.clone(), *rn)).collect()
+                            all_records
+                                .iter()
+                                .map(|(r, rn)| (canonicalize(r), *rn))
+                                .collect()
                         };
                     node_buffers.insert(node_idx, records);
                 }
@@ -2867,18 +2963,47 @@ impl PipelineExecutor {
                         transforms[transform_idx].has_distinct(),
                     );
 
+                    let expected_input =
+                        plan.graph[node_idx].expected_input_schema_in(plan).cloned();
+                    let output_schema = plan.graph[node_idx].stored_output_schema().cloned();
+                    let upstream_name = plan
+                        .graph
+                        .neighbors_directed(node_idx, Direction::Incoming)
+                        .next()
+                        .map(|i| plan.graph[i].name().to_string())
+                        .unwrap_or_default();
+
                     let mut output_records = Vec::with_capacity(input_records.len());
 
                     for (record, rn) in input_records {
+                        if let Some(exp) = expected_input.as_ref() {
+                            check_input_schema(
+                                exp,
+                                record.schema(),
+                                name,
+                                "transform",
+                                &upstream_name,
+                            )?;
+                        }
                         let ctx = EvalContext {
                             stable: &stable,
                             source_file: &source_file_arc,
                             source_row: rn,
                         };
 
+                        let target_schema = output_schema
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| Arc::clone(record.schema()));
                         let eval_result = {
                             let _guard = transform_timer.guard();
-                            evaluate_single_transform(&record, name, &mut evaluator, &ctx)
+                            evaluate_single_transform(
+                                &record,
+                                name,
+                                &mut evaluator,
+                                &ctx,
+                                &target_schema,
+                            )
                         };
                         match eval_result {
                             Ok((modified_record, Ok(()))) => {
@@ -2927,6 +3052,24 @@ impl PipelineExecutor {
                         .iter()
                         .find_map(|p| node_buffers.remove(p))
                         .unwrap_or_default();
+
+                    if let Some(expected) =
+                        plan.graph[node_idx].expected_input_schema_in(plan).cloned()
+                    {
+                        let upstream_name = predecessors
+                            .first()
+                            .map(|&i| plan.graph[i].name().to_string())
+                            .unwrap_or_default();
+                        for (record, _) in &input_records {
+                            check_input_schema(
+                                &expected,
+                                record.schema(),
+                                name,
+                                "route",
+                                &upstream_name,
+                            )?;
+                        }
+                    }
 
                     // Get successor nodes (branch transform nodes)
                     let successors: Vec<NodeIndex> = plan
@@ -3101,10 +3244,34 @@ impl PipelineExecutor {
                         .iter()
                         .map(|p| node_buffers.get(p).map_or(0, |b| b.len()))
                         .sum();
+                    let merge_output_schema = plan.graph[node_idx].stored_output_schema().cloned();
                     let mut merged = Vec::with_capacity(total);
                     for pred in &sorted_preds {
+                        let upstream_name = plan.graph[*pred].name().to_string();
                         if let Some(buf) = node_buffers.remove(pred) {
-                            merged.extend(buf);
+                            for (mut record, rn) in buf {
+                                if let Some(canonical) = merge_output_schema.as_ref() {
+                                    check_input_schema(
+                                        canonical,
+                                        record.schema(),
+                                        name,
+                                        "merge",
+                                        &upstream_name,
+                                    )?;
+                                    // Canonicalize: rebuild record with the
+                                    // Merge's `Arc<Schema>` so downstream
+                                    // operators hit the ptr_eq fast path
+                                    // regardless of which input the record
+                                    // originated from.
+                                    let values = record.values().to_vec();
+                                    let mut rebuilt = Record::new(Arc::clone(canonical), values);
+                                    for (k, v) in record.iter_meta() {
+                                        let _ = rebuilt.set_meta(k, v.clone());
+                                    }
+                                    record = rebuilt;
+                                }
+                                merged.push((record, rn));
+                            }
                         }
                     }
                     node_buffers.insert(node_idx, merged);
@@ -3224,6 +3391,21 @@ impl PipelineExecutor {
 
                     let pred = single_predecessor(plan, node_idx, "aggregation", name)?;
                     let input = node_buffers.remove(&pred).unwrap_or_default();
+
+                    if let Some(expected) =
+                        plan.graph[node_idx].expected_input_schema_in(plan).cloned()
+                    {
+                        let upstream_name = plan.graph[pred].name().to_string();
+                        for (record, _) in &input {
+                            check_input_schema(
+                                &expected,
+                                record.schema(),
+                                name,
+                                "aggregation",
+                                &upstream_name,
+                            )?;
+                        }
+                    }
 
                     // Build the per-aggregation runtime artifacts. The
                     // executor owns the evaluator + spill metadata; the
@@ -3384,6 +3566,26 @@ impl PipelineExecutor {
                             .unwrap_or_default()
                     };
 
+                    if let Some(expected) =
+                        plan.graph[node_idx].expected_input_schema_in(plan).cloned()
+                    {
+                        let upstream_name = plan
+                            .graph
+                            .neighbors_directed(node_idx, Direction::Incoming)
+                            .next()
+                            .map(|i| plan.graph[i].name().to_string())
+                            .unwrap_or_default();
+                        for (record, _) in &input_records {
+                            check_input_schema(
+                                &expected,
+                                record.schema(),
+                                name,
+                                "output",
+                                &upstream_name,
+                            )?;
+                        }
+                    }
+
                     // Dual counters:
                     //
                     // * `records_written` increments per WRITE — under
@@ -3494,6 +3696,25 @@ impl PipelineExecutor {
                         .iter()
                         .find_map(|p| node_buffers.remove(p))
                         .unwrap_or_default();
+
+                    if let Some(expected) =
+                        plan.graph[node_idx].expected_input_schema_in(plan).cloned()
+                    {
+                        let upstream_name = predecessors
+                            .first()
+                            .map(|&i| plan.graph[i].name().to_string())
+                            .unwrap_or_default();
+                        for (record, _) in &input_records {
+                            check_input_schema(
+                                &expected,
+                                record.schema(),
+                                name,
+                                "composition",
+                                &upstream_name,
+                            )?;
+                        }
+                    }
+
                     node_buffers.insert(node_idx, input_records);
                 }
 
@@ -3502,6 +3723,7 @@ impl PipelineExecutor {
                     ref driving_input,
                     ref match_mode,
                     ref on_miss,
+                    ref resolved_column_map,
                     ..
                 } => {
                     use crate::config::pipeline_node::{MatchMode, OnMiss};
@@ -3514,6 +3736,13 @@ impl PipelineExecutor {
                     // the module constants in pipeline/combine.rs and
                     // aligns with DataFusion's collect-list bound.
                     const COLLECT_PER_GROUP_CAP: usize = 10_000;
+
+                    // Combine's widened output schema — every emitted
+                    // record lands on this `Arc<Schema>` so downstream
+                    // operators hit the ptr_eq fast path and
+                    // `Record::set` always addresses a known slot.
+                    let combine_output_schema =
+                        plan.graph[node_idx].stored_output_schema().cloned();
 
                     let combine_inputs = artifacts.combine_inputs.get(name).ok_or_else(|| {
                         PipelineError::Internal {
@@ -3607,6 +3836,32 @@ impl PipelineExecutor {
                     let driver_buf = node_buffers.remove(&driver_pred).unwrap_or_default();
                     let build_buf = node_buffers.remove(&build_pred).unwrap_or_default();
 
+                    // Operator-entry schema check per D4: every record
+                    // arriving on the probe and build channels is
+                    // validated against its upstream's compile-time
+                    // output schema. Arc::ptr_eq is the fast path; a
+                    // mismatch raises E314.
+                    let driver_expected = plan.graph[driver_pred].output_schema_in(plan).clone();
+                    let build_expected = plan.graph[build_pred].output_schema_in(plan).clone();
+                    for (record, _) in &driver_buf {
+                        check_input_schema(
+                            &driver_expected,
+                            record.schema(),
+                            name,
+                            "combine",
+                            driver_upstream,
+                        )?;
+                    }
+                    for (record, _) in &build_buf {
+                        check_input_schema(
+                            &build_expected,
+                            record.schema(),
+                            name,
+                            "combine",
+                            build_upstream,
+                        )?;
+                    }
+
                     // Build the KeyExtractor pair: one side aligned to
                     // the build qualifier, the other to the driver. The
                     // i-th equality conjunct contributes one key column
@@ -3659,9 +3914,16 @@ impl PipelineExecutor {
                     let probe_extractor = KeyExtractor::new(probe_progs);
 
                     // Resolver mapping is built once and reused for
-                    // every probe iteration below.
-                    let resolver_mapping =
-                        CombineResolverMapping::new(combine_inputs, driving_input);
+                    // every probe iteration below. The `(side, u32)`
+                    // index pairs come from the CXL typechecker's
+                    // pre-resolved column map stashed on the PlanNode;
+                    // the `bare_to_side` fallback is derived here from
+                    // `combine_inputs` so unambiguous bare names keep
+                    // resolving after the resolver is constructed.
+                    let resolver_mapping = CombineResolverMapping::from_pre_resolved(
+                        resolved_column_map,
+                        combine_inputs,
+                    );
 
                     // Hash-build phase — drain the build buffer into a
                     // fresh MemoryBudget-governed CombineHashTable. The
@@ -3793,18 +4055,16 @@ impl PipelineExecutor {
                                     );
                                 }
 
-                                // Output record uses the probe record
-                                // as its base; append the `<build_qualifier>`
-                                // array (either at its schema position or as
-                                // an overflow entry).
-                                let mut rec = probe_record.clone();
-                                let arr_val = Value::Array(arr);
-                                if !rec.set(&build_qualifier, arr_val.clone()) {
-                                    rec.set_overflow(
-                                        build_qualifier.clone().into_boxed_str(),
-                                        arr_val,
-                                    );
-                                }
+                                // Output record inherits the probe's
+                                // data re-projected onto the combine's
+                                // widened output_schema; the
+                                // `<build_qualifier>` column is
+                                // guaranteed to exist on it.
+                                let mut rec = match combine_output_schema.as_ref() {
+                                    Some(s) => widen_record_to_schema(&probe_record, s),
+                                    None => probe_record.clone(),
+                                };
+                                rec.set(&build_qualifier, Value::Array(arr));
                                 output_records.push((rec, rn));
                                 emitted_since_check += 1;
                             }
@@ -3888,11 +4148,16 @@ impl PipelineExecutor {
                                                     fields: emitted,
                                                     metadata,
                                                 }) => {
-                                                    let mut rec = probe_record.clone();
-                                                    for (n, v) in emitted {
-                                                        if !rec.set(&n, v.clone()) {
-                                                            rec.set_overflow(n.into_boxed_str(), v);
+                                                    let mut rec = match combine_output_schema
+                                                        .as_ref()
+                                                    {
+                                                        Some(s) => {
+                                                            widen_record_to_schema(&probe_record, s)
                                                         }
+                                                        None => probe_record.clone(),
+                                                    };
+                                                    for (n, v) in emitted {
+                                                        rec.set(&n, v);
                                                     }
                                                     for (k, v) in metadata {
                                                         let _ = rec.set_meta(&k, v);
@@ -3936,11 +4201,14 @@ impl PipelineExecutor {
                                                 fields: emitted,
                                                 metadata,
                                             }) => {
-                                                let mut rec = probe_record.clone();
-                                                for (n, v) in emitted {
-                                                    if !rec.set(&n, v.clone()) {
-                                                        rec.set_overflow(n.into_boxed_str(), v);
+                                                let mut rec = match combine_output_schema.as_ref() {
+                                                    Some(s) => {
+                                                        widen_record_to_schema(&probe_record, s)
                                                     }
+                                                    None => probe_record.clone(),
+                                                };
+                                                for (n, v) in emitted {
+                                                    rec.set(&n, v);
                                                 }
                                                 for (k, v) in metadata {
                                                     let _ = rec.set_meta(&k, v);
@@ -4649,8 +4917,9 @@ fn build_stable_eval_context(
 
 /// Evaluate all transforms against a single record, accumulating emitted fields.
 ///
-/// Emitted fields from earlier transforms are merged into the record's overflow
-/// so that later transforms can reference them as input fields.
+/// The record is rebuilt onto a widened schema that includes every
+/// emitted field before the writes happen, so every `Record::set` lands
+/// at a known slot. The returned record carries this widened schema.
 ///
 /// On error, returns `(transform_name, EvalError)` so callers can populate
 /// the DLQ stage field with `"transform:{name}"`.
@@ -4661,8 +4930,8 @@ fn evaluate_record(
     ctx: &EvalContext,
 ) -> Result<(Record, EvalResult), (String, cxl::eval::EvalError)> {
     let mut record = record.clone();
-    let mut all_emitted = IndexMap::new();
-    let mut all_metadata = IndexMap::new();
+    let mut all_emitted: IndexMap<String, clinker_record::Value> = IndexMap::new();
+    let mut all_metadata: IndexMap<String, clinker_record::Value> = IndexMap::new();
 
     for (i, eval) in evaluators.iter_mut().enumerate() {
         let name = transform_names.get(i).copied().unwrap_or("unknown");
@@ -4674,10 +4943,9 @@ fn evaluate_record(
                 fields: emitted,
                 metadata,
             } => {
+                record = record_with_emitted_fields(&record, &emitted);
                 for (field_name, value) in &emitted {
-                    if !record.set(field_name, value.clone()) {
-                        record.set_overflow(field_name.clone().into_boxed_str(), value.clone());
-                    }
+                    record.set(field_name, value.clone());
                 }
                 for (key, value) in &metadata {
                     let _ = record.set_meta(key, value.clone());
@@ -4700,8 +4968,8 @@ fn evaluate_record(
 
 /// Evaluate all transforms with window context, accumulating emitted fields.
 ///
-/// Emitted fields from earlier transforms are merged into the record's overflow
-/// so that later transforms can reference them as input fields.
+/// Emitted fields from earlier transforms land on the widened schema
+/// so later transforms can reference them as input fields.
 ///
 /// On error, returns `(transform_name, EvalError)` so callers can populate
 /// the DLQ stage field with `"transform:{name}"`.
@@ -4769,12 +5037,9 @@ fn evaluate_record_with_window(
                 fields: emitted,
                 metadata,
             } => {
+                record = record_with_emitted_fields(&record, &emitted);
                 for (name, value) in &emitted {
-                    // Use set() for schema fields (e.g. emit amount = amount.to_int()),
-                    // set_overflow() for new fields introduced by the transform.
-                    if !record.set(name, value.clone()) {
-                        record.set_overflow(name.clone().into_boxed_str(), value.clone());
-                    }
+                    record.set(name, value.clone());
                 }
                 for (key, value) in &metadata {
                     let _ = record.set_meta(key, value.clone());
@@ -4798,11 +5063,12 @@ fn evaluate_record_with_window(
 /// Evaluate a single transform against a record, returning the
 /// modified record with emitted fields and metadata merged in.
 ///
-/// Used by the DAG-walking executor for per-node evaluation. Emitted
-/// fields land at their schema position via `Record::set` or in the
-/// overflow map via `Record::set_overflow`; metadata writes via
-/// `Record::set_meta`. The returned Record is authoritative for every
-/// downstream node — no parallel bookkeeping map is produced.
+/// Used by the DAG-walking executor for per-node evaluation. The
+/// record schema is widened in-place (rebuilt onto a schema that
+/// includes every emitted field) so `Record::set` always hits a
+/// known slot. Downstream positional-index consumers (aggregation
+/// `group_by_indices`) rely on the upstream layout, so the widened
+/// schema preserves every upstream column at its original index.
 ///
 /// Returns `Ok((modified_record, Ok(())))` on emit,
 /// `Ok((record, Err(SkipReason)))` on skip. On error, returns
@@ -4812,28 +5078,82 @@ fn evaluate_single_transform(
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
+    _output_schema: &Arc<Schema>,
 ) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
-    let mut record = record.clone();
+    let input = record;
     match evaluator
-        .eval_record::<NullStorage>(ctx, &record, None)
+        .eval_record::<NullStorage>(ctx, input, None)
         .map_err(|e| (transform_name.to_string(), e))?
     {
         EvalResult::Emit {
             fields: emitted,
             metadata,
         } => {
+            let mut out = record_with_emitted_fields(input, &emitted);
             for (name, value) in &emitted {
-                if !record.set(name, value.clone()) {
-                    record.set_overflow(name.clone().into_boxed_str(), value.clone());
-                }
+                out.set(name, value.clone());
             }
             for (key, value) in &metadata {
-                let _ = record.set_meta(key, value.clone());
+                let _ = out.set_meta(key, value.clone());
             }
-            Ok((record, Ok(())))
+            Ok((out, Ok(())))
         }
-        EvalResult::Skip(reason) => Ok((record, Err(reason))),
+        EvalResult::Skip(reason) => Ok((input.clone(), Err(reason))),
     }
+}
+
+/// Re-project `input` onto `target`: allocate a fresh `Record` whose
+/// schema is `target`, copying over any upstream field that `target`
+/// still declares. Used at operator boundaries to canonicalize the
+/// `Arc<Schema>` on the Record so downstream `Arc::ptr_eq` checks hit
+/// the fast path.
+fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Record {
+    if Arc::ptr_eq(input.schema(), target) {
+        return input.clone();
+    }
+    let mut values: Vec<clinker_record::Value> = Vec::with_capacity(target.column_count());
+    for col in target.columns() {
+        values.push(
+            input
+                .get(col)
+                .cloned()
+                .unwrap_or(clinker_record::Value::Null),
+        );
+    }
+    let mut out = Record::new(Arc::clone(target), values);
+    for (k, v) in input.iter_meta() {
+        let _ = out.set_meta(k, v.clone());
+    }
+    out
+}
+
+/// Widen `input`'s schema in place to include every key in `emitted`
+/// that is not already declared. Allocates a fresh `Arc<Schema>` only
+/// when new names appear; otherwise clones `input`. Used by the legacy
+/// linear pipeline path where the emit set is determined at eval time
+/// rather than via a plan-time `output_schema`.
+fn record_with_emitted_fields(
+    input: &Record,
+    emitted: &IndexMap<String, clinker_record::Value>,
+) -> Record {
+    let mut missing: Vec<&str> = Vec::new();
+    for key in emitted.keys() {
+        if input.schema().index(key).is_none() {
+            missing.push(key.as_str());
+        }
+    }
+    if missing.is_empty() {
+        return input.clone();
+    }
+    let mut builder = SchemaBuilder::with_capacity(input.schema().column_count() + missing.len());
+    for col in input.schema().columns() {
+        builder = builder.with_field(col.as_ref());
+    }
+    for name in missing {
+        builder = builder.with_field(name);
+    }
+    let widened = builder.build();
+    widen_record_to_schema(input, &widened)
 }
 
 /// Parse memory limit from config (default 512MB).

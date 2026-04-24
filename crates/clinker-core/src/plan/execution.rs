@@ -18,12 +18,14 @@ use crate::config::{
     AggregateConfig, OutputConfig, PipelineConfig, RouteMode, SortField, SourceConfig,
 };
 use crate::error::PipelineError;
+use crate::executor::combine::JoinSide;
 use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{IndexSpec, LocalWindowConfig, PlanIndexError};
 use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
     PartitioningProvenance,
 };
+use crate::plan::row_type::QualifiedField;
 use crate::span::Span;
 use clinker_record::Schema;
 use cxl::plan::CompiledAggregate;
@@ -87,6 +89,12 @@ pub enum PlanNode {
         /// Boxed to keep the variant small.
         #[serde(skip)]
         resolved: Option<Box<PlanSourcePayload>>,
+        /// Declared output schema. Populated by `bind_schema` from the
+        /// source's author-declared `schema:` block; every record emitted
+        /// by this source carries this exact `Arc` so downstream
+        /// `Arc::ptr_eq` schema checks hit the fast path.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
     },
     Transform {
         name: String,
@@ -118,6 +126,12 @@ pub enum PlanNode {
         /// downstream stream's ordering provenance.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         has_distinct: bool,
+        /// Widened post-emit schema. Populated by `bind_schema` from the
+        /// typechecked `TypedProgram`; includes every `emit`-written field
+        /// on top of the upstream's schema so `Record::set` at emit sites
+        /// always hits a known slot.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
     },
     Route {
         name: String,
@@ -131,6 +145,14 @@ pub enum PlanNode {
         name: String,
         #[serde(skip)]
         span: Span,
+        /// Canonical output schema adopted from `input[0]`. All Merge inputs
+        /// are structurally equal per the Merge contract (validated in
+        /// `bind_schema`); picking one canonical `Arc` lets Merge emit every
+        /// record via `Arc::clone(&output_schema)` so downstream operators
+        /// always hit the `Arc::ptr_eq` fast path instead of structural
+        /// fallback on input-switches.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
     },
     Output {
         name: String,
@@ -200,6 +222,10 @@ pub enum PlanNode {
         /// `bind_composition` during `bind_schema`; sentinel
         /// `CompositionBodyId::SENTINEL` before binding runs.
         body: CompositionBodyId,
+        /// Lowered output schema of the composition body. Populated by
+        /// `bind_composition` from the body's terminal-node output row.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
     },
     /// N-ary combine node.
     ///
@@ -242,8 +268,29 @@ pub enum PlanNode {
         /// was decomposed from. `None` for user-authored combine nodes.
         /// Consumed by `--explain` rendering for grouping.
         decomposed_from: Option<String>,
+        /// Widened post-combine output schema. For `match: collect` this
+        /// is the driver's schema plus one trailing column for the
+        /// collected array; for `match: first | all` it is the body-emit
+        /// widened schema. Populated by `bind_schema::bind_combine`.
+        #[serde(skip)]
+        output_schema: Arc<Schema>,
+        /// Pre-resolved `(side, column-index)` for every qualified field
+        /// reference in the combine body. Populated by the CXL typechecker
+        /// walk over the body against the per-input schemas; consumed
+        /// by `CombineResolverMapping::from_pre_resolved` at executor
+        /// start so probe-time resolution is a direct `Vec<Value>`
+        /// index read instead of a name-keyed hash lookup.
+        #[serde(skip)]
+        resolved_column_map: ResolvedColumnMap,
     },
 }
+
+/// Pre-resolved `(side, column-index)` map for combine body references.
+///
+/// Produced by the CXL typechecker during combine body typechecking,
+/// consumed by [`crate::executor::combine::CombineResolverMapping::from_pre_resolved`]
+/// at executor start-up. One entry per qualified field the body reads.
+pub type ResolvedColumnMap = Arc<HashMap<QualifiedField, (JoinSide, u32)>>;
 
 /// Fully-resolved Source payload, populated by the
 /// `PipelineConfig::compile()` lowering path. Wraps the parse-time
@@ -309,6 +356,71 @@ impl PlanNode {
             | PlanNode::Composition { span, .. }
             | PlanNode::Combine { span, .. } => *span,
         }
+    }
+
+    /// The stored `Arc<Schema>` for this node. For variants whose output
+    /// row shape matches the upstream (Route/Output/Sort), callers must
+    /// resolve via the graph (see [`PlanNode::output_schema_in`]).
+    pub fn stored_output_schema(&self) -> Option<&Arc<Schema>> {
+        match self {
+            PlanNode::Source { output_schema, .. }
+            | PlanNode::Transform { output_schema, .. }
+            | PlanNode::Aggregation { output_schema, .. }
+            | PlanNode::Combine { output_schema, .. }
+            | PlanNode::Composition { output_schema, .. }
+            | PlanNode::Merge { output_schema, .. } => Some(output_schema),
+            PlanNode::Route { .. } | PlanNode::Output { .. } | PlanNode::Sort { .. } => None,
+        }
+    }
+
+    /// The `Arc<Schema>` this node emits. For row-preserving variants
+    /// (Route/Output/Sort) this walks the graph to the sole upstream and
+    /// returns its schema; the DAG invariant is that these variants always
+    /// have exactly one incoming data edge.
+    pub fn output_schema_in<'a>(&'a self, dag: &'a ExecutionPlanDag) -> &'a Arc<Schema> {
+        if let Some(s) = self.stored_output_schema() {
+            return s;
+        }
+        let name = self.name();
+        let idx = dag
+            .graph
+            .node_indices()
+            .find(|&i| dag.graph[i].name() == name)
+            .expect("PlanNode::output_schema_in: node not present in its own dag");
+        let upstream = dag
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .next()
+            .expect("PlanNode::output_schema_in: row-preserving variant has no upstream");
+        dag.graph[upstream].output_schema_in(dag)
+    }
+
+    /// The `Arc<Schema>` this node expects to see on incoming records.
+    /// Equal to the sole upstream's `output_schema_in` for every variant
+    /// with exactly one incoming edge (Transform/Aggregate/Route/Output/
+    /// Sort/Composition). Returns `None` for Sources (no upstream) and
+    /// for Merge/Combine (N>1 upstreams — callers check per input).
+    pub fn expected_input_schema_in<'a>(
+        &'a self,
+        dag: &'a ExecutionPlanDag,
+    ) -> Option<&'a Arc<Schema>> {
+        if matches!(self, PlanNode::Source { .. }) {
+            return None;
+        }
+        let name = self.name();
+        let idx = dag
+            .graph
+            .node_indices()
+            .find(|&i| dag.graph[i].name() == name)?;
+        let mut incoming = dag
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming);
+        let first = incoming.next()?;
+        if incoming.next().is_some() {
+            // N>1 upstreams (Merge, Combine) — caller must walk per-input.
+            return None;
+        }
+        Some(dag.graph[first].output_schema_in(dag))
     }
 
     /// Get the type tag string for id slug construction.
@@ -1908,7 +2020,8 @@ fn compute_one(
         PlanNode::Composition { name, .. } => {
             // Composition is opaque at the top-level property pass.
             // Inherit parent ordering/partitioning — body-internal
-            // properties live in BoundBody.bound_schemas, not here.
+            // properties live on the bound body's per-node rows, not
+            // on this node.
             let parent = match parents.first() {
                 Some(p) => p,
                 None => return NodeProperties::unordered_single(),

@@ -423,8 +423,10 @@ fn test_split_csv_repeat_header() {
 
 #[test]
 fn test_split_csv_header_consistent() {
-    // All split files have identical headers (captured from first file)
-    let schema = make_schema(&["id"]);
+    // All split files share an identical header captured from the
+    // schema (not from the first record's overflow — that storage no
+    // longer exists).
+    let schema = make_schema(&["id", "extra"]);
     let registry = FileRegistry::new();
     let policy = SplitPolicy {
         max_records: Some(2),
@@ -441,17 +443,17 @@ fn test_split_csv_header_consistent() {
         policy,
     );
 
-    // All records have overflow field "extra" — header captured from first record
     for i in 0..4 {
-        let mut r = make_record(&schema, vec![Value::Integer(i)]);
-        r.set_overflow("extra".into(), Value::String(format!("val_{i}").into()));
+        let r = make_record(
+            &schema,
+            vec![Value::Integer(i), Value::String(format!("val_{i}").into())],
+        );
         writer.write_record(&r).unwrap();
     }
     writer.flush().unwrap();
 
     let contents = registry.file_contents();
     assert_eq!(contents.len(), 2);
-    // Both files should have identical headers: "id,extra"
     let header1 = contents[0].lines().next().unwrap();
     let header2 = contents[1].lines().next().unwrap();
     assert_eq!(header1, "id,extra");

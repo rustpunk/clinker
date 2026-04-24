@@ -2,7 +2,7 @@
 pub const MAX_SOURCE_LEN: usize = 64 * 1024;
 
 /// Byte-offset span for source mapping and diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
     pub start: u32,
     pub end: u32,

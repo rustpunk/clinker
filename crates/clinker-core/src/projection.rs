@@ -59,9 +59,17 @@ pub fn project_output_with_meta(
 }
 
 /// Record-driven projection (Invariant 3 implementation).
+///
+/// `include_unmapped: true` surfaces any off-schema reader columns that
+/// the Source stage captured into `$meta.*` during schema reprojection.
+/// Pre-rip this flag controlled whether the overflow map flowed into
+/// the output record; post-rip metadata is the sole home for unmapped
+/// reader fields, so the flag dispatches through the metadata merge path.
 pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) -> Record {
-    let needs_rewrite =
-        config.exclude.is_some() || config.mapping.is_some() || !config.include_metadata.is_none();
+    let needs_rewrite = config.exclude.is_some()
+        || config.mapping.is_some()
+        || !config.include_metadata.is_none()
+        || config.include_unmapped;
 
     if !needs_rewrite {
         // Fast path: no exclude, no mapping, no metadata merge — emit
@@ -86,8 +94,12 @@ pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) 
         fields.insert(name.to_string(), value.clone());
     }
 
-    // Merge metadata into output when include_metadata is set.
-    // Metadata fields are prefixed with `meta.` in the output.
+    // Merge metadata into output when include_metadata is set (key is
+    // `meta.<name>`) or when include_unmapped is set (key is `<name>`,
+    // mirroring the pre-rip overflow-passthrough shape). Both paths
+    // share the `iter_meta` iterator; include_unmapped uses the bare
+    // key so downstream tools that consumed overflow fields see the
+    // same field names they did pre-rip.
     if !config.include_metadata.is_none() {
         let meta_iter: Vec<(String, Value)> = match &config.include_metadata {
             IncludeMetadata::None => vec![],
@@ -105,6 +117,13 @@ pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) 
             let output_name = format!("meta.{key}");
             if !fields.contains_key(&output_name) {
                 fields.insert(output_name, value);
+            }
+        }
+    }
+    if config.include_unmapped {
+        for (key, value) in input_record.iter_meta() {
+            if !fields.contains_key(key) {
+                fields.insert(key.to_string(), value.clone());
             }
         }
     }
@@ -174,10 +193,14 @@ mod tests {
     use std::sync::Arc;
 
     fn make_input() -> Record {
+        // Schema is pre-widened to include every field the post-transform
+        // Record would carry — `full_name` is declared up front so
+        // `Record::set` hits a known slot.
         let schema = Arc::new(Schema::new(vec![
             "first_name".into(),
             "last_name".into(),
             "secret".into(),
+            "full_name".into(),
         ]));
         Record::new(
             schema,
@@ -185,20 +208,19 @@ mod tests {
                 Value::String("Alice".into()),
                 Value::String("Smith".into()),
                 Value::String("password123".into()),
+                Value::Null,
             ],
         )
     }
 
     #[test]
     fn test_gather_emitted_plus_unmapped() {
-        // Post-Invariant-3 rip: project_output drives off the Record
-        // itself, so emitted fields must land on the Record before
-        // the projection is invoked (the executor performs this via
-        // `Record::set` / `set_overflow` during transform eval). The
-        // test constructs a Record that mirrors the post-transform
-        // state and asserts projection gathers every field.
+        // project_output drives off the Record itself, so emitted fields
+        // must land on the Record before the projection is invoked. The
+        // widened schema guarantees every `Record::set` at emit sites
+        // hits a known slot.
         let mut input = make_input();
-        input.set_overflow("full_name".into(), Value::String("Alice Smith".into()));
+        input.set("full_name", Value::String("Alice Smith".into()));
         let emitted = IndexMap::new();
 
         let config = OutputConfig {

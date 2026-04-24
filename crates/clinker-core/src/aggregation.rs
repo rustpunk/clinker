@@ -686,9 +686,9 @@ impl AggregatorGroupState {
 
 /// Per-node-buffer row produced by every executor node that emits into
 /// `node_buffers`. The Record is authoritative: all emitted fields have
-/// been applied via `Record::set` / `set_overflow`, and all `$meta.*`
-/// writes via `Record::set_meta`. Downstream nodes resolve field
-/// references against the Record directly (Invariant 3 — no parallel
+/// been applied via `Record::set` onto the widened schema, and all
+/// `$meta.*` writes via `Record::set_meta`. Downstream nodes resolve
+/// field references against the Record directly (no parallel
 /// bookkeeping threading).
 pub type SortRow = (Record, u64);
 

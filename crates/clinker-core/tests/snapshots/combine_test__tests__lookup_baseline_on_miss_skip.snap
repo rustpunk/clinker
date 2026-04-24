@@ -2,6 +2,6 @@
 source: crates/clinker-core/tests/combine_test.rs
 expression: canonicalize_csv(result.primary_output())
 ---
-order_id,product_id,product_name
-ORD-1,PROD-A,Widget
-ORD-3,PROD-B,Gadget
+order_id,product_name
+ORD-1,Widget
+ORD-3,Gadget

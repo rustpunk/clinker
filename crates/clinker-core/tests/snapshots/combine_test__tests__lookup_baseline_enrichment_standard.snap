@@ -2,5 +2,5 @@
 source: crates/clinker-core/tests/combine_test.rs
 expression: canonicalize_csv(standard)
 ---
-f0,f1,f2,f3,order_id,product_code,quantity,product_name,priority
-3,PROD-X,1,urgent,3,PROD-X,1,UNKNOWN,urgent
+order_id,product_code,quantity,product_name,priority
+3,PROD-X,1,UNKNOWN,urgent

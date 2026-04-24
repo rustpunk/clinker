@@ -1893,6 +1893,22 @@ pub(crate) fn lower_node_to_plan_node(
     use cxl::ast::Statement;
     use std::sync::Arc;
 
+    // Build an `Arc<Schema>` from the bound output row for this node.
+    // Returns an empty sentinel if bind_schema didn't record one — the
+    // caller skips lowering in every such case, so the sentinel never
+    // reaches the executor.
+    let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
+        match artifacts.typed.get(node_name) {
+            Some(tp) => tp
+                .output_row
+                .fields()
+                .map(|(qf, _)| qf.name.as_ref())
+                .collect::<SchemaBuilder>()
+                .build(),
+            None => SchemaBuilder::new().build(),
+        }
+    };
+
     match node {
         PipelineNode::Source { config, .. } => Some(PlanNode::Source {
             name: name.to_string(),
@@ -1901,6 +1917,7 @@ pub(crate) fn lower_node_to_plan_node(
                 source: config.source.clone(),
                 validated_path: None,
             })),
+            output_schema: schema_from_bound(name),
         }),
         PipelineNode::Transform { config, .. } => {
             // Missing typed program means bind_schema hit a CXL error
@@ -1976,6 +1993,7 @@ pub(crate) fn lower_node_to_plan_node(
                 partition_lookup,
                 write_set,
                 has_distinct,
+                output_schema: schema_from_bound(name),
             })
         }
         PipelineNode::Output { config, .. } => Some(PlanNode::Output {
@@ -1996,6 +2014,7 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Merge { .. } => Some(PlanNode::Merge {
             name: name.to_string(),
             span,
+            output_schema: schema_from_bound(name),
         }),
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
@@ -2013,6 +2032,7 @@ pub(crate) fn lower_node_to_plan_node(
                 name: name.to_string(),
                 span,
                 body: body_id,
+                output_schema: schema_from_bound(name),
             })
         }
         PipelineNode::Aggregate {
@@ -2106,6 +2126,11 @@ pub(crate) fn lower_node_to_plan_node(
                 .get(name)
                 .map(CombinePredicateSummary::from_decomposed)
                 .unwrap_or_default();
+            let resolved_column_map = artifacts
+                .combine_resolved_columns
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(std::collections::HashMap::new()));
             Some(crate::plan::execution::PlanNode::Combine {
                 name: name.to_string(),
                 span,
@@ -2116,6 +2141,8 @@ pub(crate) fn lower_node_to_plan_node(
                 match_mode: config.match_mode,
                 on_miss: config.on_miss,
                 decomposed_from: None,
+                output_schema: schema_from_bound(name),
+                resolved_column_map,
             })
         }
     }

@@ -3,7 +3,8 @@
 //! These tests verify that:
 //! - Source rows are seeded from SchemaDecl as Row::closed
 //! - Row types propagate through Transform nodes
-//! - BoundSchemas are persisted on CompiledPlan
+//! - Per-node output rows are reachable via
+//!   `CompiledPlan::typed_output_row` for every bound node
 //! - The module rename from cxl_compile is complete
 
 use clinker_core::config::{CompileContext, PipelineConfig};
@@ -16,7 +17,7 @@ fn compile_yaml(yaml: &str) -> clinker_core::plan::CompiledPlan {
 }
 
 /// Gate test: a pipeline with a source declaring `schema: [{name: a, type: string}]`
-/// produces `bound_schemas.output_of("source1") == Row::closed({a: String})`.
+/// produces `typed_output_row("source1") == Row::closed({a: String})`.
 #[test]
 fn test_bind_schema_seeds_source_row_from_schemadecl() {
     let yaml = r#"
@@ -42,7 +43,7 @@ nodes:
 "#;
     let plan = compile_yaml(yaml);
     let row = plan
-        .schema_for_node_name("source1")
+        .typed_output_row("source1")
         .expect("source1 must have a bound row");
     assert_eq!(row.field_count(), 2);
     assert!(row.has_field("a"), "expected column 'a'");
@@ -54,9 +55,9 @@ nodes:
     );
 }
 
-/// Gate test: a `Source → Transform(emit y = a)` pipeline produces
-/// bound_schemas with both `a` (from source) and `y` (from emit) in
-/// the transform's output row.
+/// Gate test: a `Source → Transform(emit y = a)` pipeline produces a
+/// transform whose `typed_output_row` carries both `a` (from source)
+/// and `y` (from emit) in its declared-columns map.
 #[test]
 fn test_bind_schema_propagates_row_through_transform() {
     let yaml = r#"
@@ -86,13 +87,13 @@ nodes:
 "#;
     let plan = compile_yaml(yaml);
     let row = plan
-        .schema_for_node_name("tx")
+        .typed_output_row("tx")
         .expect("transform must have a bound row");
     assert!(row.has_field("x"), "upstream column 'x' must propagate");
     assert!(row.has_field("y"), "emitted column 'y' must appear");
 }
 
-/// Gate test: after `compile(ctx)`, `compiled_plan.schema_for_node_name("s1")`
+/// Gate test: after `compile(ctx)`, `compiled_plan.typed_output_row("s1")`
 /// returns `Some(&Row)`; same for all non-Composition nodes.
 #[test]
 fn test_bind_schema_persists_per_node_rows() {
@@ -123,19 +124,19 @@ nodes:
 "#;
     let plan = compile_yaml(yaml);
     assert!(
-        plan.schema_for_node_name("s1").is_some(),
+        plan.typed_output_row("s1").is_some(),
         "source must have bound row"
     );
     assert!(
-        plan.schema_for_node_name("t1").is_some(),
+        plan.typed_output_row("t1").is_some(),
         "transform must have bound row"
     );
     assert!(
-        plan.schema_for_node_name("o1").is_some(),
+        plan.typed_output_row("o1").is_some(),
         "output must have bound row"
     );
     assert!(
-        plan.schema_for_node_name("nonexistent").is_none(),
+        plan.typed_output_row("nonexistent").is_none(),
         "nonexistent node must return None"
     );
 }

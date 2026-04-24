@@ -38,7 +38,11 @@ impl Default for JsonWriterConfig {
 
 pub struct JsonWriter<W: Write> {
     writer: W,
-    schema: Arc<Schema>,
+    /// Schema held for the writer's lifetime. Post-rip the writer emits
+    /// records via `Record::iter_all_fields` (schema-positional) so the
+    /// field is not read per-record, but keeping the `Arc` pins the
+    /// schema against unintended drop by factory callers.
+    _schema: Arc<Schema>,
     config: JsonWriterConfig,
     records_written: u64,
 }
@@ -47,39 +51,27 @@ impl<W: Write> JsonWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: JsonWriterConfig) -> Self {
         Self {
             writer,
-            schema,
+            _schema: schema,
             config,
             records_written: 0,
         }
     }
 
-    /// Serialize a record to a JSON object.
-    /// Schema fields first (in schema order), then overflow fields (in emit order).
-    /// `preserve_nulls: false` omits keys with Null values.
+    /// Serialize a record to a JSON object in schema-column order.
+    /// `preserve_nulls: false` omits keys with Null values. Metadata is
+    /// stripped from the default output; callers that want to emit
+    /// `$meta.*` keys into the JSON object must opt in at a higher
+    /// layer (the Output node's `include_metadata` flag).
     fn record_to_json(&self, record: &Record) -> serde_json::Value {
         use serde_json::{Map, Value as Jv};
 
-        let mut obj = Map::with_capacity(record.total_field_count());
-
-        // Schema fields in order
-        for col in self.schema.columns() {
-            let val = record.get(col).unwrap_or(&Value::Null);
+        let mut obj = Map::with_capacity(record.field_count());
+        for (col, val) in record.iter_all_fields() {
             if !self.config.preserve_nulls && val.is_null() {
                 continue;
             }
             obj.insert(col.to_string(), clinker_to_json(val));
         }
-
-        // Overflow fields in emit order
-        if let Some(overflow) = record.overflow_fields() {
-            for (key, val) in overflow {
-                if !self.config.preserve_nulls && val.is_null() {
-                    continue;
-                }
-                obj.insert(key.to_string(), clinker_to_json(val));
-            }
-        }
-
         Jv::Object(obj)
     }
 }
@@ -284,41 +276,45 @@ mod tests {
     }
 
     #[test]
-    fn test_json_write_overflow_fields() {
+    fn test_json_writer_emits_schema_fields_only() {
+        // Default writer contract: schema columns only; metadata (and
+        // the `$meta.*` namespace) does not leak into the JSON object
+        // unless a higher layer opts in.
         let schema = Arc::new(Schema::new(vec!["a".into()]));
         let mut record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
-        record.set_overflow("extra".into(), Value::String("bonus".into()));
+        record
+            .set_meta("ignored", Value::String("in_meta".into()))
+            .unwrap();
         let output = write_records(JsonWriterConfig::default(), &[record], &schema);
-        assert!(
-            output.contains("\"extra\""),
-            "Overflow field should appear: {output}"
-        );
-        assert!(output.contains("bonus"));
+        assert!(output.contains("\"a\""));
+        assert!(!output.contains("ignored"));
+        assert!(!output.contains("in_meta"));
     }
 
     #[test]
     fn test_json_write_field_ordering() {
-        let schema = Arc::new(Schema::new(vec!["z_field".into(), "a_field".into()]));
-        let mut record = Record::new(
+        // Schema fields emit in schema order — the widened schema is
+        // authoritative; there is no overflow ordering to reason about.
+        let schema = Arc::new(Schema::new(vec![
+            "z_field".into(),
+            "a_field".into(),
+            "m_field".into(),
+        ]));
+        let record = Record::new(
             Arc::clone(&schema),
-            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
         );
-        record.set_overflow("m_overflow".into(), Value::Integer(3));
 
         let config = JsonWriterConfig {
             format: JsonOutputMode::Ndjson,
             ..Default::default()
         };
         let output = write_records(config, &[record], &schema);
-        // z_field should appear before a_field (schema order), m_overflow after both
         let z_pos = output.find("z_field").unwrap();
         let a_pos = output.find("a_field").unwrap();
-        let m_pos = output.find("m_overflow").unwrap();
-        assert!(z_pos < a_pos, "Schema field z should come before a");
-        assert!(
-            a_pos < m_pos,
-            "Overflow field should come after schema fields"
-        );
+        let m_pos = output.find("m_field").unwrap();
+        assert!(z_pos < a_pos, "schema field z comes before a");
+        assert!(a_pos < m_pos, "schema fields emit in schema order");
     }
 
     #[test]

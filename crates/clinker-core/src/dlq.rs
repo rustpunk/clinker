@@ -21,6 +21,12 @@ pub enum DlqErrorCategory {
     /// Distinct from `AggregateTypeError`, which fires during the per-record
     /// add path. Routed by the executor's aggregation dispatch arm.
     AggregateFinalize,
+    /// Reader captured >64 off-schema keys on a single record. Surfaced
+    /// by the Source task when a `FormatError::MetadataCapExceeded`
+    /// bubbles up from an XML/JSON reader; the partial record (first
+    /// 64 unknown keys in `$meta.*`) is quarantined and the pipeline
+    /// continues reading subsequent records.
+    MetadataCapExceeded,
 }
 
 impl DlqErrorCategory {
@@ -33,6 +39,7 @@ impl DlqErrorCategory {
             Self::AggregateTypeError => "aggregate_type_error",
             Self::ValidationFailure => "validation_failure",
             Self::AggregateFinalize => "aggregate_finalize",
+            Self::MetadataCapExceeded => "metadata_cap_exceeded",
         }
     }
 }

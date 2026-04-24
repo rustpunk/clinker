@@ -414,6 +414,7 @@ mod tests {
             name: name.to_owned(),
             span: Span::SYNTHETIC,
             resolved: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
         }
     }
 
@@ -429,6 +430,7 @@ mod tests {
             partition_lookup: None,
             write_set: BTreeSet::new(),
             has_distinct: false,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
         }
     }
 

@@ -36,38 +36,42 @@ use crate::plan::row_type::QualifiedField;
 /// hash-table side. A combine has exactly one probe qualifier and one
 /// or more build qualifiers (currently gated to one at the strategy
 /// post-pass via E312; N>2 lands in a later combine phase).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinSide {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JoinSide {
     Build,
     Probe,
 }
 
 /// Compile-time resolution table built once per combine node.
 ///
-/// Holds two indexes derived from the combine's declared inputs:
+/// Holds two indexes derived from the pre-resolved column map and the
+/// combine's declared inputs:
 ///
-/// - `qualified`: every `QualifiedField` visible in the merged row
-///   maps to `(side, bare_name)` — the side tells the resolver which
-///   record to reach into; `bare_name` is the unqualified field name
-///   on that record's own schema.
-/// - `bare_to_side`: bare field name → side. Bare CXL references
-///   (e.g. `product_id`) resolve through this table when exactly one
-///   input declares that name; an entry is absent when two or more
-///   inputs declare the same bare name, and `resolve` returns `None`
-///   rather than silently preferring a side.
+/// - `qualified`: every `QualifiedField` the body reads maps to
+///   `(side, column-index)` — the side tells the resolver which
+///   record to reach into; the `u32` is the positional index on that
+///   side's `Arc<Schema>`. Probe-time resolution is therefore a
+///   direct `Vec<Value>` index read.
+/// - `bare_to_side`: unambiguous bare field name → `(side, index)`.
+///   Bare CXL references (e.g. `product_id`) resolve through this
+///   table when exactly one input declares that name; an entry is
+///   absent when two or more inputs declare the same bare name, and
+///   `resolve` returns `None` rather than silently preferring a side.
 ///
 /// Rationale for indexing bare names here rather than deferring to a
 /// linear scan: the typechecker already rejects ambiguous bare
-/// references at compile time via [`crate::plan::row_type::ColumnLookup::Ambiguous`],
-/// so a runtime bare lookup hitting an ambiguous name is a
-/// typechecker bug. Returning `None` surfaces the bug as a missing
-/// value rather than a silent side-preference choice.
+/// references at compile time via
+/// [`crate::plan::row_type::ColumnLookup::Ambiguous`], so a runtime
+/// bare lookup hitting an ambiguous name is a typechecker bug.
+/// Returning `None` surfaces the bug as a missing value rather than a
+/// silent side-preference choice.
 pub(crate) struct CombineResolverMapping {
-    /// `(qualifier, name)` → which side + bare field name on that side.
-    qualified: HashMap<QualifiedField, (JoinSide, Arc<str>)>,
-    /// Unambiguous bare name → side + bare field name. Absent when the
+    /// `(qualifier, name)` → `(side, column-index)` on that side's
+    /// `Arc<Schema>`.
+    qualified: HashMap<QualifiedField, (JoinSide, u32)>,
+    /// Unambiguous bare name → `(side, column-index)`. Absent when the
     /// name appears on 2+ inputs.
-    bare_to_side: HashMap<Arc<str>, (JoinSide, Arc<str>)>,
+    bare_to_side: HashMap<Arc<str>, (JoinSide, u32)>,
     /// Every qualified field name, rendered once as `qualifier.name`
     /// for `available_fields` diagnostic output. Owned so the returned
     /// `&str` borrows tie to `&self`.
@@ -75,52 +79,45 @@ pub(crate) struct CombineResolverMapping {
 }
 
 impl CombineResolverMapping {
-    /// Build a mapping from a combine's declared inputs and the driver
-    /// qualifier. Walks every input's row, assigning [`JoinSide::Probe`]
-    /// to fields under `driver_qualifier` and [`JoinSide::Build`] to
-    /// every other input's fields.
+    /// Build a mapping from a pre-resolved column map produced by the
+    /// CXL typechecker's combine-body walk. `combine_inputs` supplies
+    /// qualifier → bare-name ordering for the fallback `bare_to_side`
+    /// index and for the rendered `available_fields` diagnostic list.
     ///
-    /// Panics in debug if `driver_qualifier` is not present in
-    /// `combine_inputs`; in release it produces a mapping with no
-    /// probe-side fields, which the executor will notice when every
-    /// probe-side resolve returns `None`.
-    pub(crate) fn new(
+    /// The `qualified` index is the pre-resolved map verbatim; the
+    /// `bare_to_side` index is derived by filtering qualified entries
+    /// to unambiguous bare names (names appearing on exactly one input).
+    pub(crate) fn from_pre_resolved(
+        resolved_column_map: &crate::plan::execution::ResolvedColumnMap,
         combine_inputs: &IndexMap<String, CombineInput>,
-        driver_qualifier: &str,
     ) -> Self {
-        debug_assert!(
-            combine_inputs.contains_key(driver_qualifier),
-            "CombineResolverMapping::new: driver qualifier {driver_qualifier:?} absent from inputs"
-        );
-
-        let mut qualified: HashMap<QualifiedField, (JoinSide, Arc<str>)> = HashMap::new();
+        // Count occurrences of each bare name across inputs; only
+        // unambiguous bare names (count == 1) land in `bare_to_side`.
+        // Ambiguous ones resolve to `None` at runtime — the typechecker
+        // rejects them at compile time in the correctness path.
         let mut bare_counts: HashMap<Arc<str>, usize> = HashMap::new();
-        let mut bare_first: HashMap<Arc<str>, (JoinSide, Arc<str>)> = HashMap::new();
+        let mut bare_first: HashMap<Arc<str>, (JoinSide, u32)> = HashMap::new();
         let mut available: Vec<String> = Vec::new();
 
         for (qualifier, input) in combine_inputs {
-            let side = if qualifier == driver_qualifier {
-                JoinSide::Probe
-            } else {
-                JoinSide::Build
-            };
             for (field, _ty) in input.row.fields() {
                 let bare = Arc::clone(&field.name);
                 let qf = QualifiedField::qualified(qualifier.as_str(), Arc::clone(&bare));
                 available.push(format!("{qualifier}.{bare}"));
-                qualified.insert(qf, (side, Arc::clone(&bare)));
                 *bare_counts.entry(Arc::clone(&bare)).or_insert(0) += 1;
-                bare_first.entry(Arc::clone(&bare)).or_insert((side, bare));
+                if let Some(&(side, idx)) = resolved_column_map.get(&qf) {
+                    bare_first.entry(bare).or_insert((side, idx));
+                }
             }
         }
 
-        let bare_to_side = bare_first
+        let bare_to_side: HashMap<Arc<str>, (JoinSide, u32)> = bare_first
             .into_iter()
             .filter(|(k, _)| bare_counts.get(k).copied() == Some(1))
             .collect();
 
         Self {
-            qualified,
+            qualified: (**resolved_column_map).clone(),
             bare_to_side,
             available,
         }
@@ -162,16 +159,18 @@ impl<'a> CombineResolver<'a> {
         }
     }
 
-    /// Fetch a bare field from the record on `side`. For the build
-    /// side, `None` on the record itself means `on_miss: null_fields`
-    /// is in force — the field is present in the merged row but has
-    /// no underlying value, so we surface `&clinker_record::NULL`
-    /// (the shared sentinel defined in `clinker_record::value`).
-    fn fetch(&self, side: JoinSide, bare_name: &str) -> Option<&Value> {
+    /// Fetch a field value from the record on `side` by positional
+    /// index. For the build side, `None` for the record itself means
+    /// `on_miss: null_fields` is in force — the field is present in
+    /// the merged row but has no underlying value, so we surface
+    /// `&clinker_record::NULL` (the shared sentinel defined in
+    /// `clinker_record::value`). A direct `Vec::get` means probe-time
+    /// resolution never hits a name-keyed hash lookup.
+    fn fetch(&self, side: JoinSide, idx: u32) -> Option<&Value> {
         match side {
-            JoinSide::Probe => self.probe_record.get(bare_name),
+            JoinSide::Probe => self.probe_record.values().get(idx as usize),
             JoinSide::Build => match self.build_record {
-                Some(rec) => rec.get(bare_name),
+                Some(rec) => rec.values().get(idx as usize),
                 None => Some(&clinker_record::NULL),
             },
         }
@@ -186,14 +185,14 @@ impl FieldResolver for CombineResolver<'_> {
         if name.starts_with("$meta.") {
             return self.probe_record.resolve(name);
         }
-        let (side, bare) = self.mapping.bare_to_side.get(name)?;
-        self.fetch(*side, bare)
+        let (side, idx) = self.mapping.bare_to_side.get(name)?;
+        self.fetch(*side, *idx)
     }
 
     fn resolve_qualified(&self, source: &str, field: &str) -> Option<&Value> {
         let qf = QualifiedField::qualified(source, field);
-        let (side, bare) = self.mapping.qualified.get(&qf)?;
-        self.fetch(*side, bare)
+        let (side, idx) = self.mapping.qualified.get(&qf)?;
+        self.fetch(*side, *idx)
     }
 
     fn available_fields(&self) -> Vec<&str> {
@@ -212,8 +211,8 @@ impl FieldResolver for CombineResolver<'_> {
                 .split_once('.')
                 .expect("CombineResolverMapping renders every entry as `qualifier.name`");
             let qf = QualifiedField::qualified(q_part, n_part);
-            if let Some((side, bare)) = self.mapping.qualified.get(&qf)
-                && let Some(val) = self.fetch(*side, bare)
+            if let Some((side, idx)) = self.mapping.qualified.get(&qf)
+                && let Some(val) = self.fetch(*side, *idx)
             {
                 out.push((qualified_name.as_str(), val));
             }
@@ -271,10 +270,36 @@ mod tests {
         m
     }
 
+    /// Synthesize the resolved column map the production CXL
+    /// typechecker would emit for the given combine inputs: every
+    /// `(qualifier, field)` pair maps to `(side, schema_index)` where
+    /// side is Probe for the driver qualifier and Build for every
+    /// other input, and the index is the field's position within its
+    /// own input row.
+    fn resolved_map_for(
+        inputs: &IndexMap<String, CombineInput>,
+        driver_qualifier: &str,
+    ) -> crate::plan::execution::ResolvedColumnMap {
+        let mut map: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
+        for (qualifier, input) in inputs {
+            let side = if qualifier == driver_qualifier {
+                JoinSide::Probe
+            } else {
+                JoinSide::Build
+            };
+            for (idx, (field, _ty)) in input.row.fields().enumerate() {
+                let qf = QualifiedField::qualified(qualifier.as_str(), Arc::clone(&field.name));
+                map.insert(qf, (side, idx as u32));
+            }
+        }
+        Arc::new(map)
+    }
+
     #[test]
     fn test_combine_resolver_qualified_lookup_both_sides() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(
@@ -319,7 +344,8 @@ mod tests {
     fn test_combine_resolver_bare_lookup_unambiguous() {
         // `amount` is only on orders; `name` is only on products.
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(
@@ -362,7 +388,8 @@ mod tests {
     #[test]
     fn test_combine_resolver_bare_lookup_ambiguous_returns_none() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(
@@ -398,7 +425,8 @@ mod tests {
     #[test]
     fn test_combine_resolver_build_side_none_returns_null_for_build_fields() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(
@@ -433,7 +461,8 @@ mod tests {
     #[test]
     fn test_combine_resolver_unknown_field() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(
@@ -466,7 +495,8 @@ mod tests {
     #[test]
     fn test_combine_resolver_available_fields_enumerates_both_sides() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(&orders_schema, vec![Value::Null, Value::Null, Value::Null]);
@@ -495,7 +525,8 @@ mod tests {
     #[test]
     fn test_combine_resolver_mapping_precomputed_once() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let products_schema = make_schema(&["product_id", "name", "price"]);
@@ -552,7 +583,8 @@ mod tests {
     #[test]
     fn test_combine_resolver_iter_fields() {
         let inputs = two_input_orders_products();
-        let mapping = CombineResolverMapping::new(&inputs, "orders");
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
 
         let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
         let orders_rec = make_record(
@@ -587,6 +619,123 @@ mod tests {
         assert_eq!(
             fields.get("products.name"),
             Some(&Value::String("Widget".into()))
+        );
+    }
+
+    /// `CombineResolver::fetch` is index-based: given `(side, u32)`
+    /// it returns the value at that positional slot on the probe or
+    /// build record, with no name-keyed hash lookup involved.
+    #[test]
+    fn test_combine_resolver_fetch_is_index_based() {
+        let inputs = two_input_orders_products();
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
+
+        let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
+        let orders_rec = make_record(
+            &orders_schema,
+            vec![
+                Value::String("O1".into()),
+                Value::String("P42".into()),
+                Value::Integer(100),
+            ],
+        );
+        let products_schema = make_schema(&["product_id", "name", "price"]);
+        let products_rec = make_record(
+            &products_schema,
+            vec![
+                Value::String("P42".into()),
+                Value::String("Widget".into()),
+                Value::Integer(9),
+            ],
+        );
+        let resolver = CombineResolver::new(&mapping, &orders_rec, Some(&products_rec));
+
+        // Probe side — index 2 is `amount`.
+        assert_eq!(
+            resolver.fetch(JoinSide::Probe, 2),
+            Some(&Value::Integer(100))
+        );
+        // Build side — index 1 is `name`.
+        assert_eq!(
+            resolver.fetch(JoinSide::Build, 1),
+            Some(&Value::String("Widget".into()))
+        );
+        // Build side with missing record (on_miss: null_fields) — Null
+        // sentinel regardless of the index.
+        let miss_resolver = CombineResolver::new(&mapping, &orders_rec, None);
+        assert_eq!(miss_resolver.fetch(JoinSide::Build, 1), Some(&Value::Null));
+    }
+
+    /// Feeding the resolver a synthetic resolved column map that
+    /// points a bare name to a single side causes unambiguous bare
+    /// resolution to route through that side's index.
+    #[test]
+    fn test_combine_resolver_mapping_unambiguous_bare_routes_correctly() {
+        let inputs = two_input_orders_products();
+        // `amount` is only on orders; `name` is only on products.
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
+
+        let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
+        let orders_rec = make_record(
+            &orders_schema,
+            vec![
+                Value::String("O1".into()),
+                Value::String("P42".into()),
+                Value::Integer(100),
+            ],
+        );
+        let products_schema = make_schema(&["product_id", "name", "price"]);
+        let products_rec = make_record(
+            &products_schema,
+            vec![
+                Value::String("P42".into()),
+                Value::String("Widget".into()),
+                Value::Integer(9),
+            ],
+        );
+        let resolver = CombineResolver::new(&mapping, &orders_rec, Some(&products_rec));
+        assert_eq!(resolver.resolve("amount"), Some(&Value::Integer(100)));
+        assert_eq!(
+            resolver.resolve("name"),
+            Some(&Value::String("Widget".into()))
+        );
+    }
+
+    /// A bare name that appears on two inputs must not silently pick
+    /// a side at runtime — it resolves to `None` because the
+    /// typechecker rejects ambiguous bares at compile time.
+    #[test]
+    fn test_combine_resolver_mapping_ambiguous_bare_returns_none() {
+        let inputs = two_input_orders_products();
+        let resolved = resolved_map_for(&inputs, "orders");
+        let mapping = CombineResolverMapping::from_pre_resolved(&resolved, &inputs);
+
+        let orders_schema = make_schema(&["order_id", "product_id", "amount"]);
+        let orders_rec = make_record(
+            &orders_schema,
+            vec![
+                Value::String("O1".into()),
+                Value::String("P42".into()),
+                Value::Integer(100),
+            ],
+        );
+        let products_schema = make_schema(&["product_id", "name", "price"]);
+        let products_rec = make_record(
+            &products_schema,
+            vec![
+                Value::String("P42".into()),
+                Value::String("Widget".into()),
+                Value::Integer(9),
+            ],
+        );
+
+        let resolver = CombineResolver::new(&mapping, &orders_rec, Some(&products_rec));
+        assert_eq!(
+            resolver.resolve("product_id"),
+            None,
+            "ambiguous bare name must not silently pick a side"
         );
     }
 }

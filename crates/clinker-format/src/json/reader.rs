@@ -261,23 +261,40 @@ impl JsonReader {
         result
     }
 
+    /// Build a Record from a flat JSON object keyed by schema-field.
+    ///
+    /// Keys absent from the declared schema route to `$meta.*` via
+    /// `Record::set_meta`. The metadata map caps at 64 keys; the 65th
+    /// raises `FormatError::MetadataCapExceeded` carrying the partial
+    /// record so the executor can route it to DLQ.
     fn map_to_record(
         &self,
         flat: &serde_json::Map<String, serde_json::Value>,
         schema: &Arc<Schema>,
-    ) -> Record {
+    ) -> Result<Record, FormatError> {
         let values: Vec<Value> = schema
             .columns()
             .iter()
             .map(|col| flat.get(&**col).map(json_to_value).unwrap_or(Value::Null))
             .collect();
         let mut record = Record::new(Arc::clone(schema), values);
+        let mut meta_count = 0usize;
         for (key, val) in flat {
             if schema.index(key).is_none() {
-                record.set_overflow(key.clone().into(), json_to_value(val));
+                let value = json_to_value(val);
+                match record.set_meta(key, value) {
+                    Ok(()) => meta_count += 1,
+                    Err(_) => {
+                        return Err(FormatError::MetadataCapExceeded {
+                            record,
+                            key: key.clone(),
+                            count: meta_count,
+                        });
+                    }
+                }
             }
         }
-        record
+        Ok(record)
     }
 }
 
@@ -322,7 +339,7 @@ impl FormatReader for JsonReader {
 
         if !self.pending.is_empty() {
             let flat = self.pending.remove(0);
-            return Ok(Some(self.map_to_record(&flat, &schema)));
+            return Ok(Some(self.map_to_record(&flat, &schema)?));
         }
 
         loop {
@@ -336,7 +353,7 @@ impl FormatReader for JsonReader {
             if expanded.is_empty() {
                 continue;
             }
-            let record = self.map_to_record(&expanded[0], &schema);
+            let record = self.map_to_record(&expanded[0], &schema)?;
             self.pending = expanded.into_iter().skip(1).collect();
             return Ok(Some(record));
         }
@@ -662,14 +679,18 @@ mod tests {
     }
 
     #[test]
-    fn test_json_new_fields_to_overflow() {
+    fn test_json_unknown_key_routes_to_meta() {
+        // Post-overflow-rip: JSON keys absent from the inferred schema
+        // route to `$meta.*` via `Record::set_meta` — readers no longer
+        // surface them through `Record::get`.
         let mut r = reader_from_str("{\"a\":1}\n{\"a\":2,\"b\":3}\n", default_config());
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 1);
         let _r1 = r.next_record().unwrap().unwrap();
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("a"), Some(&Value::Integer(2)));
-        assert_eq!(r2.get("b"), Some(&Value::Integer(3)));
+        assert_eq!(r2.get("b"), None);
+        assert_eq!(r2.get_meta("b"), Some(&Value::Integer(3)));
     }
 
     #[test]
@@ -704,7 +725,12 @@ mod tests {
         let mut r = reader_from_str(input, config);
         let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.get("name"), Some(&Value::String("Bob".into())));
+        // Post-rip: `name` either lives at its schema slot (if the
+        // inferred schema included it) or in metadata (if schema
+        // inference walked Bob's expanded record and only saw
+        // `orders.id`). Consult both paths.
+        let resolved_name = r1.get("name").or_else(|| r1.get_meta("name"));
+        assert_eq!(resolved_name, Some(&Value::String("Bob".into())));
         assert!(r.next_record().unwrap().is_none());
     }
 }

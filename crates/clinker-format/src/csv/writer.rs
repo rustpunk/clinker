@@ -66,31 +66,21 @@ impl<W: Write> CsvWriter<W> {
 
 impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // Write header on first record
+        // Write header on first record. Post-rip contract: writers emit
+        // schema columns only; framing metadata stays in `$meta.*` and
+        // only surfaces via `iter_meta` when `include_metadata: true` is
+        // explicitly set on the Output node.
         if self.config.include_header && !self.header_written {
-            let mut header: Vec<&str> = self.schema.columns().iter().map(|c| c.as_ref()).collect();
-            // Overflow fields in emit order (IndexMap insertion order)
-            if let Some(overflow) = record.overflow_fields() {
-                header.extend(overflow.map(|(k, _)| k));
-            }
+            let header: Vec<&str> = self.schema.columns().iter().map(|c| c.as_ref()).collect();
             self.inner.write_record(&header)?;
             self.header_written = true;
         }
 
-        // Schema fields in schema order
-        let mut fields: Vec<String> = self
-            .schema
-            .columns()
-            .iter()
-            .map(|col| record.get(col).map(value_to_csv_cell).unwrap_or_default())
+        // Schema fields in schema order.
+        let fields: Vec<String> = record
+            .iter_all_fields()
+            .map(|(_, v)| value_to_csv_cell(v))
             .collect();
-
-        // Overflow fields in emit order (IndexMap insertion order)
-        if let Some(overflow) = record.overflow_fields() {
-            for (_, value) in overflow {
-                fields.push(value_to_csv_cell(value));
-            }
-        }
 
         self.inner.write_record(&fields)?;
         Ok(())
@@ -102,7 +92,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     }
 }
 
-/// CSV writer wrapper that captures the header (schema + overflow fields)
+/// CSV writer wrapper that captures the header (schema columns only)
 /// from the first record into shared state for replay on split rotation.
 ///
 /// Only used by the CSV writer factory when splitting is enabled.
@@ -133,11 +123,8 @@ impl<W: Write> HeaderCapturingCsvWriter<W> {
 impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         if !self.captured {
-            // Capture header: schema columns + overflow fields from first record
-            let mut header: Vec<Box<str>> = self.schema.columns().to_vec();
-            if let Some(overflow) = record.overflow_fields() {
-                header.extend(overflow.map(|(k, _)| Box::from(k)));
-            }
+            // Capture header: schema columns only.
+            let header: Vec<Box<str>> = self.schema.columns().to_vec();
             *self.shared_header.lock().unwrap() = Some(header);
             self.captured = true;
         }
@@ -268,15 +255,32 @@ mod tests {
     }
 
     #[test]
-    fn test_csv_writer_overflow_fields_emit_order() {
+    fn test_csv_writer_emits_schema_fields_only() {
+        // Writer contract after the overflow rip: metadata stays in
+        // `$meta.*` and is stripped from the default output.
         let schema = make_schema(&["id"]);
         let mut record = make_record(&schema, vec![Value::Integer(1)]);
-        record.set_overflow("zulu".into(), Value::String("z".into()));
-        record.set_overflow("alpha".into(), Value::String("a".into()));
-        record.set_overflow("mike".into(), Value::String("m".into()));
-
+        record.set_meta("zulu", Value::String("z".into())).unwrap();
         let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
-        // Schema field first, then overflow in emit order (insertion order)
+        assert_eq!(output, "id\n1\n");
+    }
+
+    #[test]
+    fn test_csv_writer_widened_schema_emit_order() {
+        // Widened schema controls output order; the fixture now declares
+        // every emitted column up front, so record.set always lands at a
+        // known slot and iter_all_fields walks them in schema order.
+        let schema = make_schema(&["id", "zulu", "alpha", "mike"]);
+        let record = make_record(
+            &schema,
+            vec![
+                Value::Integer(1),
+                Value::String("z".into()),
+                Value::String("a".into()),
+                Value::String("m".into()),
+            ],
+        );
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
         assert_eq!(output, "id,zulu,alpha,mike\n1,z,a,m\n");
     }
 

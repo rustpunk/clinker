@@ -48,7 +48,7 @@ fn test_compile_artifacts_insert_body_and_lookup() {
     let body = BoundBody {
         signature_path: "compositions/test.comp.yaml".into(),
         nodes: vec![],
-        bound_schemas: Default::default(),
+        body_rows: std::collections::HashMap::new(),
         output_port_rows: IndexMap::new(),
         input_port_rows: IndexMap::new(),
         nested_body_ids: vec![],
