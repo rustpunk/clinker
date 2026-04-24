@@ -11,7 +11,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -291,7 +291,7 @@ impl FormatReader for JsonReader {
         let first = match first {
             Some(v) => v,
             None => {
-                let s = Arc::new(Schema::new(vec![]));
+                let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.inner = InnerReader::Done;
                 return Ok(s);
@@ -304,11 +304,11 @@ impl FormatReader for JsonReader {
 
         let empty = serde_json::Map::new();
         let first_flat = expanded.first().unwrap_or(&empty);
-        let columns: Vec<Box<str>> = first_flat
+        let schema = first_flat
             .keys()
             .map(|k| k.clone().into_boxed_str())
-            .collect();
-        let schema = Arc::new(Schema::new(columns));
+            .collect::<SchemaBuilder>()
+            .build();
         self.schema = Some(Arc::clone(&schema));
         self.pending = expanded;
         Ok(schema)

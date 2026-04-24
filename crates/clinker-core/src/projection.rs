@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
 use crate::config::{ConfigError, IncludeMetadata, OutputConfig};
@@ -69,14 +68,13 @@ pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) 
         // all Record fields in natural iteration order, no
         // intermediate allocation.
         let field_count = input_record.total_field_count();
-        let mut column_names: Vec<Box<str>> = Vec::with_capacity(field_count);
+        let mut schema_builder = SchemaBuilder::with_capacity(field_count);
         let mut values: Vec<Value> = Vec::with_capacity(field_count);
         for (name, value) in input_record.iter_all_fields() {
-            column_names.push(name.into());
+            schema_builder = schema_builder.with_field(name);
             values.push(value.clone());
         }
-        let schema = Arc::new(Schema::new(column_names));
-        return Record::new(schema, values);
+        return Record::new(schema_builder.build(), values);
     }
 
     // Slow path: config requires rewriting field names / dropping
@@ -126,8 +124,11 @@ pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) 
         fields = renamed;
     }
 
-    let column_names: Vec<Box<str>> = fields.keys().map(|k| k.as_str().into()).collect();
-    let schema = Arc::new(Schema::new(column_names));
+    let schema = fields
+        .keys()
+        .map(|k| Box::<str>::from(k.as_str()))
+        .collect::<SchemaBuilder>()
+        .build();
     let values: Vec<Value> = fields.into_values().collect();
     Record::new(schema, values)
 }
@@ -169,6 +170,8 @@ pub fn merge_metadata_into_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::Schema;
+    use std::sync::Arc;
 
     fn make_input() -> Record {
         let schema = Arc::new(Schema::new(vec![

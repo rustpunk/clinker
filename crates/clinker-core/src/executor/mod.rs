@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
+use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 use rayon::prelude::*;
 
@@ -3247,14 +3247,16 @@ impl PipelineExecutor {
                     // Spill schema follows the format used by
                     // `HashAggregator::spill`: group-by columns ++
                     // `__acc_state` ++ `__meta_tracker`.
-                    let mut spill_columns: Vec<Box<str>> = compiled
+                    let spill_schema = compiled
                         .group_by_fields
                         .iter()
                         .map(|s| Box::<str>::from(s.as_str()))
-                        .collect();
-                    spill_columns.push(Box::<str>::from("__acc_state"));
-                    spill_columns.push(Box::<str>::from("__meta_tracker"));
-                    let spill_schema = Arc::new(Schema::new(spill_columns));
+                        .chain([
+                            Box::<str>::from("__acc_state"),
+                            Box::<str>::from("__meta_tracker"),
+                        ])
+                        .collect::<SchemaBuilder>()
+                        .build();
 
                     let memory_limit = parse_memory_limit(config);
 

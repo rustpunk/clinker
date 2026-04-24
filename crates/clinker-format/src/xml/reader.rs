@@ -9,7 +9,7 @@ use std::sync::Arc;
 use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -308,7 +308,7 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
         let first = match first {
             Some(fields) => fields,
             None => {
-                let s = Arc::new(Schema::new(vec![]));
+                let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.done = true;
                 return Ok(s);
@@ -317,7 +317,7 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
 
         // Infer schema from first record's field names (preserving order)
         let mut seen = std::collections::HashSet::new();
-        let columns: Vec<Box<str>> = first
+        let schema = first
             .iter()
             .filter_map(|(k, _)| {
                 if seen.insert(k.clone()) {
@@ -326,8 +326,8 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
                     None
                 }
             })
-            .collect();
-        let schema = Arc::new(Schema::new(columns));
+            .collect::<SchemaBuilder>()
+            .build();
         self.schema = Some(Arc::clone(&schema));
 
         // Buffer the first record

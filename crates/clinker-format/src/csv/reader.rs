@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -57,25 +57,28 @@ impl<R: Read> CsvReader<R> {
             return Ok(Arc::clone(schema));
         }
 
-        let columns: Vec<Box<str>> = if self.config.has_header {
+        let schema = if self.config.has_header {
             let headers = self.inner.headers()?;
             if headers.is_empty() {
                 return Err(FormatError::SchemaInference("header row is empty".into()));
             }
-            headers.iter().map(|h| h.into()).collect()
+            headers
+                .iter()
+                .map(Box::<str>::from)
+                .collect::<SchemaBuilder>()
+                .build()
+        } else if !self.inner.read_record(&mut self.record_buf)? {
+            // Peek at the first record to determine column count. No
+            // record at all ⇒ empty file ⇒ empty schema.
+            SchemaBuilder::new().build()
         } else {
-            // Peek at the first record to determine column count
-            if !self.inner.read_record(&mut self.record_buf)? {
-                // Empty file — no records at all
-                let schema = Arc::new(Schema::new(vec![]));
-                self.schema = Some(Arc::clone(&schema));
-                return Ok(schema);
-            }
             let count = self.record_buf.len();
-            (0..count).map(|i| format!("col_{i}").into()).collect()
+            (0..count)
+                .map(|i| format!("col_{i}"))
+                .collect::<SchemaBuilder>()
+                .build()
         };
 
-        let schema = Arc::new(Schema::new(columns));
         self.schema = Some(Arc::clone(&schema));
         Ok(schema)
     }

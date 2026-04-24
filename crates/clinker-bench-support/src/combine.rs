@@ -9,7 +9,7 @@
 //! tunable probe-side overlap ratio (default 90%), and string non-key
 //! columns of deterministic length.
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use std::sync::Arc;
 
 /// Generates two correlated record sets for combine benchmarks.
@@ -63,12 +63,10 @@ impl CombineDataGen {
     /// Column layout: `key` (int), then `c0`, `c1`, ... `c{extra_columns-1}`
     /// (string).
     fn schema(&self) -> Arc<Schema> {
-        let mut columns: Vec<Box<str>> = Vec::with_capacity(1 + self.extra_columns);
-        columns.push("key".to_string().into_boxed_str());
-        for i in 0..self.extra_columns {
-            columns.push(format!("c{i}").into_boxed_str());
-        }
-        Arc::new(Schema::new(columns))
+        SchemaBuilder::with_capacity(1 + self.extra_columns)
+            .with_field("key")
+            .extend((0..self.extra_columns).map(|i| format!("c{i}")))
+            .build()
     }
 
     /// Deterministically generate an ASCII-lowercase string from a row index

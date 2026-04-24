@@ -1889,7 +1889,7 @@ pub(crate) fn lower_node_to_plan_node(
         extract_write_set,
     };
     use crate::plan::index::find_index_for;
-    use clinker_record::Schema;
+    use clinker_record::SchemaBuilder;
     use cxl::ast::Statement;
     use std::sync::Arc;
 
@@ -2056,7 +2056,7 @@ pub(crate) fn lower_node_to_plan_node(
                         return None;
                     }
                 };
-            let output_columns: Vec<Box<str>> = typed
+            let output_schema = typed
                 .program
                 .statements
                 .iter()
@@ -2068,8 +2068,8 @@ pub(crate) fn lower_node_to_plan_node(
                     } => Some(name.clone()),
                     _ => None,
                 })
-                .collect();
-            let output_schema = Arc::new(Schema::new(output_columns));
+                .collect::<SchemaBuilder>()
+                .build();
             Some(PlanNode::Aggregation {
                 name: name.to_string(),
                 span,

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
-use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
+use clinker_record::{MinimalRecord, RecordStorage, Schema, SchemaBuilder, Value};
 
 /// Columnar-projected record storage for Phase 1 indexing.
 /// Stores only the fields needed by window expressions.
@@ -47,9 +47,11 @@ impl Arena {
         let source_schema = reader.schema()?;
 
         // Build the projected schema (only the requested fields, in order)
-        let projected_columns: Vec<Box<str>> =
-            fields.iter().map(|f| f.clone().into_boxed_str()).collect();
-        let schema = Arc::new(Schema::new(projected_columns));
+        let schema = fields
+            .iter()
+            .map(|f| f.clone().into_boxed_str())
+            .collect::<SchemaBuilder>()
+            .build();
 
         // Map field names to their column indices in the source schema
         let field_indices: Vec<Option<usize>> =

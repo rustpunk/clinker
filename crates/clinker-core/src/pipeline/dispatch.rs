@@ -5,10 +5,9 @@
 //! records to per-type arenas with independent schemas.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use clinker_record::schema_def::{Discriminator, FieldDef, RecordTypeDef};
-use clinker_record::{MinimalRecord, Schema, Value};
+use clinker_record::{MinimalRecord, SchemaBuilder, Value};
 
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
@@ -179,8 +178,11 @@ impl MultiRecordDispatcher {
         fields: &[FieldDef],
         lines: &[&[u8]],
     ) -> Result<Arena, PipelineError> {
-        let columns: Vec<Box<str>> = fields.iter().map(|f| f.name.as_str().into()).collect();
-        let schema = Arc::new(Schema::new(columns));
+        let schema = fields
+            .iter()
+            .map(|f| Box::<str>::from(f.name.as_str()))
+            .collect::<SchemaBuilder>()
+            .build();
 
         let mut records = Vec::with_capacity(lines.len());
         for line in lines {
@@ -228,8 +230,11 @@ impl MultiRecordDispatcher {
         fields: &[FieldDef],
         records: &[HashMap<String, Value>],
     ) -> Result<Arena, PipelineError> {
-        let columns: Vec<Box<str>> = fields.iter().map(|f| f.name.as_str().into()).collect();
-        let schema = Arc::new(Schema::new(columns));
+        let schema = fields
+            .iter()
+            .map(|f| Box::<str>::from(f.name.as_str()))
+            .collect::<SchemaBuilder>()
+            .build();
 
         let mut arena_records = Vec::with_capacity(records.len());
         for record in records {

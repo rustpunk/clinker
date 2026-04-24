@@ -15,7 +15,7 @@ pub mod combine;
 pub mod generators;
 pub mod io;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -243,11 +243,12 @@ impl RecordFactory {
     /// Even-indexed fields are integers, odd-indexed are strings.
     /// `null_ratio` in [0.0, 1.0] controls the fraction of null values.
     pub fn new(field_count: usize, string_len: usize, null_ratio: f64, seed: u64) -> Self {
-        let columns: Vec<Box<str>> = (0..field_count)
-            .map(|i| format!("f{i}").into_boxed_str())
-            .collect();
+        let schema = (0..field_count)
+            .map(|i| format!("f{i}"))
+            .collect::<SchemaBuilder>()
+            .build();
         Self {
-            schema: Arc::new(Schema::new(columns)),
+            schema,
             rng: fastrand::Rng::with_seed(seed),
             string_len,
             null_ratio,
