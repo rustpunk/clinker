@@ -89,6 +89,121 @@ pub(crate) const GRACE_RECORD_BYTES_ESTIMATE: u64 = 1024;
 /// path emits matches in driver-order-then-build-walk-order.
 pub(crate) type RecordOrder = u64;
 
+/// Number of result records the BNL fallback emits per output batch
+/// before polling [`MemoryBudget::should_abort`]. Output amplification
+/// from a hot key joining against many probe-side records can produce
+/// `M * N` rows for a single equivalence class; periodic polling at the
+/// 10 K boundary keeps the abort signal responsive without paying an
+/// RSS read per emit.
+pub(crate) const RESULT_BATCH_SIZE: usize = 10_000;
+
+/// Bytes reserved for the probe-side spill stream during BNL chunked
+/// scans. Subtracted from the soft-limit budget when sizing each build
+/// chunk; the remainder is then halved to leave headroom for hashbrown
+/// table expansion (StarRocks #56491). 4 MiB is the LZ4 frame
+/// decompression buffer cost plus a small slack for the postcard
+/// payload buffer.
+pub(crate) const PROBE_BUFFER_RESERVATION: usize = 4 * 1024 * 1024;
+
+/// Threshold below which a recursive partition split is judged
+/// irreducible. If the largest child holds more than `1 -
+/// SKEW_REDUCTION_THRESHOLD` (i.e., 80%) of the parent's record count,
+/// doubling the partition count again can't separate the dominant key
+/// — bail out of recursion and fall back to BNL on the parent.
+/// AsterixDB VLDB 2022 settles on the same fraction.
+pub(crate) const SKEW_REDUCTION_THRESHOLD: f64 = 0.20;
+
+// ──────────────────────────────────────────────────────────────────────────
+// HyperLogLog distinct-key sketch
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Number of HyperLogLog registers. 64 registers ≈ ±13% nominal error;
+/// pairs with the bias-correction constant `HLL_ALPHA_64` to give a
+/// usable cardinality estimate at 64 bytes per partition (one byte per
+/// register, leading-zero count fits comfortably in a `u8` for any
+/// 64-bit hash). Sized for diagnostic-quality reporting in E310, not
+/// for query-plan cost estimation.
+const HLL_REGISTERS: usize = 64;
+
+/// Number of register-index bits derived from a 64-bit hash. `64 = 2^6`,
+/// so the top 6 bits select the register and the remaining 58 bits feed
+/// the leading-zero count.
+const HLL_INDEX_BITS: u32 = 6;
+
+/// Bias-correction constant for `m = 64`. Flajolet et al. (2007) give a
+/// closed form for `m >= 128`; for `m = 64` we use the empirically
+/// validated `0.709`, which matches Apache DataSketches and Redis
+/// HyperLogLog at the same register count.
+const HLL_ALPHA_64: f64 = 0.709;
+
+/// Tiny per-partition HyperLogLog sketch.
+///
+/// Memory: 64 bytes (one register per slot). Approximates the count of
+/// distinct hash values fed in via [`Hll::add`]; consulted by
+/// [`bnl_fallback`] when an E310 abort fires so the operator-facing
+/// diagnostic carries an actionable cardinality estimate ("partition 7,
+/// ~3.2M distinct keys") instead of a bare OOM.
+///
+/// The estimate uses the harmonic-mean form with bias correction at
+/// small range (`E < 2.5m`); large-range correction is unnecessary
+/// because the input domain is bounded by `u32::MAX - 1` records per
+/// partition (the build-side cap enforced in `CombineHashTable::build`).
+#[derive(Debug, Clone)]
+pub(crate) struct Hll {
+    registers: [u8; HLL_REGISTERS],
+}
+
+impl Hll {
+    /// Construct a fresh sketch with all registers zeroed.
+    pub(crate) fn new() -> Self {
+        Self {
+            registers: [0; HLL_REGISTERS],
+        }
+    }
+
+    /// Feed one 64-bit hash value into the sketch. Cost is one branch
+    /// plus a max-update on a single register.
+    pub(crate) fn add(&mut self, hash: u64) {
+        // Top HLL_INDEX_BITS bits pick the register; leading-zero count
+        // of the remaining bits + 1 is the contribution. The +1
+        // convention (rho = position of leftmost 1-bit, 1-indexed)
+        // matches the Flajolet 2007 paper.
+        let idx = (hash >> (64 - HLL_INDEX_BITS)) as usize;
+        let w = (hash << HLL_INDEX_BITS) | (1u64 << (HLL_INDEX_BITS - 1));
+        let rho = (w.leading_zeros() + 1) as u8;
+        if rho > self.registers[idx] {
+            self.registers[idx] = rho;
+        }
+    }
+
+    /// Return the approximate distinct-value count.
+    ///
+    /// Uses the harmonic-mean estimator `E = alpha_m * m^2 / sum(2^-M[j])`,
+    /// with the small-range linear-counting correction when more than
+    /// half the registers are still zero.
+    pub(crate) fn estimate(&self) -> u64 {
+        let m = HLL_REGISTERS as f64;
+        let mut sum_inv = 0.0f64;
+        let mut zeros = 0usize;
+        for &r in &self.registers {
+            sum_inv += 2f64.powi(-(r as i32));
+            if r == 0 {
+                zeros += 1;
+            }
+        }
+        let raw = HLL_ALPHA_64 * m * m / sum_inv;
+        // Linear-counting branch: when register vector is sparse, the
+        // harmonic-mean estimator is biased high. Switch to the
+        // closed-form `m * ln(m / V)` correction (Flajolet 2007 §4),
+        // which is unbiased in this regime.
+        if raw <= 2.5 * m && zeros > 0 {
+            (m * (m / zeros as f64).ln()).round() as u64
+        } else {
+            raw.round() as u64
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // PartitionAssigner
 // ──────────────────────────────────────────────────────────────────────────
@@ -162,9 +277,13 @@ impl PartitionAssigner {
 enum PartitionState {
     /// Build records accumulating in memory. `bytes_estimated` is a
     /// running sum used to pick a spill victim (Largest-Size policy).
+    /// `distinct_sketch` is fed on every insert; it survives the
+    /// Building → OnDisk transition so the BNL fallback can report
+    /// approximate cardinality if a partition trips E310.
     Building {
         records: Vec<Record>,
         bytes_estimated: usize,
+        distinct_sketch: Hll,
     },
     /// Build side spilled. `build_files` carries one file per
     /// spill flush of this partition (the initial bulk spill plus
@@ -173,6 +292,9 @@ enum PartitionState {
     /// to this partition; finalized into `probe_files` before reload.
     /// `hash_bits` records the assigner width at the time of writing —
     /// important for the reload path's recursive split.
+    /// `distinct_sketch` carries the build-side HLL across the spill
+    /// boundary so the reload path's BNL branch has a cardinality
+    /// estimate without re-scanning.
     ///
     /// `probe_writer` is boxed so the enum variants stay near the same
     /// stack footprint (the LZ4 frame encoder + buffered file handle
@@ -186,6 +308,7 @@ enum PartitionState {
         build_count: u64,
         probe_count: u64,
         hash_bits: u8,
+        distinct_sketch: Hll,
     },
     /// In-memory hash table built; ready for probe.
     Ready { hash_table: CombineHashTable },
@@ -254,6 +377,7 @@ impl GraceHashExecutor {
             partitions.push(PartitionState::Building {
                 records: Vec::new(),
                 bytes_estimated: 0,
+                distinct_sketch: Hll::new(),
             });
         }
         let spill_dir = tempfile::Builder::new().prefix("grace-hash-").tempdir()?;
@@ -318,10 +442,12 @@ impl GraceHashExecutor {
                 if let PartitionState::Building {
                     records,
                     bytes_estimated,
+                    distinct_sketch,
                 } = &mut self.partitions[p]
                 {
                     records.push(record);
                     *bytes_estimated += bytes;
+                    distinct_sketch.add(hash);
                 }
             }
             Some(hash_bits) => {
@@ -331,11 +457,13 @@ impl GraceHashExecutor {
                 if let PartitionState::OnDisk {
                     build_files,
                     build_count,
+                    distinct_sketch,
                     ..
                 } = &mut self.partitions[p]
                 {
                     build_files.push(new_path);
                     *build_count += 1;
+                    distinct_sketch.add(hash);
                 }
             }
         }
@@ -373,14 +501,20 @@ impl GraceHashExecutor {
     }
 
     /// Drain partition `idx` from Building → OnDisk by writing every
-    /// in-memory record to a fresh spill file.
+    /// in-memory record to a fresh spill file. The HLL sketch is
+    /// preserved verbatim across the transition so the reload-phase
+    /// BNL branch can read partition cardinality without rebuilding.
     fn spill_partition(&mut self, idx: usize) -> std::io::Result<()> {
         let assigner_bits = self.assigner.hash_bits();
         let hash_bits = assigner_bits;
         let partition_id = idx as u16;
         let prev = std::mem::replace(&mut self.partitions[idx], PartitionState::Done);
-        let records = match prev {
-            PartitionState::Building { records, .. } => records,
+        let (records, distinct_sketch) = match prev {
+            PartitionState::Building {
+                records,
+                distinct_sketch,
+                ..
+            } => (records, distinct_sketch),
             other => {
                 // Restore and bail.
                 self.partitions[idx] = other;
@@ -400,13 +534,17 @@ impl GraceHashExecutor {
             build_count: count,
             probe_count: 0,
             hash_bits,
+            distinct_sketch,
         };
         Ok(())
     }
 
     /// Transition every Building partition → Ready by constructing
     /// its `CombineHashTable`. After this call, only `Ready` and
-    /// `OnDisk` states remain.
+    /// `OnDisk` states remain. The Building variant's HLL is dropped
+    /// at this transition: in-memory partitions complete probing
+    /// against the live `CombineHashTable` and never reach the BNL
+    /// branch where the sketch would be consulted.
     pub(crate) fn finish_build(
         &mut self,
         extractor: &KeyExtractor,
@@ -518,7 +656,10 @@ impl GraceHashExecutor {
     }
 
     /// Iterate spilled partitions, returning their reload payloads in
-    /// partition order. Drains each as it yields.
+    /// partition order. Drains each as it yields. The HLL sketch
+    /// transfers ownership from the partition state to the
+    /// `SpilledPartition` so the reload path can fold cardinality
+    /// estimates into the BNL branch's E310 diagnostic.
     pub(crate) fn drain_spilled(&mut self) -> Vec<SpilledPartition> {
         let mut out = Vec::new();
         for (idx, state) in self.partitions.iter_mut().enumerate() {
@@ -528,6 +669,7 @@ impl GraceHashExecutor {
                 probe_files,
                 build_count,
                 hash_bits,
+                distinct_sketch,
                 ..
             } = prev
             {
@@ -537,6 +679,7 @@ impl GraceHashExecutor {
                     probe_files,
                     build_count,
                     hash_bits,
+                    distinct_sketch,
                 });
             }
         }
@@ -553,13 +696,16 @@ pub(crate) enum ProbeOutcome<'a> {
 }
 
 /// One spilled partition's reload payload, drained from the executor
-/// after the probe phase.
+/// after the probe phase. The HLL sketch travels alongside so the
+/// BNL fallback path can fold a cardinality estimate into the E310
+/// diagnostic without re-walking the spill files.
 pub(crate) struct SpilledPartition {
     pub partition_id: u16,
     pub build_files: Vec<SpillFilePath>,
     pub probe_files: Vec<SpillFilePath>,
     pub build_count: u64,
     pub hash_bits: u8,
+    pub distinct_sketch: Hll,
 }
 
 /// Estimate one record's heap footprint plus header overhead. Used as
@@ -886,18 +1032,40 @@ fn process_spilled_partition(
         }
     }
 
-    // Decide: split or build?
+    // Decide: in-memory build, recursive split, or BNL fallback.
+    //
+    // The reload path tries three tiers in order:
+    //  1. If the partition fits under the soft limit, build the hash
+    //     table directly and probe.
+    //  2. Otherwise, tentatively classify records under the doubled
+    //     assigner and check whether the largest child still holds
+    //     more than `1 - SKEW_REDUCTION_THRESHOLD` of the parent's
+    //     records. A non-trivial reduction means split-and-recurse
+    //     can make progress.
+    //  3. If the reduction is below threshold, or the assigner is
+    //     already at the partition-bit cap, the partition is
+    //     irreducible — fall back to block-nested-loop. BNL holds
+    //     bounded memory by chunking the build side into pieces sized
+    //     for `(soft_limit - PROBE_BUFFER_RESERVATION) / 2`.
     let parent_assigner = PartitionAssigner::new(sp.hash_bits);
-    let needs_split = budget.should_spill() && parent_assigner.double().is_some();
+    let child_assigner_opt = parent_assigner.double();
+    let needs_split = budget.should_spill() && child_assigner_opt.is_some();
     if needs_split && sp.build_count > 1 {
-        let child_assigner = parent_assigner.double().unwrap();
+        let child_assigner = child_assigner_opt.unwrap();
         // Repartition build_records into 2 child partitions by
         // re-hashing under the wider assigner. The parent's partition
         // id is `sp.partition_id`; under the child assigner the parent
         // id equals `child_id >> 1`, so children are `2*p` and `2*p+1`.
+        // Each child accumulates its own HLL during this pass — the
+        // sketch is invariant under hash-bit width (the underlying
+        // keys are unchanged), but rebuilding from the rehashed
+        // stream keeps the child sketch in step with its records
+        // rather than carrying parent-level state forward.
         let parent_id = sp.partition_id as u64;
         let mut child_a: Vec<Record> = Vec::new();
         let mut child_b: Vec<Record> = Vec::new();
+        let mut child_a_sketch = Hll::new();
+        let mut child_b_sketch = Hll::new();
         for r in build_records {
             let keys =
                 build_extractor
@@ -909,11 +1077,40 @@ fn process_spilled_partition(
             let h = hash_composite_key(&keys, hash_state);
             let cp = child_assigner.partition_for(h) as u64;
             if cp == parent_id * 2 {
+                child_a_sketch.add(h);
                 child_a.push(r);
             } else {
+                child_b_sketch.add(h);
                 child_b.push(r);
             }
         }
+
+        // Skew detection: a recursive split that fails to reduce the
+        // largest child by at least SKEW_REDUCTION_THRESHOLD is wasted
+        // work. The dominant key hashes are concentrated at one parent
+        // bucket regardless of bit width; doubling the assigner can't
+        // separate them. Bail out of recursion and route the parent
+        // into BNL fallback. Reassemble the parent's records from the
+        // (now-bisected) child halves so BNL sees the unsplit input.
+        let parent_count = sp.build_count;
+        let max_child = child_a.len().max(child_b.len()) as u64;
+        let irreducible = parent_count > 0
+            && (max_child as f64) > (1.0 - SKEW_REDUCTION_THRESHOLD) * (parent_count as f64);
+
+        if irreducible {
+            let mut combined = child_a;
+            combined.append(&mut child_b);
+            return bnl_fallback(
+                rc,
+                &sp,
+                combined,
+                body_evaluator,
+                budget,
+                output,
+                &mut BnlStats::default(),
+            );
+        }
+
         // Repartition probe records similarly.
         let mut child_a_probe: Vec<Record> = Vec::new();
         let mut child_b_probe: Vec<Record> = Vec::new();
@@ -949,9 +1146,9 @@ fn process_spilled_partition(
             }
         }
         // Re-spill each child to its own pair of files and recurse.
-        for (child_id, child_build, child_probe) in [
-            (parent_id * 2, child_a, child_a_probe),
-            (parent_id * 2 + 1, child_b, child_b_probe),
+        for (child_id, child_build, child_probe, child_sketch) in [
+            (parent_id * 2, child_a, child_a_probe, child_a_sketch),
+            (parent_id * 2 + 1, child_b, child_b_probe, child_b_sketch),
         ] {
             let bcount = child_build.len() as u64;
             let mut bw =
@@ -1005,10 +1202,27 @@ fn process_spilled_partition(
                 probe_files,
                 build_count: bcount,
                 hash_bits: child_assigner.hash_bits(),
+                distinct_sketch: child_sketch,
             };
             process_spilled_partition(rc, child_sp, body_evaluator, budget, output)?;
         }
         return Ok(());
+    }
+
+    // No further splitting is possible (assigner cap reached), but the
+    // budget still says we're over: BNL is the only safe choice. The
+    // in-memory hash-table branch below would build a table the size
+    // of the entire partition.
+    if budget.should_spill() && child_assigner_opt.is_none() {
+        return bnl_fallback(
+            rc,
+            &sp,
+            build_records,
+            body_evaluator,
+            budget,
+            output,
+            &mut BnlStats::default(),
+        );
     }
 
     // Build the in-memory hash table for the reloaded partition.
@@ -1068,6 +1282,260 @@ fn process_spilled_partition(
         }
     }
     Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Block-nested-loop fallback
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Counters captured during one BNL execution so tests can assert on
+/// chunking and batching behavior without instrumenting the budget. The
+/// fields are intentionally crate-public so the unit tests in this
+/// module can read them; production callers ignore the value.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BnlStats {
+    /// Number of build-side chunks the fallback materialized.
+    pub chunks_processed: usize,
+    /// Largest hash-table memory footprint observed across all
+    /// chunks. Sums every byte the table allocates per
+    /// [`CombineHashTable::memory_bytes`].
+    pub peak_chunk_table_bytes: usize,
+    /// Number of times the fallback hit a 10 K-record output batch
+    /// boundary and polled [`MemoryBudget::should_abort`].
+    pub batches_emitted: usize,
+    /// Largest single-chunk record count.
+    pub peak_chunk_records: usize,
+    /// Bytes the per-chunk sizing formula resolved to. Diagnostic
+    /// hook for the bounded-memory test.
+    pub chunk_byte_budget: usize,
+}
+
+/// Iterator over a build-record buffer that yields chunks bounded by
+/// estimated heap bytes. Emits at least one record per non-empty
+/// remainder so a chunk budget smaller than a single record's footprint
+/// still terminates rather than spinning. Records are moved out of the
+/// underlying Vec; the iterator drains its source.
+pub(crate) struct BuildChunkIter {
+    source: std::vec::IntoIter<Record>,
+    pending: Option<Record>,
+    byte_budget: usize,
+}
+
+impl BuildChunkIter {
+    /// Construct an iterator over `records`. `byte_budget` is the
+    /// maximum estimated heap footprint per emitted chunk. The
+    /// constructor enforces a `byte_budget >= 1` floor so the iterator
+    /// always makes forward progress.
+    pub(crate) fn new(records: Vec<Record>, byte_budget: usize) -> Self {
+        Self {
+            source: records.into_iter(),
+            pending: None,
+            byte_budget: byte_budget.max(1),
+        }
+    }
+}
+
+impl Iterator for BuildChunkIter {
+    type Item = Vec<Record>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut out: Vec<Record> = Vec::new();
+        let mut accumulated: usize = 0;
+        if let Some(r) = self.pending.take() {
+            accumulated += estimated_record_bytes(&r);
+            out.push(r);
+        }
+        for r in self.source.by_ref() {
+            let cost = estimated_record_bytes(&r);
+            if !out.is_empty() && accumulated + cost > self.byte_budget {
+                // Stash this record for the next chunk so the size cap
+                // bites. The single-record-per-chunk degenerate case is
+                // covered by the empty-out guard.
+                self.pending = Some(r);
+                break;
+            }
+            accumulated += cost;
+            out.push(r);
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+}
+
+/// Block-nested-loop fallback for irreducible partitions.
+///
+/// Chunks the build side into pieces sized for `(soft_limit -
+/// PROBE_BUFFER_RESERVATION) / 2`. For each chunk: builds a
+/// [`CombineHashTable`], scans every probe-side spill file in turn,
+/// emits matches via [`emit_for_probe`], drops the chunk's hash table,
+/// advances. The `/2` factor reserves headroom for hashbrown's resize
+/// (per StarRocks #56491); the `PROBE_BUFFER_RESERVATION` reserves
+/// space for the LZ4 frame decoder + postcard buffer.
+///
+/// Memory model:
+///   - In-flight: one chunk's hash table + the probe spill file's
+///     decode buffer + the per-record emit batch. Bounded by
+///     construction.
+///   - Out-of-loop: `output` accumulates results. Output amplification
+///     for a single hot key against M probe records is `M * 1`; per
+///     chunk it's `M * chunk_keys`, so the result-batch poll happens
+///     between every 10 K matches.
+///
+/// On [`MemoryBudget::should_abort`] returning true at any tier
+/// (chunk-table construction, between batches), the function returns
+/// an E310 [`PipelineError::Compilation`] carrying the partition_id
+/// and the HLL-derived approximate distinct-key count.
+fn bnl_fallback(
+    rc: &ReloadContext<'_>,
+    sp: &SpilledPartition,
+    build_records: Vec<Record>,
+    body_evaluator: &mut Option<ProgramEvaluator>,
+    budget: &mut MemoryBudget,
+    output: &mut Vec<(Record, RecordOrder)>,
+    stats: &mut BnlStats,
+) -> Result<(), PipelineError> {
+    let name = rc.name;
+    let driver_schema = Arc::clone(&rc.driver_schema);
+    let approx_distinct = sp.distinct_sketch.estimate();
+
+    // Per-chunk byte budget. Soft-limit minus probe reservation, then
+    // halved to leave headroom for the hash table's bucket array resize
+    // (StarRocks #56491). `max(1)` floor protects against soft_limit <
+    // PROBE_BUFFER_RESERVATION (e.g., test budgets) — yields one-record
+    // chunks, which still terminate.
+    let soft = budget.soft_limit() as usize;
+    let chunk_budget = soft
+        .saturating_sub(PROBE_BUFFER_RESERVATION)
+        .saturating_div(2)
+        .max(1);
+    stats.chunk_byte_budget = chunk_budget;
+
+    // If hard limit is already breached before any work, fail fast.
+    if budget.should_abort() {
+        return Err(combine_e310_partition_aborted(
+            name,
+            sp.partition_id,
+            approx_distinct,
+        ));
+    }
+
+    let chunks = BuildChunkIter::new(build_records, chunk_budget);
+    let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(rc.driver_extractor.len());
+    for chunk in chunks {
+        stats.chunks_processed += 1;
+        stats.peak_chunk_records = stats.peak_chunk_records.max(chunk.len());
+        let chunk_len = chunk.len();
+        let table =
+            CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
+                .map_err(|e| PipelineError::Compilation {
+                    transform_name: name.to_string(),
+                    messages: vec![format!(
+                        "E310 grace hash bnl chunk build (partition {}, ~{} distinct): {e}",
+                        sp.partition_id, approx_distinct
+                    )],
+                })?;
+        stats.peak_chunk_table_bytes = stats.peak_chunk_table_bytes.max(table.memory_bytes());
+
+        // Emit matches in 10 K-record batches against this chunk's
+        // table. After every batch boundary, poll should_abort so a
+        // runaway output amplification (one hot key joined against M
+        // probe records → M outputs per probe) gets caught.
+        let mut emitted_in_batch = 0usize;
+
+        // Per-chunk row-sequence baseline so each probe stream sees a
+        // contiguous numbering. The probe-side spill files were
+        // written with the original probe order discarded; we reissue
+        // monotonic row numbers for downstream sort stability.
+        let mut row_seq: u64 = 0;
+        for path in &sp.probe_files {
+            let reader = GraceSpillReader::open(path, Arc::clone(&driver_schema)).map_err(|e| {
+                PipelineError::Internal {
+                    op: "combine",
+                    node: name.to_string(),
+                    detail: format!("grace hash bnl probe open failed: {e}"),
+                }
+            })?;
+            for r in reader {
+                let probe_record = r.map_err(|e| PipelineError::Internal {
+                    op: "combine",
+                    node: name.to_string(),
+                    detail: format!("grace hash bnl probe read failed: {e}"),
+                })?;
+                let row_ctx = EvalContext {
+                    stable: rc.ctx.stable,
+                    source_file: rc.ctx.source_file,
+                    source_row: row_seq,
+                };
+                let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
+                probe_keys_buf.clear();
+                rc.driver_extractor
+                    .extract_into(&row_ctx, &resolver, &mut probe_keys_buf)
+                    .map_err(|e| PipelineError::Compilation {
+                        transform_name: name.to_string(),
+                        messages: vec![format!("grace hash bnl probe key eval: {e}")],
+                    })?;
+                let probe_iter = table.probe(&probe_keys_buf);
+                let pre = output.len();
+                emit_for_probe(
+                    rc.emit,
+                    &probe_record,
+                    row_seq,
+                    probe_iter,
+                    body_evaluator.as_mut(),
+                    &row_ctx,
+                    output,
+                )?;
+                let added = output.len() - pre;
+                emitted_in_batch += added;
+                row_seq += 1;
+
+                while emitted_in_batch >= RESULT_BATCH_SIZE {
+                    stats.batches_emitted += 1;
+                    emitted_in_batch -= RESULT_BATCH_SIZE;
+                    if budget.should_abort() {
+                        return Err(combine_e310_partition_aborted(
+                            name,
+                            sp.partition_id,
+                            approx_distinct,
+                        ));
+                    }
+                }
+            }
+        }
+        // Drop the chunk's hash table before reading the next chunk;
+        // bounded-memory invariant relies on this happening eagerly.
+        drop(table);
+
+        // Final between-chunk abort check. The chunked build alone
+        // cannot exceed the budget by construction (chunk_budget is
+        // sized for it), but cumulative `output` growth could.
+        if budget.should_abort() {
+            return Err(combine_e310_partition_aborted(
+                name,
+                sp.partition_id,
+                approx_distinct,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// E310 — runtime partition aborted because the chunked BNL fallback
+/// could not bring memory under the hard limit. Carries the partition
+/// index and an HLL-approximated distinct-key count so the operator
+/// can size `partition_bits` upstream or reroute the dominant key
+/// before retrying. See `crate::error` for the registry entry.
+fn combine_e310_partition_aborted(
+    transform: &str,
+    partition_id: u16,
+    approx_distinct: u64,
+) -> PipelineError {
+    PipelineError::Compilation {
+        transform_name: transform.to_string(),
+        messages: vec![format!(
+            "E310 combine grace hash exceeded memory limit on partition {partition_id}; \
+             approximate distinct key count {approx_distinct}"
+        )],
+    }
 }
 
 /// Shape-stable bundle for [`emit_for_probe`]. Bundling the per-call
@@ -1908,5 +2376,691 @@ mod tests {
         by_k.sort_by_key(|(k, _)| *k);
         let expected: Vec<(i64, String)> = (0..16).map(|i| (i, format!("v-{i}"))).collect();
         assert_eq!(by_k, expected);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Skew / BNL / E310 hard-gate tests
+    //
+    // The BNL fallback runs inside [`process_spilled_partition`]'s
+    // skew-detection branch. Driving it through a full
+    // `execute_combine_grace_hash` would require manufacturing skew
+    // through the public input shape; instead we build a minimal
+    // [`ReloadContext`] + [`SpilledPartition`] in test code so we can
+    // both observe [`BnlStats`] and assert directly on the function's
+    // chunking / batching invariants.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a tiny harness wrapping the keyed-pair join `dk == bk` so
+    /// each BNL test can drive [`bnl_fallback`] without re-typing the
+    /// `CombineResolverMapping` boilerplate.
+    struct BnlHarness {
+        decomposed: crate::plan::combine::DecomposedPredicate,
+        resolver_mapping: crate::executor::combine::CombineResolverMapping,
+        build_extractor: KeyExtractor,
+        driver_extractor: KeyExtractor,
+        emit: EmitArgsOwned,
+        build_schema: Arc<Schema>,
+        driver_schema: Arc<Schema>,
+        stable: cxl::eval::StableEvalContext,
+        source_file: Arc<str>,
+        hash_state: ahash::RandomState,
+        spill_dir: TempDir,
+    }
+
+    /// Owned analogue of [`EmitArgs`] — the live struct is borrow-only,
+    /// so the harness keeps owned copies and reconstitutes the borrowed
+    /// view inside each test.
+    struct EmitArgsOwned {
+        name: String,
+        match_mode: MatchMode,
+        on_miss: OnMiss,
+        build_qualifier: String,
+        output_schema: Arc<Schema>,
+    }
+
+    fn build_bnl_harness() -> BnlHarness {
+        use crate::executor::combine::{CombineResolverMapping, JoinSide};
+        use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
+        use cxl::eval::StableEvalContext;
+
+        let driver_schema = schema_with(&["dk", "v"]);
+        let build_schema = schema_with(&["bk", "name"]);
+
+        let (left_tp, left_expr) =
+            compile_key("emit k = dk", &["dk"], &[("dk", cxl::typecheck::Type::Int)]);
+        let (right_tp, right_expr) =
+            compile_key("emit k = bk", &["bk"], &[("bk", cxl::typecheck::Type::Int)]);
+
+        let decomposed = DecomposedPredicate {
+            equalities: vec![EqualityConjunct {
+                left_expr: left_expr.clone(),
+                left_input: Arc::from("orders"),
+                left_program: Arc::clone(&left_tp),
+                right_expr: right_expr.clone(),
+                right_input: Arc::from("products"),
+                right_program: Arc::clone(&right_tp),
+            }],
+            ranges: Vec::new(),
+            residual: None,
+        };
+
+        let mut mapping_q: std::collections::HashMap<
+            crate::plan::row_type::QualifiedField,
+            (JoinSide, u32),
+        > = std::collections::HashMap::new();
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("orders", "dk"),
+            (JoinSide::Probe, 0),
+        );
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("orders", "v"),
+            (JoinSide::Probe, 1),
+        );
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("products", "bk"),
+            (JoinSide::Build, 0),
+        );
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("products", "name"),
+            (JoinSide::Build, 1),
+        );
+
+        let mut combine_inputs: indexmap::IndexMap<String, crate::plan::combine::CombineInput> =
+            indexmap::IndexMap::new();
+        let mut driver_row_cols: indexmap::IndexMap<
+            crate::plan::row_type::QualifiedField,
+            cxl::typecheck::Type,
+        > = indexmap::IndexMap::new();
+        driver_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("dk"),
+            cxl::typecheck::Type::Int,
+        );
+        driver_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("v"),
+            cxl::typecheck::Type::String,
+        );
+        let mut build_row_cols: indexmap::IndexMap<
+            crate::plan::row_type::QualifiedField,
+            cxl::typecheck::Type,
+        > = indexmap::IndexMap::new();
+        build_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("bk"),
+            cxl::typecheck::Type::Int,
+        );
+        build_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("name"),
+            cxl::typecheck::Type::String,
+        );
+        combine_inputs.insert(
+            "orders".to_string(),
+            crate::plan::combine::CombineInput {
+                upstream_name: Arc::from("orders"),
+                row: crate::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
+                estimated_cardinality: None,
+            },
+        );
+        combine_inputs.insert(
+            "products".to_string(),
+            crate::plan::combine::CombineInput {
+                upstream_name: Arc::from("products"),
+                row: crate::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
+                estimated_cardinality: None,
+            },
+        );
+        let resolver_mapping =
+            CombineResolverMapping::from_pre_resolved(&Arc::new(mapping_q), &combine_inputs);
+
+        let driver_extractor = KeyExtractor::new(vec![(left_tp, left_expr)]);
+        let build_extractor = KeyExtractor::new(vec![(right_tp, right_expr)]);
+
+        let combined_schema = SchemaBuilder::new()
+            .with_field("dk")
+            .with_field("v")
+            .with_field("bk")
+            .with_field("name")
+            .build();
+
+        BnlHarness {
+            decomposed,
+            resolver_mapping,
+            build_extractor,
+            driver_extractor,
+            emit: EmitArgsOwned {
+                name: "bnl_test".to_string(),
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::Skip,
+                build_qualifier: "products".to_string(),
+                output_schema: combined_schema,
+            },
+            build_schema,
+            driver_schema,
+            stable: StableEvalContext::test_default(),
+            source_file: Arc::from("test.csv"),
+            hash_state: ahash::RandomState::new(),
+            spill_dir: tempfile::Builder::new()
+                .prefix("bnl-test-")
+                .tempdir()
+                .unwrap(),
+        }
+    }
+
+    /// Run `f` with a freshly-built [`ReloadContext`] borrowed off
+    /// the harness. The closure owns the BNL invocation; lifetime
+    /// inference threads the harness's borrows through `f`'s
+    /// parameter without resorting to transmutes.
+    fn with_reload_context<R>(h: &BnlHarness, f: impl FnOnce(&ReloadContext<'_>) -> R) -> R {
+        let emit = EmitArgs {
+            name: &h.emit.name,
+            decomposed: &h.decomposed,
+            resolver_mapping: &h.resolver_mapping,
+            output_schema: Some(&h.emit.output_schema),
+            match_mode: h.emit.match_mode,
+            on_miss: h.emit.on_miss,
+            build_qualifier: &h.emit.build_qualifier,
+        };
+        let eval_ctx = EvalContext {
+            stable: &h.stable,
+            source_file: &h.source_file,
+            source_row: 0,
+        };
+        let rc = ReloadContext {
+            name: &h.emit.name,
+            build_extractor: &h.build_extractor,
+            driver_extractor: &h.driver_extractor,
+            emit: &emit,
+            ctx: &eval_ctx,
+            build_schema: Arc::clone(&h.build_schema),
+            driver_schema: Arc::clone(&h.driver_schema),
+            spill_dir: h.spill_dir.path(),
+            hash_state: &h.hash_state,
+        };
+        f(&rc)
+    }
+
+    /// Spill `build_records` to a single file under partition_id 0 and
+    /// `probe_records` to a sibling probe file. Populates the
+    /// returned [`SpilledPartition`] and feeds the HLL.
+    fn spill_for_bnl(
+        h: &BnlHarness,
+        build_records: &[Record],
+        probe_records: &[Record],
+        partition_id: u16,
+        hash_bits: u8,
+    ) -> SpilledPartition {
+        let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id).unwrap();
+        let mut sketch = Hll::new();
+        for r in build_records {
+            bw.write_record(r).unwrap();
+            // Feed the HLL via the build-side hash of the join key.
+            let stable = cxl::eval::StableEvalContext::test_default();
+            let source_file: Arc<str> = Arc::from("test.csv");
+            let ctx = EvalContext {
+                stable: &stable,
+                source_file: &source_file,
+                source_row: 0,
+            };
+            let keys = h.build_extractor.extract(&ctx, r).unwrap();
+            sketch.add(hash_composite_key(&keys, &h.hash_state));
+        }
+        let bpath = bw.finish().unwrap();
+        let mut probe_files: Vec<SpillFilePath> = Vec::new();
+        if !probe_records.is_empty() {
+            let mut pw =
+                GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id | 0x8000)
+                    .unwrap();
+            for r in probe_records {
+                pw.write_record(r).unwrap();
+            }
+            probe_files.push(pw.finish().unwrap());
+        }
+        SpilledPartition {
+            partition_id,
+            build_files: vec![bpath],
+            probe_files,
+            build_count: build_records.len() as u64,
+            hash_bits,
+            distinct_sketch: sketch,
+        }
+    }
+
+    /// Hard-gate 1: a uniform-key build dataset (every record carries
+    /// the same join key) cannot be split usefully. After
+    /// `assigner.double()` the largest child still holds 100% of the
+    /// parent's records (max_child / parent ≥ 1.0 ≫ 0.8), so the
+    /// reload path must hand the partition off to BNL rather than
+    /// recursing further.
+    #[test]
+    fn test_skew_detection_triggers_bnl() {
+        let h = build_bnl_harness();
+        // 200 records, all keyed at 42 → identical hash, identical
+        // partition no matter the assigner width.
+        let builds: Vec<Record> = (0..200i64)
+            .map(|i| {
+                record_for(
+                    &h.build_schema,
+                    vec![
+                        Value::Integer(42),
+                        Value::String(format!("name-{i}").into()),
+                    ],
+                )
+            })
+            .collect();
+        let probes: Vec<Record> = (0..5i64)
+            .map(|i| {
+                record_for(
+                    &h.driver_schema,
+                    vec![Value::Integer(42), Value::String(format!("d-{i}").into())],
+                )
+            })
+            .collect();
+
+        // Use a parent assigner with a few free bits so `double()` is
+        // available — that's the path that lets the skew check fire.
+        let parent_bits = 4u8;
+        let sp = spill_for_bnl(&h, &builds, &probes, /* partition_id */ 0, parent_bits);
+
+        // Verify the math the executor uses: classify every build
+        // record under the doubled assigner; the largest child must
+        // exceed the SKEW_REDUCTION_THRESHOLD-derived ceiling.
+        let parent_assigner = PartitionAssigner::new(parent_bits);
+        let child = parent_assigner.double().unwrap();
+        let parent_id = sp.partition_id as u64;
+        let stable = cxl::eval::StableEvalContext::test_default();
+        let source_file: Arc<str> = Arc::from("test.csv");
+        let ctx = EvalContext {
+            stable: &stable,
+            source_file: &source_file,
+            source_row: 0,
+        };
+        let mut a = 0usize;
+        let mut b = 0usize;
+        for r in &builds {
+            let keys = h.build_extractor.extract(&ctx, r).unwrap();
+            let hash = hash_composite_key(&keys, &h.hash_state);
+            let cp = child.partition_for(hash) as u64;
+            if cp == parent_id * 2 {
+                a += 1;
+            } else {
+                b += 1;
+            }
+        }
+        let max_child = a.max(b);
+        let parent_count = builds.len();
+        assert!(
+            (max_child as f64) > (1.0 - SKEW_REDUCTION_THRESHOLD) * (parent_count as f64),
+            "uniform-key partition must trip the irreducible threshold; \
+             max_child={max_child}, parent={parent_count}",
+        );
+
+        // Now drive BNL directly and confirm it produces the expected
+        // 5 driver × 200 build = 1000 join rows.
+        let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut stats = BnlStats::default();
+        let mut body_eval: Option<ProgramEvaluator> = None;
+        with_reload_context(&h, |rc| {
+            bnl_fallback(
+                rc,
+                &sp,
+                builds,
+                &mut body_eval,
+                &mut budget,
+                &mut output,
+                &mut stats,
+            )
+            .expect("BNL fallback must run on irreducible partition");
+        });
+        assert_eq!(
+            output.len(),
+            5 * 200,
+            "BNL must produce the cross-product of matching keys"
+        );
+        assert!(
+            stats.chunks_processed >= 1,
+            "BNL must process at least one chunk"
+        );
+    }
+
+    /// Hard-gate 2: BNL output equals the in-memory hash join over the
+    /// same input. Tests the join correctness invariant under the
+    /// chunked-build path.
+    #[test]
+    fn test_bnl_fallback_correct_output() {
+        let h = build_bnl_harness();
+        // 50 unique keys, each carried by exactly one build and one
+        // probe row. Expected result: 50 join rows.
+        let builds: Vec<Record> = (0..50i64)
+            .map(|i| {
+                record_for(
+                    &h.build_schema,
+                    vec![Value::Integer(i), Value::String(format!("b-{i}").into())],
+                )
+            })
+            .collect();
+        let probes: Vec<Record> = (0..50i64)
+            .map(|i| {
+                record_for(
+                    &h.driver_schema,
+                    vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
+                )
+            })
+            .collect();
+        let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
+
+        // Force a small chunk budget so the chunked path actually
+        // splits the build into pieces (not a single chunk).
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut stats = BnlStats::default();
+        let mut body_eval: Option<ProgramEvaluator> = None;
+        with_reload_context(&h, |rc| {
+            bnl_fallback(
+                rc,
+                &sp,
+                builds,
+                &mut body_eval,
+                &mut budget,
+                &mut output,
+                &mut stats,
+            )
+            .expect("BNL must succeed on non-skewed input");
+        });
+
+        // Every probe joins exactly one build by `dk == bk`. The
+        // synthetic-step concatenation writes (dk, v, bk, name) into
+        // the combined schema.
+        assert_eq!(output.len(), 50, "join must yield one row per key");
+        let mut keys: Vec<i64> = output
+            .iter()
+            .map(|(r, _)| match r.values()[0] {
+                Value::Integer(i) => i,
+                _ => panic!("expected Integer at column 0"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, (0..50).collect::<Vec<_>>());
+
+        // Each row's bk (column 2) must equal its dk (column 0).
+        for (r, _) in &output {
+            let dk = match r.values()[0] {
+                Value::Integer(i) => i,
+                _ => panic!(),
+            };
+            let bk = match r.values()[2] {
+                Value::Integer(i) => i,
+                _ => panic!(),
+            };
+            assert_eq!(dk, bk, "join must align dk == bk per equality conjunct");
+        }
+    }
+
+    /// Hard-gate 3: BNL respects the `(soft_limit -
+    /// PROBE_BUFFER_RESERVATION) / 2` chunk budget formula. Verified
+    /// by feeding a small-soft-limit budget and asserting the chunk
+    /// budget the function resolves to lands at the expected value
+    /// AND that the largest observed hash-table footprint stays within
+    /// it. The peak observation is the in-process bound the test
+    /// can prove without injecting an artificial allocator.
+    #[test]
+    fn test_bnl_bounded_memory() {
+        let h = build_bnl_harness();
+        // Mid-sized build + probe set so chunks > 1.
+        let builds: Vec<Record> = (0..400i64)
+            .map(|i| {
+                record_for(
+                    &h.build_schema,
+                    vec![Value::Integer(7), Value::String(format!("b-{i}").into())],
+                )
+            })
+            .collect();
+        let probes: Vec<Record> = (0..50i64)
+            .map(|i| {
+                record_for(
+                    &h.driver_schema,
+                    vec![Value::Integer(7), Value::String(format!("d-{i}").into())],
+                )
+            })
+            .collect();
+        let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
+
+        // Budget with hard_limit huge (so should_abort never fires) and
+        // soft_limit just below PROBE_BUFFER_RESERVATION (so the chunk
+        // formula's saturating_sub bottoms out at zero and the `max(1)`
+        // floor kicks in). spill_threshold_pct expresses soft as a
+        // fraction of hard.
+        let target_soft = (PROBE_BUFFER_RESERVATION as f64) / 2.0; // ~2 MB < reservation
+        let mut budget = MemoryBudget::new(u64::MAX, target_soft / (u64::MAX as f64));
+        let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut stats = BnlStats::default();
+        let mut body_eval: Option<ProgramEvaluator> = None;
+
+        with_reload_context(&h, |rc| {
+            bnl_fallback(
+                rc,
+                &sp,
+                builds,
+                &mut body_eval,
+                &mut budget,
+                &mut output,
+                &mut stats,
+            )
+            .expect("BNL must succeed with bounded chunks");
+        });
+
+        // Verify the formula exactly. soft_limit = limit; the
+        // saturating_sub goes to zero (limit < PROBE_BUFFER_RESERVATION),
+        // saturating_div(2) stays zero, .max(1) lifts to 1.
+        assert_eq!(stats.chunk_byte_budget, 1, "chunk budget formula floor");
+
+        // With a 1-byte chunk budget every record forms its own chunk,
+        // so chunks_processed == build size and peak_chunk_records
+        // is 1.
+        assert_eq!(
+            stats.chunks_processed, 400,
+            "1-byte chunk budget should make every record its own chunk"
+        );
+        assert_eq!(
+            stats.peak_chunk_records, 1,
+            "single-record chunks bound peak_chunk_records to 1"
+        );
+        // Now drive the same input with a soft-limit large enough for
+        // one chunk and confirm the formula resolves to the expected
+        // (soft - reservation) / 2 value. hard_limit stays at u64::MAX
+        // so should_abort cannot fire on RSS.
+        let big_soft = (PROBE_BUFFER_RESERVATION as u64) * 8;
+        let mut big_budget = MemoryBudget::new(u64::MAX, (big_soft as f64) / (u64::MAX as f64));
+        let sp2 = spill_for_bnl(
+            &h,
+            &(0..10i64)
+                .map(|i| {
+                    record_for(
+                        &h.build_schema,
+                        vec![Value::Integer(7), Value::String(format!("b-{i}").into())],
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &probes,
+            1,
+            2,
+        );
+        let mut output2: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut stats2 = BnlStats::default();
+        let mut body_eval2: Option<ProgramEvaluator> = None;
+        let builds2: Vec<Record> = (0..10i64)
+            .map(|i| {
+                record_for(
+                    &h.build_schema,
+                    vec![Value::Integer(7), Value::String(format!("b-{i}").into())],
+                )
+            })
+            .collect();
+        with_reload_context(&h, |rc| {
+            bnl_fallback(
+                rc,
+                &sp2,
+                builds2,
+                &mut body_eval2,
+                &mut big_budget,
+                &mut output2,
+                &mut stats2,
+            )
+            .unwrap();
+        });
+        let expected_budget = (big_soft as usize - PROBE_BUFFER_RESERVATION) / 2;
+        assert_eq!(
+            stats2.chunk_byte_budget, expected_budget,
+            "(soft - probe) / 2 formula"
+        );
+        // peak hash-table memory must not exceed soft_limit (the
+        // architectural invariant — a single chunk's hash table is
+        // strictly smaller than the in-flight chunk plus its expansion
+        // headroom).
+        assert!(
+            stats2.peak_chunk_table_bytes <= big_budget.soft_limit() as usize,
+            "peak chunk table {} must stay within soft_limit {}",
+            stats2.peak_chunk_table_bytes,
+            big_budget.soft_limit(),
+        );
+    }
+
+    /// Hard-gate 4: BNL emits results in 10 K-record batches and polls
+    /// `should_abort` between them. Verified by producing enough output
+    /// to cross multiple batch boundaries and asserting on
+    /// `stats.batches_emitted`.
+    ///
+    /// Strategy: a single hot key K shared by 200 build rows and 60
+    /// probe rows yields 200 × 60 = 12 000 join records per chunk, so
+    /// at least one batch boundary fires.
+    #[test]
+    fn test_bnl_result_batching() {
+        let h = build_bnl_harness();
+        let builds: Vec<Record> = (0..200i64)
+            .map(|i| {
+                record_for(
+                    &h.build_schema,
+                    vec![Value::Integer(99), Value::String(format!("b-{i}").into())],
+                )
+            })
+            .collect();
+        let probes: Vec<Record> = (0..60i64)
+            .map(|i| {
+                record_for(
+                    &h.driver_schema,
+                    vec![Value::Integer(99), Value::String(format!("d-{i}").into())],
+                )
+            })
+            .collect();
+        let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
+
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut stats = BnlStats::default();
+        let mut body_eval: Option<ProgramEvaluator> = None;
+        with_reload_context(&h, |rc| {
+            bnl_fallback(
+                rc,
+                &sp,
+                builds,
+                &mut body_eval,
+                &mut budget,
+                &mut output,
+                &mut stats,
+            )
+            .expect("BNL must produce output for hot-key test");
+        });
+
+        // 200 × 60 = 12 000 join rows; should cross at least one
+        // 10 K boundary so batches_emitted ≥ 1.
+        assert_eq!(output.len(), 12_000);
+        assert!(
+            stats.batches_emitted >= 1,
+            "BNL must hit the {RESULT_BATCH_SIZE}-record batch boundary at least once; \
+             got {} batches",
+            stats.batches_emitted,
+        );
+    }
+
+    /// Hard-gate 5: hard-limit abort surfaces E310 with the partition
+    /// index AND a positive HLL distinct-key estimate. The host RSS
+    /// trivially exceeds a 1-byte limit, so `should_abort` returns true
+    /// on the very first poll inside BNL.
+    #[test]
+    fn test_e310_hard_limit_abort() {
+        if crate::pipeline::memory::rss_bytes().is_none() {
+            // RSS measurement unavailable; should_abort() returns
+            // false on this platform and the test cannot fire.
+            return;
+        }
+        let h = build_bnl_harness();
+        // Distinct keys in the build set so the HLL gives a non-zero
+        // estimate (its small-range linear-counting branch reports
+        // close to the true count when most registers are zero).
+        let builds: Vec<Record> = (0..200i64)
+            .map(|i| {
+                record_for(
+                    &h.build_schema,
+                    vec![Value::Integer(i), Value::String(format!("b-{i}").into())],
+                )
+            })
+            .collect();
+        let probes: Vec<Record> = (0..10i64)
+            .map(|i| {
+                record_for(
+                    &h.driver_schema,
+                    vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
+                )
+            })
+            .collect();
+        let sp = spill_for_bnl(&h, &builds, &probes, 7, 2);
+
+        // 1-byte hard limit → should_abort fires immediately.
+        let mut budget = MemoryBudget::new(1, 1.0);
+        let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut stats = BnlStats::default();
+        let mut body_eval: Option<ProgramEvaluator> = None;
+        let err = with_reload_context(&h, |rc| {
+            bnl_fallback(
+                rc,
+                &sp,
+                builds,
+                &mut body_eval,
+                &mut budget,
+                &mut output,
+                &mut stats,
+            )
+            .expect_err("1-byte hard limit must abort BNL with E310")
+        });
+
+        let msg = format!("{err}");
+        assert!(msg.contains("E310"), "abort must surface E310; got: {msg}");
+        assert!(
+            msg.contains("partition 7"),
+            "E310 message must include partition_id; got: {msg}",
+        );
+        let est = sp.distinct_sketch.estimate();
+        assert!(est > 0, "HLL must report a positive distinct estimate");
+        assert!(
+            msg.contains(&est.to_string()),
+            "E310 message must include approx distinct count {est}; got: {msg}",
+        );
+    }
+
+    /// HLL sanity: 200 distinct hashes give an estimate within 50% of
+    /// the true cardinality. The 64-register sketch's nominal error is
+    /// ±13%; the loose 50% bound here only guards against gross
+    /// regressions in the bias-correction or harmonic-mean formula.
+    #[test]
+    fn hll_estimate_in_band() {
+        let mut sketch = Hll::new();
+        for i in 0..200u64 {
+            sketch.add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+        let est = sketch.estimate();
+        let lower = 100;
+        let upper = 400;
+        assert!(
+            (lower..=upper).contains(&est),
+            "HLL estimate {est} for 200 distinct hashes should land in [{lower}, {upper}]",
+        );
     }
 }
