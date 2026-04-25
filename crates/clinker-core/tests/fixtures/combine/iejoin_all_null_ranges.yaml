@@ -1,0 +1,51 @@
+# Every row on both sides has null in both range columns. Under CXL
+# ternary, every range comparison resolves to false, so the join
+# emits zero matched pairs. The Polars-style NULL pre-pass partitions
+# every record into the null-range bucket; only on_miss: null_fields
+# drives any output. This fixture pins the empty-output case under
+# on_miss: skip.
+pipeline:
+  name: iejoin_all_null_ranges
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_null_drivers.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: driver_id, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_null_builds.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: build_id, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: combine
+    name: never_matches
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.entity_id == builds.entity_id and drivers.lo >= builds.lo and drivers.hi <= builds.hi"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit entity_id = drivers.entity_id
+        emit driver_id = drivers.driver_id
+        emit build_id = builds.build_id
+  - type: output
+    name: never_matches_out
+    input: never_matches
+    config:
+      name: never_matches_out
+      type: csv
+      path: /tmp/iejoin_all_null_ranges.csv

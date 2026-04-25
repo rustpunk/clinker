@@ -58,6 +58,7 @@ rayon = "1"
 fastrand = { workspace = true }
 insta = "1"
 serial_test = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "sort"

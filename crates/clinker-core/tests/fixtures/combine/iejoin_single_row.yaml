@@ -1,0 +1,50 @@
+# Minimal boundary case: exactly one record on each side. Two-pointer
+# scans, sort permutations, and bit-array initializations all need
+# to handle len=1 without indexing UB or division-by-zero. Inspired
+# by class-of-bugs reported on smaller engines: DuckDB #18067,
+# Polars #26719.
+pipeline:
+  name: iejoin_single_row
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_single_driver.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: driver_id, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_single_build.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: build_id, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: combine
+    name: single_match
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.entity_id == builds.entity_id and drivers.lo >= builds.lo and drivers.hi <= builds.hi"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit entity_id = drivers.entity_id
+        emit driver_id = drivers.driver_id
+        emit build_id = builds.build_id
+  - type: output
+    name: single_match_out
+    input: single_match
+    config:
+      name: single_match_out
+      type: csv
+      path: /tmp/iejoin_single_row.csv

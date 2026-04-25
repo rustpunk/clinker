@@ -1,0 +1,50 @@
+# Mixed equi+range fixture: assign each employee to a tax bracket.
+# Equality on entity_id (employee belongs to entity, brackets are
+# entity-scoped) plus a half-open range on income — bracket_lo is
+# inclusive, bracket_hi is exclusive, modelling the canonical
+# tax-bracket assignment shape.
+pipeline:
+  name: iejoin_tax_bracket
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_employees.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: employee_id, type: string }
+        - { name: income, type: int }
+  - type: source
+    name: brackets
+    config:
+      name: brackets
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_brackets.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: bracket_id, type: string }
+        - { name: bracket_lo, type: int }
+        - { name: bracket_hi, type: int }
+        - { name: rate, type: float }
+  - type: combine
+    name: assign_bracket
+    input:
+      employees: employees
+      brackets: brackets
+    config:
+      where: "employees.entity_id == brackets.entity_id and employees.income >= brackets.bracket_lo and employees.income < brackets.bracket_hi"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit entity_id = employees.entity_id
+        emit income = employees.income
+        emit rate = brackets.rate
+  - type: output
+    name: assign_bracket_out
+    input: assign_bracket
+    config:
+      name: assign_bracket_out
+      type: csv
+      path: /tmp/iejoin_tax_bracket.csv

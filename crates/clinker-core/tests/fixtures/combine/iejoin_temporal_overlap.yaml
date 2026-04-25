@@ -1,0 +1,54 @@
+# Mixed equi+range fixture: pair events with sessions whose intervals
+# overlap. Within a group, two intervals overlap when each starts
+# before the other ends (events.start <= sessions.end_ts and
+# events.end >= sessions.start_ts). match: all so a single event
+# may match multiple overlapping sessions in the same group.
+pipeline:
+  name: iejoin_temporal_overlap
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_events.csv
+      schema:
+        - { name: group_id, type: string }
+        - { name: event_id, type: string }
+        - { name: start, type: int }
+        - { name: end, type: int }
+  - type: source
+    name: sessions
+    config:
+      name: sessions
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_sessions.csv
+      schema:
+        - { name: group_id, type: string }
+        - { name: session_id, type: string }
+        - { name: start_ts, type: int }
+        - { name: end_ts, type: int }
+  - type: combine
+    name: overlapping
+    input:
+      events: events
+      sessions: sessions
+    config:
+      where: "events.group_id == sessions.group_id and events.start <= sessions.end_ts and events.end >= sessions.start_ts"
+      match: all
+      on_miss: null_fields
+      cxl: |
+        emit group_id = events.group_id
+        emit event_id = events.event_id
+        emit session_id = sessions.session_id
+        emit event_start = events.start
+        emit event_end = events.end
+        emit session_start = sessions.start_ts
+        emit session_end = sessions.end_ts
+  - type: output
+    name: overlapping_out
+    input: overlapping
+    config:
+      name: overlapping_out
+      type: csv
+      path: /tmp/iejoin_temporal_overlap.csv

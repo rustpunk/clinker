@@ -1,0 +1,9 @@
+entity_id,bracket_id,bracket_lo,bracket_hi,rate
+ent-A,bkt-A1,0,40000,0.1
+ent-A,bkt-A2,40000,80000,0.2
+ent-A,bkt-A3,80000,150000,0.3
+ent-A,bkt-A4,150000,500000,0.4
+ent-B,bkt-B1,0,40000,0.05
+ent-B,bkt-B2,40000,80000,0.15
+ent-B,bkt-B3,80000,150000,0.25
+ent-B,bkt-B4,150000,500000,0.35

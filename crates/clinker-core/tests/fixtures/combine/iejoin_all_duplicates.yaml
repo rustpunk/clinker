@@ -1,0 +1,53 @@
+# Both range columns identical across every build row. Without a
+# secondary tiebreaker on the other join attribute (and a tertiary
+# tiebreaker on record index), the IEJoin scan would walk an
+# exponential set of equal-key entries. Documented as errata point 4
+# in the corrected VLDB Journal 2017 paper; both DuckDB and Polars
+# implement the secondary-sort mitigation.
+pipeline:
+  name: iejoin_all_duplicates
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_dup_drivers.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: driver_id, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_dup_builds.csv
+      schema:
+        - { name: entity_id, type: string }
+        - { name: build_id, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+        - { name: tag, type: string }
+  - type: combine
+    name: duplicate_match
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.entity_id == builds.entity_id and drivers.lo >= builds.lo and drivers.hi <= builds.hi"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit entity_id = drivers.entity_id
+        emit driver_id = drivers.driver_id
+        emit build_id = builds.build_id
+        emit tag = builds.tag
+  - type: output
+    name: duplicate_match_out
+    input: duplicate_match
+    config:
+      name: duplicate_match_out
+      type: csv
+      path: /tmp/iejoin_all_duplicates.csv

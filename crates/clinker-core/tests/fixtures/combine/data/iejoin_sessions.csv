@@ -1,0 +1,6 @@
+group_id,session_id,start_ts,end_ts
+grp-1,sess-A,8,18
+grp-1,sess-B,22,28
+grp-1,sess-C,45,55
+grp-2,sess-D,1,10
+grp-2,sess-E,28,38
