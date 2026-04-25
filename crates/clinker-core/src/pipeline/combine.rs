@@ -1425,6 +1425,82 @@ mod tests {
     }
 
     #[test]
+    fn test_combine_hash_table_null_build_indexed_never_matches() {
+        // SQL three-value-logic: a build record stored under a NULL key
+        // must never match any probe — including a probe whose extracted
+        // key happens to share the NULL sentinel's hash bucket. The
+        // probe-side short-circuit guards NULL probes; this test guards
+        // the build-side, exercising every probe path that could surface
+        // a NULL-keyed build row.
+        let schema = test_schema(&["k", "tag"]);
+        let records = vec![
+            mk_record(
+                &schema,
+                vec![Value::Null, Value::String("null-build".into())],
+            ),
+            mk_record(
+                &schema,
+                vec![Value::Integer(7), Value::String("seven".into())],
+            ),
+            mk_record(
+                &schema,
+                vec![Value::Integer(42), Value::String("forty-two".into())],
+            ),
+        ];
+        let extractor = single_int_key("k");
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(256 * 1024 * 1024);
+        let table = CombineHashTable::build(records, &extractor, &ctx, &mut budget, None).unwrap();
+        assert_eq!(
+            table.len(),
+            3,
+            "all three records (incl. NULL-key) are indexed"
+        );
+
+        // Probe with each non-null integer key. The "null-build" tag must
+        // never appear in the result set, regardless of whether the
+        // matched key shares a bucket with the NULL sentinel.
+        for present_key in [7i64, 42, 1, -1, 0, 99_999, i64::MAX, i64::MIN] {
+            let probe = mk_record(&schema, vec![Value::Integer(present_key), Value::Null]);
+            let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
+            let matches: Vec<_> = table.probe(&probe_keys).collect();
+            for candidate in &matches {
+                let tag = candidate.record.resolve("tag");
+                assert_ne!(
+                    tag,
+                    Some(&Value::String("null-build".into())),
+                    "probe key {present_key} surfaced the NULL-keyed build record"
+                );
+                assert_ne!(
+                    candidate.record.resolve("k"),
+                    Some(&Value::Null),
+                    "probe key {present_key} surfaced a build record whose key is NULL"
+                );
+            }
+            // Sanity: known-present keys still find their record.
+            if present_key == 7 {
+                assert_eq!(matches.len(), 1);
+                assert_eq!(
+                    matches[0].record.resolve("tag"),
+                    Some(&Value::String("seven".into()))
+                );
+            } else if present_key == 42 {
+                assert_eq!(matches.len(), 1);
+                assert_eq!(
+                    matches[0].record.resolve("tag"),
+                    Some(&Value::String("forty-two".into()))
+                );
+            } else {
+                assert!(
+                    matches.is_empty(),
+                    "missing key {present_key} must not match anything"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_combine_hash_table_hash_collision_equality_reject() {
         // Force multiple records into the same bucket by using extreme
         // cardinality. hashbrown's AHasher is keyed by a process-random
