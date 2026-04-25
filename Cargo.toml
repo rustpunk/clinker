@@ -55,7 +55,6 @@ fastrand = "2"
 quick-xml = "0.37"
 clinker-bench-support = { path = "crates/clinker-bench-support" }
 tempfile = "3"
-bincode = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 proptest = "1.11"
 

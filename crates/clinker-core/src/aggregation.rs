@@ -1214,13 +1214,16 @@ impl HashAggregator {
         Ok(())
     }
 
-    /// Spill the in-memory groups to disk as bincode + LZ4.
+    /// Spill the in-memory groups to disk as postcard + LZ4.
     ///
     /// 1. Drain `self.groups` into a Vec.
     /// 2. Encode sort keys and sort by memcmp bytes so the k-way merge
     ///    can walk entries in group-key order.
-    /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) via
-    ///    bincode into an LZ4 frame-compressed temp file.
+    /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) as a
+    ///    length-prefixed postcard record into an LZ4 frame-compressed
+    ///    temp file. Postcard is a compact binary format with no
+    ///    self-describing framing of its own; the explicit length prefix
+    ///    delimits records inside the LZ4 frame.
     /// 4. Push the resulting `AggSpillFile` onto `self.spill_files`.
     /// 5. Reset `value_heap_bytes = 0`.
     fn spill(&mut self) -> Result<(), HashAggError> {
@@ -1249,7 +1252,7 @@ impl HashAggregator {
         }
         prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // 3. Write sorted entries as bincode + LZ4.
+        // 3. Write sorted entries as postcard + LZ4.
         let mut writer = AggSpillWriter::new(self.spill_dir.as_deref())?;
         for (sort_key, idx) in prepared {
             let (key, state) = &drained[idx];
@@ -1491,7 +1494,7 @@ pub(crate) fn finalize_group_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Binary aggregation spill infrastructure (Phase 2: bincode + LZ4)
+// Binary aggregation spill infrastructure (postcard + LZ4)
 // ---------------------------------------------------------------------------
 
 /// Merge entry for the binary aggregation spill path. Ordered by
@@ -1519,7 +1522,7 @@ impl Ord for AggMergeEntry {
     }
 }
 
-/// Binary spill entry serialized to disk via bincode + LZ4.
+/// Binary spill entry serialized to disk via postcard + LZ4.
 #[derive(Serialize, Deserialize)]
 struct AggSpillEntry {
     sort_key: Vec<u8>,
@@ -1527,9 +1530,12 @@ struct AggSpillEntry {
     state: AggregatorGroupState,
 }
 
-/// Binary aggregation spill writer. Writes `AggSpillEntry` via bincode
-/// into an LZ4 frame-compressed temp file. No schema header — the
-/// caller knows the group-by layout at construction time.
+/// Binary aggregation spill writer. Writes `AggSpillEntry` records as
+/// length-prefixed postcard payloads into an LZ4 frame-compressed temp
+/// file. Postcard has no record-level framing of its own, so each entry
+/// is preceded by a 4-byte little-endian u32 holding the encoded
+/// payload length. No schema header — the caller knows the group-by
+/// layout at construction time.
 struct AggSpillWriter {
     encoder: lz4_flex::frame::FrameEncoder<std::io::BufWriter<tempfile::NamedTempFile>>,
 }
@@ -1548,8 +1554,17 @@ impl AggSpillWriter {
     }
 
     fn write_entry(&mut self, entry: &AggSpillEntry) -> Result<(), HashAggError> {
-        bincode::serialize_into(&mut self.encoder, entry)
-            .map_err(|e| HashAggError::Spill(e.to_string()))
+        use std::io::Write;
+        let bytes = postcard::to_stdvec(entry).map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| HashAggError::Spill("spill entry exceeds 4 GiB".to_string()))?;
+        self.encoder
+            .write_all(&len.to_le_bytes())
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        self.encoder
+            .write_all(&bytes)
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        Ok(())
     }
 
     fn finish(self) -> Result<AggSpillFile, HashAggError> {
@@ -1576,34 +1591,43 @@ impl AggSpillFile {
             std::fs::File::open(&self.path).map_err(|e| HashAggError::Spill(e.to_string()))?;
         let decoder = lz4_flex::frame::FrameDecoder::new(file);
         let buf_reader = std::io::BufReader::new(decoder);
-        Ok(AggSpillReader { reader: buf_reader })
+        Ok(AggSpillReader {
+            reader: buf_reader,
+            len_buf: [0u8; 4],
+        })
     }
 }
 
-/// Binary aggregation spill reader. Yields `AggMergeEntry` via bincode
-/// deserialization from an LZ4 frame-compressed file.
+/// Binary aggregation spill reader. Yields `AggMergeEntry` by reading a
+/// 4-byte little-endian length prefix followed by a postcard-encoded
+/// payload from an LZ4 frame-compressed file. A clean-boundary EOF on
+/// the length prefix terminates the stream cleanly; any other read or
+/// decode failure surfaces as `HashAggError::Spill`.
 struct AggSpillReader {
     reader: std::io::BufReader<lz4_flex::frame::FrameDecoder<std::fs::File>>,
+    len_buf: [u8; 4],
 }
 
 impl AggSpillReader {
     fn next_entry(&mut self) -> Result<Option<AggMergeEntry>, HashAggError> {
-        match bincode::deserialize_from::<_, AggSpillEntry>(&mut self.reader) {
-            Ok(entry) => Ok(Some(AggMergeEntry {
-                sort_key: entry.sort_key,
-                group_key: entry.group_key,
-                state: entry.state,
-            })),
-            Err(e) => {
-                // bincode returns an Io error with UnexpectedEof at end of stream.
-                if let bincode::ErrorKind::Io(ref io_err) = *e
-                    && io_err.kind() == std::io::ErrorKind::UnexpectedEof
-                {
-                    return Ok(None);
-                }
-                Err(HashAggError::Spill(e.to_string()))
-            }
+        use std::io::Read;
+        match self.reader.read_exact(&mut self.len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(HashAggError::Spill(e.to_string())),
         }
+        let len = u32::from_le_bytes(self.len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        self.reader
+            .read_exact(&mut buf)
+            .map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let entry: AggSpillEntry =
+            postcard::from_bytes(&buf).map_err(|e| HashAggError::Spill(e.to_string()))?;
+        Ok(Some(AggMergeEntry {
+            sort_key: entry.sort_key,
+            group_key: entry.group_key,
+            state: entry.state,
+        }))
     }
 }
 
