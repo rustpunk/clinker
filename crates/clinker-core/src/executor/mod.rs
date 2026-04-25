@@ -3733,18 +3733,23 @@ impl PipelineExecutor {
                     use crate::pipeline::grace_hash::{GraceHashExec, execute_combine_grace_hash};
                     use crate::pipeline::iejoin::{IEJoinExec, execute_combine_iejoin};
                     use crate::pipeline::memory::MemoryBudget;
+                    use crate::pipeline::sort_merge_join::{
+                        SortMergeExec, execute_combine_sort_merge,
+                    };
                     use crate::plan::combine::CombineStrategy;
 
                     // Strategy dispatch up front. HashBuildProbe stays
                     // inline below (the long-standing path);
                     // HashPartitionIEJoin and pure-range IEJoin route
                     // to the IEJoin executor; GraceHash routes to the
-                    // grace-hash executor; sort-merge, in-memory hash,
-                    // and the BNL fallback are not yet wired.
+                    // grace-hash executor; SortMerge routes to the
+                    // sort-merge executor; in-memory hash and the BNL
+                    // fallback are not yet wired.
                     enum Dispatch {
                         Inline,
                         IEJoin(Option<u8>),
                         Grace(u8),
+                        SortMerge,
                     }
                     let dispatch = match strategy {
                         CombineStrategy::HashBuildProbe => Dispatch::Inline,
@@ -3755,9 +3760,8 @@ impl PipelineExecutor {
                         CombineStrategy::GraceHash { partition_bits } => {
                             Dispatch::Grace(*partition_bits)
                         }
-                        CombineStrategy::InMemoryHash
-                        | CombineStrategy::SortMerge
-                        | CombineStrategy::BlockNestedLoop => {
+                        CombineStrategy::SortMerge => Dispatch::SortMerge,
+                        CombineStrategy::InMemoryHash | CombineStrategy::BlockNestedLoop => {
                             return Err(PipelineError::Internal {
                                 op: "combine",
                                 node: name.clone(),
@@ -4050,6 +4054,57 @@ impl PipelineExecutor {
                                 on_miss: *on_miss,
                                 partition_bits,
                                 ctx: &grace_ctx,
+                                budget: &mut budget,
+                            })?;
+                            let probe_records_out = output_records.len() as u64;
+                            collector
+                                .record(probe_timer.finish(probe_records_in, probe_records_out));
+                            node_buffers.insert(node_idx, output_records);
+                            continue;
+                        }
+                        Dispatch::SortMerge => {
+                            // SortMerge is selected by the planner only
+                            // for pure-range predicates whose inputs
+                            // already arrive sorted on the range key
+                            // prefix. The kernel's `presorted: true`
+                            // path skips Phase A external sort and walks
+                            // the inputs in place via the two-cursor
+                            // merge.
+                            let mut budget =
+                                MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
+                            let build_records: Vec<Record> =
+                                build_buf.into_iter().map(|(r, _)| r).collect();
+                            let build_records_in = build_records.len() as u64;
+                            let build_timer = stage_metrics::StageTimer::new(
+                                stage_metrics::StageName::CombineBuild { name: name.clone() },
+                            );
+                            let build_records_out = build_records.len() as u64;
+                            collector
+                                .record(build_timer.finish(build_records_in, build_records_out));
+                            let probe_records_in = driver_buf.len() as u64;
+                            let probe_timer = stage_metrics::StageTimer::new(
+                                stage_metrics::StageName::CombineProbe { name: name.clone() },
+                            );
+                            let body_typed = artifacts.typed.get(name);
+                            let combine_output_schema_arc = combine_output_schema.clone();
+                            let sm_ctx = EvalContext {
+                                stable: &stable,
+                                source_file: &source_file_arc,
+                                source_row: 0,
+                            };
+                            let output_records = execute_combine_sort_merge(SortMergeExec {
+                                name,
+                                build_qualifier: &build_qualifier,
+                                driver_records: driver_buf,
+                                build_records,
+                                decomposed,
+                                body_program: body_typed,
+                                resolver_mapping: &resolver_mapping,
+                                output_schema: combine_output_schema_arc.as_ref(),
+                                match_mode: *match_mode,
+                                on_miss: *on_miss,
+                                presorted: true,
+                                ctx: &sm_ctx,
                                 budget: &mut budget,
                             })?;
                             let probe_records_out = output_records.len() as u64;

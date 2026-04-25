@@ -654,12 +654,25 @@ pub fn select_combine_strategies(
                 partition_bits: compute_partition_bits(inputs),
             }
         } else if !has_equi && has_range {
-            // Pure-range predicate — emit W305 and select the
-            // IEJoin strategy. The pipeline runs correctly without
-            // an equality key; the warning surfaces the lack of
-            // hash partitioning so authors notice the perf cliff.
+            // Pure-range predicate. SortMerge is preferred when both
+            // inputs already arrive sorted on the range key prefix —
+            // the kernel skips Phase A external sort and walks the
+            // pre-sorted inputs in place, which is asymptotically
+            // cheaper than IEJoin's L1/L2/permutation construction
+            // for large pre-sorted workloads. SortMerge today only
+            // covers the single-inequality case; mixed-axis (`a.x <=
+            // b.y AND a.z >= b.w`) keeps routing to IEJoin.
+            let sort_merge_eligible = decomposed.ranges.len() == 1
+                && pure_range_inputs_presorted(plan, &name, &decomposed.ranges[0]);
+            // W305 still fires either way: pure-range without a hash
+            // partition key surfaces the perf cliff so authors notice
+            // even when SortMerge takes the in-place fast path.
             diags.push(combine_w305_pure_range(&name, span));
-            CombineStrategy::IEJoin
+            if sort_merge_eligible {
+                CombineStrategy::SortMerge
+            } else {
+                CombineStrategy::IEJoin
+            }
         } else if grace_hash_should_fire(inputs, memory_limit) {
             // Pure-equi predicate with an estimated build cardinality
             // large enough to risk overrunning the soft memory limit:
@@ -780,6 +793,105 @@ fn compute_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
     }
     let bits = (max_partitions as f64).log2().floor() as u8;
     bits.clamp(MIN_BITS, DEFAULT_BITS)
+}
+
+/// True when the combine's two inputs already arrive sorted on the
+/// range conjunct's per-side key — the precondition for the SortMerge
+/// kernel to skip Phase A external sort and walk the inputs in place.
+///
+/// Only simple `qualifier.field` operands qualify: an expression-shaped
+/// range axis (e.g. `lower(a.x) < b.y`) cannot be answered by upstream
+/// `sort_order`, since the sort declaration lives at the field level
+/// of the source, not the predicate level. Returns false for any
+/// expression-shaped operand on either side.
+fn pure_range_inputs_presorted(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+    combine_name: &str,
+    range: &RangeConjunct,
+) -> bool {
+    use crate::plan::execution::PlanNode;
+    use petgraph::Direction;
+
+    let Some(left_field) = simple_field_name(&range.left_expr) else {
+        return false;
+    };
+    let Some(right_field) = simple_field_name(&range.right_expr) else {
+        return false;
+    };
+
+    // Locate the combine node and its incoming neighbors.
+    let Some(combine_idx) = plan
+        .graph
+        .node_indices()
+        .find(|&i| plan.graph[i].name() == combine_name)
+    else {
+        return false;
+    };
+    let predecessors: Vec<petgraph::graph::NodeIndex> = plan
+        .graph
+        .neighbors_directed(combine_idx, Direction::Incoming)
+        .collect();
+
+    // Match each input qualifier to its predecessor by name. The
+    // qualifier is the per-input key the user wrote in the YAML
+    // `input:` block; the upstream's stored name is what
+    // `combine_inputs[qualifier].upstream_name` records. Walk the
+    // predecessors and check whichever one carries the field we need.
+    let covers = |upstream_idx: petgraph::graph::NodeIndex, field: &str| -> bool {
+        let Some(props) = plan.node_properties.get(&upstream_idx) else {
+            return false;
+        };
+        let Some(sort_order) = props.ordering.sort_order.as_ref() else {
+            return false;
+        };
+        sort_order.first().is_some_and(|sf| sf.field == field)
+    };
+
+    // For each side, find the predecessor whose name matches the
+    // qualifier's `upstream_name`. We don't have the full
+    // `combine_inputs` here — read upstream names off the
+    // `PlanNode::name()` of each predecessor and match against the
+    // range conjunct's qualifier strings. Combine inputs use
+    // `qualifier == upstream_name` for plain (non-chain) cases; chain
+    // steps fall through and return false (the qualifier is synthetic
+    // and the upstream is a synthetic chain step with no source
+    // sort_order). That's the correct conservative choice — chain
+    // intermediates do not preserve a sort_order anyway.
+    let left_input_str = range.left_input.as_ref();
+    let right_input_str = range.right_input.as_ref();
+    let mut left_covered = false;
+    let mut right_covered = false;
+    for &pred in &predecessors {
+        match &plan.graph[pred] {
+            PlanNode::Source { name, .. }
+            | PlanNode::Transform { name, .. }
+            | PlanNode::Sort { name, .. }
+            | PlanNode::Aggregation { name, .. }
+            | PlanNode::Merge { name, .. }
+            | PlanNode::Combine { name, .. }
+            | PlanNode::Composition { name, .. }
+            | PlanNode::Route { name, .. }
+            | PlanNode::Output { name, .. } => {
+                if name == left_input_str && covers(pred, &left_field) {
+                    left_covered = true;
+                }
+                if name == right_input_str && covers(pred, &right_field) {
+                    right_covered = true;
+                }
+            }
+        }
+    }
+    left_covered && right_covered
+}
+
+/// Extract a bare field name from a simple `qualifier.field` reference,
+/// or `None` for any other expression shape (literal, function call,
+/// arithmetic, etc.).
+fn simple_field_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } if parts.len() == 2 => Some(parts[1].to_string()),
+        _ => None,
+    }
 }
 
 /// E313 — combine `where:` predicate has no extractable equality OR

@@ -3734,6 +3734,58 @@ nodes:
         );
     }
 
+    /// SortMerge end-to-end: a pure-range combine on pre-sorted inputs
+    /// runs through the SortMerge executor and produces the same
+    /// matches a hand-computed cross-product would. With `products`
+    /// sorted on `price` and `brackets` sorted on `max`, the planner
+    /// selects [`CombineStrategy::SortMerge`] and the kernel walks the
+    /// inputs in place via the two-cursor merge.
+    ///
+    /// Predicate: `product.price < bracket.max`, `match: first`.
+    /// - P1 (10) → first matching bracket where 10 < max: B25 (max=25).
+    /// - P2 (20) → B25 (20 < 25).
+    /// - P3 (30) → B40 (30 < 40).
+    /// - P4 (42) → B100 (42 < 100).
+    #[test]
+    fn test_sort_merge_price_range_exec_correct() {
+        let yaml = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/combine/sort_merge_price_range.yaml"),
+        )
+        .expect("must read sort_merge_price_range fixture");
+        let products = "sku,price\nP1,10\nP2,20\nP3,30\nP4,42\n";
+        let brackets = "bracket_id,max,rate\nB25,25,0.10\nB40,40,0.20\nB100,100,0.30\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[("products", products), ("brackets", brackets)],
+            Some("products"),
+        )
+        .expect("sort-merge fixture must run end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            4,
+            "4 products, each with one matching bracket; got: {canon}"
+        );
+        assert!(
+            canon.contains("P1,10,B25,0.1"),
+            "P1 (price=10) → B25 (max=25); got: {canon}"
+        );
+        assert!(
+            canon.contains("P2,20,B25,0.1"),
+            "P2 (price=20) → B25 (max=25); got: {canon}"
+        );
+        assert!(
+            canon.contains("P3,30,B40,0.2"),
+            "P3 (price=30) → B40 (max=40); got: {canon}"
+        );
+        assert!(
+            canon.contains("P4,42,B100,0.3"),
+            "P4 (price=42) → B100 (max=100); got: {canon}"
+        );
+    }
+
     /// Strategy-selection: an estimated build cardinality whose product
     /// with the per-record byte estimate clears the default soft-limit
     /// must yield `CombineStrategy::GraceHash` instead of
