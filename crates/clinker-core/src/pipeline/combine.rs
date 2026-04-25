@@ -1659,6 +1659,70 @@ mod tests {
     }
 
     #[test]
+    fn test_combine_hash_table_memory_overhead_bench() {
+        // Bench-scale companion to the _ratio test: holds the < 1.1×
+        // overhead target steady when both record count and record width
+        // grow an order of magnitude. The smaller test runs at 1 K rows
+        // × 10 fields and demonstrates the algorithm's overhead on a
+        // typical row; this one runs at 10 K rows × 12 fields with
+        // ~150-byte string payloads (≈1.8 KB per record, ~18 MB live)
+        // so a regression that scales overhead super-linearly with
+        // record count or with payload width — for instance one that
+        // misaccounts the keys_cache or chain growth — surfaces here
+        // even when the smaller test still passes.
+        const N_RECORDS: usize = 10_000;
+        const N_FIELDS: usize = 12;
+        const PAYLOAD_BYTES: usize = 150;
+        let cols: Vec<String> = (0..N_FIELDS).map(|i| format!("c{i}")).collect();
+        let col_refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        let schema = test_schema(&col_refs);
+
+        let filler: String = "z".repeat(PAYLOAD_BYTES);
+        let records: Vec<Record> = (0..N_RECORDS)
+            .map(|i| {
+                let mut vals: Vec<Value> = (0..N_FIELDS)
+                    .map(|_| Value::String(filler.clone().into()))
+                    .collect();
+                vals[0] = Value::String(format!("key_{i:08}").into());
+                mk_record(&schema, vals)
+            })
+            .collect();
+
+        let (typed, expr) = compile_key(
+            "emit k = c0",
+            &col_refs,
+            &col_refs
+                .iter()
+                .map(|n| (*n, cxl::typecheck::Type::String))
+                .collect::<Vec<_>>(),
+        );
+        let extractor = KeyExtractor::new(vec![(typed, expr)]);
+
+        let raw_baseline: usize = records
+            .iter()
+            .map(Record::estimated_heap_size)
+            .sum::<usize>()
+            + records.len() * std::mem::size_of::<Record>();
+
+        let stable = test_ctx();
+        let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
+        let mut budget = test_budget(1024 * 1024 * 1024);
+        let table =
+            CombineHashTable::build(records, &extractor, &ctx, &mut budget, Some(N_RECORDS))
+                .unwrap();
+
+        let total = table.memory_bytes();
+        let ratio = total as f64 / raw_baseline as f64;
+        assert!(
+            ratio < 1.1,
+            "bench-scale overhead ratio {ratio:.3} exceeds 1.1× target for \
+             {N_RECORDS}-row × {N_FIELDS}-field × {PAYLOAD_BYTES}-byte payload \
+             (total={total}, raw_baseline={raw_baseline}, overhead={})",
+            total.saturating_sub(raw_baseline)
+        );
+    }
+
+    #[test]
     fn test_combine_hash_table_oom_aborts_during_build() {
         // With a 1-byte budget, the process RSS trivially exceeds the
         // hard limit — `should_abort()` returns true on the first poll.
