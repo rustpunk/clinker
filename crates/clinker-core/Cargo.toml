@@ -92,3 +92,7 @@ harness = false
 name = "combine"
 harness = false
 
+[[bench]]
+name = "combine_iejoin"
+harness = false
+

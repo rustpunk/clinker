@@ -1221,4 +1221,82 @@ mod tests {
             prop_assert_eq!(actual, expected);
         }
     }
+
+    /// Locks `iejoin_numeric` against a nested-loop oracle at the 1K × 1K
+    /// scale used by `combine_iejoin.rs`'s correctness gate. The proptest
+    /// above runs against random inputs up to 50 × 50; this test pins the
+    /// tax-bracket-shaped workload (`>=` lo and `<` hi) at a thousand rows
+    /// per side so a regression in the larger-array code path — coarse
+    /// filter striding, permutation indexing — surfaces in CI even though
+    /// the bench harness itself is not part of `cargo test --workspace`.
+    #[test]
+    fn test_iejoin_against_nested_loop_at_scale_1k() {
+        // 50 brackets tiling [0, 100_000) on the lo axis with hi = lo +
+        // step; 1000 employees with incomes spread uniformly across the
+        // covered range. `iejoin_numeric` does NOT see the entity_id
+        // equality — the executor applies that as a partition key before
+        // calling this kernel — so this test models a single equality
+        // partition with 1000 drivers × 50 builds. The remaining 950
+        // builds + drivers (to reach 1K × 1K) come from a second
+        // partition modelled by appending another tile sequence with a
+        // disjoint income range, exercising the same kernel on a wider
+        // input.
+        const SPAN: i64 = 100_000;
+        let n_brackets_per_tile = 50usize;
+        let n_employees_per_tile = 500usize;
+        let step = SPAN / n_brackets_per_tile as i64;
+
+        let mut left: Vec<(i64, i64)> = Vec::with_capacity(2 * n_employees_per_tile);
+        let mut right: Vec<(i64, i64)> = Vec::with_capacity(2 * n_brackets_per_tile);
+        for tile in 0usize..2 {
+            let base = tile as i64 * SPAN;
+            for b in 0..n_brackets_per_tile {
+                let lo = base + b as i64 * step;
+                let hi = lo + step;
+                // For driver.income >= build.bracket_lo AND driver.income
+                // < build.bracket_hi we need build.0 = bracket_lo (Le
+                // when flipped to driver-first) and build.1 = bracket_hi
+                // (Gt when flipped). The kernel sees the predicate as
+                // `left OP right` so the build is on the right; we pass
+                // (bracket_lo, bracket_hi) as the right tuple.
+                right.push((lo, hi));
+            }
+            for e in 0..n_employees_per_tile {
+                // Mix per-row so income lands on different bracket
+                // boundaries than a strict modulo would produce.
+                let mix =
+                    ((tile * n_employees_per_tile + e) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let income = base + (mix as i64).rem_euclid(SPAN);
+                left.push((income, income));
+            }
+        }
+
+        // Predicate driver.income >= build.bracket_lo AND driver.income
+        // < build.bracket_hi. With the kernel's `left OP right`
+        // convention, axis-1 is `Ge` (driver_income >= bracket_lo) and
+        // axis-2 is `Lt` (driver_income < bracket_hi).
+        let actual: HashSet<(usize, usize)> =
+            iejoin_numeric(&left, &right, RangeOp::Ge, RangeOp::Lt)
+                .into_iter()
+                .collect();
+
+        // Oracle: same predicate via direct nested loop on the same
+        // (i64, i64) keys.
+        let mut expected: HashSet<(usize, usize)> = HashSet::new();
+        for (li, l) in left.iter().enumerate() {
+            for (ri, r) in right.iter().enumerate() {
+                if l.0 >= r.0 && l.1 < r.1 {
+                    expected.insert((li, ri));
+                }
+            }
+        }
+        assert_eq!(
+            actual,
+            expected,
+            "1K-scale tax-bracket workload diverged: iejoin {} pairs, \
+             nested-loop {} pairs",
+            actual.len(),
+            expected.len()
+        );
+    }
 }
