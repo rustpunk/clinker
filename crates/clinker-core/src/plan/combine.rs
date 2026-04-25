@@ -673,10 +673,21 @@ pub fn select_combine_strategies(
             } else {
                 CombineStrategy::IEJoin
             }
-        } else if grace_hash_should_fire(inputs, memory_limit) {
-            // Pure-equi predicate with an estimated build cardinality
-            // large enough to risk overrunning the soft memory limit:
-            // route through the disk-spilling grace hash strategy.
+        } else if grace_hash_should_fire(inputs, memory_limit)
+            || matches!(
+                artifacts.combine_strategy_hints.get(&name),
+                Some(crate::config::CombineStrategyHint::GraceHash)
+            )
+        {
+            // Pure-equi predicate with either:
+            //   - an estimated build cardinality large enough to risk
+            //     overrunning the soft memory limit (planner-driven), or
+            //   - a user-supplied `strategy: grace_hash` override.
+            // Both routes pick the disk-spilling grace hash strategy.
+            // Cardinality may be unknown under the user override path,
+            // in which case `compute_grace_partition_bits` falls back to
+            // its `MIN_BITS` floor — the executor still partitions the
+            // build correctly, it just splits into fewer buckets.
             CombineStrategy::GraceHash {
                 partition_bits: compute_grace_partition_bits(inputs),
             }
@@ -1842,6 +1853,21 @@ pub(crate) fn decompose_nary_combines(
             artifacts
                 .combine_resolved_columns
                 .insert(step.name.clone(), Arc::new(step_resolved_maps[i].clone()));
+
+            // Propagate the user's strategy hint to every chain step.
+            // The hint applies to the join semantics (pure-equi grace
+            // hash), and a left-deep chain of pure-equi joins routes
+            // every step through the same strategy when the user asked
+            // for it.
+            if let Some(hint) = artifacts
+                .combine_strategy_hints
+                .get(&original_name)
+                .copied()
+            {
+                artifacts
+                    .combine_strategy_hints
+                    .insert(step.name.clone(), hint);
+            }
         }
 
         // The final step inherits the original combine's body typed
@@ -1861,6 +1887,7 @@ pub(crate) fn decompose_nary_combines(
         artifacts.combine_inputs.remove(&original_name);
         artifacts.combine_predicates.remove(&original_name);
         artifacts.combine_driving.remove(&original_name);
+        artifacts.combine_strategy_hints.remove(&original_name);
     }
 }
 

@@ -750,6 +750,30 @@ pub struct AggregateConfig {
     pub strategy: AggregateStrategyHint,
 }
 
+/// User-supplied hint for combine execution strategy.
+///
+/// `Auto` (default) lets [`crate::plan::combine::select_combine_strategies`]
+/// pick from predicate shape and cardinality estimates. `GraceHash` is a
+/// user override that forces the disk-spilling partitioned hash join even
+/// when cardinality estimates are absent or below the soft-limit threshold
+/// — useful for benchmarks and for production pipelines where the user
+/// knows the build side does not fit in memory.
+///
+/// Mirrors [`AggregateStrategyHint`] in shape. `GraceHash` only applies to
+/// pure-equi predicates; the planner ignores the hint on mixed equi+range
+/// or pure-range nodes, where partition-IEJoin / IEJoin / SortMerge remain
+/// the correct strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CombineStrategyHint {
+    /// Optimizer picks the strategy (default).
+    #[default]
+    Auto,
+    /// Force grace hash join — disk-spilling partitioned hash. Applies
+    /// only to pure-equi predicates; ignored otherwise.
+    GraceHash,
+}
+
 /// A declarative validation attached to a transform.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -798,6 +798,14 @@ pub struct CombineBody {
     /// in [`CombineHeader::input`] is used (IndexMap iteration order).
     #[serde(default)]
     pub drive: Option<String>,
+    /// User-supplied execution strategy hint. Defaults to `Auto`.
+    /// Resolved by the `select_combine_strategies` post-pass against
+    /// predicate shape; an explicit hint that conflicts with the
+    /// predicate (e.g. `grace_hash` on a pure-range predicate) is
+    /// silently ignored — the planner picks the predicate-correct
+    /// strategy instead. Mirrors `AggregateConfig::strategy`.
+    #[serde(default)]
+    pub strategy: crate::config::CombineStrategyHint,
 }
 
 /// Output variant body. Wraps the existing sink config.
@@ -1373,6 +1381,7 @@ nodes:
             on_miss: OnMiss::NullFields,
             cxl: CxlSource::unspanned("emit id = a.id"),
             drive: None,
+            strategy: crate::config::CombineStrategyHint::Auto,
         };
         let node = PipelineNode::Combine {
             header,

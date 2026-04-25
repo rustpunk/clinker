@@ -1,16 +1,5 @@
 //! Benchmarks for the Combine node.
 //!
-//! Five criterion functions cover the performance targets from the
-//! combine spec:
-//!
-//! | Bench                          | Strategy under measurement       |
-//! |--------------------------------|----------------------------------|
-//! | `bench_combine_equi_2input`    | end-to-end equi-join executor    |
-//! | `bench_combine_iejoin`         | range/theta (IE-join)            |
-//! | `bench_combine_nary_3input`    | N-ary cascade                    |
-//! | `bench_predicate_decomposition`| where-predicate decomposition    |
-//! | `bench_combine_grace_hash`     | Grace hash partitioning + spill  |
-//!
 //! `bench_combine_equi_2input` drives the full executor path
 //! (CombineHashTable build + probe + CombineResolver + body eval +
 //! output emit) over `CombineDataGen`-produced inputs at three sizes.
@@ -19,10 +8,17 @@
 //! baseline (same row counts, same overlap ratio, same column width)
 //! and is the regression gate against the prior lookup path.
 //!
-//! The four IE/N-ary/decomposition/grace functions remain scaffolds
-//! awaiting their executor strategies — each spins up a
-//! `CombineDataGen` so the bench touches the real data-generation
-//! path, then `black_box`'s the generated rows.
+//! `bench_predicate_decomposition` is a still-empty scaffold awaiting
+//! a real workload — predicate decomposition is exercised end-to-end
+//! by the equi/iejoin/grace-hash benches today.
+//!
+//! Strategy-dedicated benches live in their own files:
+//!
+//! | File                          | Strategy under measurement      |
+//! |-------------------------------|---------------------------------|
+//! | `combine_iejoin.rs`           | range/theta IE-join             |
+//! | `combine_nary_3input.rs`      | N-ary chain decomposition       |
+//! | `combine_grace_hash.rs`       | grace hash partitioning + spill |
 
 use clinker_bench_support::CombineDataGen;
 use clinker_core::config::parse_config;
@@ -198,100 +194,16 @@ fn bench_combine_equi_2input(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_combine_iejoin(c: &mut Criterion) {
-    // C.3 fills this in with the IE-join (range + theta) strategy.
-    let mut group = c.benchmark_group("combine_iejoin");
-    let data_gen = CombineDataGen {
-        build_rows: 10_000,
-        probe_rows: 100_000,
-        overlap_ratio: 0.5,
-        key_cardinality: 1_000,
-        extra_columns: 2,
-    };
-    let build_rows = data_gen.build_records();
-    let probe_rows = data_gen.probe_records();
-    group.throughput(Throughput::Elements(100_000));
-    group.bench_function("medium", |b| {
-        b.iter(|| {
-            // C.3 fills in.
-            black_box(&build_rows);
-            black_box(&probe_rows);
-        });
-    });
-    group.finish();
-}
-
-fn bench_combine_nary_3input(c: &mut Criterion) {
-    // C.4 fills this in with the N-ary cascade executor.
-    let mut group = c.benchmark_group("combine_nary_3input");
-    // Three correlated sets: build × mid × probe.
-    let build = CombineDataGen {
-        build_rows: 1_000,
-        probe_rows: 0,
-        overlap_ratio: 0.0,
-        key_cardinality: 1_000,
-        extra_columns: 1,
-    }
-    .build_records();
-    let mid = CombineDataGen {
-        build_rows: 10_000,
-        probe_rows: 0,
-        overlap_ratio: 0.0,
-        key_cardinality: 1_000,
-        extra_columns: 1,
-    }
-    .build_records();
-    let probe = CombineDataGen {
-        build_rows: 100_000,
-        probe_rows: 0,
-        overlap_ratio: 0.0,
-        key_cardinality: 1_000,
-        extra_columns: 1,
-    }
-    .build_records();
-    group.throughput(Throughput::Elements(100_000));
-    group.bench_function("1k_10k_100k", |b| {
-        b.iter(|| {
-            // C.4 fills in.
-            black_box(&build);
-            black_box(&mid);
-            black_box(&probe);
-        });
-    });
-    group.finish();
-}
-
 fn bench_predicate_decomposition(c: &mut Criterion) {
-    // C.1 fills this in — decomposition of the where-predicate into
-    // equality / range / residual conjuncts.
+    // Placeholder — predicate decomposition runs as a side effect of
+    // `bench_combine_equi_2input` and the strategy-dedicated benches,
+    // so this bench has no separate assertions today. Kept as an
+    // explicit anchor so a future micro-benchmark of the
+    // decompose-only path lands here without churning `criterion_group!`.
     let mut group = c.benchmark_group("predicate_decomposition");
     group.bench_function("scaffold", |b| {
         b.iter(|| {
-            // C.1 fills in: parse a CXL predicate, call decompose(), assert
-            // the number of equality/range/residual conjuncts.
             black_box(());
-        });
-    });
-    group.finish();
-}
-
-fn bench_combine_grace_hash(c: &mut Criterion) {
-    // C.4 fills this in — Grace hash partitioning with disk spill.
-    let mut group = c.benchmark_group("combine_grace_hash");
-    let data_gen = CombineDataGen {
-        build_rows: 1_000_000,
-        probe_rows: 0,
-        overlap_ratio: 0.0,
-        key_cardinality: 1_000_000,
-        extra_columns: 4,
-    };
-    let build_rows = data_gen.build_records();
-    group.throughput(Throughput::Elements(1_000_000));
-    group.bench_function("1m_build", |b| {
-        b.iter(|| {
-            // C.4 fills in: force spill threshold low, run partitioned build,
-            // probe with 100K, measure end-to-end time.
-            black_box(&build_rows);
         });
     });
     group.finish();
@@ -300,9 +212,6 @@ fn bench_combine_grace_hash(c: &mut Criterion) {
 criterion_group!(
     combine_benches,
     bench_combine_equi_2input,
-    bench_combine_iejoin,
-    bench_combine_nary_3input,
     bench_predicate_decomposition,
-    bench_combine_grace_hash,
 );
 criterion_main!(combine_benches);

@@ -34,52 +34,62 @@ mod tests {
         // the signal is "this test ran", not any runtime assertion.
     }
 
-    /// Gate test for C.0.5.1: `benches/combine.rs` exists, is non-empty,
-    /// and defines all 6 scaffold functions named in the phase plan.
+    /// Bench file layout gate. The Combine performance suite is split
+    /// across one shared file (`combine.rs` — equi 2-input regression
+    /// gate plus the predicate-decomposition placeholder) and three
+    /// strategy-dedicated files (`combine_iejoin.rs`,
+    /// `combine_nary_3input.rs`, `combine_grace_hash.rs`).
     ///
-    /// Criterion benches are not discovered by `cargo test`, so this is
-    /// the only in-`cargo test` signal that the bench file is authored
+    /// Criterion benches are not discovered by `cargo test`, so this
+    /// is the only in-`cargo test` signal that every bench is wired
     /// correctly. Compile-time verification is covered separately by
     /// `cargo check --benches --workspace` in the pre-commit checklist.
     #[test]
     fn test_bench_combine_scaffold_compiles() {
-        let bench_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/combine.rs");
-        assert!(
-            bench_path.exists(),
-            "missing bench file: {}",
-            bench_path.display()
-        );
-        let source = std::fs::read_to_string(&bench_path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", bench_path.display()));
-        assert!(!source.is_empty(), "empty bench file");
+        let bench_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches");
 
-        // Five executor-strategy benches. `bench_combine_equi_2input`
-        // doubles as the regression gate against the preserved
-        // `target/criterion/lookup_baseline/10k_x_100k/lookup-v1`
-        // saved Criterion baseline.
-        for func in [
-            "fn bench_combine_equi_2input",
-            "fn bench_combine_iejoin",
-            "fn bench_combine_nary_3input",
-            "fn bench_predicate_decomposition",
-            "fn bench_combine_grace_hash",
-        ] {
+        // (file, required-function-substrings) — every entry is a
+        // separate Criterion harness with its own `criterion_main!`.
+        let files: &[(&str, &[&str])] = &[
+            (
+                "combine.rs",
+                &[
+                    "fn bench_combine_equi_2input",
+                    "fn bench_predicate_decomposition",
+                ],
+            ),
+            (
+                "combine_iejoin.rs",
+                &[
+                    "fn bench_combine_iejoin",
+                    "fn bench_combine_iejoin_nested_loop",
+                ],
+            ),
+            ("combine_nary_3input.rs", &["fn bench_combine_nary_3input"]),
+            ("combine_grace_hash.rs", &["fn bench_combine_grace_hash"]),
+        ];
+
+        for (filename, required_fns) in files {
+            let path = bench_dir.join(filename);
+            assert!(path.exists(), "missing bench file: {}", path.display());
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            assert!(!source.is_empty(), "empty bench file: {filename}");
+            for func in *required_fns {
+                assert!(
+                    source.contains(func),
+                    "benches/{filename} missing required fn: {func}"
+                );
+            }
             assert!(
-                source.contains(func),
-                "benches/combine.rs missing required fn: {func}"
+                source.contains("criterion_group!"),
+                "benches/{filename} missing criterion_group! macro"
+            );
+            assert!(
+                source.contains("criterion_main!"),
+                "benches/{filename} missing criterion_main! macro"
             );
         }
-
-        // `criterion_group!` wires every bench function into the suite.
-        assert!(
-            source.contains("criterion_group!"),
-            "benches/combine.rs missing criterion_group! macro"
-        );
-        assert!(
-            source.contains("criterion_main!"),
-            "benches/combine.rs missing criterion_main! macro"
-        );
     }
 
     /// Verifies all 10 fixture YAML files exist and are readable.
@@ -3910,6 +3920,251 @@ nodes:
             );
         } else {
             panic!("combine_idx no longer points to a Combine node");
+        }
+    }
+
+    // --- Bench correctness regression guards -----------------------------
+    //
+    // The two performance-gated benches (`combine_nary_3input.rs`,
+    // `combine_grace_hash.rs`) include inline correctness checks at
+    // small scale before measurement begins. Those gates run at
+    // `cargo bench` time, not `cargo test`. The two tests below
+    // mirror those checks at a smaller scale that fits inside a
+    // `cargo test` budget so a regression in the underlying executor
+    // strategy is caught even when CI does not run benches.
+
+    /// CI-visible mirror of the `combine_nary_3input` correctness gate.
+    /// Runs a 3-input chained equi-join at 100 × 100 × 100 with 10
+    /// equality groups (~10 rows per group per input) and asserts the
+    /// emitted row count matches the closed-form `groups *
+    /// rows_per_group^3`. A regression where the chain decomposition
+    /// drops or duplicates rows would surface here long before the
+    /// bench's perf gate at full scale flags it.
+    #[test]
+    fn test_nary_three_input_correctness_at_scale() {
+        use clinker_bench_support::CombineDataGen;
+
+        const ROWS_PER_INPUT: usize = 100;
+        const GROUPS: usize = 10;
+
+        let mk = |rows: usize, card: usize| -> String {
+            let workload = CombineDataGen {
+                build_rows: rows,
+                probe_rows: 0,
+                overlap_ratio: 0.0,
+                key_cardinality: card,
+                extra_columns: 1,
+            };
+            String::from_utf8(workload.build_csv()).expect("CombineDataGen emits utf8 CSV")
+        };
+        let a_csv = mk(ROWS_PER_INPUT, GROUPS);
+        let b_csv = mk(ROWS_PER_INPUT, GROUPS);
+        let c_csv = mk(ROWS_PER_INPUT, GROUPS);
+
+        let yaml = r#"
+pipeline:
+  name: test_nary_three_input_correctness
+nodes:
+- type: source
+  name: a
+  config:
+    name: a
+    type: csv
+    path: a.csv
+    options:
+      has_header: true
+    schema:
+      - { name: key, type: int }
+      - { name: c0, type: string }
+- type: source
+  name: b
+  config:
+    name: b
+    type: csv
+    path: b.csv
+    options:
+      has_header: true
+    schema:
+      - { name: key, type: int }
+      - { name: c0, type: string }
+- type: source
+  name: c
+  config:
+    name: c
+    type: csv
+    path: c.csv
+    options:
+      has_header: true
+    schema:
+      - { name: key, type: int }
+      - { name: c0, type: string }
+- type: combine
+  name: joined3
+  input:
+    a: a
+    b: b
+    c: c
+  config:
+    where: "a.key == b.key and b.key == c.key"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit key = a.key
+      emit a_c0 = a.c0
+      emit b_c0 = b.c0
+      emit c_c0 = c.c0
+- type: output
+  name: out
+  input: joined3
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+        let result = run_combine_fixture(
+            yaml,
+            &[("a", &a_csv), ("b", &b_csv), ("c", &c_csv)],
+            Some("a"),
+        )
+        .expect("3-input chain pipeline must execute");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+
+        let rows_per_group = ROWS_PER_INPUT / GROUPS;
+        let expected = rows_per_group.pow(3) * GROUPS;
+        assert_eq!(
+            data_rows, expected,
+            "3-input chain produced {data_rows} rows; expected {expected} \
+             ({GROUPS} groups × {rows_per_group}^3 per group)",
+        );
+    }
+
+    /// CI-visible mirror of the `combine_grace_hash` correctness gate.
+    /// Runs the same pure-equi combine through both `memory_limit: "1G"`
+    /// and `memory_limit: "16G"` at 1K × 10K and asserts the
+    /// canonicalized outputs are byte-identical. The small workload
+    /// here keeps process RSS under both soft limits so neither path
+    /// actually spills — the gate is (a) the strategy hint routes to
+    /// `CombineStrategy::GraceHash`, and (b) the two budgets produce
+    /// identical output row sets. The full bench at 100K × 1M scale is
+    /// what exercises the spill-vs-no-spill timing comparison.
+    #[test]
+    fn test_grace_hash_correctness_at_scale() {
+        use clinker_bench_support::CombineDataGen;
+
+        let workload = CombineDataGen {
+            build_rows: 1_000,
+            probe_rows: 10_000,
+            overlap_ratio: 0.95,
+            key_cardinality: 1_000,
+            extra_columns: 2,
+        };
+        let build_csv = String::from_utf8(workload.build_csv()).expect("CombineDataGen emits utf8");
+        let probe_csv = String::from_utf8(workload.probe_csv()).expect("CombineDataGen emits utf8");
+
+        let mk_yaml = |memory_limit: &str| -> String {
+            format!(
+                r#"
+pipeline:
+  name: test_grace_hash_correctness
+  memory_limit: "{memory_limit}"
+nodes:
+- type: source
+  name: build
+  config:
+    name: build
+    type: csv
+    path: build.csv
+    options:
+      has_header: true
+    schema:
+      - {{ name: key, type: int }}
+      - {{ name: c0, type: string }}
+      - {{ name: c1, type: string }}
+- type: source
+  name: probe
+  config:
+    name: probe
+    type: csv
+    path: probe.csv
+    options:
+      has_header: true
+    schema:
+      - {{ name: key, type: int }}
+      - {{ name: c0, type: string }}
+      - {{ name: c1, type: string }}
+- type: combine
+  name: joined
+  input:
+    probe: probe
+    build: build
+  config:
+    where: "probe.key == build.key"
+    match: first
+    on_miss: skip
+    strategy: grace_hash
+    cxl: |
+      emit key = probe.key
+      emit probe_c0 = probe.c0
+      emit build_c0 = build.c0
+- type: output
+  name: out
+  input: joined
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#,
+            )
+        };
+
+        let yaml_inmem = mk_yaml("16G");
+        let yaml_spill = mk_yaml("256M");
+        let inmem = run_combine_fixture(
+            &yaml_inmem,
+            &[("build", &build_csv), ("probe", &probe_csv)],
+            Some("probe"),
+        )
+        .expect("in-memory grace hash must run");
+        let spill = run_combine_fixture(
+            &yaml_spill,
+            &[("build", &build_csv), ("probe", &probe_csv)],
+            Some("probe"),
+        )
+        .expect("spilled grace hash must run");
+
+        let canon_inmem = canonicalize_csv(inmem.primary_output());
+        let canon_spill = canonicalize_csv(spill.primary_output());
+        assert_eq!(
+            canon_inmem, canon_spill,
+            "in-memory and spilled grace hash produced different output multisets",
+        );
+
+        // Also verify the strategy hint actually triggered grace hash
+        // selection — a regression where the planner falls back to
+        // HashBuildProbe would silently invalidate the bench's
+        // throughput comparison.
+        let cfg = clinker_core::yaml::from_str::<PipelineConfig>(&yaml_spill)
+            .expect("spill YAML must parse");
+        let plan = cfg
+            .compile(&clinker_core::config::CompileContext::default())
+            .expect("spill YAML must compile");
+        let combine_node = plan
+            .dag()
+            .graph
+            .node_indices()
+            .find(|i| matches!(plan.dag().graph[*i], PlanNode::Combine { .. }))
+            .expect("combine node must exist post-compile");
+        if let PlanNode::Combine { strategy, .. } = &plan.dag().graph[combine_node] {
+            assert!(
+                matches!(
+                    strategy,
+                    clinker_core::plan::combine::CombineStrategy::GraceHash { .. }
+                ),
+                "strategy: grace_hash hint must select CombineStrategy::GraceHash; got {strategy:?}",
+            );
+        } else {
+            panic!("combine node index no longer points at a Combine variant");
         }
     }
 }

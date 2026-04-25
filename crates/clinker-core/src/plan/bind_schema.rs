@@ -82,6 +82,14 @@ pub struct CompileArtifacts {
     /// selection (E306) are absent from this map and their post-pass
     /// entry is skipped.
     pub combine_driving: HashMap<String, String>,
+    /// User-supplied [`CombineStrategyHint`] per combine node, keyed by
+    /// node name. Populated from `CombineBody.strategy` during
+    /// `bind_combine`. The `select_combine_strategies` post-pass reads
+    /// this to override the planner's predicate-shape default — today
+    /// only `GraceHash` on pure-equi predicates produces a non-default
+    /// outcome. Combines absent from this map default to
+    /// [`CombineStrategyHint::Auto`].
+    pub combine_strategy_hints: HashMap<String, crate::config::CombineStrategyHint>,
     /// Per-combine pre-resolved column map produced by the CXL
     /// typechecker's combine-body walk. Key is the combine node's
     /// name; value is the `ResolvedColumnMap` shape expected by
@@ -1371,6 +1379,9 @@ fn bind_combine(
     artifacts
         .combine_inputs
         .insert(name.to_string(), combine_inputs_entries);
+    artifacts
+        .combine_strategy_hints
+        .insert(name.to_string(), config.strategy);
 
     let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
     let merged_row = Row::closed(merged_declared, cxl_span);
