@@ -21,7 +21,7 @@ pub use counters::PipelineCounters;
 pub use group_key::{GroupByKey, GroupKeyError, value_to_group_key};
 pub use minimal::MinimalRecord;
 pub use provenance::RecordProvenance;
-pub use record::Record;
+pub use record::{Record, RecordPayload};
 pub use record_view::RecordView;
 pub use resolver::{FieldResolver, HashMapResolver, WindowContext};
 pub use schema::{Schema, SchemaBuilder};

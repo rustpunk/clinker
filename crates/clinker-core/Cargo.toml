@@ -21,6 +21,7 @@ ahash = { workspace = true }
 hashbrown = "0.15"
 lz4_flex = "0.11"
 bincode = { workspace = true }
+postcard = { workspace = true }
 tempfile = "3"
 tracing = { workspace = true }
 miette = { workspace = true }

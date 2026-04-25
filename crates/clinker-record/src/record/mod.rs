@@ -2,6 +2,7 @@ use crate::resolver::FieldResolver;
 use crate::schema::Schema;
 use crate::value::Value;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Maximum number of metadata keys per record.
@@ -25,6 +26,53 @@ pub struct Record {
     /// Per-record metadata. Stripped from output unless `include_metadata` is set.
     /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
     metadata: Option<Box<IndexMap<Box<str>, Value>>>,
+}
+
+/// Wire payload for a [`Record`] in binary spill streams.
+///
+/// Schema is not embedded — the spill stream writes the schema once in
+/// a header line, so each record body carries only positional values and
+/// optional per-record metadata. Callers reconstruct a full `Record` via
+/// [`RecordPayload::into_record`].
+///
+/// Wire format (postcard): `(Vec<Value>, Option<Vec<(Box<str>, Value)>>)`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecordPayload {
+    /// Positional field values in schema column order.
+    pub values: Vec<Value>,
+    /// Per-record metadata entries, or `None` if the record has no metadata.
+    pub metadata: Option<Vec<(Box<str>, Value)>>,
+}
+
+impl RecordPayload {
+    /// Reconstruct a [`Record`] from this payload using a caller-supplied schema.
+    pub fn into_record(self, schema: Arc<Schema>) -> Record {
+        let mut record = Record::new(schema, self.values);
+        if let Some(meta_pairs) = self.metadata {
+            for (k, v) in meta_pairs {
+                // Metadata cap errors are ignored on deserialization — the cap
+                // is a write-time guard, not a wire-format invariant.
+                let _ = record.set_meta(&k, v);
+            }
+        }
+        record
+    }
+}
+
+impl Serialize for Record {
+    /// Serializes this record as a [`RecordPayload`] (values + metadata).
+    ///
+    /// The schema is not included in the wire output. Callers that need
+    /// schema information must write it separately (e.g., as a header line)
+    /// and supply it on deserialization via [`RecordPayload::into_record`].
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let meta = self.metadata_pairs();
+        RecordPayload {
+            values: self.values.clone(),
+            metadata: if meta.is_empty() { None } else { Some(meta) },
+        }
+        .serialize(serializer)
+    }
 }
 
 impl Record {
@@ -114,6 +162,18 @@ impl Record {
         self.metadata
             .iter()
             .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
+    }
+
+    /// Collect all metadata entries as owned `(Box<str>, Value)` pairs.
+    ///
+    /// Returns an empty `Vec` when the record has no metadata. Used by
+    /// [`crate::Record`]'s `Serialize` impl to produce a [`RecordPayload`]
+    /// for binary spill encoding.
+    pub fn metadata_pairs(&self) -> Vec<(Box<str>, Value)> {
+        match &self.metadata {
+            None => Vec::new(),
+            Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
     }
 
     // ── Fields ─────────────────────────────────────────────────────

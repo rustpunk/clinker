@@ -1,4 +1,4 @@
-//! Spill-to-disk infrastructure: LZ4-compressed NDJSON with schema header.
+//! Spill-to-disk infrastructure: LZ4-compressed record streams with a JSON schema header.
 //!
 //! `SpillWriter<P>` serializes (record, payload) pairs to a temp file;
 //! `SpillReader<P>` reads them back. Parameterized over per-record payload
@@ -13,11 +13,16 @@
 //! RFC and the KAFKA-9408 postmortem.
 //!
 //! File format:
-//!   Line 0: JSON array of column names (schema)
-//!   Line 1..N: JSON objects `{"r": {record obj}, "p": payload json}`
+//!   Line 0: JSON array of column names (schema header)
+//!   Line 1..N: postcard-encoded `(RecordPayload, P)` pairs, length-prefixed
+//!              as a 4-byte little-endian u32 before each record.
 //! Entire stream is LZ4 frame-compressed.
+//!
+//! The schema header stays as JSON because it is a tiny human-readable
+//! manifest written once per file. Record bodies use postcard for compact
+//! binary encoding of `Value`s and the per-record metadata map.
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,13 +31,14 @@ use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, RecordPayload, Schema};
 
 /// Error type for spill operations.
 #[derive(Debug)]
 pub enum SpillError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Postcard(postcard::Error),
     InvalidSchema(String),
 }
 
@@ -40,7 +46,8 @@ impl std::fmt::Display for SpillError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SpillError::Io(e) => write!(f, "spill I/O error: {e}"),
-            SpillError::Json(e) => write!(f, "spill JSON error: {e}"),
+            SpillError::Json(e) => write!(f, "spill JSON header error: {e}"),
+            SpillError::Postcard(e) => write!(f, "spill postcard error: {e}"),
             SpillError::InvalidSchema(msg) => write!(f, "spill schema error: {msg}"),
         }
     }
@@ -60,18 +67,23 @@ impl From<serde_json::Error> for SpillError {
     }
 }
 
+impl From<postcard::Error> for SpillError {
+    fn from(e: postcard::Error) -> Self {
+        SpillError::Postcard(e)
+    }
+}
+
 impl From<lz4_flex::frame::Error> for SpillError {
     fn from(e: lz4_flex::frame::Error) -> Self {
         SpillError::Io(std::io::Error::other(e.to_string()))
     }
 }
 
-/// Writes (record, payload) pairs to an LZ4-compressed NDJSON spill file.
+/// Writes (record, payload) pairs to an LZ4-compressed spill file.
 ///
-/// Records are manually serialized to JSON objects using schema columns +
-/// values + overflow fields. The payload `P` is serialized via serde and
-/// rides in the same line as `"p"`. Phase 8 source/output sort callsites
-/// use `P = ()` (serializes to `null`).
+/// The schema is written once as a JSON header line. Each subsequent
+/// record is written as a 4-byte little-endian length prefix followed
+/// by a postcard-encoded `(RecordPayload, P)` tuple.
 pub struct SpillWriter<P> {
     encoder: FrameEncoder<BufWriter<NamedTempFile>>,
     schema: Arc<Schema>,
@@ -91,7 +103,8 @@ impl<P: Serialize> SpillWriter<P> {
         let buf_writer = BufWriter::new(temp_file);
         let mut encoder = FrameEncoder::new(buf_writer);
 
-        // Write schema as first line: JSON array of column names
+        // Write schema as first line: JSON array of column names.
+        // Kept as JSON so the header is human-inspectable without a postcard decoder.
         let columns: Vec<&str> = schema.columns().iter().map(|c| &**c).collect();
         let schema_json = serde_json::to_string(&columns)?;
         encoder.write_all(schema_json.as_bytes())?;
@@ -104,26 +117,20 @@ impl<P: Serialize> SpillWriter<P> {
         })
     }
 
-    /// Serialize one (record, payload) pair as an NDJSON line.
-    /// Builds `{"r": {record_obj}, "p": payload_json}`.
+    /// Serialize one (record, payload) pair.
+    ///
+    /// Each pair is written as a 4-byte little-endian length prefix
+    /// followed by a postcard-encoded `(RecordPayload, P)` tuple.
     pub fn write_pair(&mut self, record: &Record, payload: &P) -> Result<(), SpillError> {
-        use serde_json::{Map, Value as JsonValue};
-
-        let mut record_obj = Map::with_capacity(record.field_count());
-        for (i, col) in self.schema.columns().iter().enumerate() {
-            let val = record.values().get(i).unwrap_or(&Value::Null);
-            record_obj.insert(col.to_string(), value_to_json(val));
-        }
-
-        let payload_json = serde_json::to_value(payload)?;
-        let mut envelope = Map::with_capacity(2);
-        envelope.insert("r".to_string(), JsonValue::Object(record_obj));
-        envelope.insert("p".to_string(), payload_json);
-
-        let line = serde_json::to_string(&JsonValue::Object(envelope))?;
-        self.encoder.write_all(line.as_bytes())?;
-        self.encoder.write_all(b"\n")?;
-
+        let meta = record.metadata_pairs();
+        let rec_payload = RecordPayload {
+            values: record.values().to_vec(),
+            metadata: if meta.is_empty() { None } else { Some(meta) },
+        };
+        let bytes = postcard::to_stdvec(&(&rec_payload, payload))?;
+        let len = bytes.len() as u32;
+        self.encoder.write_all(&len.to_le_bytes())?;
+        self.encoder.write_all(&bytes)?;
         Ok(())
     }
 
@@ -179,9 +186,9 @@ impl<P: DeserializeOwned> SpillFile<P> {
         }
 
         Ok(SpillReader {
-            lines: buf_reader,
+            reader: buf_reader,
             schema: Arc::clone(&self.schema),
-            line_buf: String::new(),
+            len_buf: [0u8; 4],
             _payload: PhantomData,
         })
     }
@@ -199,11 +206,11 @@ impl<P> SpillFile<P> {
     }
 }
 
-/// Reads (record, payload) pairs from an LZ4-compressed NDJSON spill file.
+/// Reads (record, payload) pairs from an LZ4-compressed spill file.
 pub struct SpillReader<P> {
-    lines: BufReader<FrameDecoder<std::fs::File>>,
+    reader: BufReader<FrameDecoder<std::fs::File>>,
     schema: Arc<Schema>,
-    line_buf: String,
+    len_buf: [u8; 4],
     _payload: PhantomData<P>,
 }
 
@@ -211,63 +218,27 @@ impl<P: DeserializeOwned> Iterator for SpillReader<P> {
     type Item = Result<(Record, P), SpillError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.line_buf.clear();
-        match self.lines.read_line(&mut self.line_buf) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                let line = self.line_buf.trim();
-                if line.is_empty() {
-                    return None;
-                }
-                Some(self.parse_pair(line))
-            }
-            Err(e) => Some(Err(SpillError::Io(e))),
+        // Read 4-byte length prefix
+        match self.reader.read_exact(&mut self.len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => return Some(Err(SpillError::Io(e))),
         }
+        let len = u32::from_le_bytes(self.len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        if let Err(e) = self.reader.read_exact(&mut buf) {
+            return Some(Err(SpillError::Io(e)));
+        }
+        Some(self.parse_pair(&buf))
     }
 }
 
 impl<P: DeserializeOwned> SpillReader<P> {
-    fn parse_pair(&self, line: &str) -> Result<(Record, P), SpillError> {
-        let envelope: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)?;
-
-        let record_json = envelope
-            .get("r")
-            .ok_or_else(|| SpillError::InvalidSchema("missing 'r' field in spill line".into()))?;
-        let payload_json = envelope
-            .get("p")
-            .ok_or_else(|| SpillError::InvalidSchema("missing 'p' field in spill line".into()))?;
-
-        let obj = record_json
-            .as_object()
-            .ok_or_else(|| SpillError::InvalidSchema("'r' field is not a JSON object".into()))?;
-
-        // Extract schema fields in order
-        let mut values = Vec::with_capacity(self.schema.column_count());
-        for col in self.schema.columns() {
-            let val = obj.get(&**col).map(json_to_value).unwrap_or(Value::Null);
-            values.push(val);
-        }
-
-        // Spill files are written with the operator's widened schema,
-        // so the JSON object's keys are exactly the schema columns.
-        let record = Record::new(Arc::clone(&self.schema), values);
-        let _ = obj;
-
-        let payload: P = serde_json::from_value(payload_json.clone())?;
+    fn parse_pair(&self, buf: &[u8]) -> Result<(Record, P), SpillError> {
+        let (rec_payload, payload): (RecordPayload, P) = postcard::from_bytes(buf)?;
+        let record = rec_payload.into_record(Arc::clone(&self.schema));
         Ok((record, payload))
     }
-}
-
-/// Convert a clinker Value to serde_json::Value for serialization.
-fn value_to_json(val: &Value) -> serde_json::Value {
-    // Value already implements Serialize, so we can use serde_json::to_value
-    serde_json::to_value(val).unwrap_or(serde_json::Value::Null)
-}
-
-/// Convert a serde_json::Value back to a clinker Value.
-fn json_to_value(json: &serde_json::Value) -> Value {
-    // Value implements Deserialize with custom logic
-    serde_json::from_value(json.clone()).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -393,11 +364,12 @@ mod tests {
         let schema = test_schema();
         let mut writer: SpillWriter<()> = SpillWriter::new(Arc::clone(&schema), None).unwrap();
 
-        // Write 1000 records of repetitive tabular data
+        // Write 1000 records; postcard binary is significantly more compact
+        // than NDJSON. Assert the spill file is under 50% of the equivalent
+        // raw NDJSON to confirm postcard + LZ4 are both contributing.
         let mut raw_ndjson_size = 0usize;
         for i in 0..1000 {
             let record = make_record(&schema, &format!("person_{i}"), i as i64 * 100, i % 2 == 0);
-            // Estimate raw NDJSON size
             raw_ndjson_size += format!(
                 r#"{{"name":"person_{}","amount":{},"active":{}}}"#,
                 i,
@@ -405,16 +377,17 @@ mod tests {
                 i % 2 == 0
             )
             .len()
-                + 1; // newline
+                + 1;
             writer.write_record(&record).unwrap();
         }
 
         let spill_file = writer.finish().unwrap();
         let spill_size = std::fs::metadata(spill_file.path()).unwrap().len() as usize;
 
+        // Postcard + LZ4 should be well under 50% of raw NDJSON
         assert!(
-            spill_size < (raw_ndjson_size * 80 / 100),
-            "Spill file ({spill_size} bytes) should be < 80% of raw NDJSON ({raw_ndjson_size} bytes)"
+            spill_size < (raw_ndjson_size / 2),
+            "Spill file ({spill_size} bytes) should be < 50% of raw NDJSON ({raw_ndjson_size} bytes)"
         );
     }
 
