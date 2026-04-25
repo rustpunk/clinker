@@ -1756,7 +1756,12 @@ impl PipelineConfig {
         // nodes). The pass mutates PlanNode::Combine in place,
         // replacing construction-time placeholders for `strategy` and
         // `driving_input`.
-        crate::plan::combine::select_combine_strategies(&mut dag, &artifacts, &mut diags);
+        crate::plan::combine::select_combine_strategies(
+            &mut dag,
+            &artifacts,
+            &mut diags,
+            self.pipeline.memory_limit.as_deref(),
+        );
 
         // If lowering accumulated any non-composition error-severity
         // diagnostics, return them. Composition binding errors

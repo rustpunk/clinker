@@ -591,6 +591,7 @@ pub fn select_combine_strategies(
     plan: &mut crate::plan::execution::ExecutionPlanDag,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
+    memory_limit: Option<&str>,
 ) {
     use crate::plan::execution::PlanNode;
     use petgraph::graph::NodeIndex;
@@ -659,6 +660,13 @@ pub fn select_combine_strategies(
             // hash partitioning so authors notice the perf cliff.
             diags.push(combine_w305_pure_range(&name, span));
             CombineStrategy::IEJoin
+        } else if grace_hash_should_fire(inputs, memory_limit) {
+            // Pure-equi predicate with an estimated build cardinality
+            // large enough to risk overrunning the soft memory limit:
+            // route through the disk-spilling grace hash strategy.
+            CombineStrategy::GraceHash {
+                partition_bits: compute_grace_partition_bits(inputs),
+            }
         } else {
             CombineStrategy::HashBuildProbe
         };
@@ -675,6 +683,68 @@ pub fn select_combine_strategies(
             *build_inputs = build;
         }
     }
+}
+
+/// True when the planner should emit `GraceHash` instead of
+/// `HashBuildProbe`. Fires when every input has an estimated
+/// cardinality AND the smaller side multiplied by a conservative
+/// per-record byte estimate would breach the configured 80% soft
+/// limit. The pipeline's `memory_limit:` YAML knob is what binds
+/// the threshold; absent that, we fall back to the same default
+/// `MemoryBudget::from_config(None)` uses.
+///
+/// When estimates are missing on either side, returns false — there
+/// is no signal to override the default in-memory hash strategy, and
+/// overspilling small joins is worse than the rare case of a missed
+/// grace dispatch.
+fn grace_hash_should_fire(
+    inputs: &IndexMap<String, CombineInput>,
+    memory_limit: Option<&str>,
+) -> bool {
+    use crate::pipeline::grace_hash::GRACE_RECORD_BYTES_ESTIMATE;
+    use crate::pipeline::memory::parse_memory_limit_bytes;
+    let estimates: Vec<u64> = inputs
+        .values()
+        .filter_map(|ci| ci.estimated_cardinality)
+        .collect();
+    if estimates.len() < inputs.len() {
+        return false;
+    }
+    let build_estimate = estimates.iter().copied().min().unwrap_or(0);
+    if build_estimate == 0 {
+        return false;
+    }
+    let limit = parse_memory_limit_bytes(memory_limit);
+    let soft_limit = limit / 100 * 80;
+    let estimated_bytes = build_estimate.saturating_mul(GRACE_RECORD_BYTES_ESTIMATE);
+    estimated_bytes >= soft_limit
+}
+
+/// Compute `partition_bits` for `GraceHash`. Targets ~256 records per
+/// partition under an unspilled build to keep per-partition hash table
+/// overhead amortized. Capped at 12 bits (4096 partitions) per the
+/// per-partition file overhead breakeven.
+fn compute_grace_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
+    const TARGET_PER_PARTITION: u64 = 256;
+    const MIN_BITS: u8 = 4; // 16 partitions floor
+    const MAX_BITS: u8 = 12; // 4096 partitions cap
+    let estimates: Vec<u64> = inputs
+        .values()
+        .filter_map(|ci| ci.estimated_cardinality)
+        .collect();
+    if estimates.len() < inputs.len() {
+        return MIN_BITS;
+    }
+    let build_estimate = estimates.iter().copied().min().unwrap_or(0);
+    if build_estimate == 0 {
+        return MIN_BITS;
+    }
+    let max_partitions = build_estimate / TARGET_PER_PARTITION;
+    if max_partitions <= 1 {
+        return MIN_BITS;
+    }
+    let bits = (max_partitions as f64).log2().ceil() as u8;
+    bits.clamp(MIN_BITS, MAX_BITS)
 }
 
 /// Compute `partition_bits` for `HashPartitionIEJoin`. Default is 8 (256
@@ -1946,7 +2016,7 @@ mod tests {
         let (mut plan, artifacts) =
             synthetic_combine_plan(vec![("orders", None), ("products", None)], 1, 0, true);
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         assert!(diags.is_empty(), "no diagnostics expected; got {diags:?}");
         if let crate::plan::execution::PlanNode::Combine {
             strategy,
@@ -1967,7 +2037,7 @@ mod tests {
         let (mut plan, artifacts) =
             synthetic_combine_plan(vec![("orders", None), ("products", None)], 0, 1, true);
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "W305");
         if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
@@ -1984,7 +2054,7 @@ mod tests {
         let (mut plan, artifacts) =
             synthetic_combine_plan(vec![("orders", None), ("products", None)], 0, 0, true);
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "E313");
     }
@@ -1996,7 +2066,7 @@ mod tests {
         let (mut plan, artifacts) =
             synthetic_combine_plan(vec![("orders", None), ("products", None)], 1, 1, true);
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         assert!(diags.is_empty(), "no diagnostics expected; got {diags:?}");
         if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
             match strategy {
@@ -2022,7 +2092,7 @@ mod tests {
             true,
         );
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
             match strategy {
                 CombineStrategy::HashPartitionIEJoin { partition_bits } => {
@@ -2045,7 +2115,7 @@ mod tests {
             true,
         );
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "W302");
         // Strategy still stamped — W302 is advisory.
@@ -2059,7 +2129,7 @@ mod tests {
         let (mut plan, artifacts) =
             synthetic_combine_plan(vec![("orders", None), ("products", None)], 1, 0, false);
         let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         // E306 is the root cause and was already in diags before this pass;
         // this pass should NOT add a new diagnostic for the missing driver.
         assert!(diags.is_empty());

@@ -3730,6 +3730,7 @@ impl PipelineExecutor {
                     use crate::config::pipeline_node::{MatchMode, OnMiss};
                     use crate::executor::combine::{CombineResolver, CombineResolverMapping};
                     use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
+                    use crate::pipeline::grace_hash::{GraceHashExec, execute_combine_grace_hash};
                     use crate::pipeline::iejoin::{IEJoinExec, execute_combine_iejoin};
                     use crate::pipeline::memory::MemoryBudget;
                     use crate::plan::combine::CombineStrategy;
@@ -3737,19 +3738,25 @@ impl PipelineExecutor {
                     // Strategy dispatch up front. HashBuildProbe stays
                     // inline below (the long-standing path);
                     // HashPartitionIEJoin and pure-range IEJoin route
-                    // to the IEJoin executor; every other strategy
-                    // bails with `PipelineError::Internal` because
-                    // grace-hash spill and sort-merge are not yet
-                    // wired here.
-                    let iejoin_partition_bits: Option<Option<u8>> = match strategy {
-                        CombineStrategy::HashBuildProbe => None,
+                    // to the IEJoin executor; GraceHash routes to the
+                    // grace-hash executor; sort-merge, in-memory hash,
+                    // and the BNL fallback are not yet wired.
+                    enum Dispatch {
+                        Inline,
+                        IEJoin(Option<u8>),
+                        Grace(u8),
+                    }
+                    let dispatch = match strategy {
+                        CombineStrategy::HashBuildProbe => Dispatch::Inline,
                         CombineStrategy::HashPartitionIEJoin { partition_bits } => {
-                            Some(Some(*partition_bits))
+                            Dispatch::IEJoin(Some(*partition_bits))
                         }
-                        CombineStrategy::IEJoin => Some(None),
+                        CombineStrategy::IEJoin => Dispatch::IEJoin(None),
+                        CombineStrategy::GraceHash { partition_bits } => {
+                            Dispatch::Grace(*partition_bits)
+                        }
                         CombineStrategy::InMemoryHash
                         | CombineStrategy::SortMerge
-                        | CombineStrategy::GraceHash { .. }
                         | CombineStrategy::BlockNestedLoop => {
                             return Err(PipelineError::Internal {
                                 op: "combine",
@@ -3957,51 +3964,101 @@ impl PipelineExecutor {
                         combine_inputs,
                     );
 
-                    // IEJoin / HashPartitionIEJoin dispatch: prep is
-                    // identical to HashBuildProbe up to this point
-                    // (input fetch + schema check + resolver mapping),
-                    // but the matching kernel is range-aware.
-                    if let Some(partition_bits) = iejoin_partition_bits {
-                        let mut budget =
-                            MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
-                        let build_records: Vec<Record> =
-                            build_buf.into_iter().map(|(r, _)| r).collect();
-                        let build_records_in = build_records.len() as u64;
-                        let build_timer = stage_metrics::StageTimer::new(
-                            stage_metrics::StageName::CombineBuild { name: name.clone() },
-                        );
-                        let build_records_out = build_records.len() as u64;
-                        collector.record(build_timer.finish(build_records_in, build_records_out));
-                        let probe_records_in = driver_buf.len() as u64;
-                        let probe_timer = stage_metrics::StageTimer::new(
-                            stage_metrics::StageName::CombineProbe { name: name.clone() },
-                        );
-                        let body_typed = artifacts.typed.get(name);
-                        let combine_output_schema_arc = combine_output_schema.clone();
-                        let iejoin_ctx = EvalContext {
-                            stable: &stable,
-                            source_file: &source_file_arc,
-                            source_row: 0,
-                        };
-                        let output_records = execute_combine_iejoin(IEJoinExec {
-                            name,
-                            build_qualifier: &build_qualifier,
-                            driver_records: driver_buf,
-                            build_records,
-                            decomposed,
-                            body_program: body_typed,
-                            resolver_mapping: &resolver_mapping,
-                            output_schema: combine_output_schema_arc.as_ref(),
-                            match_mode: *match_mode,
-                            on_miss: *on_miss,
-                            partition_bits,
-                            ctx: &iejoin_ctx,
-                            budget: &mut budget,
-                        })?;
-                        let probe_records_out = output_records.len() as u64;
-                        collector.record(probe_timer.finish(probe_records_in, probe_records_out));
-                        node_buffers.insert(node_idx, output_records);
-                        continue;
+                    // IEJoin / HashPartitionIEJoin / GraceHash
+                    // dispatch: prep is identical to HashBuildProbe
+                    // up to this point (input fetch + schema check +
+                    // resolver mapping), but the matching kernel is
+                    // strategy-specific.
+                    match dispatch {
+                        Dispatch::IEJoin(partition_bits) => {
+                            let mut budget =
+                                MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
+                            let build_records: Vec<Record> =
+                                build_buf.into_iter().map(|(r, _)| r).collect();
+                            let build_records_in = build_records.len() as u64;
+                            let build_timer = stage_metrics::StageTimer::new(
+                                stage_metrics::StageName::CombineBuild { name: name.clone() },
+                            );
+                            let build_records_out = build_records.len() as u64;
+                            collector
+                                .record(build_timer.finish(build_records_in, build_records_out));
+                            let probe_records_in = driver_buf.len() as u64;
+                            let probe_timer = stage_metrics::StageTimer::new(
+                                stage_metrics::StageName::CombineProbe { name: name.clone() },
+                            );
+                            let body_typed = artifacts.typed.get(name);
+                            let combine_output_schema_arc = combine_output_schema.clone();
+                            let iejoin_ctx = EvalContext {
+                                stable: &stable,
+                                source_file: &source_file_arc,
+                                source_row: 0,
+                            };
+                            let output_records = execute_combine_iejoin(IEJoinExec {
+                                name,
+                                build_qualifier: &build_qualifier,
+                                driver_records: driver_buf,
+                                build_records,
+                                decomposed,
+                                body_program: body_typed,
+                                resolver_mapping: &resolver_mapping,
+                                output_schema: combine_output_schema_arc.as_ref(),
+                                match_mode: *match_mode,
+                                on_miss: *on_miss,
+                                partition_bits,
+                                ctx: &iejoin_ctx,
+                                budget: &mut budget,
+                            })?;
+                            let probe_records_out = output_records.len() as u64;
+                            collector
+                                .record(probe_timer.finish(probe_records_in, probe_records_out));
+                            node_buffers.insert(node_idx, output_records);
+                            continue;
+                        }
+                        Dispatch::Grace(partition_bits) => {
+                            let mut budget =
+                                MemoryBudget::from_config(config.pipeline.memory_limit.as_deref());
+                            let build_records: Vec<Record> =
+                                build_buf.into_iter().map(|(r, _)| r).collect();
+                            let build_records_in = build_records.len() as u64;
+                            let build_timer = stage_metrics::StageTimer::new(
+                                stage_metrics::StageName::CombineBuild { name: name.clone() },
+                            );
+                            let build_records_out = build_records.len() as u64;
+                            collector
+                                .record(build_timer.finish(build_records_in, build_records_out));
+                            let probe_records_in = driver_buf.len() as u64;
+                            let probe_timer = stage_metrics::StageTimer::new(
+                                stage_metrics::StageName::CombineProbe { name: name.clone() },
+                            );
+                            let body_typed = artifacts.typed.get(name);
+                            let combine_output_schema_arc = combine_output_schema.clone();
+                            let grace_ctx = EvalContext {
+                                stable: &stable,
+                                source_file: &source_file_arc,
+                                source_row: 0,
+                            };
+                            let output_records = execute_combine_grace_hash(GraceHashExec {
+                                name,
+                                build_qualifier: &build_qualifier,
+                                driver_records: driver_buf,
+                                build_records,
+                                decomposed,
+                                body_program: body_typed,
+                                resolver_mapping: &resolver_mapping,
+                                output_schema: combine_output_schema_arc.as_ref(),
+                                match_mode: *match_mode,
+                                on_miss: *on_miss,
+                                partition_bits,
+                                ctx: &grace_ctx,
+                                budget: &mut budget,
+                            })?;
+                            let probe_records_out = output_records.len() as u64;
+                            collector
+                                .record(probe_timer.finish(probe_records_in, probe_records_out));
+                            node_buffers.insert(node_idx, output_records);
+                            continue;
+                        }
+                        Dispatch::Inline => {}
                     }
 
                     // Hash-build phase — drain the build buffer into a

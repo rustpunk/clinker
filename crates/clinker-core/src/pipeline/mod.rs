@@ -1,6 +1,8 @@
 pub mod arena;
 pub mod combine;
 pub mod dispatch;
+pub mod grace_hash;
+pub(crate) mod grace_spill;
 pub mod iejoin;
 pub mod index;
 pub mod ingestion;

@@ -3733,4 +3733,131 @@ nodes:
             "match: first emits exactly one row per driver even with multiple matches"
         );
     }
+
+    /// Strategy-selection: an estimated build cardinality whose product
+    /// with the per-record byte estimate clears the default soft-limit
+    /// must yield `CombineStrategy::GraceHash` instead of
+    /// `HashBuildProbe`.
+    #[test]
+    fn test_grace_hash_strategy_selected_for_large_build() {
+        use clinker_core::plan::bind_schema::CompileArtifacts;
+        use clinker_core::plan::combine::{
+            CombineInput, CombinePredicateSummary, CombineStrategy, DecomposedPredicate,
+            EqualityConjunct, select_combine_strategies,
+        };
+        use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
+        use clinker_core::plan::row_type::{QualifiedField, Row};
+        use clinker_core::span::Span;
+        use cxl::ast::{Expr, LiteralValue, NodeId, Program};
+        use cxl::lexer::Span as CxlSpan;
+        use cxl::typecheck::Type;
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        let mut artifacts = CompileArtifacts::default();
+        let mut graph = petgraph::graph::DiGraph::new();
+
+        for q in ["orders", "products"] {
+            graph.add_node(PlanNode::Source {
+                name: q.to_string(),
+                span: Span::SYNTHETIC,
+                resolved: None,
+                output_schema: clinker_record::SchemaBuilder::new().build(),
+            });
+        }
+
+        // Build estimate huge enough that estimated_bytes >= 80% of
+        // 512 MiB: 600_000 rows * 1024 bytes = ~586 MB > 410 MB soft
+        // limit.
+        let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
+        for (q, card) in [("orders", 1_000_000u64), ("products", 600_000u64)] {
+            let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
+            row_fields.insert(QualifiedField::bare("id"), Type::String);
+            inputs_map.insert(
+                q.to_string(),
+                CombineInput {
+                    upstream_name: Arc::from(q),
+                    row: Row::closed(row_fields, CxlSpan::new(0, 0)),
+                    estimated_cardinality: Some(card),
+                },
+            );
+        }
+        artifacts
+            .combine_inputs
+            .insert("test_combine".to_string(), inputs_map.clone());
+        artifacts
+            .combine_driving
+            .insert("test_combine".to_string(), "orders".to_string());
+
+        let dummy_lit = || Expr::Literal {
+            node_id: NodeId(0),
+            value: LiteralValue::Int(0),
+            span: CxlSpan::new(0, 0),
+        };
+        let dummy_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: Program {
+                statements: Vec::new(),
+                span: CxlSpan::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+            output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+        });
+        let predicate = DecomposedPredicate {
+            equalities: vec![EqualityConjunct {
+                left_expr: dummy_lit(),
+                left_input: Arc::from("orders"),
+                left_program: Arc::clone(&dummy_program),
+                right_expr: dummy_lit(),
+                right_input: Arc::from("products"),
+                right_program: Arc::clone(&dummy_program),
+            }],
+            ranges: Vec::new(),
+            residual: None,
+        };
+        artifacts
+            .combine_predicates
+            .insert("test_combine".to_string(), predicate);
+
+        let combine_idx = graph.add_node(PlanNode::Combine {
+            name: "test_combine".to_string(),
+            span: Span::SYNTHETIC,
+            strategy: CombineStrategy::HashBuildProbe,
+            driving_input: String::new(),
+            build_inputs: Vec::new(),
+            predicate_summary: CombinePredicateSummary::default(),
+            match_mode: clinker_core::config::pipeline_node::MatchMode::First,
+            on_miss: clinker_core::config::pipeline_node::OnMiss::NullFields,
+            decomposed_from: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
+            resolved_column_map: Arc::new(std::collections::HashMap::new()),
+        });
+
+        let mut plan = ExecutionPlanDag {
+            graph,
+            topo_order: Vec::new(),
+            source_dag: Vec::new(),
+            indices_to_build: Vec::new(),
+            output_projections: Vec::new(),
+            parallelism: clinker_core::plan::execution::ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+            correlation_sort_note: None,
+            node_properties: std::collections::HashMap::new(),
+        };
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
+        if let PlanNode::Combine { strategy, .. } = &plan.graph[combine_idx] {
+            assert!(
+                matches!(strategy, CombineStrategy::GraceHash { .. }),
+                "expected GraceHash for large pure-equi build; got {strategy:?}"
+            );
+        } else {
+            panic!("combine_idx no longer points to a Combine node");
+        }
+    }
 }
