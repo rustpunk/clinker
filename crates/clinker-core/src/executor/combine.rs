@@ -34,8 +34,9 @@ use crate::plan::row_type::QualifiedField;
 ///
 /// `Probe` is the driver (streaming) side; `Build` is the materialized
 /// hash-table side. A combine has exactly one probe qualifier and one
-/// or more build qualifiers (currently gated to one at the strategy
-/// post-pass via E312; N>2 lands in a later combine phase).
+/// build qualifier — N-ary user-authored combines are rewritten by the
+/// plan-time decomposition pass into a chain of binary combines, so by
+/// the time this enum is consulted every combine in the DAG is binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JoinSide {
     Build,

@@ -36,18 +36,17 @@
 //!
 //! | Code        | Severity | Meaning                                              |
 //! |-------------|----------|------------------------------------------------------|
-//! | `E300`      | error    | Combine requires at least 2 inputs                   |
+//! | `E300`      | error    | Combine input count is out of bounds (must be 2..=8) |
 //! | `E301`      | error    | Combine input qualifier collides with reserved namespace |
 //! | `E303`      | error    | Combine where-clause is not boolean                  |
 //! | `E304`      | error    | Field not in combine merged row                      |
-//! | `E305`      | error    | Combine where-clause has no cross-input comparisons  |
+//! | `E305`      | error    | Combine where-clause has no cross-input comparisons OR forms a disconnected join graph |
 //! | `E306`      | error    | Combine drive hint references unknown input          |
 //! | `E307`      | error    | Combine input references undeclared upstream         |
 //! | `E308`      | error    | Combine cxl body references unknown field            |
 //! | `E309`      | error    | Combine output schema is empty                       |
 //! | `E310`      | error    | Combine runtime exceeded hard memory limit           |
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
-//! | `E312`      | error    | Combine has N>2 inputs (binary only, for now)        |
 //! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
 //! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
@@ -474,7 +473,7 @@ mod diagnostic_tests {
         // explicit entry both here and in the registry table above.
         for code in [
             "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E312", "E313", "E314",
+            "E313", "E314",
         ] {
             let pattern = format!("`{code}`");
             assert!(

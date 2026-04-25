@@ -1322,7 +1322,7 @@ impl PipelineConfig {
         // E200 diagnostics surface here with per-node spans. Also
         // recurses into composition bodies via bind_composition,
         // populating CompileArtifacts.composition_bodies.
-        let artifacts = crate::plan::bind_schema::bind_schema(
+        let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
             ctx,
@@ -1718,13 +1718,21 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        // Phase Combine C.2.4 — combine strategy + driving-input
-        // post-pass. Runs after the DAG is fully enriched (so every
-        // PlanNode::Combine is present and property derivation has
-        // stamped ordering provenance) and before the final fatal-error
-        // check so any E312 / E313 it raises blocks the compile. The
-        // pass mutates PlanNode::Combine in place, replacing
-        // construction-time placeholders for `strategy` and
+        // N-ary combine decomposition. Rewrites every `PlanNode::Combine`
+        // with input count > 2 into a left-deep chain of binary combines
+        // so the strategy pass below sees only N=2 nodes. Runs against
+        // the fully-enriched DAG; emits E300 (input cap) and E305
+        // (disconnected join graph). Mutates `artifacts` in place to
+        // add per-step `combine_inputs` / `combine_predicates` /
+        // `combine_driving` entries.
+        crate::plan::combine::decompose_nary_combines(&mut dag, &mut artifacts, &mut diags);
+
+        // Combine strategy + driving-input post-pass. Runs after the
+        // DAG is fully enriched (so every PlanNode::Combine is present
+        // and property derivation has stamped ordering provenance) and
+        // after N-ary decomposition (so this pass only sees binary
+        // nodes). The pass mutates PlanNode::Combine in place,
+        // replacing construction-time placeholders for `strategy` and
         // `driving_input`.
         crate::plan::combine::select_combine_strategies(&mut dag, &artifacts, &mut diags);
 

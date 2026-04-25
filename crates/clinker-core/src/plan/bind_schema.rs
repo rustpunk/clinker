@@ -1447,10 +1447,12 @@ fn bind_combine(
     // executor synthesizes the output record at probe time; no body
     // evaluator runs for Collect.
     //
-    // Auto-derivation is only meaningful for N=2 (the only shape that
-    // survives the C.2.4.4 post-pass; E312 rejects N>2 outright). For
-    // pathological N≥3 + Collect fixtures we skip output row insertion
-    // and let the post-pass surface E312 as the root-cause diagnostic.
+    // Auto-derivation is only meaningful for N=2. The N-ary
+    // decomposition pass rewrites N>2 combines into a chain of binary
+    // steps before strategy selection, so a Collect-mode N>2 fixture
+    // would lose its single build_qualifier — skip the auto-derivation
+    // here and let downstream passes surface diagnostics on the
+    // decomposed chain.
     if matches!(config.match_mode, MatchMode::Collect) {
         if !config.cxl.source.trim().is_empty() {
             diags.push(combine_e311_collect_with_body(name, span));

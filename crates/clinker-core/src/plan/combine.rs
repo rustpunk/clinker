@@ -18,16 +18,18 @@
 //!   - `CompileArtifacts.combine_inputs`      — per-input metadata
 //!     (name-keyed; see `CombineInput` for the no-`NodeIndex` rationale)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::error::{Diagnostic, LabeledSpan};
-use crate::plan::row_type::Row;
+use crate::plan::execution::DependencyType;
+use crate::plan::row_type::{QualifiedField, Row};
 use crate::span::Span;
 use cxl::ast::{BinOp, Expr, NodeId, Program, Statement};
+use cxl::typecheck::Type;
 use cxl::typecheck::pass::TypedProgram;
 use cxl::typecheck::{TypeDiagnostic, type_check};
 
@@ -564,23 +566,22 @@ pub(crate) const SMALL_INPUT_THRESHOLD: u64 = 10_000;
 /// populated. Mirrors `select_aggregation_strategies` in shape.
 ///
 /// Per-combine work:
-///   1. **E312** — N>2 inputs are unsupported in C.2 (decomposition is
-///      Phase C.4). Emits the diagnostic and leaves the node's
-///      strategy/driving_input as construction defaults; downstream
-///      executor dispatch sees the unstamped placeholder and bails.
-///   2. **E313** — pure-range / pure-residual predicates have no
-///      equi-conjuncts and cannot run on `HashBuildProbe`. Phase C.3
-///      will downgrade this to a strategy switch (`SortMerge` /
-///      `IEJoin`); for C.2 it's a hard error.
-///   3. **W302** — pure-equi predicates with all inputs marked small
+///   1. **E313** — pure-residual predicates have no equi-conjuncts and
+///      no range conjuncts, so no decomposable strategy can run them.
+///      Hard error; downstream operator dispatch never sees the node.
+///   2. **W302** — pure-equi predicates with all inputs marked small
 ///      (cardinality ≤ [`SMALL_INPUT_THRESHOLD`]) get an advisory
 ///      hinting that `InMemoryHash` may be cheaper than
 ///      `HashBuildProbe`. Non-fatal.
-///   4. Stamps `CombineStrategy::HashBuildProbe` and the driving
+///   3. Stamps `CombineStrategy::HashBuildProbe` and the driving
 ///      qualifier (read from `artifacts.combine_driving`) onto the node.
 ///      Combines whose driver selection failed at bind time (E306) are
 ///      absent from `combine_driving` and skipped here — the prior
 ///      diagnostic is the root cause.
+///
+/// N-ary combines (input count > 2) are rewritten upstream by
+/// [`decompose_nary_combines`] into a chain of binary combines before
+/// this post-pass runs, so `inputs.len() <= 2` is an invariant here.
 ///
 /// Always runs to completion — the post-pass itself is infallible.
 /// Diagnostics accumulate in `diags`; callers (e.g.
@@ -613,10 +614,6 @@ pub fn select_combine_strategies(
             None => continue,
         };
 
-        if inputs.len() > 2 {
-            diags.push(combine_e312_nary_unsupported(&name, inputs.len(), span));
-            continue;
-        }
         // Pre-classify the predicate shape. Three branches:
         //   - mixed equi + range  → HashPartitionIEJoin
         //   - pure range, no equi → IEJoin (single partition, plus W305)
@@ -715,23 +712,6 @@ fn compute_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
     bits.clamp(MIN_BITS, DEFAULT_BITS)
 }
 
-/// E312 — combine has more than 2 inputs. C.2 supports binary combines
-/// only; N>2 is decomposed in C.4.
-fn combine_e312_nary_unsupported(combine_name: &str, input_count: usize, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        "E312",
-        format!(
-            "combine {combine_name:?} declares {input_count} inputs; C.2 supports binary \
-             combines only (N=2). N-ary combine decomposition lands in Phase C.4."
-        ),
-        LabeledSpan::primary(span, String::new()),
-    )
-    .with_help(
-        "split the combine into a chain of 2-input combines, or wait for the C.4 N-ary \
-         decomposition pass",
-    )
-}
-
 /// E313 — combine `where:` predicate has no extractable equality OR
 /// range conjuncts. With neither, no decomposable strategy can run
 /// the join short of a non-decomposable fallback (grace hash with a
@@ -807,9 +787,9 @@ fn combine_w302_small_both(combine_name: &str, span: Span) -> Diagnostic {
 ///      `chooseBuildSide` policy.
 ///   3. **Declaration order fallback** — first qualifier in the
 ///      `IndexMap`. For `inputs.len() >= 3` this also emits **W306**
-///      (planner cannot determine optimal driver). C.2 gates N>2 at
-///      `select_combine_strategies` (E312), so W306 is unreachable in
-///      C.2; it's wired now for the C.4 N-ary path.
+///      (planner cannot determine optimal driver) so authors notice
+///      missing cardinality estimates on the original N-ary combine
+///      before [`decompose_nary_combines`] runs.
 pub(crate) fn select_driving_input(
     inputs: &IndexMap<String, CombineInput>,
     explicit_drive: Option<&str>,
@@ -873,8 +853,10 @@ fn combine_e306_invalid_drive(
 }
 
 /// W306 — planner cannot pick a single optimal driving input. Emitted
-/// for combines with 3+ inputs that lack cardinality estimates. Wired
-/// now for C.4 N-ary; unreachable in C.2 (E312 fires first).
+/// for combines with 3+ inputs that lack cardinality estimates. Fires
+/// on the original N-ary combine before decomposition runs, surfacing
+/// missing cardinality data while the user-authored shape is still
+/// visible.
 fn combine_w306_ambiguous_driver(combine_name: &str, span: Span) -> Diagnostic {
     Diagnostic::warning(
         "W306",
@@ -888,6 +870,661 @@ fn combine_w306_ambiguous_driver(combine_name: &str, span: Span) -> Diagnostic {
         "add an explicit `drive:` hint to silence this warning, or attach cardinality \
          estimates upstream",
     )
+}
+
+// ─── N-ary plan-time decomposition ───────────────────────────────────
+//
+// Authors may declare a combine with N > 2 inputs:
+//
+//   - type: combine
+//     name: enriched
+//     input:
+//       orders: orders
+//       products: products
+//       categories: categories
+//     config:
+//       where: orders.product_id == products.product_id
+//              and products.product_id == categories.product_id
+//
+// The executor's combine arm operates on binary nodes. Rather than ship
+// a separate N-ary kernel, the planner rewrites every N > 2 combine
+// into a chain of (N - 1) binary combines before strategy selection
+// runs. Each step joins the running intermediate against one new
+// build-side input; the predicate is sliced into the conjuncts whose
+// qualifiers are all available at that step.
+//
+// Ordering is predicate-aware greedy (GOO): from the driver, accept
+// the connected partner with the smallest cardinality estimate, breaking
+// ties by declaration order. Cardinality-only ordering can pick pairs
+// that share no conjunct, forcing a Cartesian product between
+// disconnected components — checking connectivity first and prioritizing
+// connected pairs eliminates that failure mode.
+//
+// The chain is left-deep: the final step adopts the user-authored
+// `match_mode` and `on_miss`; intermediate steps emit every match and
+// drop misses so the cardinality contract of the original N-ary join
+// survives the rewrite.
+
+/// Maximum number of inputs the decomposition pass accepts on a single
+/// combine node. Beyond this, a chain of (N-1) binary combines becomes
+/// hard to reason about for plan stability and memory accounting; the
+/// planner emits an E300 with the cap surfaced in the diagnostic and
+/// skips the rewrite.
+pub(crate) const MAX_COMBINE_INPUTS: usize = 8;
+
+/// One link in an N-ary combine's decomposition chain.
+///
+/// `name` is the synthetic node name `__combine_{original}_step_{i}`;
+/// `driving_input` carries the previous step's synthetic name (for
+/// `i >= 1`) or the original driver qualifier (for `i == 0`); `build_input`
+/// is the qualifier joined at this step. `intermediate_row` is the
+/// merged row column-pruned to the qualifiers joined so far —
+/// downstream compile/runtime work that needs the row at this step
+/// reads it without walking the original merged row again.
+/// `predicate_slice` carries the conjuncts whose left+right qualifiers
+/// are both joined at this step.
+pub(crate) struct BinaryDecomposeStep {
+    pub(crate) name: String,
+    pub(crate) build_input: String,
+    pub(crate) driving_input: String,
+    pub(crate) intermediate_row: Row,
+    pub(crate) predicate_slice: DecomposedPredicate,
+}
+
+/// Returns true iff the conjunct's left/right qualifiers are both
+/// elements of `joined`.
+fn equality_in_joined(eq: &EqualityConjunct, joined: &HashSet<String>) -> bool {
+    joined.contains(eq.left_input.as_ref()) && joined.contains(eq.right_input.as_ref())
+}
+
+fn range_in_joined(r: &RangeConjunct, joined: &HashSet<String>) -> bool {
+    joined.contains(r.left_input.as_ref()) && joined.contains(r.right_input.as_ref())
+}
+
+/// Count predicate conjuncts whose qualifiers are both inside the
+/// `(joined ∪ {candidate})` set. Used by the GOO partner selector.
+fn connected_conjuncts(
+    predicate: &DecomposedPredicate,
+    joined: &HashSet<String>,
+    candidate: &str,
+) -> usize {
+    let mut frontier = joined.clone();
+    frontier.insert(candidate.to_string());
+    let eq = predicate
+        .equalities
+        .iter()
+        .filter(|c| equality_in_joined(c, &frontier))
+        .count();
+    let rg = predicate
+        .ranges
+        .iter()
+        .filter(|c| range_in_joined(c, &frontier))
+        .count();
+    eq + rg
+}
+
+/// Predicate-aware greedy decomposition of an N-ary combine into N-1
+/// binary steps.
+///
+/// At each step, every still-unjoined input is scored by the count of
+/// predicate conjuncts that connect it to the already-joined frontier.
+/// Inputs with zero connecting conjuncts are skipped — selecting one
+/// would force a Cartesian product. From the connected candidates the
+/// planner picks the one with the smallest `estimated_cardinality`,
+/// breaking ties by `IndexMap` declaration order so the result is
+/// deterministic across runs.
+///
+/// Returns E305 (disconnected join graph) when no unjoined input is
+/// connected to the joined frontier — equivalent to a missing
+/// transitive edge between two components of the predicate graph.
+pub(crate) fn decompose_nary_combine(
+    original_name: &str,
+    inputs: &IndexMap<String, CombineInput>,
+    predicate: &DecomposedPredicate,
+    full_merged_row: &Row,
+    driving: &str,
+    span: Span,
+) -> Result<Vec<BinaryDecomposeStep>, Box<Diagnostic>> {
+    let total = inputs.len();
+    debug_assert!(
+        total > 2,
+        "decompose_nary_combine called with {total} inputs; binary combines do not need decomposition"
+    );
+
+    let mut joined: HashSet<String> = HashSet::new();
+    joined.insert(driving.to_string());
+    let mut current_intermediate = driving.to_string();
+    // Conjuncts already assigned to a step. Indexed by position in the
+    // parent decomposition's `equalities` / `ranges` Vec so the same
+    // conjunct never lands on two steps.
+    let mut assigned_eq: HashSet<usize> = HashSet::new();
+    let mut assigned_range: HashSet<usize> = HashSet::new();
+    let mut steps = Vec::with_capacity(total - 1);
+
+    for step_idx in 0..(total - 1) {
+        let mut best: Option<(&str, usize, Option<u64>, usize)> = None;
+        for (decl_pos, (qual, ci)) in inputs.iter().enumerate() {
+            if joined.contains(qual) {
+                continue;
+            }
+            let connected = connected_conjuncts(predicate, &joined, qual);
+            if connected == 0 {
+                continue;
+            }
+            let card = ci.estimated_cardinality;
+            let candidate = (qual.as_str(), decl_pos, card, connected);
+            best = Some(match best {
+                None => candidate,
+                Some(prev) => {
+                    let (_, prev_decl, prev_card, _) = prev;
+                    let prefer_candidate = match (card, prev_card) {
+                        (Some(a), Some(b)) if a != b => a < b,
+                        _ => decl_pos < prev_decl,
+                    };
+                    if prefer_candidate { candidate } else { prev }
+                }
+            });
+        }
+
+        let picked = match best {
+            Some((q, _, _, _)) => q.to_string(),
+            None => return Err(Box::new(combine_e305_disconnected(original_name, span))),
+        };
+
+        // Slice the predicate to conjuncts now fully available. A
+        // conjunct is "now fully available" iff both its qualifiers are
+        // in `joined ∪ {picked}` AND it has not yet been assigned to a
+        // prior step.
+        let mut frontier = joined.clone();
+        frontier.insert(picked.clone());
+        let mut equalities = Vec::new();
+        for (i, eq) in predicate.equalities.iter().enumerate() {
+            if assigned_eq.contains(&i) {
+                continue;
+            }
+            if equality_in_joined(eq, &frontier) {
+                equalities.push(eq.clone());
+                assigned_eq.insert(i);
+            }
+        }
+        let mut ranges = Vec::new();
+        for (i, r) in predicate.ranges.iter().enumerate() {
+            if assigned_range.contains(&i) {
+                continue;
+            }
+            if range_in_joined(r, &frontier) {
+                ranges.push(r.clone());
+                assigned_range.insert(i);
+            }
+        }
+        let predicate_slice = DecomposedPredicate {
+            equalities,
+            ranges,
+            residual: None,
+        };
+
+        // Column-prune the merged row to fields whose qualifier is in
+        // the joined ∪ {picked} set. Preserve the merged row's
+        // `RowTail` so an open parent (composition boundary) stays
+        // open, even though combine-merged rows are closed in practice.
+        let mut declared: IndexMap<QualifiedField, Type> = IndexMap::new();
+        for (qf, ty) in full_merged_row.fields() {
+            if let Some(qualifier) = qf.qualifier.as_deref()
+                && frontier.contains(qualifier)
+            {
+                declared.insert(qf.clone(), ty.clone());
+            }
+        }
+        let intermediate_row = Row::from_parts(
+            declared,
+            full_merged_row.declared_span,
+            full_merged_row.tail.clone(),
+        );
+
+        let step_name = format!("__combine_{original_name}_step_{step_idx}");
+        steps.push(BinaryDecomposeStep {
+            name: step_name.clone(),
+            build_input: picked.clone(),
+            driving_input: current_intermediate,
+            intermediate_row,
+            predicate_slice,
+        });
+        joined.insert(picked);
+        current_intermediate = step_name;
+    }
+
+    Ok(steps)
+}
+
+/// Validate that the join graph induced by `predicate` connects every
+/// declared input. The graph has one node per qualifier and an edge
+/// `(left, right)` per cross-input conjunct (equality or range).
+///
+/// Single-input predicates contribute no edges: a same-input
+/// `(a.x == a.y)` conjunct never appears here because such conjuncts
+/// classify as residual at decomposition time and the residual carries
+/// no `left_input`/`right_input` pair.
+///
+/// Returns E305 when the graph is disconnected — joining the inputs
+/// would produce a Cartesian product across components.
+pub(crate) fn validate_join_graph_connectivity(
+    inputs: &IndexMap<String, CombineInput>,
+    predicate: &DecomposedPredicate,
+    combine_name: &str,
+    span: Span,
+) -> Result<(), Box<Diagnostic>> {
+    if inputs.len() <= 1 {
+        return Ok(());
+    }
+    // Union-find over qualifier indices. `parent[i]` points at i's
+    // representative; flat after `find` path-compression.
+    let qualifiers: Vec<&str> = inputs.keys().map(String::as_str).collect();
+    let mut parent: Vec<usize> = (0..qualifiers.len()).collect();
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut cur = i;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    let index_of = |q: &str| qualifiers.iter().position(|x| *x == q);
+    for eq in &predicate.equalities {
+        if eq.left_input.as_ref() == eq.right_input.as_ref() {
+            continue;
+        }
+        if let (Some(li), Some(ri)) = (
+            index_of(eq.left_input.as_ref()),
+            index_of(eq.right_input.as_ref()),
+        ) {
+            union(&mut parent, li, ri);
+        }
+    }
+    for r in &predicate.ranges {
+        if r.left_input.as_ref() == r.right_input.as_ref() {
+            continue;
+        }
+        if let (Some(li), Some(ri)) = (
+            index_of(r.left_input.as_ref()),
+            index_of(r.right_input.as_ref()),
+        ) {
+            union(&mut parent, li, ri);
+        }
+    }
+    let root0 = find(&mut parent, 0);
+    let all_connected = (1..qualifiers.len()).all(|i| find(&mut parent, i) == root0);
+    if all_connected {
+        Ok(())
+    } else {
+        Err(Box::new(combine_e305_disconnected(combine_name, span)))
+    }
+}
+
+/// E305 — combine where-clause forms a disconnected join graph. Two or
+/// more groups of inputs share no cross-input comparison; joining them
+/// would produce a Cartesian product across components.
+fn combine_e305_disconnected(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E305",
+        format!(
+            "combine {combine_name:?} where-clause forms a disconnected join graph; \
+             inputs in different components would produce a Cartesian product"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add a cross-input comparison that links all inputs (e.g. via a transitive \
+         equality chain)",
+    )
+}
+
+/// E300 — combine input count exceeds the supported maximum. Sibling
+/// constructor to `combine_e300` (in `bind_schema.rs`) which fires for
+/// the lower bound (`< 2`); this fires for the upper bound after the
+/// decomposition pass has the fully-bound input map. Same code so
+/// authors see one diagnostic family for "input-count out of bounds".
+fn combine_e300_too_many_inputs(combine_name: &str, count: usize, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E300",
+        format!(
+            "combine {combine_name:?} declares {count} inputs, maximum supported is \
+             {MAX_COMBINE_INPUTS}"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "split the combine into two or more chained combine nodes; each chained \
+         combine joins one additional input against the running intermediate",
+    )
+}
+
+/// Plan-time post-pass that decomposes every N-ary `PlanNode::Combine`
+/// (input count > 2) into a left-deep chain of (N-1) binary
+/// `PlanNode::Combine` nodes. Runs before
+/// [`select_combine_strategies`] so strategy selection sees only
+/// binary nodes.
+///
+/// The original combine's `NodeIndex` is reused as the final step in
+/// the chain — its outgoing edges, span, output_schema, and
+/// authored `match_mode`/`on_miss` survive in place. Earlier steps
+/// are added as new nodes with synthetic names; they default to
+/// `MatchMode::All` + `OnMiss::Drop` so intermediate cardinality
+/// matches the user-authored N-ary shape.
+///
+/// Diagnostics:
+///   - E300 — `inputs.len() > MAX_COMBINE_INPUTS`. Decomposition is
+///     skipped; the original N-ary node remains in the graph and the
+///     downstream strategy pass also skips it (no driver is stamped
+///     because [`combine_driving`](CompileArtifacts::combine_driving)
+///     was populated normally but `select_combine_strategies` will
+///     leave the strategy/driver fields unset until the user reduces
+///     input count).
+///   - E305 — disconnected join graph. Decomposition is skipped; the
+///     diagnostic surfaces the missing transitive comparison.
+pub(crate) fn decompose_nary_combines(
+    plan: &mut crate::plan::execution::ExecutionPlanDag,
+    artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::config::pipeline_node::{MatchMode, OnMiss};
+    use crate::plan::execution::{PlanEdge, PlanNode};
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use petgraph::visit::EdgeRef;
+
+    // Snapshot every N-ary combine before any structural change, so
+    // adding new nodes during the pass can't cause us to revisit
+    // synthetic step nodes (which all have inputs.len() == 2 anyway,
+    // but the snapshot is the simpler invariant to reason about).
+    let nary: Vec<(NodeIndex, String, Span)> = plan
+        .graph
+        .node_indices()
+        .filter_map(|idx| match &plan.graph[idx] {
+            PlanNode::Combine { name, span, .. } => {
+                let count = artifacts
+                    .combine_inputs
+                    .get(name)
+                    .map(IndexMap::len)
+                    .unwrap_or(0);
+                if count > 2 {
+                    Some((idx, name.clone(), *span))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect();
+
+    for (original_idx, original_name, span) in nary {
+        let inputs = match artifacts.combine_inputs.get(&original_name) {
+            Some(i) => i.clone(),
+            None => continue,
+        };
+        if inputs.len() > MAX_COMBINE_INPUTS {
+            diags.push(combine_e300_too_many_inputs(
+                &original_name,
+                inputs.len(),
+                span,
+            ));
+            continue;
+        }
+        let predicate = match artifacts.combine_predicates.get(&original_name) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+        if let Err(d) = validate_join_graph_connectivity(&inputs, &predicate, &original_name, span)
+        {
+            diags.push(*d);
+            continue;
+        }
+        let driving = match artifacts.combine_driving.get(&original_name) {
+            Some(d) => d.clone(),
+            None => continue,
+        };
+
+        // Reconstruct the merged row from the per-input rows. This is
+        // the same shape `bind_combine` builds; we don't keep the
+        // merged row in artifacts, so we rematerialize it here.
+        let mut merged_declared: IndexMap<QualifiedField, Type> = IndexMap::new();
+        for (qualifier, ci) in &inputs {
+            for (qf, ty) in ci.row.fields() {
+                let qualified = QualifiedField::qualified(qualifier.as_str(), qf.name.clone());
+                merged_declared.insert(qualified, ty.clone());
+            }
+        }
+        let merged_row = Row::closed(
+            merged_declared,
+            cxl::lexer::Span::new(span.start as usize, span.start as usize),
+        );
+
+        let steps = match decompose_nary_combine(
+            &original_name,
+            &inputs,
+            &predicate,
+            &merged_row,
+            &driving,
+            span,
+        ) {
+            Ok(s) => s,
+            Err(d) => {
+                diags.push(*d);
+                continue;
+            }
+        };
+
+        // Capture original combine details before any mutation. The
+        // snapshot above filtered to `PlanNode::Combine`; an earlier
+        // pass running between the snapshot and here that mutated this
+        // index away from `Combine` would invalidate the snapshot's
+        // assumption — skip and continue rather than panic.
+        let PlanNode::Combine {
+            match_mode: original_match_mode,
+            on_miss: original_on_miss,
+            output_schema: original_output_schema,
+            ..
+        } = plan.graph[original_idx].clone()
+        else {
+            continue;
+        };
+
+        // Build a name → NodeIndex lookup over the current graph for
+        // wiring source-edges. Snapshot here so it captures the
+        // pre-mutation state; new step nodes get added to the local
+        // map as we create them.
+        let mut node_by_name: HashMap<String, NodeIndex> = HashMap::new();
+        for idx in plan.graph.node_indices() {
+            node_by_name.insert(plan.graph[idx].name().to_string(), idx);
+        }
+
+        // Original combine's incoming edges go away — each step adds
+        // its own. Capture targets first, then delete.
+        let incoming_edges: Vec<petgraph::graph::EdgeIndex> = plan
+            .graph
+            .edges_directed(original_idx, Direction::Incoming)
+            .map(|e| e.id())
+            .collect();
+        for eid in incoming_edges {
+            plan.graph.remove_edge(eid);
+        }
+
+        // Add (N - 2) earlier steps as new nodes. Step (N - 2) reuses
+        // `original_idx`. Each step gets its own CompileArtifacts entries.
+        let last_step_idx = steps.len() - 1;
+        let mut step_indices: Vec<NodeIndex> = Vec::with_capacity(steps.len());
+        for (i, step) in steps.iter().enumerate() {
+            let predicate_summary = CombinePredicateSummary::from_decomposed(&step.predicate_slice);
+            let (match_mode, on_miss, output_schema, idx) = if i == last_step_idx {
+                (
+                    original_match_mode,
+                    original_on_miss,
+                    original_output_schema.clone(),
+                    original_idx,
+                )
+            } else {
+                (
+                    MatchMode::All,
+                    OnMiss::Skip,
+                    clinker_record::SchemaBuilder::new().build(),
+                    plan.graph.add_node(PlanNode::Combine {
+                        name: step.name.clone(),
+                        span,
+                        strategy: CombineStrategy::HashBuildProbe,
+                        driving_input: String::new(),
+                        build_inputs: Vec::new(),
+                        predicate_summary,
+                        match_mode: MatchMode::All,
+                        on_miss: OnMiss::Skip,
+                        decomposed_from: Some(original_name.clone()),
+                        output_schema: clinker_record::SchemaBuilder::new().build(),
+                        resolved_column_map: Arc::new(HashMap::new()),
+                    }),
+                )
+            };
+            if i == last_step_idx {
+                // Mutate the original combine in place. Name shifts to
+                // the synthetic step name; metadata becomes the final
+                // step's; outgoing edges already point at downstream
+                // consumers.
+                if let PlanNode::Combine {
+                    name,
+                    strategy,
+                    driving_input,
+                    build_inputs,
+                    predicate_summary: ps,
+                    match_mode: mm,
+                    on_miss: om,
+                    decomposed_from,
+                    output_schema: os,
+                    resolved_column_map,
+                    ..
+                } = &mut plan.graph[original_idx]
+                {
+                    *name = step.name.clone();
+                    *strategy = CombineStrategy::HashBuildProbe;
+                    *driving_input = String::new();
+                    *build_inputs = Vec::new();
+                    *ps = predicate_summary;
+                    *mm = match_mode;
+                    *om = on_miss;
+                    *decomposed_from = Some(original_name.clone());
+                    *os = output_schema;
+                    *resolved_column_map = Arc::new(HashMap::new());
+                }
+            }
+            step_indices.push(idx);
+            node_by_name.insert(step.name.clone(), idx);
+        }
+
+        // Wire edges. Step 0 ← driver source + first build source.
+        // Step i ≥ 1 ← step (i-1) + step's build source.
+        for (i, step) in steps.iter().enumerate() {
+            let driver_idx = if i == 0 {
+                let original_driver_input = inputs
+                    .get(&driving)
+                    .expect("driver qualifier present in combine_inputs");
+                node_by_name
+                    .get(original_driver_input.upstream_name.as_ref())
+                    .copied()
+            } else {
+                Some(step_indices[i - 1])
+            };
+            let build_input_meta = inputs
+                .get(&step.build_input)
+                .expect("step.build_input was selected from inputs.keys()");
+            let build_idx = node_by_name
+                .get(build_input_meta.upstream_name.as_ref())
+                .copied();
+            let target = step_indices[i];
+            if let Some(d) = driver_idx {
+                plan.graph.add_edge(
+                    d,
+                    target,
+                    PlanEdge {
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+            }
+            if let Some(b) = build_idx {
+                plan.graph.add_edge(
+                    b,
+                    target,
+                    PlanEdge {
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+            }
+        }
+
+        // Populate CompileArtifacts for each step.
+        for (i, step) in steps.iter().enumerate() {
+            // Per-step inputs map: driver row + build row.
+            let driver_row = if i == 0 {
+                inputs
+                    .get(&driving)
+                    .map(|ci| ci.row.clone())
+                    .expect("driver qualifier present in combine_inputs")
+            } else {
+                steps[i - 1].intermediate_row.clone()
+            };
+            let driver_upstream: Arc<str> = if i == 0 {
+                Arc::clone(&inputs.get(&driving).unwrap().upstream_name)
+            } else {
+                Arc::from(steps[i - 1].name.as_str())
+            };
+            let build_meta = inputs
+                .get(&step.build_input)
+                .expect("step.build_input qualifier was selected from inputs.keys()");
+
+            let mut step_inputs: IndexMap<String, CombineInput> = IndexMap::new();
+            step_inputs.insert(
+                step.driving_input.clone(),
+                CombineInput {
+                    upstream_name: driver_upstream,
+                    row: driver_row,
+                    estimated_cardinality: None,
+                },
+            );
+            step_inputs.insert(
+                step.build_input.clone(),
+                CombineInput {
+                    upstream_name: Arc::clone(&build_meta.upstream_name),
+                    row: build_meta.row.clone(),
+                    estimated_cardinality: build_meta.estimated_cardinality,
+                },
+            );
+
+            artifacts
+                .combine_inputs
+                .insert(step.name.clone(), step_inputs);
+            artifacts
+                .combine_predicates
+                .insert(step.name.clone(), step.predicate_slice.clone());
+            artifacts
+                .combine_driving
+                .insert(step.name.clone(), step.driving_input.clone());
+        }
+
+        // Drop the original combine's artifacts — its name is gone from
+        // the graph (the index now hosts the final step under a
+        // synthetic name).
+        artifacts.combine_inputs.remove(&original_name);
+        artifacts.combine_predicates.remove(&original_name);
+        artifacts.combine_driving.remove(&original_name);
+        artifacts.combine_resolved_columns.remove(&original_name);
+    }
 }
 
 #[cfg(test)]
@@ -1170,21 +1807,6 @@ mod tests {
     }
 
     #[test]
-    fn test_combine_strategy_e312_nary_unsupported() {
-        let (mut plan, artifacts) =
-            synthetic_combine_plan(vec![("a", None), ("b", None), ("c", None)], 1, 0, true);
-        let mut diags = Vec::new();
-        select_combine_strategies(&mut plan, &artifacts, &mut diags);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, "E312");
-        if let crate::plan::execution::PlanNode::Combine { driving_input, .. } =
-            first_combine(&plan)
-        {
-            assert!(driving_input.is_empty(), "no driver stamped on E312");
-        }
-    }
-
-    #[test]
     fn test_combine_strategy_pure_range_w305_iejoin() {
         // Pure range → W305 + IEJoin strategy.
         let (mut plan, artifacts) =
@@ -1319,5 +1941,508 @@ mod tests {
         };
         assert_eq!(node.name(), "test_combine");
         assert_eq!(node.type_tag(), "combine");
+    }
+
+    // ─── N-ary decomposition tests ─────────────────────────────────────
+
+    /// Build an N-ary plan with explicit per-pair equality conjuncts.
+    /// `inputs` is `(qualifier, cardinality)`; `edges` is a list of
+    /// `(left_qualifier, right_qualifier)` predicate edges. The resulting
+    /// `ExecutionPlanDag` contains a single user-authored Combine node
+    /// named `test_combine` with no source edges (decomposition does not
+    /// require sources to exist) and N source nodes named after the
+    /// input qualifiers so edge-rewiring lookups work.
+    fn nary_plan(
+        combine_name: &str,
+        inputs: Vec<(&str, Option<u64>)>,
+        edges: Vec<(&str, &str)>,
+        driver: &str,
+    ) -> (
+        crate::plan::execution::ExecutionPlanDag,
+        crate::plan::bind_schema::CompileArtifacts,
+        Row,
+    ) {
+        use crate::config::pipeline_node::{MatchMode, OnMiss};
+        use crate::plan::bind_schema::CompileArtifacts;
+        use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+        use crate::span::Span;
+        use cxl::ast::{Expr, LiteralValue, NodeId};
+        use cxl::lexer::Span as CxlSpan;
+
+        let mut artifacts = CompileArtifacts::default();
+        let mut graph = petgraph::graph::DiGraph::new();
+
+        // Add a Source node per input qualifier so name lookups resolve
+        // when the decomposition pass wires edges. The Source's
+        // `output_schema` is empty; tests don't run records through it.
+        for (qual, _card) in &inputs {
+            graph.add_node(PlanNode::Source {
+                name: (*qual).to_string(),
+                span: Span::SYNTHETIC,
+                resolved: None,
+                output_schema: clinker_record::SchemaBuilder::new().build(),
+            });
+        }
+
+        // Per-input row: each input declares one bare field "id" so the
+        // merged row has unambiguous columns per qualifier.
+        let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
+        for (qual, card) in &inputs {
+            let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
+            row_fields.insert(QualifiedField::bare("id"), Type::String);
+            inputs_map.insert(
+                (*qual).to_string(),
+                CombineInput {
+                    upstream_name: Arc::from(*qual),
+                    row: Row::closed(row_fields, CxlSpan::new(0, 0)),
+                    estimated_cardinality: *card,
+                },
+            );
+        }
+        artifacts
+            .combine_inputs
+            .insert(combine_name.to_string(), inputs_map.clone());
+        artifacts
+            .combine_driving
+            .insert(combine_name.to_string(), driver.to_string());
+
+        // Construct EqualityConjuncts whose left/right inputs match the
+        // edges argument. The expressions themselves are dummy literals;
+        // decomposition only inspects qualifier identity.
+        let dummy_lit = || Expr::Literal {
+            node_id: NodeId(0),
+            value: LiteralValue::Int(0),
+            span: CxlSpan::new(0, 0),
+        };
+        let dummy_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: cxl::ast::Program {
+                statements: Vec::new(),
+                span: CxlSpan::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+            output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+        });
+        let equalities: Vec<EqualityConjunct> = edges
+            .iter()
+            .map(|(l, r)| EqualityConjunct {
+                left_expr: dummy_lit(),
+                left_input: Arc::from(*l),
+                left_program: Arc::clone(&dummy_program),
+                right_expr: dummy_lit(),
+                right_input: Arc::from(*r),
+                right_program: Arc::clone(&dummy_program),
+            })
+            .collect();
+        let predicate = DecomposedPredicate {
+            equalities,
+            ranges: Vec::new(),
+            residual: None,
+        };
+        artifacts
+            .combine_predicates
+            .insert(combine_name.to_string(), predicate);
+
+        // Build the merged row mirror of bind_combine's logic so the
+        // intermediate-row pruning has something to filter against.
+        let mut merged: IndexMap<QualifiedField, Type> = IndexMap::new();
+        for (qual, _) in &inputs {
+            merged.insert(
+                QualifiedField::qualified(*qual, Arc::from("id")),
+                Type::String,
+            );
+        }
+        let merged_row = Row::closed(merged, CxlSpan::new(0, 0));
+
+        graph.add_node(PlanNode::Combine {
+            name: combine_name.to_string(),
+            span: Span::SYNTHETIC,
+            strategy: CombineStrategy::HashBuildProbe,
+            driving_input: String::new(),
+            build_inputs: Vec::new(),
+            predicate_summary: CombinePredicateSummary::from_decomposed(
+                artifacts.combine_predicates.get(combine_name).unwrap(),
+            ),
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::NullFields,
+            decomposed_from: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
+            resolved_column_map: Arc::new(std::collections::HashMap::new()),
+        });
+
+        let plan = ExecutionPlanDag {
+            graph,
+            topo_order: Vec::new(),
+            source_dag: Vec::new(),
+            indices_to_build: Vec::new(),
+            output_projections: Vec::new(),
+            parallelism: crate::plan::execution::ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+            correlation_sort_note: None,
+            node_properties: std::collections::HashMap::new(),
+        };
+        (plan, artifacts, merged_row)
+    }
+
+    fn collect_combines(
+        plan: &crate::plan::execution::ExecutionPlanDag,
+    ) -> Vec<&crate::plan::execution::PlanNode> {
+        plan.graph
+            .node_weights()
+            .filter(|n| matches!(n, crate::plan::execution::PlanNode::Combine { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn test_nary_decompose_three_inputs() {
+        let (mut plan, mut artifacts, _row) = nary_plan(
+            "c",
+            vec![("a", None), ("b", None), ("d", None)],
+            vec![("a", "b"), ("b", "d")],
+            "a",
+        );
+        let mut diags = Vec::new();
+        decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
+        let errors: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| matches!(d.severity, crate::error::Severity::Error))
+            .collect();
+        assert!(errors.is_empty(), "no errors expected; got {errors:?}");
+
+        let combines = collect_combines(&plan);
+        assert_eq!(
+            combines.len(),
+            2,
+            "3-input decomposition produces N-1 = 2 binary combines"
+        );
+        for n in combines {
+            if let crate::plan::execution::PlanNode::Combine {
+                name,
+                decomposed_from,
+                ..
+            } = n
+            {
+                assert!(
+                    name != "c",
+                    "original combine name 'c' must be gone post-decomposition"
+                );
+                assert_eq!(
+                    decomposed_from.as_deref(),
+                    Some("c"),
+                    "synthetic step {name:?} must record its origin combine"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_nary_decompose_four_inputs() {
+        let (mut plan, mut artifacts, _row) = nary_plan(
+            "c",
+            vec![("a", None), ("b", None), ("d", None), ("e", None)],
+            vec![("a", "b"), ("b", "d"), ("d", "e")],
+            "a",
+        );
+        let mut diags = Vec::new();
+        decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| matches!(d.severity, crate::error::Severity::Error)),
+            "no errors on a connected 4-input chain"
+        );
+        let combines = collect_combines(&plan);
+        assert_eq!(
+            combines.len(),
+            3,
+            "4-input decomposition produces N-1 = 3 binary combines"
+        );
+    }
+
+    #[test]
+    fn test_nary_greedy_ordering() {
+        // Inputs a, b, d, e with predicate edges a—b, b—d, d—e plus a
+        // shortcut a—d, where d has the smallest cardinality. From
+        // driver `a`, the greedy selector should prefer `d` (connected
+        // via the shortcut and lowest cardinality) over `b` (also
+        // connected but larger).
+        let (mut plan, mut artifacts, _row) = nary_plan(
+            "c",
+            vec![
+                ("a", Some(1000)),
+                ("b", Some(500)),
+                ("d", Some(50)),
+                ("e", Some(800)),
+            ],
+            vec![("a", "b"), ("b", "d"), ("d", "e"), ("a", "d")],
+            "a",
+        );
+        let mut diags = Vec::new();
+        decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
+        // Step 0 joined `a` with the smallest connected partner — `d`.
+        // The synthetic step name carries its build qualifier in
+        // `combine_inputs[step.name]`, so we look that up here.
+        let step0 = artifacts
+            .combine_inputs
+            .get("__combine_c_step_0")
+            .expect("step 0 inserted into combine_inputs");
+        assert!(
+            step0.contains_key("d"),
+            "greedy ordering picks d (smallest cardinality, connected via a—d shortcut); \
+             step 0 inputs: {:?}",
+            step0.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_nary_e300_exceeds_cap() {
+        // 9-input combine — exceeds MAX_COMBINE_INPUTS. The pass emits
+        // E300 and skips decomposition; the original node remains.
+        let inputs: Vec<(&str, Option<u64>)> = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+            .iter()
+            .map(|s| (*s, None))
+            .collect();
+        let edges: Vec<(&str, &str)> = (1..inputs.len())
+            .map(|i| (inputs[0].0, inputs[i].0))
+            .collect();
+        let (mut plan, mut artifacts, _row) = nary_plan("c", inputs.clone(), edges, "a");
+        let mut diags = Vec::new();
+        decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
+        let e300: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "E300").collect();
+        assert_eq!(e300.len(), 1, "expected one E300; got {diags:?}");
+        assert!(
+            e300[0].message.contains("maximum supported is 8"),
+            "E300 message must surface the cap; got {:?}",
+            e300[0].message
+        );
+        let combines = collect_combines(&plan);
+        assert_eq!(
+            combines.len(),
+            1,
+            "decomposition is skipped when the cap is exceeded"
+        );
+    }
+
+    #[test]
+    fn test_nary_e305_disconnected_graph() {
+        // 4 inputs split into two components: a—b and d—e. No bridge
+        // edge → E305. Decomposition is skipped.
+        let (mut plan, mut artifacts, _row) = nary_plan(
+            "c",
+            vec![("a", None), ("b", None), ("d", None), ("e", None)],
+            vec![("a", "b"), ("d", "e")],
+            "a",
+        );
+        let mut diags = Vec::new();
+        decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
+        let e305: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "E305").collect();
+        assert_eq!(e305.len(), 1, "expected one E305; got {diags:?}");
+        let combines = collect_combines(&plan);
+        assert_eq!(
+            combines.len(),
+            1,
+            "disconnected graph: no synthetic steps are inserted"
+        );
+        if let crate::plan::execution::PlanNode::Combine {
+            name,
+            decomposed_from,
+            ..
+        } = combines[0]
+        {
+            assert_eq!(name, "c", "original N-ary node must remain");
+            assert!(
+                decomposed_from.is_none(),
+                "the surviving node is the original, not a synthetic step"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nary_intermediate_row_correct() {
+        // Direct unit test of `decompose_nary_combine`: step 0's
+        // intermediate row contains driver + first build qualifiers
+        // only; step 1's adds the second build's qualifiers.
+        let (_, _, merged_row) = nary_plan(
+            "c",
+            vec![("a", Some(100)), ("b", Some(200)), ("d", Some(300))],
+            vec![("a", "b"), ("b", "d")],
+            "a",
+        );
+        let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
+        for (q, card) in [("a", Some(100u64)), ("b", Some(200)), ("d", Some(300))] {
+            let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
+            row_fields.insert(QualifiedField::bare("id"), Type::String);
+            inputs_map.insert(
+                q.to_string(),
+                CombineInput {
+                    upstream_name: Arc::from(q),
+                    row: Row::closed(row_fields, cxl::lexer::Span::new(0, 0)),
+                    estimated_cardinality: card,
+                },
+            );
+        }
+        let dummy_lit = || Expr::Literal {
+            node_id: NodeId(0),
+            value: cxl::ast::LiteralValue::Int(0),
+            span: cxl::lexer::Span::new(0, 0),
+        };
+        let dummy_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: cxl::ast::Program {
+                statements: Vec::new(),
+                span: cxl::lexer::Span::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+            output_row: cxl::typecheck::row::Row::closed(
+                IndexMap::new(),
+                cxl::lexer::Span::new(0, 0),
+            ),
+        });
+        let predicate = DecomposedPredicate {
+            equalities: vec![
+                EqualityConjunct {
+                    left_expr: dummy_lit(),
+                    left_input: Arc::from("a"),
+                    left_program: Arc::clone(&dummy_program),
+                    right_expr: dummy_lit(),
+                    right_input: Arc::from("b"),
+                    right_program: Arc::clone(&dummy_program),
+                },
+                EqualityConjunct {
+                    left_expr: dummy_lit(),
+                    left_input: Arc::from("b"),
+                    left_program: Arc::clone(&dummy_program),
+                    right_expr: dummy_lit(),
+                    right_input: Arc::from("d"),
+                    right_program: Arc::clone(&dummy_program),
+                },
+            ],
+            ranges: Vec::new(),
+            residual: None,
+        };
+        let steps = decompose_nary_combine(
+            "c",
+            &inputs_map,
+            &predicate,
+            &merged_row,
+            "a",
+            Span::SYNTHETIC,
+        )
+        .expect("decomposition succeeds on a connected chain");
+
+        let step0_quals: HashSet<&str> = steps[0]
+            .intermediate_row
+            .fields()
+            .filter_map(|(qf, _)| qf.qualifier.as_deref())
+            .collect();
+        assert!(
+            step0_quals.contains("a") && step0_quals.contains("b") && !step0_quals.contains("d"),
+            "step 0 intermediate row must contain driver + first build only; got {step0_quals:?}"
+        );
+
+        let step1_quals: HashSet<&str> = steps[1]
+            .intermediate_row
+            .fields()
+            .filter_map(|(qf, _)| qf.qualifier.as_deref())
+            .collect();
+        assert!(
+            step1_quals.contains("a") && step1_quals.contains("b") && step1_quals.contains("d"),
+            "step 1 intermediate row must contain all joined qualifiers; got {step1_quals:?}"
+        );
+    }
+
+    #[test]
+    fn test_nary_predicate_assignment() {
+        // Predicates a—b and b—d. After decomposition, step 0 carries
+        // the a—b conjunct; step 1 carries the b—d conjunct. No
+        // conjunct lands on two steps.
+        let (_, _, merged_row) = nary_plan(
+            "c",
+            vec![("a", None), ("b", None), ("d", None)],
+            vec![("a", "b"), ("b", "d")],
+            "a",
+        );
+        let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
+        for q in ["a", "b", "d"] {
+            let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
+            row_fields.insert(QualifiedField::bare("id"), Type::String);
+            inputs_map.insert(
+                q.to_string(),
+                CombineInput {
+                    upstream_name: Arc::from(q),
+                    row: Row::closed(row_fields, cxl::lexer::Span::new(0, 0)),
+                    estimated_cardinality: None,
+                },
+            );
+        }
+        let dummy_lit = || Expr::Literal {
+            node_id: NodeId(0),
+            value: cxl::ast::LiteralValue::Int(0),
+            span: cxl::lexer::Span::new(0, 0),
+        };
+        let dummy_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: cxl::ast::Program {
+                statements: Vec::new(),
+                span: cxl::lexer::Span::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+            output_row: cxl::typecheck::row::Row::closed(
+                IndexMap::new(),
+                cxl::lexer::Span::new(0, 0),
+            ),
+        });
+        let predicate = DecomposedPredicate {
+            equalities: vec![
+                EqualityConjunct {
+                    left_expr: dummy_lit(),
+                    left_input: Arc::from("a"),
+                    left_program: Arc::clone(&dummy_program),
+                    right_expr: dummy_lit(),
+                    right_input: Arc::from("b"),
+                    right_program: Arc::clone(&dummy_program),
+                },
+                EqualityConjunct {
+                    left_expr: dummy_lit(),
+                    left_input: Arc::from("b"),
+                    left_program: Arc::clone(&dummy_program),
+                    right_expr: dummy_lit(),
+                    right_input: Arc::from("d"),
+                    right_program: Arc::clone(&dummy_program),
+                },
+            ],
+            ranges: Vec::new(),
+            residual: None,
+        };
+        let steps = decompose_nary_combine(
+            "c",
+            &inputs_map,
+            &predicate,
+            &merged_row,
+            "a",
+            Span::SYNTHETIC,
+        )
+        .expect("decomposition succeeds on a connected chain");
+
+        assert_eq!(steps[0].predicate_slice.equalities.len(), 1);
+        let step0_eq = &steps[0].predicate_slice.equalities[0];
+        assert_eq!(step0_eq.left_input.as_ref(), "a");
+        assert_eq!(step0_eq.right_input.as_ref(), "b");
+
+        assert_eq!(steps[1].predicate_slice.equalities.len(), 1);
+        let step1_eq = &steps[1].predicate_slice.equalities[0];
+        assert_eq!(step1_eq.left_input.as_ref(), "b");
+        assert_eq!(step1_eq.right_input.as_ref(), "d");
     }
 }
