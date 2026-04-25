@@ -88,6 +88,15 @@ impl CombineResolverMapping {
     /// The `qualified` index is the pre-resolved map verbatim; the
     /// `bare_to_side` index is derived by filtering qualified entries
     /// to unambiguous bare names (names appearing on exactly one input).
+    ///
+    /// Chain-intermediate inputs (left-deep N-ary decomposition driver
+    /// rows) carry `QualifiedField`s whose inner `qualifier` field is
+    /// `Some(orig_qualifier)` — that inner qualifier wins over the
+    /// outer `IndexMap` key when matching against the resolved column
+    /// map, because the resolved column map is keyed by the original
+    /// author-visible qualifier (`a`, `b`, …) and the outer key for a
+    /// chain-intermediate driver entry is the synthetic step name
+    /// (`__combine_X_step_0`).
     pub(crate) fn from_pre_resolved(
         resolved_column_map: &crate::plan::execution::ResolvedColumnMap,
         combine_inputs: &IndexMap<String, CombineInput>,
@@ -100,11 +109,19 @@ impl CombineResolverMapping {
         let mut bare_first: HashMap<Arc<str>, (JoinSide, u32)> = HashMap::new();
         let mut available: Vec<String> = Vec::new();
 
-        for (qualifier, input) in combine_inputs {
+        for (outer_qualifier, input) in combine_inputs {
             for (field, _ty) in input.row.fields() {
                 let bare = Arc::clone(&field.name);
-                let qf = QualifiedField::qualified(qualifier.as_str(), Arc::clone(&bare));
-                available.push(format!("{qualifier}.{bare}"));
+                // Prefer the QualifiedField's inner qualifier when the
+                // row carries qualified fields (chain-intermediate
+                // case); fall back to the outer IndexMap key for plain
+                // bare-field rows (sources, plain build inputs).
+                let resolve_qual: Arc<str> = field
+                    .qualifier
+                    .clone()
+                    .unwrap_or_else(|| Arc::from(outer_qualifier.as_str()));
+                let qf = QualifiedField::qualified(resolve_qual.as_ref(), Arc::clone(&bare));
+                available.push(format!("{resolve_qual}.{bare}"));
                 *bare_counts.entry(Arc::clone(&bare)).or_insert(0) += 1;
                 if let Some(&(side, idx)) = resolved_column_map.get(&qf) {
                     bare_first.entry(bare).or_insert((side, idx));

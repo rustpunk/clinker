@@ -926,6 +926,119 @@ mod tests {
         }
     }
 
+    /// End-to-end execution of the 3-input shared-key combine fixture.
+    /// orders ⨝ products on product_id, then chain-intermediate ⨝
+    /// categories on category_id. Every driver row matches exactly one
+    /// product and one category by construction; the chain-intermediate
+    /// schema's encoded columns are the load-bearing invariant — step 1
+    /// reads `b.category_id` from the `__products__category_id` slot of
+    /// the encoded driver record.
+    #[test]
+    fn test_nary_three_input_exec_correct() {
+        let yaml = load_fixture("three_input_shared_key.yaml");
+        let orders_csv =
+            "order_id,product_id,amount\nord-1,p-1,100\nord-2,p-2,200\nord-3,p-3,300\n";
+        let products_csv = "product_id,name,category_id\n\
+            p-1,Apple,c-fruit\n\
+            p-2,Bread,c-grain\n\
+            p-3,Carrot,c-veg\n";
+        let categories_csv = "category_id,category_name\n\
+            c-fruit,Fruit\n\
+            c-grain,Grain\n\
+            c-veg,Vegetable\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("orders", orders_csv),
+                ("products", products_csv),
+                ("categories", categories_csv),
+            ],
+            Some("orders"),
+        )
+        .expect("3-input shared-key fixture must execute end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        let expected = canonicalize_csv(
+            "order_id,product_id,product_name,category_name,amount\n\
+            ord-1,p-1,Apple,Fruit,100\n\
+            ord-2,p-2,Bread,Grain,200\n\
+            ord-3,p-3,Carrot,Vegetable,300\n",
+        );
+        assert_eq!(
+            canon, expected,
+            "3-input chain output must match the hand-computed transitive join; got:\n{canon}"
+        );
+    }
+
+    /// End-to-end execution of a 4-input combine that decomposes into
+    /// a 3-step chain: a ⨝ b, then ⨝ c, then ⨝ d. Each step is
+    /// pure-equi on the shared `id` column so every step uses
+    /// HashBuildProbe; both intermediate steps emit encoded passthrough
+    /// records that the next step's resolver mapping reads positionally.
+    #[test]
+    fn test_nary_four_input_exec_correct() {
+        let yaml = load_fixture("four_input_equi.yaml");
+        let a_csv = "id,a_val\n1,a-one\n2,a-two\n3,a-three\n";
+        let b_csv = "id,b_val\n1,b-one\n2,b-two\n3,b-three\n";
+        let c_csv = "id,c_val\n1,c-one\n2,c-two\n3,c-three\n";
+        let d_csv = "id,d_val\n1,d-one\n2,d-two\n3,d-three\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("a_src", a_csv),
+                ("b_src", b_csv),
+                ("c_src", c_csv),
+                ("d_src", d_csv),
+            ],
+            Some("a_src"),
+        )
+        .expect("4-input combine fixture must execute end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        let expected = canonicalize_csv(
+            "id,a_val,b_val,c_val,d_val\n\
+            1,a-one,b-one,c-one,d-one\n\
+            2,a-two,b-two,c-two,d-two\n\
+            3,a-three,b-three,c-three,d-three\n",
+        );
+        assert_eq!(
+            canon, expected,
+            "4-input chain output must match the hand-computed transitive join; got:\n{canon}"
+        );
+    }
+
+    /// End-to-end execution of a 3-input mixed-predicate combine. Step
+    /// 0 = a ⨝ b on `a.id == b.id` (pure equi → HashBuildProbe); step 1
+    /// = (a,b) ⨝ c on `b.start >= c.begin and b.fin < c.finish` (pure
+    /// range → IEJoin). Strategy selection runs per chain step against
+    /// each step's predicate slice, so this fixture exercises the
+    /// hash-then-IEJoin transition across the chain boundary.
+    #[test]
+    fn test_nary_three_input_mixed_exec_correct() {
+        let yaml = load_fixture("three_input_mixed.yaml");
+        let a_csv = "id,seq\n1,1\n2,2\n3,3\n";
+        let b_csv = "id,start,fin\n1,10,20\n2,30,40\n3,50,60\n";
+        let c_csv = "begin,finish,window_id\n5,25,W-EARLY\n25,45,W-MID\n45,65,W-LATE\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[("a_src", a_csv), ("b_src", b_csv), ("c_src", c_csv)],
+            Some("a_src"),
+        )
+        .expect("3-input mixed-predicate fixture must execute end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        // Hand-computed: each (a,b) row falls into exactly one c
+        // window. (1, 10..20) → W-EARLY (5..25); (2, 30..40) → W-MID
+        // (25..45); (3, 50..60) → W-LATE (45..65).
+        let expected = canonicalize_csv(
+            "id,seq,start,fin,window_id\n\
+            1,1,10,20,W-EARLY\n\
+            2,2,30,40,W-MID\n\
+            3,3,50,60,W-LATE\n",
+        );
+        assert_eq!(
+            canon, expected,
+            "mixed-predicate chain output must match hand-computed expected rows; got:\n{canon}"
+        );
+    }
+
     /// Pure-range combine compiles successfully under the IEJoin
     /// planner: the `select_combine_strategies` post-pass emits
     /// W305 (advisory: no equality conjuncts) and selects the

@@ -1724,8 +1724,30 @@ impl PipelineConfig {
         // the fully-enriched DAG; emits E300 (input cap) and E305
         // (disconnected join graph). Mutates `artifacts` in place to
         // add per-step `combine_inputs` / `combine_predicates` /
-        // `combine_driving` entries.
+        // `combine_driving` entries, and grows the graph with
+        // (N-2) synthetic chain nodes per N-ary combine.
         crate::plan::combine::decompose_nary_combines(&mut dag, &mut artifacts, &mut diags);
+
+        // Synthetic chain nodes pushed by `decompose_nary_combines`
+        // are not in `dag.topo_order` — that vector was built from the
+        // pre-decomposition graph. Re-derive the topological order so
+        // the executor walks every chain step in dependency order.
+        // The graph remains acyclic by construction (each step has
+        // exactly two distinct upstream edges chosen from previously
+        // placed nodes).
+        dag.topo_order = match petgraph::algo::toposort(&dag.graph, None) {
+            Ok(order) => order,
+            Err(cycle) => {
+                let cycle_path =
+                    crate::plan::execution::extract_cycle_path(&dag.graph, cycle.node_id());
+                diags.push(Diagnostic::error(
+                    "E003",
+                    format!("cycle detected post-combine-decomposition: {cycle_path}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            }
+        };
 
         // Combine strategy + driving-input post-pass. Runs after the
         // DAG is fully enriched (so every PlanNode::Combine is present

@@ -402,7 +402,6 @@ fn pwmj_numeric(left_keys: &[i64], right_keys: &[i64], op: RangeOp) -> Vec<(usiz
 /// callers can update one field without rewriting the call site.
 pub(crate) struct IEJoinExec<'a> {
     pub name: &'a str,
-    pub driving_input: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
     pub build_records: Vec<Record>,
@@ -426,7 +425,6 @@ pub(crate) fn execute_combine_iejoin(
 ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
     let IEJoinExec {
         name,
-        driving_input,
         build_qualifier,
         driver_records,
         build_records,
@@ -471,40 +469,40 @@ pub(crate) fn execute_combine_iejoin(
 
     // Build extractors aligned to the driver and build qualifiers, one
     // per equality conjunct. Mirrors the alignment loop in
-    // executor::mod.rs's HashBuildProbe arm.
+    // executor::mod.rs's HashBuildProbe arm — the side that matches the
+    // build qualifier feeds the build extractor; the other side feeds
+    // the driver extractor regardless of its qualifier (chain-buried
+    // qualifiers from N-ary decomposition route through the resolver
+    // mapping at extract time).
     let mut driver_eq_progs: Vec<(Arc<TypedProgram>, Expr)> = Vec::new();
     let mut build_eq_progs: Vec<(Arc<TypedProgram>, Expr)> = Vec::new();
     for eq in &decomposed.equalities {
-        let (driver_expr, driver_prog, build_expr, build_prog) = if eq.left_input.as_ref()
-            == driving_input
-            && eq.right_input.as_ref() == build_qualifier
-        {
-            (
-                eq.left_expr.clone(),
-                Arc::clone(&eq.left_program),
-                eq.right_expr.clone(),
-                Arc::clone(&eq.right_program),
-            )
-        } else if eq.left_input.as_ref() == build_qualifier
-            && eq.right_input.as_ref() == driving_input
-        {
-            (
-                eq.right_expr.clone(),
-                Arc::clone(&eq.right_program),
-                eq.left_expr.clone(),
-                Arc::clone(&eq.left_program),
-            )
-        } else {
-            return Err(PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!(
-                    "equality conjunct has qualifiers ({}, {}); expected ({driving_input}, \
-                     {build_qualifier})",
-                    eq.left_input, eq.right_input
-                ),
-            });
-        };
+        let (driver_expr, driver_prog, build_expr, build_prog) =
+            if eq.left_input.as_ref() == build_qualifier {
+                (
+                    eq.right_expr.clone(),
+                    Arc::clone(&eq.right_program),
+                    eq.left_expr.clone(),
+                    Arc::clone(&eq.left_program),
+                )
+            } else if eq.right_input.as_ref() == build_qualifier {
+                (
+                    eq.left_expr.clone(),
+                    Arc::clone(&eq.left_program),
+                    eq.right_expr.clone(),
+                    Arc::clone(&eq.right_program),
+                )
+            } else {
+                return Err(PipelineError::Internal {
+                    op: "combine",
+                    node: name.to_string(),
+                    detail: format!(
+                        "equality conjunct has qualifiers ({}, {}); neither matches \
+                         build qualifier {build_qualifier:?}",
+                        eq.left_input, eq.right_input
+                    ),
+                });
+            };
         driver_eq_progs.push((driver_prog, driver_expr));
         build_eq_progs.push((build_prog, build_expr));
     }
@@ -514,18 +512,18 @@ pub(crate) fn execute_combine_iejoin(
     // Range-key extractors, one per range conjunct, aligned to driver
     // and build sides. The range conjunct does NOT carry a per-side
     // TypedProgram (range expressions share the where-clause program),
-    // so we clone `range_program` for each side.
+    // so we clone `range_program` for each side. The build qualifier
+    // selects which side is build; the OTHER side feeds the driver
+    // extractor regardless of its qualifier (chain-buried qualifiers
+    // from N-ary decomposition route through the resolver mapping at
+    // extract time).
     let mut driver_range_progs: Vec<(Arc<TypedProgram>, Expr)> = Vec::new();
     let mut build_range_progs: Vec<(Arc<TypedProgram>, Expr)> = Vec::new();
     let mut range_ops: Vec<RangeOp> = Vec::new();
     for r in &decomposed.ranges {
-        let (driver_expr, build_expr, op) = if r.left_input.as_ref() == driving_input
-            && r.right_input.as_ref() == build_qualifier
-        {
+        let (driver_expr, build_expr, op) = if r.right_input.as_ref() == build_qualifier {
             (r.left_expr.clone(), r.right_expr.clone(), r.op)
-        } else if r.left_input.as_ref() == build_qualifier
-            && r.right_input.as_ref() == driving_input
-        {
+        } else if r.left_input.as_ref() == build_qualifier {
             // Flip the operator so the predicate reads as
             // `driver_key OP build_key`.
             let flipped = match r.op {
@@ -540,8 +538,8 @@ pub(crate) fn execute_combine_iejoin(
                 op: "combine",
                 node: name.to_string(),
                 detail: format!(
-                    "range conjunct has qualifiers ({}, {}); expected ({driving_input}, \
-                     {build_qualifier})",
+                    "range conjunct has qualifiers ({}, {}); neither matches build \
+                     qualifier {build_qualifier:?}",
                     r.left_input, r.right_input
                 ),
             });
@@ -590,10 +588,16 @@ pub(crate) fn execute_combine_iejoin(
     let mut range_buf: Vec<Value> = Vec::new();
 
     for (i, (rec, _rn)) in driver_records.iter().enumerate() {
+        // Driver-side key extraction routes through `CombineResolver`
+        // so chain-buried qualifiers (e.g. `b.id` against an N-ary
+        // decomposition step's encoded intermediate record) resolve
+        // via the resolved column map rather than `Record`'s
+        // bare-name fallback.
+        let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
         eq_buf.clear();
         if !driver_extractor.is_empty() {
             driver_extractor
-                .extract_into(ctx, rec, &mut eq_buf)
+                .extract_into(ctx, &driver_resolver, &mut eq_buf)
                 .map_err(|e| key_eval_error(name, "driving", e))?;
         }
         if eq_buf.iter().any(|v| matches!(v, Value::Null)) {
@@ -602,7 +606,7 @@ pub(crate) fn execute_combine_iejoin(
         }
         range_buf.clear();
         driver_range_extractor
-            .extract_into(ctx, rec, &mut range_buf)
+            .extract_into(ctx, &driver_resolver, &mut range_buf)
             .map_err(|e| key_eval_error(name, "driving", e))?;
         let Some(rk) = range_keys_to_i64_pair(&range_buf) else {
             unmatched_drivers.push(i);
@@ -748,49 +752,95 @@ pub(crate) fn execute_combine_iejoin(
                         matched_driver[driver_idx] = true;
                     }
                     MatchMode::First | MatchMode::All => {
-                        let resolver = CombineResolver::new(
-                            resolver_mapping,
-                            driver_record,
-                            Some(build_record),
-                        );
-                        let evaluator =
-                            body_eval.as_mut().ok_or_else(|| PipelineError::Internal {
-                                op: "combine",
-                                node: name.to_string(),
-                                detail: "combine body typed program missing for non-collect match"
-                                    .to_string(),
-                            })?;
-                        match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                            Ok(EvalResult::Emit { fields, metadata }) => {
-                                let mut rec = match output_schema {
-                                    Some(s) => widen_record_to_schema(driver_record, s),
-                                    None => driver_record.clone(),
-                                };
-                                for (n, v) in fields {
-                                    rec.set(&n, v);
-                                }
-                                for (k, v) in metadata {
-                                    let _ = rec.set_meta(&k, v);
-                                }
-                                output_records.push((rec, driver_order));
-                                matched_driver[driver_idx] = true;
-                                emitted_since_check += 1;
-                                if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                                    if budget.should_abort() {
-                                        return Err(PipelineError::Compilation {
-                                            transform_name: name.to_string(),
-                                            messages: vec![format!(
-                                                "E310 combine probe memory limit exceeded: \
-                                                 hard limit {}",
-                                                budget.hard_limit()
-                                            )],
-                                        });
+                        if let Some(evaluator) = body_eval.as_mut() {
+                            let resolver = CombineResolver::new(
+                                resolver_mapping,
+                                driver_record,
+                                Some(build_record),
+                            );
+                            match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
+                                Ok(EvalResult::Emit { fields, metadata }) => {
+                                    let mut rec = match output_schema {
+                                        Some(s) => widen_record_to_schema(driver_record, s),
+                                        None => driver_record.clone(),
+                                    };
+                                    for (n, v) in fields {
+                                        rec.set(&n, v);
                                     }
-                                    emitted_since_check = 0;
+                                    for (k, v) in metadata {
+                                        let _ = rec.set_meta(&k, v);
+                                    }
+                                    output_records.push((rec, driver_order));
+                                    matched_driver[driver_idx] = true;
+                                    emitted_since_check += 1;
+                                    if emitted_since_check >= MEMORY_CHECK_INTERVAL {
+                                        if budget.should_abort() {
+                                            return Err(PipelineError::Compilation {
+                                                transform_name: name.to_string(),
+                                                messages: vec![format!(
+                                                    "E310 combine probe memory limit exceeded: \
+                                                     hard limit {}",
+                                                    budget.hard_limit()
+                                                )],
+                                            });
+                                        }
+                                        emitted_since_check = 0;
+                                    }
                                 }
+                                Ok(EvalResult::Skip(_)) => {}
+                                Err(e) => return Err(PipelineError::from(e)),
                             }
-                            Ok(EvalResult::Skip(_)) => {}
-                            Err(e) => return Err(PipelineError::from(e)),
+                        } else {
+                            // Body-less synthetic intermediate step
+                            // from N-ary decomposition: emit one
+                            // record per matched pair by concatenating
+                            // driver values then build values onto the
+                            // step's encoded `Arc<Schema>`. Mirrors
+                            // the HashBuildProbe arm's passthrough
+                            // path; downstream chain step's resolver
+                            // mapping reads the encoded columns at
+                            // their declared positions.
+                            let target_schema =
+                                output_schema.ok_or_else(|| PipelineError::Internal {
+                                    op: "combine",
+                                    node: name.to_string(),
+                                    detail: "synthetic combine step has no output schema; \
+                                             decomposition pass did not run"
+                                        .to_string(),
+                                })?;
+                            let mut values: Vec<Value> =
+                                Vec::with_capacity(target_schema.column_count());
+                            values.extend(driver_record.values().iter().cloned());
+                            values.extend(build_record.values().iter().cloned());
+                            if values.len() != target_schema.column_count() {
+                                return Err(PipelineError::Internal {
+                                    op: "combine",
+                                    node: name.to_string(),
+                                    detail: format!(
+                                        "synthetic combine step produced {} concatenated \
+                                         values; encoded schema has {} columns",
+                                        values.len(),
+                                        target_schema.column_count()
+                                    ),
+                                });
+                            }
+                            let rec = Record::new(Arc::clone(target_schema), values);
+                            output_records.push((rec, driver_order));
+                            matched_driver[driver_idx] = true;
+                            emitted_since_check += 1;
+                            if emitted_since_check >= MEMORY_CHECK_INTERVAL {
+                                if budget.should_abort() {
+                                    return Err(PipelineError::Compilation {
+                                        transform_name: name.to_string(),
+                                        messages: vec![format!(
+                                            "E310 combine probe memory limit exceeded: \
+                                             hard limit {}",
+                                            budget.hard_limit()
+                                        )],
+                                    });
+                                }
+                                emitted_since_check = 0;
+                            }
                         }
                     }
                 }

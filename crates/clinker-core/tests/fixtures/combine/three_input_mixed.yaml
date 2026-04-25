@@ -1,0 +1,60 @@
+# 3-input combine, mixed equi+range across the chain.
+# Step 0 = a ⨝ b on a.id == b.id (pure equi → HashBuildProbe).
+# Step 1 = step0 ⨝ c on b.start >= c.begin and b.fin < c.finish
+#   (pure range → IEJoin) — exercises strategy switch per chain step.
+# Each (a,b) pair has exactly one matching c window.
+pipeline:
+  name: three_input_mixed
+nodes:
+  - type: source
+    name: a_src
+    config:
+      name: a_src
+      type: csv
+      path: tests/fixtures/combine/data/three_input_mixed_a.csv
+      schema:
+        - { name: id, type: string }
+        - { name: seq, type: int }
+  - type: source
+    name: b_src
+    config:
+      name: b_src
+      type: csv
+      path: tests/fixtures/combine/data/three_input_mixed_b.csv
+      schema:
+        - { name: id, type: string }
+        - { name: start, type: int }
+        - { name: fin, type: int }
+  - type: source
+    name: c_src
+    config:
+      name: c_src
+      type: csv
+      path: tests/fixtures/combine/data/three_input_mixed_c.csv
+      schema:
+        - { name: begin, type: int }
+        - { name: finish, type: int }
+        - { name: window_id, type: string }
+  - type: combine
+    name: joined_mixed
+    input:
+      a: a_src
+      b: b_src
+      c: c_src
+    config:
+      where: "a.id == b.id and b.start >= c.begin and b.fin < c.finish"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = a.id
+        emit seq = a.seq
+        emit start = b.start
+        emit fin = b.fin
+        emit window_id = c.window_id
+  - type: output
+    name: joined_mixed_out
+    input: joined_mixed
+    config:
+      name: joined_mixed_out
+      type: csv
+      path: three_input_mixed_out.csv

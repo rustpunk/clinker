@@ -3894,50 +3894,51 @@ impl PipelineExecutor {
                     }
 
                     // Build the KeyExtractor pair: one side aligned to
-                    // the build qualifier, the other to the driver. The
+                    // the build qualifier, the other to the probe. The
                     // i-th equality conjunct contributes one key column
-                    // to each extractor — the expression whose
-                    // `*_input` matches the side we're extracting for.
+                    // to each extractor — the side that matches the
+                    // build qualifier feeds the build extractor; the
+                    // OTHER side feeds the probe extractor. For an
+                    // N-ary chain step, the probe-side qualifier may be
+                    // a chain-buried original qualifier (e.g. `b` in a
+                    // step that joins `__combine_X_step_0` against
+                    // `c`); the executor accepts any non-build
+                    // qualifier as probe-side and routes its lookup
+                    // through the resolver mapping below.
                     let mut build_progs: Vec<(Arc<TypedProgram>, cxl::ast::Expr)> = Vec::new();
                     let mut probe_progs: Vec<(Arc<TypedProgram>, cxl::ast::Expr)> = Vec::new();
                     for eq in &decomposed.equalities {
-                        let (build_expr, build_prog, probe_expr, probe_prog) = if eq
-                            .left_input
-                            .as_ref()
-                            == build_qualifier.as_str()
-                            && eq.right_input.as_ref() == driving_input.as_str()
-                        {
-                            (
-                                eq.left_expr.clone(),
-                                Arc::clone(&eq.left_program),
-                                eq.right_expr.clone(),
-                                Arc::clone(&eq.right_program),
-                            )
-                        } else if eq.left_input.as_ref() == driving_input.as_str()
-                            && eq.right_input.as_ref() == build_qualifier.as_str()
-                        {
-                            (
-                                eq.right_expr.clone(),
-                                Arc::clone(&eq.right_program),
-                                eq.left_expr.clone(),
-                                Arc::clone(&eq.left_program),
-                            )
-                        } else {
-                            // Qualifiers on this equality conjunct
-                            // do not match the combine's driver/
-                            // build pair — the plan-time
-                            // decomposition put a foreign conjunct
-                            // into `equalities`. Planner bug.
-                            return Err(PipelineError::Internal {
-                                op: "combine",
-                                node: name.clone(),
-                                detail: format!(
-                                    "equality conjunct has qualifiers ({}, {}); \
-                                         expected ({}, {})",
-                                    eq.left_input, eq.right_input, driving_input, build_qualifier,
-                                ),
-                            });
-                        };
+                        let (build_expr, build_prog, probe_expr, probe_prog) =
+                            if eq.left_input.as_ref() == build_qualifier.as_str() {
+                                (
+                                    eq.left_expr.clone(),
+                                    Arc::clone(&eq.left_program),
+                                    eq.right_expr.clone(),
+                                    Arc::clone(&eq.right_program),
+                                )
+                            } else if eq.right_input.as_ref() == build_qualifier.as_str() {
+                                (
+                                    eq.right_expr.clone(),
+                                    Arc::clone(&eq.right_program),
+                                    eq.left_expr.clone(),
+                                    Arc::clone(&eq.left_program),
+                                )
+                            } else {
+                                // Neither side matches the build
+                                // qualifier — the plan-time
+                                // decomposition placed a foreign
+                                // conjunct into `equalities`. Planner
+                                // bug.
+                                return Err(PipelineError::Internal {
+                                    op: "combine",
+                                    node: name.clone(),
+                                    detail: format!(
+                                        "equality conjunct has qualifiers ({}, {}); \
+                                         neither matches build qualifier {build_qualifier:?}",
+                                        eq.left_input, eq.right_input,
+                                    ),
+                                });
+                            };
                         build_progs.push((build_prog, build_expr));
                         probe_progs.push((probe_prog, probe_expr));
                     }
@@ -3984,7 +3985,6 @@ impl PipelineExecutor {
                         };
                         let output_records = execute_combine_iejoin(IEJoinExec {
                             name,
-                            driving_input,
                             build_qualifier: &build_qualifier,
                             driver_records: driver_buf,
                             build_records,
@@ -4069,9 +4069,21 @@ impl PipelineExecutor {
                             source_row: rn,
                         };
 
+                        // Probe-side key extraction routes through the
+                        // shared `CombineResolver` so chain-buried
+                        // qualifiers (e.g. `b.id` against an N-ary
+                        // decomposition step's encoded intermediate
+                        // record) resolve via the resolved column map
+                        // rather than `Record::resolve_qualified`'s
+                        // bare-name fallback. For non-chain combines
+                        // the lookup goes through the same path with
+                        // the same answer (probe-side qualifier maps
+                        // to its native source-row position).
+                        let probe_key_resolver =
+                            CombineResolver::new(&resolver_mapping, &probe_record, None);
                         probe_keys_buf.clear();
                         probe_extractor
-                            .extract_into(&ctx, &probe_record, &mut probe_keys_buf)
+                            .extract_into(&ctx, &probe_key_resolver, &mut probe_keys_buf)
                             .map_err(|e| PipelineError::Compilation {
                                 transform_name: name.clone(),
                                 messages: vec![format!("combine probe key eval error: {e}")],
@@ -4256,23 +4268,13 @@ impl PipelineExecutor {
                                             }
                                         }
                                     }
-                                } else {
+                                } else if let Some(evaluator) = body_evaluator.as_mut() {
                                     for matched in &matched_records {
                                         let resolver = CombineResolver::new(
                                             &resolver_mapping,
                                             &probe_record,
                                             Some(matched),
                                         );
-                                        let evaluator =
-                                            body_evaluator.as_mut().ok_or_else(|| {
-                                                PipelineError::Internal {
-                                                    op: "combine",
-                                                    node: name.clone(),
-                                                    detail: "combine body typed program \
-                                                             missing for non-collect match"
-                                                        .to_string(),
-                                                }
-                                            })?;
                                         match evaluator
                                             .eval_record::<NullStorage>(&ctx, &resolver, None)
                                         {
@@ -4305,6 +4307,49 @@ impl PipelineExecutor {
                                                 return Err(PipelineError::from(e));
                                             }
                                         }
+                                    }
+                                } else {
+                                    // Body-less synthetic step from
+                                    // N-ary combine decomposition: the
+                                    // step's encoded output schema
+                                    // concatenates driver columns then
+                                    // build columns, both in the order
+                                    // their `intermediate_row.fields()`
+                                    // walk produces. Emit one record
+                                    // per match by concatenating value
+                                    // slices and constructing on the
+                                    // encoded `Arc<Schema>`.
+                                    let target_schema =
+                                        combine_output_schema.as_ref().ok_or_else(|| {
+                                            PipelineError::Internal {
+                                                op: "combine",
+                                                node: name.clone(),
+                                                detail: "synthetic combine step has no output \
+                                                     schema; decomposition pass did not run"
+                                                    .to_string(),
+                                            }
+                                        })?;
+                                    for matched in &matched_records {
+                                        let mut values: Vec<Value> =
+                                            Vec::with_capacity(target_schema.column_count());
+                                        values.extend(probe_record.values().iter().cloned());
+                                        values.extend(matched.values().iter().cloned());
+                                        if values.len() != target_schema.column_count() {
+                                            return Err(PipelineError::Internal {
+                                                op: "combine",
+                                                node: name.clone(),
+                                                detail: format!(
+                                                    "synthetic combine step produced {} \
+                                                     concatenated values; encoded schema \
+                                                     has {} columns",
+                                                    values.len(),
+                                                    target_schema.column_count()
+                                                ),
+                                            });
+                                        }
+                                        let rec = Record::new(Arc::clone(target_schema), values);
+                                        output_records.push((rec, rn));
+                                        emitted_since_check += 1;
                                     }
                                 }
                             }

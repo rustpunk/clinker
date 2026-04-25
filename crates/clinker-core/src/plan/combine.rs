@@ -912,6 +912,24 @@ fn combine_w306_ambiguous_driver(combine_name: &str, span: Span) -> Diagnostic {
 /// skips the rewrite.
 pub(crate) const MAX_COMBINE_INPUTS: usize = 8;
 
+/// Encode a `(qualifier, field)` pair into a flat schema column name for
+/// chain-intermediate combine outputs.
+///
+/// A non-final step in an N-ary decomposition chain emits records whose
+/// schema is the union of the joined inputs' fields. Original qualifiers
+/// (`orders`, `products`, …) are not preserved on a flat
+/// `clinker_record::Schema` — every column is a single bare string —
+/// so the decomposition encodes each `(qualifier, field)` pair as
+/// `__{qualifier}__{field}` and routes the next step's predicate /
+/// body through the executor's qualifier-aware resolver to find them
+/// again. The double-underscore prefix distinguishes encoded columns
+/// from author-declared field names which never legally start with
+/// `__` (CXL identifiers begin with `[A-Za-z_]` but pipeline-author
+/// fields by convention do not lead with double-underscore).
+pub(crate) fn encode_chain_column(qualifier: &str, name: &str) -> String {
+    format!("__{qualifier}__{name}")
+}
+
 /// One link in an N-ary combine's decomposition chain.
 ///
 /// `name` is the synthetic node name `__combine_{original}_step_{i}`;
@@ -1057,10 +1075,26 @@ pub(crate) fn decompose_nary_combine(
                 assigned_range.insert(i);
             }
         }
+        // When the slice has range conjuncts but no equality program
+        // to source NodeIds from, the IEJoin executor falls back to
+        // `slice.residual` for the typed-program reference its range
+        // KeyExtractor needs. The original predicate's residual covers
+        // every range NodeId because `decompose_predicate` folds every
+        // range conjunct into the residual program at the original
+        // merged-row scope. Threading that same `Arc` through here
+        // satisfies the IEJoin invariant without re-typechecking;
+        // when the slice has equalities, the equality conjunct's
+        // `left_program` provides the same coverage and the residual
+        // is unused.
+        let slice_residual = if !ranges.is_empty() && equalities.is_empty() {
+            predicate.residual.as_ref().map(Arc::clone)
+        } else {
+            None
+        };
         let predicate_slice = DecomposedPredicate {
             equalities,
             ranges,
-            residual: None,
+            residual: slice_residual,
         };
 
         // Column-prune the merged row to fields whose qualifier is in
@@ -1340,6 +1374,19 @@ pub(crate) fn decompose_nary_combines(
             continue;
         };
 
+        // Migrate the original combine's body typed program (if any)
+        // and resolved column map from the original-name slot to the
+        // final step's name. The body's `QualifiedFieldRef`s reference
+        // original qualifiers (`orders`, `products`, …); the final
+        // step's resolved column map is rebuilt below to map those
+        // through the chain.
+        let original_body_typed = artifacts.typed.remove(&original_name);
+        // Drop the original combine's resolved column map — we rebuild
+        // per-step maps below, and the final step's map differs from
+        // the original because chain qualifiers route through Probe at
+        // encoded indices rather than directly to the original sources.
+        artifacts.combine_resolved_columns.remove(&original_name);
+
         // Build a name → NodeIndex lookup over the current graph for
         // wiring source-edges. Snapshot here so it captures the
         // pre-mutation state; new step nodes get added to the local
@@ -1360,24 +1407,112 @@ pub(crate) fn decompose_nary_combines(
             plan.graph.remove_edge(eid);
         }
 
+        // Compute each non-final step's encoded output `Arc<Schema>`.
+        // Column order matches `intermediate_row.fields()` iteration
+        // order; the i-th encoded column corresponds to the i-th
+        // qualified field in the running merged-row prefix. This
+        // alignment is the load-bearing invariant for resolved column
+        // map indices below — the encoded schema column at index `j`
+        // holds the value for the i-th joined `(qualifier, field)`,
+        // and `j == position_in_intermediate_row.fields()`.
+        let last_step_idx = steps.len() - 1;
+        let mut step_output_schemas: Vec<Arc<clinker_record::Schema>> =
+            Vec::with_capacity(steps.len());
+        for (i, step) in steps.iter().enumerate() {
+            let schema = if i == last_step_idx {
+                Arc::clone(&original_output_schema)
+            } else {
+                let mut builder = clinker_record::SchemaBuilder::new();
+                for (qf, _ty) in step.intermediate_row.fields() {
+                    let qualifier = qf
+                        .qualifier
+                        .as_deref()
+                        .expect("intermediate_row carries qualified fields by construction");
+                    builder = builder.with_field(encode_chain_column(qualifier, qf.name.as_ref()));
+                }
+                builder.build()
+            };
+            step_output_schemas.push(schema);
+        }
+
+        // Build per-step resolved column maps. Keyed by ORIGINAL
+        // qualifier + field name; values are `(JoinSide, idx)`. The
+        // index for `Probe` is the column position in the driver
+        // record's schema (encoded for steps ≥ 1, native for step 0);
+        // the index for `Build` is the column position in the build
+        // input's source schema. The `CombineResolver` consumes this
+        // map at runtime via
+        // `CombineResolverMapping::from_pre_resolved`.
+        let mut step_resolved_maps: Vec<
+            HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)>,
+        > = Vec::with_capacity(steps.len());
+        for (i, step) in steps.iter().enumerate() {
+            let mut step_map: HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> =
+                HashMap::new();
+            // Probe-side qualifiers: every original qualifier that's
+            // already in the joined chain at the start of this step.
+            // For step 0 the chain has only the original driving
+            // qualifier; the driver record is that source's row, so
+            // probe idx = position in the driver source's row fields
+            // (which are bare QualifiedFields). For step ≥ 1 the
+            // chain holds every qualifier joined in steps `[0..i)`;
+            // probe idx = position in step[i-1].intermediate_row's
+            // fields iteration (= position in the encoded schema).
+            if i == 0 {
+                let driver_input = inputs
+                    .get(&driving)
+                    .expect("driver qualifier present in combine_inputs");
+                for (idx, (qf, _ty)) in driver_input.row.fields().enumerate() {
+                    let resolve_qual = qf.qualifier.as_deref().unwrap_or(driving.as_str());
+                    let key = QualifiedField::qualified(resolve_qual, qf.name.clone());
+                    step_map.insert(key, (crate::executor::combine::JoinSide::Probe, idx as u32));
+                }
+            } else {
+                let prev_intermediate = &steps[i - 1].intermediate_row;
+                for (idx, (qf, _ty)) in prev_intermediate.fields().enumerate() {
+                    let resolve_qual = qf
+                        .qualifier
+                        .as_deref()
+                        .expect("intermediate_row fields are qualified by construction");
+                    let key = QualifiedField::qualified(resolve_qual, qf.name.clone());
+                    step_map.insert(key, (crate::executor::combine::JoinSide::Probe, idx as u32));
+                }
+            }
+            // Build-side qualifier: the single input newly joined at
+            // this step. Build idx = position in that source's row
+            // fields (bare QualifiedFields). We key the resolved map
+            // using `step.build_input` as the original qualifier so
+            // the conjunct's `QualifiedFieldRef("c", "id")` matches.
+            let build_input_meta = inputs
+                .get(&step.build_input)
+                .expect("step.build_input qualifier was selected from inputs.keys()");
+            for (idx, (qf, _ty)) in build_input_meta.row.fields().enumerate() {
+                let key = QualifiedField::qualified(step.build_input.as_str(), qf.name.clone());
+                step_map.insert(key, (crate::executor::combine::JoinSide::Build, idx as u32));
+            }
+            step_resolved_maps.push(step_map);
+        }
+
         // Add (N - 2) earlier steps as new nodes. Step (N - 2) reuses
         // `original_idx`. Each step gets its own CompileArtifacts entries.
-        let last_step_idx = steps.len() - 1;
         let mut step_indices: Vec<NodeIndex> = Vec::with_capacity(steps.len());
         for (i, step) in steps.iter().enumerate() {
             let predicate_summary = CombinePredicateSummary::from_decomposed(&step.predicate_slice);
+            let step_output_schema = Arc::clone(&step_output_schemas[i]);
+            let step_resolved_map: crate::plan::execution::ResolvedColumnMap =
+                Arc::new(step_resolved_maps[i].clone());
             let (match_mode, on_miss, output_schema, idx) = if i == last_step_idx {
                 (
                     original_match_mode,
                     original_on_miss,
-                    original_output_schema.clone(),
+                    step_output_schema.clone(),
                     original_idx,
                 )
             } else {
                 (
                     MatchMode::All,
                     OnMiss::Skip,
-                    clinker_record::SchemaBuilder::new().build(),
+                    step_output_schema.clone(),
                     plan.graph.add_node(PlanNode::Combine {
                         name: step.name.clone(),
                         span,
@@ -1388,8 +1523,8 @@ pub(crate) fn decompose_nary_combines(
                         match_mode: MatchMode::All,
                         on_miss: OnMiss::Skip,
                         decomposed_from: Some(original_name.clone()),
-                        output_schema: clinker_record::SchemaBuilder::new().build(),
-                        resolved_column_map: Arc::new(HashMap::new()),
+                        output_schema: Arc::clone(&step_output_schema),
+                        resolved_column_map: Arc::clone(&step_resolved_map),
                     }),
                 )
             };
@@ -1421,7 +1556,7 @@ pub(crate) fn decompose_nary_combines(
                     *om = on_miss;
                     *decomposed_from = Some(original_name.clone());
                     *os = output_schema;
-                    *resolved_column_map = Arc::new(HashMap::new());
+                    *resolved_column_map = Arc::clone(&step_resolved_map);
                 }
             }
             step_indices.push(idx);
@@ -1470,7 +1605,14 @@ pub(crate) fn decompose_nary_combines(
 
         // Populate CompileArtifacts for each step.
         for (i, step) in steps.iter().enumerate() {
-            // Per-step inputs map: driver row + build row.
+            // Per-step inputs map: driver row + build row. The driver
+            // entry for step ≥ 1 carries the previous step's
+            // intermediate_row (with qualified fields keyed by
+            // original qualifiers); the executor's resolver uses each
+            // QualifiedField's INNER qualifier to match against the
+            // resolved column map, so the outer IndexMap key (the
+            // synthetic step name) does not need to align with body
+            // references.
             let driver_row = if i == 0 {
                 inputs
                     .get(&driving)
@@ -1515,6 +1657,20 @@ pub(crate) fn decompose_nary_combines(
             artifacts
                 .combine_driving
                 .insert(step.name.clone(), step.driving_input.clone());
+            artifacts
+                .combine_resolved_columns
+                .insert(step.name.clone(), Arc::new(step_resolved_maps[i].clone()));
+        }
+
+        // The final step inherits the original combine's body typed
+        // program (if any). The body's QualifiedFieldRefs against the
+        // original qualifiers route through the final step's resolved
+        // column map at runtime — chain-buried qualifiers map to
+        // (Probe, encoded_idx); the newly joined qualifier maps to
+        // (Build, native_idx).
+        if let Some(body) = original_body_typed {
+            let final_step_name = &steps[last_step_idx].name;
+            artifacts.typed.insert(final_step_name.clone(), body);
         }
 
         // Drop the original combine's artifacts — its name is gone from
@@ -1523,7 +1679,6 @@ pub(crate) fn decompose_nary_combines(
         artifacts.combine_inputs.remove(&original_name);
         artifacts.combine_predicates.remove(&original_name);
         artifacts.combine_driving.remove(&original_name);
-        artifacts.combine_resolved_columns.remove(&original_name);
     }
 }
 

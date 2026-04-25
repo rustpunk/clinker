@@ -1,0 +1,4 @@
+product_id,name,category_id
+p-1,Apple,c-fruit
+p-2,Bread,c-grain
+p-3,Carrot,c-veg

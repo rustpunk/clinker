@@ -1,7 +1,11 @@
-# 3-input combine, shared equi key across all inputs.
-# Pattern: orders joined with products AND a per-product categories lookup,
-# all on product_id equality.
-# Input order is significant — IndexMap preserves insertion order (C.0.1 test).
+# 3-input combine, shared equi key across the chain.
+# Pattern: orders join products on product_id, and the (orders+products)
+# intermediate joins categories on category_id from products. The
+# decomposition pass rewrites this into a left-deep chain of two
+# binary combines: step 0 = orders ⨝ products on product_id;
+# step 1 = step0 ⨝ categories on category_id.
+# Input declaration order is significant — IndexMap preserves it
+# (C.0.1 test).
 pipeline:
   name: three_input_shared_key
 nodes:
@@ -10,7 +14,7 @@ nodes:
     config:
       name: orders
       type: csv
-      path: tests/fixtures/combine/data/orders.csv
+      path: tests/fixtures/combine/data/three_input_orders.csv
       schema:
         - { name: order_id, type: string }
         - { name: product_id, type: string }
@@ -20,21 +24,20 @@ nodes:
     config:
       name: products
       type: csv
-      path: tests/fixtures/combine/data/products.csv
+      path: tests/fixtures/combine/data/three_input_products.csv
       schema:
         - { name: product_id, type: string }
         - { name: name, type: string }
-        - { name: category, type: string }
+        - { name: category_id, type: string }
   - type: source
     name: categories
     config:
       name: categories
       type: csv
-      path: tests/fixtures/combine/data/products.csv
+      path: tests/fixtures/combine/data/three_input_categories.csv
       schema:
-        - { name: product_id, type: string }
-        - { name: name, type: string }
-        - { name: category, type: string }
+        - { name: category_id, type: string }
+        - { name: category_name, type: string }
   - type: combine
     name: fully_enriched
     input:
@@ -42,14 +45,14 @@ nodes:
       products: products
       categories: categories
     config:
-      where: "orders.product_id == products.product_id and products.product_id == categories.product_id"
+      where: "orders.product_id == products.product_id and products.category_id == categories.category_id"
       match: first
       on_miss: null_fields
       cxl: |
         emit order_id = orders.order_id
         emit product_id = orders.product_id
         emit product_name = products.name
-        emit category = categories.category
+        emit category_name = categories.category_name
         emit amount = orders.amount
   - type: output
     name: fully_enriched_out
@@ -57,4 +60,4 @@ nodes:
     config:
       name: fully_enriched_out
       type: csv
-      path: /tmp/fully_enriched_three_input_shared_key.csv
+      path: fully_enriched_three_input_shared_key.csv
