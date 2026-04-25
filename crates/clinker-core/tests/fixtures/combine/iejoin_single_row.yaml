@@ -47,4 +47,4 @@ nodes:
     config:
       name: single_match_out
       type: csv
-      path: /tmp/iejoin_single_row.csv
+      path: iejoin_single_row.csv

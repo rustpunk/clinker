@@ -44,6 +44,7 @@ fn combine_strategy_tag(s: &crate::plan::combine::CombineStrategy) -> &'static s
         CombineStrategy::HashBuildProbe => "hash_build_probe",
         CombineStrategy::InMemoryHash => "in_memory_hash",
         CombineStrategy::HashPartitionIEJoin { .. } => "hash_partition_iejoin",
+        CombineStrategy::IEJoin => "iejoin",
         CombineStrategy::SortMerge => "sort_merge",
         CombineStrategy::GraceHash { .. } => "grace_hash",
         CombineStrategy::BlockNestedLoop => "block_nested_loop",

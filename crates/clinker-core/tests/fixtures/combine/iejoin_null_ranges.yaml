@@ -49,4 +49,4 @@ nodes:
     config:
       name: assign_bracket_out
       type: csv
-      path: /tmp/iejoin_null_ranges.csv
+      path: iejoin_null_ranges.csv

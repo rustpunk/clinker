@@ -51,4 +51,4 @@ nodes:
     config:
       name: overlapping_out
       type: csv
-      path: /tmp/iejoin_temporal_overlap.csv
+      path: iejoin_temporal_overlap.csv

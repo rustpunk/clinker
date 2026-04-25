@@ -942,24 +942,31 @@ mod tests {
         );
     }
 
-    /// A combine where-clause needs at least one cross-input equality to
-    /// drive the `HashBuildProbe` planner. A pure-range fixture is
-    /// rejected at compile time with E313 until the sort-merge / iejoin
-    /// planner lands. When that support arrives, this test needs to be
-    /// rewritten or removed in favor of an end-to-end range-combine
-    /// assertion.
+    /// Pure-range combine compiles successfully under the IEJoin
+    /// planner: the `select_combine_strategies` post-pass emits
+    /// W305 (advisory: no equality conjuncts) and selects the
+    /// `IEJoin` strategy. Hard E313 still fires for predicates with
+    /// neither equi NOR range conjuncts (covered separately by the
+    /// in-source `test_combine_strategy_non_decomposable_e313`).
     #[test]
-    fn test_combine_e313_pure_range_rejected() {
+    fn test_combine_pure_range_compiles_with_iejoin_strategy() {
         let yaml = load_fixture("two_input_range.yaml");
         let config = parse_fixture(&yaml);
-        let mut ctx = clinker_core::config::CompileContext::default();
-        ctx.allow_absolute_paths = true;
-        let diags = config
-            .compile(&ctx)
-            .expect_err("pure-range combine must be rejected by the binary hash planner");
+        let plan = compile_plan(&config);
+        let combine = plan
+            .graph
+            .node_weights()
+            .find_map(|n| match n {
+                PlanNode::Combine { strategy, .. } => Some(strategy),
+                _ => None,
+            })
+            .expect("plan contains a combine node");
         assert!(
-            diags.iter().any(|d| d.code == "E313"),
-            "expected E313 for pure-range combine; got {diags:?}"
+            matches!(
+                combine,
+                clinker_core::plan::combine::CombineStrategy::IEJoin
+            ),
+            "expected CombineStrategy::IEJoin for pure-range combine; got {combine:?}"
         );
     }
 
@@ -3199,5 +3206,434 @@ nodes:
         );
         assert!(canon.contains("ORD-1"), "ORD-1 must survive");
         assert!(!canon.contains("ORD-2"), "ORD-2 null-key must be dropped");
+    }
+
+    // ─── IEJoin integration tests ──────────────────────────────────
+    //
+    // These fixtures live under `tests/fixtures/combine/iejoin_*.yaml`
+    // and reference CSV data files in `tests/fixtures/combine/data/`.
+    // The runner sources data from `inputs` (in-memory) so the YAML's
+    // `path:` is treated as a logical handle the executor's CSV
+    // reader binds against. Per-test inline data keeps the assertions
+    // readable; the fixture YAML is authoritative for the predicate
+    // and pipeline shape.
+
+    /// Load a fixture YAML file by stem from
+    /// `tests/fixtures/combine/`. Used by the IEJoin integration
+    /// suite below.
+    fn load_iejoin_fixture(stem: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/combine")
+            .join(format!("{stem}.yaml"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()))
+    }
+
+    const IEJOIN_EMPLOYEES_CSV: &str = "entity_id,employee_id,income\n\
+        ent-A,emp-001,42000\n\
+        ent-A,emp-002,87500\n\
+        ent-B,emp-003,15000\n\
+        ent-B,emp-004,210000\n";
+
+    const IEJOIN_BRACKETS_CSV: &str = "entity_id,bracket_id,bracket_lo,bracket_hi,rate\n\
+        ent-A,bkt-A1,0,40000,0.1\n\
+        ent-A,bkt-A2,40000,80000,0.2\n\
+        ent-A,bkt-A3,80000,150000,0.3\n\
+        ent-A,bkt-A4,150000,500000,0.4\n\
+        ent-B,bkt-B1,0,40000,0.05\n\
+        ent-B,bkt-B2,40000,80000,0.15\n\
+        ent-B,bkt-B3,80000,150000,0.25\n\
+        ent-B,bkt-B4,150000,500000,0.35\n";
+
+    /// Tax-bracket assignment via mixed equi+range predicate.
+    /// emp-001 (entity_id=ent-A, income=42000) → bkt-A2 (40000..80000).
+    /// emp-002 (ent-A, 87500) → bkt-A3 (80000..150000).
+    /// emp-003 (ent-B, 15000) → bkt-B1 (0..40000).
+    /// emp-004 (ent-B, 210000) → bkt-B4 (150000..500000).
+    #[test]
+    fn test_iejoin_tax_bracket_correct() {
+        let yaml = load_iejoin_fixture("iejoin_tax_bracket");
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("employees", IEJOIN_EMPLOYEES_CSV),
+                ("brackets", IEJOIN_BRACKETS_CSV),
+            ],
+            Some("employees"),
+        )
+        .expect("tax bracket fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            4,
+            "4 employees, each with one matching bracket; got: {canon}"
+        );
+        // Each employee gets the correct rate per their income.
+        assert!(canon.contains("ent-A,42000,0.2"), "emp-001 → 0.2 rate");
+        assert!(canon.contains("ent-A,87500,0.3"), "emp-002 → 0.3 rate");
+        assert!(canon.contains("ent-B,15000,0.05"), "emp-003 → 0.05 rate");
+        assert!(canon.contains("ent-B,210000,0.35"), "emp-004 → 0.35 rate");
+    }
+
+    /// Temporal overlap: events match overlapping sessions in the
+    /// same group via mixed equi+range. `match: all` so multiple
+    /// overlaps all surface.
+    #[test]
+    fn test_iejoin_temporal_overlap_correct() {
+        let events_csv = "group_id,event_id,start,end\n\
+            grp-1,evt-001,10,20\n\
+            grp-1,evt-002,15,25\n\
+            grp-1,evt-003,40,50\n\
+            grp-2,evt-004,5,12\n\
+            grp-2,evt-005,30,35\n";
+        let sessions_csv = "group_id,session_id,start_ts,end_ts\n\
+            grp-1,sess-A,8,18\n\
+            grp-1,sess-B,22,28\n\
+            grp-1,sess-C,45,55\n\
+            grp-2,sess-D,1,10\n\
+            grp-2,sess-E,28,38\n";
+        let yaml = load_iejoin_fixture("iejoin_temporal_overlap");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("events", events_csv), ("sessions", sessions_csv)],
+            Some("events"),
+        )
+        .expect("temporal overlap fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // Hand-computed expected matches:
+        //   evt-001 (10..20) overlaps sess-A (8..18) — start<=end_ts (10<=18), end>=start_ts (20>=8) ✓
+        //   evt-002 (15..25) overlaps sess-A (8..18)  — 15<=18, 25>=8 ✓
+        //   evt-002 (15..25) overlaps sess-B (22..28) — 15<=28, 25>=22 ✓
+        //   evt-003 (40..50) overlaps sess-C (45..55) — 40<=55, 50>=45 ✓
+        //   evt-004 (5..12)  overlaps sess-D (1..10)  — 5<=10, 12>=1 ✓
+        //   evt-005 (30..35) overlaps sess-E (28..38) — 30<=38, 35>=28 ✓
+        // Total: 6 matched pairs.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 6,
+            "expected 6 overlapping event/session pairs; got: {canon}"
+        );
+    }
+
+    /// NULL income → no bracket match. With `on_miss: null_fields`,
+    /// those employees emit one row with build-side fields null-filled.
+    #[test]
+    fn test_iejoin_null_range_never_matches() {
+        let null_employees = "entity_id,employee_id,income\n\
+            ent-A,emp-001,42000\n\
+            ent-A,emp-002,\n\
+            ent-A,emp-003,87500\n\
+            ent-B,emp-004,\n\
+            ent-B,emp-005,15000\n";
+        let yaml = load_iejoin_fixture("iejoin_null_ranges");
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("employees", null_employees),
+                ("brackets", IEJOIN_BRACKETS_CSV),
+            ],
+            Some("employees"),
+        )
+        .expect("null-range fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        // 5 employees, all 5 emit (3 with matched bracket, 2 with
+        // null bracket fields). `match: first` means each driver
+        // emits at most once.
+        assert_eq!(data_rows.len(), 5, "5 employees emit; got: {canon}");
+        // The two null-income employees emit with null bracket
+        // fields. Canonicalized CSV represents Null as an empty
+        // field — check that emp-002 and emp-004 land on rows with
+        // empty bracket_id and rate slots.
+        assert!(
+            data_rows
+                .iter()
+                .any(|r| r.contains("emp-002") && r.contains(",,")),
+            "emp-002 must emit with null bracket fields; got: {canon}"
+        );
+        assert!(
+            data_rows
+                .iter()
+                .any(|r| r.contains("emp-004") && r.contains(",,")),
+            "emp-004 must emit with null bracket fields; got: {canon}"
+        );
+    }
+
+    /// Inclusive vs exclusive boundary: a value equal to a boundary
+    /// matches `>=` (inclusive) but not `>` (strict).
+    #[test]
+    fn test_iejoin_boundary_inclusive_exclusive() {
+        // Inclusive: build.lo = 50, driver.x = 50, predicate `>=`
+        // → match.
+        let inclusive_yaml = r#"
+pipeline:
+  name: inclusive_boundary
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: id, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: id, type: string }
+        - { name: lo, type: int }
+  - type: combine
+    name: bnd
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.id == builds.id and drivers.x >= builds.lo"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = drivers.id
+        emit x = drivers.x
+        emit lo = builds.lo
+  - type: output
+    name: bnd_out
+    input: bnd
+    config:
+      name: bnd_out
+      type: csv
+      path: bnd.csv
+"#;
+        let drivers = "id,x\nA,50\n";
+        let builds = "id,lo\nA,50\n";
+        let result = run_combine_fixture(
+            inclusive_yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("inclusive boundary fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(data_rows, 1, "inclusive `>=` matches equal boundary");
+
+        // Strict: same data, predicate `>` → no match.
+        let strict_yaml = inclusive_yaml.replace("drivers.x >= builds.lo", "drivers.x > builds.lo");
+        let result_strict = run_combine_fixture(
+            &strict_yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("strict boundary fixture must run");
+        let data_rows_strict = canonicalize_csv(result_strict.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(data_rows_strict, 0, "strict `>` rejects equal boundary");
+    }
+
+    /// Empty build → all drivers unmatched. `on_miss: skip` drops
+    /// them; output is empty (header only).
+    #[test]
+    fn test_iejoin_empty_build_side() {
+        let empty_brackets = "entity_id,bracket_id,bracket_lo,bracket_hi,rate\n";
+        let yaml = load_iejoin_fixture("iejoin_empty_build");
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("employees", IEJOIN_EMPLOYEES_CSV),
+                ("brackets", empty_brackets),
+            ],
+            Some("employees"),
+        )
+        .expect("empty-build fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(data_rows, 0, "empty build + on_miss:skip drops all drivers");
+    }
+
+    /// All build records identical (errata point 4 territory):
+    /// every driver should match every build under inclusive ops.
+    /// 10 drivers × 10 builds with `match: all` → 100 output rows.
+    #[test]
+    fn test_iejoin_all_duplicates() {
+        let drivers = "entity_id,driver_id,lo,hi\n\
+            ent-A,drv-01,50,100\nent-A,drv-02,50,100\n\
+            ent-A,drv-03,50,100\nent-A,drv-04,50,100\n\
+            ent-A,drv-05,50,100\nent-A,drv-06,50,100\n\
+            ent-A,drv-07,50,100\nent-A,drv-08,50,100\n\
+            ent-A,drv-09,50,100\nent-A,drv-10,50,100\n";
+        let builds = "entity_id,build_id,lo,hi,tag\n\
+            ent-A,bld-01,0,200,t01\nent-A,bld-02,0,200,t02\n\
+            ent-A,bld-03,0,200,t03\nent-A,bld-04,0,200,t04\n\
+            ent-A,bld-05,0,200,t05\nent-A,bld-06,0,200,t06\n\
+            ent-A,bld-07,0,200,t07\nent-A,bld-08,0,200,t08\n\
+            ent-A,bld-09,0,200,t09\nent-A,bld-10,0,200,t10\n";
+        let yaml = load_iejoin_fixture("iejoin_all_duplicates");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("all-duplicates fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(
+            data_rows, 100,
+            "10 drivers × 10 builds with both ranges inclusive → full Cartesian"
+        );
+    }
+
+    /// Single-inequality predicate (no equality, one range conjunct)
+    /// routes to the IEJoin strategy (PWMJ kernel under the hood).
+    /// Asserts correctness end-to-end without observing the kernel
+    /// directly.
+    #[test]
+    fn test_single_inequality_uses_pwmj() {
+        let yaml = r#"
+pipeline:
+  name: pure_range_single
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: id, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: bid, type: string }
+        - { name: y, type: int }
+  - type: combine
+    name: pure_range
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.x < builds.y"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit id = drivers.id
+        emit bid = builds.bid
+        emit x = drivers.x
+        emit y = builds.y
+  - type: output
+    name: pure_range_out
+    input: pure_range
+    config:
+      name: pure_range_out
+      type: csv
+      path: pure_range.csv
+"#;
+        let drivers = "id,x\nD1,1\nD2,5\nD3,10\n";
+        let builds = "bid,y\nB1,3\nB2,7\nB3,12\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("single-inequality fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // D1 (x=1) < B1 (y=3), B2 (7), B3 (12) → 3 rows.
+        // D2 (x=5) < B2 (7), B3 (12) → 2 rows.
+        // D3 (x=10) < B3 (12) → 1 row.
+        // Total = 6.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 6,
+            "single-inequality cross-product matches expected; got: {canon}"
+        );
+    }
+
+    /// `match: first` short-circuits to one row per matching driver
+    /// even when multiple builds satisfy the predicate.
+    #[test]
+    fn test_iejoin_match_first_short_circuits() {
+        let yaml = r#"
+pipeline:
+  name: first_short_circuit
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: id, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: gid, type: string }
+        - { name: bid, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: combine
+    name: first_only
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.id == builds.gid and drivers.x >= builds.lo and drivers.x <= builds.hi"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = drivers.id
+        emit x = drivers.x
+        emit bid = builds.bid
+  - type: output
+    name: first_only_out
+    input: first_only
+    config:
+      name: first_only_out
+      type: csv
+      path: first_only.csv
+"#;
+        let drivers = "id,x\nA,50\n";
+        // 3 builds all match A's x=50 within range.
+        let builds = "gid,bid,lo,hi\nA,B1,0,100\nA,B2,40,60\nA,B3,49,51\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("match-first fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(
+            data_rows, 1,
+            "match: first emits exactly one row per driver even with multiple matches"
+        );
     }
 }

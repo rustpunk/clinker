@@ -1,6 +1,7 @@
 pub mod arena;
 pub mod combine;
 pub mod dispatch;
+pub mod iejoin;
 pub mod index;
 pub mod ingestion;
 pub mod loser_tree;

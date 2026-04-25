@@ -47,4 +47,4 @@ nodes:
     config:
       name: assign_bracket_out
       type: csv
-      path: /tmp/iejoin_empty_build.csv
+      path: iejoin_empty_build.csv

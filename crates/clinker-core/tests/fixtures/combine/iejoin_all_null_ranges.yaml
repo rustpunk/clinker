@@ -48,4 +48,4 @@ nodes:
     config:
       name: never_matches_out
       type: csv
-      path: /tmp/iejoin_all_null_ranges.csv
+      path: iejoin_all_null_ranges.csv

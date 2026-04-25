@@ -50,4 +50,4 @@ nodes:
     config:
       name: duplicate_match_out
       type: csv
-      path: /tmp/iejoin_all_duplicates.csv
+      path: iejoin_all_duplicates.csv

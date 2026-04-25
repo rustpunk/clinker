@@ -46,9 +46,18 @@ use cxl::typecheck::{TypeDiagnostic, type_check};
 pub enum CombineStrategy {
     HashBuildProbe,
     InMemoryHash,
+    #[serde(rename = "hash_partition_iejoin")]
     HashPartitionIEJoin {
         partition_bits: u8,
     },
+    /// Pure-range IEJoin without hash partitioning. Selected when the
+    /// `where:` clause has only range conjuncts — there is no equality
+    /// key to bucket on, so the IEJoin runs as a single virtual
+    /// partition. Single-inequality predicates route through the same
+    /// strategy and dispatch to the piecewise merge join kernel
+    /// inside the executor.
+    #[serde(rename = "iejoin")]
+    IEJoin,
     SortMerge,
     GraceHash {
         partition_bits: u8,
@@ -608,7 +617,15 @@ pub fn select_combine_strategies(
             diags.push(combine_e312_nary_unsupported(&name, inputs.len(), span));
             continue;
         }
-        if decomposed.equalities.is_empty() {
+        // Pre-classify the predicate shape. Three branches:
+        //   - mixed equi + range  → HashPartitionIEJoin
+        //   - pure range, no equi → IEJoin (single partition, plus W305)
+        //   - pure equi, no range → HashBuildProbe (default path)
+        // A predicate with neither equi nor range conjuncts emits
+        // E313: there is no decomposable strategy that can run it.
+        let has_equi = !decomposed.equalities.is_empty();
+        let has_range = !decomposed.ranges.is_empty();
+        if !has_equi && !has_range {
             diags.push(combine_e313_no_equi(&name, span));
             continue;
         }
@@ -634,6 +651,21 @@ pub fn select_combine_strategies(
             .cloned()
             .collect();
 
+        let chosen_strategy: CombineStrategy = if has_equi && has_range {
+            CombineStrategy::HashPartitionIEJoin {
+                partition_bits: compute_partition_bits(inputs),
+            }
+        } else if !has_equi && has_range {
+            // Pure-range predicate — emit W305 and select the
+            // IEJoin strategy. The pipeline runs correctly without
+            // an equality key; the warning surfaces the lack of
+            // hash partitioning so authors notice the perf cliff.
+            diags.push(combine_w305_pure_range(&name, span));
+            CombineStrategy::IEJoin
+        } else {
+            CombineStrategy::HashBuildProbe
+        };
+
         if let PlanNode::Combine {
             strategy,
             driving_input,
@@ -641,11 +673,46 @@ pub fn select_combine_strategies(
             ..
         } = &mut plan.graph[idx]
         {
-            *strategy = CombineStrategy::HashBuildProbe;
+            *strategy = chosen_strategy;
             *driving_input = driving;
             *build_inputs = build;
         }
     }
+}
+
+/// Compute `partition_bits` for `HashPartitionIEJoin`. Default is 8 (256
+/// partitions). When estimated build cardinality is known and would
+/// produce partitions averaging fewer than 64 records — the breakeven
+/// where IEJoin's sort overhead dominates over linear scan — the bit
+/// count is reduced. The minimum returned value is 1 (two partitions);
+/// pure-range combines bypass partitioning entirely and use
+/// [`CombineStrategy::IEJoin`] instead.
+fn compute_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
+    const DEFAULT_BITS: u8 = 8;
+    const MIN_BITS: u8 = 1;
+    const TARGET_PER_PARTITION: u64 = 64;
+    // Use the smaller side as the "build" estimate — same heuristic
+    // the grace-hash partitioner uses. When estimates are missing on
+    // either input, fall back to the default.
+    let estimates: Vec<u64> = inputs
+        .values()
+        .filter_map(|ci| ci.estimated_cardinality)
+        .collect();
+    if estimates.len() < inputs.len() {
+        return DEFAULT_BITS;
+    }
+    let build_estimate = estimates.iter().copied().min().unwrap_or(0);
+    if build_estimate == 0 {
+        return DEFAULT_BITS;
+    }
+    // Find the largest `bits` such that build_estimate / 2^bits >= 64.
+    // i.e. 2^bits <= build_estimate / 64.
+    let max_partitions = build_estimate / TARGET_PER_PARTITION;
+    if max_partitions <= 1 {
+        return MIN_BITS;
+    }
+    let bits = (max_partitions as f64).log2().floor() as u8;
+    bits.clamp(MIN_BITS, DEFAULT_BITS)
 }
 
 /// E312 — combine has more than 2 inputs. C.2 supports binary combines
@@ -665,22 +732,44 @@ fn combine_e312_nary_unsupported(combine_name: &str, input_count: usize, span: S
     )
 }
 
-/// E313 — combine `where:` predicate has no extractable equality
-/// conjuncts. `HashBuildProbe` requires at least one cross-input
-/// equality; pure-range predicates need `SortMerge` / `IEJoin`
-/// (Phase C.3).
+/// E313 — combine `where:` predicate has no extractable equality OR
+/// range conjuncts. With neither, no decomposable strategy can run
+/// the join short of a non-decomposable fallback (grace hash with a
+/// pure-residual filter), which is not yet wired.
 fn combine_e313_no_equi(combine_name: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         "E313",
         format!(
-            "combine {combine_name:?} where-clause has no equality conjuncts; \
-             `HashBuildProbe` requires at least one cross-input `==` comparison"
+            "combine {combine_name:?} where-clause has no decomposable cross-input \
+             comparisons; needs at least one equality or range conjunct"
         ),
         LabeledSpan::primary(span, String::new()),
     )
     .with_help(
-        "add a cross-input equality (e.g. `a.id == b.id`); pure-range predicates land in \
-         Phase C.3 (`SortMerge` / `IEJoin`)",
+        "add a cross-input comparison (e.g. `a.id == b.id` or `a.t < b.t`); \
+         predicates with neither shape have no supported execution strategy yet",
+    )
+}
+
+/// W305 — pure-range combine predicate. Selects [`CombineStrategy::IEJoin`]
+/// (no hash partitioning); IEJoin is correct for any range shape but
+/// without an equality key the partitioning that
+/// `HashPartitionIEJoin` provides cannot apply, so very large inputs
+/// stay slower than equi-joins.
+fn combine_w305_pure_range(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::warning(
+        "W305",
+        format!(
+            "combine {combine_name:?} has no equality conjuncts; selecting `IEJoin` \
+             — performance may be slower than an equi-join. Add a cross-input \
+             equality (e.g. `a.id == b.id`) to enable hash partitioning."
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "IEJoin is `O(N log N + M)` in the matched-pair count; without an equality \
+         key the planner cannot partition inputs, so the comparison runs across \
+         every record pair",
     )
 }
 
@@ -816,13 +905,30 @@ mod tests {
         assert!(json.contains("grace_hash"));
         assert!(json.contains("partition_bits"));
 
-        // Exercise all 6 variants so the test fails if any variant is
+        // Exercise all 7 variants so the test fails if any variant is
         // accidentally made non-serializable.
         let _ = serde_json::to_string(&CombineStrategy::InMemoryHash).unwrap();
         let _ = serde_json::to_string(&CombineStrategy::HashPartitionIEJoin { partition_bits: 10 })
             .unwrap();
+        let _ = serde_json::to_string(&CombineStrategy::IEJoin).unwrap();
         let _ = serde_json::to_string(&CombineStrategy::SortMerge).unwrap();
         let _ = serde_json::to_string(&CombineStrategy::BlockNestedLoop).unwrap();
+    }
+
+    #[test]
+    fn test_combine_strategy_iejoin_serialize() {
+        // Pure-range IEJoin serializes as the bare snake_case tag.
+        let json = serde_json::to_string(&CombineStrategy::IEJoin).unwrap();
+        assert_eq!(json, r#""iejoin""#);
+
+        // HashPartitionIEJoin serializes as a tagged object with
+        // partition_bits (an externally-tagged adjacent-content shape
+        // matching every other strategy that carries fields).
+        let json =
+            serde_json::to_string(&CombineStrategy::HashPartitionIEJoin { partition_bits: 8 })
+                .unwrap();
+        assert!(json.contains("hash_partition_iejoin"));
+        assert!(json.contains("\"partition_bits\":8"));
     }
 
     fn synthetic_input(qualifier: &str, cardinality: Option<u64>) -> (String, CombineInput) {
@@ -1079,13 +1185,78 @@ mod tests {
     }
 
     #[test]
-    fn test_combine_strategy_e313_no_equi() {
+    fn test_combine_strategy_pure_range_w305_iejoin() {
+        // Pure range → W305 + IEJoin strategy.
         let (mut plan, artifacts) =
             synthetic_combine_plan(vec![("orders", None), ("products", None)], 0, 1, true);
         let mut diags = Vec::new();
         select_combine_strategies(&mut plan, &artifacts, &mut diags);
         assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "W305");
+        if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
+            assert!(matches!(strategy, CombineStrategy::IEJoin));
+        } else {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_combine_strategy_non_decomposable_e313() {
+        // Predicate with neither equality nor range conjuncts (e.g.
+        // pure residual `or` clause) — still emits E313.
+        let (mut plan, artifacts) =
+            synthetic_combine_plan(vec![("orders", None), ("products", None)], 0, 0, true);
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "E313");
+    }
+
+    #[test]
+    fn test_combine_strategy_selects_iejoin_for_mixed_equi_range() {
+        // Mixed equi+range → HashPartitionIEJoin with default
+        // partition_bits=8 when cardinalities are unknown.
+        let (mut plan, artifacts) =
+            synthetic_combine_plan(vec![("orders", None), ("products", None)], 1, 1, true);
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        assert!(diags.is_empty(), "no diagnostics expected; got {diags:?}");
+        if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
+            match strategy {
+                CombineStrategy::HashPartitionIEJoin { partition_bits } => {
+                    assert_eq!(*partition_bits, 8, "default partition_bits is 8");
+                }
+                other => panic!("expected HashPartitionIEJoin, got {other:?}"),
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_compute_partition_bits_reduces_for_small_cardinality() {
+        // Both inputs estimated; smaller side dominates the heuristic.
+        // 100 records, target=64-per-partition → max 1 partition →
+        // MIN_BITS=1.
+        let (mut plan, artifacts) = synthetic_combine_plan(
+            vec![("orders", Some(100)), ("products", Some(500))],
+            1,
+            1,
+            true,
+        );
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags);
+        if let crate::plan::execution::PlanNode::Combine { strategy, .. } = first_combine(&plan) {
+            match strategy {
+                CombineStrategy::HashPartitionIEJoin { partition_bits } => {
+                    assert!(
+                        *partition_bits < 8,
+                        "small input must reduce partition_bits"
+                    );
+                }
+                other => panic!("expected HashPartitionIEJoin, got {other:?}"),
+            }
+        }
     }
 
     #[test]
