@@ -579,122 +579,6 @@ nodes:
 }
 
 // ---------------------------------------------------------------------------
-// 14.4.5: correlated DLQ with sorted input
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_e2e_correlated_dlq() {
-    let yaml = r#"
-pipeline:
-  name: correlated_dlq_e2e
-error_handling:
-  strategy: continue
-  correlation_key: employee_id
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    type: csv
-    schema:
-      - { name: id, type: any }
-      - { name: name, type: any }
-      - { name: value, type: any }
-      - { name: amount, type: any }
-      - { name: customer_id, type: any }
-      - { name: employee_id, type: any }
-      - { name: dept, type: any }
-      - { name: department, type: any }
-      - { name: salary, type: any }
-      - { name: group, type: any }
-      - { name: status, type: any }
-
-- type: transform
-  name: validate
-  input: src
-  config:
-    cxl: 'emit emp = employee_id
-
-      emit val = value.to_int()
-
-      '
-- type: output
-  name: out
-  input: validate
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-
-    // Group A: 3 records, one bad -> entire group DLQ'd
-    // Group B: 2 records, all good -> emitted
-    // Group C: 1 record, bad -> DLQ'd
-    let csv = "employee_id,value\n\
-        A,100\nA,bad\nA,300\n\
-        B,400\nB,500\n\
-        C,oops\n";
-
-    let config = parse_config(yaml).unwrap();
-    let params = test_params(&config);
-
-    let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
-        "src".to_string(),
-        Box::new(Cursor::new(csv.as_bytes().to_vec())) as Box<dyn Read + Send>,
-    )]);
-
-    let buf = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(buf.clone()) as Box<dyn Write + Send>,
-    )]);
-
-    let report = PipelineExecutor::run_plan_with_readers_writers(
-        &clinker_core::config::PipelineConfig::compile(
-            &config,
-            &clinker_core::config::CompileContext::default(),
-        )
-        .expect("compile"),
-        readers,
-        writers,
-        &params,
-    )
-    .unwrap();
-    let output = buf.as_string();
-
-    // Group A (3) + Group C (1) = 4 DLQ'd
-    assert_eq!(report.counters.dlq_count, 4, "4 records DLQ'd");
-    // Group B (2) emitted
-    assert_eq!(report.counters.ok_count, 2, "2 records emitted");
-
-    // Output should contain group B
-    assert!(output.contains("B"), "output has group B: {output}");
-    assert!(
-        !output.contains(",bad"),
-        "output should not contain bad: {output}"
-    );
-
-    // DLQ entries: check trigger flags
-    assert_eq!(report.dlq_entries.len(), 4);
-    let root_causes = report.dlq_entries.iter().filter(|e| e.trigger).count();
-    assert_eq!(root_causes, 2, "2 root causes (bad in A, oops in C)");
-    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
-    assert_eq!(collaterals, 2, "2 collateral records from group A");
-
-    // Collateral entries should mention "correlated with failure"
-    let collateral = report.dlq_entries.iter().find(|e| !e.trigger).unwrap();
-    assert!(
-        collateral
-            .error_message
-            .contains("correlated with failure in group"),
-        "collateral reason: {}",
-        collateral.error_message
-    );
-}
-
-// ---------------------------------------------------------------------------
 // 14.4.6: multi-output + file splitting (each output splits independently)
 // ---------------------------------------------------------------------------
 
@@ -917,5 +801,117 @@ nodes:
     assert!(
         !standard.contains("Alice"),
         "standard should not have Alice: {standard}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Option W Amendment A7: include_unmapped projection semantics
+// ═══════════════════════════════════════════════════════════════════
+//
+// Verify that at the Output boundary:
+//   include_unmapped: false → only CXL-named emit columns appear
+//   include_unmapped: true  → every column of the record appears
+//
+// Before the Option W shortcut fix, the Output arm synthesised an
+// "all-emit" layout that made these two settings indistinguishable.
+// Now the Output arm consults the predecessor Transform's bound
+// `OutputLayout` (which knows which columns are CXL emits vs
+// upstream passthroughs), restoring the documented semantic.
+
+#[test]
+fn test_e2e_output_include_unmapped_false() {
+    let yaml = r#"
+pipeline:
+  name: include_unmapped_false
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: a, type: int }
+      - { name: b, type: int }
+      - { name: c, type: int }
+- type: transform
+  name: compute
+  input: src
+  config:
+    cxl: "emit x = a + 1\nemit y = b"
+- type: output
+  name: dest
+  input: compute
+  config:
+    name: dest
+    path: out.csv
+    type: csv
+    include_unmapped: false
+"#;
+    let csv = "a,b,c\n1,2,3\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.counters.ok_count, 1);
+
+    // include_unmapped: false → only x, y (the CXL emits). c (pure
+    // passthrough) must NOT appear. a and b are upstream columns, but
+    // `emit y = b` and `emit x = a + 1` do not shadow (different names)
+    // — so a/b remain upstream-only passthroughs and are filtered out.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "x,y", "header must be exactly x,y, got: {output}");
+    assert_eq!(
+        lines[1], "2,2",
+        "row must be exactly x=2,y=2, got: {output}"
+    );
+    assert!(
+        !output.contains("c,"),
+        "include_unmapped: false must drop c (pure passthrough): {output}"
+    );
+}
+
+#[test]
+fn test_e2e_output_include_unmapped_true() {
+    let yaml = r#"
+pipeline:
+  name: include_unmapped_true
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: a, type: int }
+      - { name: b, type: int }
+      - { name: c, type: int }
+- type: transform
+  name: compute
+  input: src
+  config:
+    cxl: "emit x = a + 1\nemit y = b"
+- type: output
+  name: dest
+  input: compute
+  config:
+    name: dest
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "a,b,c\n1,2,3\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.counters.ok_count, 1);
+
+    // include_unmapped: true → every record column appears. Positional
+    // schema per Option W: upstream columns first (a, b, c), then emits
+    // that don't shadow (x, y) → header a,b,c,x,y.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines[0], "a,b,c,x,y",
+        "header must include all record columns, got: {output}"
+    );
+    assert_eq!(
+        lines[1], "1,2,3,2,2",
+        "row values: a=1,b=2,c=3,x=2,y=2 — got: {output}"
     );
 }

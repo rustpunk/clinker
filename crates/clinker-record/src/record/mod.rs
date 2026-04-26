@@ -330,6 +330,7 @@ mod tests {
         let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
         assert_eq!(fields.len(), 5);
         assert_eq!(fields[0].0, "id");
+        assert_eq!(fields[1].0, "name");
         assert_eq!(fields[4].0, "active");
     }
 
@@ -374,6 +375,15 @@ mod tests {
         let record = Record::new(schema, values);
         assert_eq!(record.values().len(), 5);
         assert_eq!(record.values()[0], Value::Integer(1));
+    }
+
+    #[test]
+    fn test_record_total_field_count() {
+        let schema = test_schema();
+        let values = vec![Value::Null; 5];
+        let record = Record::new(schema, values);
+        assert_eq!(record.total_field_count(), 5);
+        assert_eq!(record.field_count(), 5);
     }
 
     #[test]

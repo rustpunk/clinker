@@ -32,7 +32,8 @@ use crate::error::PipelineError;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     CompiledRoute, CompiledTransform, DlqEntry, NullStorage, build_format_writer,
-    evaluate_single_transform, parse_memory_limit, stage_metrics, widen_record_to_schema,
+    evaluate_single_transform, evaluate_single_transform_windowed, parse_memory_limit,
+    stage_metrics, widen_record_to_schema,
 };
 use crate::pipeline::memory::MemoryBudget;
 use crate::plan::bind_schema::CompileArtifacts;
@@ -147,6 +148,27 @@ pub(crate) struct ExecutorContext<'a> {
     /// lifetime acrobatic that would otherwise force every operator
     /// to thread the same lifetime as the borrowed plan-time refs.
     pub(crate) spill_root_path: Arc<std::path::Path>,
+
+    /// Columnar arena materialized once before the dispatcher walk
+    /// when the plan needs windowed/positional access. `Some` when
+    /// any Transform on the current DAG carries `window_index:
+    /// Some(_)`; `None` otherwise. The arena owns a stable record
+    /// ordering the windowed Transform arm reads through
+    /// `evaluate_record_with_window`. Held as `Arc` so the dispatcher
+    /// arm and any rayon-parallel windowed worker share one backing
+    /// store. Composition body recursion inherits the parent's arena
+    /// (cloned cheaply) — body pipelines that need their own arena
+    /// override this field at recursion entry.
+    pub(crate) arena: Option<Arc<crate::pipeline::arena::Arena>>,
+
+    /// Per-source secondary indices co-built with [`Self::arena`].
+    /// Index `i` corresponds to source position `i` in the plan's
+    /// source list. Each entry maps composite group-by keys to arena
+    /// record positions, backing the windowed Transform arm's
+    /// partition lookup. `Some` iff [`Self::arena`] is `Some`; the
+    /// two are populated together by Phase-0 setup and torn down
+    /// together at the end of the walk.
+    pub(crate) indices: Option<Arc<Vec<crate::pipeline::index::SecondaryIndex>>>,
 }
 
 impl ExecutorContext<'_> {
@@ -247,7 +269,11 @@ pub(crate) fn dispatch_plan_node(
             ctx.node_buffers.insert(node_idx, records);
         }
 
-        PlanNode::Transform { ref name, .. } => {
+        PlanNode::Transform {
+            ref name,
+            window_index,
+            ..
+        } => {
             // Get input records: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
             let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
@@ -295,6 +321,22 @@ pub(crate) fn dispatch_plan_node(
                 .map(|i| current_dag.graph[i].name().to_string())
                 .unwrap_or_default();
 
+            // Plan invariant: any Transform with `window_index: Some`
+            // requires the per-source arena and SecondaryIndex set
+            // populated by Phase-0 setup. Fail loudly if they're
+            // missing — the alternative (silently fall back to
+            // no-window eval) corrupts `$window.*` results.
+            if window_index.is_some() && (ctx.arena.is_none() || ctx.indices.is_none()) {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: name.clone(),
+                    detail: format!(
+                        "transform {name:?} declares window_index but executor context has no arena+indices; \
+                         Phase-0 setup did not populate them"
+                    ),
+                });
+            }
+
             let mut output_records = Vec::with_capacity(input_records.len());
 
             for (record, rn) in input_records {
@@ -313,13 +355,34 @@ pub(crate) fn dispatch_plan_node(
                     .unwrap_or_else(|| Arc::clone(record.schema()));
                 let eval_result = {
                     let _guard = ctx.transform_timer.guard();
-                    evaluate_single_transform(
-                        &record,
-                        name,
-                        &mut evaluator,
-                        &eval_ctx,
-                        &target_schema,
-                    )
+                    if let Some(idx_num) = window_index {
+                        // Phase-0 invariant: arena/indices Some when window_index Some.
+                        // record_pos = source_row - 1 holds because Phase-0 materializes
+                        // records in arena order; row number is preserved through
+                        // upstream Source/Transform/Route arms.
+                        let arena = ctx.arena.as_ref().unwrap();
+                        let indices = ctx.indices.as_ref().unwrap();
+                        let record_pos = (rn - 1) as u32;
+                        evaluate_single_transform_windowed(
+                            &record,
+                            name,
+                            &mut evaluator,
+                            &eval_ctx,
+                            current_dag,
+                            idx_num,
+                            arena,
+                            indices,
+                            record_pos,
+                        )
+                    } else {
+                        evaluate_single_transform(
+                            &record,
+                            name,
+                            &mut evaluator,
+                            &eval_ctx,
+                            &target_schema,
+                        )
+                    }
                 };
                 match eval_result {
                     Ok((modified_record, Ok(()))) => {
@@ -988,10 +1051,20 @@ pub(crate) fn dispatch_plan_node(
                 .find(|o| o.name == *name)
                 .unwrap_or(ctx.primary_output);
 
+            // Compute the upstream node's CXL emit names once.
+            // `include_unmapped: false` consults this to drop upstream
+            // passthroughs the user did not explicitly emit.
+            let cxl_emit_names = current_dag.graph[node_idx].cxl_emit_names_in(current_dag);
+            let cxl_emit_names_opt: Option<&[String]> = if cxl_emit_names.is_empty() {
+                None
+            } else {
+                Some(&cxl_emit_names)
+            };
+
             let output_schema = if let Some((rec, _)) = input_records.first() {
                 let projected = {
                     let _guard = ctx.projection_timer.guard();
-                    project_output_from_record(rec, out_cfg)
+                    project_output_from_record(rec, out_cfg, cxl_emit_names_opt)
                 };
                 Arc::clone(projected.schema())
             } else {
@@ -1013,7 +1086,7 @@ pub(crate) fn dispatch_plan_node(
                         for (record, _rn) in &input_records {
                             let projected = {
                                 let _guard = ctx.projection_timer.guard();
-                                project_output_from_record(record, out_cfg)
+                                project_output_from_record(record, out_cfg, cxl_emit_names_opt)
                             };
                             let write_result = {
                                 let _guard = ctx.write_timer.guard();

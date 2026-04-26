@@ -148,7 +148,7 @@ impl RecordStorage for Arena {
 }
 
 /// Estimate the in-memory size of a MinimalRecord (rough heuristic).
-fn estimated_size(record: &MinimalRecord) -> usize {
+pub(crate) fn estimated_size(record: &MinimalRecord) -> usize {
     let base = std::mem::size_of::<MinimalRecord>();
     let fields: usize = (0..record.len())
         .map(|i| match record.get(i) {

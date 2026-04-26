@@ -1,5 +1,6 @@
 ---
 source: crates/clinker-core/tests/pre_lift_baselines.rs
+assertion_line: 360
 expression: text
 ---
 === Execution Plan ===

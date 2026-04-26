@@ -1567,7 +1567,6 @@ impl PipelineConfig {
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 indices: &indices,
                 primary_source: primary_source.as_str(),
-                runtime_input_schema: ctx.runtime_input_schema.as_deref(),
             };
             let plan_node =
                 lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
@@ -1676,31 +1675,14 @@ impl PipelineConfig {
             indices_to_build: indices,
             output_projections,
             parallelism,
-            correlation_sort_note: None,
             node_properties: HashMap::new(),
         };
 
         // ── Enrichment pipeline ─────────────────────────────────────
-        //
-        // Pipeline-level correlation-key sort injection runs first: it
-        // materializes a planner-synthesized `PlanNode::Sort` on the
-        // primary source's outgoing edges when the pipeline declares a
-        // correlation key. This is distinct from per-operator algorithm
-        // sort requirements (enforcer sorts) and must run first because
-        // the correlation sort reshapes the graph topology that the
-        // enforcer pass + property derivation walk.
         let inputs_map: HashMap<String, crate::config::SourceConfig> = source_configs
             .iter()
             .map(|i| (i.name.clone(), i.clone()))
             .collect();
-        if let Err(e) = dag.inject_correlation_sort(&self.error_handling, &source_configs) {
-            diags.push(Diagnostic::error(
-                "E003",
-                format!("correlation sort injection failed: {e}"),
-                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-            ));
-            return Err(diags);
-        }
         if let Err(e) = dag.insert_enforcer_sorts(&inputs_map) {
             diags.push(Diagnostic::error(
                 "E003",
@@ -1936,7 +1918,6 @@ pub(crate) struct LoweringCtx<'a> {
     pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
     pub indices: &'a [crate::plan::index::IndexSpec],
     pub primary_source: &'a str,
-    pub runtime_input_schema: Option<&'a [String]>,
 }
 
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
@@ -2140,20 +2121,15 @@ pub(crate) fn lower_node_to_plan_node(
                 cxl: agg_body.cxl.source.as_str().to_string(),
                 strategy: agg_body.strategy,
             };
-            // Prefer the runtime Arrow schema when available.
-            // `typed.field_types` comes from the author-declared source
-            // schema, which may contain columns not present in the actual
-            // file; the aggregator projects records by positional index,
-            // so `group_by_indices` must resolve against the runtime
-            // layout, not the declared superset.
-            let input_schema: Vec<String> = match ctx.runtime_input_schema {
-                Some(rt) => rt.to_vec(),
-                None => typed
-                    .field_types
-                    .keys()
-                    .map(|qf| qf.name.to_string())
-                    .collect(),
-            };
+            // `typed.field_types` is keyed and ordered by `bind_schema`'s
+            // upstream `Row`, so iterating its keys yields the live
+            // column layout the aggregator will project against — no
+            // separate runtime-schema thread is needed.
+            let input_schema: Vec<String> = typed
+                .field_types
+                .keys()
+                .map(|qf| qf.name.to_string())
+                .collect();
             let compiled_agg =
                 match cxl::plan::extract_aggregates(&typed, &agg_cfg.group_by, &input_schema) {
                     Ok(c) => c,
@@ -2240,68 +2216,6 @@ pub(crate) fn lower_node_to_plan_node(
     }
 }
 
-/// Correlation key for grouped DLQ rejection.
-///
-/// When set on `ErrorHandlingConfig`, all records sharing a correlation key value
-/// are DLQ'd atomically if any single record in the group fails evaluation.
-/// Custom `Deserialize`: accepts `"field"` string or `["f1", "f2"]` array.
-#[derive(Debug, Clone, Serialize)]
-pub enum CorrelationKey {
-    Single(String),
-    Compound(Vec<String>),
-}
-
-impl CorrelationKey {
-    /// Return the field names that make up this correlation key.
-    pub fn fields(&self) -> Vec<&str> {
-        match self {
-            Self::Single(f) => vec![f.as_str()],
-            Self::Compound(fs) => fs.iter().map(|f| f.as_str()).collect(),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for CorrelationKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct CorrelationKeyVisitor;
-
-        impl<'de> Visitor<'de> for CorrelationKeyVisitor {
-            type Value = CorrelationKey;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a string (single key) or array of strings (compound key)")
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(CorrelationKey::Single(v.to_string()))
-            }
-
-            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut fields = Vec::new();
-                while let Some(field) = seq.next_element::<String>()? {
-                    fields.push(field);
-                }
-                if fields.is_empty() {
-                    return Err(de::Error::custom("correlation_key array must not be empty"));
-                }
-                if fields.len() == 1 {
-                    return Ok(CorrelationKey::Single(fields.remove(0)));
-                }
-                Ok(CorrelationKey::Compound(fields))
-            }
-        }
-
-        deserializer.deserialize_any(CorrelationKeyVisitor)
-    }
-}
-
-fn default_max_group_buffer() -> Option<u64> {
-    Some(100_000)
-}
-
 /// Error handling strategy and DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2312,17 +2226,6 @@ pub struct ErrorHandlingConfig {
     pub dlq: Option<DlqConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
-    /// Correlation key for grouped DLQ rejection. When set, all records sharing
-    /// a key value are DLQ'd atomically if any record in the group fails.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub correlation_key: Option<CorrelationKey>,
-    /// Maximum records buffered per correlation group. Groups exceeding this cap
-    /// are DLQ'd entirely with a `group_size_exceeded` summary entry. Default: 100,000.
-    #[serde(
-        default = "default_max_group_buffer",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub max_group_buffer: Option<u64>,
 }
 
 impl Default for ErrorHandlingConfig {
@@ -2331,8 +2234,6 @@ impl Default for ErrorHandlingConfig {
             strategy: default_strategy(),
             dlq: None,
             type_error_threshold: None,
-            correlation_key: None,
-            max_group_buffer: None,
         }
     }
 }

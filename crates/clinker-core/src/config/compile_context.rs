@@ -32,15 +32,6 @@ pub struct CompileContext {
     /// Wired from the `--allow-absolute-paths` CLI flag and/or
     /// the `CLINKER_ALLOW_ABSOLUTE_PATHS` env var.
     pub allow_absolute_paths: bool,
-    /// Runtime column layout for aggregate `group_by_indices` alignment.
-    ///
-    /// `typed.field_types` reflects the author-declared source schema, which
-    /// may be a superset of the real file columns. When the executor opens
-    /// source readers, it populates this field with the live column names
-    /// so the Aggregate lowering arm resolves indices against the runtime
-    /// layout rather than the declared one. `None` for CLI `--explain`,
-    /// tests, and benches — they align to the declared schema.
-    pub runtime_input_schema: Option<Vec<String>>,
 }
 
 impl CompileContext {
@@ -52,7 +43,6 @@ impl CompileContext {
             workspace_root: workspace_root.into(),
             pipeline_dir: PathBuf::new(),
             allow_absolute_paths: false,
-            runtime_input_schema: None,
         }
     }
 
@@ -65,7 +55,6 @@ impl CompileContext {
             workspace_root: workspace_root.into(),
             pipeline_dir: pipeline_dir.into(),
             allow_absolute_paths: false,
-            runtime_input_schema: None,
         }
     }
 
@@ -83,7 +72,6 @@ impl Default for CompileContext {
             workspace_root: std::env::current_dir().unwrap_or_default(),
             pipeline_dir: PathBuf::new(),
             allow_absolute_paths: false,
-            runtime_input_schema: None,
         }
     }
 }

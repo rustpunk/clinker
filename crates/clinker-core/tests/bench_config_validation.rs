@@ -279,32 +279,6 @@ fn test_multi_output_route_targets_match_outputs() {
     }
 }
 
-/// Correlated configs have sort_order and correlation_key.
-#[test]
-fn test_correlated_configs_have_sort_order_and_key() {
-    let configs = [
-        "execution_mode/sorted_streaming_correlated.yaml",
-        "execution_mode/sorted_streaming_group_flush.yaml",
-        "features/dlq_correlated.yaml",
-    ];
-    let root = workspace_root().join("benches/pipelines");
-    for name in configs {
-        let path = root.join(name);
-        let yaml = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let config = parse_config(&yaml).unwrap_or_else(|e| panic!("{name}: {e}"));
-
-        let source = config.source_configs().next().expect("no source");
-        assert!(
-            source.sort_order.as_ref().map_or(false, |s| !s.is_empty()),
-            "{name}: source must have non-empty sort_order"
-        );
-        assert!(
-            config.error_handling.correlation_key.is_some(),
-            "{name}: error_handling must have correlation_key"
-        );
-    }
-}
-
 /// Two-pass configs have analytic_window with non-empty group_by.
 #[test]
 fn test_two_pass_configs_have_analytic_window_group_by() {

@@ -1009,8 +1009,15 @@ impl HashAggregator {
             .collect();
         let factory = AccumulatorFactory::new(compiled);
         let estimated = estimated_bytes_per_group(&factory, group_by_indices.len());
+        // `.max(1)` clamp: integer division yields 0 when a single group's
+        // estimated footprint exceeds the 60% share of the budget. Without
+        // the clamp the downstream check `self.groups.len() >= self.max_groups`
+        // is `usize >= 0` — always true — and spill fires on every record
+        // insertion. Clamping to 1 lets at least one group land before
+        // spilling, the minimum sensible behavior at pathologically small
+        // budgets.
         let max_groups = if memory_budget > 0 && estimated > 0 {
-            (memory_budget * 60 / 100) / estimated
+            ((memory_budget * 60 / 100) / estimated).max(1)
         } else {
             usize::MAX
         };
@@ -2926,35 +2933,63 @@ mod spill_trigger_tests {
     }
 
     // ------------------------------------------------------------------
-    // RSS backstop: tiny budget triggers spill via RSS check
+    // RSS backstop fires exclusively — neither the group-count nor
+    // value-heap thresholds are reachable under the configured budget
+    // and workload, so the only path that can spill is the RSS check.
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_rss_backstop_with_tiny_budget() {
+    fn test_rss_backstop_fires_exclusively() {
         if crate::pipeline::memory::rss_bytes().is_none() {
             return; // Skip on unsupported platforms
         }
         let tmp = tempfile::tempdir().expect("tempdir");
         let input = make_schema(&["k"]);
-        // Budget of 1 byte — RSS always exceeds 85% of 1 byte.
+        // 1 MB budget:
+        //   - max_groups resolves to hundreds (>> the 10 unique keys below),
+        //     so the primary group-count threshold cannot fire.
+        //   - value_heap_bytes stays ~0 (count(*) is i64-per-group),
+        //     so the 40% value-heap threshold cannot fire.
+        //   - RSS of any real test process is tens of MB >> 85% of 1 MB,
+        //     so the RSS backstop is the only path that can spill.
+        const BUDGET: usize = 1024 * 1024;
         let mut agg = build_test_aggregator(
             &[("k", Type::String)],
             &["k"],
             "emit k = k\nemit n = count(*)",
-            1,
+            BUDGET,
             Some(tmp.path().to_path_buf()),
         );
+        // Precondition assertions make the test self-documenting about
+        // which branch it claims to exercise.
+        assert!(
+            agg.max_groups() >= 100,
+            "precondition: max_groups={} must dwarf the 10-key workload \
+             (otherwise the primary group-count threshold fires and this \
+             test is not exercising the RSS backstop)",
+            agg.max_groups()
+        );
+
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("t.csv");
-        // Feed enough records to trigger the RSS check (>= 4096).
-        for i in 0..5000u64 {
-            let r = make_record(&input, vec![Value::String(format!("rss_{i}").into())]);
+        // Feed > 4096 records across only 10 unique keys so the group-count
+        // primary threshold stays inert (groups.len() plateaus at 10).
+        for i in 0..5_000u64 {
+            let key = format!("k{}", i % 10);
+            let r = make_record(&input, vec![Value::String(key.into())]);
             agg.add_record(&r, i, &ctx_for(&stable, &file, i))
                 .expect("add_record");
         }
         assert!(
+            agg.value_heap_bytes() < BUDGET * 40 / 100,
+            "precondition: value_heap_bytes={} must stay under 40% of budget \
+             (otherwise the secondary value-heap threshold fires and this \
+             test is not exercising the RSS backstop)",
+            agg.value_heap_bytes()
+        );
+        assert!(
             !agg.spill_files().is_empty(),
-            "RSS backstop should trigger spill with 1-byte budget"
+            "RSS backstop should spill when process RSS exceeds 85% of a 1 MB budget"
         );
     }
 }

@@ -4249,7 +4249,6 @@ nodes:
                 per_transform: Vec::new(),
                 worker_threads: 1,
             },
-            correlation_sort_note: None,
             node_properties: std::collections::HashMap::new(),
         };
         let mut diags = Vec::new();

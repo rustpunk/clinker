@@ -475,7 +475,6 @@ mod tests {
                 per_transform: vec![],
                 worker_threads: 1,
             },
-            correlation_sort_note: None,
             node_properties: Default::default(),
         }
     }

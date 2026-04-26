@@ -55,21 +55,32 @@ pub fn project_output_with_meta(
     _metadata: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
-    project_output_from_record(input_record, config)
+    project_output_from_record(input_record, config, None)
 }
 
 /// Record-driven projection (Invariant 3 implementation).
 ///
-/// `include_unmapped: true` surfaces any off-schema reader columns that
-/// the Source stage captured into `$meta.*` during schema reprojection.
-/// Pre-rip this flag controlled whether the overflow map flowed into
-/// the output record; post-rip metadata is the sole home for unmapped
-/// reader fields, so the flag dispatches through the metadata merge path.
-pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) -> Record {
+/// `include_unmapped: true` surfaces every column on the record AND any
+/// off-schema reader columns captured into `$meta.*` during schema
+/// reprojection.
+///
+/// `include_unmapped: false`: when `cxl_emit_names` is `Some`, the output
+/// is restricted to those names — upstream passthroughs the user did
+/// NOT explicitly emit are dropped. This matches the documented Output
+/// projection semantic. When `cxl_emit_names` is `None` (caller has no
+/// upstream PlanNode handle), all upstream columns survive — the
+/// permissive fallback used by tests and ad-hoc projections.
+pub fn project_output_from_record(
+    input_record: &Record,
+    config: &OutputConfig,
+    cxl_emit_names: Option<&[String]>,
+) -> Record {
+    let drop_unmapped = !config.include_unmapped && cxl_emit_names.is_some();
     let needs_rewrite = config.exclude.is_some()
         || config.mapping.is_some()
         || !config.include_metadata.is_none()
-        || config.include_unmapped;
+        || config.include_unmapped
+        || drop_unmapped;
 
     if !needs_rewrite {
         // Fast path: no exclude, no mapping, no metadata merge — emit
@@ -92,6 +103,23 @@ pub fn project_output_from_record(input_record: &Record, config: &OutputConfig) 
         IndexMap::with_capacity(input_record.total_field_count());
     for (name, value) in input_record.iter_all_fields() {
         fields.insert(name.to_string(), value.clone());
+    }
+
+    // Restrict to user-emitted columns when the caller supplied the
+    // upstream node's emit-name list and `include_unmapped: false`.
+    // Walk the emit list to preserve declaration order; metadata fields
+    // (meta-prefixed below) are added after this restriction so they
+    // survive even though they are not in `cxl_emit_names`.
+    if drop_unmapped {
+        let allowed: std::collections::HashSet<&str> =
+            cxl_emit_names.unwrap().iter().map(|s| s.as_str()).collect();
+        let kept: IndexMap<String, Value> = cxl_emit_names
+            .unwrap()
+            .iter()
+            .filter_map(|name| fields.get(name.as_str()).map(|v| (name.clone(), v.clone())))
+            .collect();
+        fields = kept;
+        let _ = allowed;
     }
 
     // Merge metadata into output when include_metadata is set (key is

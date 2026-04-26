@@ -687,3 +687,145 @@ nodes:
     assert_eq!(stream_report.counters.ok_count, 2);
     assert_eq!(sorted_body_lines(&hash_out), sorted_body_lines(&stream_out));
 }
+
+/// Option-W Part B canary: window transform followed by aggregate.
+///
+/// Before Option-W completion, this pipeline entered the arena closed-loop
+/// path which iterated a transform chain without dispatching the aggregate
+/// node. The aggregate never ran; output was silently empty/incorrect.
+///
+/// Mirrors `benches/pipelines/realistic/windowed_analytics.yaml`. Asserts:
+///   * Aggregate output is non-empty.
+///   * `total_metric` per group = sum of `metric` (= f2) per `f1` group.
+///   * `record_count` per group = count of input records per `f1` group.
+///   * `avg_w_sum` per group is non-null (window values flowed through).
+#[test]
+fn test_e2e_windowed_transform_then_aggregate() {
+    let yaml = r#"
+pipeline:
+  name: windowed_then_aggregate
+nodes:
+- type: source
+  name: source
+  config:
+    name: source
+    type: csv
+    path: input.csv
+    options:
+      has_header: true
+    schema:
+      - { name: f0, type: int }
+      - { name: f1, type: string }
+      - { name: f2, type: int }
+
+- type: transform
+  name: windowed
+  input: source
+  config:
+    cxl: |
+      emit f0 = f0
+      emit f1 = f1
+      emit metric = f2
+      emit w_sum = $window.sum(f2)
+    analytic_window:
+      group_by: [f0]
+
+- type: aggregate
+  name: summarize
+  input: windowed
+  config:
+    group_by: [f1]
+    strategy: hash
+    cxl: |
+      emit f1 = f1
+      emit total_metric = sum(metric)
+      emit avg_w_sum = avg(w_sum)
+      emit record_count = count(*)
+
+- type: output
+  name: sink
+  input: summarize
+  config:
+    name: sink
+    type: csv
+    path: output.csv
+    include_unmapped: true
+"#;
+
+    // Two partitions on f0 (window group-by):
+    //   f0=1 → rows with f1="a" (2), f1="b" (1). w_sum per row = 100+200+300 = 600.
+    //   f0=2 → rows with f1="a" (1), f1="c" (2). w_sum per row = 50+400+500 = 950.
+    // After aggregate group_by f1:
+    //   f1="a": 3 records; total_metric = 100+200+50 = 350.
+    //   f1="b": 1 record;  total_metric = 300.
+    //   f1="c": 2 records; total_metric = 400+500 = 900.
+    let csv = "f0,f1,f2\n\
+        1,a,100\n\
+        1,a,200\n\
+        1,b,300\n\
+        2,a,50\n\
+        2,c,400\n\
+        2,c,500\n";
+
+    let (report, out) = run_single(yaml, csv);
+    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries expected");
+    assert!(
+        !out.is_empty() && out.lines().count() >= 2,
+        "aggregate output must be non-empty (header + ≥1 group): {out}"
+    );
+
+    // Parse output into a map keyed by f1.
+    let mut lines = out.lines();
+    let header = lines.next().expect("header row present");
+    let cols: Vec<&str> = header.split(',').collect();
+    let idx_f1 = cols.iter().position(|c| *c == "f1").expect("f1 col");
+    let idx_total = cols
+        .iter()
+        .position(|c| *c == "total_metric")
+        .expect("total_metric col");
+    let idx_count = cols
+        .iter()
+        .position(|c| *c == "record_count")
+        .expect("record_count col");
+    let idx_avg = cols
+        .iter()
+        .position(|c| *c == "avg_w_sum")
+        .expect("avg_w_sum col");
+
+    let mut by_group: HashMap<String, (i64, i64, String)> = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        let f1 = parts[idx_f1].trim_matches('"').to_string();
+        let total: i64 = parts[idx_total].parse().expect("total_metric i64");
+        let count: i64 = parts[idx_count].parse().expect("record_count i64");
+        let avg = parts[idx_avg].to_string();
+        by_group.insert(f1, (total, count, avg));
+    }
+
+    // Golden: {a: total=350 n=3, b: total=300 n=1, c: total=900 n=2}
+    assert_eq!(by_group.len(), 3, "three distinct f1 groups: {by_group:?}");
+    let (total_a, count_a, avg_a) = by_group.get("a").expect("group a");
+    let (total_b, count_b, avg_b) = by_group.get("b").expect("group b");
+    let (total_c, count_c, avg_c) = by_group.get("c").expect("group c");
+    assert_eq!((*total_a, *count_a), (350, 3), "group a totals");
+    assert_eq!((*total_b, *count_b), (300, 1), "group b totals");
+    assert_eq!((*total_c, *count_c), (900, 2), "group c totals");
+
+    // Window values propagated (avg_w_sum is non-null). We don't pin exact
+    // float values; the key invariant is "aggregate sees real window
+    // output, not silently-empty defaults."
+    for (group, avg) in [("a", avg_a), ("b", avg_b), ("c", avg_c)] {
+        assert!(
+            !avg.is_empty()
+                && avg != "null"
+                && avg != "0"
+                && avg != "0.0"
+                && !avg.eq_ignore_ascii_case("none"),
+            "group {group}: avg_w_sum should be a real window-derived \
+             average, got {avg:?}"
+        );
+    }
+}

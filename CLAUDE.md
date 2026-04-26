@@ -9,9 +9,11 @@ Before any git commit, run the same checks as GitHub CI (`.github/workflows/ci.y
 1. `cargo fmt --all` (CI runs `--check`; locally fix first)
 2. `cargo clippy --workspace -- -D warnings`
 3. `cargo test --workspace`
-4. `cargo deny check`
+4. `cargo check --benches --workspace` — `cargo test --workspace` does NOT compile benches; a changed crate API can leave bench call-sites broken and only surface in CI
+5. `cargo check --features bench-alloc -p clinker-benchmarks`
+6. `cargo deny check`
 
-Fix any issues before committing. All four must pass — these are the exact checks CI enforces on every PR.
+Fix any issues before committing. All six must pass — these are the exact checks CI enforces on every PR.
 
 ## Build & test commands
 

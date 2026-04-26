@@ -310,7 +310,11 @@ mod tests {
 
     #[test]
     fn test_override_alias_mapping_interaction() {
-        // Alias creates identity boundary: mapping keys use post-alias names
+        // Alias creates identity boundary: mapping keys use post-alias names.
+        // Under Option W, aliases are a schema-level concern (the record's
+        // bound schema carries the post-alias name); there is no per-record
+        // emitted side-map to rename at projection time. This test now
+        // verifies the alias map itself is correctly built.
         let mut schema = base_schema();
         let fields = match &mut schema {
             ResolvedSchema::SingleRecord { fields } => fields,
@@ -325,32 +329,16 @@ mod tests {
         resolve_overrides(&mut schema, &[patch]).unwrap();
 
         let aliases = build_alias_map(&schema);
-
-        // Simulate alias application to emitted fields
-        let mut emitted = indexmap::IndexMap::new();
-        emitted.insert(
-            "employee_id".to_string(),
-            clinker_record::Value::Integer(42),
-        );
-        crate::projection::apply_aliases(&mut emitted, &aliases);
-
-        // Post-alias name is emp_id
-        assert!(
-            emitted.contains_key("emp_id"),
-            "post-alias name should be emp_id"
-        );
-        assert!(
-            !emitted.contains_key("employee_id"),
-            "pre-alias name should be gone"
+        assert_eq!(
+            aliases.get("employee_id").map(|s| s.as_str()),
+            Some("emp_id"),
+            "alias map should map pre → post name"
         );
 
         // Output mapping uses post-alias name
         let mut mapping = indexmap::IndexMap::new();
         mapping.insert("emp_id".to_string(), "Employee ID".to_string());
-
-        // Pre-alias name should NOT match
         assert!(!mapping.contains_key("employee_id"));
-        // Post-alias name should match
         assert!(mapping.contains_key("emp_id"));
     }
 

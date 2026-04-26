@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::{Control, DfsEvent, EdgeRef, Topo, depth_first_search};
+use petgraph::visit::{Control, DfsEvent, Topo, depth_first_search};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
@@ -521,6 +521,63 @@ impl PlanNode {
     /// The stored `Arc<Schema>` for this node. For variants whose output
     /// row shape matches the upstream (Route/Output/Sort), callers must
     /// resolve via the graph (see [`PlanNode::output_schema_in`]).
+    /// Names of CXL-emitted columns this node produces, for downstream
+    /// `include_unmapped: false` projection at the Output boundary.
+    ///
+    /// - Source: every column is user-declared in the source schema, so
+    ///   the full schema counts as "explicitly emitted".
+    /// - Transform: `write_set` — just the `emit` LHS names, excluding
+    ///   upstream passthroughs that the planner widened into the output
+    ///   schema.
+    /// - Aggregation / Combine / Composition / Merge: `output_schema`
+    ///   columns — these variants don't widen; their schema IS the set
+    ///   of explicitly produced columns.
+    /// - Route / Sort / Output: walk to the immediate upstream and
+    ///   inherit its emit names (these variants don't add their own).
+    pub fn cxl_emit_names_in(&self, dag: &ExecutionPlanDag) -> Vec<String> {
+        match self {
+            PlanNode::Source { output_schema, .. } => output_schema
+                .columns()
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            PlanNode::Transform {
+                write_set,
+                output_schema,
+                ..
+            } => output_schema
+                .columns()
+                .iter()
+                .filter(|c| write_set.contains(c.as_ref()))
+                .map(|c| c.to_string())
+                .collect(),
+            PlanNode::Aggregation { output_schema, .. }
+            | PlanNode::Combine { output_schema, .. }
+            | PlanNode::Composition { output_schema, .. }
+            | PlanNode::Merge { output_schema, .. } => output_schema
+                .columns()
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            PlanNode::Route { .. } | PlanNode::Sort { .. } | PlanNode::Output { .. } => {
+                let name = self.name();
+                let idx = match dag
+                    .graph
+                    .node_indices()
+                    .find(|&i| dag.graph[i].name() == name)
+                {
+                    Some(i) => i,
+                    None => return Vec::new(),
+                };
+                dag.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .next()
+                    .map(|upstream| dag.graph[upstream].cxl_emit_names_in(dag))
+                    .unwrap_or_default()
+            }
+        }
+    }
+
     pub fn stored_output_schema(&self) -> Option<&Arc<Schema>> {
         match self {
             PlanNode::Source { output_schema, .. }
@@ -733,8 +790,6 @@ pub struct ExecutionPlanDag {
     pub output_projections: Vec<OutputSpec>,
     /// Parallelism profile for the pipeline.
     pub parallelism: ParallelismProfile,
-    /// If correlation sort was auto-injected, describes what was prepended.
-    pub correlation_sort_note: Option<String>,
     /// Physical properties (ordering, partitioning) per node, keyed by
     /// `NodeIndex`. Populated by
     /// [`compute_node_properties`](ExecutionPlanDag::compute_node_properties)
@@ -767,7 +822,6 @@ impl ExecutionPlanDag {
                 per_transform: Vec::new(),
                 worker_threads: 1,
             },
-            correlation_sort_note: None,
             node_properties: HashMap::new(),
         }
     }
@@ -775,39 +829,6 @@ impl ExecutionPlanDag {
     /// Whether any node requires arena allocation (window functions).
     pub fn required_arena(&self) -> bool {
         !self.indices_to_build.is_empty()
-    }
-
-    /// Whether the executor must dispatch the sorted-streaming path
-    /// (correlation-key DLQ failure-domain batching).
-    ///
-    /// The signal is pipeline-level — the presence of a planner-synthesized
-    /// correlation [`PlanNode::Sort`] inserted by
-    /// [`Self::inject_correlation_sort`]. Operator-intrinsic sort
-    /// requirements (`RequiresSortedInput`) are an orthogonal concern
-    /// reserved for future merge-join / streaming-agg.
-    pub fn required_sorted_input(&self) -> bool {
-        if self.required_arena() {
-            return false;
-        }
-        self.correlation_sort_node().is_some()
-    }
-
-    /// Locate the planner-synthesized correlation [`PlanNode::Sort`] node, if
-    /// any, returning `(node_index, sort_fields)`.
-    ///
-    /// Used by the executor to retrieve the active correlation sort order
-    /// without re-deriving it from `error_handling.correlation_key`.
-    pub fn correlation_sort_node(&self) -> Option<(NodeIndex, &[SortField])> {
-        self.graph
-            .node_indices()
-            .find_map(|idx| match &self.graph[idx] {
-                PlanNode::Sort {
-                    name, sort_fields, ..
-                } if name.starts_with(CORRELATION_SORT_PREFIX) => {
-                    Some((idx, sort_fields.as_slice()))
-                }
-                _ => None,
-            })
     }
 
     /// Get transform nodes in topological order.
@@ -910,8 +931,6 @@ impl ExecutionPlanDag {
     pub fn execution_summary(&self) -> String {
         if self.required_arena() {
             "TwoPass".to_string()
-        } else if self.required_sorted_input() {
-            "SortedStreaming".to_string()
         } else {
             "Streaming".to_string()
         }
@@ -938,10 +957,6 @@ impl ExecutionPlanDag {
             self.output_projections.len()
         ));
         out.push_str(&format!("DAG nodes: {}\n\n", self.graph.node_count()));
-
-        if let Some(note) = &self.correlation_sort_note {
-            out.push_str(&format!("{note}\n\n"));
-        }
 
         if !self.source_dag.is_empty() {
             out.push_str("Source DAG:\n");
@@ -2195,176 +2210,7 @@ pub(crate) fn build_source_dag(
 /// transform's per-operator [`NodeExecutionReqs::RequiresSortedInput`].
 pub const ENFORCER_SORT_PREFIX: &str = "__sort_for_";
 
-/// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes
-/// inserted by [`ExecutionPlanDag::inject_correlation_sort`] to materialize
-/// the pipeline-level `error_handling.correlation_key` failure-domain
-/// grouping policy. Distinct from [`ENFORCER_SORT_PREFIX`] because the two
-/// passes encode different concerns: operator-intrinsic algorithm needs vs.
-/// declared pipeline-level policy.
-pub const CORRELATION_SORT_PREFIX: &str = "__correlation_sort_";
-
 impl ExecutionPlanDag {
-    /// Inject a [`PlanNode::Sort`] for the pipeline-level
-    /// `error_handling.correlation_key` failure-domain grouping policy.
-    ///
-    /// This is the *direct compile-time injection* path for pipeline-scoped
-    /// ordering policy, distinct from
-    /// [`insert_enforcer_sorts`](Self::insert_enforcer_sorts) which serves
-    /// per-operator algorithm-intrinsic requirements.
-    ///
-    /// # Behavior
-    /// - No-op if `error_handling.correlation_key` is unset.
-    /// - No-op if the primary source's declared `sort_order` already starts
-    ///   with the correlation key fields (idempotent satisfaction).
-    /// - Otherwise inserts one [`PlanNode::Sort`] node immediately downstream
-    ///   of the primary source ([`PipelineConfig::inputs[0]`]) and reroutes
-    ///   every existing data edge from that source through it. Sort fields =
-    ///   `[correlation_key_fields..., declared_sort_order_remainder...]` to
-    ///   match the deleted `maybe_inject_correlation_sort` semantics.
-    ///
-    /// # Idempotency
-    /// A second call adds zero new nodes: the inserted [`PlanNode::Sort`]
-    /// stands between the source and any consumer, so the source no longer
-    /// has direct Transform consumers to reroute. The reserved-prefix guard
-    /// (validated by [`insert_enforcer_sorts`]) prevents user-declared name
-    /// collisions.
-    ///
-    /// # Errors
-    /// Returns [`PipelineError::Compilation`] if `inputs[0]` is not present
-    /// in the DAG (should be impossible after a successful node-building
-    /// pass; treated as an internal invariant violation).
-    pub fn inject_correlation_sort(
-        &mut self,
-        error_handling: &crate::config::ErrorHandlingConfig,
-        sources: &[SourceConfig],
-    ) -> Result<(), PipelineError> {
-        let Some(correlation_key) = error_handling.correlation_key.as_ref() else {
-            return Ok(());
-        };
-        let Some(primary_input) = sources.first() else {
-            return Ok(());
-        };
-
-        // Build the desired sort_fields list: correlation key first, then any
-        // user-declared trailing fields not already in the key prefix.
-        let key_field_names: Vec<String> = correlation_key
-            .fields()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let declared: Vec<SortField> = primary_input
-            .sort_order
-            .as_ref()
-            .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect())
-            .unwrap_or_default();
-
-        // Idempotent satisfaction: declared sort already starts with the
-        // correlation key fields (direction-agnostic, matching the deleted
-        // is_sorted_by_correlation_key behavior).
-        let already_satisfied = key_field_names.len() <= declared.len()
-            && key_field_names
-                .iter()
-                .zip(declared.iter())
-                .all(|(k, sf)| k == &sf.field);
-        if already_satisfied {
-            return Ok(());
-        }
-
-        // Locate the primary source node by name.
-        let primary_name = &primary_input.name;
-        let source_idx = self.graph.node_indices().find(
-            |&idx| matches!(&self.graph[idx], PlanNode::Source { name, .. } if name == primary_name),
-        );
-        let Some(source_idx) = source_idx else {
-            return Err(PipelineError::Compilation {
-                transform_name: primary_name.clone(),
-                messages: vec![format!(
-                    "inject_correlation_sort: primary source '{primary_name}' not found in DAG"
-                )],
-            });
-        };
-
-        // Build sort fields: key first, then any declared trailing fields not
-        // already named in the key prefix.
-        let mut sort_fields: Vec<SortField> = key_field_names
-            .iter()
-            .map(|f| SortField {
-                field: f.clone(),
-                order: crate::config::SortOrder::Asc,
-                null_order: None,
-            })
-            .collect();
-        for sf in declared.into_iter() {
-            if !key_field_names.contains(&sf.field) {
-                sort_fields.push(sf);
-            }
-        }
-
-        // Snapshot all outgoing data edges from the source. Reroute each
-        // through a single inserted Sort node, preserving DependencyType.
-        let outgoing: Vec<(NodeIndex, DependencyType)> = self
-            .graph
-            .edges_directed(source_idx, petgraph::Direction::Outgoing)
-            .map(|e| (e.target(), e.weight().dependency_type))
-            .collect();
-
-        // Idempotency: if every outgoing edge already lands on a
-        // CORRELATION_SORT_PREFIX Sort node, no work to do.
-        if !outgoing.is_empty()
-            && outgoing.iter().all(|(t, _)| {
-                matches!(&self.graph[*t], PlanNode::Sort { name, .. } if name.starts_with(CORRELATION_SORT_PREFIX))
-            })
-        {
-            return Ok(());
-        }
-
-        if outgoing.is_empty() {
-            // Nothing downstream — nothing to enforce ordering for.
-            return Ok(());
-        }
-
-        // Planner-synthesized correlation sort enforcer. This node has
-        // no source-level declaration; it is derived from the primary
-        // source's correlation key and inserted on every outgoing edge.
-        // Correlation-sort nodes have no author-written YAML origin, so
-        // `Span::SYNTHETIC` is the correct span.
-        let sort_node = PlanNode::Sort {
-            name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
-            span: Span::SYNTHETIC,
-            sort_fields,
-        };
-        let sort_idx = self.graph.add_node(sort_node);
-
-        for (target, dep_type) in outgoing {
-            // Skip rerouting if the target is already the correlation Sort
-            // (defensive — outgoing was filtered above, but petgraph allows
-            // multi-edges).
-            if target == sort_idx {
-                continue;
-            }
-            if let Some(edge_id) = self.graph.find_edge(source_idx, target) {
-                self.graph.remove_edge(edge_id);
-            }
-            self.graph.add_edge(
-                sort_idx,
-                target,
-                PlanEdge {
-                    dependency_type: dep_type,
-                },
-            );
-        }
-        // Add the single Source -> Sort edge (Data dependency).
-        self.graph.add_edge(
-            source_idx,
-            sort_idx,
-            PlanEdge {
-                dependency_type: DependencyType::Data,
-            },
-        );
-
-        Ok(())
-    }
-
     /// Enforcer-sort insertion.
     ///
     /// Walks every [`PlanNode::Transform`] whose
@@ -2392,16 +2238,14 @@ impl ExecutionPlanDag {
                 continue;
             }
             let name = node.name();
-            for prefix in [ENFORCER_SORT_PREFIX, CORRELATION_SORT_PREFIX] {
-                if name.starts_with(prefix) {
-                    return Err(PipelineError::Compilation {
-                        transform_name: name.to_string(),
-                        messages: vec![format!(
-                            "node name '{}' uses reserved prefix '{}' (planner-synthesized sort enforcers only)",
-                            name, prefix
-                        )],
-                    });
-                }
+            if name.starts_with(ENFORCER_SORT_PREFIX) {
+                return Err(PipelineError::Compilation {
+                    transform_name: name.to_string(),
+                    messages: vec![format!(
+                        "node name '{}' uses reserved prefix '{}' (planner-synthesized sort enforcers only)",
+                        name, ENFORCER_SORT_PREFIX
+                    )],
+                });
             }
         }
 

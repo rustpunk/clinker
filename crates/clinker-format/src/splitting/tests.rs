@@ -424,8 +424,8 @@ fn test_split_csv_repeat_header() {
 #[test]
 fn test_split_csv_header_consistent() {
     // All split files share an identical header captured from the
-    // schema (not from the first record's overflow — that storage no
-    // longer exists).
+    // schema; there is no per-record overflow side-channel for column
+    // names.
     let schema = make_schema(&["id", "extra"]);
     let registry = FileRegistry::new();
     let policy = SplitPolicy {
