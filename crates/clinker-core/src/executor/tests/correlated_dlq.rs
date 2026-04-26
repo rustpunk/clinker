@@ -1020,3 +1020,204 @@ nodes:
         "output must NOT contain department A combined rows (department A failed): {output}"
     );
 }
+
+#[test]
+fn route_eval_error_dlqs_whole_group() {
+    // A Route condition that errors at evaluation time (e.g., a CXL
+    // expression that fails to convert) is routed to the correlation
+    // buffer as a trigger event for the failing record's group, just
+    // like a Transform error. Surviving records of the same group
+    // that succeed routing then DLQ as collaterals at commit time.
+    //
+    // Test pipeline: source → route(condition contains
+    // amount.to_int() > 0) → output. The bad row fails conversion
+    // inside the route condition, surfacing a route eval error;
+    // surviving group-A rows route cleanly to the "good" arm, but
+    // the buffer rolls back the whole group at commit.
+    let yaml = r#"
+pipeline:
+  name: route_eval_error_test
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: amount, type: string }
+
+- type: route
+  name: split
+  input: src
+  config:
+    mode: exclusive
+    conditions:
+      good: 'amount.to_int() > 0'
+    default: good
+
+- type: output
+  name: out
+  input: split.good
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,4\n";
+    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+
+    assert_eq!(
+        counters.dlq_count, 3,
+        "group A: 1 trigger (bad route eval) + 2 collaterals (A,1 and A,3)"
+    );
+    assert_eq!(counters.ok_count, 1, "only B,4 emitted");
+
+    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
+    assert_eq!(triggers, 1, "one trigger for the route eval failure");
+
+    assert!(output.contains("B,4"), "output should contain B: {output}");
+    assert!(
+        !output.contains("A,1") && !output.contains("A,3"),
+        "output must NOT contain any group A rows: {output}"
+    );
+}
+
+#[test]
+fn combine_iejoin_output_inherits_driver_correlation_meta() {
+    // The IEJoin combine strategy (selected for mixed equi+range
+    // predicates) must inherit driver meta the same way the
+    // HashBuildProbe path does. The kernel emits combined records via
+    // its local `widen_record_to_schema` helper (pipeline/iejoin.rs),
+    // which already copies `iter_meta()` from the driver record onto
+    // the widened output. This test locks that behavior so a future
+    // refactor that swaps the helper for a bare `Record::new(...)`
+    // would surface here.
+    //
+    // Test pipeline: orders (driver) → validate (transform that fails
+    // on a bad amount) → combine(orders ⨝ sessions on employee_id +
+    // event-time-within-session) → output. The mixed equi+range
+    // predicate triggers the HashPartitionIEJoin strategy.
+    let yaml = r#"
+pipeline:
+  name: combine_iejoin_correlation_meta
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: amount, type: string }
+      - { name: event_time, type: int }
+
+- type: source
+  name: sessions
+  config:
+    name: sessions
+    path: sessions.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: session_start, type: int }
+      - { name: session_end, type: int }
+
+- type: transform
+  name: validate
+  input: orders
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit amount_int = amount.to_int()
+      emit event_time = event_time
+
+- type: combine
+  name: enriched
+  input:
+    o: validate
+    s: sessions
+  config:
+    where: 'o.employee_id == s.employee_id and o.event_time >= s.session_start and o.event_time <= s.session_end'
+    match: first
+    on_miss: skip
+    cxl: |
+      emit employee_id = o.employee_id
+      emit amount_int = o.amount_int
+      emit event_time = o.event_time
+      emit session_start = s.session_start
+
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: false
+"#;
+    let orders_csv = "employee_id,amount,event_time\nA,1,5\nA,bad,10\nA,3,15\nB,4,25\n";
+    let sessions_csv = "employee_id,session_start,session_end\nA,0,20\nB,20,30\n";
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = PipelineRunParams {
+        execution_id: "test-exec-id".to_string(),
+        batch_id: "test-batch-id".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+    };
+
+    let primary = "orders".to_string();
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+        (
+            "orders".to_string(),
+            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+        (
+            "sessions".to_string(),
+            Box::new(std::io::Cursor::new(sessions_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+    ]);
+
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
+            .unwrap();
+    let output = buf.as_string();
+
+    assert_eq!(
+        report.counters.dlq_count, 3,
+        "group A: 1 trigger (bad row) + 2 collaterals (IEJoin output rows)"
+    );
+    assert_eq!(
+        report.counters.ok_count, 1,
+        "only group B's combined row emitted"
+    );
+
+    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
+    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    assert_eq!(triggers, 1, "one trigger for the bad source row");
+    assert_eq!(collaterals, 2, "two collaterals for IEJoin output rows");
+
+    assert!(output.contains("B,4"), "output should contain B: {output}");
+    assert!(
+        !output.contains("A,1") && !output.contains("A,3"),
+        "output must NOT contain group A rows: {output}"
+    );
+}
