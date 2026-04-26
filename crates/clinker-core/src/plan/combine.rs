@@ -587,30 +587,137 @@ pub(crate) const SMALL_INPUT_THRESHOLD: u64 = 10_000;
 /// Diagnostics accumulate in `diags`; callers (e.g.
 /// `compile_with_diagnostics`) inspect them to decide overall compile
 /// success.
+/// Bundled artifact subsets the per-graph combine post-pass reads.
+///
+/// Threaded into [`select_combine_strategies_in_graph`] so the same
+/// work runs uniformly over the top-level
+/// [`crate::plan::execution::ExecutionPlanDag`] and over each
+/// composition body's mini-DAG. Carrying the subsets as a struct
+/// (rather than half a dozen positional arguments) lets the wrapper
+/// `select_combine_strategies_in_bodies` borrow-split
+/// [`crate::plan::bind_schema::CompileArtifacts`] across
+/// `composition_bodies` (mutable) and the four lookup tables
+/// (immutable) without falling back to a clippy allow.
+pub(crate) struct CombineSelectionTables<'a> {
+    /// Per-combine input qualifier metadata, keyed by combine node name.
+    pub combine_inputs: &'a std::collections::HashMap<String, IndexMap<String, CombineInput>>,
+    /// Per-combine decomposed `where:` predicate, keyed by combine node name.
+    pub combine_predicates: &'a std::collections::HashMap<String, DecomposedPredicate>,
+    /// Per-combine driving qualifier, keyed by combine node name.
+    pub combine_driving: &'a std::collections::HashMap<String, String>,
+    /// Per-combine user-supplied strategy hint, keyed by combine node name.
+    pub combine_strategy_hints:
+        &'a std::collections::HashMap<String, crate::config::CombineStrategyHint>,
+}
+
 pub fn select_combine_strategies(
     plan: &mut crate::plan::execution::ExecutionPlanDag,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
     memory_limit: Option<&str>,
 ) {
+    // The top-level pass owns the `node_properties` table needed by
+    // `pure_range_inputs_presorted`. Snapshot it as a clone so the
+    // shared inner pass can take an immutable view alongside the
+    // graph's mutable borrow without aliasing through `plan`.
+    let node_properties_snapshot = plan.node_properties.clone();
+    let tables = CombineSelectionTables {
+        combine_inputs: &artifacts.combine_inputs,
+        combine_predicates: &artifacts.combine_predicates,
+        combine_driving: &artifacts.combine_driving,
+        combine_strategy_hints: &artifacts.combine_strategy_hints,
+    };
+    select_combine_strategies_in_graph(
+        &mut plan.graph,
+        Some(&node_properties_snapshot),
+        &tables,
+        diags,
+        memory_limit,
+    );
+}
+
+/// Run [`select_combine_strategies`]'s per-graph work on every
+/// composition body's mini-DAG. Body graphs hold their own
+/// `PlanNode::Combine` nodes that the top-level pass cannot see, so
+/// without this companion sweep body-context combines reach the
+/// executor with placeholder strategy + empty driving_input, then
+/// short-circuit at dispatch with an `Internal` "driving_input not
+/// stamped" error. Body graphs lack populated `node_properties` —
+/// the pure-range SortMerge eligibility probe is skipped.
+pub fn select_combine_strategies_in_bodies(
+    artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+    memory_limit: Option<&str>,
+) {
+    // Split the artifacts borrow: the bodies map mutates via
+    // `values_mut()`, while the lookup tables (combine_inputs,
+    // combine_predicates, combine_driving, combine_strategy_hints)
+    // remain immutable references for the inner per-graph call.
+    let crate::plan::bind_schema::CompileArtifacts {
+        composition_bodies,
+        combine_inputs,
+        combine_predicates,
+        combine_driving,
+        combine_strategy_hints,
+        ..
+    } = artifacts;
+
+    let tables = CombineSelectionTables {
+        combine_inputs,
+        combine_predicates,
+        combine_driving,
+        combine_strategy_hints,
+    };
+    for body in composition_bodies.values_mut() {
+        select_combine_strategies_in_graph(&mut body.graph, None, &tables, diags, memory_limit);
+    }
+}
+
+/// Inner per-graph implementation of [`select_combine_strategies`].
+///
+/// Splits the artifacts borrow so the same work can run twice — once
+/// over the top-level `ExecutionPlanDag.graph` and once per body's
+/// mini-DAG inside `CompileArtifacts.composition_bodies`.
+///
+/// `node_properties` carries sort-order provenance for pure-range
+/// `SortMerge` eligibility. Top-level callers pass `Some(&props)`;
+/// body-context callers pass `None` because body lowering never runs
+/// the parallelism / property-derivation passes that populate it.
+/// Without that view, pure-range combines uniformly route to
+/// `IEJoin`, never `SortMerge` — body bodies don't author pure-range
+/// fixtures today, so the difference is academic.
+pub(crate) fn select_combine_strategies_in_graph(
+    graph: &mut petgraph::graph::DiGraph<
+        crate::plan::execution::PlanNode,
+        crate::plan::execution::PlanEdge,
+    >,
+    node_properties: Option<
+        &std::collections::HashMap<
+            petgraph::graph::NodeIndex,
+            crate::plan::properties::NodeProperties,
+        >,
+    >,
+    tables: &CombineSelectionTables<'_>,
+    diags: &mut Vec<Diagnostic>,
+    memory_limit: Option<&str>,
+) {
     use crate::plan::execution::PlanNode;
     use petgraph::graph::NodeIndex;
 
-    let combine_nodes: Vec<(NodeIndex, String, Span)> = plan
-        .graph
+    let combine_nodes: Vec<(NodeIndex, String, Span)> = graph
         .node_indices()
-        .filter_map(|idx| match &plan.graph[idx] {
+        .filter_map(|idx| match &graph[idx] {
             PlanNode::Combine { name, span, .. } => Some((idx, name.clone(), *span)),
             _ => None,
         })
         .collect();
 
     for (idx, name, span) in combine_nodes {
-        let inputs = match artifacts.combine_inputs.get(&name) {
+        let inputs = match tables.combine_inputs.get(&name) {
             Some(i) => i,
             None => continue,
         };
-        let decomposed = match artifacts.combine_predicates.get(&name) {
+        let decomposed = match tables.combine_predicates.get(&name) {
             Some(d) => d,
             None => continue,
         };
@@ -635,7 +742,7 @@ pub fn select_combine_strategies(
             diags.push(combine_w302_small_both(&name, span));
         }
 
-        let driving = match artifacts.combine_driving.get(&name) {
+        let driving = match tables.combine_driving.get(&name) {
             Some(d) => d.clone(),
             None => continue,
         };
@@ -663,7 +770,9 @@ pub fn select_combine_strategies(
             // covers the single-inequality case; mixed-axis (`a.x <=
             // b.y AND a.z >= b.w`) keeps routing to IEJoin.
             let sort_merge_eligible = decomposed.ranges.len() == 1
-                && pure_range_inputs_presorted(plan, &name, &decomposed.ranges[0]);
+                && node_properties.is_some_and(|props| {
+                    pure_range_inputs_presorted(graph, props, &name, &decomposed.ranges[0])
+                });
             // W305 still fires either way: pure-range without a hash
             // partition key surfaces the perf cliff so authors notice
             // even when SortMerge takes the in-place fast path.
@@ -675,7 +784,7 @@ pub fn select_combine_strategies(
             }
         } else if grace_hash_should_fire(inputs, memory_limit)
             || matches!(
-                artifacts.combine_strategy_hints.get(&name),
+                tables.combine_strategy_hints.get(&name),
                 Some(crate::config::CombineStrategyHint::GraceHash)
             )
         {
@@ -700,7 +809,7 @@ pub fn select_combine_strategies(
             driving_input,
             build_inputs,
             ..
-        } = &mut plan.graph[idx]
+        } = &mut graph[idx]
         {
             *strategy = chosen_strategy;
             *driving_input = driving;
@@ -816,11 +925,17 @@ fn compute_partition_bits(inputs: &IndexMap<String, CombineInput>) -> u8 {
 /// of the source, not the predicate level. Returns false for any
 /// expression-shaped operand on either side.
 fn pure_range_inputs_presorted(
-    plan: &crate::plan::execution::ExecutionPlanDag,
+    graph: &petgraph::graph::DiGraph<
+        crate::plan::execution::PlanNode,
+        crate::plan::execution::PlanEdge,
+    >,
+    node_properties: &std::collections::HashMap<
+        petgraph::graph::NodeIndex,
+        crate::plan::properties::NodeProperties,
+    >,
     combine_name: &str,
     range: &RangeConjunct,
 ) -> bool {
-    use crate::plan::execution::PlanNode;
     use petgraph::Direction;
 
     let Some(left_field) = simple_field_name(&range.left_expr) else {
@@ -831,15 +946,13 @@ fn pure_range_inputs_presorted(
     };
 
     // Locate the combine node and its incoming neighbors.
-    let Some(combine_idx) = plan
-        .graph
+    let Some(combine_idx) = graph
         .node_indices()
-        .find(|&i| plan.graph[i].name() == combine_name)
+        .find(|&i| graph[i].name() == combine_name)
     else {
         return false;
     };
-    let predecessors: Vec<petgraph::graph::NodeIndex> = plan
-        .graph
+    let predecessors: Vec<petgraph::graph::NodeIndex> = graph
         .neighbors_directed(combine_idx, Direction::Incoming)
         .collect();
 
@@ -849,7 +962,7 @@ fn pure_range_inputs_presorted(
     // `combine_inputs[qualifier].upstream_name` records. Walk the
     // predecessors and check whichever one carries the field we need.
     let covers = |upstream_idx: petgraph::graph::NodeIndex, field: &str| -> bool {
-        let Some(props) = plan.node_properties.get(&upstream_idx) else {
+        let Some(props) = node_properties.get(&upstream_idx) else {
             return false;
         };
         let Some(sort_order) = props.ordering.sort_order.as_ref() else {
@@ -873,23 +986,12 @@ fn pure_range_inputs_presorted(
     let mut left_covered = false;
     let mut right_covered = false;
     for &pred in &predecessors {
-        match &plan.graph[pred] {
-            PlanNode::Source { name, .. }
-            | PlanNode::Transform { name, .. }
-            | PlanNode::Sort { name, .. }
-            | PlanNode::Aggregation { name, .. }
-            | PlanNode::Merge { name, .. }
-            | PlanNode::Combine { name, .. }
-            | PlanNode::Composition { name, .. }
-            | PlanNode::Route { name, .. }
-            | PlanNode::Output { name, .. } => {
-                if name == left_input_str && covers(pred, &left_field) {
-                    left_covered = true;
-                }
-                if name == right_input_str && covers(pred, &right_field) {
-                    right_covered = true;
-                }
-            }
+        let name = graph[pred].name();
+        if name == left_input_str && covers(pred, &left_field) {
+            left_covered = true;
+        }
+        if name == right_input_str && covers(pred, &right_field) {
+            right_covered = true;
         }
     }
     left_covered && right_covered

@@ -182,16 +182,25 @@ pub(crate) fn dispatch_plan_node(
     let node = current_dag.graph[node_idx].clone();
     match node {
         PlanNode::Source { ref name, .. } => {
-            // Combine build-side sources get their own pre-loaded
-            // records; every other source falls back to the
-            // primary driving reader's stream. Records are
-            // canonicalized onto the Source's plan-time
-            // `Arc<Schema>` so every downstream operator hits
-            // the `Arc::ptr_eq` fast path on the first record.
-            // Structural equality holds by construction:
-            // `CoercingReader` builds its Arc from the same
-            // declared `schema:` block that `bind_schema` reads
-            // to populate `PlanNode::Source.output_schema`.
+            // Three input paths feed a Source's buffer: (1) records
+            // already seeded into `ctx.node_buffers[node_idx]` by the
+            // body executor at composition entry — composition input
+            // ports surface as synthetic Source nodes in the body
+            // graph, owning the records the parent scope harvested
+            // for that port; (2) combine build-side sources whose
+            // records were pre-loaded into `combine_source_records`
+            // before the DAG walk; (3) fall back to the primary
+            // driving reader's stream via `all_records`. Records are
+            // canonicalized onto the Source's plan-time `Arc<Schema>`
+            // so every downstream operator hits the `Arc::ptr_eq`
+            // fast path on the first record. Structural equality
+            // holds by construction: `CoercingReader` builds its Arc
+            // from the same declared `schema:` block that
+            // `bind_schema` reads to populate
+            // `PlanNode::Source.output_schema`, and synthetic port
+            // sources adopt their parent source's column list at
+            // bind_composition time so port-bound records canonicalize
+            // cleanly.
             let source_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
             let canonicalize = |r: &Record| -> Record {
                 match source_schema.as_ref() {
@@ -214,18 +223,27 @@ pub(crate) fn dispatch_plan_node(
                     None => r.clone(),
                 }
             };
-            let records: Vec<_> =
-                if let Some(src_recs) = ctx.combine_source_records.get(name.as_str()) {
-                    src_recs
-                        .iter()
-                        .map(|(r, rn)| (canonicalize(r), *rn))
-                        .collect()
-                } else {
-                    ctx.all_records
-                        .iter()
-                        .map(|(r, rn)| (canonicalize(r), *rn))
-                        .collect()
-                };
+            let records: Vec<_> = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
+                // Body-context port source — records were seeded by
+                // `execute_composition_body` from parent-scope output.
+                // The seeded records still carry the parent producer's
+                // `Arc<Schema>`, so canonicalize them onto this port
+                // source's schema before downstream consumers run.
+                seeded
+                    .into_iter()
+                    .map(|(r, rn)| (canonicalize(&r), rn))
+                    .collect()
+            } else if let Some(src_recs) = ctx.combine_source_records.get(name.as_str()) {
+                src_recs
+                    .iter()
+                    .map(|(r, rn)| (canonicalize(r), *rn))
+                    .collect()
+            } else {
+                ctx.all_records
+                    .iter()
+                    .map(|(r, rn)| (canonicalize(r), *rn))
+                    .collect()
+            };
             ctx.node_buffers.insert(node_idx, records);
         }
 

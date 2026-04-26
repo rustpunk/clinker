@@ -1,0 +1,37 @@
+# 2-input combine inside a composition body. Port-bound rows
+# (orders, products) are joined on product_id; the body emits an
+# enriched row per matched order. Verifies that combine's `input:`
+# qualifier map references signature input ports just as it would
+# reference top-level node names — schema-by-name lookup carries
+# port-bound Open-tail rows transparently.
+_compose:
+  name: combine_enrich
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: price, type: float }
+  outputs:
+    enriched: enrich_combine
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: enrich_combine
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+        emit total = products.price * orders.quantity

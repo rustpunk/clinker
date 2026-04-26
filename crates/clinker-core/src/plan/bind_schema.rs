@@ -625,11 +625,51 @@ fn bind_composition(
     // each body node's declared `input:` field, mirroring the
     // edge-wiring loop in top-level `PipelineConfig::compile()`.
     use crate::plan::execution::{DependencyType, PlanEdge};
+    use clinker_record::SchemaBuilder;
     use petgraph::graph::DiGraph;
 
     let mut body_graph: DiGraph<crate::plan::execution::PlanNode, PlanEdge> = DiGraph::new();
     let mut body_name_to_idx: std::collections::HashMap<String, petgraph::graph::NodeIndex> =
         std::collections::HashMap::new();
+
+    // 14a. Synthesize a `PlanNode::Source` per declared input port. The
+    // body's mini-DAG sees ports as first-class root nodes — body
+    // consumers reference them by name through the same edge-wiring
+    // pass that handles body-internal references, and the dispatcher
+    // walks them via the standard Source arm with pre-seeded records
+    // from the parent scope. Without these synthetics, multi-port
+    // consumers (notably combine, whose `input:` map keys ARE port
+    // names) would have no incoming edges in the body DAG and fail
+    // their predecessor-by-name lookup at dispatch time.
+    //
+    // The synthetic node's `output_schema` adopts the parent source's
+    // declared columns (the schema records actually carry at runtime),
+    // not the port's declared columns — port rows declare a subset
+    // and rely on Open-tail pass-through, but records flowing in
+    // already carry every parent column.
+    for (port_name, _port_row) in &input_port_rows {
+        let parent_node_name = match call_inputs.get(port_name) {
+            Some(n) => n.as_str(),
+            None => continue, // optional port not bound — skip
+        };
+        let parent_row = match parent_schema_by_name.get(parent_node_name) {
+            Some(r) => r,
+            None => continue, // upstream missing — already diagnosed
+        };
+        let port_schema = parent_row
+            .field_names()
+            .map(|qf| qf.name.as_ref())
+            .collect::<SchemaBuilder>()
+            .build();
+        let port_source = crate::plan::execution::PlanNode::Source {
+            name: port_name.clone(),
+            span,
+            resolved: None,
+            output_schema: port_schema,
+        };
+        let idx = body_graph.add_node(port_source);
+        body_name_to_idx.insert(port_name.clone(), idx);
+    }
 
     for spanned in &body_file.nodes {
         let saphyr_line = spanned.referenced.line();
@@ -688,8 +728,7 @@ fn bind_composition(
             // in the body — wire those, the same way top-level
             // compile() does.
             PipelineNode::Source { .. } => {}
-            PipelineNode::Composition { header, .. }
-            | PipelineNode::Transform { header, .. }
+            PipelineNode::Transform { header, .. }
             | PipelineNode::Aggregate { header, .. }
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. } => {
@@ -700,6 +739,32 @@ fn bind_composition(
                     }
                 };
                 wire(&r);
+            }
+            PipelineNode::Composition {
+                header,
+                inputs: nested_inputs,
+                ..
+            } => {
+                // Composition nodes carry both `header.input:` (the
+                // single-edge DAG-topology input shared with every
+                // other variant) AND a multi-port `inputs:` map that
+                // binds each declared signature input port to an
+                // upstream node. Both must produce edges so the
+                // body's topo sort places every upstream before this
+                // call-site — without the per-port edges, secondary
+                // ports (those not also named on `header.input:`)
+                // would race against the composition's body
+                // executing and surface empty.
+                let r = match &header.input.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                };
+                wire(&r);
+                for upstream in nested_inputs.values() {
+                    wire(upstream);
+                }
             }
             PipelineNode::Merge { header, .. } => {
                 for inp in &header.inputs {
@@ -742,71 +807,18 @@ fn bind_composition(
         }
     };
 
-    // Resolve each input port name to the body node that consumes it.
-    // The body executor seeds the parent-scope record stream into
-    // this NodeIndex's buffer so the dispatcher's dependency-walk
-    // sees the same shape it does at the top level.
+    // Resolve each input port name to its synthetic-source NodeIndex.
+    // The synthetic port-source was added to `body_name_to_idx` in
+    // step 14a; the body executor seeds parent-scope records into
+    // that index's buffer at composition entry, and the dispatcher's
+    // standard Source arm reads them through. Each port owns its own
+    // NodeIndex — multi-port consumers (notably combine) read each
+    // port's records from a distinct buffer slot, with no collision.
     let mut port_name_to_node_idx: std::collections::HashMap<String, petgraph::graph::NodeIndex> =
         std::collections::HashMap::new();
-    for spanned in &body_file.nodes {
-        let n = &spanned.value;
-        let consumer_name = n.name().to_string();
-        let Some(&consumer_idx) = body_name_to_idx.get(&consumer_name) else {
-            continue;
-        };
-        let inputs: Vec<String> = match n {
-            PipelineNode::Source { .. } => Vec::new(),
-            PipelineNode::Composition { header, .. }
-            | PipelineNode::Transform { header, .. }
-            | PipelineNode::Aggregate { header, .. }
-            | PipelineNode::Route { header, .. }
-            | PipelineNode::Output { header, .. } => {
-                vec![match &header.input.value {
-                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
-                    crate::config::node_header::NodeInput::Port { node, port } => {
-                        format!("{node}.{port}")
-                    }
-                }]
-            }
-            PipelineNode::Merge { header, .. } => header
-                .inputs
-                .iter()
-                .map(|inp| match &inp.value {
-                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
-                    crate::config::node_header::NodeInput::Port { node, port } => {
-                        format!("{node}.{port}")
-                    }
-                })
-                .collect(),
-            PipelineNode::Combine { header, .. } => header
-                .input
-                .values()
-                .map(|ni| match &ni.value {
-                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
-                    crate::config::node_header::NodeInput::Port { node, port } => {
-                        format!("{node}.{port}")
-                    }
-                })
-                .collect(),
-        };
-        for input_full in inputs {
-            let producer_key = body_strip_port(&input_full);
-            // A body-internal reference resolves through
-            // `body_name_to_idx`; only references that don't match
-            // a body-local node — and DO match a declared input
-            // port — populate `port_name_to_node_idx`.
-            if !body_name_to_idx.contains_key(producer_key)
-                && signature.inputs.contains_key(producer_key)
-            {
-                // Single-consumer port is the common shape; the
-                // first body node that consumes the port wins. A
-                // multi-consumer port would need fan-out to all
-                // consumers, but the present body executor uses
-                // the first-consumer mapping.
-                port_name_to_node_idx
-                    .entry(producer_key.to_string())
-                    .or_insert(consumer_idx);
-            }
+    for port_name in signature.inputs.keys() {
+        if let Some(&idx) = body_name_to_idx.get(port_name.as_str()) {
+            port_name_to_node_idx.insert(port_name.clone(), idx);
         }
     }
 

@@ -1792,6 +1792,16 @@ impl PipelineConfig {
             &mut diags,
             self.pipeline.memory_limit.as_deref(),
         );
+        // Companion sweep over composition body mini-DAGs. Body
+        // graphs hold their own `PlanNode::Combine` nodes that the
+        // top-level pass above cannot reach, so without this call
+        // body-context combines never get their strategy + driving
+        // qualifier stamped and short-circuit at dispatch.
+        crate::plan::combine::select_combine_strategies_in_bodies(
+            &mut artifacts,
+            &mut diags,
+            self.pipeline.memory_limit.as_deref(),
+        );
 
         // If lowering accumulated any non-composition error-severity
         // diagnostics, return them. Composition binding errors

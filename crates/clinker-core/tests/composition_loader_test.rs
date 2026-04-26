@@ -24,10 +24,12 @@ fn fixture_workspace_root() -> PathBuf {
 
 /// Gate 1: loading the committed `tests/fixtures/compositions/` dir
 /// returns `Ok` with one entry per on-disk `.comp.yaml`. The corpus
-/// includes the original five W101/structural fixtures plus four
-/// body-executor fixtures (transform / nested / route+merge /
-/// runtime-error) used by the integration tests for the recursive
-/// body executor.
+/// includes the five W101/structural fixtures, four body-executor
+/// fixtures (transform / nested / route+merge / runtime-error), and
+/// five combine-in-composition fixtures (combine_enrich,
+/// nested_combine, combine_after_transform, combine_collect,
+/// combine_bad_predicate) wired against the body executor's combine
+/// path.
 #[test]
 fn test_phase1_scanner_loads_all_fixtures() {
     let root = fixture_workspace_root();
@@ -36,8 +38,8 @@ fn test_phase1_scanner_loads_all_fixtures() {
 
     assert_eq!(
         table.len(),
-        9,
-        "expected 9 composition signatures, got {}: {:?}",
+        14,
+        "expected 14 composition signatures, got {}: {:?}",
         table.len(),
         table.keys().collect::<Vec<_>>()
     );
@@ -50,6 +52,11 @@ fn test_phase1_scanner_loads_all_fixtures() {
         "dlq_shape",
         "nested_caller",
         "passthrough_check",
+        "combine_enrich",
+        "nested_combine",
+        "combine_after_transform",
+        "combine_collect",
+        "combine_bad_predicate",
     ] {
         assert!(
             names.contains(&expected),

@@ -1959,10 +1959,93 @@ impl PipelineExecutor {
         // as a build-side upstream whose reader is still in the `readers`
         // registry (primary was removed at function entry). Drained here
         // so the readers are consumed exactly once.
+        //
+        // Body-context translation: `combine_input.upstream_name` is the
+        // raw value from the combine's `input:` map. For top-level
+        // combines that's a parent-scope source name. For combines
+        // inside a composition body that's a port name — translated
+        // here through the owning body's `input_port_sources` table to
+        // recover the parent-scope source backing the port. Nested
+        // compositions chain port references — an inner body's port
+        // resolves to an outer body's port, which resolves to the
+        // top-level pipeline source — so the translation walks the
+        // body-parent chain until it lands on a source name. Without
+        // this step, body-context build-side readers would never load
+        // and the parent's secondary Source dispatch would canonicalize
+        // primary records onto the wrong schema.
+        //
+        // Two reverse lookups: combine-node-name → owning body, and
+        // body → its enclosing body (parent_of). Top-level combines
+        // are absent from `combine_owning_body`; bodies whose
+        // composition node lives in the top-level pipeline are absent
+        // from `parent_of`.
+        let mut combine_owning_body: HashMap<
+            &str,
+            crate::plan::composition_body::CompositionBodyId,
+        > = HashMap::new();
+        for (body_id, body) in &artifacts.composition_bodies {
+            for combine_name in body.name_to_idx.keys() {
+                if artifacts.combine_inputs.contains_key(combine_name) {
+                    combine_owning_body.insert(combine_name.as_str(), *body_id);
+                }
+            }
+        }
+        let mut parent_of: HashMap<
+            crate::plan::composition_body::CompositionBodyId,
+            crate::plan::composition_body::CompositionBodyId,
+        > = HashMap::new();
+        for (parent_id, parent_body) in &artifacts.composition_bodies {
+            for child_id in &parent_body.nested_body_ids {
+                parent_of.insert(*child_id, *parent_id);
+            }
+        }
+
+        // Walk the port-chain from a body-context combine up to a
+        // parent-pipeline source name. At each level, translate the
+        // current port name through `body.input_port_sources`. If the
+        // resolved value is itself a port name in the enclosing body,
+        // step up; otherwise it is the source name we want.
+        let resolve_upstream = |start_body_id: crate::plan::composition_body::CompositionBodyId,
+                                start_name: &str|
+         -> String {
+            let mut current_body_id = start_body_id;
+            let mut current_name = start_name.to_string();
+            loop {
+                let Some(body) = artifacts.composition_bodies.get(&current_body_id) else {
+                    return current_name;
+                };
+                let Some(parent_node) = body.input_port_sources.get(&current_name) else {
+                    // Not a port in this body — it's a body-internal
+                    // node name, which is the terminal case for
+                    // body-context combines whose input map references
+                    // a transform/aggregate inside the same body.
+                    return current_name;
+                };
+                let parent_node = parent_node.clone();
+                match parent_of.get(&current_body_id) {
+                    Some(&outer_id) => {
+                        current_body_id = outer_id;
+                        current_name = parent_node;
+                    }
+                    None => {
+                        // No enclosing body — the resolved name is a
+                        // top-level pipeline node (typically a Source).
+                        return parent_node;
+                    }
+                }
+            }
+        };
+
         let mut combine_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
-        for combine_inputs in artifacts.combine_inputs.values() {
+        for (combine_name, combine_inputs) in &artifacts.combine_inputs {
+            let owning_body_id = combine_owning_body.get(combine_name.as_str()).copied();
             for combine_input in combine_inputs.values() {
-                let upstream = combine_input.upstream_name.as_ref();
+                let raw_upstream = combine_input.upstream_name.as_ref();
+                let resolved = match owning_body_id {
+                    Some(body_id) => resolve_upstream(body_id, raw_upstream),
+                    None => raw_upstream.to_string(),
+                };
+                let upstream: &str = resolved.as_str();
                 if upstream == input.name {
                     // Primary source — records already live in
                     // `all_records`.

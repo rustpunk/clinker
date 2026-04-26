@@ -1,0 +1,33 @@
+# 2-input combine inside a composition body, exercising
+# `match: collect`. The driver row gains a trailing `products`
+# column of type Array carrying every matched build row. Per the
+# combine spec, `match: collect` REJECTS any non-empty `cxl:`
+# body (E311), so the body field is omitted entirely — the
+# executor synthesizes the output row from `(driver fields,
+# build_qualifier as Array)` automatically.
+_compose:
+  name: combine_collect
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  outputs:
+    collected: collect_combine
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: collect_combine
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""

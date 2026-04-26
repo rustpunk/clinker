@@ -1,0 +1,40 @@
+# Nested composition: the outer body forwards both ports straight
+# through to `combine_enrich.comp.yaml`, then stamps a constant
+# `tenant` field onto each enriched row. The body executor must
+# recurse into the inner combine for the inner-emitted columns
+# (order_id, product_name, total) AND the outer-emitted column
+# (tenant) to all reach the top-level output.
+_compose:
+  name: nested_combine
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: price, type: float }
+  outputs:
+    tagged: tag_tenant
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner_enrich
+    input: orders
+    use: ./combine_enrich.comp.yaml
+    inputs:
+      orders: orders
+      products: products
+  - type: transform
+    name: tag_tenant
+    input: inner_enrich
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_name = product_name
+        emit total = total
+        emit tenant = "acme"
