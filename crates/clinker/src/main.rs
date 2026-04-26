@@ -443,13 +443,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
                 })?;
-        let (dag, _) = PipelineExecutor::explain_plan_dag(&compiled_plan)?;
+        let dag = compiled_plan.dag();
+        let artifacts = compiled_plan.artifacts();
         match format {
             ExplainFormat::Text => {
-                print!("{}", dag.explain_text(&pipeline_config));
+                print!(
+                    "{}",
+                    dag.explain_text_with_artifacts(&pipeline_config, artifacts)
+                );
             }
             ExplainFormat::Json => {
-                let json = serde_json::to_string_pretty(&dag).map_err(|e| {
+                let view = clinker_core::plan::execution::ExplainJson::new(dag, artifacts);
+                let json = serde_json::to_string_pretty(&view).map_err(|e| {
                     PipelineError::Config(clinker_core::config::ConfigError::Validation(format!(
                         "JSON serialization failed: {e}"
                     )))

@@ -1160,6 +1160,347 @@ mod tests {
         );
     }
 
+    /// Compile a fixture and return the full `CompiledPlan` so tests can
+    /// reach `.dag()`, `.config()`, and `.artifacts()` without re-running
+    /// the lowering pipeline. Mirrors `compile_plan`'s scratch-path opt-in.
+    fn compile_full_plan(config: &PipelineConfig) -> clinker_core::plan::CompiledPlan {
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        config
+            .compile(&ctx)
+            .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
+    }
+
+    /// Gate: text `--explain` for a 2-input combine emits a multi-line
+    /// per-combine block that names the strategy, the driving input, the
+    /// predicate-shape detail (Equalities / Ranges / Residual), the match
+    /// mode, and the planned-share memory budget. The 2-input fixture
+    /// `two_input_range.yaml` is the canonical pure-range case; combined
+    /// with `two_input_equi.yaml` it exercises both predicate buckets.
+    #[test]
+    fn test_explain_combine_strategy() {
+        let yaml = load_fixture("two_input_range.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+
+        assert!(
+            text.contains("Combine 'bracketed':"),
+            "explain must carry the per-combine block header; got:\n{text}",
+        );
+        assert!(
+            text.contains("Driving input:"),
+            "explain must label the driving input; got:\n{text}",
+        );
+        assert!(
+            text.contains("Build input:"),
+            "explain must label at least one build input; got:\n{text}",
+        );
+        // pure-range predicate → "Ranges:" detail header
+        assert!(
+            text.contains("Ranges:"),
+            "two_input_range fixture is pure-range; explain detail must include Ranges:; got:\n{text}",
+        );
+        assert!(
+            text.contains("Match: first"),
+            "explain must surface the match mode; got:\n{text}",
+        );
+        assert!(
+            text.contains("On miss: null_fields"),
+            "explain must surface the on-miss policy; got:\n{text}",
+        );
+        assert!(
+            text.contains("Memory budget (planned share):"),
+            "explain must surface the planned-share memory budget line; got:\n{text}",
+        );
+    }
+
+    /// Gate: a 3-input combine — decomposed at plan time into a chain of
+    /// 2 binary combines — renders in the explain block under the
+    /// original user-declared name with numbered step lines. The
+    /// `decomposed_from` field on `PlanNode::Combine` drives the grouping.
+    #[test]
+    fn test_explain_nary_decomposition() {
+        let yaml = load_fixture("three_input_shared_key.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+
+        assert!(
+            text.contains("Combine 'fully_enriched' (3 inputs, binary decomposition):"),
+            "explain must group the chain under the original name with the 'binary decomposition' qualifier; got:\n{text}",
+        );
+        assert!(
+            text.contains("Step 1:"),
+            "decomposed chain must enumerate Step 1; got:\n{text}",
+        );
+        assert!(
+            text.contains("Step 2:"),
+            "decomposed chain must enumerate Step 2; got:\n{text}",
+        );
+        // The original name appears exactly once at the group header.
+        // The synthetic step nodes carry rewritten names (containing
+        // `__decomposed`) that include the original as a substring,
+        // so we count the literal `Combine 'fully_enriched'` prefix
+        // (apostrophe-bounded) — that prefix only matches the header.
+        let header_hits = text.matches("Combine 'fully_enriched'").count();
+        assert_eq!(
+            header_hits, 1,
+            "original combine name must appear exactly once at the group header; got {header_hits} hits in:\n{text}",
+        );
+    }
+
+    /// Gate: JSON `--explain` for a combine carries the rich predicate
+    /// detail (`equalities[].left/.right`), the inputs map (with role +
+    /// estimated_rows), the planned-share memory budget bytes, and a
+    /// `decomposed_from` field that is JSON null for a singleton combine.
+    #[test]
+    fn test_explain_combine_json() {
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let view = clinker_core::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let json: serde_json::Value =
+            serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
+
+        let nodes = json["nodes"]
+            .as_array()
+            .expect("explain JSON must carry a nodes array");
+        let combine = nodes
+            .iter()
+            .find(|n| n["type"] == "combine" && n["name"] == "enriched")
+            .unwrap_or_else(|| panic!("no combine node 'enriched' in nodes: {nodes:#?}"));
+
+        // Preserved fields from the plain ExecutionPlanDag serializer.
+        assert!(combine.get("strategy").is_some());
+        assert!(combine.get("driving_input").is_some());
+        assert!(combine.get("build_inputs").is_some());
+        assert!(combine.get("predicate_summary").is_some());
+        assert!(combine.get("match_mode").is_some());
+        assert!(combine.get("on_miss").is_some());
+
+        // New rich predicate object.
+        let predicate = combine
+            .get("predicate")
+            .unwrap_or_else(|| panic!("missing predicate; got {combine:#?}"));
+        let eqs = predicate["equalities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("predicate.equalities must be an array; got {predicate:#?}"));
+        assert!(
+            !eqs.is_empty(),
+            "two_input_equi has at least one equality conjunct; got {predicate:#?}",
+        );
+        let first_eq = &eqs[0];
+        assert!(
+            first_eq["left"].is_string(),
+            "equality left must be a string; got {first_eq:#?}",
+        );
+        assert!(
+            first_eq["right"].is_string(),
+            "equality right must be a string; got {first_eq:#?}",
+        );
+        let left_str = first_eq["left"].as_str().unwrap();
+        // Both sides are qualified `<input>.<field>` form.
+        assert!(
+            left_str.contains('.'),
+            "qualified field reference must contain a dot; got {left_str:?}",
+        );
+
+        // New inputs map: each declared input has role + estimated_rows,
+        // estimated_rows is JSON null when no cardinality estimate exists.
+        let inputs = combine
+            .get("inputs")
+            .unwrap_or_else(|| panic!("missing inputs; got {combine:#?}"));
+        let inputs_obj = inputs
+            .as_object()
+            .unwrap_or_else(|| panic!("inputs must be an object; got {inputs:#?}"));
+        assert!(
+            inputs_obj.contains_key("orders") && inputs_obj.contains_key("products"),
+            "inputs must enumerate every declared qualifier; got {inputs:#?}",
+        );
+        for (qual, entry) in inputs_obj {
+            assert!(
+                entry["role"].is_string(),
+                "inputs[{qual}].role must be a string; got {entry:#?}",
+            );
+            // Without an explicit cardinality hint, estimated_rows is null.
+            let est = &entry["estimated_rows"];
+            assert!(
+                est.is_null() || est.is_number(),
+                "inputs[{qual}].estimated_rows must be a number or null; got {entry:#?}",
+            );
+        }
+
+        // Memory budget bytes — concrete u64.
+        let mb = combine
+            .get("memory_budget_bytes")
+            .unwrap_or_else(|| panic!("missing memory_budget_bytes; got {combine:#?}"));
+        assert!(
+            mb.as_u64().is_some_and(|n| n > 0),
+            "memory_budget_bytes must be a positive integer; got {mb:#?}",
+        );
+
+        // decomposed_from is JSON null for a singleton combine (the
+        // `#[serde(skip_serializing_if = ...)]` derived behavior may
+        // omit the key when None — accept either omission or null).
+        match combine.get("decomposed_from") {
+            None => {}
+            Some(v) => assert!(
+                v.is_null(),
+                "decomposed_from must be null for a singleton combine; got {v:#?}",
+            ),
+        }
+    }
+
+    /// Gate: a combine whose `combine_predicates` entry is missing (no
+    /// decomposed predicate stored — the kind of state a compile-time
+    /// E303 leaves the artifacts side-table in) must not panic during
+    /// explain rendering. Mirrors the existing `display_name()` defensive
+    /// rendering at execution.rs that falls back to `<unselected>` for an
+    /// empty driving input. We construct this state by compiling a
+    /// successful plan and then mutating the artifacts to drop the
+    /// predicate entry — closer to the real failure mode (artifacts
+    /// state inconsistent with PlanNode) than fabricating a synthetic
+    /// PlanNode from scratch.
+    #[test]
+    fn test_explain_combine_with_e3xx_error() {
+        use std::collections::HashMap;
+
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        // Build a CompileArtifacts mirror with an empty
+        // combine_predicates table. The rest of the side-tables stay
+        // intact (combine_inputs etc.) because the explain block falls
+        // back to summary-only when predicate detail is unavailable —
+        // it doesn't crash through downstream lookups.
+        let original = plan.artifacts();
+        let mut censored = original.clone();
+        censored.combine_predicates = HashMap::new();
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), &censored);
+        // The block still renders — header + summary line — without
+        // panic. The detail bucket headers (Equalities:/Ranges:/
+        // Residual:) are absent because the predicate is unreachable.
+        assert!(
+            text.contains("Combine 'enriched':"),
+            "explain must still render the block header on missing predicate; got:\n{text}",
+        );
+        assert!(
+            text.contains("Predicate: equalities="),
+            "explain must still render the count summary on missing predicate; got:\n{text}",
+        );
+    }
+
+    /// Gate: an 8-input combine — the C.4 input cap — decomposes into a
+    /// chain of 7 binary combines. Explain must enumerate Step 1 through
+    /// Step 7 and report `(8 inputs, binary decomposition)` at the
+    /// header.
+    #[test]
+    fn test_explain_combine_8ary_decomposition() {
+        let mut yaml = String::new();
+        yaml.push_str("pipeline:\n  name: eight_input_chain\nnodes:\n");
+        for c in 'a'..='h' {
+            yaml.push_str(&format!(
+                concat!(
+                    "  - type: source\n    name: {c}_src\n    config:\n",
+                    "      name: {c}_src\n      type: csv\n",
+                    "      path: tests/fixtures/combine/data/eight_input_{c}.csv\n",
+                    "      schema:\n        - {{ name: id, type: string }}\n",
+                    "        - {{ name: {c}_val, type: string }}\n",
+                ),
+                c = c,
+            ));
+        }
+        yaml.push_str("  - type: combine\n    name: joined8\n    input:\n");
+        for c in 'a'..='h' {
+            yaml.push_str(&format!("      {c}: {c}_src\n", c = c));
+        }
+        yaml.push_str("    config:\n      where: \"");
+        // Equi key shared across consecutive pairs: a.id == b.id and
+        // b.id == c.id ... so every input participates in the join graph.
+        let letters: Vec<char> = ('a'..='h').collect();
+        let pairs: Vec<String> = letters
+            .windows(2)
+            .map(|w| format!("{}.id == {}.id", w[0], w[1]))
+            .collect();
+        yaml.push_str(&pairs.join(" and "));
+        yaml.push_str("\"\n      match: first\n      on_miss: skip\n      cxl: |\n");
+        yaml.push_str("        emit id = a.id\n");
+        for c in 'a'..='h' {
+            yaml.push_str(&format!("        emit {c}_val = {c}.{c}_val\n", c = c));
+        }
+        yaml.push_str("  - type: output\n    name: joined8_out\n    input: joined8\n    config:\n");
+        yaml.push_str("      name: joined8_out\n      type: csv\n      path: /tmp/joined8.csv\n");
+
+        let config: PipelineConfig =
+            clinker_core::yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+        assert!(
+            text.contains("(8 inputs, binary decomposition):"),
+            "8-input combine must label the group header with `(8 inputs, binary decomposition):`; got:\n{text}",
+        );
+        for step in 1..=7 {
+            let needle = format!("Step {step}:");
+            assert!(
+                text.contains(&needle),
+                "8-input chain must enumerate {needle}; got:\n{text}",
+            );
+        }
+        assert!(
+            !text.contains("Step 8:"),
+            "8-input chain decomposes into 7 binary combines; Step 8 must NOT appear; got:\n{text}",
+        );
+    }
+
+    /// Gate: a combine with `match: collect` round-trips that mode through
+    /// both the text and JSON explain paths. The text path must surface
+    /// `Match: collect`; the JSON path must serialize `match_mode` as the
+    /// stable kebab-case string.
+    #[test]
+    fn test_explain_combine_collect_mode() {
+        let yaml = load_fixture("match_collect.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+        assert!(
+            text.contains("Match: collect"),
+            "match: collect must surface in the text explain block; got:\n{text}",
+        );
+
+        let view = clinker_core::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let json: serde_json::Value =
+            serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
+        let nodes = json["nodes"]
+            .as_array()
+            .expect("explain JSON must carry a nodes array");
+        let combine = nodes
+            .iter()
+            .find(|n| n["type"] == "combine")
+            .unwrap_or_else(|| panic!("no combine node in nodes: {nodes:#?}"));
+        assert_eq!(
+            combine["match_mode"], "collect",
+            "match_mode must round-trip as 'collect' through JSON; got {combine:#?}",
+        );
+    }
+
     /// Sweep of combine fixtures that compile all the way through the
     /// canonical path under the current feature set: 2-input equi,
     /// 2-input mixed-predicate, match-mode variants, on-miss variants,

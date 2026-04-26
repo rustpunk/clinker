@@ -112,6 +112,79 @@ impl CombinePredicateSummary {
     }
 }
 
+/// Short label for an `Expr` operand inside an equality / range conjunct,
+/// rendered in `--explain` predicate-detail lines. Bare
+/// `QualifiedFieldRef`s render as `"input.field"` (the common case);
+/// any compound expression (function call, arithmetic, coalesce) prints
+/// as `"<expr>"` because a faithful re-printer would require a CXL AST
+/// pretty-printer that does not yet exist. The qualifier is preserved
+/// as a leading prefix when the expression starts with one so users
+/// can still pin which side an opaque expression belongs to.
+fn format_conjunct_operand(expr: &Expr) -> String {
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } => parts
+            .iter()
+            .map(|p| p.as_ref())
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => "<expr>".to_string(),
+    }
+}
+
+/// Symbol form of a [`RangeOp`] for `--explain` rendering. Matches CXL
+/// surface syntax (`<`, `<=`, `>`, `>=`).
+fn range_op_symbol(op: RangeOp) -> &'static str {
+    match op {
+        RangeOp::Lt => "<",
+        RangeOp::Le => "<=",
+        RangeOp::Gt => ">",
+        RangeOp::Ge => ">=",
+    }
+}
+
+impl DecomposedPredicate {
+    /// Render the `Equalities`/`Ranges`/`Residual` detail block for
+    /// `--explain` text output. Each non-empty bucket emits a header line
+    /// followed by indented `- left == right` (or `< / <= / > / >=`)
+    /// entries. The residual program is rendered as `<compiled
+    /// expression>` because a faithful pretty-printer for `TypedProgram`
+    /// is not part of this surface — the count + presence flag is the
+    /// load-bearing signal for users tuning a predicate.
+    ///
+    /// Returns the empty string when every bucket is empty (the
+    /// summary-only line above is enough). Each emitted line ends with
+    /// a `\n` so the caller composes blocks via `push_str`.
+    pub fn format_text(&self) -> String {
+        let mut out = String::new();
+        if !self.equalities.is_empty() {
+            out.push_str("  Equalities:\n");
+            for eq in &self.equalities {
+                out.push_str(&format!(
+                    "    - {} == {}\n",
+                    format_conjunct_operand(&eq.left_expr),
+                    format_conjunct_operand(&eq.right_expr),
+                ));
+            }
+        }
+        if !self.ranges.is_empty() {
+            out.push_str("  Ranges:\n");
+            for r in &self.ranges {
+                out.push_str(&format!(
+                    "    - {} {} {}\n",
+                    format_conjunct_operand(&r.left_expr),
+                    range_op_symbol(r.op),
+                    format_conjunct_operand(&r.right_expr),
+                ));
+            }
+        }
+        if self.residual.is_some() {
+            out.push_str("  Residual:\n");
+            out.push_str("    - <compiled expression>\n");
+        }
+        out
+    }
+}
+
 /// Equality conjunct between two inputs.
 ///
 /// Stores full [`Expr`] pairs (drill D14), not field names — enables
