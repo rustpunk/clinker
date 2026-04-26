@@ -263,6 +263,7 @@ nodes:
             agg_idx,
             PlanEdge {
                 dependency_type: DependencyType::Data,
+                port: None,
             },
         );
 

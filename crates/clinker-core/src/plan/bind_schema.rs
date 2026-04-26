@@ -706,18 +706,19 @@ fn bind_composition(
         let Some(&consumer_idx) = body_name_to_idx.get(consumer_name) else {
             continue;
         };
-        let mut wire = |producer_full: &str| {
+        let mut wire = |producer_full: &str, port: Option<String>| {
             let producer_key = body_strip_port(producer_full);
             // Body-internal references resolve through name_to_idx;
             // references to a signature input port don't produce a
             // graph edge — port seeding is handled at composition
-            // entry by the executor.
+            // entry by the executor through the live edge graph.
             if let Some(&producer_idx) = body_name_to_idx.get(producer_key) {
                 body_graph.add_edge(
                     producer_idx,
                     consumer_idx,
                     PlanEdge {
                         dependency_type: DependencyType::Data,
+                        port,
                     },
                 );
             }
@@ -738,32 +739,23 @@ fn bind_composition(
                         format!("{node}.{port}")
                     }
                 };
-                wire(&r);
+                wire(&r, None);
             }
             PipelineNode::Composition {
-                header,
                 inputs: nested_inputs,
                 ..
             } => {
-                // Composition nodes carry both `header.input:` (the
-                // single-edge DAG-topology input shared with every
-                // other variant) AND a multi-port `inputs:` map that
-                // binds each declared signature input port to an
-                // upstream node. Both must produce edges so the
-                // body's topo sort places every upstream before this
-                // call-site — without the per-port edges, secondary
-                // ports (those not also named on `header.input:`)
-                // would race against the composition's body
-                // executing and surface empty.
-                let r = match &header.input.value {
-                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
-                    crate::config::node_header::NodeInput::Port { node, port } => {
-                        format!("{node}.{port}")
-                    }
-                };
-                wire(&r);
-                for upstream in nested_inputs.values() {
-                    wire(upstream);
+                // Composition's named-port `inputs:` map is the
+                // authoritative call-site binding. Each entry produces
+                // one port-tagged edge — the dispatcher walks
+                // incoming edges and reads the tag to harvest records
+                // per port. `header.input:` is YAML-shape obligation
+                // for the shared `NodeHeader` struct but is redundant
+                // for a Composition's wiring (every required port is
+                // already covered by `inputs:` per E104), so it does
+                // not produce its own edge.
+                for (port_name, upstream) in nested_inputs {
+                    wire(upstream, Some(port_name.clone()));
                 }
             }
             PipelineNode::Merge { header, .. } => {
@@ -774,7 +766,7 @@ fn bind_composition(
                             format!("{node}.{port}")
                         }
                     };
-                    wire(&r);
+                    wire(&r, None);
                 }
             }
             PipelineNode::Combine { header, .. } => {
@@ -785,7 +777,7 @@ fn bind_composition(
                             format!("{node}.{port}")
                         }
                     };
-                    wire(&r);
+                    wire(&r, None);
                 }
             }
         }

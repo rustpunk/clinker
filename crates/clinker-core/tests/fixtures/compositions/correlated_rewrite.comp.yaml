@@ -1,0 +1,25 @@
+# Body whose Transform overwrites the field used as the correlation
+# key. Used to verify group identity is captured at Source ingest and
+# survives every downstream rewrite — including a rewrite that lives
+# inside a composition body. Without ingest-anchored identity, every
+# row would coalesce into one giant `REWRITTEN` group and a single
+# bad row would DLQ every record across all original groups.
+_compose:
+  name: correlated_rewrite
+  inputs:
+    inp:
+      schema:
+        - { name: employee_id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: rewrite
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: rewrite
+    input: inp
+    config:
+      cxl: |
+        emit employee_id = "REWRITTEN"
+        emit val = value.to_int()

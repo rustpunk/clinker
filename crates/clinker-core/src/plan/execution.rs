@@ -812,9 +812,22 @@ impl DependencyType {
 }
 
 /// Edge in the execution plan DAG.
+///
+/// `port` carries the consumer-side port name when the edge feeds a
+/// node whose inputs are named (currently `PlanNode::Composition`). The
+/// dispatcher uses the live edge graph + port tag as the single source
+/// of truth for runtime port resolution: planner-injected nodes (e.g.,
+/// `inject_correlation_sort`'s synthetic Sort) reroute edges and carry
+/// the tag forward, so a downstream composition arm always reads its
+/// producer through the live graph rather than a frozen name snapshot.
+/// `None` for unnamed-input edges (every other consumer arm).
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanEdge {
     pub dependency_type: DependencyType,
+    /// Consumer-side port name when the consumer takes named inputs;
+    /// `None` otherwise. Preserved across edge reroutes by every
+    /// planner pass that splices intermediate nodes.
+    pub port: Option<String>,
 }
 
 /// DAG-based execution plan — replaces ExecutionPlan.
@@ -2356,12 +2369,17 @@ impl ExecutionPlanDag {
             }
 
             // Locate and remove the direct Source→consumer edge, capturing
-            // its dependency type for re-use on the rewritten edges.
+            // its dependency type and consumer-side port for re-use on
+            // the rewritten edges. The port tag belongs to the
+            // sort→consumer hop (the consumer is unchanged); the
+            // source→sort hop has no port (Sort takes a single unnamed
+            // input).
             let edge_id = self
                 .graph
                 .find_edge(source_idx, consumer_idx)
                 .expect("source parent must have outgoing edge to consumer");
             let dep_type = self.graph[edge_id].dependency_type;
+            let consumer_port = self.graph[edge_id].port.clone();
             self.graph.remove_edge(edge_id);
 
             // Planner-synthesized sort enforcer. No YAML node exists
@@ -2381,6 +2399,7 @@ impl ExecutionPlanDag {
                 sort_idx,
                 PlanEdge {
                     dependency_type: dep_type,
+                    port: None,
                 },
             );
             self.graph.add_edge(
@@ -2388,6 +2407,7 @@ impl ExecutionPlanDag {
                 consumer_idx,
                 PlanEdge {
                     dependency_type: dep_type,
+                    port: consumer_port,
                 },
             );
         }
@@ -2465,10 +2485,20 @@ impl ExecutionPlanDag {
             }
         }
 
-        let outgoing: Vec<(NodeIndex, DependencyType)> = self
+        // Capture (target, dep_type, port) for every outgoing edge — the
+        // port tag must survive the splice so a downstream
+        // composition's named-input edge keeps its tag on the new
+        // sort→target hop.
+        let outgoing: Vec<(NodeIndex, DependencyType, Option<String>)> = self
             .graph
             .edges_directed(source_idx, petgraph::Direction::Outgoing)
-            .map(|e| (e.target(), e.weight().dependency_type))
+            .map(|e| {
+                (
+                    e.target(),
+                    e.weight().dependency_type,
+                    e.weight().port.clone(),
+                )
+            })
             .collect();
         if outgoing.is_empty() {
             return Ok(());
@@ -2476,7 +2506,7 @@ impl ExecutionPlanDag {
 
         // Idempotent insertion guard: every outgoing edge already
         // lands on a CORRELATION_SORT_PREFIX Sort node — nothing to do.
-        if outgoing.iter().all(|(t, _)| {
+        if outgoing.iter().all(|(t, _, _)| {
             matches!(&self.graph[*t], PlanNode::Sort { name, .. } if name.starts_with(CORRELATION_SORT_PREFIX))
         }) {
             return Ok(());
@@ -2488,7 +2518,7 @@ impl ExecutionPlanDag {
             sort_fields,
         };
         let sort_idx = self.graph.add_node(sort_node);
-        for (target, dep_type) in outgoing {
+        for (target, dep_type, port) in outgoing {
             if target == sort_idx {
                 continue;
             }
@@ -2500,6 +2530,7 @@ impl ExecutionPlanDag {
                 target,
                 PlanEdge {
                     dependency_type: dep_type,
+                    port,
                 },
             );
         }
@@ -2508,6 +2539,7 @@ impl ExecutionPlanDag {
             sort_idx,
             PlanEdge {
                 dependency_type: DependencyType::Data,
+                port: None,
             },
         );
 
@@ -2570,6 +2602,7 @@ impl ExecutionPlanDag {
                 commit_idx,
                 PlanEdge {
                     dependency_type: DependencyType::Data,
+                    port: None,
                 },
             );
         }

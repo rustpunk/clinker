@@ -1590,7 +1590,7 @@ impl PipelineConfig {
             let Some(&consumer_idx) = name_to_idx.get(consumer_name) else {
                 continue;
             };
-            let mut wire = |producer_full: &str| {
+            let mut wire = |producer_full: &str, port: Option<String>| {
                 let producer_key = strip_port_for_edge(producer_full);
                 if let Some(&producer_idx) = name_to_idx.get(producer_key) {
                     graph.add_edge(
@@ -1598,32 +1598,46 @@ impl PipelineConfig {
                         consumer_idx,
                         PlanEdge {
                             dependency_type: DependencyType::Data,
+                            port,
                         },
                     );
                 }
             };
             match node {
                 PipelineNode::Source { .. } => {}
-                // Composition wires its `input:` like every other
-                // 1-in node. The body executor consults predecessors
-                // for schema checks at composition entry, and the
-                // top-level walker needs the edge so a downstream
-                // consumer of this composition sees it as predecessor.
-                PipelineNode::Composition { header, .. }
-                | PipelineNode::Transform { header, .. }
+                PipelineNode::Transform { header, .. }
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. } => {
-                    wire(&input_full_reference(&header.input.value));
+                    wire(&input_full_reference(&header.input.value), None);
+                }
+                PipelineNode::Composition {
+                    inputs: call_inputs,
+                    ..
+                } => {
+                    // Composition's named-port `inputs:` map is the
+                    // authoritative call-site binding. Each entry
+                    // produces one port-tagged incoming edge — the
+                    // dispatcher walks live incoming edges and reads
+                    // the tag at composition entry to harvest
+                    // per-port records. `header.input:` is YAML-shape
+                    // obligation on the shared `NodeHeader` struct
+                    // and adds no information beyond what `inputs:`
+                    // already covers (every required port is
+                    // validated to be present in `inputs:` per E104),
+                    // so it does not produce its own edge.
+                    for (port_name, upstream) in call_inputs {
+                        wire(upstream, Some(port_name.clone()));
+                    }
                 }
                 PipelineNode::Merge { header, .. } => {
                     for inp in &header.inputs {
-                        wire(&input_full_reference(&inp.value));
+                        wire(&input_full_reference(&inp.value), None);
                     }
                 }
                 PipelineNode::Combine { header, .. } => {
                     for node_input in header.input.values() {
-                        wire(&input_full_reference(&node_input.value));
+                        wire(&input_full_reference(&node_input.value), None);
                     }
                 }
             }

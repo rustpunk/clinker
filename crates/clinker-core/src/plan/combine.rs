@@ -1957,6 +1957,7 @@ pub(crate) fn decompose_nary_combines(
                     target,
                     PlanEdge {
                         dependency_type: DependencyType::Data,
+                        port: None,
                     },
                 );
             }
@@ -1966,6 +1967,7 @@ pub(crate) fn decompose_nary_combines(
                     target,
                     PlanEdge {
                         dependency_type: DependencyType::Data,
+                        port: None,
                     },
                 );
             }

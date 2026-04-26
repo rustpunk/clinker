@@ -455,6 +455,7 @@ mod tests {
     fn data_edge() -> PlanEdge {
         PlanEdge {
             dependency_type: DependencyType::Data,
+            port: None,
         }
     }
 

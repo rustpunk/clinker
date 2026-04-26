@@ -1372,8 +1372,12 @@ pub(crate) fn dispatch_plan_node(
                 "composition {name:?}: body_id is sentinel — bind_composition did not run"
             );
 
-            let bound_body = ctx
-                .artifacts
+            // Verify the body exists; the value itself is no longer
+            // needed at this scope — schema checks read the parent
+            // graph directly and `collect_port_records` walks live
+            // edges, so the body's lookup is deferred to
+            // `execute_composition_body`.
+            ctx.artifacts
                 .body_of(body)
                 .ok_or_else(|| PipelineError::compose_body_missing(name.clone()))?;
 
@@ -1421,8 +1425,8 @@ pub(crate) fn dispatch_plan_node(
                 ));
             }
 
-            let port_records = collect_port_records(ctx, current_dag, bound_body, node_idx)?;
             let composition_name = name.clone();
+            let port_records = collect_port_records(ctx, current_dag, node_idx, &composition_name)?;
             let output_records =
                 execute_composition_body(ctx, body, port_records, &composition_name)?;
             ctx.node_buffers.insert(node_idx, output_records);
@@ -2533,49 +2537,57 @@ fn flush_clean_records_to_writers(
 
 /// Collect parent-scope records keyed by composition input port name.
 ///
-/// Reads `bound_body.input_port_sources` to find each port's upstream
-/// node in the PARENT scope's `current_dag`, looks up that node's
-/// NodeIndex, and clones records out of `ctx.node_buffers` under that
-/// index. Cloning rather than removing leaves the parent producer's
-/// buffer intact for any sibling consumer that the parent walk has
-/// not yet reached. The record stream is small relative to the
-/// pipeline's working set; the clone is the same shape every Output
-/// arm uses for fan-out today.
+/// Resolves ports via the live edge graph: walks `parent_dag`'s incoming
+/// edges into `composition_node_idx`, reads each edge's `port` tag, and
+/// clones records from the producer's `node_buffers` slot. The frozen
+/// port-name snapshot kept by an earlier design drifted whenever a
+/// planner pass spliced a node between the producer and the composition
+/// (the synthetic `inject_correlation_sort` Sort being the canonical
+/// trigger), silently emptying the producer's buffer one hop downstream.
+/// Edge-walking the live graph is the same source-of-truth pattern every
+/// other arm of the dispatcher uses (`Transform`, `Aggregate`, `Output`,
+/// `Sort` all read predecessors via `neighbors_directed`).
+///
+/// Cloning rather than removing keeps the parent producer's buffer
+/// intact for any sibling consumer the parent walk has not yet reached;
+/// fan-out from a single producer to multiple ports is a normal case.
 fn collect_port_records(
     ctx: &ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
-    bound_body: &crate::plan::composition_body::BoundBody,
     composition_node_idx: NodeIndex,
+    composition_name: &str,
 ) -> Result<IndexMap<String, Vec<(clinker_record::Record, u64)>>, PipelineError> {
     let mut result: IndexMap<String, Vec<(clinker_record::Record, u64)>> = IndexMap::new();
-    for (port_name, parent_node_name) in &bound_body.input_port_sources {
-        // The parent node may itself carry a port qualifier (e.g.
-        // `route_node.branch`); strip to the bare name to match
-        // `name()` on each parent-graph node.
-        let bare = parent_node_name
-            .split('.')
-            .next()
-            .unwrap_or(parent_node_name);
-        let parent_idx = parent_dag
-            .graph
-            .node_indices()
-            .find(|&i| parent_dag.graph[i].name() == bare);
-        let records = match parent_idx {
-            Some(idx) => ctx.node_buffers.get(&idx).cloned().unwrap_or_default(),
-            None => {
-                // Nested-composition case: the parent scope is
-                // itself a body, the upstream name refers to one of
-                // that body's own input ports (not a body-internal
-                // node), so the records were seeded into THIS
-                // composition node's own buffer at the enclosing
-                // composition-arm entry. Fall through to that
-                // buffer before declaring an internal error.
-                ctx.node_buffers
-                    .get(&composition_node_idx)
-                    .cloned()
-                    .unwrap_or_default()
-            }
+    use petgraph::visit::EdgeRef;
+    for edge in parent_dag
+        .graph
+        .edges_directed(composition_node_idx, Direction::Incoming)
+    {
+        let Some(port_name) = edge.weight().port.as_ref() else {
+            // Composition incoming edges are always port-tagged at
+            // bind time; an untagged edge is a planner-pass bug
+            // (likely a rewrite that forgot to preserve the tag) and
+            // surfaces here as an internal error rather than a silent
+            // record drop.
+            return Err(PipelineError::Internal {
+                op: "composition",
+                node: composition_name.to_string(),
+                detail: format!(
+                    "untagged incoming edge from node {:?}; every composition input edge must \
+                     carry a port name (planner-pass invariant — see PlanEdge.port)",
+                    parent_dag.graph[edge.source()].name(),
+                ),
+            });
         };
+        let records = ctx
+            .node_buffers
+            .get(&edge.source())
+            .cloned()
+            .unwrap_or_default();
+        // Two parallel edges to the same port (e.g. `inputs: { p: a,
+        // p: a }` — currently rejected at parse, but the runtime is
+        // defensive) would overwrite; the wiring pass guarantees
+        // unique port names per consumer.
         result.insert(port_name.clone(), records);
     }
     Ok(result)
