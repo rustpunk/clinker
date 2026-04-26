@@ -967,22 +967,28 @@ impl PipelineExecutor {
         // Body-context translation: `combine_input.upstream_name` is the
         // raw value from the combine's `input:` map. For top-level
         // combines that's a parent-scope source name. For combines
-        // inside a composition body that's a port name — translated
-        // here through the owning body's `input_port_sources` table to
-        // recover the parent-scope source backing the port. Nested
-        // compositions chain port references — an inner body's port
-        // resolves to an outer body's port, which resolves to the
-        // top-level pipeline source — so the translation walks the
-        // body-parent chain until it lands on a source name. Without
-        // this step, body-context build-side readers would never load
-        // and the parent's secondary Source dispatch would canonicalize
-        // primary records onto the wrong schema.
+        // inside a composition body that's a port name — resolved here
+        // by walking the live edge graph one composition layer at a
+        // time. Each step finds the parent scope's incoming edge to
+        // the current body's composition node tagged with the current
+        // port name, follows to the producer, and recurses if the
+        // producer is the parent body's own synthetic-port-source
+        // (i.e., the composition's input was itself a port in the
+        // enclosing scope). The walk terminates on a non-port producer
+        // and returns its name (typically a top-level Source). This
+        // keeps reader setup aligned with the dispatcher's port
+        // resolution: both consult the live edge graph, so any
+        // planner-pass rewrite that updates edges automatically flows
+        // through both paths without a parallel name snapshot.
         //
         // Two reverse lookups: combine-node-name → owning body, and
-        // body → its enclosing body (parent_of). Top-level combines
-        // are absent from `combine_owning_body`; bodies whose
-        // composition node lives in the top-level pipeline are absent
-        // from `parent_of`.
+        // body → (enclosing scope, composition NodeIndex in that scope).
+        // Top-level combines are absent from `combine_owning_body`;
+        // bodies whose composition node lives in the top-level pipeline
+        // have `parent_body_id = None` in `body_to_parent`.
+        use petgraph::Direction;
+        use petgraph::graph::NodeIndex;
+        use petgraph::visit::EdgeRef;
         let mut combine_owning_body: HashMap<
             &str,
             crate::plan::composition_body::CompositionBodyId,
@@ -994,21 +1000,56 @@ impl PipelineExecutor {
                 }
             }
         }
-        let mut parent_of: HashMap<
+
+        #[derive(Clone, Copy)]
+        struct BodyParentScope {
+            parent_body_id: Option<crate::plan::composition_body::CompositionBodyId>,
+            composition_node_idx: NodeIndex,
+        }
+        let mut body_to_parent: HashMap<
             crate::plan::composition_body::CompositionBodyId,
-            crate::plan::composition_body::CompositionBodyId,
+            BodyParentScope,
         > = HashMap::new();
+        for idx in plan.graph.node_indices() {
+            if let crate::plan::execution::PlanNode::Composition { body, .. } = &plan.graph[idx] {
+                body_to_parent.insert(
+                    *body,
+                    BodyParentScope {
+                        parent_body_id: None,
+                        composition_node_idx: idx,
+                    },
+                );
+            }
+        }
         for (parent_id, parent_body) in &artifacts.composition_bodies {
-            for child_id in &parent_body.nested_body_ids {
-                parent_of.insert(*child_id, *parent_id);
+            for idx in parent_body.graph.node_indices() {
+                if let crate::plan::execution::PlanNode::Composition { body, .. } =
+                    &parent_body.graph[idx]
+                {
+                    body_to_parent.insert(
+                        *body,
+                        BodyParentScope {
+                            parent_body_id: Some(*parent_id),
+                            composition_node_idx: idx,
+                        },
+                    );
+                }
             }
         }
 
-        // Walk the port-chain from a body-context combine up to a
-        // parent-pipeline source name. At each level, translate the
-        // current port name through `body.input_port_sources`. If the
-        // resolved value is itself a port name in the enclosing body,
-        // step up; otherwise it is the source name we want.
+        // Edge-walk a body-context port reference to its terminal name
+        // in the topmost enclosing scope. At each step the current name
+        // must be a port in the current body (otherwise it's already
+        // body-internal, terminal). The corresponding parent scope's
+        // incoming edge to the body's composition node carries the port
+        // tag; the producer of that edge is either:
+        //   - the parent body's synthetic-port-source for one of its
+        //     own input ports → recurse one layer up, AND
+        //   - any other node → terminal (return its name).
+        // Distinguishes the synthetic-port-source case by exact
+        // NodeIndex match against the parent body's
+        // `port_name_to_node_idx`, not just by name, because port names
+        // can legally collide with body-internal node names.
         let resolve_upstream = |start_body_id: crate::plan::composition_body::CompositionBodyId,
                                 start_name: &str|
          -> String {
@@ -1018,23 +1059,68 @@ impl PipelineExecutor {
                 let Some(body) = artifacts.composition_bodies.get(&current_body_id) else {
                     return current_name;
                 };
-                let Some(parent_node) = body.input_port_sources.get(&current_name) else {
-                    // Not a port in this body — it's a body-internal
-                    // node name, which is the terminal case for
-                    // body-context combines whose input map references
-                    // a transform/aggregate inside the same body.
+                if !body.port_name_to_node_idx.contains_key(&current_name) {
+                    // Not a port in this body — body-internal node
+                    // name (Transform/Aggregate/Source declared in the
+                    // body); terminal.
+                    return current_name;
+                }
+                let Some(scope) = body_to_parent.get(&current_body_id).copied() else {
                     return current_name;
                 };
-                let parent_node = parent_node.clone();
-                match parent_of.get(&current_body_id) {
-                    Some(&outer_id) => {
-                        current_body_id = outer_id;
-                        current_name = parent_node;
+                let parent_graph = match scope.parent_body_id {
+                    None => &plan.graph,
+                    Some(pid) => match artifacts.composition_bodies.get(&pid) {
+                        Some(b) => &b.graph,
+                        None => return current_name,
+                    },
+                };
+                let mut producer_idx_opt: Option<NodeIndex> = None;
+                for edge in
+                    parent_graph.edges_directed(scope.composition_node_idx, Direction::Incoming)
+                {
+                    if edge.weight().port.as_deref() == Some(current_name.as_str()) {
+                        producer_idx_opt = Some(edge.source());
+                        break;
                     }
+                }
+                let Some(producer_idx) = producer_idx_opt else {
+                    // No port-tagged incoming edge — planner-pass
+                    // invariant violation; the dispatcher would also
+                    // surface this as PipelineError::Internal at the
+                    // composition arm. Return current_name; the caller
+                    // (reader setup) will silently skip if no reader
+                    // matches, mirroring the existing fall-through.
+                    return current_name;
+                };
+                let producer_name = parent_graph[producer_idx].name().to_string();
+                match scope.parent_body_id {
                     None => {
-                        // No enclosing body — the resolved name is a
-                        // top-level pipeline node (typically a Source).
-                        return parent_node;
+                        // Parent is top-level; producer is a top-level
+                        // node (typically a Source).
+                        return producer_name;
+                    }
+                    Some(pid) => {
+                        let parent_body = match artifacts.composition_bodies.get(&pid) {
+                            Some(b) => b,
+                            None => return producer_name,
+                        };
+                        // Synthetic-port-source identification: the
+                        // producer's NodeIndex must match the parent
+                        // body's port_name_to_node_idx entry for that
+                        // name. Name-only check is unsafe — port and
+                        // body-internal namespaces can legally collide.
+                        if parent_body
+                            .port_name_to_node_idx
+                            .get(&producer_name)
+                            .copied()
+                            == Some(producer_idx)
+                        {
+                            current_body_id = pid;
+                            current_name = producer_name;
+                        } else {
+                            return producer_name;
+                        }
                     }
                 }
             }

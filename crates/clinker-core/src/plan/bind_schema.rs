@@ -814,17 +814,6 @@ fn bind_composition(
         }
     }
 
-    // `input_port_sources` carries the parent-scope upstream name
-    // per port, in the signature's declared input order. The body
-    // executor consults this at composition entry to collect
-    // parent-scope records keyed by port name.
-    let mut input_port_sources: IndexMap<String, String> = IndexMap::new();
-    for port_name in signature.inputs.keys() {
-        if let Some(parent_node) = call_inputs.get(port_name) {
-            input_port_sources.insert(port_name.clone(), parent_node.clone());
-        }
-    }
-
     // `output_port_to_node_idx` resolves each declared output port
     // alias to the body NodeIndex that produces it. Aliases of the
     // form `node_name` or `node_name.channel` strip to the bare
@@ -897,7 +886,6 @@ fn bind_composition(
         topo_order: body_topo,
         name_to_idx: body_name_to_idx,
         port_name_to_node_idx,
-        input_port_sources,
         body_rows,
         node_input_refs,
         route_bodies,

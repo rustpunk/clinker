@@ -77,25 +77,6 @@ pub struct BoundBody {
     /// body-internal reference resolution).
     pub port_name_to_node_idx: HashMap<String, NodeIndex>,
 
-    /// Bind-time snapshot of the call site's `inputs:` map (port name →
-    /// upstream node name in the parent scope). Order matches the
-    /// signature's `inputs:` declaration.
-    ///
-    /// Scope: **compile-time reader setup only**. The source-reader
-    /// initializer walks this across nested bodies to translate a
-    /// body-context combine's build-side port reference back to a
-    /// top-level pipeline source name.
-    ///
-    /// Not consulted at runtime dispatch — the dispatcher resolves
-    /// composition input ports via the live `PlanEdge.port` tag on
-    /// incoming edges of the composition node, the same edge-walk
-    /// pattern every other arm uses for predecessor lookup. Mixing
-    /// this name snapshot with runtime dispatch caused
-    /// `inject_correlation_sort` + composition pipelines to silently
-    /// drop every record (the synthetic Sort consumed the producer's
-    /// buffer one hop downstream of where the snapshot pointed).
-    pub input_port_sources: IndexMap<String, String>,
-
     /// Per-node output row inside this body scope. Keyed by node name.
     /// Consumers that want a public accessor go through
     /// `CompiledPlan::typed_output_row`, which only sees top-level

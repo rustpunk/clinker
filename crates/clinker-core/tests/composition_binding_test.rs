@@ -51,7 +51,6 @@ fn test_compile_artifacts_insert_body_and_lookup() {
         topo_order: Vec::new(),
         name_to_idx: std::collections::HashMap::new(),
         port_name_to_node_idx: std::collections::HashMap::new(),
-        input_port_sources: IndexMap::new(),
         body_rows: std::collections::HashMap::new(),
         node_input_refs: std::collections::HashMap::new(),
         route_bodies: std::collections::HashMap::new(),
