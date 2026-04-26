@@ -15,6 +15,12 @@ Source DAG:
 
 === Physical Properties ===
 
+source.ingest_src:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
 composition.enrich1:
   ordering: <none>
   ordering_provenance: NoOrdering
@@ -22,12 +28,6 @@ composition.enrich1:
   partitioning_provenance: SingleStream
 
 output.sink:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-
-source.ingest_src:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -45,6 +45,6 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [composition:body=<ID>] enrich1 (line:18)
-  │ [output] sink (line:28)
   ● [source] ingest_src (line:7)
+  │ [composition:body=<ID>] enrich1 (line:18)
+  │ [output] sink (line:28)

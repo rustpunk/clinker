@@ -297,7 +297,11 @@ fn main() -> ExitCode {
                         | PipelineError::Internal { .. }
                         | PipelineError::SortOrderViolation { .. }
                         | PipelineError::MergeSortOrderViolation { .. }
-                        | PipelineError::SchemaMismatch { .. } => ExitCode::from(1),
+                        | PipelineError::SchemaMismatch { .. }
+                        | PipelineError::CompositionDepthExceeded { .. }
+                        | PipelineError::CompositionBodyMissing { .. }
+                        | PipelineError::CompositionUnknownPort { .. }
+                        | PipelineError::CompositionBodyError { .. } => ExitCode::from(1),
                         PipelineError::Io(_) => ExitCode::from(4),
                         PipelineError::Eval(_) | PipelineError::Accumulator { .. } => {
                             ExitCode::from(3)

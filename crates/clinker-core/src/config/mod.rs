@@ -1604,8 +1604,14 @@ impl PipelineConfig {
                 }
             };
             match node {
-                PipelineNode::Source { .. } | PipelineNode::Composition { .. } => {}
-                PipelineNode::Transform { header, .. }
+                PipelineNode::Source { .. } => {}
+                // Composition wires its `input:` like every other
+                // 1-in node. The body executor consults predecessors
+                // for schema checks at composition entry, and the
+                // top-level walker needs the edge so a downstream
+                // consumer of this composition sees it as predecessor.
+                PipelineNode::Composition { header, .. }
+                | PipelineNode::Transform { header, .. }
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. } => {
@@ -2087,11 +2093,28 @@ pub(crate) fn lower_node_to_plan_node(
             if body_id == CompositionBodyId::SENTINEL {
                 return None;
             }
+            // Composition's output schema is the first declared
+            // output port's row, not the call-site node name (which
+            // has no entry in `artifacts.typed` — compositions don't
+            // carry their own CXL body). The downstream
+            // `expected_input_schema_in` walk uses this Arc to
+            // schema-check records flowing out of the composition.
+            let comp_output_schema = artifacts
+                .composition_bodies
+                .get(&body_id)
+                .and_then(|body| body.output_port_rows.values().next())
+                .map(|row| {
+                    row.fields()
+                        .map(|(qf, _)| qf.name.as_ref())
+                        .collect::<SchemaBuilder>()
+                        .build()
+                })
+                .unwrap_or_else(|| SchemaBuilder::new().build());
             Some(PlanNode::Composition {
                 name: name.to_string(),
                 span,
                 body: body_id,
-                output_schema: schema_from_bound(name),
+                output_schema: comp_output_schema,
             })
         }
         PipelineNode::Aggregate {

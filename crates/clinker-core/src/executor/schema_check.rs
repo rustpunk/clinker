@@ -32,6 +32,15 @@ pub fn check_input_schema(
     if Arc::ptr_eq(expected, actual) {
         return Ok(());
     }
+    // Empty expected acts as "no expected schema" — produced by
+    // `output_schema_in` for body-root row-preserving variants whose
+    // input is a port-seeded record stream rather than a graph
+    // upstream. Skipping the check here avoids false E314 on the
+    // single legitimate body-context case; mismatches still surface
+    // when the operator carries a real `expected` Arc.
+    if expected.column_count() == 0 {
+        return Ok(());
+    }
     if expected.columns() == actual.columns() {
         return Ok(());
     }

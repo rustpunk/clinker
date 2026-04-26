@@ -41,8 +41,13 @@ use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
 
-/// Maximum composition nesting depth before E107 fires.
-const MAX_COMPOSITION_DEPTH: u32 = 50;
+/// Maximum composition nesting depth.
+///
+/// Compile-time depth violations emit E107 from `bind_composition`.
+/// The runtime composition-body executor reuses this same constant as
+/// its recursion-depth guard and emits a distinct E112 on overflow,
+/// so log-grep on either code finds exactly one emission site.
+pub(crate) const MAX_COMPOSITION_DEPTH: u32 = 50;
 
 /// Compile artifacts produced by `bind_schema` — one entry per node name
 /// whose CXL body successfully type-checked, plus per-node row types.
@@ -596,35 +601,304 @@ fn bind_composition(
     // 12. Persist body per-node rows.
     let body_rows: HashMap<String, Row> = body_schema_by_name.clone();
 
-    // 13. Lower body nodes to PlanNodes via the shared lowering function.
-    let body_plan_nodes: Vec<crate::plan::execution::PlanNode> = body_file
-        .nodes
-        .iter()
-        .filter_map(|spanned| {
-            let saphyr_line = spanned.referenced.line();
-            let body_span = if saphyr_line > 0 {
-                crate::span::Span::line_only(saphyr_line as u32)
-            } else {
-                crate::span::Span::SYNTHETIC
-            };
-            let n = &spanned.value;
-            let n_name = n.name().to_string();
-            // Body nodes are lowered with a default `LoweringCtx` — they are
-            // inspected in Kiln drill-in views but never executed through
-            // this DAG, so they don't need parallelism/index/aggregate
-            // enrichment. The top-level `compile_with_diagnostics` path
-            // supplies a populated ctx for runtime-executed nodes.
-            let ctx = crate::config::LoweringCtx::default();
-            crate::config::lower_node_to_plan_node(n, &n_name, body_span, artifacts, &ctx, diags)
-        })
-        .collect();
+    // 13. Empty-body rejection (E111). A composition with zero body
+    // nodes has nothing to execute and would silently no-op at runtime,
+    // which is the strict rejection pattern enforced by
+    // StreamSets / Camel / Logstash. Reject at bind time so authors
+    // see the bug at compile rather than as missing output rows.
+    if body_file.nodes.is_empty() {
+        diags.push(Diagnostic::error(
+            "E111",
+            format!(
+                "composition node {node_name:?}: body file {} has zero nodes",
+                resolved_path.display()
+            ),
+            LabeledSpan::primary(span, String::new()),
+        ));
+        return;
+    }
 
-    // 14. Build and insert BoundBody.
+    // 14. Lower body nodes to PlanNodes via the shared lowering
+    // function and build a mini-DAG keyed by NodeIndex. The body
+    // executor walks this graph topologically using the same
+    // dispatcher entry as the top-level walker — edges come from
+    // each body node's declared `input:` field, mirroring the
+    // edge-wiring loop in top-level `PipelineConfig::compile()`.
+    use crate::plan::execution::{DependencyType, PlanEdge};
+    use petgraph::graph::DiGraph;
+
+    let mut body_graph: DiGraph<crate::plan::execution::PlanNode, PlanEdge> = DiGraph::new();
+    let mut body_name_to_idx: std::collections::HashMap<String, petgraph::graph::NodeIndex> =
+        std::collections::HashMap::new();
+
+    for spanned in &body_file.nodes {
+        let saphyr_line = spanned.referenced.line();
+        let body_span = if saphyr_line > 0 {
+            crate::span::Span::line_only(saphyr_line as u32)
+        } else {
+            crate::span::Span::SYNTHETIC
+        };
+        let n = &spanned.value;
+        let n_name = n.name().to_string();
+        // Body nodes are lowered with a default `LoweringCtx` — they
+        // run inside the body executor's mini-DAG and don't need the
+        // top-level parallelism/index/aggregate enrichment. The
+        // top-level `compile_with_diagnostics` path supplies a
+        // populated ctx for runtime-executed top-level nodes.
+        let lower_ctx = crate::config::LoweringCtx::default();
+        if let Some(plan_node) = crate::config::lower_node_to_plan_node(
+            n, &n_name, body_span, artifacts, &lower_ctx, diags,
+        ) {
+            let idx = body_graph.add_node(plan_node);
+            body_name_to_idx.insert(n_name, idx);
+        }
+    }
+
+    // Wire edges by walking each body node's `input:` reference(s).
+    // `input_full_reference` strips ports lazily; the producer key is
+    // the bare node name (the part before `.`).
+    fn body_strip_port(r: &str) -> &str {
+        r.split('.').next().unwrap_or(r)
+    }
+    for spanned in &body_file.nodes {
+        let n = &spanned.value;
+        let consumer_name = n.name();
+        let Some(&consumer_idx) = body_name_to_idx.get(consumer_name) else {
+            continue;
+        };
+        let mut wire = |producer_full: &str| {
+            let producer_key = body_strip_port(producer_full);
+            // Body-internal references resolve through name_to_idx;
+            // references to a signature input port don't produce a
+            // graph edge — port seeding is handled at composition
+            // entry by the executor.
+            if let Some(&producer_idx) = body_name_to_idx.get(producer_key) {
+                body_graph.add_edge(
+                    producer_idx,
+                    consumer_idx,
+                    PlanEdge {
+                        dependency_type: DependencyType::Data,
+                    },
+                );
+            }
+        };
+        match n {
+            // Sources are roots and Compositions inside the body are
+            // call-sites whose own input(s) come from upstream nodes
+            // in the body — wire those, the same way top-level
+            // compile() does.
+            PipelineNode::Source { .. } => {}
+            PipelineNode::Composition { header, .. }
+            | PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. } => {
+                let r = match &header.input.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                };
+                wire(&r);
+            }
+            PipelineNode::Merge { header, .. } => {
+                for inp in &header.inputs {
+                    let r = match &inp.value {
+                        crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                        crate::config::node_header::NodeInput::Port { node, port } => {
+                            format!("{node}.{port}")
+                        }
+                    };
+                    wire(&r);
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for ni in header.input.values() {
+                    let r = match &ni.value {
+                        crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                        crate::config::node_header::NodeInput::Port { node, port } => {
+                            format!("{node}.{port}")
+                        }
+                    };
+                    wire(&r);
+                }
+            }
+        }
+    }
+
+    // Topo sort. Cycles inside a body are surfaced as bind-time
+    // errors with the composition node's call-site span — distinct
+    // from E108 (enclosing-scope reference) which fires earlier on
+    // body-internal CXL evaluation.
+    let body_topo = match petgraph::algo::toposort(&body_graph, None) {
+        Ok(order) => order,
+        Err(_) => {
+            diags.push(Diagnostic::error(
+                "E107",
+                format!("cycle detected inside composition body for node {node_name:?}"),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            return;
+        }
+    };
+
+    // Resolve each input port name to the body node that consumes it.
+    // The body executor seeds the parent-scope record stream into
+    // this NodeIndex's buffer so the dispatcher's dependency-walk
+    // sees the same shape it does at the top level.
+    let mut port_name_to_node_idx: std::collections::HashMap<String, petgraph::graph::NodeIndex> =
+        std::collections::HashMap::new();
+    for spanned in &body_file.nodes {
+        let n = &spanned.value;
+        let consumer_name = n.name().to_string();
+        let Some(&consumer_idx) = body_name_to_idx.get(&consumer_name) else {
+            continue;
+        };
+        let inputs: Vec<String> = match n {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Composition { header, .. }
+            | PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. } => {
+                vec![match &header.input.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                }]
+            }
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .map(|inp| match &inp.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .map(|ni| match &ni.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+        };
+        for input_full in inputs {
+            let producer_key = body_strip_port(&input_full);
+            // A body-internal reference resolves through
+            // `body_name_to_idx`; only references that don't match
+            // a body-local node — and DO match a declared input
+            // port — populate `port_name_to_node_idx`.
+            if !body_name_to_idx.contains_key(producer_key)
+                && signature.inputs.contains_key(producer_key)
+            {
+                // Single-consumer port is the common shape; the
+                // first body node that consumes the port wins. A
+                // multi-consumer port would need fan-out to all
+                // consumers, but the present body executor uses
+                // the first-consumer mapping.
+                port_name_to_node_idx
+                    .entry(producer_key.to_string())
+                    .or_insert(consumer_idx);
+            }
+        }
+    }
+
+    // `input_port_sources` carries the parent-scope upstream name
+    // per port, in the signature's declared input order. The body
+    // executor consults this at composition entry to collect
+    // parent-scope records keyed by port name.
+    let mut input_port_sources: IndexMap<String, String> = IndexMap::new();
+    for port_name in signature.inputs.keys() {
+        if let Some(parent_node) = call_inputs.get(port_name) {
+            input_port_sources.insert(port_name.clone(), parent_node.clone());
+        }
+    }
+
+    // `output_port_to_node_idx` resolves each declared output port
+    // alias to the body NodeIndex that produces it. Aliases of the
+    // form `node_name` or `node_name.channel` strip to the bare
+    // node name; the executor harvests records from this index at
+    // end of the body walk.
+    let mut output_port_to_node_idx: IndexMap<String, petgraph::graph::NodeIndex> = IndexMap::new();
+    for (port_name, alias) in &signature.outputs {
+        let internal_ref = &alias.internal_ref.value;
+        let bare = internal_ref.split('.').next().unwrap_or(internal_ref);
+        if let Some(&idx) = body_name_to_idx.get(bare) {
+            output_port_to_node_idx.insert(port_name.clone(), idx);
+        }
+    }
+
+    // Populate `node_input_refs` and `route_bodies` from the body
+    // file so the body executor can resolve `<route>.<branch>`
+    // references and compile per-route conditions without having to
+    // re-parse the .comp.yaml at runtime.
+    let mut node_input_refs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut route_bodies: HashMap<String, crate::config::pipeline_node::RouteBody> = HashMap::new();
+    for spanned in &body_file.nodes {
+        let n = &spanned.value;
+        let n_name = n.name().to_string();
+        let inputs: Vec<String> = match n {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Composition { header, .. }
+            | PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. } => {
+                vec![match &header.input.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                }]
+            }
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .map(|inp| match &inp.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .map(|ni| match &ni.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+        };
+        node_input_refs.insert(n_name.clone(), inputs);
+
+        if let PipelineNode::Route { config, .. } = n {
+            route_bodies.insert(n_name, config.clone());
+        }
+    }
+
+    // 15. Build and insert BoundBody.
     let bound_body = BoundBody {
         signature_path: resolved_path,
-        nodes: body_plan_nodes,
+        graph: body_graph,
+        topo_order: body_topo,
+        name_to_idx: body_name_to_idx,
+        port_name_to_node_idx,
+        input_port_sources,
         body_rows,
+        node_input_refs,
+        route_bodies,
         output_port_rows: output_port_rows.clone(),
+        output_port_to_node_idx,
         input_port_rows,
         nested_body_ids,
     };
@@ -633,7 +907,7 @@ fn bind_composition(
         .composition_body_assignments
         .insert(node_name.to_string(), body_id);
 
-    // 15. Write composition's output row to parent scope.
+    // 16. Write composition's output row to parent scope.
     // Use the first output port's row as the composition node's output.
     if let Some((_, row)) = output_port_rows.into_iter().next() {
         parent_schema_by_name.insert(node_name.to_string(), row);

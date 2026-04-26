@@ -47,9 +47,16 @@ fn test_compile_artifacts_insert_body_and_lookup() {
 
     let body = BoundBody {
         signature_path: "compositions/test.comp.yaml".into(),
-        nodes: vec![],
+        graph: petgraph::graph::DiGraph::new(),
+        topo_order: Vec::new(),
+        name_to_idx: std::collections::HashMap::new(),
+        port_name_to_node_idx: std::collections::HashMap::new(),
+        input_port_sources: IndexMap::new(),
         body_rows: std::collections::HashMap::new(),
+        node_input_refs: std::collections::HashMap::new(),
+        route_bodies: std::collections::HashMap::new(),
         output_port_rows: IndexMap::new(),
+        output_port_to_node_idx: IndexMap::new(),
         input_port_rows: IndexMap::new(),
         nested_body_ids: vec![],
     };
@@ -1032,8 +1039,8 @@ fn test_pipeline_compile_with_workspace_root_binds_compositions() {
                 .body_of(*body)
                 .expect("body_of should return the BoundBody");
             assert!(
-                !bound_body.nodes.is_empty(),
-                "BoundBody.nodes should be populated for {name:?}"
+                !bound_body.topo_order.is_empty(),
+                "BoundBody.topo_order should be populated for {name:?}"
             );
         }
     }

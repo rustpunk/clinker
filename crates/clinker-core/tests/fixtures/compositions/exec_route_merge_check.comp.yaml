@@ -1,0 +1,40 @@
+# Body containing route → 2 transform branches → merge. Used to
+# confirm the body executor walks the real DAG topologically (linear
+# sequential connections cannot represent route+merge — the prior
+# pass-through stub would silently drop branches).
+_compose:
+  name: exec_route_merge_check
+  inputs:
+    inp:
+      schema:
+        - { name: a, type: int }
+  outputs:
+    out: merged
+  config_schema: {}
+
+nodes:
+  - type: route
+    name: split
+    input: inp
+    config:
+      conditions:
+        lo: "a.to_int() < 10"
+        hi: "a.to_int() >= 10"
+      default: lo
+  - type: transform
+    name: lo_branch
+    input: split.lo
+    config:
+      cxl: |
+        emit a = a
+        emit bucket = "lo"
+  - type: transform
+    name: hi_branch
+    input: split.hi
+    config:
+      cxl: |
+        emit a = a
+        emit bucket = "hi"
+  - type: merge
+    name: merged
+    inputs: [lo_branch, hi_branch]

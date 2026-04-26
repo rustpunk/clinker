@@ -1,0 +1,30 @@
+# Nested composition: the outer body calls another composition
+# (`exec_transform_check`) and stamps an additional flag. The body
+# executor must recurse correctly into the inner body for the outer
+# `marker` field AND the inner `computed` field to both reach the
+# top-level output.
+_compose:
+  name: exec_nested_check
+  inputs:
+    inp:
+      schema:
+        - { name: a, type: int }
+  outputs:
+    out: stamp
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner
+    input: inp
+    use: ./exec_transform_check.comp.yaml
+    inputs:
+      inp: inp
+  - type: transform
+    name: stamp
+    input: inner
+    config:
+      cxl: |
+        emit a = a
+        emit computed = computed
+        emit marker = "nested"

@@ -24,6 +24,8 @@
 //! | `E107`      | error    | Cycle detected in flat post-expansion graph          |
 //! | `E108`      | error    | Composition body references enclosing scope (IsolatedFromAbove) |
 //! | `E109`      | error    | Ambiguous column reference (declared vs pass-through in open row) |
+//! | `E111`      | error    | Composition body has zero nodes (rejected at bind time) |
+//! | `E112`      | error    | Runtime composition recursion depth exceeded |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
@@ -291,6 +293,36 @@ pub enum PipelineError {
         operator_kind: &'static str,
         upstream_name: String,
     },
+    /// E112 — a composition node's runtime body recursion exceeded
+    /// `MAX_COMPOSITION_DEPTH`. Distinct from E107 (compile-time depth
+    /// guard) so log greppers can pinpoint the runtime emission site
+    /// without ambiguity. Always aborts the run.
+    CompositionDepthExceeded {
+        composition_name: String,
+        depth: u32,
+    },
+    /// Internal invariant violation: `PlanNode::Composition.body`
+    /// resolves to no entry in `CompileArtifacts.composition_bodies`.
+    /// Should never happen post-bind. Always aborts the run.
+    CompositionBodyMissing {
+        composition_name: String,
+    },
+    /// Internal invariant violation: a body input port has no
+    /// `BoundBody.port_name_to_node_idx` entry, so no body node
+    /// consumes the parent's records. Should never happen post-bind.
+    /// Always aborts the run.
+    CompositionUnknownPort {
+        composition_name: String,
+        port_name: String,
+    },
+    /// Wraps an error that surfaced inside a composition body's
+    /// recursive walk so the rendered diagnostic carries the
+    /// composition's name. Lets users see "in composition '<name>'"
+    /// in failure messages instead of an opaque inner error.
+    CompositionBodyError {
+        composition_name: String,
+        inner: Box<PipelineError>,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -369,6 +401,69 @@ impl fmt::Display for PipelineError {
                     actual.column_count(),
                 )
             }
+            Self::CompositionDepthExceeded {
+                composition_name,
+                depth,
+            } => write!(
+                f,
+                "E112 runtime composition recursion depth exceeded ({depth}) \
+                 in composition '{composition_name}'"
+            ),
+            Self::CompositionBodyMissing { composition_name } => write!(
+                f,
+                "internal error in composition '{composition_name}': \
+                 body handle resolves to no entry in composition_bodies"
+            ),
+            Self::CompositionUnknownPort {
+                composition_name,
+                port_name,
+            } => write!(
+                f,
+                "internal error in composition '{composition_name}': \
+                 input port '{port_name}' has no body-side consumer"
+            ),
+            Self::CompositionBodyError {
+                composition_name,
+                inner,
+            } => write!(f, "in composition '{composition_name}': {inner}"),
+        }
+    }
+}
+
+impl PipelineError {
+    /// E112 — runtime recursion depth guard fired in a composition
+    /// body executor. Distinct from E107 (compile-time depth check)
+    /// so log greppers can pinpoint the runtime emission site.
+    pub fn compose_depth_exceeded(composition_name: String, depth: u32) -> Self {
+        Self::CompositionDepthExceeded {
+            composition_name,
+            depth,
+        }
+    }
+
+    /// Invariant violation: `PlanNode::Composition.body` resolved to
+    /// no body in `CompileArtifacts.composition_bodies`. Should never
+    /// happen post-bind; constructed only from a debug-asserted path.
+    pub fn compose_body_missing(composition_name: String) -> Self {
+        Self::CompositionBodyMissing { composition_name }
+    }
+
+    /// Invariant violation: a body input port has no
+    /// `port_name_to_node_idx` entry, so no body node consumes the
+    /// parent's records. Should never happen post-bind.
+    pub fn compose_unknown_port(composition_name: &str, port_name: &str) -> Self {
+        Self::CompositionUnknownPort {
+            composition_name: composition_name.to_string(),
+            port_name: port_name.to_string(),
+        }
+    }
+
+    /// Wrap an inner error from a composition body walk so the
+    /// rendered diagnostic carries the composition's name.
+    pub fn compose_body_error(composition_name: String, inner: Box<PipelineError>) -> Self {
+        Self::CompositionBodyError {
+            composition_name,
+            inner,
         }
     }
 }
@@ -450,7 +545,7 @@ mod diagnostic_tests {
     fn test_error_registry_e101_through_e108_documented() {
         let source = include_str!("error.rs");
         for code in [
-            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E109",
+            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E109", "E111", "E112",
         ] {
             let pattern = format!("`{code}`");
             assert!(

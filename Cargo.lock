@@ -894,6 +894,7 @@ dependencies = [
  "dirs",
  "indexmap",
  "notify",
+ "petgraph",
  "regex",
  "rfd 0.15.4",
  "serde",

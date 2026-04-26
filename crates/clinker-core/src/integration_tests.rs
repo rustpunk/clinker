@@ -71,7 +71,11 @@ mod tests {
                 | PipelineError::Internal { .. }
                 | PipelineError::SortOrderViolation { .. }
                 | PipelineError::MergeSortOrderViolation { .. }
-                | PipelineError::SchemaMismatch { .. },
+                | PipelineError::SchemaMismatch { .. }
+                | PipelineError::CompositionDepthExceeded { .. }
+                | PipelineError::CompositionBodyMissing { .. }
+                | PipelineError::CompositionUnknownPort { .. }
+                | PipelineError::CompositionBodyError { .. },
             ) => 1,
             Err(PipelineError::Eval(_) | PipelineError::Accumulator { .. }) => 3,
             Err(

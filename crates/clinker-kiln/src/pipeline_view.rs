@@ -570,18 +570,57 @@ fn cxl_subtitle(cxl: &str) -> String {
         .collect()
 }
 
-/// Derive canvas nodes from a `BoundBody`'s `PlanNode` list.
+/// Derive canvas nodes from a `BoundBody`'s mini-DAG.
 ///
 /// Used when drilled into a composition: the sub-canvas renders the
-/// composition's internal nodes. Layout is a simple left-to-right chain.
+/// composition's internal nodes. Layout walks `body.topo_order` and
+/// places each node at column = 1 + max(predecessor columns), then
+/// stacks per-column rows with the same `STAGGER_Y` / `STACK_GAP`
+/// constants as `derive_pipeline_view`. Edges come from
+/// `body.graph.edge_references()` so route, merge, and combine
+/// branches all render as the real DAG instead of a synthetic chain.
 pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) -> PipelineView {
     use clinker_core::plan::execution::PlanNode;
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use petgraph::visit::EdgeRef;
+    use std::collections::HashMap;
 
-    let mut stages = Vec::with_capacity(body.nodes.len());
+    // Column = 1 + max column of incoming neighbors; nodes with no
+    // incoming edges (sources, port-seed nodes) sit at column 0.
+    let mut cols: HashMap<NodeIndex, usize> = HashMap::with_capacity(body.topo_order.len());
+    for &idx in &body.topo_order {
+        let col = body
+            .graph
+            .neighbors_directed(idx, Direction::Incoming)
+            .filter_map(|p| cols.get(&p).copied())
+            .map(|c| c + 1)
+            .max()
+            .unwrap_or(0);
+        cols.insert(idx, col);
+    }
 
-    for (idx, plan_node) in body.nodes.iter().enumerate() {
-        let x = LEFT_MARGIN + idx as f32 * (NODE_WIDTH + NODE_GAP);
-        let y = BASE_Y;
+    // Per-column row counter for vertical stacking; matches the
+    // top-level layout's stagger pattern so a body view feels visually
+    // consistent with the parent canvas.
+    let mut col_rows: HashMap<usize, usize> = HashMap::new();
+    let mut idx_to_slot: HashMap<NodeIndex, usize> = HashMap::with_capacity(body.topo_order.len());
+    let mut stages: Vec<StageView> = Vec::with_capacity(body.topo_order.len());
+
+    for &node_idx in &body.topo_order {
+        let plan_node = &body.graph[node_idx];
+        let col = cols.get(&node_idx).copied().unwrap_or(0);
+        let row = *col_rows
+            .entry(col)
+            .and_modify(|r| *r += 1)
+            .or_insert(0_usize);
+        let x = LEFT_MARGIN + (col as f32) * (NODE_WIDTH + NODE_GAP);
+        let stagger = if col.is_multiple_of(2) {
+            0.0
+        } else {
+            STAGGER_Y
+        };
+        let y = BASE_Y + (row as f32) * (NODE_HEIGHT + STACK_GAP) + stagger;
 
         let (id, kind, subtitle) = match plan_node {
             PlanNode::Source { name, .. } => (name.clone(), StageKind::Source, String::new()),
@@ -603,6 +642,8 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
             }
         };
 
+        let slot = stages.len();
+        idx_to_slot.insert(node_idx, slot);
         stages.push(StageView {
             id,
             label: plan_node.name().to_string(),
@@ -616,9 +657,17 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
         });
     }
 
-    // Simple sequential connections for body nodes
-    let connections: Vec<(usize, usize)> = (0..stages.len().saturating_sub(1))
-        .map(|i| (i, i + 1))
+    // Walk every edge in the mini-DAG and translate it to a slot
+    // pair. Stages were pushed in topo order, so every edge's source
+    // and target are already in `idx_to_slot`.
+    let connections: Vec<(usize, usize)> = body
+        .graph
+        .edge_references()
+        .filter_map(|e| {
+            let from = idx_to_slot.get(&e.source()).copied()?;
+            let to = idx_to_slot.get(&e.target()).copied()?;
+            Some((from, to))
+        })
         .collect();
 
     PipelineView {

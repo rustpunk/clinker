@@ -723,7 +723,7 @@ impl PipelineExecutor {
                 })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
-        let compiled_transforms: Vec<CompiledTransform> = resolved_transforms
+        let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
                 let typed = validated_plan
@@ -744,6 +744,35 @@ impl PipelineExecutor {
                 })
             })
             .collect::<Result<_, _>>()?;
+
+        // Extend with body transforms. Composition bodies' Transform
+        // / Aggregate nodes have their typed programs sitting in
+        // `artifacts.typed` under the body's node name. The body
+        // dispatcher arm looks up `transform_by_name` in the same
+        // table the top-level walker uses, so every executable body
+        // node has to be present here too. Skip names already
+        // present so the top-level entry wins on collision.
+        let mut existing_names: std::collections::HashSet<String> =
+            compiled_transforms.iter().map(|c| c.name.clone()).collect();
+        for body in validated_plan.artifacts().composition_bodies.values() {
+            for idx in body.graph.node_indices() {
+                let body_node = &body.graph[idx];
+                let n = body_node.name();
+                if matches!(
+                    body_node,
+                    crate::plan::execution::PlanNode::Transform { .. }
+                        | crate::plan::execution::PlanNode::Aggregation { .. }
+                ) && !existing_names.contains(n)
+                    && let Some(typed) = validated_plan.artifacts().typed.get(n)
+                {
+                    compiled_transforms.push(CompiledTransform {
+                        name: n.to_string(),
+                        typed: typed.clone(),
+                    });
+                    existing_names.insert(n.to_string());
+                }
+            }
+        }
 
         // Compile route conditions if any transform has a route config.
         // Collect all emitted field names for route condition resolution.
@@ -794,6 +823,66 @@ impl PipelineExecutor {
             }
         };
 
+        // Compile body Routes alongside the top-level singleton.
+        // The dispatcher's Route arm consults
+        // `compiled_routes_by_name` first; any name found here wins
+        // over the singleton, which keeps the long-standing
+        // single-top-level-Route path intact while letting body
+        // Routes carry their own conditions.
+        let mut compiled_routes_by_name: std::collections::HashMap<String, CompiledRoute> =
+            std::collections::HashMap::new();
+        for body in validated_plan.artifacts().composition_bodies.values() {
+            for (route_name, route_body) in &body.route_bodies {
+                // Build the body Route's RouteConfig from its parsed
+                // RouteBody. The condition resolver needs the field
+                // set — for body context the body's input port
+                // schema(s) plus everything emitted upstream within
+                // the body.
+                let conditions: Vec<crate::config::RouteBranch> = route_body
+                    .conditions
+                    .iter()
+                    .map(|(name, cxl)| crate::config::RouteBranch {
+                        name: name.clone(),
+                        condition: cxl.source.as_str().to_string(),
+                    })
+                    .collect();
+                let route_config = crate::config::RouteConfig {
+                    mode: route_body.mode,
+                    branches: conditions,
+                    default: route_body.default.clone(),
+                };
+                // Use the union of port column names + any emit on
+                // body upstream nodes. A union of declared body
+                // schemas is overinclusive but safe — branches'
+                // typecheck already passed at bind time, so resolver
+                // false-positives won't surface here.
+                let mut emitted_fields: Vec<String> = Vec::new();
+                for row in body.input_port_rows.values() {
+                    for qf in row.field_names() {
+                        let s = qf.name.to_string();
+                        if !emitted_fields.contains(&s) {
+                            emitted_fields.push(s);
+                        }
+                    }
+                }
+                for (n, typed) in &validated_plan.artifacts().typed {
+                    if !body.name_to_idx.contains_key(n.as_str()) {
+                        continue;
+                    }
+                    for stmt in &typed.program.statements {
+                        if let Statement::Emit { name: en, .. } = stmt {
+                            let s = en.to_string();
+                            if !emitted_fields.contains(&s) {
+                                emitted_fields.push(s);
+                            }
+                        }
+                    }
+                }
+                let cr = Self::compile_route(&route_config, &emitted_fields)?;
+                compiled_routes_by_name.insert(route_name.clone(), cr);
+            }
+        }
+
         let plan = validated_plan.dag();
         collector.record(compile_timer.finish(0, 0));
 
@@ -822,6 +911,7 @@ impl PipelineExecutor {
             writers,
             &compiled_transforms,
             compiled_route,
+            compiled_routes_by_name,
             plan,
             validated_plan.artifacts(),
             params,
@@ -1203,6 +1293,7 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
+        compiled_routes_by_name: HashMap<String, CompiledRoute>,
         plan: &ExecutionPlanDag,
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
@@ -1944,6 +2035,7 @@ impl PipelineExecutor {
                 writers,
                 transforms,
                 compiled_route,
+                compiled_routes_by_name,
                 plan,
                 artifacts,
                 params,
@@ -2811,6 +2903,7 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
+        compiled_routes_by_name: HashMap<String, CompiledRoute>,
         plan: &ExecutionPlanDag,
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
@@ -2856,7 +2949,6 @@ impl PipelineExecutor {
         let mut ctx = dispatch::ExecutorContext {
             config,
             artifacts,
-            current_dag: plan,
             output_configs: &output_configs,
             primary_output: &output_configs[0],
             compiled_transforms: transforms,
@@ -2880,6 +2972,9 @@ impl PipelineExecutor {
             projection_timer: stage_metrics::CumulativeTimer::new(),
             write_timer: stage_metrics::CumulativeTimer::new(),
             collector,
+            recursion_depth: 0,
+            compiled_routes_by_name,
+            current_body_node_input_refs: None,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2888,7 +2983,7 @@ impl PipelineExecutor {
         // `ctx.current_dag` (which aliases `plan`) at the field
         // granularity through every dispatcher call.
         for node_idx in plan.topo_order.clone() {
-            dispatch::dispatch_plan_node(&mut ctx, node_idx)?;
+            dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
         }
 
         // Drain mutable per-walk state out of the context for the

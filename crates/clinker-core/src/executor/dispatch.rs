@@ -1,6 +1,6 @@
 //! Top-level DAG dispatcher.
 //!
-//! [`dispatch_plan_node`] reads `ctx.current_dag.graph[node_idx]` and routes
+//! [`dispatch_plan_node`] reads `current_dag.graph[node_idx]` and routes
 //! the node to its executor arm — Source materialization, Transform projection,
 //! Route fan-out, Merge concatenation, Sort enforcement, Aggregation,
 //! Combine, Composition pass-through, and Output writing. Mutable per-walk
@@ -77,7 +77,6 @@ pub(crate) struct ExecutorContext<'a> {
     // Borrowed plan-time state.
     pub(crate) config: &'a PipelineConfig,
     pub(crate) artifacts: &'a CompileArtifacts,
-    pub(crate) current_dag: &'a ExecutionPlanDag,
     pub(crate) output_configs: &'a [OutputConfig],
     pub(crate) primary_output: &'a OutputConfig,
     pub(crate) compiled_transforms: &'a [CompiledTransform],
@@ -92,6 +91,21 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) all_records: Vec<(Record, u64)>,
     pub(crate) writers: HashMap<String, Box<dyn Write + Send>>,
     pub(crate) compiled_route: Option<CompiledRoute>,
+    /// Per-route compiled evaluators keyed by route node name.
+    /// Populated for body Routes (and any Route whose conditions
+    /// must survive an explicit name lookup). The Route dispatcher
+    /// arm checks this map first; if absent, it falls back to the
+    /// `compiled_route` singleton — the long-standing single-route
+    /// path the top-level executor uses.
+    pub(crate) compiled_routes_by_name: HashMap<String, CompiledRoute>,
+    /// Body-scope `input:` reference table installed by the body
+    /// executor before each body walk and cleared afterward. The
+    /// Route dispatcher arm consults this map (when present) to
+    /// resolve branch successors instead of walking `ctx.config.nodes`,
+    /// which is top-level only and would not see body siblings.
+    /// `None` at the top level — the existing config-walk path
+    /// covers every top-level node.
+    pub(crate) current_body_node_input_refs: Option<HashMap<String, Vec<String>>>,
     pub(crate) counters: PipelineCounters,
     pub(crate) dlq_entries: Vec<DlqEntry>,
     pub(crate) output_errors: Vec<PipelineError>,
@@ -102,11 +116,21 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) projection_timer: stage_metrics::CumulativeTimer,
     pub(crate) write_timer: stage_metrics::CumulativeTimer,
     pub(crate) collector: &'a mut stage_metrics::StageCollector,
+
+    /// Composition-body recursion depth. Incremented inside
+    /// `execute_composition_body` before recursing on the body's
+    /// mini-DAG and decremented at every exit path. Initialized to
+    /// 0 at top-level `execute_dag_branching`; never read by
+    /// non-Composition arms. The Composition arm in
+    /// `dispatch_plan_node` checks this against
+    /// `MAX_COMPOSITION_DEPTH` before recursing and emits E112 on
+    /// overflow.
+    pub(crate) recursion_depth: u32,
 }
 
 /// Execute one DAG node by routing it to its arm.
 ///
-/// Reads the node by `node_idx` from `ctx.current_dag.graph` and dispatches
+/// Reads the node by `node_idx` from `current_dag.graph` and dispatches
 /// on `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
 /// and updates the cumulative counters / timers. Errors short-circuit only
 /// for invariant violations and `ErrorStrategy::FailFast` runtime failures;
@@ -117,9 +141,10 @@ pub(crate) struct ExecutorContext<'a> {
 /// the walk.
 pub(crate) fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
 ) -> Result<(), PipelineError> {
-    let node = ctx.current_dag.graph[node_idx].clone();
+    let node = current_dag.graph[node_idx].clone();
     match node {
         PlanNode::Source { ref name, .. } => {
             // Combine build-side sources get their own pre-loaded
@@ -132,9 +157,7 @@ pub(crate) fn dispatch_plan_node(
             // `CoercingReader` builds its Arc from the same
             // declared `schema:` block that `bind_schema` reads
             // to populate `PlanNode::Source.output_schema`.
-            let source_schema = ctx.current_dag.graph[node_idx]
-                .stored_output_schema()
-                .cloned();
+            let source_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
             let canonicalize = |r: &Record| -> Record {
                 match source_schema.as_ref() {
                     Some(target) => {
@@ -177,8 +200,7 @@ pub(crate) fn dispatch_plan_node(
             let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
                 own_buf
             } else {
-                let predecessors: Vec<NodeIndex> = ctx
-                    .current_dag
+                let predecessors: Vec<NodeIndex> = current_dag
                     .graph
                     .neighbors_directed(node_idx, Direction::Incoming)
                     .collect();
@@ -209,18 +231,15 @@ pub(crate) fn dispatch_plan_node(
                 ctx.compiled_transforms[transform_idx].has_distinct(),
             );
 
-            let expected_input = ctx.current_dag.graph[node_idx]
-                .expected_input_schema_in(ctx.current_dag)
+            let expected_input = current_dag.graph[node_idx]
+                .expected_input_schema_in(current_dag)
                 .cloned();
-            let output_schema = ctx.current_dag.graph[node_idx]
-                .stored_output_schema()
-                .cloned();
-            let upstream_name = ctx
-                .current_dag
+            let output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
+            let upstream_name = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .next()
-                .map(|i| ctx.current_dag.graph[i].name().to_string())
+                .map(|i| current_dag.graph[i].name().to_string())
                 .unwrap_or_default();
 
             let mut output_records = Vec::with_capacity(input_records.len());
@@ -287,24 +306,30 @@ pub(crate) fn dispatch_plan_node(
             default: _,
             ..
         } => {
-            // Get input records from predecessor
-            let predecessors: Vec<NodeIndex> = ctx
-                .current_dag
+            // Body-context Routes that consume an input port have no
+            // predecessor in the body's mini-DAG — the records are
+            // seeded into this node's own buffer at composition entry.
+            // Check own buffer first, fall back to predecessor.
+            let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records = predecessors
-                .iter()
-                .find_map(|p| ctx.node_buffers.remove(p))
-                .unwrap_or_default();
+            let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                own_buf
+            } else {
+                predecessors
+                    .iter()
+                    .find_map(|p| ctx.node_buffers.remove(p))
+                    .unwrap_or_default()
+            };
 
-            if let Some(expected) = ctx.current_dag.graph[node_idx]
-                .expected_input_schema_in(ctx.current_dag)
+            if let Some(expected) = current_dag.graph[node_idx]
+                .expected_input_schema_in(current_dag)
                 .cloned()
             {
                 let upstream_name = predecessors
                     .first()
-                    .map(|&i| ctx.current_dag.graph[i].name().to_string())
+                    .map(|&i| current_dag.graph[i].name().to_string())
                     .unwrap_or_default();
                 for (record, _) in &input_records {
                     check_input_schema(&expected, record.schema(), name, "route", &upstream_name)?;
@@ -312,8 +337,7 @@ pub(crate) fn dispatch_plan_node(
             }
 
             // Get successor nodes (branch transform nodes)
-            let successors: Vec<NodeIndex> = ctx
-                .current_dag
+            let successors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Outgoing)
                 .collect();
@@ -335,25 +359,41 @@ pub(crate) fn dispatch_plan_node(
             let route_parent = name.strip_prefix("route_").unwrap_or(name);
             let mut succ_by_name: HashMap<String, NodeIndex> = HashMap::new();
             for &succ in &successors {
-                succ_by_name.insert(ctx.current_dag.graph[succ].name().to_string(), succ);
+                succ_by_name.insert(current_dag.graph[succ].name().to_string(), succ);
             }
             let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
-            for spanned in &ctx.config.nodes {
+            // Iterate either the body's input-ref table (when set
+            // by the body executor for the current walk) or the
+            // top-level config nodes. The shape is the same:
+            // `(consumer_name, input_ref)` pairs.
+            let mut name_input_pairs: Vec<(String, String)> = Vec::new();
+            if let Some(body_refs) = ctx.current_body_node_input_refs.as_ref() {
+                for (consumer, refs) in body_refs {
+                    for r in refs {
+                        name_input_pairs.push((consumer.clone(), r.clone()));
+                    }
+                }
+            } else {
                 use crate::config::PipelineNode;
                 use crate::config::node_header::NodeInput;
-                let (node_name, input_ref) = match &spanned.value {
-                    PipelineNode::Transform { header, .. }
-                    | PipelineNode::Aggregate { header, .. }
-                    | PipelineNode::Route { header, .. }
-                    | PipelineNode::Output { header, .. } => {
-                        let ir = match &header.input.value {
-                            NodeInput::Single(s) => s.clone(),
-                            NodeInput::Port { node, port } => format!("{node}.{port}"),
-                        };
-                        (header.name.clone(), ir)
-                    }
-                    _ => continue,
-                };
+                for spanned in &ctx.config.nodes {
+                    let (node_name, input_ref) = match &spanned.value {
+                        PipelineNode::Transform { header, .. }
+                        | PipelineNode::Aggregate { header, .. }
+                        | PipelineNode::Route { header, .. }
+                        | PipelineNode::Output { header, .. } => {
+                            let ir = match &header.input.value {
+                                NodeInput::Single(s) => s.clone(),
+                                NodeInput::Port { node, port } => format!("{node}.{port}"),
+                            };
+                            (header.name.clone(), ir)
+                        }
+                        _ => continue,
+                    };
+                    name_input_pairs.push((node_name, input_ref));
+                }
+            }
+            for (node_name, input_ref) in name_input_pairs {
                 // Port form: "<route>.<branch>" — branch name comes
                 // from the port suffix. Standard for named branches
                 // on routes with multiple downstream consumers per
@@ -382,8 +422,29 @@ pub(crate) fn dispatch_plan_node(
                 branch_buffers.insert(succ, Vec::new());
             }
 
-            // Use compiled_route to evaluate conditions
-            if let Some(ref mut route) = ctx.compiled_route {
+            // Per-route compiled evaluator wins over the singleton
+            // — `compiled_routes_by_name` is populated for body
+            // Routes (and any Route whose conditions need an explicit
+            // lookup), while the singleton remains the long-standing
+            // path for the top-level Route. A body's Route arm
+            // therefore finds its own conditions here instead of
+            // inheriting the top-level Route's conditions, which
+            // would have been the only ones available before.
+            // `take` + restore keeps the route's `&mut`-mutated state
+            // (regex caches, evaluator counters) consistent across
+            // records hitting the same Route node within one walk.
+            let from_map = ctx.compiled_routes_by_name.remove(name.as_str());
+            let mut from_singleton_flag = false;
+            let mut route_handle = match from_map {
+                Some(r) => Some(r),
+                None => {
+                    let taken = ctx.compiled_route.take();
+                    from_singleton_flag = taken.is_some();
+                    taken
+                }
+            };
+
+            if let Some(ref mut route) = route_handle {
                 for (record, rn) in input_records {
                     let eval_ctx = EvalContext {
                         stable: ctx.stable,
@@ -428,6 +489,14 @@ pub(crate) fn dispatch_plan_node(
                     }
                 }
             }
+            // Restore the route to whichever storage it came from.
+            if let Some(r) = route_handle {
+                if from_singleton_flag {
+                    ctx.compiled_route = Some(r);
+                } else {
+                    ctx.compiled_routes_by_name.insert(name.to_string(), r);
+                }
+            }
 
             // Put branch buffers into node_buffers keyed by successor
             for (succ_idx, buf) in branch_buffers {
@@ -442,8 +511,7 @@ pub(crate) fn dispatch_plan_node(
             // the unified taxonomy a Merge is a first-class node
             // (no "merge_<transform>" synthesis) so we read the
             // order straight off `PipelineNode::Merge.header.inputs`.
-            let predecessors: Vec<NodeIndex> = ctx
-                .current_dag
+            let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
@@ -475,7 +543,7 @@ pub(crate) fn dispatch_plan_node(
             // Sort predecessors by declaration order
             let mut sorted_preds = predecessors.clone();
             sorted_preds.sort_by_key(|p| {
-                let pred_name = ctx.current_dag.graph[*p].name();
+                let pred_name = current_dag.graph[*p].name();
                 declaration_order
                     .iter()
                     .position(|d| d == pred_name)
@@ -486,12 +554,10 @@ pub(crate) fn dispatch_plan_node(
                 .iter()
                 .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len()))
                 .sum();
-            let merge_output_schema = ctx.current_dag.graph[node_idx]
-                .stored_output_schema()
-                .cloned();
+            let merge_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
             let mut merged = Vec::with_capacity(total);
             for pred in &sorted_preds {
-                let upstream_name = ctx.current_dag.graph[*pred].name().to_string();
+                let upstream_name = current_dag.graph[*pred].name().to_string();
                 if let Some(buf) = ctx.node_buffers.remove(pred) {
                     for (mut record, rn) in buf {
                         if let Some(canonical) = merge_output_schema.as_ref() {
@@ -533,8 +599,7 @@ pub(crate) fn dispatch_plan_node(
             // parallel bookkeeping map rides alongside.
             use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 
-            let predecessors: Vec<NodeIndex> = ctx
-                .current_dag
+            let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
@@ -633,19 +698,15 @@ pub(crate) fn dispatch_plan_node(
             // match — internal invariants always abort.
             use crate::aggregation::{HashAggError, SortRow as AggSortRow};
 
-            let pred = crate::executor::single_predecessor(
-                ctx.current_dag,
-                node_idx,
-                "aggregation",
-                name,
-            )?;
+            let pred =
+                crate::executor::single_predecessor(current_dag, node_idx, "aggregation", name)?;
             let input = ctx.node_buffers.remove(&pred).unwrap_or_default();
 
-            if let Some(expected) = ctx.current_dag.graph[node_idx]
-                .expected_input_schema_in(ctx.current_dag)
+            if let Some(expected) = current_dag.graph[node_idx]
+                .expected_input_schema_in(current_dag)
                 .cloned()
             {
-                let upstream_name = ctx.current_dag.graph[pred].name().to_string();
+                let upstream_name = current_dag.graph[pred].name().to_string();
                 for (record, _) in &input {
                     check_input_schema(
                         &expected,
@@ -790,8 +851,7 @@ pub(crate) fn dispatch_plan_node(
             let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
                 own_buf
             } else {
-                let predecessors: Vec<NodeIndex> = ctx
-                    .current_dag
+                let predecessors: Vec<NodeIndex> = current_dag
                     .graph
                     .neighbors_directed(node_idx, Direction::Incoming)
                     .collect();
@@ -801,8 +861,7 @@ pub(crate) fn dispatch_plan_node(
                         // When multiple outputs share a predecessor,
                         // clone the buffer for all but the last
                         // consumer to avoid starving siblings.
-                        let remaining_consumers = ctx
-                            .current_dag
+                        let remaining_consumers = current_dag
                             .graph
                             .neighbors_directed(p, Direction::Outgoing)
                             .filter(|&succ| succ > node_idx)
@@ -816,16 +875,15 @@ pub(crate) fn dispatch_plan_node(
                     .unwrap_or_default()
             };
 
-            if let Some(expected) = ctx.current_dag.graph[node_idx]
-                .expected_input_schema_in(ctx.current_dag)
+            if let Some(expected) = current_dag.graph[node_idx]
+                .expected_input_schema_in(current_dag)
                 .cloned()
             {
-                let upstream_name = ctx
-                    .current_dag
+                let upstream_name = current_dag
                     .graph
                     .neighbors_directed(node_idx, Direction::Incoming)
                     .next()
-                    .map(|i| ctx.current_dag.graph[i].name().to_string())
+                    .map(|i| current_dag.graph[i].name().to_string())
                     .unwrap_or_default();
                 for (record, _) in &input_records {
                     check_input_schema(&expected, record.schema(), name, "output", &upstream_name)?;
@@ -926,44 +984,76 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Composition { ref name, body, .. } => {
-            // Composition runtime expansion is deferred — the body
-            // is lowered for `--explain` and property derivation
-            // only; for now pass records through unchanged.
+            // Recursive body execution: collect parent-scope records
+            // per declared input port, swap `current_dag` to the body's
+            // mini-DAG, walk the body's topo, then collect the body's
+            // first declared output port and write it to this node's
+            // buffer in the parent scope. The dispatcher arm logic
+            // never diverged across body and top-level walks — both
+            // run through `dispatch_plan_node` after a current_dag
+            // swap, mirroring DataFusion's `RecursiveQueryExec` pattern
+            // where the recursive term re-enters the same execution
+            // loop with a different plan.
             debug_assert_ne!(
                 body,
                 crate::plan::composition_body::CompositionBodyId::SENTINEL,
                 "composition {name:?}: body_id is sentinel — bind_composition did not run"
             );
-            let predecessors: Vec<NodeIndex> = ctx
-                .current_dag
+
+            let bound_body = ctx
+                .artifacts
+                .body_of(body)
+                .ok_or_else(|| PipelineError::compose_body_missing(name.clone()))?;
+
+            // Schema-check parent records before stepping into the
+            // body. Failures here surface with the parent-scope
+            // upstream name, matching the diagnostic shape every
+            // other arm emits at its own entry.
+            let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
-            let input_records = predecessors
-                .iter()
-                .find_map(|p| ctx.node_buffers.remove(p))
-                .unwrap_or_default();
-
-            if let Some(expected) = ctx.current_dag.graph[node_idx]
-                .expected_input_schema_in(ctx.current_dag)
+            if let Some(expected) = current_dag.graph[node_idx]
+                .expected_input_schema_in(current_dag)
                 .cloned()
             {
                 let upstream_name = predecessors
                     .first()
-                    .map(|&i| ctx.current_dag.graph[i].name().to_string())
+                    .map(|&i| current_dag.graph[i].name().to_string())
                     .unwrap_or_default();
-                for (record, _) in &input_records {
-                    check_input_schema(
-                        &expected,
-                        record.schema(),
-                        name,
-                        "composition",
-                        &upstream_name,
-                    )?;
+                // Peek-only schema check; the records are still owned
+                // by their producer's buffer until `collect_port_records`
+                // claims them below.
+                if let Some(&first_pred) = predecessors.first()
+                    && let Some(records) = ctx.node_buffers.get(&first_pred)
+                {
+                    for (record, _) in records {
+                        check_input_schema(
+                            &expected,
+                            record.schema(),
+                            name,
+                            "composition",
+                            &upstream_name,
+                        )?;
+                    }
                 }
             }
 
-            ctx.node_buffers.insert(node_idx, input_records);
+            // Depth guard before recursion — same constant the
+            // compile-time IsolatedFromAbove check uses, distinct
+            // emission code for log greppability.
+            if ctx.recursion_depth >= crate::plan::bind_schema::MAX_COMPOSITION_DEPTH {
+                return Err(PipelineError::compose_depth_exceeded(
+                    name.clone(),
+                    ctx.recursion_depth,
+                ));
+            }
+
+            let port_records = collect_port_records(ctx, current_dag, bound_body, node_idx)?;
+            let composition_name = name.clone();
+            let output_records =
+                execute_composition_body(ctx, body, port_records, &composition_name)?;
+            ctx.node_buffers.insert(node_idx, output_records);
         }
 
         PlanNode::Combine {
@@ -1026,9 +1116,7 @@ pub(crate) fn dispatch_plan_node(
             // record lands on this `Arc<Schema>` so downstream
             // operators hit the ptr_eq fast path and
             // `Record::set` always addresses a known slot.
-            let combine_output_schema = ctx.current_dag.graph[node_idx]
-                .stored_output_schema()
-                .cloned();
+            let combine_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
 
             let combine_inputs =
                 ctx.artifacts
@@ -1092,15 +1180,14 @@ pub(crate) fn dispatch_plan_node(
             // DAG edges run upstream_source -> combine (or via
             // an intermediate Transform chain). We search the
             // incoming neighbors and match by the node's name.
-            let predecessors: Vec<NodeIndex> = ctx
-                .current_dag
+            let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
             let driver_pred = predecessors
                 .iter()
                 .copied()
-                .find(|p| ctx.current_dag.graph[*p].name() == driver_upstream)
+                .find(|p| current_dag.graph[*p].name() == driver_upstream)
                 .ok_or_else(|| PipelineError::Internal {
                     op: "combine",
                     node: name.clone(),
@@ -1112,7 +1199,7 @@ pub(crate) fn dispatch_plan_node(
             let build_pred = predecessors
                 .iter()
                 .copied()
-                .find(|p| ctx.current_dag.graph[*p].name() == build_upstream)
+                .find(|p| current_dag.graph[*p].name() == build_upstream)
                 .ok_or_else(|| PipelineError::Internal {
                     op: "combine",
                     node: name.clone(),
@@ -1130,11 +1217,11 @@ pub(crate) fn dispatch_plan_node(
             // validated against its upstream's compile-time
             // output schema. Arc::ptr_eq is the fast path; a
             // mismatch raises E314.
-            let driver_expected = ctx.current_dag.graph[driver_pred]
-                .output_schema_in(ctx.current_dag)
+            let driver_expected = current_dag.graph[driver_pred]
+                .output_schema_in(current_dag)
                 .clone();
-            let build_expected = ctx.current_dag.graph[build_pred]
-                .output_schema_in(ctx.current_dag)
+            let build_expected = current_dag.graph[build_pred]
+                .output_schema_in(current_dag)
                 .clone();
             for (record, _) in &driver_buf {
                 check_input_schema(
@@ -1744,4 +1831,154 @@ pub(crate) fn dispatch_plan_node(
     }
 
     Ok(())
+}
+
+/// Collect parent-scope records keyed by composition input port name.
+///
+/// Reads `bound_body.input_port_sources` to find each port's upstream
+/// node in the PARENT scope's `current_dag`, looks up that node's
+/// NodeIndex, and clones records out of `ctx.node_buffers` under that
+/// index. Cloning rather than removing leaves the parent producer's
+/// buffer intact for any sibling consumer that the parent walk has
+/// not yet reached. The record stream is small relative to the
+/// pipeline's working set; the clone is the same shape every Output
+/// arm uses for fan-out today.
+fn collect_port_records(
+    ctx: &ExecutorContext<'_>,
+    parent_dag: &ExecutionPlanDag,
+    bound_body: &crate::plan::composition_body::BoundBody,
+    composition_node_idx: NodeIndex,
+) -> Result<IndexMap<String, Vec<(clinker_record::Record, u64)>>, PipelineError> {
+    let mut result: IndexMap<String, Vec<(clinker_record::Record, u64)>> = IndexMap::new();
+    for (port_name, parent_node_name) in &bound_body.input_port_sources {
+        // The parent node may itself carry a port qualifier (e.g.
+        // `route_node.branch`); strip to the bare name to match
+        // `name()` on each parent-graph node.
+        let bare = parent_node_name
+            .split('.')
+            .next()
+            .unwrap_or(parent_node_name);
+        let parent_idx = parent_dag
+            .graph
+            .node_indices()
+            .find(|&i| parent_dag.graph[i].name() == bare);
+        let records = match parent_idx {
+            Some(idx) => ctx.node_buffers.get(&idx).cloned().unwrap_or_default(),
+            None => {
+                // Nested-composition case: the parent scope is
+                // itself a body, the upstream name refers to one of
+                // that body's own input ports (not a body-internal
+                // node), so the records were seeded into THIS
+                // composition node's own buffer at the enclosing
+                // composition-arm entry. Fall through to that
+                // buffer before declaring an internal error.
+                ctx.node_buffers
+                    .get(&composition_node_idx)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        };
+        result.insert(port_name.clone(), records);
+    }
+    Ok(result)
+}
+
+/// Execute one composition body's mini-DAG.
+///
+/// Builds a transient body-scope `ExecutionPlanDag` and walks it
+/// through `dispatch_plan_node` — the same dispatcher entry the
+/// top-level walker uses. The body's `node_buffers` namespace
+/// is swapped in via `mem::replace` so body NodeIndices index a
+/// fresh space; the parent buffers are restored after the walk.
+/// The depth-counter guard increments via RAII so `?`-bubbled
+/// errors can't leak the counter.
+fn execute_composition_body(
+    ctx: &mut ExecutorContext<'_>,
+    body_id: crate::plan::composition_body::CompositionBodyId,
+    port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
+    composition_name: &str,
+) -> Result<Vec<(clinker_record::Record, u64)>, PipelineError> {
+    // Resolve body and pre-compute everything that needs the
+    // bound_body borrow before the swap so the body_dag clone is
+    // independent of the artifacts borrow.
+    let bound_body = ctx
+        .artifacts
+        .body_of(body_id)
+        .ok_or_else(|| PipelineError::compose_body_missing(composition_name.to_string()))?;
+
+    let body_dag = crate::plan::execution::ExecutionPlanDag::from_body(bound_body);
+
+    // Seed body-scope buffers from parent records keyed by port.
+    let mut body_buffers: HashMap<NodeIndex, Vec<(clinker_record::Record, u64)>> = HashMap::new();
+    for (port_name, records) in port_records {
+        let body_idx = bound_body
+            .port_name_to_node_idx
+            .get(port_name.as_str())
+            .ok_or_else(|| PipelineError::compose_unknown_port(composition_name, &port_name))?;
+        body_buffers.insert(*body_idx, records);
+    }
+
+    // Pick the body's terminal output node. The bind-time alias
+    // resolution wrote the port → NodeIndex map onto BoundBody;
+    // the first declared output port wins. Zero-output-port bodies
+    // are legal (sink-only / side-effect bodies) and produce no
+    // record stream back to the parent.
+    let output_idx = bound_body.output_port_to_node_idx.values().next().copied();
+
+    // Swap node_buffers to a body-local namespace so body NodeIndices
+    // don't collide with the parent's. `combine_source_records` is
+    // also swapped to an empty map: the body's Source arms (if any
+    // — body-scope sources are unusual but legal) fall back to
+    // `all_records`, not parent-scope combine sources.
+    let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
+    let saved_combine = std::mem::take(&mut ctx.combine_source_records);
+    // Install the body's `input:` reference table so the Route arm
+    // can resolve `<route>.<branch>` references against body
+    // siblings. Restored on exit.
+    let saved_body_refs = ctx
+        .current_body_node_input_refs
+        .replace(bound_body.node_input_refs.clone());
+
+    // Increment depth before recursing. Every exit path below
+    // decrements before returning so the counter stays in sync —
+    // including the `walk_result?` early-return at the end. The
+    // dispatcher loop already collects errors into `walk_result`
+    // rather than `?`-bubbling, so the only `?`-bubble that escapes
+    // this function is on `walk_result?` itself, which fires AFTER
+    // the decrement.
+    ctx.recursion_depth += 1;
+
+    // Walk the body's topo through the same dispatcher the top-level
+    // walker uses. Errors from within the body are wrapped with the
+    // composition's name for diagnosability — the user sees
+    // "in composition '<name>': <inner>" instead of an opaque
+    // inner-only message.
+    let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
+    let mut walk_result: Result<(), PipelineError> = Ok(());
+    for node_idx in topo {
+        if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
+            walk_result = Err(PipelineError::compose_body_error(
+                composition_name.to_string(),
+                Box::new(inner),
+            ));
+            break;
+        }
+    }
+
+    // Harvest output before restoring parent buffers.
+    let output_records = match (&walk_result, output_idx) {
+        (Ok(()), Some(idx)) => ctx.node_buffers.remove(&idx).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    // Decrement depth and restore parent scope. `saturating_sub`
+    // is defensive over the invariant; the inc/dec pairs are kept in
+    // sync by hand on every exit path through this function.
+    ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
+    ctx.node_buffers = saved_buffers;
+    ctx.combine_source_records = saved_combine;
+    ctx.current_body_node_input_refs = saved_body_refs;
+
+    walk_result?;
+    Ok(output_records)
 }

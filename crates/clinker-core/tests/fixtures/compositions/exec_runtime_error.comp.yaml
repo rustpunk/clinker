@@ -1,0 +1,21 @@
+# Body whose Transform calls `to_int()` on a string input that may
+# fail at runtime. Used to verify body errors surface wrapped with
+# the composition's name for diagnosability.
+_compose:
+  name: exec_runtime_error
+  inputs:
+    inp:
+      schema:
+        - { name: a, type: string }
+  outputs:
+    out: int_only
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: int_only
+    input: inp
+    config:
+      cxl: |
+        emit a = a
+        emit n = a.to_int()

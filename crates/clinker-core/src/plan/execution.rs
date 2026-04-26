@@ -376,8 +376,14 @@ impl PlanNode {
 
     /// The `Arc<Schema>` this node emits. For row-preserving variants
     /// (Route/Output/Sort) this walks the graph to the sole upstream and
-    /// returns its schema; the DAG invariant is that these variants always
-    /// have exactly one incoming data edge.
+    /// returns its schema. At the top level the DAG invariant is that
+    /// these variants always have exactly one incoming data edge; in
+    /// composition-body context a Route at the body root may consume
+    /// an input port that doesn't appear as a graph edge — for that
+    /// case we fall back to a leaked empty `Arc<Schema>` so downstream
+    /// schema checks see "no expected schema" (paired with the body
+    /// arm that already handles this gracefully via the
+    /// `expected_input_schema_in() -> Option<&Arc>` shape).
     pub fn output_schema_in<'a>(&'a self, dag: &'a ExecutionPlanDag) -> &'a Arc<Schema> {
         if let Some(s) = self.stored_output_schema() {
             return s;
@@ -388,12 +394,23 @@ impl PlanNode {
             .node_indices()
             .find(|&i| dag.graph[i].name() == name)
             .expect("PlanNode::output_schema_in: node not present in its own dag");
-        let upstream = dag
+        if let Some(upstream) = dag
             .graph
             .neighbors_directed(idx, petgraph::Direction::Incoming)
             .next()
-            .expect("PlanNode::output_schema_in: row-preserving variant has no upstream");
-        dag.graph[upstream].output_schema_in(dag)
+        {
+            return dag.graph[upstream].output_schema_in(dag);
+        }
+        // Body-root row-preserving fallback. The empty schema is
+        // structurally equal to nothing, so any downstream `column-list`
+        // structural check will fail unless the consumer also short-
+        // circuits on `expected.column_count() == 0` — which the
+        // current dispatcher arms do via the `Option<&Arc<_>>` peek.
+        // The Arc is leaked because `&'a Arc<Schema>` requires a
+        // borrow that outlives this call; the leak is one-shot per
+        // body Route at compile time.
+        static EMPTY_SCHEMA: std::sync::OnceLock<Arc<Schema>> = std::sync::OnceLock::new();
+        EMPTY_SCHEMA.get_or_init(|| Arc::new(Schema::new(Vec::new())))
     }
 
     /// The `Arc<Schema>` this node expects to see on incoming records.
@@ -567,6 +584,35 @@ pub struct ExecutionPlanDag {
 }
 
 impl ExecutionPlanDag {
+    /// Build a transient `ExecutionPlanDag` whose graph + topo_order
+    /// alias a composition body's mini-DAG, with empty top-level
+    /// fields (source_dag, indices_to_build, output_projections,
+    /// parallelism, correlation sort, node_properties).
+    ///
+    /// Used by the body executor to swap the dispatcher's
+    /// `current_dag` field while running a composition body. The
+    /// dispatcher reads `graph` for node lookup and neighbor walks
+    /// and `topo_order` for ordering — every other field is a
+    /// top-level concern that body walks don't touch. The graph is
+    /// cloned because the dispatcher needs to own its `current_dag`
+    /// borrow target via a stack-local; the graph itself is small
+    /// relative to the record stream.
+    pub(crate) fn from_body(body: &crate::plan::composition_body::BoundBody) -> Self {
+        Self {
+            graph: body.graph.clone(),
+            topo_order: body.topo_order.clone(),
+            source_dag: Vec::new(),
+            indices_to_build: Vec::new(),
+            output_projections: Vec::new(),
+            parallelism: ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+            correlation_sort_note: None,
+            node_properties: HashMap::new(),
+        }
+    }
+
     /// Whether any node requires arena allocation (window functions).
     pub fn required_arena(&self) -> bool {
         !self.indices_to_build.is_empty()
@@ -670,6 +716,18 @@ impl ExecutionPlanDag {
             .graph
             .node_weights()
             .any(|n| matches!(n, PlanNode::Combine { .. }))
+        {
+            return true;
+        }
+        // Composition nodes recurse into a body mini-DAG via the
+        // dispatcher's Composition arm. A streaming single-input
+        // walk would never enter that arm; without this branch the
+        // body executor would silently no-op and authors would see
+        // upstream records pass straight through.
+        if self
+            .graph
+            .node_weights()
+            .any(|n| matches!(n, PlanNode::Composition { .. }))
         {
             return true;
         }

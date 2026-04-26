@@ -21,13 +21,13 @@ output.enriched_out:
   partitioning: Single
   partitioning_provenance: SingleStream
 
-composition.addr_norm:
+source.addresses_src:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
   partitioning_provenance: SingleStream
 
-source.addresses_src:
+composition.addr_norm:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -52,6 +52,6 @@ Worker threads: 4
 === DAG Topology ===
 
   ● [output] enriched_out (line:48)
-  ● [composition:body=<ID>] addr_norm (line:39)
   ● [source] addresses_src (line:17)
+  │ [composition:body=<ID>] addr_norm (line:39)
   ● [source] customers_src (line:7)

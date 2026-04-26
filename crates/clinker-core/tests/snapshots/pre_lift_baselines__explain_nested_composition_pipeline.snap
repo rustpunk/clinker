@@ -15,6 +15,12 @@ Source DAG:
 
 === Physical Properties ===
 
+source.raw_src:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
 composition.nested_process:
   ordering: <none>
   ordering_provenance: NoOrdering
@@ -22,12 +28,6 @@ composition.nested_process:
   partitioning_provenance: SingleStream
 
 output.final_out:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-
-source.raw_src:
   ordering: <none>
   ordering_provenance: NoOrdering
   partitioning: Single
@@ -45,6 +45,6 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [composition:body=<ID>] nested_process (line:20)
-  │ [output] final_out (line:29)
   ● [source] raw_src (line:7)
+  │ [composition:body=<ID>] nested_process (line:20)
+  │ [output] final_out (line:29)

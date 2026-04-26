@@ -23,17 +23,21 @@ fn fixture_workspace_root() -> PathBuf {
 // ---------------------------------------------------------------------
 
 /// Gate 1: loading the committed `tests/fixtures/compositions/` dir
-/// returns `Ok` with exactly 5 entries, one per on-disk `.comp.yaml`.
+/// returns `Ok` with one entry per on-disk `.comp.yaml`. The corpus
+/// includes the original five W101/structural fixtures plus four
+/// body-executor fixtures (transform / nested / route+merge /
+/// runtime-error) used by the integration tests for the recursive
+/// body executor.
 #[test]
 fn test_phase1_scanner_loads_all_fixtures() {
     let root = fixture_workspace_root();
-    let table =
-        scan_workspace_signatures(&root).expect("5-fixture corpus must load without errors");
+    let table = scan_workspace_signatures(&root)
+        .expect("composition fixture corpus must load without errors");
 
     assert_eq!(
         table.len(),
-        5,
-        "expected 5 composition signatures, got {}: {:?}",
+        9,
+        "expected 9 composition signatures, got {}: {:?}",
         table.len(),
         table.keys().collect::<Vec<_>>()
     );
