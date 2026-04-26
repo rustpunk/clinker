@@ -524,6 +524,113 @@ nodes:
 }
 
 #[test]
+fn aggregate_output_inherits_correlation_meta() {
+    // An aggregate that satisfies E151's group_by-superset invariant
+    // must have its emitted rows participate in correlation rollback.
+    // When a transform error fails one record in group A, the
+    // surviving A records still flow into the aggregator and produce
+    // one (A, total) output row — that aggregate row is the ONLY
+    // thing the Output arm sees for group A, so it must inherit the
+    // correlation meta and route into cell [A] alongside the trigger
+    // error. The whole group then DLQs uniformly: one trigger for
+    // the bad source row plus one collateral for the aggregate
+    // output row. Group B is clean and its aggregate row flushes to
+    // the writer.
+    //
+    // Mechanism: `MetadataCommonTracker` in HashAggregator /
+    // StreamingAggregator observes every input record's meta and at
+    // finalize() copies non-conflicting common pairs onto each
+    // emitted row. Under E151's group_by ⊇ correlation_key.fields()
+    // invariant every input record in a group shares the same
+    // `__cxl_correlation_key` meta, so the tracker forwards it to
+    // the aggregate output row.
+    //
+    // Without meta inheritance, the aggregate row for A would land
+    // in a distinct null-keyed buffer cell, group A's writer-side
+    // buffer would be "clean" (only the trigger event in cell [A]
+    // with no record slots), and group A's aggregate output would
+    // be wrongly emitted to the writer.
+    let yaml = r#"
+pipeline:
+  name: aggregate_correlation_meta
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: value, type: string }
+
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit employee_id = employee_id
+
+      emit val = value.to_int()
+
+      '
+- type: aggregate
+  name: agg
+  input: validate
+  config:
+    group_by:
+    - employee_id
+    cxl: 'emit employee_id = employee_id
+
+      emit total = sum(val)
+
+      '
+- type: output
+  name: out
+  input: agg
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,7\nB,11\n";
+    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+
+    assert_eq!(
+        counters.dlq_count, 2,
+        "group A: 1 trigger (bad row) + 1 collateral (aggregate output)"
+    );
+    assert_eq!(counters.ok_count, 1, "only group B's aggregate row emitted");
+
+    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
+    let collaterals = dlq_entries.iter().filter(|e| !e.trigger).count();
+    assert_eq!(triggers, 1, "exactly one trigger for the bad source row");
+    assert_eq!(
+        collaterals, 1,
+        "exactly one collateral for the aggregate output row"
+    );
+
+    let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
+    assert_eq!(
+        collateral.category,
+        crate::dlq::DlqErrorCategory::Correlated,
+        "aggregate-output collateral carries the Correlated category"
+    );
+
+    assert!(
+        output.contains("B,18"),
+        "output should contain group B's aggregate row: {output}"
+    );
+    assert!(
+        !output.contains("A,4"),
+        "output must NOT contain group A's aggregate row (group A failed): {output}"
+    );
+}
+
+#[test]
 fn group_identity_fixed_at_ingest_when_transform_rewrites_key() {
     // F.1: a Transform that rewrites the correlation_key field must
     // not change a row's group identity. Group identity is captured at
