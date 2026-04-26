@@ -2068,6 +2068,61 @@ fn combine_operand_qualified(expr: &cxl::ast::Expr, input: &std::sync::Arc<str>)
     }
 }
 
+/// Compile-time guard: every `PlanNode::Composition` must have all of
+/// its incoming edges tagged with [`PlanEdge::port`]. The dispatcher's
+/// `collect_port_records` resolves composition inputs by reading those
+/// tags off the live edge graph; an untagged edge means a planner pass
+/// spliced an intermediate node between a producer and a composition
+/// without preserving the tag, and would silently drop records at
+/// dispatch. Surfacing this at compile time lets users see E152 instead
+/// of a confusing runtime `PipelineError::Internal`.
+///
+/// Walks `dag.graph` and every body's mini-DAG in
+/// `artifacts.composition_bodies` (nested compositions live there).
+/// Returns one diagnostic per offending edge.
+pub(crate) fn diagnose_untagged_composition_edges(
+    dag: &ExecutionPlanDag,
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+) -> Vec<crate::error::Diagnostic> {
+    use crate::error::{Diagnostic, LabeledSpan};
+    use petgraph::Direction;
+    use petgraph::visit::EdgeRef;
+    fn check(graph: &DiGraph<PlanNode, PlanEdge>, scope_label: &str, out: &mut Vec<Diagnostic>) {
+        for idx in graph.node_indices() {
+            let PlanNode::Composition {
+                name: comp_name,
+                span,
+                ..
+            } = &graph[idx]
+            else {
+                continue;
+            };
+            for edge in graph.edges_directed(idx, Direction::Incoming) {
+                if edge.weight().port.is_some() {
+                    continue;
+                }
+                let producer = graph[edge.source()].name().to_string();
+                let err = PlanError::CompositionUntaggedIncomingEdge {
+                    composition: comp_name.clone(),
+                    producer,
+                    scope: scope_label.to_string(),
+                };
+                out.push(Diagnostic::error(
+                    "E152",
+                    err.to_string(),
+                    LabeledSpan::primary(*span, String::new()),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    check(&dag.graph, "top-level", &mut out);
+    for (body_id, body) in &artifacts.composition_bodies {
+        check(&body.graph, &format!("body {}", body_id.0), &mut out);
+    }
+    out
+}
+
 /// Extract the cycle path from a DFS back-edge detection.
 ///
 /// Uses `depth_first_search` with `DfsEvent::BackEdge` + predecessor map
@@ -3280,6 +3335,19 @@ pub enum PlanError {
         aggregate: String,
         missing_fields: Vec<String>,
     },
+    /// E152 — a `PlanNode::Composition` has an incoming edge with no
+    /// `PlanEdge.port` tag. Compile-time guard for the dispatcher's
+    /// runtime invariant: `collect_port_records` resolves composition
+    /// inputs by reading the port tag off each incoming edge, and an
+    /// untagged edge is a planner-pass bug (the rewrite spliced a
+    /// node between the producer and the composition without
+    /// preserving the tag). Surfaced here so it fails compile rather
+    /// than silently dropping records at dispatch.
+    CompositionUntaggedIncomingEdge {
+        composition: String,
+        producer: String,
+        scope: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -3373,8 +3441,164 @@ impl std::fmt::Display for PlanError {
                     missing_fields.join(", ")
                 )
             }
+            PlanError::CompositionUntaggedIncomingEdge {
+                composition,
+                producer,
+                scope,
+            } => {
+                write!(
+                    f,
+                    "E152 composition '{composition}' has untagged incoming edge from \
+                     '{producer}' ({scope}); every composition input edge must carry a \
+                     port name (planner-pass invariant — see PlanEdge.port)",
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for PlanError {}
+
+#[cfg(test)]
+mod port_tag_guard_tests {
+    use super::*;
+    use crate::plan::bind_schema::CompileArtifacts;
+    use crate::plan::composition_body::CompositionBodyId;
+    use clinker_record::SchemaBuilder;
+    use std::sync::Arc;
+
+    fn empty_dag() -> ExecutionPlanDag {
+        ExecutionPlanDag {
+            graph: DiGraph::new(),
+            topo_order: Vec::new(),
+            source_dag: Vec::new(),
+            indices_to_build: Vec::new(),
+            output_projections: Vec::new(),
+            parallelism: ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+            node_properties: HashMap::new(),
+        }
+    }
+
+    fn source_node(name: &str) -> PlanNode {
+        PlanNode::Source {
+            name: name.to_string(),
+            span: Span::SYNTHETIC,
+            resolved: None,
+            output_schema: SchemaBuilder::new().build(),
+        }
+    }
+
+    fn composition_node(name: &str) -> PlanNode {
+        PlanNode::Composition {
+            name: name.to_string(),
+            span: Span::SYNTHETIC,
+            body: CompositionBodyId::SENTINEL,
+            output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn diagnose_silent_when_every_composition_edge_is_port_tagged() {
+        let mut dag = empty_dag();
+        let src = dag.graph.add_node(source_node("src"));
+        let comp = dag.graph.add_node(composition_node("comp"));
+        dag.graph.add_edge(
+            src,
+            comp,
+            PlanEdge {
+                dependency_type: DependencyType::Data,
+                port: Some("p".to_string()),
+            },
+        );
+        let artifacts = CompileArtifacts::default();
+        let diags = diagnose_untagged_composition_edges(&dag, &artifacts);
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn diagnose_emits_e152_for_untagged_top_level_composition_edge() {
+        let mut dag = empty_dag();
+        let src = dag.graph.add_node(source_node("src"));
+        let comp = dag.graph.add_node(composition_node("comp"));
+        dag.graph.add_edge(
+            src,
+            comp,
+            PlanEdge {
+                dependency_type: DependencyType::Data,
+                port: None,
+            },
+        );
+        let artifacts = CompileArtifacts::default();
+        let diags = diagnose_untagged_composition_edges(&dag, &artifacts);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {:?}", diags);
+        assert_eq!(diags[0].code, "E152");
+        assert!(
+            diags[0].message.contains("comp"),
+            "diag should name the composition: {}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("src"),
+            "diag should name the producer: {}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("top-level"),
+            "diag should label the scope: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn diagnose_emits_e152_for_untagged_body_composition_edge() {
+        let dag = empty_dag();
+        let mut artifacts = CompileArtifacts::default();
+        let body_id = artifacts.fresh_body_id();
+        let mut body_graph = DiGraph::<PlanNode, PlanEdge>::new();
+        let body_src = body_graph.add_node(source_node("body_src"));
+        let body_comp = body_graph.add_node(composition_node("nested_comp"));
+        body_graph.add_edge(
+            body_src,
+            body_comp,
+            PlanEdge {
+                dependency_type: DependencyType::Data,
+                port: None,
+            },
+        );
+        let body = crate::plan::composition_body::BoundBody {
+            signature_path: std::path::PathBuf::from("compositions/test.comp.yaml"),
+            graph: body_graph,
+            topo_order: Vec::new(),
+            name_to_idx: HashMap::new(),
+            port_name_to_node_idx: HashMap::new(),
+            body_rows: HashMap::new(),
+            node_input_refs: HashMap::new(),
+            route_bodies: HashMap::new(),
+            output_port_rows: indexmap::IndexMap::new(),
+            output_port_to_node_idx: indexmap::IndexMap::new(),
+            input_port_rows: indexmap::IndexMap::new(),
+            nested_body_ids: Vec::new(),
+        };
+        artifacts.insert_body(body_id, body);
+        let diags = diagnose_untagged_composition_edges(&dag, &artifacts);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {:?}", diags);
+        assert_eq!(diags[0].code, "E152");
+        assert!(
+            diags[0].message.contains("nested_comp"),
+            "diag should name the nested composition: {}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains(&format!("body {}", body_id.0)),
+            "diag should label the body scope: {}",
+            diags[0].message
+        );
+    }
+}

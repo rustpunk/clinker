@@ -1895,6 +1895,17 @@ impl PipelineConfig {
             };
         }
 
+        // E152 — every PlanNode::Composition's incoming edges must carry
+        // a `PlanEdge.port` tag. Compile-time guard for the dispatcher's
+        // collect_port_records invariant: a planner pass that splices an
+        // intermediate node between a producer and a composition without
+        // preserving the port tag would silently drop records at
+        // dispatch. Runs after every edge-rewriting pass so the final
+        // plan state is what's verified.
+        diags.extend(crate::plan::execution::diagnose_untagged_composition_edges(
+            &dag, &artifacts,
+        ));
+
         // If lowering accumulated any non-composition error-severity
         // diagnostics, return them. Composition binding errors
         // (E102–E109) are non-fatal — the composition node is silently
