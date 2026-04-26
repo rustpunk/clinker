@@ -27,6 +27,16 @@ pub enum DlqErrorCategory {
     /// 64 unknown keys in `$meta.*`) is quarantined and the pipeline
     /// continues reading subsequent records.
     MetadataCapExceeded,
+    /// Collateral entry emitted for non-failing records in a correlation
+    /// group whose group was DLQ'd because some other record failed. The
+    /// sibling root-cause entry carries `trigger: true` and the original
+    /// failure category; collaterals carry `trigger: false` and this
+    /// category. Emitted only by the `CorrelationCommit` arm.
+    Correlated,
+    /// A correlation-key group exceeded `error_handling.max_group_buffer`.
+    /// One entry per group with `trigger: true` plus collaterals for the
+    /// other buffered records of the same group.
+    GroupSizeExceeded,
 }
 
 impl DlqErrorCategory {
@@ -40,6 +50,8 @@ impl DlqErrorCategory {
             Self::ValidationFailure => "validation_failure",
             Self::AggregateFinalize => "aggregate_finalize",
             Self::MetadataCapExceeded => "metadata_cap_exceeded",
+            Self::Correlated => "correlated",
+            Self::GroupSizeExceeded => "group_size_exceeded",
         }
     }
 }

@@ -323,6 +323,15 @@ pub enum PipelineError {
         composition_name: String,
         inner: Box<PipelineError>,
     },
+    /// Diagnostic carrier for a correlation-key group that exceeded
+    /// `error_handling.max_group_buffer`. The actual flow-control
+    /// signal lives in the DLQ entries the `CorrelationCommit` arm
+    /// emits — this variant is rendered into the trigger entry's
+    /// `error_message` and never propagated up the call stack.
+    CorrelationGroupOverflow {
+        group_key: String,
+        count: u64,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -426,6 +435,12 @@ impl fmt::Display for PipelineError {
                 composition_name,
                 inner,
             } => write!(f, "in composition '{composition_name}': {inner}"),
+            Self::CorrelationGroupOverflow { group_key, count } => write!(
+                f,
+                "correlation-key group {group_key:?} exceeded max_group_buffer \
+                 after {count} records — remaining records of the group are \
+                 DLQ'd as collateral"
+            ),
         }
     }
 }

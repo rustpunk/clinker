@@ -1207,6 +1207,23 @@ impl PipelineExecutor {
         );
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
+        // Correlation grouping context. `Some(...)` iff
+        // `error_handling.correlation_key` is set; the planner's
+        // `inject_correlation_commit` pass guarantees a terminal
+        // `PlanNode::CorrelationCommit` is also present so the
+        // dispatcher walks the buffers at end-of-DAG. Resolved here
+        // alongside arena/indices because both gate Phase-0 setup
+        // off the same enrichment-pass output.
+        let (correlation_key_fields, correlation_buffers, correlation_max_group_buffer) =
+            match config.error_handling.correlation_key.as_ref() {
+                Some(ck) => {
+                    let fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
+                    let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
+                    (Some(fields), Some(HashMap::new()), cap)
+                }
+                None => (None, None, 0),
+            };
+
         // Construct the dispatcher context. Mutable per-walk state
         // (node_buffers, counters, DLQ, timers, output writers,
         // output errors, the visited-source set backing the
@@ -1249,6 +1266,9 @@ impl PipelineExecutor {
             spill_root_path,
             arena,
             indices,
+            correlation_key_fields,
+            correlation_buffers,
+            correlation_max_group_buffer,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2190,6 +2210,7 @@ mod tests {
 
     mod aggregation;
     mod branching;
+    mod correlated_dlq;
     mod format_dispatch;
     mod multi_output;
 }

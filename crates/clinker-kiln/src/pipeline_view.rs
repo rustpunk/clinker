@@ -640,6 +640,11 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
             PlanNode::Combine { name, strategy, .. } => {
                 (name.clone(), StageKind::Combine, format!("{strategy:?}"))
             }
+            PlanNode::CorrelationCommit { name, .. } => (
+                name.clone(),
+                StageKind::Transform,
+                "correlation_commit".into(),
+            ),
         };
 
         let slot = stages.len();

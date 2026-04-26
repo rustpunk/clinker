@@ -82,7 +82,8 @@ mod tests {
                 PipelineError::Io(_)
                 | PipelineError::Format(_)
                 | PipelineError::ThreadPool(_)
-                | PipelineError::Multiple(_),
+                | PipelineError::Multiple(_)
+                | PipelineError::CorrelationGroupOverflow { .. },
             ) => 4,
         }
     }

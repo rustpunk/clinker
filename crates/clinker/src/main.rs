@@ -309,6 +309,11 @@ fn main() -> ExitCode {
                         PipelineError::Format(_)
                         | PipelineError::ThreadPool(_)
                         | PipelineError::Multiple(_) => ExitCode::from(4),
+                        // Diagnostic-carrier — never propagated as a
+                        // top-level error; folded into DLQ at the
+                        // emission site. Treat as exit 4 defensively
+                        // in case a future caller surfaces it.
+                        PipelineError::CorrelationGroupOverflow { .. } => ExitCode::from(4),
                     }
                 }
             }

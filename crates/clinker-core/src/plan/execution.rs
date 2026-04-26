@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::{Control, DfsEvent, Topo, depth_first_search};
+use petgraph::visit::{Control, DfsEvent, EdgeRef, Topo, depth_first_search};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
@@ -387,6 +387,32 @@ pub enum PlanNode {
         #[serde(skip)]
         output_schema: Arc<Schema>,
     },
+    /// Planner-synthesized terminal commit node for `correlation_key` pipelines.
+    ///
+    /// Inserted by [`ExecutionPlanDag::inject_correlation_commit`] downstream
+    /// of every [`PlanNode::Output`] when `error_handling.correlation_key`
+    /// is set. The Output arm redirects projected records into
+    /// `ExecutorContext.correlation_buffers` instead of writing to the
+    /// FormatWriter; this arm walks the buffer at end-of-DAG and, per
+    /// correlation group, either flushes records to the appropriate writer
+    /// (clean group) or emits DLQ entries with `trigger`/collateral
+    /// markings (any record in the group failed, or the group exceeded
+    /// `max_group_buffer`). Reserved-prefix name guard: every
+    /// `CorrelationCommit` node's name starts with
+    /// [`CORRELATION_COMMIT_PREFIX`].
+    CorrelationCommit {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        /// Correlation key fields, copied from `error_handling.correlation_key`
+        /// at planner-synthesis time. Used by the dispatcher arm to format
+        /// the group key in DLQ trigger messages.
+        commit_group_by: Vec<String>,
+        /// Per-group buffer cap. Mirrors
+        /// `error_handling.max_group_buffer`; the dispatcher arm checks
+        /// against this when deciding overflow disposition.
+        max_group_buffer: u64,
+    },
     /// N-ary combine node.
     ///
     /// Carries the `--explain`-visible shape of the combine inline so the
@@ -498,7 +524,8 @@ impl PlanNode {
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. }
             | PlanNode::Composition { name, .. }
-            | PlanNode::Combine { name, .. } => name,
+            | PlanNode::Combine { name, .. }
+            | PlanNode::CorrelationCommit { name, .. } => name,
         }
     }
 
@@ -514,7 +541,8 @@ impl PlanNode {
             | PlanNode::Sort { span, .. }
             | PlanNode::Aggregation { span, .. }
             | PlanNode::Composition { span, .. }
-            | PlanNode::Combine { span, .. } => *span,
+            | PlanNode::Combine { span, .. }
+            | PlanNode::CorrelationCommit { span, .. } => *span,
         }
     }
 
@@ -559,7 +587,10 @@ impl PlanNode {
                 .iter()
                 .map(|c| c.to_string())
                 .collect(),
-            PlanNode::Route { .. } | PlanNode::Sort { .. } | PlanNode::Output { .. } => {
+            PlanNode::Route { .. }
+            | PlanNode::Sort { .. }
+            | PlanNode::Output { .. }
+            | PlanNode::CorrelationCommit { .. } => {
                 let name = self.name();
                 let idx = match dag
                     .graph
@@ -586,7 +617,10 @@ impl PlanNode {
             | PlanNode::Combine { output_schema, .. }
             | PlanNode::Composition { output_schema, .. }
             | PlanNode::Merge { output_schema, .. } => Some(output_schema),
-            PlanNode::Route { .. } | PlanNode::Output { .. } | PlanNode::Sort { .. } => None,
+            PlanNode::Route { .. }
+            | PlanNode::Output { .. }
+            | PlanNode::Sort { .. }
+            | PlanNode::CorrelationCommit { .. } => None,
         }
     }
 
@@ -669,6 +703,7 @@ impl PlanNode {
             PlanNode::Aggregation { .. } => "aggregation",
             PlanNode::Composition { .. } => "composition",
             PlanNode::Combine { .. } => "combine",
+            PlanNode::CorrelationCommit { .. } => "correlation_commit",
         }
     }
 
@@ -701,6 +736,16 @@ impl PlanNode {
             }
             PlanNode::Composition { name, body, .. } => {
                 format!("[composition:body={}] {name}", body.0)
+            }
+            PlanNode::CorrelationCommit {
+                name,
+                commit_group_by,
+                ..
+            } => {
+                format!(
+                    "[correlation_commit] {name} key=[{}]",
+                    commit_group_by.join(", ")
+                )
             }
             PlanNode::Combine {
                 name,
@@ -1439,7 +1484,8 @@ impl ExecutionPlanDag {
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
                 | PlanNode::Sort { .. }
-                | PlanNode::Composition { .. } => {
+                | PlanNode::Composition { .. }
+                | PlanNode::CorrelationCommit { .. } => {
                     let deps: Vec<String> = self
                         .graph
                         .neighbors_directed(idx, petgraph::Direction::Incoming)
@@ -1582,7 +1628,8 @@ impl ExecutionPlanDag {
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
                 | PlanNode::Sort { .. }
-                | PlanNode::Composition { .. } => {
+                | PlanNode::Composition { .. }
+                | PlanNode::CorrelationCommit { .. } => {
                     let deps: Vec<String> = self
                         .graph
                         .neighbors_directed(idx, petgraph::Direction::Incoming)
@@ -2210,6 +2257,18 @@ pub(crate) fn build_source_dag(
 /// transform's per-operator [`NodeExecutionReqs::RequiresSortedInput`].
 pub const ENFORCER_SORT_PREFIX: &str = "__sort_for_";
 
+/// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes
+/// inserted by [`ExecutionPlanDag::inject_correlation_sort`] to materialize
+/// `error_handling.correlation_key` failure-domain grouping. Distinct
+/// from [`ENFORCER_SORT_PREFIX`] because the two passes encode different
+/// concerns: per-operator algorithm need vs. pipeline-level policy.
+pub const CORRELATION_SORT_PREFIX: &str = "__correlation_sort_";
+
+/// Reserved name prefix for planner-synthesized [`PlanNode::CorrelationCommit`]
+/// terminal nodes inserted by [`ExecutionPlanDag::inject_correlation_commit`].
+/// User node names matching this prefix are rejected at compile time.
+pub const CORRELATION_COMMIT_PREFIX: &str = "__correlation_commit_";
+
 impl ExecutionPlanDag {
     /// Enforcer-sort insertion.
     ///
@@ -2231,21 +2290,32 @@ impl ExecutionPlanDag {
         inputs: &HashMap<String, SourceConfig>,
     ) -> Result<(), PipelineError> {
         // Reserved-prefix guard: validate up-front so insertions cannot
-        // collide with a user-declared name.
+        // collide with a user-declared name. Covers every reserved
+        // planner prefix at once so a misnamed user node is rejected
+        // even before the first synthesis pass runs.
         for idx in self.graph.node_indices() {
             let node = &self.graph[idx];
-            if matches!(node, PlanNode::Sort { .. }) {
+            if matches!(
+                node,
+                PlanNode::Sort { .. } | PlanNode::CorrelationCommit { .. }
+            ) {
                 continue;
             }
             let name = node.name();
-            if name.starts_with(ENFORCER_SORT_PREFIX) {
-                return Err(PipelineError::Compilation {
-                    transform_name: name.to_string(),
-                    messages: vec![format!(
-                        "node name '{}' uses reserved prefix '{}' (planner-synthesized sort enforcers only)",
-                        name, ENFORCER_SORT_PREFIX
-                    )],
-                });
+            for prefix in [
+                ENFORCER_SORT_PREFIX,
+                CORRELATION_SORT_PREFIX,
+                CORRELATION_COMMIT_PREFIX,
+            ] {
+                if name.starts_with(prefix) {
+                    return Err(PipelineError::Compilation {
+                        transform_name: name.to_string(),
+                        messages: vec![format!(
+                            "node name '{}' uses reserved prefix '{}' (planner-synthesized only)",
+                            name, prefix
+                        )],
+                    });
+                }
             }
         }
 
@@ -2323,6 +2393,198 @@ impl ExecutionPlanDag {
         }
 
         Ok(())
+    }
+
+    /// Inject a [`PlanNode::Sort`] for the pipeline-level
+    /// `error_handling.correlation_key` failure-domain grouping policy.
+    ///
+    /// No-op when `correlation_key` is unset, when there is no primary
+    /// source, or when the source's declared `sort_order` already starts
+    /// with the correlation-key fields. Otherwise inserts one
+    /// [`PlanNode::Sort`] downstream of the primary source and reroutes
+    /// every existing data edge from that source through it.
+    pub fn inject_correlation_sort(
+        &mut self,
+        error_handling: &crate::config::ErrorHandlingConfig,
+        sources: &[SourceConfig],
+    ) -> Result<(), PipelineError> {
+        let Some(correlation_key) = error_handling.correlation_key.as_ref() else {
+            return Ok(());
+        };
+        let Some(primary_input) = sources.first() else {
+            return Ok(());
+        };
+
+        let key_field_names: Vec<String> = correlation_key
+            .fields()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let declared: Vec<SortField> = primary_input
+            .sort_order
+            .as_ref()
+            .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect())
+            .unwrap_or_default();
+
+        // Idempotent satisfaction: declared sort already starts with the
+        // correlation key fields. Direction-agnostic to mirror the
+        // deleted impl.
+        let already_satisfied = key_field_names.len() <= declared.len()
+            && key_field_names
+                .iter()
+                .zip(declared.iter())
+                .all(|(k, sf)| k == &sf.field);
+        if already_satisfied {
+            return Ok(());
+        }
+
+        let primary_name = &primary_input.name;
+        let source_idx = self.graph.node_indices().find(
+            |&idx| matches!(&self.graph[idx], PlanNode::Source { name, .. } if name == primary_name),
+        );
+        let Some(source_idx) = source_idx else {
+            return Err(PipelineError::Compilation {
+                transform_name: primary_name.clone(),
+                messages: vec![format!(
+                    "inject_correlation_sort: primary source '{primary_name}' not found in DAG"
+                )],
+            });
+        };
+
+        let mut sort_fields: Vec<SortField> = key_field_names
+            .iter()
+            .map(|f| SortField {
+                field: f.clone(),
+                order: crate::config::SortOrder::Asc,
+                null_order: None,
+            })
+            .collect();
+        for sf in declared.into_iter() {
+            if !key_field_names.contains(&sf.field) {
+                sort_fields.push(sf);
+            }
+        }
+
+        let outgoing: Vec<(NodeIndex, DependencyType)> = self
+            .graph
+            .edges_directed(source_idx, petgraph::Direction::Outgoing)
+            .map(|e| (e.target(), e.weight().dependency_type))
+            .collect();
+        if outgoing.is_empty() {
+            return Ok(());
+        }
+
+        // Idempotent insertion guard: every outgoing edge already
+        // lands on a CORRELATION_SORT_PREFIX Sort node — nothing to do.
+        if outgoing.iter().all(|(t, _)| {
+            matches!(&self.graph[*t], PlanNode::Sort { name, .. } if name.starts_with(CORRELATION_SORT_PREFIX))
+        }) {
+            return Ok(());
+        }
+
+        let sort_node = PlanNode::Sort {
+            name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
+            span: Span::SYNTHETIC,
+            sort_fields,
+        };
+        let sort_idx = self.graph.add_node(sort_node);
+        for (target, dep_type) in outgoing {
+            if target == sort_idx {
+                continue;
+            }
+            if let Some(edge_id) = self.graph.find_edge(source_idx, target) {
+                self.graph.remove_edge(edge_id);
+            }
+            self.graph.add_edge(
+                sort_idx,
+                target,
+                PlanEdge {
+                    dependency_type: dep_type,
+                },
+            );
+        }
+        self.graph.add_edge(
+            source_idx,
+            sort_idx,
+            PlanEdge {
+                dependency_type: DependencyType::Data,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Inject the terminal [`PlanNode::CorrelationCommit`] for
+    /// `error_handling.correlation_key` pipelines.
+    ///
+    /// One commit node is created and every existing [`PlanNode::Output`]
+    /// gains an outgoing edge to it. Output writes from the dispatcher
+    /// arm route into [`crate::executor::dispatch::CorrelationGroupBuffer`]s
+    /// keyed by group; the commit arm walks those buffers at end-of-DAG.
+    /// Idempotent — calling twice with a commit already present is a
+    /// no-op.
+    pub fn inject_correlation_commit(
+        &mut self,
+        error_handling: &crate::config::ErrorHandlingConfig,
+    ) -> Result<(), PipelineError> {
+        let Some(correlation_key) = error_handling.correlation_key.as_ref() else {
+            return Ok(());
+        };
+
+        // Idempotent: bail if a commit node already exists.
+        let already = self
+            .graph
+            .node_weights()
+            .any(|n| matches!(n, PlanNode::CorrelationCommit { .. }));
+        if already {
+            return Ok(());
+        }
+
+        let commit_group_by: Vec<String> = correlation_key
+            .fields()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let max_group_buffer = error_handling.max_group_buffer.unwrap_or(100_000);
+
+        let output_indices: Vec<NodeIndex> = self
+            .graph
+            .node_indices()
+            .filter(|&idx| matches!(self.graph[idx], PlanNode::Output { .. }))
+            .collect();
+        if output_indices.is_empty() {
+            return Ok(());
+        }
+
+        let commit_node = PlanNode::CorrelationCommit {
+            name: format!("{CORRELATION_COMMIT_PREFIX}terminal"),
+            span: Span::SYNTHETIC,
+            commit_group_by,
+            max_group_buffer,
+        };
+        let commit_idx = self.graph.add_node(commit_node);
+
+        for output_idx in output_indices {
+            self.graph.add_edge(
+                output_idx,
+                commit_idx,
+                PlanEdge {
+                    dependency_type: DependencyType::Data,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Whether this DAG carries the correlation-key terminal commit
+    /// node. Returns `true` iff [`Self::inject_correlation_commit`]
+    /// has run on a pipeline with `error_handling.correlation_key`
+    /// configured AND at least one [`PlanNode::Output`] was present.
+    pub fn required_sorted_input(&self) -> bool {
+        self.graph
+            .node_weights()
+            .any(|n| matches!(n, PlanNode::CorrelationCommit { .. }))
     }
 
     /// Populate `node_properties` via topological walk.
@@ -2817,6 +3079,22 @@ fn compute_one(
                 partitioning: single_stream_partitioning(),
             }
         }
+
+        PlanNode::CorrelationCommit { .. } => {
+            // Terminal node — no downstream ever consults its ordering.
+            // Inherit upstream parent_partitioning() defensively in case
+            // a future planner pass walks this slot.
+            NodeProperties {
+                ordering: parents
+                    .first()
+                    .map(|p| p.ordering.clone())
+                    .unwrap_or(Ordering {
+                        sort_order: None,
+                        provenance: OrderingProvenance::NoOrdering,
+                    }),
+                partitioning: parent_partitioning(),
+            }
+        }
     }
 }
 
@@ -2953,6 +3231,22 @@ pub enum PlanError {
     AggregateWithMultipleInputs {
         transform: String,
     },
+    /// E150 — `error_handling.correlation_key` is incompatible with any
+    /// Transform that uses analytic windows (`window_index: Some(_)`).
+    /// Per-group arena construction across correlation boundaries is a
+    /// separate concern; reject at compile time so users see the
+    /// limitation up front instead of a confusing runtime path.
+    CorrelationKeyWithArena {
+        transform: String,
+    },
+    /// E151 — an Aggregate node's `group_by` does not include every
+    /// `correlation_key` field. Without this superset relation an
+    /// aggregate row could mix records from multiple correlation
+    /// groups into a single output row, breaking per-group rollback.
+    CorrelationKeyWithMixedAggregate {
+        aggregate: String,
+        missing_fields: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -3025,6 +3319,25 @@ impl std::fmt::Display for PlanError {
                     f,
                     "aggregate transform '{}' cannot consume multiple inputs",
                     transform
+                )
+            }
+            PlanError::CorrelationKeyWithArena { transform } => {
+                write!(
+                    f,
+                    "E150 transform '{transform}' uses analytic windows but the \
+                     pipeline has `error_handling.correlation_key` set; per-group \
+                     arena construction is not supported",
+                )
+            }
+            PlanError::CorrelationKeyWithMixedAggregate {
+                aggregate,
+                missing_fields,
+            } => {
+                write!(
+                    f,
+                    "E151 aggregate '{aggregate}' group_by must include every \
+                     correlation_key field — missing: [{}]",
+                    missing_fields.join(", ")
                 )
             }
         }

@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
-use clinker_record::{PipelineCounters, Record, SchemaBuilder, Value};
+use clinker_record::{GroupByKey, PipelineCounters, Record, SchemaBuilder, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason, StableEvalContext};
 use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
@@ -29,6 +29,115 @@ use petgraph::graph::NodeIndex;
 
 use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
+
+/// Record meta key carrying the per-record correlation-group identity.
+///
+/// The Source arm stamps the key field values (cloned from the source
+/// record) onto every ingested record under this meta key as a
+/// [`Value::Array`]. Downstream arms (Transform / Route / Output) read
+/// the same meta to look up the record's correlation group when
+/// `error_handling.correlation_key` is configured. Reserved-prefix
+/// `__cxl_` so users cannot collide with it via emit.
+pub(crate) const CORRELATION_KEY_META: &str = "__cxl_correlation_key";
+
+/// Read the correlation key vector off a record's meta. Returns
+/// `None` when the meta is absent (record entered before correlation
+/// tagging was active, or the field was not stamped); callers treat
+/// that as a per-record null group (individual rejection).
+fn read_correlation_meta(record: &Record) -> Option<Vec<GroupByKey>> {
+    match record.get_meta(CORRELATION_KEY_META)? {
+        Value::Array(arr) => {
+            let key: Vec<GroupByKey> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, v)| value_to_correlation_key(v, i))
+                .collect();
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
+fn value_to_correlation_key(v: &Value, idx: usize) -> GroupByKey {
+    use clinker_record::value_to_group_key;
+    if let Value::String(s) = v
+        && s.is_empty()
+    {
+        return GroupByKey::Null;
+    }
+    if v.is_null() {
+        return GroupByKey::Null;
+    }
+    value_to_group_key(v, "__correlation_key", None, idx as u32)
+        .ok()
+        .flatten()
+        .unwrap_or(GroupByKey::Null)
+}
+
+/// True if every component of the key is null.
+fn key_is_null(key: &[GroupByKey]) -> bool {
+    key.iter().all(|k| matches!(k, GroupByKey::Null))
+}
+
+/// Build the buffer key for a record. When every component of the
+/// record's correlation key is null, append the source-row number as
+/// a synthetic disambiguator so each null-keyed record lands in its
+/// own buffer cell — preserving the per-record null-rejection
+/// semantic without forcing the Output arm to take a separate
+/// non-buffered writer path.
+fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
+    let mut key = read_correlation_meta(record).unwrap_or_default();
+    if key.is_empty() || key_is_null(&key) {
+        key.push(GroupByKey::Int(row_num as i64));
+    }
+    key
+}
+
+/// Redirect a per-record error into the correlation buffer when
+/// correlation buffering is active.
+///
+/// Returns `true` iff the buffer is active and the error has been
+/// parked under the record's group cell — the caller must NOT also
+/// push to `ctx.dlq_entries` / `counters.dlq_count`. Returns `false`
+/// when the buffer is unconfigured, signaling the caller to take the
+/// per-record DLQ path. Buffer admission bumps `total_records`,
+/// tripping the overflow flag once `max_group_buffer` is exceeded.
+/// Null-keyed records get a row-number-disambiguated cell so each is
+/// its own group of one.
+fn record_error_to_buffer_if_grouped(
+    ctx: &mut ExecutorContext<'_>,
+    record: &Record,
+    row_num: u64,
+    category: crate::dlq::DlqErrorCategory,
+    error_message: String,
+    stage: Option<String>,
+    route: Option<String>,
+) -> bool {
+    if ctx.correlation_buffers.is_none() {
+        return false;
+    }
+    let key = buffer_key_for_record(record, row_num);
+    let max_buf = ctx.correlation_max_group_buffer;
+    let buffers = ctx
+        .correlation_buffers
+        .as_mut()
+        .expect("checked buffers Some above");
+    let entry = buffers.entry(key).or_default();
+    entry.total_records += 1;
+    if max_buf > 0 && entry.total_records > max_buf {
+        entry.overflowed = true;
+    }
+    entry.error_rows.insert(row_num);
+    entry.error_messages.push(CorrelationErrorRecord {
+        row_num,
+        original_record: record.clone(),
+        category,
+        error_message,
+        stage,
+        route,
+    });
+    true
+}
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     CompiledRoute, CompiledTransform, DlqEntry, NullStorage, build_format_writer,
@@ -169,6 +278,26 @@ pub(crate) struct ExecutorContext<'a> {
     /// two are populated together by Phase-0 setup and torn down
     /// together at the end of the walk.
     pub(crate) indices: Option<Arc<Vec<crate::pipeline::index::SecondaryIndex>>>,
+
+    /// Resolved `error_handling.correlation_key` field list. `Some`
+    /// iff the configured pipeline uses correlation grouping; empty
+    /// otherwise. The Source arm reads this to compute each ingested
+    /// record's group key vector and stamp it into record meta.
+    pub(crate) correlation_key_fields: Option<Vec<String>>,
+
+    /// Per-correlation-group buffer holding deferred output writes
+    /// and per-record error events. `Some` iff the plan carries a
+    /// [`PlanNode::CorrelationCommit`] terminal — that node walks the
+    /// map at end-of-DAG to flush clean groups to writers and DLQ
+    /// dirty groups uniformly across all output sinks. `None`
+    /// otherwise; Output writes go straight to the FormatWriter.
+    pub(crate) correlation_buffers: Option<HashMap<Vec<GroupByKey>, CorrelationGroupBuffer>>,
+
+    /// Cap on per-group record count; mirrors
+    /// `error_handling.max_group_buffer`. Zero when correlation
+    /// buffering is disabled. Read by the Output arm before admitting
+    /// a record into the buffer to detect overflow at admission time.
+    pub(crate) correlation_max_group_buffer: u64,
 }
 
 impl ExecutorContext<'_> {
@@ -245,7 +374,7 @@ pub(crate) fn dispatch_plan_node(
                     None => r.clone(),
                 }
             };
-            let records: Vec<_> = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
+            let mut records: Vec<_> = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
                 // Body-context port source — records were seeded by
                 // `execute_composition_body` from parent-scope output.
                 // The seeded records still carry the parent producer's
@@ -266,6 +395,25 @@ pub(crate) fn dispatch_plan_node(
                     .map(|(r, rn)| (canonicalize(r), *rn))
                     .collect()
             };
+            // Stamp the correlation-key meta on every freshly-ingested
+            // record so downstream arms can reach the row's group
+            // identity even if a Transform later rewrites the key
+            // field. Body-context Sources skip this — the parent walk
+            // already stamped the records before seeding them. Combine
+            // build-source records get stamped against the same key
+            // fields; build sources lacking those fields stamp Null
+            // and the Combine arm later inherits the driver's tag.
+            if let Some(fields) = ctx.correlation_key_fields.clone() {
+                for (rec, _) in records.iter_mut() {
+                    if rec.get_meta(CORRELATION_KEY_META).is_none() {
+                        let key_values: Vec<Value> = fields
+                            .iter()
+                            .map(|f| rec.get(f).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        let _ = rec.set_meta(CORRELATION_KEY_META, Value::Array(key_values));
+                    }
+                }
+            }
             ctx.node_buffers.insert(node_idx, records);
         }
 
@@ -398,16 +546,28 @@ pub(crate) fn dispatch_plan_node(
                         if ctx.strategy == ErrorStrategy::FailFast {
                             return Err(eval_err.into());
                         }
-                        ctx.counters.dlq_count += 1;
-                        ctx.dlq_entries.push(DlqEntry {
-                            source_row: rn,
-                            category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: eval_err.to_string(),
-                            original_record: record,
-                            stage: Some(DlqEntry::stage_transform(&transform_name)),
-                            route: None,
-                            trigger: true,
-                        });
+                        let stage = Some(DlqEntry::stage_transform(&transform_name));
+                        let routed = record_error_to_buffer_if_grouped(
+                            ctx,
+                            &record,
+                            rn,
+                            crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            eval_err.to_string(),
+                            stage.clone(),
+                            None,
+                        );
+                        if !routed {
+                            ctx.counters.dlq_count += 1;
+                            ctx.dlq_entries.push(DlqEntry {
+                                source_row: rn,
+                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                error_message: eval_err.to_string(),
+                                original_record: record,
+                                stage,
+                                route: None,
+                                trigger: true,
+                            });
+                        }
                     }
                 }
             }
@@ -591,16 +751,28 @@ pub(crate) fn dispatch_plan_node(
                             if ctx.strategy == ErrorStrategy::FailFast {
                                 return Err(route_err.into());
                             }
-                            ctx.counters.dlq_count += 1;
-                            ctx.dlq_entries.push(DlqEntry {
-                                source_row: rn,
-                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: route_err.to_string(),
-                                original_record: record,
-                                stage: Some(DlqEntry::stage_route_eval()),
-                                route: None,
-                                trigger: true,
-                            });
+                            let stage = Some(DlqEntry::stage_route_eval());
+                            let routed = record_error_to_buffer_if_grouped(
+                                ctx,
+                                &record,
+                                rn,
+                                crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                route_err.to_string(),
+                                stage.clone(),
+                                None,
+                            );
+                            if !routed {
+                                ctx.counters.dlq_count += 1;
+                                ctx.dlq_entries.push(DlqEntry {
+                                    source_row: rn,
+                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
+                                    error_message: route_err.to_string(),
+                                    original_record: record,
+                                    stage,
+                                    route: None,
+                                    trigger: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -897,16 +1069,28 @@ pub(crate) fn dispatch_plan_node(
                     match ctx.config.error_handling.strategy {
                         ErrorStrategy::FailFast => return Err(e.into()),
                         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                            ctx.counters.dlq_count += 1;
-                            ctx.dlq_entries.push(DlqEntry {
-                                source_row: *row_num,
-                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                error_message: format!("aggregate {name}: {e}"),
-                                original_record: record.clone(),
-                                stage: Some(crate::dlq::stage_aggregate(name)),
-                                route: None,
-                                trigger: true,
-                            });
+                            let stage = Some(crate::dlq::stage_aggregate(name));
+                            let routed = record_error_to_buffer_if_grouped(
+                                ctx,
+                                record,
+                                *row_num,
+                                crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                format!("aggregate {name}: {e}"),
+                                stage.clone(),
+                                None,
+                            );
+                            if !routed {
+                                ctx.counters.dlq_count += 1;
+                                ctx.dlq_entries.push(DlqEntry {
+                                    source_row: *row_num,
+                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                    error_message: format!("aggregate {name}: {e}"),
+                                    original_record: record.clone(),
+                                    stage,
+                                    route: None,
+                                    trigger: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -1010,7 +1194,30 @@ pub(crate) fn dispatch_plan_node(
                 }
             }
 
-            // Dual counters:
+            // When correlation buffering is active, every record
+            // routed to this Output goes through the per-group buffer
+            // — `CorrelationCommit` decides at end-of-DAG whether to
+            // flush the group to the writer or DLQ it. Null-keyed
+            // records get a row-disambiguated buffer cell each so
+            // they retain per-record-rejection semantics without
+            // splitting the writer path.
+            let buffered: Vec<(Record, u64, Vec<GroupByKey>)>;
+            let unbuffered: Vec<(Record, u64)>;
+            if ctx.correlation_buffers.is_some() {
+                buffered = input_records
+                    .into_iter()
+                    .map(|(rec, rn)| {
+                        let key = buffer_key_for_record(&rec, rn);
+                        (rec, rn, key)
+                    })
+                    .collect();
+                unbuffered = Vec::new();
+            } else {
+                buffered = Vec::new();
+                unbuffered = input_records;
+            }
+
+            // Counter semantics:
             //
             // * `records_written` increments per WRITE — under
             //   inclusive Route fan-out, one input matching N
@@ -1026,16 +1233,21 @@ pub(crate) fn dispatch_plan_node(
             //   `row_num` (per-source counter), tracked across
             //   all Output arms via the `ok_source_rows` set
             //   declared at function scope.
-            let output_record_count = input_records.len() as u64;
+            //
+            // Buffered records DEFER counter increments to the
+            // `CorrelationCommit` arm — clean groups bump
+            // counters at flush time; dirty groups never count
+            // toward `ok_count`.
+            let unbuffered_record_count = unbuffered.len() as u64;
             let mut newly_ok: u64 = 0;
-            for (_, row_num) in &input_records {
+            for (_, row_num) in &unbuffered {
                 if ctx.ok_source_rows.insert(*row_num) {
                     newly_ok += 1;
                 }
             }
             ctx.counters.ok_count += newly_ok;
-            ctx.counters.records_written += output_record_count;
-            ctx.records_emitted += output_record_count;
+            ctx.counters.records_written += unbuffered_record_count;
+            ctx.records_emitted += unbuffered_record_count;
 
             // Derive output schema from first emitted record.
             // The Record is authoritative post-rip; materialize
@@ -1061,16 +1273,46 @@ pub(crate) fn dispatch_plan_node(
                 Some(&cxl_emit_names)
             };
 
-            let output_schema = if let Some((rec, _)) = input_records.first() {
-                let projected = {
-                    let _guard = ctx.projection_timer.guard();
-                    project_output_from_record(rec, out_cfg, cxl_emit_names_opt)
-                };
-                Arc::clone(projected.schema())
-            } else {
-                // No records to write — use empty schema
+            // Buffer non-null-key records. Project once, push slot.
+            // Overflow check fires the moment a group's record count
+            // exceeds the configured cap; subsequent records of the
+            // same group are still admitted so they can become
+            // collateral entries when `CorrelationCommit` drains the
+            // group, but admission flips the overflow flag so the
+            // commit arm emits a `GroupSizeExceeded` trigger.
+            if !buffered.is_empty() {
+                let max_buf = ctx.correlation_max_group_buffer;
+                let buffers = ctx
+                    .correlation_buffers
+                    .as_mut()
+                    .expect("correlation_buffers is Some — we just checked above");
+                for (record, rn, group_key) in buffered.iter() {
+                    let projected = project_output_from_record(record, out_cfg, cxl_emit_names_opt);
+                    let entry = buffers.entry(group_key.clone()).or_default();
+                    entry.total_records += 1;
+                    if max_buf > 0 && entry.total_records > max_buf {
+                        entry.overflowed = true;
+                    }
+                    entry.records.push(CorrelationRecordSlot {
+                        row_num: *rn,
+                        original_record: record.clone(),
+                        projected,
+                        output_name: name.clone(),
+                    });
+                }
+            }
+
+            if unbuffered.is_empty() {
                 ctx.collector.record(scan_timer.finish(0, 0));
                 return Ok(());
+            }
+
+            let output_schema = {
+                let projected = {
+                    let _guard = ctx.projection_timer.guard();
+                    project_output_from_record(&unbuffered[0].0, out_cfg, cxl_emit_names_opt)
+                };
+                Arc::clone(projected.schema())
             };
 
             // Find and take the writer for this output. Errors
@@ -1083,7 +1325,7 @@ pub(crate) fn dispatch_plan_node(
                     Ok(mut csv_writer) => {
                         ctx.collector.record(scan_timer.finish(1, 1));
                         let mut write_failed = false;
-                        for (record, _rn) in &input_records {
+                        for (record, _rn) in &unbuffered {
                             let projected = {
                                 let _guard = ctx.projection_timer.guard();
                                 project_output_from_record(record, out_cfg, cxl_emit_names_opt)
@@ -1960,8 +2202,323 @@ pub(crate) fn dispatch_plan_node(
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
             ctx.node_buffers.insert(node_idx, output_records);
         }
+
+        PlanNode::CorrelationCommit {
+            ref name,
+            ref commit_group_by,
+            max_group_buffer,
+            ..
+        } => {
+            commit_correlation_buffers(ctx, name, commit_group_by, max_group_buffer)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Correlation-group buffer entry.
+///
+/// One per `(group_key, output_name)` cell in
+/// [`ExecutorContext::correlation_buffers`]. `records` holds projected
+/// output rows captured by the Output arm before any writer commit;
+/// `error_set` carries source-row IDs of records that failed somewhere
+/// in the pipeline, with the first-error message held alongside for the
+/// trigger entry. `total_records` counts every distinct source row that
+/// passed through the group (including failures and successes), so the
+/// `CorrelationCommit` arm can detect overflow against the configured
+/// `max_group_buffer`. `overflowed` short-circuits further admissions
+/// once the cap has fired.
+#[derive(Debug, Default)]
+pub(crate) struct CorrelationGroupBuffer {
+    pub(crate) records: Vec<CorrelationRecordSlot>,
+    pub(crate) error_rows: HashSet<u64>,
+    pub(crate) error_messages: Vec<CorrelationErrorRecord>,
+    pub(crate) total_records: u64,
+    pub(crate) overflowed: bool,
+}
+
+/// One buffered output record awaiting commit.
+///
+/// Captured at the Output arm. `output_name` identifies which writer
+/// the record will land in once the group is flushed clean. The
+/// `original_record` is held alongside the projected row because a
+/// dirty group's DLQ entry uses the original (pre-projection) record
+/// to preserve source-side context.
+#[derive(Debug, Clone)]
+pub(crate) struct CorrelationRecordSlot {
+    pub(crate) row_num: u64,
+    pub(crate) original_record: Record,
+    pub(crate) projected: Record,
+    pub(crate) output_name: String,
+}
+
+/// One failure event captured against a correlation group.
+///
+/// Pushed by the Transform / Route / Output arms when correlation
+/// buffering is active. `original_record` is the record at the moment
+/// of failure (e.g., the Transform input that failed evaluation).
+/// Multiple events per row are possible if a row fans out across
+/// branches and more than one branch fails — the `CorrelationCommit`
+/// arm dedupes by `row_num` for trigger emission.
+#[derive(Debug, Clone)]
+pub(crate) struct CorrelationErrorRecord {
+    pub(crate) row_num: u64,
+    pub(crate) original_record: Record,
+    pub(crate) category: crate::dlq::DlqErrorCategory,
+    pub(crate) error_message: String,
+    pub(crate) stage: Option<String>,
+    pub(crate) route: Option<String>,
+}
+
+/// Walk every correlation buffer and emit the per-group commit:
+/// flush-to-writer for clean groups, DLQ-with-trigger for dirty groups,
+/// overflow-aware DLQ for groups that tripped `max_group_buffer`.
+///
+/// Two-phase: phase 1 walks every group once, accumulating clean
+/// records into a per-output queue and emitting DLQ entries for
+/// dirty/overflow groups. Phase 2 opens each writer ONCE, writes the
+/// accumulated queue, and flushes — one writer take per Output, not
+/// one per group. The phasing is necessary because every group flush
+/// would otherwise contend for `ctx.writers.remove(name)`, leaving
+/// subsequent groups silently dropped.
+fn commit_correlation_buffers(
+    ctx: &mut ExecutorContext<'_>,
+    _commit_node_name: &str,
+    _commit_group_by: &[String],
+    _max_group_buffer: u64,
+) -> Result<(), PipelineError> {
+    use std::collections::BTreeMap;
+
+    let Some(mut buffers) = ctx.correlation_buffers.take() else {
+        return Ok(());
+    };
+
+    // Stable iteration order — sort by formatted group key so DLQ
+    // emission and writer flush are deterministic across runs.
+    let mut group_keys: Vec<Vec<GroupByKey>> = buffers.keys().cloned().collect();
+    group_keys.sort_by_key(|k| format_group_key(k));
+
+    // Phase 1: per-group disposition. Clean groups' records flow
+    // into `clean_per_output` keyed by output_name; the BTreeMap key
+    // ordering is the writer-flush order. Dirty groups land in the
+    // DLQ inline.
+    let mut clean_per_output: BTreeMap<String, Vec<CorrelationRecordSlot>> = BTreeMap::new();
+    for group_key in group_keys {
+        let Some(group) = buffers.remove(&group_key) else {
+            continue;
+        };
+        commit_one_group(ctx, &group_key, group, &mut clean_per_output)?;
+    }
+
+    // Phase 2: drain the clean per-output queues to writers.
+    flush_clean_records_to_writers(ctx, clean_per_output)?;
+
+    Ok(())
+}
+
+fn format_group_key(key: &[GroupByKey]) -> String {
+    let parts: Vec<String> = key
+        .iter()
+        .map(|k| match k {
+            GroupByKey::Null => "null".to_string(),
+            GroupByKey::Bool(b) => b.to_string(),
+            GroupByKey::Int(i) => i.to_string(),
+            GroupByKey::Float(bits) => f64::from_bits(*bits).to_string(),
+            GroupByKey::Str(s) => format!("{s:?}"),
+            GroupByKey::Date(d) => d.to_string(),
+            GroupByKey::DateTime(ts) => ts.to_string(),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+fn commit_one_group(
+    ctx: &mut ExecutorContext<'_>,
+    group_key: &[GroupByKey],
+    group: CorrelationGroupBuffer,
+    clean_per_output: &mut std::collections::BTreeMap<String, Vec<CorrelationRecordSlot>>,
+) -> Result<(), PipelineError> {
+    let CorrelationGroupBuffer {
+        records,
+        error_rows,
+        error_messages,
+        total_records,
+        overflowed,
+    } = group;
+
+    if overflowed {
+        // Overflow disposition: one root-cause DLQ entry with
+        // category=GroupSizeExceeded and trigger=true; every other
+        // buffered record of the group becomes a collateral with
+        // category=Correlated and trigger=false. Per-record original
+        // records come from `records` (the projected buffer holds the
+        // un-projected original alongside).
+        let mut emitted_trigger = false;
+        let group_repr = format_group_key(group_key);
+        let overflow_msg = PipelineError::CorrelationGroupOverflow {
+            group_key: group_repr.clone(),
+            count: total_records,
+        }
+        .to_string();
+        // Dedup distinct rows by row_num so Route fan-out (one row to N
+        // outputs) emits one DLQ entry, not N.
+        let mut seen_rows: HashSet<u64> = HashSet::new();
+        for slot in &records {
+            if !seen_rows.insert(slot.row_num) {
+                continue;
+            }
+            let (category, trigger, error_message) = if !emitted_trigger {
+                emitted_trigger = true;
+                (
+                    crate::dlq::DlqErrorCategory::GroupSizeExceeded,
+                    true,
+                    overflow_msg.clone(),
+                )
+            } else {
+                (
+                    crate::dlq::DlqErrorCategory::Correlated,
+                    false,
+                    format!("correlated with failure in group: {overflow_msg}"),
+                )
+            };
+            ctx.counters.dlq_count += 1;
+            ctx.dlq_entries.push(DlqEntry {
+                source_row: slot.row_num,
+                category,
+                error_message,
+                original_record: slot.original_record.clone(),
+                stage: Some("correlation_commit".to_string()),
+                route: None,
+                trigger,
+            });
+        }
+        return Ok(());
+    }
+
+    let group_dirty = !error_rows.is_empty();
+    if !group_dirty {
+        // Clean group → drop the records into the per-output queue
+        // for batched flush after every group has been visited.
+        for slot in records {
+            clean_per_output
+                .entry(slot.output_name.clone())
+                .or_default()
+                .push(slot);
+        }
+        return Ok(());
+    }
+
+    // Dirty group → drop projected records, emit DLQ entries for every
+    // distinct row_num touched by the group. Triggers come from
+    // `error_messages`; collaterals come from `records` (rows that
+    // succeeded their leg but get rolled back because the group failed).
+    let first_err_message = error_messages
+        .first()
+        .map(|e| e.error_message.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut seen_rows: HashSet<u64> = HashSet::new();
+    // Trigger entries: one per distinct erroring row. Multiple errors
+    // per row (different branches failing) collapse to a single trigger
+    // entry carrying the first error.
+    for err in &error_messages {
+        if !seen_rows.insert(err.row_num) {
+            continue;
+        }
+        ctx.counters.dlq_count += 1;
+        ctx.dlq_entries.push(DlqEntry {
+            source_row: err.row_num,
+            category: err.category,
+            error_message: err.error_message.clone(),
+            original_record: err.original_record.clone(),
+            stage: err.stage.clone(),
+            route: err.route.clone(),
+            trigger: true,
+        });
+    }
+    // Collateral entries: every other distinct row that flowed through
+    // the group's Output buffers but didn't itself error.
+    for slot in &records {
+        if seen_rows.contains(&slot.row_num) {
+            continue;
+        }
+        if !seen_rows.insert(slot.row_num) {
+            continue;
+        }
+        ctx.counters.dlq_count += 1;
+        ctx.dlq_entries.push(DlqEntry {
+            source_row: slot.row_num,
+            category: crate::dlq::DlqErrorCategory::Correlated,
+            error_message: format!("correlated with failure in group: {first_err_message}"),
+            original_record: slot.original_record.clone(),
+            stage: Some("correlation_commit".to_string()),
+            route: None,
+            trigger: false,
+        });
+    }
+
+    Ok(())
+}
+
+fn flush_clean_records_to_writers(
+    ctx: &mut ExecutorContext<'_>,
+    per_output: std::collections::BTreeMap<String, Vec<CorrelationRecordSlot>>,
+) -> Result<(), PipelineError> {
+    for (output_name, slots) in per_output {
+        if slots.is_empty() {
+            continue;
+        }
+        let out_cfg = ctx
+            .output_configs
+            .iter()
+            .find(|o| o.name == output_name)
+            .unwrap_or(ctx.primary_output);
+        let output_schema = Arc::clone(slots[0].projected.schema());
+
+        let Some(raw_writer) = ctx.writers.remove(&output_name) else {
+            continue;
+        };
+        match build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema)) {
+            Ok(mut writer) => {
+                let mut write_failed = false;
+                for slot in &slots {
+                    let write_result = {
+                        let _guard = ctx.write_timer.guard();
+                        writer.write_record(&slot.projected)
+                    };
+                    if let Err(e) = write_result {
+                        ctx.output_errors.push(PipelineError::from(e));
+                        write_failed = true;
+                        break;
+                    }
+                }
+                if !write_failed {
+                    let flush_result = {
+                        let _guard = ctx.write_timer.guard();
+                        writer.flush()
+                    };
+                    if let Err(e) = flush_result {
+                        ctx.output_errors.push(PipelineError::from(e));
+                    }
+                }
+            }
+            Err(e) => ctx.output_errors.push(e),
+        }
+
+        // Counter accounting: per-row newly-ok bookkeeping was
+        // deferred at Output arm time when buffering. Apply it here
+        // so records never count toward `ok_count` if their group
+        // rolled back.
+        let mut newly_ok: u64 = 0;
+        for slot in &slots {
+            if ctx.ok_source_rows.insert(slot.row_num) {
+                newly_ok += 1;
+            }
+        }
+        ctx.counters.ok_count += newly_ok;
+        ctx.counters.records_written += slots.len() as u64;
+        ctx.records_emitted += slots.len() as u64;
+    }
     Ok(())
 }
 

@@ -1683,6 +1683,18 @@ impl PipelineConfig {
             .iter()
             .map(|i| (i.name.clone(), i.clone()))
             .collect();
+        // Pipeline-level correlation-sort injection runs before the
+        // operator-level enforcer pass so the latter sees the
+        // correlation sort already in place. The correlation pass is
+        // a no-op when `error_handling.correlation_key` is unset.
+        if let Err(e) = dag.inject_correlation_sort(&self.error_handling, &source_configs) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("correlation-sort injection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
         if let Err(e) = dag.insert_enforcer_sorts(&inputs_map) {
             diags.push(Diagnostic::error(
                 "E003",
@@ -1784,6 +1796,90 @@ impl PipelineConfig {
             &mut diags,
             self.pipeline.memory_limit.as_deref(),
         );
+
+        // Correlation-key validity gates. Run AFTER the DAG is fully
+        // enriched so we see every Transform's `window_index` and every
+        // Aggregate's resolved `group_by`. Both produce typed
+        // [`PlanError`] variants surfaced as user-visible diagnostics.
+        if self.error_handling.correlation_key.is_some() {
+            for node in dag.graph.node_weights() {
+                if let crate::plan::execution::PlanNode::Transform {
+                    name,
+                    window_index: Some(_),
+                    ..
+                } = node
+                {
+                    let err = crate::plan::execution::PlanError::CorrelationKeyWithArena {
+                        transform: name.clone(),
+                    };
+                    diags.push(Diagnostic::error(
+                        "E150",
+                        err.to_string(),
+                        LabeledSpan::primary(node.span(), String::new()),
+                    ));
+                }
+            }
+            if let Some(ck) = self.error_handling.correlation_key.as_ref() {
+                let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
+                for node in dag.graph.node_weights() {
+                    if let crate::plan::execution::PlanNode::Aggregation { name, config, .. } = node
+                    {
+                        let group_by: Vec<&str> =
+                            config.group_by.iter().map(|s| s.as_str()).collect();
+                        let missing: Vec<String> = key_fields
+                            .iter()
+                            .filter(|f| !group_by.contains(&f.as_str()))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            let err =
+                                crate::plan::execution::PlanError::CorrelationKeyWithMixedAggregate {
+                                    aggregate: name.clone(),
+                                    missing_fields: missing,
+                                };
+                            diags.push(Diagnostic::error(
+                                "E151",
+                                err.to_string(),
+                                LabeledSpan::primary(node.span(), String::new()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inject the terminal correlation-commit node once the DAG is
+        // otherwise frozen. Re-derive topo afterward because the
+        // commit node and its incoming edges change the order. No-op
+        // when `error_handling.correlation_key` is unset.
+        if let Err(e) = dag.inject_correlation_commit(&self.error_handling) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("correlation-commit injection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        if dag.graph.node_weights().any(|n| {
+            matches!(
+                n,
+                crate::plan::execution::PlanNode::CorrelationCommit { .. }
+            )
+        }) {
+            dag.topo_order = match petgraph::algo::toposort(&dag.graph, None) {
+                Ok(order) => order,
+                Err(cycle) => {
+                    let cycle_path =
+                        crate::plan::execution::extract_cycle_path(&dag.graph, cycle.node_id());
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!("cycle detected post-correlation-commit: {cycle_path}"),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+            };
+        }
 
         // If lowering accumulated any non-composition error-severity
         // diagnostics, return them. Composition binding errors
@@ -2216,6 +2312,72 @@ pub(crate) fn lower_node_to_plan_node(
     }
 }
 
+/// Correlation key for grouped DLQ rejection.
+///
+/// When set on [`ErrorHandlingConfig`], every record in a group sharing a
+/// correlation-key value is DLQ'd atomically if any single record in that
+/// group fails Transform / Route eval / Output write. Group identity is
+/// fixed at ingest: a Transform that rewrites the key field does not
+/// change a row's group. Custom [`Deserialize`] accepts a YAML scalar
+/// (`correlation_key: foo`) for a single-field key or a sequence
+/// (`correlation_key: [a, b]`) for a compound key.
+#[derive(Debug, Clone, Serialize)]
+pub enum CorrelationKey {
+    Single(String),
+    Compound(Vec<String>),
+}
+
+impl CorrelationKey {
+    /// Field names that compose this correlation key, in declaration order.
+    pub fn fields(&self) -> Vec<&str> {
+        match self {
+            Self::Single(f) => vec![f.as_str()],
+            Self::Compound(fs) => fs.iter().map(|f| f.as_str()).collect(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CorrelationKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CorrelationKeyVisitor;
+
+        impl<'de> Visitor<'de> for CorrelationKeyVisitor {
+            type Value = CorrelationKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string (single key) or array of strings (compound key)")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CorrelationKey::Single(v.to_string()))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(field) = seq.next_element::<String>()? {
+                    fields.push(field);
+                }
+                if fields.is_empty() {
+                    return Err(de::Error::custom("correlation_key array must not be empty"));
+                }
+                if fields.len() == 1 {
+                    return Ok(CorrelationKey::Single(fields.remove(0)));
+                }
+                Ok(CorrelationKey::Compound(fields))
+            }
+        }
+
+        deserializer.deserialize_any(CorrelationKeyVisitor)
+    }
+}
+
+fn default_max_group_buffer() -> Option<u64> {
+    Some(100_000)
+}
+
 /// Error handling strategy and DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2226,6 +2388,20 @@ pub struct ErrorHandlingConfig {
     pub dlq: Option<DlqConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
+    /// Correlation key for grouped DLQ rejection. When set, records sharing
+    /// this key value are DLQ'd as a unit if ANY record in the group fails
+    /// Transform / Route eval / Output write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_key: Option<CorrelationKey>,
+    /// Maximum buffered records per correlation group. Once a group reaches
+    /// this cap, the group is DLQ'd with a `group_size_exceeded` root-cause
+    /// entry plus collateral entries for every other buffered record of the
+    /// group. Default: 100_000.
+    #[serde(
+        default = "default_max_group_buffer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_group_buffer: Option<u64>,
 }
 
 impl Default for ErrorHandlingConfig {
@@ -2234,6 +2410,8 @@ impl Default for ErrorHandlingConfig {
             strategy: default_strategy(),
             dlq: None,
             type_error_threshold: None,
+            correlation_key: None,
+            max_group_buffer: None,
         }
     }
 }
