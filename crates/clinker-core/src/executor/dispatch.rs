@@ -126,6 +126,41 @@ pub(crate) struct ExecutorContext<'a> {
     /// `MAX_COMPOSITION_DEPTH` before recursing and emits E112 on
     /// overflow.
     pub(crate) recursion_depth: u32,
+
+    /// Pipeline-scoped temporary directory. Allocated once at
+    /// `execute_dag_branching` start; every spilling operator (grace
+    /// hash, sort-merge join, sort buffer, hash aggregation) writes
+    /// spill files inside it. Shared across composition body
+    /// recursion — body executors do not allocate a fresh subdir.
+    /// Primary cleanup is per-file `tempfile::TempPath` Drop;
+    /// secondary sweep is the pipeline-scoped TempDir Drop on panic
+    /// unwinding, which closes the operator-level panic-leak hole
+    /// observed in Spark (SPARK-3563, SPARK-24340) and DuckDB
+    /// (issues 6420, 5878). The `Arc` keeps the directory alive
+    /// while any outstanding spill file path borrows it; this
+    /// matters in error paths where the executor returns before
+    /// every reader has been drained.
+    pub(crate) spill_root: Arc<tempfile::TempDir>,
+    /// Cached path into [`Self::spill_root`]. Sharing an
+    /// `Arc<Path>` keeps every operator-side `to_path_buf()` call
+    /// off the `TempDir::path()` chain in hot paths and bypasses a
+    /// lifetime acrobatic that would otherwise force every operator
+    /// to thread the same lifetime as the borrowed plan-time refs.
+    pub(crate) spill_root_path: Arc<std::path::Path>,
+}
+
+impl ExecutorContext<'_> {
+    /// Borrow the pipeline-scoped TempDir handle. Held alongside
+    /// the cached `spill_root_path` so every operator that prefers
+    /// the owned form (e.g. `SortBuffer::new` taking
+    /// `Option<PathBuf>`) can clone the path without re-traversing
+    /// `TempDir::path()`. The TempDir itself is needed to keep the
+    /// directory alive across the whole walk including any
+    /// concurrent reads on spill paths the executor has not yet
+    /// drained.
+    pub(crate) fn spill_root(&self) -> &Arc<tempfile::TempDir> {
+        &self.spill_root
+    }
 }
 
 /// Execute one DAG node by routing it to its arm.
@@ -615,8 +650,12 @@ pub(crate) fn dispatch_plan_node(
 
             let schema = input_records[0].0.schema().clone();
             let memory_limit = parse_memory_limit(ctx.config);
-            let mut buf: SortBuffer<u64> =
-                SortBuffer::new(sort_fields.clone(), memory_limit, None, schema);
+            let mut buf: SortBuffer<u64> = SortBuffer::new(
+                sort_fields.clone(),
+                memory_limit,
+                Some(ctx.spill_root_path.to_path_buf()),
+                schema,
+            );
 
             let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
             let sort_count = input_records.len() as u64;
@@ -759,7 +798,7 @@ pub(crate) fn dispatch_plan_node(
                 Arc::clone(output_schema),
                 spill_schema,
                 memory_limit,
-                None,
+                Some(ctx.spill_root_path.to_path_buf()),
                 name.clone(),
             )?;
 
@@ -1395,6 +1434,7 @@ pub(crate) fn dispatch_plan_node(
                         partition_bits,
                         ctx: &grace_ctx,
                         budget: &mut budget,
+                        spill_dir: ctx.spill_root_path.as_ref(),
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
@@ -1448,6 +1488,7 @@ pub(crate) fn dispatch_plan_node(
                         presorted: true,
                         ctx: &sm_ctx,
                         budget: &mut budget,
+                        spill_dir: ctx.spill_root_path.as_ref(),
                     })?;
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector

@@ -34,7 +34,7 @@
 //! implementation pass.
 
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
@@ -42,7 +42,6 @@ use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalError, EvalResult, ProgramEvaluator, SkipReason};
 use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
-use tempfile::TempDir;
 
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
@@ -112,13 +111,18 @@ impl MatchingRunBuffer {
 /// Push one inner record into the buffer, spilling either the whole
 /// in-memory run (on the first overflow) or the accumulated tail (on
 /// subsequent overflows) when the byte count would exceed `byte_limit`.
+///
+/// Returns the byte length committed to disk during this call (zero
+/// when the record stayed in memory). Caller folds the result into
+/// [`crate::pipeline::memory::MemoryBudget::record_spill_bytes`] so
+/// the disk-quota gate can fire on overflow.
 fn push_to_buffer(
     buf: &mut MatchingRunBuffer,
     record: Record,
     byte_limit: usize,
     spill_dir: &std::path::Path,
     spill_seq: &mut u32,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let incoming = std::mem::size_of::<Record>() + record.estimated_heap_size();
     match buf {
         MatchingRunBuffer::InMemory { records, bytes } => {
@@ -128,7 +132,7 @@ fn push_to_buffer(
                 let mut drained = std::mem::take(records);
                 let schema = Arc::clone(drained[0].schema());
                 drained.push(record);
-                let segment_path = write_spill_segment(spill_dir, spill_seq, &drained)?;
+                let (segment_path, written) = write_spill_segment(spill_dir, spill_seq, &drained)?;
                 let count = drained.len() as u64;
                 *buf = MatchingRunBuffer::Spilled {
                     segments: vec![segment_path],
@@ -137,11 +141,11 @@ fn push_to_buffer(
                     tail: Vec::new(),
                     tail_bytes: 0,
                 };
-                Ok(())
+                Ok(written)
             } else {
                 *bytes = bytes.saturating_add(incoming);
                 records.push(record);
-                Ok(())
+                Ok(0)
             }
         }
         MatchingRunBuffer::Spilled {
@@ -156,15 +160,15 @@ fn push_to_buffer(
                 // and start a fresh tail with the incoming record.
                 let mut drained = std::mem::take(tail);
                 drained.push(record);
-                let segment_path = write_spill_segment(spill_dir, spill_seq, &drained)?;
+                let (segment_path, written) = write_spill_segment(spill_dir, spill_seq, &drained)?;
                 *spilled_count = spilled_count.saturating_add(drained.len() as u64);
                 *tail_bytes = 0;
                 segments.push(segment_path);
-                Ok(())
+                Ok(written)
             } else {
                 *tail_bytes = tail_bytes.saturating_add(incoming);
                 tail.push(record);
-                Ok(())
+                Ok(0)
             }
         }
     }
@@ -172,12 +176,14 @@ fn push_to_buffer(
 
 /// Write a slice of records as a single fresh spill segment via
 /// [`GraceSpillWriter`]. The returned path lives inside `spill_dir`;
-/// the caller's `TempDir` owns its lifetime.
+/// the caller's `TempDir` owns its lifetime. The byte length is
+/// returned alongside the path so the caller can fold it into
+/// [`crate::pipeline::memory::MemoryBudget::record_spill_bytes`].
 fn write_spill_segment(
     spill_dir: &std::path::Path,
     spill_seq: &mut u32,
     records: &[Record],
-) -> std::io::Result<SpillFilePath> {
+) -> std::io::Result<(SpillFilePath, u64)> {
     let seq = *spill_seq;
     *spill_seq = spill_seq.wrapping_add(1);
     let mut writer = GraceSpillWriter::new(spill_dir, 0, (seq & 0xFFFF) as u16)?;
@@ -326,6 +332,11 @@ pub(crate) struct SortMergeExec<'a> {
     pub presorted: bool,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a mut MemoryBudget,
+    /// Pipeline-scoped spill directory borrowed from
+    /// `ExecutorContext::spill_root_path`. Matching-run spill segments
+    /// land inside it; the surrounding `Arc<TempDir>` Drop is the
+    /// secondary panic-safe cleanup sweep.
+    pub spill_dir: &'a Path,
 }
 
 /// Snapshot of which phases ran during a sort-merge execution. Used by
@@ -387,6 +398,7 @@ fn execute_combine_sort_merge_with_stats(
         presorted,
         ctx,
         budget,
+        spill_dir,
     } = args;
 
     let mut stats = SortMergeStats::default();
@@ -561,17 +573,9 @@ fn execute_combine_sort_merge_with_stats(
     let mut body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
     let mut emitted_since_check = 0usize;
 
-    // TempDir owns every matching-run spill file; dropped on function
-    // exit so spill paths outlive the merge walk but not the executor.
-    let spill_root: TempDir = tempfile::Builder::new()
-        .prefix("sort-merge-")
-        .tempdir()
-        .map_err(|e| PipelineError::Internal {
-            op: "combine",
-            node: name.to_string(),
-            detail: format!("sort-merge spill temp dir alloc failed: {e}"),
-        })?;
-    let spill_dir: PathBuf = spill_root.path().to_path_buf();
+    // Matching-run spill segments land in the caller-owned
+    // pipeline-scoped TempDir. Each segment cleans itself on Drop;
+    // panic-leaked segments are swept by the pipeline TempDir Drop.
     let mut spill_seq: u32 = 0;
 
     // Matching-run byte threshold: soft_limit / 4 (SPARK-13450 /
@@ -601,7 +605,7 @@ fn execute_combine_sort_merge_with_stats(
         build_qualifier,
         ctx,
         byte_limit,
-        spill_dir: &spill_dir,
+        spill_dir,
         spill_seq: &mut spill_seq,
         stats: &mut stats,
         output: &mut output_records,
@@ -609,10 +613,6 @@ fn execute_combine_sort_merge_with_stats(
         emitted_since_check: &mut emitted_since_check,
         budget,
     })?;
-
-    // Drop the temp dir last; matching-run spill files are bound to its
-    // lifetime via `Arc<Path>` clones held inside the buffer.
-    drop(spill_root);
 
     // ── on_miss / collect-mode flush ─────────────────────────────────
     //
@@ -972,7 +972,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
         for (build_record, build_key) in build_pairs.iter() {
             if apply_op(driver_key, op, build_key) {
                 let was_inmemory = matches!(run, MatchingRunBuffer::InMemory { .. });
-                push_to_buffer(
+                let written = push_to_buffer(
                     &mut run,
                     build_record.clone(),
                     byte_limit,
@@ -984,6 +984,16 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
                     node: name.to_string(),
                     detail: format!("sort-merge matching-run spill failed: {e}"),
                 })?;
+                if written > 0 && budget.record_spill_bytes(written) {
+                    return Err(PipelineError::Compilation {
+                        transform_name: name.to_string(),
+                        messages: vec![format!(
+                            "E310 sort-merge matching-run exceeded disk-spill quota: {} > {}",
+                            budget.cumulative_spill_bytes(),
+                            budget.disk_quota()
+                        )],
+                    });
+                }
                 if was_inmemory && matches!(run, MatchingRunBuffer::Spilled { .. }) {
                     spilled_this_run = true;
                 }
@@ -1486,6 +1496,10 @@ mod tests {
             Some(b) => MemoryBudget::new(b, 0.80),
             None => MemoryBudget::from_config(None),
         };
+        let dir = tempfile::Builder::new()
+            .prefix("sm-test-")
+            .tempdir()
+            .expect("sort-merge test temp dir");
         let args = SortMergeExec {
             name: "sm_test",
             build_qualifier: rk.build_qual,
@@ -1500,8 +1514,15 @@ mod tests {
             presorted: rk.presorted,
             ctx: &ctx,
             budget: &mut budget,
+            spill_dir: dir.path(),
         };
-        execute_combine_sort_merge_with_stats(args).expect("sort-merge kernel execution failed")
+        let result = execute_combine_sort_merge_with_stats(args)
+            .expect("sort-merge kernel execution failed");
+        // Hold the TempDir until the kernel has consumed every spill
+        // segment; segments carry `Arc<Path>` references back into
+        // this directory.
+        drop(dir);
+        result
     }
 
     /// Pure-range correctness gate: products vs tax brackets.

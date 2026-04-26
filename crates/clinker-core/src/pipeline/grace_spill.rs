@@ -117,8 +117,13 @@ impl GraceSpillWriter {
         Ok(())
     }
 
-    /// Finalize the LZ4 frame, append the footer, return the file path.
-    pub(crate) fn finish(self) -> std::io::Result<SpillFilePath> {
+    /// Finalize the LZ4 frame, append the footer, return the file
+    /// path along with the byte length of the finished file.
+    ///
+    /// The byte length feeds [`crate::pipeline::memory::MemoryBudget::record_spill_bytes`]
+    /// so the disk-quota poll can tally cumulative on-disk usage
+    /// without re-stat'ing each finalized file.
+    pub(crate) fn finish(self) -> std::io::Result<(SpillFilePath, u64)> {
         let Self {
             encoder,
             path,
@@ -133,7 +138,7 @@ impl GraceSpillWriter {
             .into_inner()
             .map_err(|e| std::io::Error::other(e.into_error().to_string()))?;
         // Seek to current end and append footer; LZ4 frame is closed.
-        file.seek(SeekFrom::End(0))?;
+        let body_end = file.seek(SeekFrom::End(0))?;
         let mut footer = [0u8; FOOTER_SIZE];
         footer[0..4].copy_from_slice(&GRACE_SPILL_MAGIC.to_le_bytes());
         footer[4..6].copy_from_slice(&GRACE_SPILL_VERSION.to_le_bytes());
@@ -142,7 +147,8 @@ impl GraceSpillWriter {
         footer[9..17].copy_from_slice(&record_count.to_le_bytes());
         file.write_all(&footer)?;
         file.flush()?;
-        Ok(Arc::from(path.as_path()))
+        let total_bytes = body_end + FOOTER_SIZE as u64;
+        Ok((Arc::from(path.as_path()), total_bytes))
     }
 }
 
@@ -312,7 +318,9 @@ mod tests {
         for i in 0..50 {
             w.write_record(&record(&s, i, &format!("row-{i}"))).unwrap();
         }
-        let path = w.finish().unwrap();
+        let (path, bytes) = w.finish().unwrap();
+        let on_disk = std::fs::metadata(&*path).unwrap().len();
+        assert_eq!(bytes, on_disk, "reported byte count must match file size");
 
         let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
         assert_eq!(reader.header().record_count, 50);
@@ -331,7 +339,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = schema();
         let w = GraceSpillWriter::new(dir.path(), 4, 0).unwrap();
-        let path = w.finish().unwrap();
+        let (path, _bytes) = w.finish().unwrap();
         let reader = GraceSpillReader::open(&path, Arc::clone(&s)).unwrap();
         assert_eq!(reader.header().record_count, 0);
         let recs: Vec<_> = reader.collect();
@@ -346,7 +354,7 @@ mod tests {
         for i in 0..10 {
             w.write_record(&record(&s, i, "x")).unwrap();
         }
-        let path = w.finish().unwrap();
+        let (path, _bytes) = w.finish().unwrap();
 
         // Corrupt: chop off the last 32 bytes BEFORE the footer (i.e. body bytes).
         let total = std::fs::metadata(&*path).unwrap().len();
@@ -387,7 +395,7 @@ mod tests {
         let s = schema();
         let mut w = GraceSpillWriter::new(dir.path(), 4, 0).unwrap();
         w.write_record(&record(&s, 1, "a")).unwrap();
-        let path = w.finish().unwrap();
+        let (path, _bytes) = w.finish().unwrap();
 
         // Overwrite magic bytes with garbage.
         let mut f = std::fs::OpenOptions::new()

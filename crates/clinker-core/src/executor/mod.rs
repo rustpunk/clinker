@@ -2937,6 +2937,26 @@ impl PipelineExecutor {
             .map(|(i, t)| (t.name.as_str(), i))
             .collect();
 
+        // Pipeline-scoped spill directory. One TempDir per pipeline
+        // run; every spilling operator borrows its path. Drop runs at
+        // the end of the walk (normal exit) or during stack unwinding
+        // (panic), so any individual spill file an operator left
+        // behind mid-flight gets swept by the directory's recursive
+        // remove. This is the secondary cleanup sweep that closes the
+        // panic-leak hole; primary cleanup remains per-file via
+        // `tempfile::TempPath` Drop.
+        let spill_root = Arc::new(
+            tempfile::Builder::new()
+                .prefix("clinker-spill-")
+                .tempdir()
+                .map_err(|e| PipelineError::Internal {
+                    op: "executor",
+                    node: String::new(),
+                    detail: format!("failed to allocate pipeline spill root: {e}"),
+                })?,
+        );
+        let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
+
         // Construct the dispatcher context. Mutable per-walk state
         // (node_buffers, counters, DLQ, timers, output writers,
         // output errors, the visited-source set backing the
@@ -2975,6 +2995,8 @@ impl PipelineExecutor {
             recursion_depth: 0,
             compiled_routes_by_name,
             current_body_node_input_refs: None,
+            spill_root,
+            spill_root_path,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2985,6 +3007,13 @@ impl PipelineExecutor {
         for node_idx in plan.topo_order.clone() {
             dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
         }
+
+        // Take the pipeline-scoped TempDir out of the context. Held
+        // until the very end of the walk so any operator-side spill
+        // files survive the topo loop; dropped explicitly below
+        // after the metrics flush so the directory's recursive
+        // remove runs after every reader has gone away.
+        let pipeline_spill_root = ctx.spill_root().clone();
 
         // Drain mutable per-walk state out of the context for the
         // post-walk reporting + caller-facing return tuple.
@@ -3028,6 +3057,14 @@ impl PipelineExecutor {
             1 => return Err(output_errors.into_iter().next().unwrap()),
             _ => return Err(PipelineError::Multiple(output_errors)),
         }
+
+        // Release the pipeline-scoped TempDir Arc clone last; the
+        // directory drops once the original `ctx.spill_root` and
+        // this clone are both gone. Spill operators have already
+        // released their per-file `TempPath` handles by this point;
+        // any path the dispatcher couldn't drain still lives inside
+        // this directory, and its Drop now sweeps the filesystem.
+        drop(pipeline_spill_root);
 
         Ok((
             std::mem::take(counters),

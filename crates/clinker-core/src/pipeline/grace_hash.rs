@@ -42,10 +42,13 @@
 //!
 //! ## Cleanup
 //!
-//! The executor owns a [`tempfile::TempDir`]. Drop removes the
-//! directory on normal exit and on panic unwind.
+//! The executor borrows a path inside the pipeline-scoped
+//! `Arc<tempfile::TempDir>` carried on `ExecutorContext`. Each
+//! committed spill file (a [`tempfile::TempPath`]) deletes itself on
+//! Drop; the pipeline-scoped TempDir Drop is the secondary sweep that
+//! collects files leaked by an operator panic.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ahash::RandomState;
@@ -53,7 +56,6 @@ use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 use cxl::typecheck::TypedProgram;
-use tempfile::TempDir;
 
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
@@ -348,28 +350,44 @@ pub(crate) struct GraceHashExec<'a> {
     pub partition_bits: u8,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a mut MemoryBudget,
+    /// Pipeline-scoped spill directory. Owned by the executor's
+    /// `Arc<TempDir>` on `ExecutorContext`; this borrow lives for one
+    /// combine invocation. Cleanup of individual spill files runs on
+    /// `tempfile::TempPath` Drop; the pipeline-scoped TempDir Drop
+    /// closes the panic-leak hole for files committed mid-combine.
+    pub spill_dir: &'a Path,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
 // GraceHashExecutor
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Stateful grace hash executor. Owns the temp directory, the partition
-/// table, and the memory budget. Public surface is constructed and
-/// driven by [`execute_combine_grace_hash`]; the type itself is
-/// `pub(crate)` so unit tests in this module can assert on the
-/// transition lifecycle.
+/// Stateful grace hash executor. Owns the partition table and the
+/// memory budget; the spill directory is supplied by the caller and
+/// owned outside the executor (the pipeline-scoped `Arc<TempDir>`
+/// lives on `ExecutorContext` so cleanup spans the whole run rather
+/// than each operator). Public surface is constructed and driven by
+/// [`execute_combine_grace_hash`]; the type itself is `pub(crate)` so
+/// unit tests in this module can assert on the transition lifecycle.
 pub(crate) struct GraceHashExecutor {
     assigner: PartitionAssigner,
     partitions: Vec<PartitionState>,
-    spill_dir: TempDir,
+    spill_dir: PathBuf,
     hash_state: RandomState,
+    /// Bytes written across every spill commit this executor has
+    /// performed. Drained by [`Self::take_spilled_bytes`] so the
+    /// caller can fold the delta into [`MemoryBudget::record_spill_bytes`]
+    /// and surface E310 on disk-quota overflow.
+    spilled_bytes: u64,
 }
 
 impl GraceHashExecutor {
-    /// Build a fresh executor sized for `partition_bits`. Allocates a
-    /// fresh temp directory; cleanup runs on Drop.
-    pub(crate) fn new(partition_bits: u8) -> std::io::Result<Self> {
+    /// Build a fresh executor sized for `partition_bits`. The caller
+    /// supplies the spill directory — a path inside the pipeline-scoped
+    /// `Arc<TempDir>` from `ExecutorContext::spill_root_path`. Cleanup
+    /// of individual files runs on `tempfile::TempPath` Drop; the
+    /// pipeline-scoped TempDir provides the secondary panic-safe sweep.
+    pub(crate) fn new(partition_bits: u8, spill_dir: &Path) -> std::io::Result<Self> {
         let assigner = PartitionAssigner::new(partition_bits.max(1));
         let n = assigner.num_partitions();
         let mut partitions = Vec::with_capacity(n);
@@ -380,19 +398,27 @@ impl GraceHashExecutor {
                 distinct_sketch: Hll::new(),
             });
         }
-        let spill_dir = tempfile::Builder::new().prefix("grace-hash-").tempdir()?;
         Ok(Self {
             assigner,
             partitions,
-            spill_dir,
+            spill_dir: spill_dir.to_path_buf(),
             hash_state: RandomState::new(),
+            spilled_bytes: 0,
         })
     }
 
-    /// Path of the temp directory hosting per-partition spill files.
-    /// Exposed for cleanup-on-Drop tests.
+    /// Path of the spill directory hosting per-partition files.
+    /// Borrowed reference into the caller-owned `Arc<TempDir>`.
     pub(crate) fn spill_dir_path(&self) -> &Path {
-        self.spill_dir.path()
+        &self.spill_dir
+    }
+
+    /// Drain the cumulative spill-bytes counter and return it. The
+    /// caller folds the result into
+    /// [`MemoryBudget::record_spill_bytes`] after each operation that
+    /// may have spilled (build, probe finalize, repartition).
+    pub(crate) fn take_spilled_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.spilled_bytes)
     }
 
     /// Hash state shared by every partition. Build and probe must hash
@@ -451,9 +477,10 @@ impl GraceHashExecutor {
                 }
             }
             Some(hash_bits) => {
-                let mut w = GraceSpillWriter::new(self.spill_dir.path(), hash_bits, p as u16)?;
+                let mut w = GraceSpillWriter::new(&self.spill_dir, hash_bits, p as u16)?;
                 w.write_record(&record)?;
-                let new_path = w.finish()?;
+                let (new_path, written) = w.finish()?;
+                self.spilled_bytes = self.spilled_bytes.saturating_add(written);
                 if let PartitionState::OnDisk {
                     build_files,
                     build_count,
@@ -521,12 +548,13 @@ impl GraceHashExecutor {
                 return Ok(());
             }
         };
-        let mut writer = GraceSpillWriter::new(self.spill_dir.path(), hash_bits, partition_id)?;
+        let mut writer = GraceSpillWriter::new(&self.spill_dir, hash_bits, partition_id)?;
         let count = records.len() as u64;
         for r in records {
             writer.write_record(&r)?;
         }
-        let path = writer.finish()?;
+        let (path, written) = writer.finish()?;
+        self.spilled_bytes = self.spilled_bytes.saturating_add(written);
         self.partitions[idx] = PartitionState::OnDisk {
             build_files: vec![path],
             probe_writer: None,
@@ -609,7 +637,7 @@ impl GraceHashExecutor {
             } => {
                 if probe_writer.is_none() {
                     *probe_writer = Some(Box::new(GraceSpillWriter::new(
-                        self.spill_dir.path(),
+                        &self.spill_dir,
                         *hash_bits,
                         // Probe-side files share the partition_id but
                         // are distinguishable by adding 0x8000 — the
@@ -640,6 +668,7 @@ impl GraceHashExecutor {
     /// before the reload phase reopens them. Build-side writers were
     /// already finalized in `spill_partition`.
     pub(crate) fn finalize_probe_spills(&mut self) -> std::io::Result<()> {
+        let mut written_total: u64 = 0;
         for state in &mut self.partitions {
             if let PartitionState::OnDisk {
                 probe_writer,
@@ -648,10 +677,12 @@ impl GraceHashExecutor {
             } = state
                 && let Some(w) = probe_writer.take()
             {
-                let path = (*w).finish()?;
+                let (path, written) = (*w).finish()?;
+                written_total = written_total.saturating_add(written);
                 probe_files.push(path);
             }
         }
+        self.spilled_bytes = self.spilled_bytes.saturating_add(written_total);
         Ok(())
     }
 
@@ -744,6 +775,7 @@ pub(crate) fn execute_combine_grace_hash(
         partition_bits,
         ctx,
         budget,
+        spill_dir,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -810,10 +842,10 @@ pub(crate) fn execute_combine_grace_hash(
         .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
 
     let mut executor =
-        GraceHashExecutor::new(partition_bits).map_err(|e| PipelineError::Internal {
+        GraceHashExecutor::new(partition_bits, spill_dir).map_err(|e| PipelineError::Internal {
             op: "combine",
             node: name.to_string(),
-            detail: format!("grace hash temp dir alloc failed: {e}"),
+            detail: format!("grace hash spill dir bind failed: {e}"),
         })?;
 
     // ── Build phase ────────────────────────────────────────────────────
@@ -835,6 +867,16 @@ pub(crate) fn execute_combine_grace_hash(
             })?;
     }
     executor.finish_build(&build_extractor, ctx, budget)?;
+    if budget.record_spill_bytes(executor.take_spilled_bytes()) {
+        return Err(PipelineError::Compilation {
+            transform_name: name.to_string(),
+            messages: vec![format!(
+                "E310 grace hash build exceeded disk-spill quota: {} > {}",
+                budget.cumulative_spill_bytes(),
+                budget.disk_quota()
+            )],
+        });
+    }
 
     // ── Probe phase ───────────────────────────────────────────────────
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
@@ -918,6 +960,16 @@ pub(crate) fn execute_combine_grace_hash(
             node: name.to_string(),
             detail: format!("grace hash probe finalize failed: {e}"),
         })?;
+    if budget.record_spill_bytes(executor.take_spilled_bytes()) {
+        return Err(PipelineError::Compilation {
+            transform_name: name.to_string(),
+            messages: vec![format!(
+                "E310 grace hash probe exceeded disk-spill quota: {} > {}",
+                budget.cumulative_spill_bytes(),
+                budget.disk_quota()
+            )],
+        });
+    }
 
     // ── Reload phase ──────────────────────────────────────────────────
     // Process every spilled partition pair. A reloaded partition that
@@ -1165,11 +1217,23 @@ fn process_spilled_partition(
                     detail: format!("grace hash repartition build write: {e}"),
                 })?;
             }
-            let bpath = bw.finish().map_err(|e| PipelineError::Internal {
+            let (bpath, b_written) = bw.finish().map_err(|e| PipelineError::Internal {
                 op: "combine",
                 node: name.to_string(),
                 detail: format!("grace hash repartition build finalize: {e}"),
             })?;
+            if budget.record_spill_bytes(b_written) {
+                return Err(PipelineError::Compilation {
+                    transform_name: name.to_string(),
+                    messages: vec![format!(
+                        "E310 grace hash repartition build exceeded disk-spill quota \
+                         (partition_id={}): {} > {}",
+                        child_id,
+                        budget.cumulative_spill_bytes(),
+                        budget.disk_quota()
+                    )],
+                });
+            }
             let mut probe_files: Vec<SpillFilePath> = Vec::new();
             if !child_probe.is_empty() {
                 let mut pw = GraceSpillWriter::new(
@@ -1189,11 +1253,23 @@ fn process_spilled_partition(
                         detail: format!("grace hash repartition probe write: {e}"),
                     })?;
                 }
-                let p = pw.finish().map_err(|e| PipelineError::Internal {
+                let (p, p_written) = pw.finish().map_err(|e| PipelineError::Internal {
                     op: "combine",
                     node: name.to_string(),
                     detail: format!("grace hash repartition probe finalize: {e}"),
                 })?;
+                if budget.record_spill_bytes(p_written) {
+                    return Err(PipelineError::Compilation {
+                        transform_name: name.to_string(),
+                        messages: vec![format!(
+                            "E310 grace hash repartition probe exceeded disk-spill quota \
+                             (partition_id={}): {} > {}",
+                            child_id,
+                            budget.cumulative_spill_bytes(),
+                            budget.disk_quota()
+                        )],
+                    });
+                }
                 probe_files.push(p);
             }
             let child_sp = SpilledPartition {
@@ -1866,27 +1942,62 @@ mod tests {
     }
 
     #[test]
-    fn temp_dir_cleaned_on_drop() {
-        let exec = GraceHashExecutor::new(4).unwrap();
-        let path = exec.spill_dir_path().to_path_buf();
-        assert!(path.exists());
+    fn pipeline_temp_dir_owns_spill_files_on_drop() {
+        // Pipeline-scoped TempDir is the owner; the executor only
+        // borrows its path. Files committed via spill_partition stay
+        // alive while the TempDir lives and disappear when it drops.
+        let pipeline_dir = tempfile::Builder::new()
+            .prefix("grace-pipeline-")
+            .tempdir()
+            .unwrap();
+        let pipeline_path = pipeline_dir.path().to_path_buf();
+        let mut exec = GraceHashExecutor::new(4, pipeline_dir.path()).unwrap();
+        let schema = schema_with(&["k"]);
+        // Deposit a record and force a spill so a file actually exists.
+        let rec = record_for(&schema, vec![Value::Integer(7)]);
+        let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+        exec.add_build_record(rec, 0, &mut budget).unwrap();
+        exec.spill_partition(0).unwrap();
+        let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
+        assert!(spilled_inside >= 1, "spill_partition must commit a file");
         drop(exec);
-        assert!(!path.exists(), "spill dir must be removed on Drop");
+        assert!(
+            pipeline_path.exists(),
+            "pipeline-scoped dir must outlive the executor"
+        );
+        drop(pipeline_dir);
+        assert!(
+            !pipeline_path.exists(),
+            "pipeline-scoped dir Drop must remove the spill files"
+        );
     }
 
     #[test]
-    fn temp_dir_cleaned_on_panic() {
-        // Capture the path via a wrapper; on panic the TempDir's Drop
-        // still runs during unwinding.
+    fn pipeline_temp_dir_cleans_on_panic_unwind() {
+        // Operator-mid-spill panic leaks files unless an enclosing
+        // TempDir whose lifetime outlives the operator collects them.
+        // The pipeline-scoped TempDir provides that secondary sweep.
         let captured: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let exec = GraceHashExecutor::new(4).unwrap();
-            *captured.lock().unwrap() = Some(exec.spill_dir_path().to_path_buf());
-            panic!("simulated executor panic");
+            let pipeline_dir = tempfile::Builder::new()
+                .prefix("grace-panic-")
+                .tempdir()
+                .unwrap();
+            *captured.lock().unwrap() = Some(pipeline_dir.path().to_path_buf());
+            let mut exec = GraceHashExecutor::new(4, pipeline_dir.path()).unwrap();
+            let schema = schema_with(&["k"]);
+            let rec = record_for(&schema, vec![Value::Integer(99)]);
+            let mut budget = MemoryBudget::new(u64::MAX, 0.80);
+            exec.add_build_record(rec, 0, &mut budget).unwrap();
+            exec.spill_partition(0).unwrap();
+            panic!("simulated mid-spill panic");
         }));
         assert!(result.is_err(), "panic must propagate out");
         let path = captured.lock().unwrap().clone().unwrap();
-        assert!(!path.exists(), "spill dir must be removed on panic unwind");
+        assert!(
+            !path.exists(),
+            "pipeline-scoped TempDir Drop must clean spill files on panic unwind"
+        );
     }
 
     /// Add records into a low-budget executor and assert that at least
@@ -1894,7 +2005,11 @@ mod tests {
     #[test]
     fn spill_activates_under_tiny_budget() {
         let schema = schema_with(&["k", "v"]);
-        let mut exec = GraceHashExecutor::new(4).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("gh-test-")
+            .tempdir()
+            .unwrap();
+        let mut exec = GraceHashExecutor::new(4, dir.path()).unwrap();
         let mut budget = tiny_budget();
         for i in 0..256i64 {
             let rec = record_for(
@@ -1922,7 +2037,11 @@ mod tests {
     #[test]
     fn lazy_probe_spill_routes_to_partition_file() {
         let schema = schema_with(&["k"]);
-        let mut exec = GraceHashExecutor::new(4).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("gh-test-")
+            .tempdir()
+            .unwrap();
+        let mut exec = GraceHashExecutor::new(4, dir.path()).unwrap();
         let mut budget = tiny_budget();
 
         // Send 64 records all to partition 0 (top 4 bits = 0). Use a
@@ -2108,6 +2227,10 @@ mod tests {
         combined_schema_builder = combined_schema_builder.with_field("name");
         let combined_schema = combined_schema_builder.build();
 
+        let dir = tempfile::Builder::new()
+            .prefix("gh-e2e-")
+            .tempdir()
+            .unwrap();
         let result = execute_combine_grace_hash(GraceHashExec {
             name: "grace_test",
             build_qualifier: "products",
@@ -2122,6 +2245,7 @@ mod tests {
             partition_bits: 4,
             ctx: &ctx,
             budget: &mut budget,
+            spill_dir: dir.path(),
         })
         .expect("grace hash E2E");
 
@@ -2291,6 +2415,10 @@ mod tests {
         combined_schema_builder = combined_schema_builder.with_field("name");
         let combined_schema = combined_schema_builder.build();
 
+        let dir = tempfile::Builder::new()
+            .prefix("gh-spill-e2e-")
+            .tempdir()
+            .unwrap();
         let result = execute_combine_grace_hash(GraceHashExec {
             name: "grace_spill_test",
             build_qualifier: "products",
@@ -2305,6 +2433,7 @@ mod tests {
             partition_bits: 4,
             ctx: &ctx,
             budget: &mut budget,
+            spill_dir: dir.path(),
         })
         .expect("grace hash spill E2E");
 
@@ -2324,13 +2453,197 @@ mod tests {
         assert_eq!(keys, (0..32).collect::<Vec<_>>());
     }
 
+    /// Disk-quota gate: a build phase that spills more than the
+    /// configured `max_spill_bytes` aborts with E310 instead of
+    /// continuing to fill the disk. The hard memory limit is large
+    /// (so `should_abort` never fires); only the disk quota can
+    /// cause this combine to fail.
+    #[test]
+    fn execute_grace_hash_aborts_on_disk_quota_overflow() {
+        use crate::executor::combine::{CombineResolverMapping, JoinSide};
+        use crate::plan::combine::{DecomposedPredicate, EqualityConjunct};
+        use cxl::eval::{EvalContext, StableEvalContext};
+
+        let driver_schema = schema_with(&["dk", "v"]);
+        let build_schema = schema_with(&["bk", "name"]);
+
+        // Many records on the build side so the tiny spill threshold
+        // forces a partition flush before the quota gate trips.
+        let drivers: Vec<(Record, RecordOrder)> = (0..16i64)
+            .map(|i| {
+                (
+                    Record::new(
+                        Arc::clone(&driver_schema),
+                        vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
+                    ),
+                    i as u64,
+                )
+            })
+            .collect();
+        let builds: Vec<Record> = (0..512i64)
+            .map(|i| {
+                Record::new(
+                    Arc::clone(&build_schema),
+                    vec![
+                        Value::Integer(i % 16),
+                        Value::String(format!("b-{i:08}-padding-padding-padding-padding").into()),
+                    ],
+                )
+            })
+            .collect();
+
+        let (left_tp, left_expr) =
+            compile_key("emit k = dk", &["dk"], &[("dk", cxl::typecheck::Type::Int)]);
+        let (right_tp, right_expr) =
+            compile_key("emit k = bk", &["bk"], &[("bk", cxl::typecheck::Type::Int)]);
+        let decomposed = DecomposedPredicate {
+            equalities: vec![EqualityConjunct {
+                left_expr,
+                left_input: Arc::from("orders"),
+                left_program: left_tp,
+                right_expr,
+                right_input: Arc::from("products"),
+                right_program: right_tp,
+            }],
+            ranges: Vec::new(),
+            residual: None,
+        };
+
+        let mut mapping_q: std::collections::HashMap<
+            crate::plan::row_type::QualifiedField,
+            (JoinSide, u32),
+        > = std::collections::HashMap::new();
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("orders", "dk"),
+            (JoinSide::Probe, 0),
+        );
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("orders", "v"),
+            (JoinSide::Probe, 1),
+        );
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("products", "bk"),
+            (JoinSide::Build, 0),
+        );
+        mapping_q.insert(
+            crate::plan::row_type::QualifiedField::qualified("products", "name"),
+            (JoinSide::Build, 1),
+        );
+
+        let mut combine_inputs: indexmap::IndexMap<String, crate::plan::combine::CombineInput> =
+            indexmap::IndexMap::new();
+        let mut driver_row_cols: indexmap::IndexMap<
+            crate::plan::row_type::QualifiedField,
+            cxl::typecheck::Type,
+        > = indexmap::IndexMap::new();
+        driver_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("dk"),
+            cxl::typecheck::Type::Int,
+        );
+        driver_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("v"),
+            cxl::typecheck::Type::String,
+        );
+        let mut build_row_cols: indexmap::IndexMap<
+            crate::plan::row_type::QualifiedField,
+            cxl::typecheck::Type,
+        > = indexmap::IndexMap::new();
+        build_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("bk"),
+            cxl::typecheck::Type::Int,
+        );
+        build_row_cols.insert(
+            crate::plan::row_type::QualifiedField::bare("name"),
+            cxl::typecheck::Type::String,
+        );
+        combine_inputs.insert(
+            "orders".to_string(),
+            crate::plan::combine::CombineInput {
+                upstream_name: Arc::from("orders"),
+                row: crate::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
+                estimated_cardinality: None,
+            },
+        );
+        combine_inputs.insert(
+            "products".to_string(),
+            crate::plan::combine::CombineInput {
+                upstream_name: Arc::from("products"),
+                row: crate::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
+                estimated_cardinality: None,
+            },
+        );
+        let resolver_mapping =
+            CombineResolverMapping::from_pre_resolved(&Arc::new(mapping_q), &combine_inputs);
+
+        let stable = StableEvalContext::test_default();
+        let source_file: Arc<str> = Arc::from("test.csv");
+        let ctx = EvalContext {
+            stable: &stable,
+            source_file: &source_file,
+            source_row: 0,
+        };
+
+        // Memory hard limit huge so should_abort never fires; spill
+        // threshold tiny so spills happen; disk quota tight so the
+        // first partition flush trips it.
+        let mut budget = MemoryBudget::new(10 * 1024 * 1024 * 1024, 0.000_001);
+        budget.max_spill_bytes = 64;
+
+        let combined_schema = clinker_record::SchemaBuilder::new()
+            .with_field("dk")
+            .with_field("v")
+            .with_field("bk")
+            .with_field("name")
+            .build();
+
+        let dir = tempfile::Builder::new()
+            .prefix("gh-quota-")
+            .tempdir()
+            .unwrap();
+        let result = execute_combine_grace_hash(GraceHashExec {
+            name: "grace_quota_test",
+            build_qualifier: "products",
+            driver_records: drivers,
+            build_records: builds,
+            decomposed: &decomposed,
+            body_program: None,
+            resolver_mapping: &resolver_mapping,
+            output_schema: Some(&combined_schema),
+            match_mode: crate::config::pipeline_node::MatchMode::All,
+            on_miss: crate::config::pipeline_node::OnMiss::Skip,
+            partition_bits: 4,
+            ctx: &ctx,
+            budget: &mut budget,
+            spill_dir: dir.path(),
+        });
+
+        let err = result.expect_err("disk quota must abort the combine");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("E310"),
+            "error must surface E310 for disk-quota overflow; got {rendered}"
+        );
+        assert!(
+            rendered.contains("disk-spill quota"),
+            "error must mention disk-spill quota; got {rendered}"
+        );
+        assert!(
+            budget.cumulative_spill_bytes() > 64,
+            "cumulative_spill_bytes must reflect the overflowing total"
+        );
+    }
+
     /// Round-trip records through the spill writer/reader by calling
     /// `add_build_record`, `spill_largest_building`, then reloading via
     /// `drain_spilled` + `GraceSpillReader`.
     #[test]
     fn build_spill_reload_records_match() {
         let schema = schema_with(&["k", "v"]);
-        let mut exec = GraceHashExecutor::new(2).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("gh-test-")
+            .tempdir()
+            .unwrap();
+        let mut exec = GraceHashExecutor::new(2, dir.path()).unwrap();
         let mut budget = MemoryBudget::new(u64::MAX, 0.80); // never spills via budget
         let originals: Vec<Record> = (0..16i64)
             .map(|i| {
@@ -2404,7 +2717,7 @@ mod tests {
         stable: cxl::eval::StableEvalContext,
         source_file: Arc<str>,
         hash_state: ahash::RandomState,
-        spill_dir: TempDir,
+        spill_dir: tempfile::TempDir,
     }
 
     /// Owned analogue of [`EmitArgs`] — the live struct is borrow-only,
@@ -2602,7 +2915,7 @@ mod tests {
             let keys = h.build_extractor.extract(&ctx, r).unwrap();
             sketch.add(hash_composite_key(&keys, &h.hash_state));
         }
-        let bpath = bw.finish().unwrap();
+        let (bpath, _b_written) = bw.finish().unwrap();
         let mut probe_files: Vec<SpillFilePath> = Vec::new();
         if !probe_records.is_empty() {
             let mut pw =
@@ -2611,7 +2924,8 @@ mod tests {
             for r in probe_records {
                 pw.write_record(r).unwrap();
             }
-            probe_files.push(pw.finish().unwrap());
+            let (p_path, _p_written) = pw.finish().unwrap();
+            probe_files.push(p_path);
         }
         SpilledPartition {
             partition_id,
