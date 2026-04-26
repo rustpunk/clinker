@@ -687,3 +687,336 @@ nodes:
     );
     assert_eq!(counters.ok_count, 1, "the original-B group emitted");
 }
+
+#[test]
+fn combine_output_inherits_driver_correlation_meta() {
+    // A combine's output rows must inherit the driver record's
+    // correlation meta so they participate in the same buffer cell as
+    // any driver-side trigger error from the same correlation group.
+    // The driver side carries the authoritative group identity;
+    // build-side rows are consumed by the hash table and never reach
+    // the writer directly.
+    //
+    // Mechanism: the combine arm emits each combined record by either
+    // (a) cloning the driver record and overlaying the body's emitted
+    // fields, or (b) widening the driver record to the combine's
+    // output schema via `widen_record_to_schema`, which copies
+    // `iter_meta()` from the driver onto the widened record. Either
+    // way the driver's `__cxl_correlation_key` meta survives onto the
+    // combined output.
+    //
+    // Test pipeline: orders (driver) → validate (transform that fails
+    // on a bad amount) → combine with departments (build) on
+    // employee_id → output. correlation_key=employee_id stamped at
+    // both sources. Group A's bad row triggers a buffer error; the
+    // surviving A driver records produce combined rows that must DLQ
+    // as Correlated collaterals. Group B's clean driver record
+    // produces a combined row that flushes to the writer.
+    let yaml = r#"
+pipeline:
+  name: combine_correlation_meta
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: amount, type: string }
+
+- type: source
+  name: departments
+  config:
+    name: departments
+    path: departments.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: dept, type: string }
+
+- type: transform
+  name: validate
+  input: orders
+  config:
+    cxl: 'emit employee_id = employee_id
+
+      emit amount_int = amount.to_int()
+
+      '
+- type: combine
+  name: enriched
+  input:
+    o: validate
+    d: departments
+  config:
+    where: 'o.employee_id == d.employee_id'
+    match: first
+    on_miss: skip
+    cxl: |
+      emit employee_id = o.employee_id
+      emit amount_int = o.amount_int
+      emit dept = d.dept
+
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: false
+"#;
+    let orders_csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,7\n";
+    let departments_csv = "employee_id,dept\nA,HR\nB,ENG\n";
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = PipelineRunParams {
+        execution_id: "test-exec-id".to_string(),
+        batch_id: "test-batch-id".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+    };
+
+    let primary = "orders".to_string();
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+        (
+            "orders".to_string(),
+            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+        (
+            "departments".to_string(),
+            Box::new(std::io::Cursor::new(departments_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+    ]);
+
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
+            .unwrap();
+    let output = buf.as_string();
+
+    // Group A driver records: A,1 (clean) and A,3 (clean) survive
+    // validate; A,bad triggers the buffer error. The 2 surviving
+    // driver records produce 2 combined output rows (each matched
+    // with department HR). Both DLQ as collaterals; the bad row
+    // DLQs as the trigger. Total = 3.
+    assert_eq!(
+        report.counters.dlq_count, 3,
+        "group A: 1 trigger (bad row) + 2 collaterals (combined output rows for A,1 and A,3)"
+    );
+    assert_eq!(
+        report.counters.ok_count, 1,
+        "group B's combined row (B,7,ENG) is the only emission"
+    );
+
+    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
+    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    assert_eq!(triggers, 1, "one trigger for the bad source row");
+    assert_eq!(
+        collaterals, 2,
+        "two collaterals for the surviving driver-side combined output rows"
+    );
+
+    for c in report.dlq_entries.iter().filter(|e| !e.trigger) {
+        assert_eq!(
+            c.category,
+            crate::dlq::DlqErrorCategory::Correlated,
+            "combined-output collateral carries the Correlated category"
+        );
+    }
+
+    assert!(
+        output.contains("B,7,ENG"),
+        "output should contain group B's combined row: {output}"
+    );
+    assert!(
+        !output.contains("A,1") && !output.contains("A,3"),
+        "output must NOT contain any group A combined row (group A failed): {output}"
+    );
+}
+
+#[test]
+fn combine_chain_output_inherits_driver_correlation_meta() {
+    // Three-input combine decomposed into a left-deep chain of two
+    // binary steps. Step 0 (synthetic, body-less) joins the driver
+    // with the first build input and emits an intermediate record
+    // that becomes step 1's driver. Step 1 (final, body-bearing)
+    // joins that intermediate with the second build input and emits
+    // the user-projected output row.
+    //
+    // The intermediate record must carry the original driver's
+    // correlation meta so that step 1's widen path can re-emit it
+    // onto the final output row. If step 0 drops meta, step 1's
+    // driver has none, the final widen has nothing to copy, and the
+    // output rows fall into null buffer cells disconnected from any
+    // upstream trigger error.
+    //
+    // Test pipeline: orders (driver, with department_id correlation
+    // key) → validate (transform that fails on a bad amount) →
+    // 3-input combine (orders ⨝ products on product_id, then ⨝
+    // categories on category_id) → output. correlation_key is
+    // department_id so the trigger error from one bad record in
+    // department A propagates to invalidate the surviving
+    // department-A combined output rows.
+    let yaml = r#"
+pipeline:
+  name: combine_chain_correlation_meta
+error_handling:
+  strategy: continue
+  correlation_key: department_id
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department_id, type: string }
+      - { name: product_id, type: string }
+      - { name: amount, type: string }
+
+- type: source
+  name: products
+  config:
+    name: products
+    path: products.csv
+    type: csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+      - { name: category_id, type: string }
+
+- type: source
+  name: categories
+  config:
+    name: categories
+    path: categories.csv
+    type: csv
+    schema:
+      - { name: category_id, type: string }
+      - { name: category_name, type: string }
+
+- type: transform
+  name: validate
+  input: orders
+  config:
+    cxl: |
+      emit order_id = order_id
+      emit department_id = department_id
+      emit product_id = product_id
+      emit amount_int = amount.to_int()
+
+- type: combine
+  name: enriched
+  input:
+    o: validate
+    p: products
+    c: categories
+  config:
+    where: "o.product_id == p.product_id and p.category_id == c.category_id"
+    match: first
+    on_miss: skip
+    cxl: |
+      emit order_id = o.order_id
+      emit department_id = o.department_id
+      emit product_name = p.name
+      emit category_name = c.category_name
+      emit amount_int = o.amount_int
+
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: false
+"#;
+    let orders_csv = "order_id,department_id,product_id,amount\nO1,A,P1,100\nO2,A,P1,bad\nO3,A,P2,300\nO4,B,P2,400\n";
+    let products_csv = "product_id,name,category_id\nP1,Widget,C1\nP2,Gadget,C2\n";
+    let categories_csv = "category_id,category_name\nC1,Hardware\nC2,Software\n";
+
+    let config = crate::config::parse_config(yaml).unwrap();
+    let params = PipelineRunParams {
+        execution_id: "test-exec-id".to_string(),
+        batch_id: "test-batch-id".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+    };
+
+    let primary = "orders".to_string();
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+        (
+            "orders".to_string(),
+            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+        (
+            "products".to_string(),
+            Box::new(std::io::Cursor::new(products_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+        (
+            "categories".to_string(),
+            Box::new(std::io::Cursor::new(categories_csv.as_bytes().to_vec()))
+                as Box<dyn std::io::Read + Send>,
+        ),
+    ]);
+
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
+            .unwrap();
+    let output = buf.as_string();
+
+    // Department A: O1 and O3 succeed validate; O2 fails (trigger).
+    // Both surviving driver rows produce one combined output row each
+    // through the 2-step chain. With correct meta inheritance both
+    // combined rows DLQ as collaterals. Trigger + 2 collaterals = 3.
+    // Department B: O4 succeeds and produces one clean combined row
+    // that flushes to the writer.
+    assert_eq!(
+        report.counters.dlq_count, 3,
+        "department A: 1 trigger (bad row) + 2 collaterals (chain output rows for O1 and O3)"
+    );
+    assert_eq!(
+        report.counters.ok_count, 1,
+        "department B's combined row (O4) is the only emission"
+    );
+
+    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
+    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    assert_eq!(triggers, 1, "one trigger for the bad source row");
+    assert_eq!(
+        collaterals, 2,
+        "two collaterals for the surviving driver-side chain output rows"
+    );
+
+    assert!(
+        output.contains("O4"),
+        "output should contain department B's combined row: {output}"
+    );
+    assert!(
+        !output.contains("O1") && !output.contains("O3"),
+        "output must NOT contain department A combined rows (department A failed): {output}"
+    );
+}

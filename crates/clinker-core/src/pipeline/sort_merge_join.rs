@@ -1198,8 +1198,14 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             ),
                         });
                     }
-                    args.output
-                        .push((Record::new(Arc::clone(target_schema), values), driver_order));
+                    let mut rec = Record::new(Arc::clone(target_schema), values);
+                    // Carry the driver's meta forward so the chain's final
+                    // step can re-emit `__cxl_correlation_key` onto the
+                    // user-projected output row.
+                    for (k, v) in driver_record.iter_meta() {
+                        let _ = rec.set_meta(k, v.clone());
+                    }
+                    args.output.push((rec, driver_order));
                 } else {
                     // No body and no output schema (test-mode pass-through):
                     // emit one record per match carrying the driver record

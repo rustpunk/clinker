@@ -2167,7 +2167,16 @@ pub(crate) fn dispatch_plan_node(
                                         ),
                                     });
                                 }
-                                let rec = Record::new(Arc::clone(target_schema), values);
+                                let mut rec = Record::new(Arc::clone(target_schema), values);
+                                // Driver-side meta is the authoritative carrier
+                                // for `__cxl_correlation_key` through an N-ary
+                                // chain — without it the next chain step's
+                                // `widen_record_to_schema` finds no meta to copy
+                                // and the final output row falls into a null
+                                // correlation buffer cell.
+                                for (k, v) in probe_record.iter_meta() {
+                                    let _ = rec.set_meta(k, v.clone());
+                                }
                                 output_records.push((rec, rn));
                                 emitted_since_check += 1;
                             }

@@ -824,7 +824,13 @@ pub(crate) fn execute_combine_iejoin(
                                     ),
                                 });
                             }
-                            let rec = Record::new(Arc::clone(target_schema), values);
+                            let mut rec = Record::new(Arc::clone(target_schema), values);
+                            // Carry the driver's meta forward so the chain's
+                            // final step can re-emit `__cxl_correlation_key`
+                            // onto the user-projected output row.
+                            for (k, v) in driver_record.iter_meta() {
+                                let _ = rec.set_meta(k, v.clone());
+                            }
                             output_records.push((rec, driver_order));
                             matched_driver[driver_idx] = true;
                             emitted_since_check += 1;

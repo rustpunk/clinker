@@ -1801,7 +1801,14 @@ fn emit_for_probe<'a>(
                             ),
                         });
                     }
-                    output.push((Record::new(Arc::clone(target_schema), values), rn));
+                    let mut rec = Record::new(Arc::clone(target_schema), values);
+                    // Carry the probe's meta forward through the chain so the
+                    // final step can re-emit `__cxl_correlation_key` onto the
+                    // user-projected output row.
+                    for (k, v) in probe_record.iter_meta() {
+                        let _ = rec.set_meta(k, v.clone());
+                    }
+                    output.push((rec, rn));
                 }
             }
         }
