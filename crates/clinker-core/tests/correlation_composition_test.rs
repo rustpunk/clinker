@@ -8,10 +8,10 @@
 //!   errors. The whole correlation group DLQs uniformly; clean groups
 //!   pass through.
 //!
-//! * Group identity is captured at Source ingest as
-//!   `__cxl_correlation_key` meta and survives a rewrite of the
-//!   underlying field — even when the rewrite happens inside a
-//!   composition body.
+//! * Group identity is captured at Source ingest into a write-
+//!   protected `$ck.<field>` shadow column on the Source's schema
+//!   and survives a rewrite of the underlying user-declared field —
+//!   even when the rewrite happens inside a composition body.
 //!
 //! These tests are the body-scope siblings of
 //! `executor::tests::correlated_dlq::one_fail_dlqs_whole_group` and
@@ -196,9 +196,10 @@ fn composition_body_key_rewrite_does_not_change_group_identity() {
     // Source → composition(correlated_rewrite) → output. The body's
     // Transform overwrites `employee_id` to a fixed string before the
     // `value.to_int()` failure fires. Group identity is captured at
-    // Source ingest as `__cxl_correlation_key` meta (independent of
-    // emitted fields), so the body's rewrite cannot move records
-    // between groups.
+    // Source ingest into the `$ck.employee_id` shadow column (the
+    // CXL parser rejects user emits on the `$ck.*` namespace, so the
+    // body cannot rewrite the snapshot), and the column propagates
+    // positionally through the body's mini-DAG.
     //
     // If grouping wrongly used the rewritten field value, every input
     // row would coalesce into one giant `REWRITTEN` group and the

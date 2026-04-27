@@ -1802,9 +1802,11 @@ fn emit_for_probe<'a>(
                         });
                     }
                     let mut rec = Record::new(Arc::clone(target_schema), values);
-                    // Carry the probe's meta forward through the chain so the
-                    // final step can re-emit `__cxl_correlation_key` onto the
-                    // user-projected output row.
+                    // Carry the probe's `$meta.*` forward through synthetic
+                    // chain steps. User-emitted record metadata travels with
+                    // the probe row by contract; without this copy the next
+                    // step's `widen_record_to_schema` finds no meta to
+                    // propagate.
                     for (k, v) in probe_record.iter_meta() {
                         let _ = rec.set_meta(k, v.clone());
                     }
@@ -1821,8 +1823,34 @@ fn widen(input: &Record, target: &Arc<Schema>) -> Record {
         return input.clone();
     }
     let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
-    for col in target.columns() {
-        values.push(input.get(col).cloned().unwrap_or(Value::Null));
+    for (i, col) in target.columns().iter().enumerate() {
+        let v = match input.get(col.as_ref()) {
+            Some(v) => v.clone(),
+            None => {
+                // Recover an engine-stamped column from a chain-encoded
+                // intermediate driver: column `$ck.<field>` arrives as
+                // `__<driver_qualifier>__$ck.<field>` in the final
+                // step's driver record. See
+                // `executor::widen_record_to_schema` for the canonical
+                // version of this logic.
+                let is_engine_stamped = target
+                    .field_metadata(i)
+                    .is_some_and(|m| m.is_engine_stamped());
+                if is_engine_stamped {
+                    let suffix = format!("__{}", col.as_ref());
+                    input
+                        .schema()
+                        .columns()
+                        .iter()
+                        .position(|n| n.as_ref().ends_with(&suffix))
+                        .map(|j| input.values()[j].clone())
+                        .unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+        };
+        values.push(v);
     }
     let mut out = Record::new(Arc::clone(target), values);
     for (k, v) in input.iter_meta() {

@@ -1477,6 +1477,20 @@ pub(crate) fn finalize_group_inner(
     let compiled = factory.compiled();
     let mut values: Vec<Value> = vec![Value::Null; output_schema.column_count()];
     let mut user_meta: IndexMap<Box<str>, Value> = IndexMap::new();
+    // Stamp every group-by column from the group key tuple. The CXL
+    // parser blocks `emit $ck.* = ...` so engine-stamped group-by
+    // columns (`$ck.<field>` shadow columns) have no covering emit
+    // and would otherwise leave the slot at `Value::Null`. User-emit
+    // statements still run after this loop and override the slot for
+    // any group-by column they cover, so explicit `emit X = X` writes
+    // win on collision.
+    for (key_idx, gb_name) in compiled.group_by_fields.iter().enumerate() {
+        if let Some(out_idx) = output_schema.index(gb_name)
+            && let Some(gk) = key.get(key_idx)
+        {
+            values[out_idx] = gk.to_value();
+        }
+    }
     for emit in &compiled.emits {
         let v = eval_expr_in_agg_scope(&emit.residual, &scope).map_err(HashAggError::Residual)?;
         if emit.is_meta {

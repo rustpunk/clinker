@@ -537,19 +537,19 @@ fn aggregate_output_inherits_correlation_meta() {
     // output row. Group B is clean and its aggregate row flushes to
     // the writer.
     //
-    // Mechanism: `MetadataCommonTracker` in HashAggregator /
-    // StreamingAggregator observes every input record's meta and at
-    // finalize() copies non-conflicting common pairs onto each
-    // emitted row. Under E151's group_by ⊇ correlation_key.fields()
-    // invariant every input record in a group shares the same
-    // `__cxl_correlation_key` meta, so the tracker forwards it to
-    // the aggregate output row.
+    // Mechanism: every record in a group carries the same
+    // `$ck.employee_id` snapshot column stamped at Source ingest. The
+    // E151 group_by ⊇ correlation_key.fields() invariant requires the
+    // user to list every correlation-key field in the Aggregate's
+    // group_by, so the snapshot column propagates positionally onto
+    // the aggregate output row and the buffer-key extractor finds
+    // the same group identity on the emitted row.
     //
-    // Without meta inheritance, the aggregate row for A would land
-    // in a distinct null-keyed buffer cell, group A's writer-side
-    // buffer would be "clean" (only the trigger event in cell [A]
-    // with no record slots), and group A's aggregate output would
-    // be wrongly emitted to the writer.
+    // Without that propagation the aggregate row for A would land in
+    // a distinct null-keyed buffer cell, group A's writer-side buffer
+    // would be "clean" (only the trigger event in cell [A] with no
+    // record slots), and group A's aggregate output would be wrongly
+    // emitted to the writer.
     let yaml = r#"
 pipeline:
   name: aggregate_correlation_meta
@@ -582,6 +582,7 @@ nodes:
   config:
     group_by:
     - employee_id
+    - $ck.employee_id
     cxl: 'emit employee_id = employee_id
 
       emit total = sum(val)
@@ -632,10 +633,13 @@ nodes:
 
 #[test]
 fn group_identity_fixed_at_ingest_when_transform_rewrites_key() {
-    // F.1: a Transform that rewrites the correlation_key field must
-    // not change a row's group identity. Group identity is captured at
-    // Source ingest (via `__cxl_correlation_key` meta) and survives
-    // every downstream Transform.
+    // A Transform that rewrites the correlation_key field must not
+    // change a row's group identity. Group identity is captured at
+    // Source ingest into a write-protected `$ck.<field>` shadow
+    // column on the Source's schema, and the snapshot value
+    // propagates positionally through every downstream operator that
+    // does not explicitly drop it (per the unified DAG-walk
+    // invariant).
     let yaml = r#"
 pipeline:
   name: rewrite_key_test
@@ -702,8 +706,9 @@ fn combine_output_inherits_driver_correlation_meta() {
     // fields, or (b) widening the driver record to the combine's
     // output schema via `widen_record_to_schema`, which copies
     // `iter_meta()` from the driver onto the widened record. Either
-    // way the driver's `__cxl_correlation_key` meta survives onto the
-    // combined output.
+    // way the driver's `$ck.<field>` snapshot column propagates onto
+    // the combined output's schema and the buffer-key extractor
+    // recovers the original correlation group on the emitted row.
     //
     // Test pipeline: orders (driver) → validate (transform that fails
     // on a bad amount) → combine with departments (build) on

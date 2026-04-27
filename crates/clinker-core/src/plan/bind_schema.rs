@@ -1899,7 +1899,12 @@ fn bind_combine(
         diags.push(combine_e309(name, span));
     }
 
-    let output_row = combine_output_row(&body_typed, cxl_span);
+    let driver_row = artifacts
+        .combine_driving
+        .get(name)
+        .and_then(|q| artifacts.combine_inputs.get(name).and_then(|m| m.get(q)))
+        .map(|input| input.row.clone());
+    let output_row = combine_output_row(&body_typed, driver_row.as_ref(), cxl_span);
     schema_by_name.insert(name.to_string(), output_row.clone());
     let mut body_typed = body_typed;
     body_typed.output_row = output_row;
@@ -2455,7 +2460,11 @@ fn walk_statement_exprs(
 /// Meta emits (`emit $meta.x = ...`) don't contribute to the output
 /// row schema; they write to per-record metadata, not the record
 /// itself.
-fn combine_output_row(typed: &TypedProgram, span: cxl::lexer::Span) -> Row {
+fn combine_output_row(
+    typed: &TypedProgram,
+    driver_row: Option<&Row>,
+    span: cxl::lexer::Span,
+) -> Row {
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for stmt in &typed.program.statements {
         if let Statement::Emit {
@@ -2474,6 +2483,24 @@ fn combine_output_row(typed: &TypedProgram, span: cxl::lexer::Span) -> Row {
                 .and_then(|t| t.clone())
                 .unwrap_or(Type::Any);
             out.insert(QualifiedField::bare(name.as_ref()), emit_type);
+        }
+    }
+    // Auto-append the driver's engine-stamped tail (`$ck.<field>`
+    // shadow columns) so the combined record's schema carries the
+    // driver's frozen-identity snapshot through the join boundary.
+    // The runtime `widen_record_to_schema` picks up the values from
+    // the driver record by name; without these slots the combined
+    // record would silently drop the snapshot and lose its
+    // correlation-group identity. Mirrors how the dispatch arm
+    // forwards `iter_meta()` from the driver, but for schema columns.
+    if let Some(driver) = driver_row {
+        for (qf, ty) in driver.fields() {
+            if qf.name.starts_with("$ck.") {
+                let bare = QualifiedField::bare(qf.name.clone());
+                if !out.contains_key(&bare) {
+                    out.insert(bare, ty.clone());
+                }
+            }
         }
     }
     Row::closed(out, span)

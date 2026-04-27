@@ -1297,17 +1297,19 @@ impl PipelineExecutor {
         // `error_handling.correlation_key` is set; the planner's
         // `inject_correlation_commit` pass guarantees a terminal
         // `PlanNode::CorrelationCommit` is also present so the
-        // dispatcher walks the buffers at end-of-DAG. Resolved here
-        // alongside arena/indices because both gate Phase-0 setup
-        // off the same enrichment-pass output.
-        let (correlation_key_fields, correlation_buffers, correlation_max_group_buffer) =
+        // dispatcher walks the buffers at end-of-DAG. Group identity
+        // travels through the schema as `$ck.<field>` shadow columns
+        // stamped at Source ingest; the dispatcher reads them via the
+        // `FieldMetadata.snapshot_of` annotation, so the executor
+        // context only needs to know whether buffering is active and
+        // the per-group cap.
+        let (correlation_buffers, correlation_max_group_buffer) =
             match config.error_handling.correlation_key.as_ref() {
-                Some(ck) => {
-                    let fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
+                Some(_) => {
                     let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
-                    (Some(fields), Some(HashMap::new()), cap)
+                    (Some(HashMap::new()), cap)
                 }
-                None => (None, None, 0),
+                None => (None, 0),
             };
 
         // Construct the dispatcher context. Mutable per-walk state
@@ -1352,7 +1354,6 @@ impl PipelineExecutor {
             spill_root_path,
             arena,
             indices,
-            correlation_key_fields,
             correlation_buffers,
             correlation_max_group_buffer,
         };
@@ -2150,19 +2151,52 @@ pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Re
         return input.clone();
     }
     let mut values: Vec<clinker_record::Value> = Vec::with_capacity(target.column_count());
-    for col in target.columns() {
-        values.push(
-            input
-                .get(col)
-                .cloned()
-                .unwrap_or(clinker_record::Value::Null),
-        );
+    for (i, col) in target.columns().iter().enumerate() {
+        let v = match input.get(col.as_ref()) {
+            Some(v) => v.clone(),
+            None => recover_engine_stamped_value(input, target, i, col.as_ref()),
+        };
+        values.push(v);
     }
     let mut out = Record::new(Arc::clone(target), values);
     for (k, v) in input.iter_meta() {
         let _ = out.set_meta(k, v.clone());
     }
     out
+}
+
+/// Recover an engine-stamped column's value when the input does not
+/// expose it under the target column name. The N-ary combine
+/// decomposition encodes intermediate-step columns as
+/// `__<qualifier>__<name>`, so a `$ck.<field>` snapshot column
+/// arrives at the final step's body construction under
+/// `__<driver>__$ck.<field>` rather than `$ck.<field>` directly.
+/// Walk the input schema for any column ending in `__<col>` and
+/// recover the value; otherwise default to `Value::Null` (the column
+/// remains an unstamped slot, matching the behavior for build sources
+/// that never declared the correlation-key field).
+fn recover_engine_stamped_value(
+    input: &Record,
+    target: &Arc<Schema>,
+    target_idx: usize,
+    target_col: &str,
+) -> clinker_record::Value {
+    let is_engine_stamped = target
+        .field_metadata(target_idx)
+        .is_some_and(|m| m.is_engine_stamped());
+    if !is_engine_stamped {
+        return clinker_record::Value::Null;
+    }
+    let suffix = format!("__{target_col}");
+    if let Some(j) = input
+        .schema()
+        .columns()
+        .iter()
+        .position(|n| n.as_ref().ends_with(&suffix))
+    {
+        return input.values()[j].clone();
+    }
+    clinker_record::Value::Null
 }
 
 /// Widen `input`'s schema in place to include every key in `emitted`
@@ -2183,9 +2217,22 @@ fn record_with_emitted_fields(
     if missing.is_empty() {
         return input.clone();
     }
-    let mut builder = SchemaBuilder::with_capacity(input.schema().column_count() + missing.len());
-    for col in input.schema().columns() {
-        builder = builder.with_field(col.as_ref());
+    let n = input.schema().column_count();
+    let mut builder = SchemaBuilder::with_capacity(n + missing.len());
+    // Preserve every existing column AND its `FieldMetadata`. Without
+    // explicit forwarding the engine-stamp annotation on `$ck.<field>`
+    // shadow columns is dropped and downstream readers (the buffer-key
+    // extractor at the Output arm, the projection fast path) treat the
+    // column as a user-declared one.
+    for i in 0..n {
+        let name = input
+            .schema()
+            .column_name(i)
+            .expect("column_name within column_count");
+        match input.schema().field_metadata(i) {
+            Some(meta) => builder = builder.with_field_meta(name, meta.clone()),
+            None => builder = builder.with_field(name),
+        }
     }
     for name in missing {
         builder = builder.with_field(name);

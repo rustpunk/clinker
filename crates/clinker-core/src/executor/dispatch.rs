@@ -30,34 +30,6 @@ use petgraph::graph::NodeIndex;
 use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
 
-/// Record meta key carrying the per-record correlation-group identity.
-///
-/// The Source arm stamps the key field values (cloned from the source
-/// record) onto every ingested record under this meta key as a
-/// [`Value::Array`]. Downstream arms (Transform / Route / Output) read
-/// the same meta to look up the record's correlation group when
-/// `error_handling.correlation_key` is configured. Reserved-prefix
-/// `__cxl_` so users cannot collide with it via emit.
-pub(crate) const CORRELATION_KEY_META: &str = "__cxl_correlation_key";
-
-/// Read the correlation key vector off a record's meta. Returns
-/// `None` when the meta is absent (record entered before correlation
-/// tagging was active, or the field was not stamped); callers treat
-/// that as a per-record null group (individual rejection).
-fn read_correlation_meta(record: &Record) -> Option<Vec<GroupByKey>> {
-    match record.get_meta(CORRELATION_KEY_META)? {
-        Value::Array(arr) => {
-            let key: Vec<GroupByKey> = arr
-                .iter()
-                .enumerate()
-                .map(|(i, v)| value_to_correlation_key(v, i))
-                .collect();
-            Some(key)
-        }
-        _ => None,
-    }
-}
-
 fn value_to_correlation_key(v: &Value, idx: usize) -> GroupByKey {
     use clinker_record::value_to_group_key;
     if let Value::String(s) = v
@@ -79,14 +51,32 @@ fn key_is_null(key: &[GroupByKey]) -> bool {
     key.iter().all(|k| matches!(k, GroupByKey::Null))
 }
 
-/// Build the buffer key for a record. When every component of the
-/// record's correlation key is null, append the source-row number as
-/// a synthetic disambiguator so each null-keyed record lands in its
-/// own buffer cell — preserving the per-record null-rejection
-/// semantic without forcing the Output arm to take a separate
-/// non-buffered writer path.
+/// Build the buffer key for a record by reading every engine-stamped
+/// snapshot column (i.e. each `$ck.<field>` shadow column the source
+/// widening pass attached to the schema). The shadow column carries
+/// the user-declared field's value at Source ingest, so a downstream
+/// Transform that rewrites the user-visible field cannot change a
+/// row's group identity.
+///
+/// When every component of the key is null — either because the
+/// record carries no engine-stamped columns (e.g. an Aggregate output
+/// that did not propagate `$ck.*` because the user did not list it
+/// in `group_by`) or because every snapshot value is itself Null — a
+/// row-number disambiguator lands the record in its own buffer cell,
+/// preserving per-record null-rejection semantics without forcing the
+/// Output arm onto a separate non-buffered writer path.
 fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
-    let mut key = read_correlation_meta(record).unwrap_or_default();
+    let schema = record.schema();
+    let mut key: Vec<GroupByKey> = Vec::new();
+    for i in 0..schema.column_count() {
+        if schema
+            .field_metadata(i)
+            .is_some_and(|m| m.snapshot_of.is_some())
+        {
+            let idx = key.len();
+            key.push(value_to_correlation_key(&record.values()[i], idx));
+        }
+    }
     if key.is_empty() || key_is_null(&key) {
         key.push(GroupByKey::Int(row_num as i64));
     }
@@ -279,12 +269,6 @@ pub(crate) struct ExecutorContext<'a> {
     /// together at the end of the walk.
     pub(crate) indices: Option<Arc<Vec<crate::pipeline::index::SecondaryIndex>>>,
 
-    /// Resolved `error_handling.correlation_key` field list. `Some`
-    /// iff the configured pipeline uses correlation grouping; empty
-    /// otherwise. The Source arm reads this to compute each ingested
-    /// record's group key vector and stamp it into record meta.
-    pub(crate) correlation_key_fields: Option<Vec<String>>,
-
     /// Per-correlation-group buffer holding deferred output writes
     /// and per-record error events. `Some` iff the plan carries a
     /// [`PlanNode::CorrelationCommit`] terminal — that node walks the
@@ -353,6 +337,24 @@ pub(crate) fn dispatch_plan_node(
             // bind_composition time so port-bound records canonicalize
             // cleanly.
             let source_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
+            // Precompute the engine-stamped tail mapping for this target:
+            // `(target_index, source_field_name)` per `$ck.<field>` shadow
+            // column. Resolved once per Source so the per-record canonicalize
+            // closure does a single name→index lookup against the reader
+            // schema instead of re-scanning the target's `field_metadata`
+            // every record.
+            let engine_stamped: Vec<(usize, Box<str>)> = source_schema
+                .as_ref()
+                .map(|target| {
+                    (0..target.column_count())
+                        .filter_map(|i| {
+                            target
+                                .field_metadata(i)
+                                .and_then(|m| m.snapshot_of.as_ref().map(|name| (i, name.clone())))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let canonicalize = |r: &Record| -> Record {
                 match source_schema.as_ref() {
                     Some(target) => {
@@ -364,10 +366,10 @@ pub(crate) fn dispatch_plan_node(
                             // engine-stamped tail columns (`$ck.<field>` shadow
                             // columns from `error_handling.correlation_key`
                             // widening). Reader columns must equal the user-
-                            // declared prefix of the target; the tail is filled
-                            // by `Record::new`'s arity padding (Null today;
-                            // populated by the source-arm correlation stamp in
-                            // a later wave).
+                            // declared prefix of the target; tail slots are
+                            // filled by the snapshot stamp below. Build sources
+                            // missing a correlation-key field stamp `Value::Null`
+                            // — the Combine arm later inherits the driver's tag.
                             debug_assert!(
                                 target
                                     .columns()
@@ -383,13 +385,20 @@ pub(crate) fn dispatch_plan_node(
                                 r.schema().columns(),
                                 target.columns(),
                             );
-                            // Engine-stamped tail slots default to `Value::Null`;
-                            // a later wave fills them with the source field's
-                            // value at ingest. Padding here keeps `Record::new`'s
-                            // arity invariant intact in both debug and release
-                            // builds.
                             let mut values = r.values().to_vec();
                             values.resize(target.column_count(), Value::Null);
+                            // Stamp the engine-stamped tail at ingest: each
+                            // `$ck.<field>` slot captures the user-declared
+                            // field's value here, before any downstream
+                            // Transform can rewrite it. Frozen-identity
+                            // semantics flow through the schema column for
+                            // the rest of the DAG.
+                            let reader = r.schema();
+                            for (target_idx, source_field) in &engine_stamped {
+                                if let Some(src_idx) = reader.index(source_field) {
+                                    values[*target_idx] = r.values()[src_idx].clone();
+                                }
+                            }
                             let mut rebuilt = Record::new(Arc::clone(target), values);
                             for (k, v) in r.iter_meta() {
                                 let _ = rebuilt.set_meta(k, v.clone());
@@ -400,7 +409,7 @@ pub(crate) fn dispatch_plan_node(
                     None => r.clone(),
                 }
             };
-            let mut records: Vec<_> = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
+            let records: Vec<_> = if let Some(seeded) = ctx.node_buffers.remove(&node_idx) {
                 // Body-context port source — records were seeded by
                 // `execute_composition_body` from parent-scope output.
                 // The seeded records still carry the parent producer's
@@ -421,25 +430,6 @@ pub(crate) fn dispatch_plan_node(
                     .map(|(r, rn)| (canonicalize(r), *rn))
                     .collect()
             };
-            // Stamp the correlation-key meta on every freshly-ingested
-            // record so downstream arms can reach the row's group
-            // identity even if a Transform later rewrites the key
-            // field. Body-context Sources skip this — the parent walk
-            // already stamped the records before seeding them. Combine
-            // build-source records get stamped against the same key
-            // fields; build sources lacking those fields stamp Null
-            // and the Combine arm later inherits the driver's tag.
-            if let Some(fields) = ctx.correlation_key_fields.clone() {
-                for (rec, _) in records.iter_mut() {
-                    if rec.get_meta(CORRELATION_KEY_META).is_none() {
-                        let key_values: Vec<Value> = fields
-                            .iter()
-                            .map(|f| rec.get(f).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        let _ = rec.set_meta(CORRELATION_KEY_META, Value::Array(key_values));
-                    }
-                }
-            }
             ctx.node_buffers.insert(node_idx, records);
         }
 
@@ -2198,12 +2188,12 @@ pub(crate) fn dispatch_plan_node(
                                     });
                                 }
                                 let mut rec = Record::new(Arc::clone(target_schema), values);
-                                // Driver-side meta is the authoritative carrier
-                                // for `__cxl_correlation_key` through an N-ary
-                                // chain — without it the next chain step's
-                                // `widen_record_to_schema` finds no meta to copy
-                                // and the final output row falls into a null
-                                // correlation buffer cell.
+                                // Driver-side `$meta.*` carries through an
+                                // N-ary chain — without this copy the next
+                                // chain step's `widen_record_to_schema`
+                                // finds no meta to forward and user-emitted
+                                // record metadata is lost on the final
+                                // output row.
                                 for (k, v) in probe_record.iter_meta() {
                                     let _ = rec.set_meta(k, v.clone());
                                 }

@@ -1199,9 +1199,11 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                         });
                     }
                     let mut rec = Record::new(Arc::clone(target_schema), values);
-                    // Carry the driver's meta forward so the chain's final
-                    // step can re-emit `__cxl_correlation_key` onto the
-                    // user-projected output row.
+                    // Carry the driver's `$meta.*` forward through synthetic
+                    // chain steps. User-emitted record metadata travels with
+                    // the driver row by contract; without this copy the
+                    // next step's `widen_record_to_schema` finds no meta to
+                    // propagate.
                     for (k, v) in driver_record.iter_meta() {
                         let _ = rec.set_meta(k, v.clone());
                     }

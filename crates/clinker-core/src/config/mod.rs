@@ -2068,7 +2068,6 @@ pub(crate) fn lower_node_to_plan_node(
     };
     use crate::plan::index::find_index_for;
     use clinker_record::{FieldMetadata, SchemaBuilder};
-    use cxl::ast::Statement;
     use std::sync::Arc;
 
     // Build an `Arc<Schema>` from the bound output row for this node.
@@ -2281,20 +2280,18 @@ pub(crate) fn lower_node_to_plan_node(
                         return None;
                     }
                 };
-            let output_schema = typed
-                .program
-                .statements
-                .iter()
-                .filter_map(|s| match s {
-                    Statement::Emit {
-                        name,
-                        is_meta: false,
-                        ..
-                    } => Some(name.clone()),
-                    _ => None,
-                })
-                .collect::<SchemaBuilder>()
-                .build();
+            // `schema_from_bound` reads the typed `output_row` produced
+            // by `propagate_aggregate` (group-by columns first, then
+            // emits) and stamps engine-stamp metadata on the
+            // `$ck.<field>` shadow columns that propagate through. The
+            // emit-only path used previously omitted any group-by
+            // column the user could not cover with an explicit emit
+            // (the CXL parser rejects `emit $ck.* = ...`), so engine-
+            // stamped group-by columns silently dropped from the
+            // aggregate's `output_schema` and the runtime
+            // `finalize_group_inner` had no slot to populate from the
+            // group key.
+            let output_schema = schema_from_bound(name);
             Some(PlanNode::Aggregation {
                 name: name.to_string(),
                 span,
