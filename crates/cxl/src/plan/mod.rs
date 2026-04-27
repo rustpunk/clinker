@@ -25,7 +25,7 @@
 //!   `clinker-record`. Keeping `Expr` serde-free matches DataFusion's
 //!   architectural decision (see apache/arrow-datafusion#1832).
 
-use clinker_record::accumulator::AggregateType;
+use clinker_record::accumulator::{AccumulatorEnum, AggregateType, Reversibility};
 
 use crate::ast::Expr;
 
@@ -96,4 +96,31 @@ pub struct CompiledAggregate {
     pub pre_agg_filter: Option<Expr>,
     /// One per `Statement::Emit` in the CXL (post-extraction residuals).
     pub emits: Vec<CompiledEmit>,
+    /// Whether the runtime aggregator must record per-input-row lineage
+    /// `(input_row_id → group_index)` so a downstream rollback step can
+    /// retract individual contributions without rerunning the whole
+    /// stream. Derived from the aggregate's relaxed-correlation-key
+    /// opt-in plus the reversibility of every binding's accumulator —
+    /// any `BufferRequired` binding short-circuits this back to `false`
+    /// because that path will replay surviving rows from a separate
+    /// per-group buffer instead of running the lineage-driven retract.
+    /// Strict (non-relaxed) aggregates always set this `false`.
+    pub requires_lineage: bool,
+}
+
+impl CompiledAggregate {
+    /// Derive `requires_lineage` from the relaxed-correlation-key opt-in.
+    ///
+    /// `requires_lineage` flips on iff the aggregate has opted into
+    /// relaxed correlation-key semantics AND every binding's accumulator
+    /// is reversible. A single `BufferRequired` binding (`Min`, `Max`,
+    /// `Avg`, `WeightedAvg`) short-circuits the result to `false` so the
+    /// runtime takes the buffered-contributions path for the whole
+    /// aggregate rather than splitting the rollback strategy per slot.
+    pub fn set_requires_lineage_for_relaxed(&mut self, relaxed_correlation_key: bool) {
+        self.requires_lineage = relaxed_correlation_key
+            && self.bindings.iter().all(|b| {
+                AccumulatorEnum::for_type(&b.acc_type).reversibility() == Reversibility::Reversible
+            });
+    }
 }

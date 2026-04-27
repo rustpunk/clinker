@@ -506,3 +506,59 @@ fn test_for_type_roundtrip() {
         let _ = acc.finalize();
     }
 }
+
+// ---------- Reversibility classification ----------
+//
+// Sum / Count / Collect / Any expose an O(1) inverse operation that can
+// recover state byte-equivalent to never having observed a retracted
+// contribution. Min, Max, Avg, WeightedAvg are classified BufferRequired:
+// Min/Max because they are positional (the prior extremum is unrecoverable
+// once shadowed); Avg/WeightedAvg because incremental retract on the
+// Kahan-compensated f64 paths drifts away from a re-fold over surviving
+// rows.
+
+#[test]
+fn test_reversibility_sum() {
+    assert_eq!(sum().reversibility(), Reversibility::Reversible);
+}
+
+#[test]
+fn test_reversibility_count() {
+    // Both Count flavors classify the same — Reversible — because the
+    // increment is by 1 and the inverse is decrement-by-1.
+    assert_eq!(count_all().reversibility(), Reversibility::Reversible);
+    assert_eq!(count_field().reversibility(), Reversibility::Reversible);
+}
+
+#[test]
+fn test_reversibility_collect() {
+    assert_eq!(collect().reversibility(), Reversibility::Reversible);
+}
+
+#[test]
+fn test_reversibility_any() {
+    assert_eq!(any().reversibility(), Reversibility::Reversible);
+}
+
+#[test]
+fn test_reversibility_min() {
+    assert_eq!(min().reversibility(), Reversibility::BufferRequired);
+}
+
+#[test]
+fn test_reversibility_max() {
+    assert_eq!(max().reversibility(), Reversibility::BufferRequired);
+}
+
+#[test]
+fn test_reversibility_avg() {
+    assert_eq!(avg().reversibility(), Reversibility::BufferRequired);
+}
+
+#[test]
+fn test_reversibility_weighted_avg() {
+    assert_eq!(
+        weighted_avg().reversibility(),
+        Reversibility::BufferRequired
+    );
+}

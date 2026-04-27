@@ -672,6 +672,19 @@ pub struct AggregatorGroupState {
     /// the earliest input row's position. The global-fold empty-input
     /// case emits `0` because no record ever updates this field.
     pub min_row_num: u64,
+    /// Stable in-memory index of this group within the owning
+    /// `HashAggregator.groups` map at insertion time. Populated only on
+    /// the lineage path (when `compiled.requires_lineage` is true) so a
+    /// flat `(input_row, group_index)` map can be reconstructed without
+    /// a parallel HashMap. Meaningless after spill+merge — index space
+    /// is reassigned by the recovery loop.
+    pub group_index: u32,
+    /// Per-group input-row-number list. Populated only on the lineage
+    /// path; empty otherwise (an empty `Vec` does not allocate). Spilled
+    /// alongside accumulator state so the post-merge `AggregatorGroupState`
+    /// preserves which input rows folded into each group across the
+    /// round trip.
+    pub input_rows: Vec<u32>,
 }
 
 impl AggregatorGroupState {
@@ -680,6 +693,8 @@ impl AggregatorGroupState {
             row,
             meta_tracker: MetadataCommonTracker::new(),
             min_row_num: u64::MAX,
+            group_index: 0,
+            input_rows: Vec::new(),
         }
     }
 }
@@ -980,6 +995,15 @@ pub struct HashAggregator {
     /// Counter for periodic RSS backstop polling. Checked every 4096
     /// records to limit /proc/self/statm read overhead.
     records_since_rss_check: u32,
+    /// Flat `(input_row_id, group_index)` lineage map, allocated only
+    /// when `compiled.requires_lineage` is true. Append-only on the hot
+    /// path; the per-entry footprint (8 bytes) is charged into
+    /// `value_heap_bytes` so the existing spill-trigger thresholds gate
+    /// it without a separate budget knob. Drained on every `spill()`
+    /// call: post-spill the per-group `AggregatorGroupState.input_rows`
+    /// holds the canonical lineage shape, and the flat vec is rebuilt
+    /// from there during finalize when callers need the dense form.
+    lineage: Option<Vec<(u32, u32)>>,
 }
 
 impl HashAggregator {
@@ -1007,6 +1031,7 @@ impl HashAggregator {
             .filter(|e| e.is_meta)
             .map(|e| e.output_name.clone())
             .collect();
+        let requires_lineage = compiled.requires_lineage;
         let factory = AccumulatorFactory::new(compiled);
         let estimated = estimated_bytes_per_group(&factory, group_by_indices.len());
         // `.max(1)` clamp: integer division yields 0 when a single group's
@@ -1020,6 +1045,16 @@ impl HashAggregator {
             ((memory_budget * 60 / 100) / estimated).max(1)
         } else {
             usize::MAX
+        };
+        // The empty-vec form `Some(Vec::new())` does not allocate until
+        // the first push, so the lineage-disabled path observes
+        // `lineage = None` and pays exactly zero per-record overhead;
+        // the lineage-enabled path eats one branch and an inline
+        // `Some` discriminator on every `add_record`.
+        let lineage = if requires_lineage {
+            Some(Vec::new())
+        } else {
+            None
         };
         Self {
             groups: hashbrown::HashMap::new(),
@@ -1040,6 +1075,7 @@ impl HashAggregator {
             rows_seen: 0,
             max_groups,
             records_since_rss_check: 0,
+            lineage,
         }
     }
 
@@ -1135,11 +1171,18 @@ impl HashAggregator {
             }
         }
 
-        // 4. Look up / insert per-group state.
-        let group_state = self
-            .groups
-            .entry(key)
-            .or_insert_with(|| AggregatorGroupState::new(self.factory.create_accumulators()));
+        // 4. Look up / insert per-group state. On the lineage path the
+        //    insertion-order index is stamped on each new group so
+        //    `add_record` can append `(row_num, group_index)` to the
+        //    flat lineage vec without a parallel HashMap; the closure
+        //    only fires for new groups, so existing keys keep their
+        //    original index.
+        let next_group_idx = self.groups.len() as u32;
+        let group_state = self.groups.entry(key).or_insert_with(|| {
+            let mut state = AggregatorGroupState::new(self.factory.create_accumulators());
+            state.group_index = next_group_idx;
+            state
+        });
 
         // Track the minimum row_num across every input record folded
         // into this group — emitted as the finalized SortRow's row
@@ -1147,6 +1190,28 @@ impl HashAggregator {
         // earliest input row's position.
         if row_num < group_state.min_row_num {
             group_state.min_row_num = row_num;
+        }
+
+        // Lineage recording. Cost: one branch + two appends per record.
+        // The 8-byte flat-vec entry plus the 4-byte per-group input_rows
+        // entry are charged into `value_heap_bytes` so the existing 40%
+        // value-heap spill threshold gates lineage memory without a
+        // separate budget knob.
+        if let Some(lin) = self.lineage.as_mut() {
+            // `row_num` is u64 in the API; lineage stores u32 because
+            // every existing aggregation pipeline is bounded by the
+            // 4 GiB hash-aggregation budget. A row number exceeding
+            // u32::MAX requires no special handling here — the truncated
+            // lineage entry will sit alongside the full-precision
+            // `min_row_num`, which is what downstream sort-stable
+            // ordering uses.
+            let row_u32 = row_num as u32;
+            let group_idx = group_state.group_index;
+            lin.push((row_u32, group_idx));
+            group_state.input_rows.push(row_u32);
+            self.value_heap_bytes = self
+                .value_heap_bytes
+                .saturating_add(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<u32>());
         }
 
         // 5. BindingArg dispatch hot loop (D1).
@@ -1276,6 +1341,14 @@ impl HashAggregator {
 
         // 5. All per-group value heap bytes are now off-process.
         self.value_heap_bytes = 0;
+        // The flat lineage vec mirrored the in-memory groups; once the
+        // groups have been drained, the per-group `input_rows` vectors
+        // (already serialized inside each `AggSpillEntry.state`) are the
+        // canonical lineage shape. The flat representation is rebuilt at
+        // finalize time when a downstream caller asks for it.
+        if let Some(lin) = self.lineage.as_mut() {
+            lin.clear();
+        }
         Ok(())
     }
 
@@ -1911,6 +1984,12 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
     }
     // `MetadataCommonTracker`: associative merge per D11 revised.
     dst.meta_tracker.merge(src.meta_tracker);
+    // `input_rows`: concatenate. The lineage path is the only producer
+    // of non-empty `input_rows`; the strict path leaves both sides
+    // empty and the extension is a no-op. `group_index` is left at
+    // `dst`'s value — its post-merge identity is reassigned by the
+    // recovery loop, so neither side's index is canonical here.
+    dst.input_rows.extend(src.input_rows);
 }
 
 /// Boundary-merging aggregator monomorphized over an `AccumulatorOp`.
@@ -2729,6 +2808,29 @@ mod spill_trigger_tests {
         memory_budget: usize,
         spill_dir: Option<std::path::PathBuf>,
     ) -> HashAggregator {
+        build_test_aggregator_with_lineage(
+            input_fields,
+            group_by,
+            cxl_src,
+            memory_budget,
+            spill_dir,
+            false,
+        )
+    }
+
+    /// Like `build_test_aggregator` but stamps `requires_lineage` on the
+    /// extracted `CompiledAggregate` so the runtime takes the
+    /// lineage-recording path. Mirrors what the planner does at
+    /// `config/mod.rs` once an `AggregateBody` opts into relaxed
+    /// correlation-key semantics with all-Reversible bindings.
+    fn build_test_aggregator_with_lineage(
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+        memory_budget: usize,
+        spill_dir: Option<std::path::PathBuf>,
+        requires_lineage: bool,
+    ) -> HashAggregator {
         let parsed = Parser::parse(cxl_src);
         assert!(
             parsed.errors.is_empty(),
@@ -2750,8 +2852,13 @@ mod spill_trigger_tests {
         let schema_names: Vec<String> =
             input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
         let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
-        let compiled =
+        let mut compiled =
             extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates");
+        // Mirror the planner: for the lineage path, the relaxed-CK opt-in
+        // is what flips `requires_lineage`. Tests that need the
+        // lineage-disabled path leave this `false` and the constructor
+        // takes the existing zero-overhead path.
+        compiled.set_requires_lineage_for_relaxed(requires_lineage);
 
         let output_columns: Vec<Box<str>> = compiled
             .emits
@@ -3008,5 +3115,168 @@ mod spill_trigger_tests {
             !agg.spill_files().is_empty(),
             "RSS backstop should spill when process RSS exceeds 85% of a 1 MB budget"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Lineage path: allocation gate, recording correctness, spill round
+    // trip. The runtime retract path that consumes lineage is not yet
+    // wired; these tests pin the observable shape that retract will
+    // depend on (which rows mapped to which groups, byte-exact across
+    // a spill round trip).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_lineage_disabled_is_none() {
+        // Strict mode (the default): `requires_lineage` stays `false`,
+        // the `lineage` field is `None`, and a few records leave the
+        // accumulator with the same memory shape it had before this
+        // commit landed.
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            10_000_000,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..5u64 {
+            let r = make_record(&input, vec![Value::String(format!("k{}", i % 2).into())]);
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+        }
+        assert!(
+            agg.lineage.is_none(),
+            "strict aggregates must not allocate the lineage map"
+        );
+        for state in agg.groups().values() {
+            assert!(
+                state.input_rows.is_empty(),
+                "strict aggregates must not populate per-group input_rows"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lineage_recording_pairs_rows_with_groups() {
+        // 5 records across 2 groups (alternating); flat lineage must
+        // record every row, and the two groups' indices must be
+        // distinct. The actual u32 values for `group_index` are an
+        // implementation detail (insertion order); the test asserts
+        // structural invariants that the retract path will rely on.
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator_with_lineage(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            10_000_000,
+            None,
+            true,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let keys = ["a", "b", "a", "b", "a"];
+        for (i, k) in keys.iter().enumerate() {
+            let r = make_record(&input, vec![Value::String((*k).into())]);
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let lineage = agg.lineage.as_ref().expect("lineage allocated");
+        assert_eq!(lineage.len(), 5, "every record must produce one entry");
+        // Row numbers must be the input order 0..5.
+        let rows: Vec<u32> = lineage.iter().map(|(r, _)| *r).collect();
+        assert_eq!(rows, vec![0, 1, 2, 3, 4]);
+        // Two distinct group indices, alternating with the input keys.
+        let g0 = lineage[0].1;
+        let g1 = lineage[1].1;
+        assert_ne!(
+            g0, g1,
+            "two distinct keys must yield two distinct group indices"
+        );
+        assert_eq!(lineage[2].1, g0, "key 'a' must route to its first group");
+        assert_eq!(lineage[3].1, g1, "key 'b' must route to its first group");
+        assert_eq!(lineage[4].1, g0, "key 'a' must route to its first group");
+
+        // Per-group input_rows mirror the flat lineage partition.
+        let groups = agg.groups();
+        assert_eq!(groups.len(), 2);
+        let mut input_row_lists: Vec<Vec<u32>> =
+            groups.values().map(|s| s.input_rows.clone()).collect();
+        input_row_lists.sort();
+        assert_eq!(input_row_lists, vec![vec![0, 2, 4], vec![1, 3]]);
+    }
+
+    #[test]
+    fn test_lineage_round_trips_through_spill() {
+        // Force at least one spill, then finalize. The spill clears the
+        // flat lineage vec but the per-group `input_rows` ride along
+        // with each `AggSpillEntry` and survive the merge — both as
+        // `merge_group_sidecars` concatenations across spill files and
+        // as the original lists for groups that never had to merge.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator_with_lineage(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            1024,
+            Some(tmp.path().to_path_buf()),
+            true,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let keys = ["a", "b", "c", "d"];
+        for i in 0..32u64 {
+            let k = keys[(i as usize) % keys.len()];
+            let r = make_record(&input, vec![Value::String(k.into())]);
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "tiny budget must trigger at least one spill"
+        );
+
+        // Walk every spill file's entries directly, verifying that
+        // `input_rows` round-trips byte-for-byte through postcard+LZ4.
+        let mut by_key: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
+        for f in agg.spill_files() {
+            let mut reader = f.reader().expect("open spill reader");
+            while let Some(entry) = reader.next_entry().expect("read entry") {
+                let key_str = match &entry.group_key[0] {
+                    GroupByKey::Str(s) => s.to_string(),
+                    other => panic!("unexpected group key shape: {other:?}"),
+                };
+                by_key
+                    .entry(key_str)
+                    .or_default()
+                    .extend(entry.state.input_rows.iter().copied());
+            }
+        }
+        // Drain in-memory groups too — anything spill missed.
+        for (k, state) in agg.groups() {
+            let key_str = match &k[0] {
+                GroupByKey::Str(s) => s.to_string(),
+                other => panic!("unexpected group key shape: {other:?}"),
+            };
+            by_key
+                .entry(key_str)
+                .or_default()
+                .extend(state.input_rows.iter().copied());
+        }
+
+        for (k, mut rows) in by_key.into_iter() {
+            rows.sort();
+            // Recover the expected row indices for this key from the
+            // input pattern: positions where `keys[i % 4] == k`.
+            let key_idx = keys.iter().position(|kk| *kk == k).expect("known key");
+            let expected: Vec<u32> = (0..32u32)
+                .filter(|i| (*i as usize) % 4 == key_idx)
+                .collect();
+            assert_eq!(
+                rows, expected,
+                "lineage for key {k:?} must survive spill round-trip exactly"
+            );
+        }
     }
 }

@@ -525,6 +525,20 @@ pub enum AggregateType {
     Any,
 }
 
+/// Whether an accumulator can subtract a value to undo a prior contribution.
+///
+/// `Reversible` variants admit an `O(1)` retract step that walks back a
+/// single contribution and recovers a state byte-equivalent to never having
+/// observed it. `BufferRequired` variants must replay surviving inputs from
+/// scratch — either because the operation is positional (`Min`, `Max`) or
+/// because incremental retract under floating-point arithmetic accumulates
+/// drift that diverges from a re-fold (`Avg`, `WeightedAvg`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reversibility {
+    Reversible,
+    BufferRequired,
+}
+
 /// Per-group heap allocation cost: one `AccumulatorEnum` in the group's row.
 /// No `Box<dyn>` indirection. Serde derive enables spill-to-disk via JSON/NDJSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -593,6 +607,27 @@ impl AccumulatorEnum {
             AggregateType::Collect => Self::Collect(CollectState::default()),
             AggregateType::WeightedAvg => Self::WeightedAvg(WeightedAvgState::default()),
             AggregateType::Any => Self::Any(AnyState::default()),
+        }
+    }
+
+    /// Whether this accumulator admits an O(1) retract step.
+    ///
+    /// `Sum`, `Count`, `Collect`, `Any` are reversible: an inverse operation
+    /// recovers a state equivalent to never having observed the retracted
+    /// value. `Min` and `Max` are positional and need the full surviving
+    /// multiset to recompute. `Avg` and `WeightedAvg` are mathematically
+    /// reversible but classified `BufferRequired` because incremental
+    /// retract on the Kahan-compensated f64 paths accumulates drift that
+    /// diverges from a re-fold over surviving rows; the buffered path
+    /// trades memory for byte-exact equivalence to a baseline rerun.
+    pub const fn reversibility(&self) -> Reversibility {
+        match self {
+            Self::Sum(_) | Self::Count(_) | Self::Collect(_) | Self::Any(_) => {
+                Reversibility::Reversible
+            }
+            Self::Min(_) | Self::Max(_) | Self::Avg(_) | Self::WeightedAvg(_) => {
+                Reversibility::BufferRequired
+            }
         }
     }
 

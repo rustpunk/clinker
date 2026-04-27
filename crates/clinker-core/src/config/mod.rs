@@ -2351,7 +2351,7 @@ pub(crate) fn lower_node_to_plan_node(
                 .keys()
                 .map(|qf| qf.name.to_string())
                 .collect();
-            let compiled_agg =
+            let mut compiled_agg =
                 match cxl::plan::extract_aggregates(&typed, &agg_cfg.group_by, &input_schema) {
                     Ok(c) => c,
                     Err(errs) => {
@@ -2365,6 +2365,12 @@ pub(crate) fn lower_node_to_plan_node(
                         return None;
                     }
                 };
+            // Plan-time derivation of the runtime lineage gate. Strict
+            // aggregates leave it `false`; relaxed aggregates flip it on
+            // only when every binding is reversible — a single
+            // BufferRequired accumulator routes the whole aggregate to
+            // the buffered-contributions path that lineage cannot help.
+            compiled_agg.set_requires_lineage_for_relaxed(agg_body.relaxed_correlation_key);
             // `schema_from_bound` reads the typed `output_row` produced
             // by `propagate_aggregate` (group-by columns first, then
             // emits) and stamps engine-stamp metadata on the
