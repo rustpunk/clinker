@@ -1455,6 +1455,7 @@ pub(crate) fn dispatch_plan_node(
             ref match_mode,
             ref on_miss,
             ref resolved_column_map,
+            ref propagate_ck,
             ..
         } => {
             use crate::config::pipeline_node::{MatchMode, OnMiss};
@@ -1572,14 +1573,34 @@ pub(crate) fn dispatch_plan_node(
             // DAG edges run upstream_source -> combine (or via
             // an intermediate Transform chain). We search the
             // incoming neighbors and match by the node's name.
+            //
+            // `inject_correlation_sort` splices a synthetic
+            // `__correlation_sort_<source>` Sort node between the
+            // primary source and its downstream consumers. The
+            // suffix carries the original source name; treating
+            // any such Sort as an alias for its prefix-stripped
+            // upstream lets the combine arm transparently resolve
+            // through the splice. See `plan::execution::CORRELATION_SORT_PREFIX`.
             let predecessors: Vec<NodeIndex> = current_dag
                 .graph
                 .neighbors_directed(node_idx, Direction::Incoming)
                 .collect();
+            let predecessor_matches = |p: NodeIndex, target: &str| -> bool {
+                let pname = current_dag.graph[p].name();
+                if pname == target {
+                    return true;
+                }
+                if let Some(stripped) =
+                    pname.strip_prefix(crate::plan::execution::CORRELATION_SORT_PREFIX)
+                {
+                    return stripped == target;
+                }
+                false
+            };
             let driver_pred = predecessors
                 .iter()
                 .copied()
-                .find(|p| current_dag.graph[*p].name() == driver_upstream)
+                .find(|p| predecessor_matches(*p, driver_upstream))
                 .ok_or_else(|| PipelineError::Internal {
                     op: "combine",
                     node: name.clone(),
@@ -1591,7 +1612,7 @@ pub(crate) fn dispatch_plan_node(
             let build_pred = predecessors
                 .iter()
                 .copied()
-                .find(|p| current_dag.graph[*p].name() == build_upstream)
+                .find(|p| predecessor_matches(*p, build_upstream))
                 .ok_or_else(|| PipelineError::Internal {
                     op: "combine",
                     node: name.clone(),
@@ -1739,6 +1760,7 @@ pub(crate) fn dispatch_plan_node(
                         match_mode: *match_mode,
                         on_miss: *on_miss,
                         partition_bits,
+                        propagate_ck,
                         ctx: &iejoin_ctx,
                         budget: &mut budget,
                     })?;
@@ -1785,6 +1807,7 @@ pub(crate) fn dispatch_plan_node(
                         match_mode: *match_mode,
                         on_miss: *on_miss,
                         partition_bits,
+                        propagate_ck,
                         ctx: &grace_ctx,
                         budget: &mut budget,
                         spill_dir: ctx.spill_root_path.as_ref(),
@@ -1839,6 +1862,7 @@ pub(crate) fn dispatch_plan_node(
                         match_mode: *match_mode,
                         on_miss: *on_miss,
                         presorted: true,
+                        propagate_ck,
                         ctx: &sm_ctx,
                         budget: &mut budget,
                         spill_dir: ctx.spill_root_path.as_ref(),
@@ -1945,6 +1969,7 @@ pub(crate) fn dispatch_plan_node(
                         // time, so on_miss policy does not
                         // bypass emission under Collect).
                         let mut arr: Vec<Value> = Vec::new();
+                        let mut first_collected_build: Option<Record> = None;
                         let mut truncated = false;
                         let probe_iter = hash_table.probe(&probe_keys_buf);
                         for candidate in probe_iter {
@@ -1976,6 +2001,9 @@ pub(crate) fn dispatch_plan_node(
                                 truncated = true;
                                 break;
                             }
+                            if first_collected_build.is_none() {
+                                first_collected_build = Some(candidate.record.clone());
+                            }
                             // Build a Value::Map for every
                             // matched build record, preserving
                             // its own schema order.
@@ -2002,6 +2030,22 @@ pub(crate) fn dispatch_plan_node(
                             Some(s) => widen_record_to_schema(&probe_record, s),
                             None => probe_record.clone(),
                         };
+                        // Build-side `$ck.<field>` propagation under
+                        // collect mode is single-valued: the first
+                        // matched build's CK fills the slot. Every
+                        // matched build's full payload is still
+                        // preserved inside the array via the
+                        // per-row `Value::Map` encoding above, so
+                        // nothing is lost — the slot simply mirrors
+                        // the first match's identity. Skipped under
+                        // `propagate_ck: driver`.
+                        if let Some(first_build) = first_collected_build.as_ref() {
+                            crate::executor::copy_build_ck_columns(
+                                &mut rec,
+                                first_build,
+                                propagate_ck,
+                            );
+                        }
                         rec.set(&build_qualifier, Value::Array(arr));
                         output_records.push((rec, rn));
                         emitted_since_check += 1;
@@ -2134,6 +2178,17 @@ pub(crate) fn dispatch_plan_node(
                                         for (k, v) in metadata {
                                             let _ = rec.set_meta(&k, v);
                                         }
+                                        // Build-side `$ck.<field>` propagation
+                                        // for this matched row. Driver-only
+                                        // pipelines short-circuit inside the
+                                        // helper; the call is uniform across
+                                        // every emit site so the policy is one
+                                        // code path for the whole engine.
+                                        crate::executor::copy_build_ck_columns(
+                                            &mut rec,
+                                            matched,
+                                            propagate_ck,
+                                        );
                                         output_records.push((rec, rn));
                                         emitted_since_check += 1;
                                     }
@@ -2159,6 +2214,15 @@ pub(crate) fn dispatch_plan_node(
                             // per match by concatenating value
                             // slices and constructing on the
                             // encoded `Arc<Schema>`.
+                            //
+                            // No `copy_build_ck_columns` call here:
+                            // build-side `$ck.<field>` values are
+                            // already in the concatenated tail under
+                            // their encoded names (`__<qualifier>__$ck.<field>`).
+                            // The chain's final step then resolves
+                            // them via `widen_record_to_schema`'s
+                            // engine-stamped fallback when projecting
+                            // onto the original output schema.
                             let target_schema =
                                 combine_output_schema.as_ref().ok_or_else(|| {
                                     PipelineError::Internal {

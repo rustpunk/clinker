@@ -2204,6 +2204,60 @@ fn recover_engine_stamped_value(
     clinker_record::Value::Null
 }
 
+/// Copy build-side `$ck.<field>` columns from `build` into `out` per
+/// the combine's `propagate_ck` spec. Driver wins on collision: if
+/// `out` already carries a non-null value for the column (because
+/// `widen_record_to_schema(driver, …)` filled it), the build value is
+/// not written. This is the single runtime CK-copy path used by every
+/// combine strategy (HashBuildProbe, IEJoin, GraceHash, SortMerge);
+/// keeping the policy here means a strategy never has to encode the
+/// `$ck` semantics itself.
+///
+/// `Driver` is the no-op — keeps today's behavior so existing combines
+/// migrated to `propagate_ck: driver` produce identical output. `All`
+/// copies every `$ck.*` column the build record carries. `Named(set)`
+/// copies only the listed CK fields.
+pub(crate) fn copy_build_ck_columns(
+    out: &mut Record,
+    build: &Record,
+    spec: &crate::config::pipeline_node::PropagateCkSpec,
+) {
+    use crate::config::pipeline_node::PropagateCkSpec;
+    if matches!(spec, PropagateCkSpec::Driver) {
+        return;
+    }
+    let build_schema = Arc::clone(build.schema());
+    for (idx, col) in build_schema.columns().iter().enumerate() {
+        let Some(field_name) = col.strip_prefix("$ck.") else {
+            continue;
+        };
+        let allowed = match spec {
+            PropagateCkSpec::Driver => false,
+            PropagateCkSpec::All => true,
+            PropagateCkSpec::Named(names) => names.contains(field_name),
+        };
+        if !allowed {
+            continue;
+        }
+        if out.schema().index(col.as_ref()).is_none() {
+            // Output schema didn't widen for this column — the
+            // plan-time `combine_output_row` filtered it out
+            // already. Skip rather than silently lose data.
+            continue;
+        }
+        // Driver wins on collision: a non-null value at this slot
+        // came from the driver via `widen_record_to_schema`. Only
+        // fill when the slot is still null.
+        match out.get(col.as_ref()) {
+            Some(clinker_record::Value::Null) | None => {
+                let v = &build.values()[idx];
+                out.set(col.as_ref(), v.clone());
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 /// Widen `input`'s schema in place to include every key in `emitted`
 /// that is not already declared. Allocates a fresh `Arc<Schema>` only
 /// when new names appear; otherwise clones `input`. Used by the legacy

@@ -417,6 +417,10 @@ pub(crate) struct IEJoinExec<'a> {
     /// scan. `None` → run as a single virtual partition (pure-range
     /// case, where there are no equality keys to partition on).
     pub partition_bits: Option<u8>,
+    /// Build-side `$ck.<field>` propagation policy. Mirrors the
+    /// HashBuildProbe arm — every strategy threads the same spec to
+    /// the shared `copy_build_ck_columns` helper at every emit site.
+    pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a mut MemoryBudget,
 }
@@ -436,6 +440,7 @@ pub(crate) fn execute_combine_iejoin(
         match_mode,
         on_miss,
         partition_bits,
+        propagate_ck,
         ctx,
         budget,
     } = args;
@@ -657,6 +662,12 @@ pub(crate) fn execute_combine_iejoin(
 
     let mut collect_accum: HashMap<usize, Vec<Value>> = HashMap::new();
     let mut collect_truncated: HashMap<usize, ()> = HashMap::new();
+    // First matched build record per driver index, captured so the
+    // collect-mode flush can propagate build-side `$ck.<field>`
+    // values onto the synthesized output row. Single-valued slot;
+    // every per-build payload still rides inside the array via
+    // `Value::Map`, so no lineage is lost.
+    let mut first_collected_builds: HashMap<usize, Record> = HashMap::new();
 
     let op1 = range_ops[0];
     let op2 = if n_ranges >= 2 {
@@ -745,6 +756,9 @@ pub(crate) fn execute_combine_iejoin(
                             collect_truncated.insert(driver_idx, ());
                             continue;
                         }
+                        first_collected_builds
+                            .entry(driver_idx)
+                            .or_insert_with(|| build_record.clone());
                         let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
                         for (fname, val) in build_record.iter_all_fields() {
                             m.insert(fname.into(), val.clone());
@@ -771,6 +785,11 @@ pub(crate) fn execute_combine_iejoin(
                                     for (k, v) in metadata {
                                         let _ = rec.set_meta(&k, v);
                                     }
+                                    crate::executor::copy_build_ck_columns(
+                                        &mut rec,
+                                        build_record,
+                                        propagate_ck,
+                                    );
                                     output_records.push((rec, driver_order));
                                     matched_driver[driver_idx] = true;
                                     emitted_since_check += 1;
@@ -874,6 +893,9 @@ pub(crate) fn execute_combine_iejoin(
                 Some(s) => widen_record_to_schema(driver_record, s),
                 None => driver_record.clone(),
             };
+            if let Some(first_build) = first_collected_builds.remove(&i) {
+                crate::executor::copy_build_ck_columns(&mut rec, &first_build, propagate_ck);
+            }
             rec.set(build_qualifier, Value::Array(arr));
             output_records.push((rec, *driver_order));
         }

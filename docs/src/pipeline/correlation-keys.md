@@ -255,7 +255,15 @@ error_handling:
 
 Under `propagate_ck: driver`, output rows from `enriched` carry the `$ck.employee_id` value from the driver record, regardless of which department record matched. A trigger error on a driver record DLQ's that driver's whole correlation group, including any combine output rows that were already produced for that group.
 
-This rule holds across all combine execution paths: the hash-join path, the IEJoin range-predicate path, and chained combines (combine consuming the output of another combine).
+Under `propagate_ck: all` (or `{ named: [...] }`), the combine widens its output schema with the build-side `$ck.<field>` columns it propagates, and the runtime copies the matched build record's values into those columns. **Driver wins on a name collision**: if both the driver and a build input declare `$ck.<field>`, the column appears once on the output schema and the runtime keeps the driver's value -- the build's value would only land if the driver's slot was null, which never happens for a same-named CK field that the driver itself observes.
+
+Match-mode interaction:
+
+- `match: first` -- one matched build per driver row; that build's `$ck.<field>` fills the propagated slot.
+- `match: all` -- one output row per matched build; each row carries its own matched build's `$ck.<field>`.
+- `match: collect` -- one synthesized output row per driver. The propagated `$ck.<field>` slot is single-valued: the **first matched build's** CK fills it. Every matched build's full payload still rides inside the array column via `Value::Map`, so per-build lineage is preserved at the cost of single-valued addressing on the propagated slot.
+
+This rule holds across all combine execution paths: the hash-join path, the IEJoin range-predicate path, the grace-hash spill path, the sort-merge path, and chained combines (combine consuming the output of another combine).
 
 The `drive:` field on a combine selects which input is the driver. Choose the side that carries the authoritative group identity for downstream DLQ routing -- typically the larger or more transactional stream.
 
