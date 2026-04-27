@@ -461,6 +461,36 @@ fn window_collect_full_partition_retract() {
     );
 }
 
+/// `lag(2)` and `lead(2)` near a partition boundary: the existing
+/// matrix exercises lag(1) / lead(1); these are the boundary-stress
+/// variants for offsets > 1. Removing position k shifts every
+/// lag/lead reference in a lookup-position window. One test asserts
+/// bit-for-bit baseline equivalence over a fixture where the bad row
+/// sits inside the lag/lead reach window of the partition's first /
+/// last surviving rows.
+#[test]
+fn window_lag2_and_lead2_boundary_retract() {
+    let yaml = build_yaml(
+        "emit w_lag2 = $window.lag(2).emp_id\n      emit w_lead2 = $window.lead(2).emp_id",
+    );
+    let (full_csv, baseline_csv) = build_inputs(RetractKind::SingleRow);
+
+    let (counters, dlq, output) = run_pipeline(&yaml, full_csv).expect("retract pipeline");
+    let (_, _, baseline_output) = run_pipeline(&yaml, baseline_csv).expect("baseline pipeline");
+
+    assert!(
+        !dlq.is_empty(),
+        "expected DLQ entries from the BAD row, got none.\ncounters={counters:?}"
+    );
+    assert!(counters.dlq_count > 0);
+    assert_eq!(
+        sort_body(&output),
+        sort_body(&baseline_output),
+        "lag(2)+lead(2) retract-corrected output must equal baseline rerun.\n\
+         GOT:\n{output}\nBASELINE:\n{baseline_output}"
+    );
+}
+
 // `$window.distinct(...)` and `$window.any(...)` / `$window.all(...)`
 // are listed in the windows.md docs but the CXL parser today rejects
 // `distinct` (it is a top-level keyword) and the iterable-predicate

@@ -2003,6 +2003,41 @@ impl PipelineConfig {
                         ));
                     }
                 }
+
+                // Chained-aggregate stack guard. When a content-relaxed
+                // aggregate feeds another aggregate whose `group_by` does
+                // NOT include every correlation-key field, the runtime
+                // cannot prove correct retraction propagation: the inner
+                // retract delta would have to thread through the outer
+                // aggregator's accumulator state, which has no lineage
+                // entry for the inner-aggregate output rows. Reject at
+                // plan time so the user sees the limit before they hit
+                // silent corruption at runtime. The outer aggregate is
+                // safe iff its `group_by` is a superset of the pipeline
+                // CK — then the outer aggregate stays on the strict-
+                // collateral path and observes inner retract effects only
+                // through the wholesale group rebuild.
+                let chained_violations = collect_chained_aggregate_e15w_violations(&dag, ck);
+                for (downstream_node_idx, upstream_name) in chained_violations {
+                    let node = &dag.graph[downstream_node_idx];
+                    let downstream_name = node.name();
+                    diags.push(Diagnostic::error(
+                        "E15W",
+                        format!(
+                            "E15W aggregate '{}' is downstream of relaxed aggregate '{}' but \
+                             its `group_by` omits at least one correlation-key field. The \
+                             runtime cannot prove correct retraction propagation through \
+                             chained aggregates with narrower group_by than the pipeline \
+                             correlation key — the outer aggregate's accumulator state holds \
+                             no lineage entry for the inner aggregate's output rows. \
+                             Either widen the downstream `group_by` to include every \
+                             correlation-key field, or restructure the pipeline so the \
+                             relaxed aggregate is terminal.",
+                            downstream_name, upstream_name
+                        ),
+                        LabeledSpan::primary(node.span(), String::new()),
+                    ));
+                }
             }
         }
 
@@ -3075,4 +3110,88 @@ fn extend_aggregate_group_by_with_shadow(
         }
         *output_schema = builder.build();
     }
+}
+
+/// Find every (downstream-aggregate, upstream-aggregate-name) pair that
+/// constitutes a chained-aggregate retraction violation under the
+/// pipeline correlation key.
+///
+/// A chained aggregate is a `PlanNode::Aggregation` reachable downstream
+/// (transitively) of another `PlanNode::Aggregation`. The downstream
+/// aggregate violates the retraction protocol's substitution proof when
+/// the *upstream* aggregate is content-relaxed (its `group_by` omits a
+/// correlation-key field, activating the retraction protocol) AND the
+/// downstream aggregate's `group_by` omits any correlation-key field.
+/// The downstream aggregate then has no lineage entry through which the
+/// inner retract can rebuild its accumulator state, and the runtime
+/// would silently produce stale output.
+///
+/// Returns one entry per violating downstream aggregate; the first
+/// upstream relaxed aggregate found is reported as the cause for the
+/// diagnostic message. Multiple distinct upstream aggregates feeding
+/// the same downstream collapse to a single diagnostic — the user
+/// resolution (widen the downstream `group_by` or restructure) is the
+/// same regardless of which upstream they look at first.
+fn collect_chained_aggregate_e15w_violations(
+    dag: &crate::plan::execution::ExecutionPlanDag,
+    ck: &CorrelationKey,
+) -> Vec<(petgraph::graph::NodeIndex, String)> {
+    use crate::plan::execution::{PlanNode, group_by_omits_any_ck_field};
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use petgraph::visit::EdgeRef;
+    use std::collections::{HashSet, VecDeque};
+
+    let mut findings: Vec<(NodeIndex, String)> = Vec::new();
+
+    for downstream_idx in dag.graph.node_indices() {
+        let PlanNode::Aggregation { config, .. } = &dag.graph[downstream_idx] else {
+            continue;
+        };
+        if !group_by_omits_any_ck_field(&config.group_by, Some(ck)) {
+            // Downstream's group_by ⊇ correlation_key. The downstream
+            // aggregate stays on the strict-collateral path and absorbs
+            // any inner retract via wholesale group rebuild — safe.
+            continue;
+        }
+
+        // BFS upstream from the downstream aggregate, looking for the
+        // first relaxed aggregate ancestor. `seen` prevents revisits in
+        // a diamond-shaped DAG.
+        let mut seen: HashSet<NodeIndex> = HashSet::new();
+        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
+        for edge in dag
+            .graph
+            .edges_directed(downstream_idx, Direction::Incoming)
+        {
+            let pred = edge.source();
+            if seen.insert(pred) {
+                queue.push_back(pred);
+            }
+        }
+        let mut upstream_relaxed_name: Option<String> = None;
+        while let Some(idx) = queue.pop_front() {
+            if let PlanNode::Aggregation {
+                name,
+                config: upstream_cfg,
+                ..
+            } = &dag.graph[idx]
+                && group_by_omits_any_ck_field(&upstream_cfg.group_by, Some(ck))
+            {
+                upstream_relaxed_name = Some(name.clone());
+                break;
+            }
+            for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
+                let pred = edge.source();
+                if seen.insert(pred) {
+                    queue.push_back(pred);
+                }
+            }
+        }
+        if let Some(upstream_name) = upstream_relaxed_name {
+            findings.push((downstream_idx, upstream_name));
+        }
+    }
+
+    findings
 }
