@@ -359,12 +359,38 @@ pub(crate) fn dispatch_plan_node(
                         if Arc::ptr_eq(r.schema(), target) {
                             r.clone()
                         } else {
-                            debug_assert_eq!(
+                            // The reader's `Arc<Schema>` covers the user-declared
+                            // columns; the plan-time target may extend that with
+                            // engine-stamped tail columns (`$ck.<field>` shadow
+                            // columns from `error_handling.correlation_key`
+                            // widening). Reader columns must equal the user-
+                            // declared prefix of the target; the tail is filled
+                            // by `Record::new`'s arity padding (Null today;
+                            // populated by the source-arm correlation stamp in
+                            // a later wave).
+                            debug_assert!(
+                                target
+                                    .columns()
+                                    .iter()
+                                    .zip(r.schema().columns())
+                                    .all(|(t, s)| t == s)
+                                    && r.schema().column_count() <= target.column_count()
+                                    && (r.schema().column_count()..target.column_count())
+                                        .all(|i| target.field_metadata(i).is_some()),
+                                "Source reader columns must form the user-declared prefix \
+                                 of the plan-time target schema; any tail columns must \
+                                 carry engine-stamp metadata. reader: {:?}, target: {:?}",
                                 r.schema().columns(),
                                 target.columns(),
-                                "Source reader Arc must match plan-time declared columns",
                             );
-                            let mut rebuilt = Record::new(Arc::clone(target), r.values().to_vec());
+                            // Engine-stamped tail slots default to `Value::Null`;
+                            // a later wave fills them with the source field's
+                            // value at ingest. Padding here keeps `Record::new`'s
+                            // arity invariant intact in both debug and release
+                            // builds.
+                            let mut values = r.values().to_vec();
+                            values.resize(target.column_count(), Value::Null);
+                            let mut rebuilt = Record::new(Arc::clone(target), values);
                             for (k, v) in r.iter_meta() {
                                 let _ = rebuilt.set_meta(k, v.clone());
                             }

@@ -168,6 +168,7 @@ mod tests {
             &ctx,
             &symbol_table,
             std::path::Path::new(""),
+            config.error_handling.correlation_key.as_ref(),
         );
         (artifacts, diags)
     }

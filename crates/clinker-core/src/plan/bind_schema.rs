@@ -157,6 +157,12 @@ pub(crate) struct BindContext<'a> {
     /// pipeline this is typically `"pipelines/"` or similar; for nested
     /// compositions it's the directory of the `.comp.yaml` file.
     pub origin_dir: PathBuf,
+    /// Pipeline-level `error_handling.correlation_key`, threaded so the
+    /// Source-arm widening pass can synthesize one `$ck.<field>` shadow
+    /// column per declared correlation field. `None` when the pipeline
+    /// has no correlation key. Composition bodies inherit the parent
+    /// pipeline's key — they have no `error_handling` of their own.
+    pub correlation_key: Option<&'a crate::config::CorrelationKey>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -167,12 +173,21 @@ pub(crate) struct BindContext<'a> {
 /// `pipeline_dir` is the workspace-relative directory of the pipeline
 /// file being compiled. Used to resolve relative `use:` paths on
 /// `PipelineNode::Composition` nodes. Pass `""` if unknown.
+///
+/// `correlation_key` is the pipeline-level
+/// `error_handling.correlation_key`. When `Some`, every `Source` node's
+/// declared schema is widened with one `$ck.<field>` shadow column per
+/// listed field, tail-appended in declaration order. The shadow columns
+/// preserve correlation-group identity through downstream Transforms
+/// that may rewrite the user-declared field. Composition body Sources
+/// inherit the same widening through the recursive walk.
 pub fn bind_schema(
     nodes: &[Spanned<PipelineNode>],
     diags: &mut Vec<Diagnostic>,
     ctx: &CompileContext,
     symbol_table: &CompositionSymbolTable,
     pipeline_dir: &Path,
+    correlation_key: Option<&crate::config::CorrelationKey>,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
@@ -183,6 +198,7 @@ pub fn bind_schema(
         depth: 0,
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
+        correlation_key,
     };
     bind_schema_inner(
         nodes,
@@ -241,7 +257,7 @@ fn bind_schema_inner(
         match node {
             PipelineNode::Source { config, .. } => {
                 let schema_decl: &SchemaDecl = &config.schema;
-                let columns = columns_from_decl(schema_decl);
+                let columns = columns_from_decl(schema_decl, bind_ctx.correlation_key);
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
                 let row = Row::closed(columns, cxl_span);
                 schema_by_name.insert(name.clone(), row.clone());
@@ -625,7 +641,6 @@ fn bind_composition(
     // each body node's declared `input:` field, mirroring the
     // edge-wiring loop in top-level `PipelineConfig::compile()`.
     use crate::plan::execution::{DependencyType, PlanEdge};
-    use clinker_record::SchemaBuilder;
     use petgraph::graph::DiGraph;
 
     let mut body_graph: DiGraph<crate::plan::execution::PlanNode, PlanEdge> = DiGraph::new();
@@ -656,11 +671,8 @@ fn bind_composition(
             Some(r) => r,
             None => continue, // upstream missing — already diagnosed
         };
-        let port_schema = parent_row
-            .field_names()
-            .map(|qf| qf.name.as_ref())
-            .collect::<SchemaBuilder>()
-            .build();
+        let port_schema =
+            schema_from_field_names(parent_row.field_names().map(|qf| qf.name.as_ref()));
         let port_source = crate::plan::execution::PlanNode::Source {
             name: port_name.clone(),
             span,
@@ -1158,6 +1170,23 @@ fn build_input_port_rows(
             }
         }
 
+        // Append the parent's engine-stamped tail columns ($ck.<field>
+        // shadow columns from `error_handling.correlation_key` widening)
+        // to the body's port declared set. The runtime port-synthetic
+        // Source built at body entry adopts every parent column, so the
+        // body sees these at runtime; declaring them here keeps the
+        // compile-time Row aligned with that runtime shape — without
+        // this step the open-tail mechanism would silently drop
+        // engine-stamped columns from the body's compile-time view and
+        // surface as a schema mismatch when records flow back to the
+        // parent (the composition's `output_schema` is derived from the
+        // body's terminal Row).
+        let mut declared_columns = declared_columns;
+        for (qf, ty) in upstream_row.fields() {
+            if qf.name.starts_with("$ck.") && !declared_columns.contains_key(qf) {
+                declared_columns.insert(qf.clone(), ty.clone());
+            }
+        }
         // Build Row::open(declared, fresh_tail) for the port.
         let tail_var = cxl::typecheck::row::TailVarId(*next_tail_var);
         *next_tail_var += 1;
@@ -1373,11 +1402,65 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 // ─── Upstream schema helpers ────────────────────────────────────────
 
-fn columns_from_decl(decl: &SchemaDecl) -> IndexMap<QualifiedField, Type> {
-    decl.columns
+/// Build a runtime `Arc<Schema>` from an iterator of column names,
+/// stamping engine-stamp metadata on every column whose name begins
+/// with the `$ck.` prefix. The metadata's `snapshot_of` records the
+/// suffix (the user-declared source field). Mirrors the deduction in
+/// `lower_node_to_plan_node`'s `schema_from_bound` closure so a
+/// composition body's port-synthetic Source carries the same marker.
+pub(crate) fn schema_from_field_names<'a, I>(names: I) -> Arc<clinker_record::Schema>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    use clinker_record::{FieldMetadata, SchemaBuilder};
+    let mut builder = SchemaBuilder::new();
+    for name in names {
+        builder = match name.strip_prefix("$ck.") {
+            Some(field) => builder.with_field_meta(name, FieldMetadata::snapshot_of(field)),
+            None => builder.with_field(name),
+        };
+    }
+    builder.build()
+}
+
+/// Build the `Row.declared` map for a Source from its author-declared
+/// `schema:` block, optionally tail-appending one `$ck.<field>` shadow
+/// column per `correlation_key` field.
+///
+/// Each shadow column is typed identically to the user-declared field
+/// of the same name; if a listed correlation field is not declared on
+/// the source schema, that shadow column is skipped (E15X surfaces the
+/// missing-field case elsewhere — this function only widens the rows
+/// it can type unambiguously). Tail-append preserves user-declared
+/// positional indices, mirroring Spark `_metadata`.
+fn columns_from_decl(
+    decl: &SchemaDecl,
+    correlation_key: Option<&crate::config::CorrelationKey>,
+) -> IndexMap<QualifiedField, Type> {
+    let mut cols: IndexMap<QualifiedField, Type> = decl
+        .columns
         .iter()
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
-        .collect()
+        .collect();
+    if let Some(ck) = correlation_key {
+        for field in ck.fields() {
+            // Type the shadow column identically to the user-declared
+            // field. When the source schema does not declare `field`,
+            // skip — a missing correlation-key field is surfaced by
+            // the validation pass (config/mod.rs:1818-) and would only
+            // produce a phantom $ck. column with no source value.
+            if let Some(ty) = decl
+                .columns
+                .iter()
+                .find(|c| c.name.as_str() == field)
+                .map(|c| c.ty.clone())
+            {
+                let shadow_name = format!("$ck.{field}");
+                cols.insert(QualifiedField::bare(shadow_name), ty);
+            }
+        }
+    }
+    cols
 }
 
 fn upstream_schema<'a>(

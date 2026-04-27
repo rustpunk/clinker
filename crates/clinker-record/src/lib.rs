@@ -24,6 +24,6 @@ pub use provenance::RecordProvenance;
 pub use record::{Record, RecordPayload};
 pub use record_view::RecordView;
 pub use resolver::{FieldResolver, HashMapResolver, WindowContext};
-pub use schema::{Schema, SchemaBuilder};
+pub use schema::{FieldMetadata, Schema, SchemaBuilder};
 pub use storage::RecordStorage;
 pub use value::{NULL, Value};

@@ -1352,6 +1352,7 @@ impl PipelineConfig {
             ctx,
             &symbol_table,
             &ctx.pipeline_dir,
+            self.error_handling.correlation_key.as_ref(),
         );
         // Only abort on non-composition CXL errors (E200/E201). Composition
         // binding errors (E102–E109) are non-fatal for the rest of the
@@ -2066,7 +2067,7 @@ pub(crate) fn lower_node_to_plan_node(
         extract_write_set,
     };
     use crate::plan::index::find_index_for;
-    use clinker_record::SchemaBuilder;
+    use clinker_record::{FieldMetadata, SchemaBuilder};
     use cxl::ast::Statement;
     use std::sync::Arc;
 
@@ -2074,14 +2075,29 @@ pub(crate) fn lower_node_to_plan_node(
     // Returns an empty sentinel if bind_schema didn't record one — the
     // caller skips lowering in every such case, so the sentinel never
     // reaches the executor.
+    //
+    // Columns whose name has the `$ck.` prefix carry engine-stamp
+    // metadata pointing at the user-declared source field (the shadow
+    // is named `$ck.<field>` and stamps `snapshot_of: <field>`). The
+    // marker travels with the column through the DAG: when a Transform
+    // / Aggregate / Combine output row inherits a `$ck.*` column, its
+    // own `Arc<Schema>` recovers the same metadata here. LD-005's
+    // reserved-`$` prefix guarantees no user-declared column collides.
     let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
         match artifacts.typed.get(node_name) {
-            Some(tp) => tp
-                .output_row
-                .fields()
-                .map(|(qf, _)| qf.name.as_ref())
-                .collect::<SchemaBuilder>()
-                .build(),
+            Some(tp) => {
+                let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
+                for (qf, _) in tp.output_row.fields() {
+                    let col = qf.name.as_ref();
+                    builder = match col.strip_prefix("$ck.") {
+                        Some(field) => {
+                            builder.with_field_meta(col, FieldMetadata::snapshot_of(field))
+                        }
+                        None => builder.with_field(col),
+                    };
+                }
+                builder.build()
+            }
             None => SchemaBuilder::new().build(),
         }
     };
