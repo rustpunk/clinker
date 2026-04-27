@@ -370,13 +370,6 @@ pub enum PlanNode {
         /// construction. `Some` iff resolved strategy is Streaming.
         #[serde(skip_serializing_if = "Option::is_none")]
         qualified_sort_order: Option<Vec<SortField>>,
-        /// Mirrors `AggregateBody.relaxed_correlation_key`. When `true`,
-        /// the strict E151 superset requirement is bypassed for this
-        /// aggregate and the per-node CK-set lattice intersects the
-        /// parent CK set with `group_by` (omitted CK fields disappear
-        /// from downstream visibility).
-        #[serde(default, skip_serializing_if = "is_false")]
-        relaxed_correlation_key: bool,
     },
     /// Composition call-site node. Lowered to `PlanNode::Composition` in
     /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
@@ -1166,26 +1159,28 @@ impl ExecutionPlanDag {
         out
     }
 
-    /// Render the retraction-cost block for relaxed-CK aggregates and
-    /// buffer-mode windows.
+    /// Render the retraction-cost block for content-relaxed aggregates
+    /// and buffer-mode windows.
     ///
     /// `config` is `Some` when the caller went through one of the
     /// artifacts-aware entry points and can read the pipeline-level
-    /// `correlation_fanout_policy` default. Without it the block still
-    /// emits per-aggregate / per-window detail; only the policy line
-    /// degrades to "unknown at this rendering".
+    /// `correlation_fanout_policy` default plus the `correlation_key`
+    /// used to classify aggregates. Without it the block still emits
+    /// per-window detail; aggregate detection requires the correlation
+    /// key, so the per-aggregate section is silent on the no-config
+    /// rendering and the policy line degrades to "unknown at this
+    /// rendering".
     ///
-    /// The block is silent on pipelines with no relaxed-CK aggregate so
-    /// strict-correlation and non-correlated `--explain` output stays
-    /// identical to today's text.
+    /// The block is silent on pipelines whose every aggregate has
+    /// `group_by ⊇ correlation_key` so strict-correlation and
+    /// non-correlated `--explain` output stays identical to today's
+    /// text.
     fn render_retraction_section(&self, out: &mut String, config: Option<&PipelineConfig>) {
+        let correlation_key = config.and_then(|c| c.error_handling.correlation_key.as_ref());
         let mut relaxed_aggregates: Vec<(&str, &PlanNode)> = Vec::new();
         for &idx in &self.topo_order {
-            if let PlanNode::Aggregation {
-                name,
-                relaxed_correlation_key: true,
-                ..
-            } = &self.graph[idx]
+            if let PlanNode::Aggregation { name, config, .. } = &self.graph[idx]
+                && group_by_omits_any_ck_field(&config.group_by, correlation_key)
             {
                 relaxed_aggregates.push((name.as_str(), &self.graph[idx]));
             }
@@ -2890,17 +2885,18 @@ impl ExecutionPlanDag {
     /// at least one field that is not part of the window's
     /// `partition_by` slice. Reads `node_properties.ck_set`, so callers
     /// must invoke `compute_node_properties` first. Idempotent.
-    pub(crate) fn derive_window_buffer_recompute_flags(&mut self) {
-        // Pipeline-level enabler: at least one relaxed-CK aggregate
-        // anywhere in the DAG. Without one, the retraction protocol
-        // does not fire and no window needs buffer mode.
+    pub(crate) fn derive_window_buffer_recompute_flags(
+        &mut self,
+        correlation_key: Option<&crate::config::CorrelationKey>,
+    ) {
+        // Pipeline-level enabler: at least one aggregate whose `group_by`
+        // omits a correlation-key field. Without one, the retraction
+        // protocol does not fire and no window needs buffer mode.
         let has_relaxed_aggregate = self.graph.node_weights().any(|n| {
             matches!(
                 n,
-                PlanNode::Aggregation {
-                    relaxed_correlation_key: true,
-                    ..
-                }
+                PlanNode::Aggregation { config, .. }
+                    if group_by_omits_any_ck_field(&config.group_by, correlation_key)
             )
         });
         if !has_relaxed_aggregate {
@@ -3356,11 +3352,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Aggregation {
-            config,
-            relaxed_correlation_key,
-            ..
-        } => {
+        PlanNode::Aggregation { config, .. } => {
             // Aggregation node ordering is the sole responsibility of
             // the `select_aggregation_strategies` post-pass, which runs
             // immediately after `compute_node_properties` and overwrites
@@ -3371,14 +3363,18 @@ fn compute_one(
             // rather than silently asserting a false ordering.
             //
             // CK lattice rule:
-            //   - strict (default): preserves parent CK set unchanged
-            //     because E151 still requires `group_by ⊇ correlation_key`.
-            //   - relaxed: intersects parent CK set with `group_by`. Any
-            //     CK column the user dropped from `group_by` stops being
-            //     visible to downstream consumers because the aggregator
-            //     no longer projects it onto its output rows.
+            //   - strict (`group_by ⊇ correlation_key`): preserves parent
+            //     CK set unchanged.
+            //   - relaxed (`group_by` omits any CK field): intersects
+            //     parent CK set with `group_by`. Any CK column the user
+            //     dropped from `group_by` stops being visible to
+            //     downstream consumers because the aggregator no longer
+            //     projects it onto its output rows.
             let parent_ck = preserve_parent_ck_set();
-            let ck_set: BTreeSet<String> = if *relaxed_correlation_key {
+            let omits_ck = correlation_key_fields
+                .iter()
+                .any(|f| !config.group_by.iter().any(|g| g == f));
+            let ck_set: BTreeSet<String> = if omits_ck {
                 let group_by_set: BTreeSet<&str> =
                     config.group_by.iter().map(String::as_str).collect();
                 parent_ck
@@ -3650,6 +3646,34 @@ pub(crate) fn cxl_has_nondeterministic_call(typed: &TypedProgram) -> bool {
     false
 }
 
+/// True when an aggregate's `group_by` omits at least one field of the
+/// pipeline-level correlation key.
+///
+/// Selects between the strict-collateral two-phase commit (returns
+/// `false`) and the relaxed lattice + five-phase retraction protocol
+/// (returns `true`). Pipelines without a correlation key always return
+/// `false` — there is no key to test against, so retraction is not in
+/// play.
+///
+/// `correlation_key` is the comma-split [`crate::config::CorrelationKey`]
+/// fields. `group_by` is the aggregate's user-declared (or
+/// auto-extension-rewritten) group-by list. Field-name comparison is
+/// strict equality; the auto-extension pass appends `$ck.<field>` shadow
+/// columns whenever the user already lists the corresponding bare field,
+/// so the bare-name check below sees the post-extension shape and stays
+/// stable across the rewrite.
+pub(crate) fn group_by_omits_any_ck_field(
+    group_by: &[String],
+    correlation_key: Option<&crate::config::CorrelationKey>,
+) -> bool {
+    let Some(ck) = correlation_key else {
+        return false;
+    };
+    ck.fields()
+        .iter()
+        .any(|f| !group_by.iter().any(|g| g.as_str() == *f))
+}
+
 /// Detect whether a CXL transform contains any `distinct` statement.
 ///
 /// Sibling of [`extract_write_set`] — sourced from the same `TypedProgram`
@@ -3727,14 +3751,6 @@ pub enum PlanError {
     /// limitation up front instead of a confusing runtime path.
     CorrelationKeyWithArena {
         transform: String,
-    },
-    /// E151 — an Aggregate node's `group_by` does not include every
-    /// `correlation_key` field. Without this superset relation an
-    /// aggregate row could mix records from multiple correlation
-    /// groups into a single output row, breaking per-group rollback.
-    CorrelationKeyWithMixedAggregate {
-        aggregate: String,
-        missing_fields: Vec<String>,
     },
     /// E152 — a `PlanNode::Composition` has an incoming edge with no
     /// `PlanEdge.port` tag. Compile-time guard for the dispatcher's
@@ -3829,17 +3845,6 @@ impl std::fmt::Display for PlanError {
                     "E150 transform '{transform}' uses analytic windows but the \
                      pipeline has `error_handling.correlation_key` set; per-group \
                      arena construction is not supported",
-                )
-            }
-            PlanError::CorrelationKeyWithMixedAggregate {
-                aggregate,
-                missing_fields,
-            } => {
-                write!(
-                    f,
-                    "E151 aggregate '{aggregate}' group_by must include every \
-                     correlation_key field — missing: [{}]",
-                    missing_fields.join(", ")
                 )
             }
             PlanError::CompositionUntaggedIncomingEdge {

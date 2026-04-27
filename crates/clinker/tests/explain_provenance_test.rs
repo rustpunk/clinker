@@ -134,7 +134,7 @@ fn test_explain_error_code_e105_outputs_doc_content() {
 }
 
 #[test]
-fn test_explain_error_code_e15w_relaxed_correlation_key_help() {
+fn test_explain_error_code_e15w_retraction_help() {
     let output = Command::new(clinker_bin())
         .arg("explain")
         .arg("--code")
@@ -152,8 +152,8 @@ fn test_explain_error_code_e15w_relaxed_correlation_key_help() {
         "E15W doc must reference its own code.\nstdout: {stdout}"
     );
     assert!(
-        stdout.contains("relaxed_correlation_key"),
-        "E15W doc must mention the relaxed_correlation_key opt-in.\nstdout: {stdout}"
+        stdout.contains("retraction"),
+        "E15W doc must mention the retraction protocol.\nstdout: {stdout}"
     );
 }
 

@@ -1019,7 +1019,7 @@ impl AggregateStream {
     /// Convert the stream into a boxed [`HashAggregator`] owning the
     /// in-memory state, plus a snapshot of the Hash-arm group-by indices.
     /// Returns `None` for the `Streaming` arm — that path is rejected
-    /// for relaxed-CK aggregates at compile time (E15Y), so the relaxed
+    /// for retraction-mode aggregates at compile time (E15Y), so the
     /// commit orchestrator only ever calls this on a Hash-arm stream.
     pub fn into_retained_hash(self) -> Option<Box<HashAggregator>> {
         match self {
@@ -1679,7 +1679,7 @@ impl HashAggregator {
     /// * **Lineage / fold path** — for each binding's accumulator in the
     ///   group, calls `acc.sub(&stored_value)` against the corresponding
     ///   slot in `AggregatorGroupState.retract_values`. Reversible-only
-    ///   bindings are guaranteed by `set_retraction_flags_for_relaxed`.
+    ///   bindings are guaranteed by `set_retraction_flags`.
     /// * **Buffer path** — removes the matching entry from
     ///   `BufferedGroupState.contributions`/`input_rows`. The next
     ///   `finalize` call re-folds the surviving contributions through a
@@ -3494,19 +3494,21 @@ mod spill_trigger_tests {
         )
     }
 
-    /// Like `build_test_aggregator` but flips the relaxed-CK opt-in on
-    /// the extracted `CompiledAggregate` so the runtime takes whichever
-    /// retraction-strategy path the binding shape selects (lineage for
-    /// all-Reversible, buffer-mode for any BufferRequired). Mirrors what
-    /// the planner does at `config/mod.rs` once an `AggregateBody` opts
-    /// into relaxed correlation-key semantics.
+    /// Like `build_test_aggregator` but configures retraction-strategy
+    /// flags on the extracted `CompiledAggregate` as if the planner had
+    /// classified this aggregate as relaxed (lineage for all-Reversible
+    /// bindings, buffer-mode for any BufferRequired binding). Tests
+    /// pass `is_relaxed = true` to exercise the retraction paths
+    /// directly; the runtime planner makes the same call once it
+    /// determines an aggregate's `group_by` omits a correlation-key
+    /// field.
     fn build_test_aggregator_relaxed(
         input_fields: &[(&str, Type)],
         group_by: &[&str],
         cxl_src: &str,
         memory_budget: usize,
         spill_dir: Option<std::path::PathBuf>,
-        relaxed_correlation_key: bool,
+        is_relaxed: bool,
     ) -> HashAggregator {
         let parsed = Parser::parse(cxl_src);
         assert!(
@@ -3531,11 +3533,11 @@ mod spill_trigger_tests {
         let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
         let mut compiled =
             extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates");
-        // Mirror the planner: the relaxed-CK opt-in is what flips one of
+        // Mirror the planner: relaxed aggregates flip exactly one of
         // the two retraction-strategy flags. Tests that want the strict
-        // (zero-overhead) path leave this `false` and the constructor
-        // sees both flags as `false`.
-        compiled.set_retraction_flags_for_relaxed(relaxed_correlation_key);
+        // (zero-overhead) path leave `is_relaxed = false` and the
+        // constructor sees both flags as `false`.
+        compiled.set_retraction_flags(is_relaxed);
 
         let output_columns: Vec<Box<str>> = compiled
             .emits

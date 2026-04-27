@@ -100,11 +100,11 @@ clinker run pipeline.yaml --dry-run       # validate config
 
 ## Retraction section
 
-Pipelines that opt at least one Aggregate into `relaxed_correlation_key: true` get a `=== Retraction ===` block in the text output. The block is silent on every other pipeline, so strict-correlation and non-correlated `--explain` output stays identical to today's text.
+Pipelines whose at least one Aggregate has a `group_by` that omits a correlation-key field get a `=== Retraction ===` block in the text output. The engine selects the retraction-mode path automatically based on `group_by` content; the block is silent on every other pipeline, so strict-correlation and non-correlated `--explain` output stays identical to today's text.
 
-The block opens with a one-line summary -- `retraction enabled — N relaxed aggregates, M buffer-mode windows, fanout policy: <policy>.` -- followed by one block per relaxed Aggregate and one per buffer-mode window index.
+The block opens with a one-line summary -- `retraction enabled — N relaxed aggregates, M buffer-mode windows, fanout policy: <policy>.` -- followed by one block per retraction-mode Aggregate and one per buffer-mode window index.
 
-Per relaxed Aggregate the block reports:
+Per retraction-mode Aggregate the block reports:
 
 - the resolved accumulator path (`Reversible` or `BufferRequired`),
 - the per-row lineage memory cost (`~8 bytes/row` for Reversible, `n/a` for BufferRequired which holds raw contributions instead),
@@ -123,8 +123,8 @@ Group cardinality is honestly surfaced as "unknown at plan time" -- the planner 
 `clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:
 
 ```bash
-clinker explain --code E15W   # non-deterministic CXL builtin under relaxed_correlation_key
-clinker explain --code E15Y   # relaxed_correlation_key incompatible with strategy: streaming
+clinker explain --code E15W   # non-deterministic CXL builtin downstream of a retraction-mode aggregate
+clinker explain --code E15Y   # retraction-mode aggregate incompatible with strategy: streaming
 ```
 
 The full set of codes is enumerated in the error returned when an unknown code is passed.

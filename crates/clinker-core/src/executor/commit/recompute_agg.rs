@@ -22,8 +22,8 @@ use crate::executor::dispatch::ExecutorContext;
 /// On per-aggregator failure (e.g. retract against a spilled aggregator),
 /// the protocol degrades to "DLQ entire affected group" — the
 /// orchestrator's flush phase emits collateral entries for every record
-/// derived from the degraded aggregate, mirroring today's strict
-/// E151-collateral semantics.
+/// derived from the degraded aggregate, mirroring the strict-collateral
+/// DLQ shape every aggregate uses on the strict path.
 pub(crate) fn recompute_aggregates(
     ctx: &mut ExecutorContext<'_>,
     scope: &RetractScope,

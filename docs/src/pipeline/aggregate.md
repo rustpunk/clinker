@@ -90,25 +90,14 @@ If your source declares a `sort_order:` that covers the group-by fields, the opt
 
 Hash aggregation works on unsorted input and is the safe default. It uses more memory but handles any data ordering. Memory-aware disk spill kicks in when RSS approaches the pipeline's `memory_limit`.
 
-## Correlation-key opt-out: `relaxed_correlation_key`
+## Correlation-key interaction
 
-By default, an aggregate downstream of a pipeline with `error_handling.correlation_key` must include every correlation-key field in `group_by` (compile error `E151` otherwise). Set `relaxed_correlation_key: true` to bypass that requirement and let one correlation group span multiple aggregate groups:
+In a pipeline with `error_handling.correlation_key`, the engine inspects each aggregate's `group_by` against the correlation key:
 
-```yaml
-error_handling:
-  correlation_key: order_id
+- `group_by ⊇ correlation_key.fields()` — strict-collateral path. The aggregate emits one row per group, the row inherits the correlation identity of its inputs, and a DLQ trigger anywhere in the group rolls back the whole group including the aggregate output. Zero retraction overhead.
+- `group_by` omits any correlation-key field — retraction protocol path. A single correlation group may span multiple aggregate groups; correlation-key fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output. The engine retracts only the failing records and refinalizes affected groups.
 
-- type: aggregate
-  name: dept_totals
-  input: validate
-  config:
-    group_by: [department]               # omits order_id
-    relaxed_correlation_key: true        # bypass E151
-    cxl: |
-      emit total = sum(amount)
-```
-
-This is purely additive: pipelines without the field keep today's strict semantics. The opt-in is incompatible with `strategy: streaming` -- the combination is rejected with `E15Y` because streaming aggregates emit at group-boundary close, before the terminal correlation commit, and that defeats the rollback window the relaxed path needs. See [Correlation Keys](correlation-keys.md#aggregate-interaction) for the full lattice rules.
+Authors do not configure this — the engine selects the path automatically based on `group_by` content. A retraction-mode aggregate is incompatible with `strategy: streaming` (rejected with `E15Y`, because streaming aggregates emit at group-boundary close before the terminal correlation commit and that defeats the rollback window). Non-deterministic CXL builtins (e.g. `now`) downstream of a retraction-mode aggregate are rejected with `E15W`. See [Correlation Keys](correlation-keys.md#aggregate-interaction) for the full lattice rules.
 
 The retraction protocol carries a per-aggregate cost — Reversible accumulators use a per-row lineage map, BufferRequired accumulators hold raw contributions until commit. The [operator-by-operator retraction cost reference](correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator breakdown; `clinker run --explain` reports the live per-aggregate detail.
 

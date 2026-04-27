@@ -68,10 +68,11 @@ Groups that exceed the cap are DLQ'd entirely with a `group_size_exceeded` trigg
 
 ## Compile-time constraints
 
-Two compile-time invariants are enforced:
+One compile-time invariant is enforced:
 
-- **Aggregate group-by superset**: every correlation-key field must appear in `group_by` of every aggregate downstream of the source. The engine extends `group_by` automatically when it can; an explicit `group_by` that omits a correlation-key field produces an `E151` compile error. See [Aggregate interaction](#aggregate-interaction) below.
 - **Arena execution incompatible**: the arena-evaluated execution path is incompatible with correlation grouping. Combinations are rejected at compile time.
+
+Aggregates whose `group_by` includes every correlation-key field stay on the strict-collateral path; aggregates that omit any correlation-key field activate the retraction protocol automatically. Authors do not configure this — the engine inspects the configuration and picks the correct path. See [Aggregate interaction](#aggregate-interaction) below.
 
 ## Per-operator interactions
 
@@ -156,7 +157,7 @@ If `east_orders` and `west_orders` both contain rows for `order_id = ORD-42`, al
 
 ### Aggregate interaction
 
-By default, every correlation-key field must be in `group_by`. The engine auto-extends `group_by` to include the correlation-key fields when you omit them; if you specify a `group_by` that explicitly excludes a correlation-key field, the pipeline fails to compile with `E151`.
+When an aggregate's `group_by` lists every correlation-key field, the aggregate stays on the strict-collateral path: each emitted row inherits the correlation identity of its inputs and any DLQ trigger in the group rolls back every record in the group, including the aggregate output row. This is the zero-overhead default.
 
 ```yaml
 error_handling:
@@ -166,10 +167,12 @@ error_handling:
   name: order_totals
   input: validate
   config:
-    group_by: [order_id]               # OK -- includes correlation key
+    group_by: [order_id]               # strict -- includes the correlation key
     cxl: |
       emit total = sum(amount)
 ```
+
+When an aggregate's `group_by` omits any correlation-key field, the engine routes the aggregate through the retraction protocol automatically. A single correlation group may span multiple aggregate groups; correlation-key fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output. Authors do not configure this — the engine inspects the configuration and picks the correct path.
 
 ```yaml
 error_handling:
@@ -179,34 +182,14 @@ error_handling:
   name: dept_totals
   input: validate
   config:
-    group_by: [department]             # E151 -- omits order_id
+    group_by: [department]             # retraction protocol is active
     cxl: |
       emit total = sum(amount)
 ```
 
-The reason is structural: aggregates emit one row per group, and the emitted row must inherit the correlation identity of its inputs so that downstream DLQ logic can route it correctly. If a single aggregate group spanned multiple correlation groups, the emitted row would have ambiguous identity and could not participate in correlation rollback.
+Aggregate output rows on the strict path inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row -- but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
 
-Aggregate output rows inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row -- but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
-
-#### Opting out: `relaxed_correlation_key`
-
-Set `relaxed_correlation_key: true` on an aggregate to bypass the strict superset requirement above. With the opt-in, a correlation group may span multiple aggregate groups; correlation-key fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output.
-
-```yaml
-error_handling:
-  correlation_key: order_id
-
-- type: aggregate
-  name: dept_totals
-  input: validate
-  config:
-    group_by: [department]
-    relaxed_correlation_key: true      # bypass E151
-    cxl: |
-      emit total = sum(amount)
-```
-
-The opt-in is purely additive: existing pipelines without it keep today's strict semantics. Combining `relaxed_correlation_key: true` with `strategy: streaming` is rejected at compile time with `E15Y`, because streaming aggregates emit at group-boundary close (before the terminal correlation commit) and that defeats the rollback window the opt-in is designed to support.
+On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. The retraction protocol's compile-time and runtime constraints (`E15W` for non-deterministic builtins downstream, `E15Y` for `strategy: streaming` on a retraction-mode aggregate) are enforced automatically once the engine has classified the aggregate.
 
 ### Combine interaction
 
@@ -275,24 +258,24 @@ A composition's body operates on records flowing in from the parent pipeline. Th
 
 ## Operator-by-operator retraction cost reference
 
-The `relaxed_correlation_key: true` opt-in pulls the per-Aggregate retraction protocol into play. Each operator on the post-source DAG carries a different cost profile under retraction; the table below summarizes the per-operator footprint so you can size memory and pick `propagate_ck` settings before pipelines hit production.
+An aggregate whose `group_by` omits a correlation-key field activates the retraction protocol automatically. Each operator on the post-source DAG carries a different cost profile under retraction; the table below summarizes the per-operator footprint so you can size memory and pick `propagate_ck` settings before pipelines hit production.
 
 | Operator | Retraction cost |
 |---|---|
 | Source | None at retraction time. The CK shadow columns are stamped at ingest; replay never re-reads the source file. |
 | Transform | Re-evaluated against substituted upstream rows during sub-DAG replay. Cost = O(rows_substituted) per layer, no extra state held. Non-deterministic builtins (e.g. `now`) are rejected at compile time with E15W. |
-| Aggregate (strict) | None. Strict aggregates short-circuit to today's two-phase commit body and pay zero retraction overhead. |
-| Aggregate (relaxed, Reversible bindings) | Per-row lineage map `(input_row_id → group_index)` carried alongside accumulator state — ~8 bytes/row plus the per-group `input_rows` Vec inline cost. Retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. Reversible accumulators: `sum`, `count`, `collect`, `any`. |
-| Aggregate (relaxed, BufferRequired bindings) | Per-group raw contributions held until commit. Memory cost = O(input_rows × Σ binding_value_size). Retract recomputes affected groups from `contributions − retracted_rows`. BufferRequired accumulators: `min`, `max`, `avg`, `weighted_avg`. |
+| Aggregate (strict, `group_by ⊇ correlation_key`) | None. Strict aggregates short-circuit to today's two-phase commit body and pay zero retraction overhead. |
+| Aggregate (retraction-mode, Reversible bindings) | Per-row lineage map `(input_row_id → group_index)` carried alongside accumulator state — ~8 bytes/row plus the per-group `input_rows` Vec inline cost. Retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. Reversible accumulators: `sum`, `count`, `collect`, `any`. |
+| Aggregate (retraction-mode, BufferRequired bindings) | Per-group raw contributions held until commit. Memory cost = O(input_rows × Σ binding_value_size). Retract recomputes affected groups from `contributions − retracted_rows`. BufferRequired accumulators: `min`, `max`, `avg`, `weighted_avg`. |
 | Combine (driver propagation) | One propagated `$ck.<field>` slot from the driver record. No retraction state held by the combine itself; replay carries upstream deltas through. |
 | Combine (`propagate_ck: all` / `named: [...]`) | Same per-row cost as driver propagation, plus the widened output schema's `$ck.<field>` columns must be re-populated on replay. Cost scales with the output schema width, not retraction frequency. |
-| Window (streaming) | None — streaming windows are forbidden downstream of relaxed-CK aggregates whose dropped CK fields overlap `partition_by`. The plan-time derivation switches such windows into buffer mode. |
+| Window (streaming) | None — streaming windows are incompatible with a retraction-mode aggregate whose dropped CK fields overlap `partition_by`. The plan-time derivation switches such windows into buffer mode. |
 | Window (buffer-mode) | Per-partition raw row buffers held until commit. Memory cost = O(largest partition × per-row-size). Retract reruns the configured `$window.*` evaluation over `partition − retracted_rows`. Covers all 13 `$window.*` builtins uniformly via wholesale recompute. |
 | Output | Holds retracted rows in `correlation_buffers` until commit. Replay substitutes the post-retract row in place; clean records flush to the writer, dirty records DLQ per the resolved `correlation_fanout_policy`. |
 
 The `--explain` output's `=== Retraction ===` section reports the live per-aggregate / per-window detail derived from the current pipeline. The `clinker metrics collect` spool reports the runtime counterpart: `correlation.retract.groups_recomputed`, `.partitions_recomputed`, `.subdag_replay_rows`, `.output_rows_retracted_total`, `.degrade_fallback_count`. Use the explain block for plan-time capacity sizing, the metrics spool for post-run confirmation.
 
-When retraction's preconditions break at runtime (an aggregate spilled before retract reached it, or a window partition exceeded the memory budget), the orchestrator degrades to "DLQ entire affected group/partition" — today's strict E151 collateral semantics. Each degrade increments `correlation.retract.degrade_fallback_count`; persistent non-zero values point at a tighter memory budget or a smaller correlation key cardinality.
+When retraction's preconditions break at runtime (an aggregate spilled before retract reached it, or a window partition exceeded the memory budget), the orchestrator degrades to "DLQ entire affected group/partition" — the same strict-collateral DLQ shape every aggregate uses on the strict path. Each degrade increments `correlation.retract.degrade_fallback_count`; persistent non-zero values point at a tighter memory budget or a smaller correlation key cardinality.
 
 ## Debugging
 

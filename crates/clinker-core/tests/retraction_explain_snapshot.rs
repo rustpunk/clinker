@@ -62,7 +62,6 @@ nodes:
   input: windowed
   config:
     group_by: [department]
-    relaxed_correlation_key: true
     cxl: 'emit department = department
 
       emit total = sum(amount)

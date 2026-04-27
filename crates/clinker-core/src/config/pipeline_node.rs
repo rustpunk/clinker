@@ -747,6 +747,14 @@ pub enum MatchMode {
 pub type AnalyticWindowSpec = serde_json::Value;
 
 /// Aggregate variant body. Peer to Transform (no longer nested).
+///
+/// Whether the engine routes this aggregate through retraction-aware
+/// machinery is content-derived from `group_by` against the pipeline-level
+/// `error_handling.correlation_key`: aggregates whose `group_by` lists
+/// every correlation-key field stay on the strict-collateral two-phase
+/// commit; aggregates that omit any correlation-key field activate the
+/// relaxed lattice and the five-phase commit. Authors do not configure
+/// this — the engine inspects the configuration and selects the path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregateBody {
@@ -754,22 +762,6 @@ pub struct AggregateBody {
     pub cxl: CxlSource,
     #[serde(default)]
     pub strategy: crate::config::AggregateStrategyHint,
-    /// Opt out of the strict `group_by ⊇ correlation_key` requirement.
-    ///
-    /// When `false` (default), an Aggregate downstream of a pipeline-level
-    /// `error_handling.correlation_key` must list every correlation-key
-    /// field in `group_by` or compile fails with `E151`. When `true`, the
-    /// superset requirement is relaxed: a single correlation group may
-    /// span multiple aggregate groups, and the omitted CK fields stop
-    /// being visible to downstream consumers of this aggregate's output.
-    /// The `$ck.<field>` shadow columns themselves are still preserved
-    /// at ingest; the relaxation only affects the per-node CK-set
-    /// inference and the pipeline-level rollback shape.
-    ///
-    /// Additive opt-in: existing pipelines parse identically with this
-    /// field absent and keep today's strict semantics.
-    #[serde(default)]
-    pub relaxed_correlation_key: bool,
 }
 
 /// Route variant body. `conditions:` is an [`IndexMap`] so that branch
@@ -859,8 +851,7 @@ pub struct CombineBody {
     /// Optional override for the pipeline-level correlation fan-out
     /// policy. When `Some`, the Combine's output records carry this
     /// policy through the DLQ trigger walk; downstream Output overrides
-    /// can then override it again. Additive opt-in mirroring
-    /// `relaxed_correlation_key` — `None` falls through to whichever
+    /// can then override it again. `None` falls through to whichever
     /// pipeline default is in effect, preserving today's "trigger fans
     /// out across the joined record set" semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]

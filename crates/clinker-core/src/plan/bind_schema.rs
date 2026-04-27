@@ -694,12 +694,17 @@ fn bind_composition(
         };
         let n = &spanned.value;
         let n_name = n.name().to_string();
-        // Body nodes are lowered with a default `LoweringCtx` — they
-        // run inside the body executor's mini-DAG and don't need the
-        // top-level parallelism/index/aggregate enrichment. The
-        // top-level `compile_with_diagnostics` path supplies a
-        // populated ctx for runtime-executed top-level nodes.
-        let lower_ctx = crate::config::LoweringCtx::default();
+        // Body nodes are lowered without the top-level
+        // parallelism/index enrichment — those live on the
+        // top-level mini-DAG. The pipeline-level correlation_key still
+        // threads in: body aggregates inside a correlated pipeline must
+        // pick the same retraction-mode flags the top-level lowering
+        // would, since their `group_by` shape is what determines the
+        // commit-time behavior.
+        let lower_ctx = crate::config::LoweringCtx {
+            correlation_key: bind_ctx.correlation_key,
+            ..crate::config::LoweringCtx::default()
+        };
         if let Some(plan_node) = crate::config::lower_node_to_plan_node(
             n, &n_name, body_span, artifacts, &lower_ctx, diags,
         ) {

@@ -283,10 +283,11 @@ pub(crate) struct ExecutorContext<'a> {
     /// a record into the buffer to detect overflow at admission time.
     pub(crate) correlation_max_group_buffer: u64,
 
-    /// Per-relaxed-CK-aggregate retained state. Populated by the
-    /// Aggregate dispatch arm BEFORE finalize when
-    /// `relaxed_correlation_key: true`; drained by the orchestrator's
-    /// recompute-aggregates phase. Empty for strict pipelines, so the
+    /// Per-aggregate retained state for nodes whose `group_by` omits a
+    /// correlation-key field. Populated by the Aggregate dispatch arm
+    /// BEFORE finalize on those aggregates; drained by the
+    /// orchestrator's recompute-aggregates phase. Empty for pipelines
+    /// whose every aggregate has `group_by ⊇ correlation_key`, so the
     /// strict commit path observes zero overhead.
     pub(crate) relaxed_aggregator_states: HashMap<NodeIndex, RetainedAggregatorState>,
 
@@ -328,8 +329,9 @@ pub(crate) enum CommitStepPath {
     /// Strict pipeline (no relaxed-CK aggregate); orchestrator routed
     /// straight to the existing two-phase commit body.
     FastPath,
-    /// Relaxed pipeline (at least one `relaxed_correlation_key: true`
-    /// aggregate); orchestrator ran the full five-phase protocol.
+    /// Relaxed pipeline (at least one aggregate whose `group_by` omits
+    /// a correlation-key field); orchestrator ran the full five-phase
+    /// protocol.
     FivePhase,
 }
 
@@ -1194,9 +1196,16 @@ pub(crate) fn dispatch_plan_node(
             ref compiled,
             strategy: agg_strategy,
             ref output_schema,
-            relaxed_correlation_key,
             ..
         } => {
+            // Whether this aggregate participates in retraction-mode
+            // commit is fully determined by the planner-set
+            // retraction-strategy flags on `compiled`: `requires_lineage`
+            // for all-Reversible bindings, `requires_buffer_mode` for
+            // any BufferRequired binding. Strict aggregates have both
+            // flags `false` and bypass the retain-finalize-into-state
+            // path entirely.
+            let is_relaxed = compiled.requires_lineage || compiled.requires_buffer_mode;
             // Hash-aggregation dispatch arm.
             //
             // DataFusion PR #9241 / #12086 lesson: any
@@ -1334,17 +1343,17 @@ pub(crate) fn dispatch_plan_node(
                 source_file: ctx.source_file_arc,
                 source_row: 0,
             };
-            let out_rows: Vec<AggSortRow> = if relaxed_correlation_key {
+            let out_rows: Vec<AggSortRow> = if is_relaxed {
                 let mut hash_box = match stream.into_retained_hash() {
                     Some(b) => b,
                     None => {
-                        // Streaming arm under relaxed_correlation_key
-                        // is rejected at compile time (E15Y); reaching
-                        // this branch is a planner-pass bug.
+                        // Streaming + retraction-mode is rejected at
+                        // compile time (E15Y); reaching this branch is
+                        // a planner-pass bug.
                         return Err(PipelineError::Internal {
                             op: "aggregation",
                             node: name.clone(),
-                            detail: "relaxed_correlation_key aggregate produced a non-Hash \
+                            detail: "retraction-mode aggregate produced a non-Hash \
                                  stream — E15Y should have rejected this at compile time"
                                 .to_string(),
                         });

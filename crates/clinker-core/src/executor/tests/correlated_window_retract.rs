@@ -4,7 +4,7 @@
 //! Scope. The pipeline geometry exercised here is:
 //!
 //! ```text
-//! Source(CK=emp_id) → Transform(window: partition_by=[dept]) → Aggregate(relaxed_correlation_key, group_by=[dept]) → Output
+//! Source(CK=emp_id) → Transform(window: partition_by=[dept]) → Aggregate(group_by=[dept]) → Output
 //! ```
 //!
 //! The window's `partition_by` does not include the pipeline-level
@@ -209,7 +209,6 @@ nodes:
   input: windowed
   config:
     group_by: [dept]
-    relaxed_correlation_key: true
     cxl: 'emit dept = dept
 
       emit total = sum(amount)

@@ -88,7 +88,10 @@ pub(crate) fn orchestrate(
     commit_group_by: &[String],
     max_group_buffer: u64,
 ) -> Result<(), PipelineError> {
-    if !is_relaxed_pipeline(current_dag) {
+    if !is_relaxed_pipeline(
+        current_dag,
+        ctx.config.error_handling.correlation_key.as_ref(),
+    ) {
         // Strict pipeline — short-circuit to today's two-phase flush
         // shape. Records the `FastPath` flag for the zero-overhead
         // invariant test assertion.
@@ -128,19 +131,31 @@ pub(crate) fn orchestrate(
     flush::flush_buffered(ctx, &scope, commit_group_by)
 }
 
-/// True when the current DAG carries at least one relaxed-CK aggregate.
+/// True when the current DAG carries at least one aggregate whose
+/// `group_by` omits a correlation-key field — i.e. one that activates
+/// the retraction protocol.
 ///
-/// Pipelines without one short-circuit to today's strict commit body so
-/// the existing `correlated_dlq.rs` workload runs with zero retraction
-/// overhead.
-fn is_relaxed_pipeline(current_dag: &ExecutionPlanDag) -> bool {
+/// Pipelines whose every aggregate has `group_by ⊇ correlation_key`
+/// (and pipelines without a correlation key at all) short-circuit to
+/// today's strict commit body so the strict workload runs with zero
+/// retraction overhead. The orchestrator reads
+/// `error_handling.correlation_key` off the executor context to
+/// classify each aggregate; the same classification is computed at
+/// plan time when the planner sets the per-aggregate retraction-strategy
+/// flags, so the runtime check stays consistent with the plan.
+fn is_relaxed_pipeline(
+    current_dag: &ExecutionPlanDag,
+    correlation_key: Option<&crate::config::CorrelationKey>,
+) -> bool {
+    let Some(_) = correlation_key else {
+        return false;
+    };
     current_dag.graph.node_weights().any(|n| {
         matches!(
             n,
-            crate::plan::execution::PlanNode::Aggregation {
-                relaxed_correlation_key: true,
-                ..
-            }
+            crate::plan::execution::PlanNode::Aggregation { config, .. }
+                if crate::plan::execution::group_by_omits_any_ck_field(
+                    &config.group_by, correlation_key)
         )
     })
 }

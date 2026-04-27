@@ -1,6 +1,6 @@
 ---
 source: crates/clinker-core/tests/retraction_explain_snapshot.rs
-assertion_line: 87
+assertion_line: 84
 expression: text
 ---
 === Execution Plan ===
@@ -103,5 +103,5 @@ Worker threads: 4
   │ [sort] __correlation_sort_orders
   │ [transform] windowed (line:19)
   ◇ [aggregation:hash] dept_totals (line:34)
-  │ [output] out (line:49)
+  │ [output] out (line:48)
   │ [correlation_commit] __correlation_commit_terminal key=[order_id]

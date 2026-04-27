@@ -118,9 +118,9 @@ pub fn extract_aggregates(
         pre_agg_filter,
         emits,
         // Both retraction-strategy flags default to `false`; the planner
-        // flips at most one of them on via
-        // `set_retraction_flags_for_relaxed` when the owning aggregate
-        // opts into relaxed correlation-key semantics.
+        // flips at most one of them on via `set_retraction_flags` when
+        // the owning aggregate's `group_by` omits a correlation-key
+        // field.
         requires_lineage: false,
         requires_buffer_mode: false,
     })
@@ -912,10 +912,10 @@ mod tests {
         // Default after extraction is always `false` for both.
         assert!(!compiled.requires_lineage);
         assert!(!compiled.requires_buffer_mode);
-        compiled.set_retraction_flags_for_relaxed(true);
+        compiled.set_retraction_flags(true);
         assert!(
             compiled.requires_lineage,
-            "all-Reversible bindings under relaxed_correlation_key must enable lineage"
+            "all-Reversible bindings under retraction mode must enable lineage"
         );
         assert!(
             !compiled.requires_buffer_mode,
@@ -936,7 +936,7 @@ mod tests {
         );
         let mut compiled =
             extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
-        compiled.set_retraction_flags_for_relaxed(true);
+        compiled.set_retraction_flags(true);
         assert!(
             !compiled.requires_lineage,
             "a single BufferRequired binding short-circuits requires_lineage to false"
@@ -959,7 +959,7 @@ mod tests {
         );
         let mut compiled =
             extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
-        compiled.set_retraction_flags_for_relaxed(true);
+        compiled.set_retraction_flags(true);
         assert!(!compiled.requires_lineage);
         assert!(compiled.requires_buffer_mode);
     }
@@ -970,9 +970,9 @@ mod tests {
         let typed = typed_for_agg("emit total = sum(salary)", fields, &["dept"]);
         let mut compiled =
             extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
-        // Strict mode (relaxed_correlation_key=false) suppresses both
-        // flags regardless of binding shape.
-        compiled.set_retraction_flags_for_relaxed(false);
+        // Strict mode (`is_relaxed = false`) suppresses both flags
+        // regardless of binding shape.
+        compiled.set_retraction_flags(false);
         assert!(!compiled.requires_lineage);
         assert!(!compiled.requires_buffer_mode);
 
@@ -986,7 +986,7 @@ mod tests {
         );
         let mut compiled2 =
             extract_aggregates(&typed2, &["dept".to_string()], &schema_names(fields)).unwrap();
-        compiled2.set_retraction_flags_for_relaxed(false);
+        compiled2.set_retraction_flags(false);
         assert!(!compiled2.requires_lineage);
         assert!(!compiled2.requires_buffer_mode);
     }

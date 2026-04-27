@@ -1,6 +1,6 @@
 //! Integration tests for the relaxed-CK five-phase correlation-commit
-//! protocol. Sibling to `correlated_dlq.rs` which exercises the strict
-//! E151 path.
+//! protocol. Sibling to `correlated_dlq.rs` which exercises the
+//! strict-collateral path.
 //!
 //! The orchestrator's path selection is verified through:
 //!
@@ -61,11 +61,11 @@ fn run_pipeline(
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
-/// Strict pipeline (no `relaxed_correlation_key`) — verifies today's
-/// `correlated_dlq.rs` workload runs unchanged after the orchestrator
-/// landed. The orchestrator's `is_relaxed_pipeline` check picks the
-/// FastPath branch so the strict body emits the same DLQ shape as
-/// before.
+/// Strict pipeline (every aggregate has `group_by ⊇ correlation_key`,
+/// or no aggregate at all) — verifies today's `correlated_dlq.rs`
+/// workload runs unchanged after the orchestrator landed. The
+/// orchestrator's `is_relaxed_pipeline` check picks the FastPath
+/// branch so the strict body emits the same DLQ shape as before.
 #[test]
 fn strict_pipeline_zero_overhead_short_circuits_to_fast_path() {
     let yaml = r#"
@@ -144,7 +144,6 @@ nodes:
   input: src
   config:
     group_by: [dept]
-    relaxed_correlation_key: true
     cxl: 'emit dept = dept
 
       emit total = sum(amount)
@@ -325,7 +324,6 @@ nodes:
   input: validate
   config:
     group_by: [department]
-    relaxed_correlation_key: true
     cxl: 'emit department = department
 
       emit total = sum(amount_int)
@@ -479,7 +477,6 @@ nodes:
   input: validate
   config:
     group_by: [department]
-    relaxed_correlation_key: true
     cxl: 'emit department = department
 
       emit lo = min(amount_int)
@@ -601,7 +598,6 @@ nodes:
   input: validate
   config:
     group_by: [department]
-    relaxed_correlation_key: true
     cxl: 'emit department = department
 
       emit total = sum(amount_int)
@@ -720,7 +716,6 @@ nodes:
   input: src
   config:
     group_by: [dept]
-    relaxed_correlation_key: true
     cxl: 'emit dept = dept
 
       emit total = sum(amount)

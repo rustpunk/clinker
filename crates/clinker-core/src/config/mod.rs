@@ -1597,6 +1597,7 @@ impl PipelineConfig {
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 indices: &indices,
                 primary_source: primary_source.as_str(),
+                correlation_key: self.error_handling.correlation_key.as_ref(),
             };
             let plan_node =
                 lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
@@ -1786,41 +1787,46 @@ impl PipelineConfig {
         // flag at runtime to choose between streaming-emit and buffered
         // emit; pipelines without a relaxed-CK aggregate keep every flag
         // false and the executor stays on its existing path.
-        dag.derive_window_buffer_recompute_flags();
+        dag.derive_window_buffer_recompute_flags(self.error_handling.correlation_key.as_ref());
 
-        // E15Y: relaxed_correlation_key + streaming aggregator strategy
-        // is rejected at compile time. Streaming aggregates emit at
-        // group-boundary close, before the terminal CorrelationCommit,
-        // which defeats the rollback window the relaxed opt-in needs.
-        // Runs before `select_aggregation_strategies` so the post-pass's
-        // generic "explicit Streaming on ineligible input" diagnostic
-        // does not preempt the more specific E15Y message.
+        // E15Y: an aggregate whose `group_by` omits any correlation-key
+        // field cannot also use `strategy: streaming`. Streaming
+        // aggregates emit at group-boundary close, before the terminal
+        // CorrelationCommit, which defeats the rollback window the
+        // retraction protocol needs. Runs before
+        // `select_aggregation_strategies` so the post-pass's generic
+        // "explicit Streaming on ineligible input" diagnostic does not
+        // preempt the more specific E15Y message.
         let mut e15y_present = false;
-        for node in dag.graph.node_weights() {
-            if let crate::plan::execution::PlanNode::Aggregation {
-                name,
-                config,
-                relaxed_correlation_key: true,
-                ..
-            } = node
-                && matches!(
-                    config.strategy,
-                    crate::config::AggregateStrategyHint::Streaming
-                )
-            {
-                diags.push(Diagnostic::error(
-                    "E15Y",
-                    format!(
-                        "E15Y aggregate '{}' opted into relaxed_correlation_key but \
-                         its strategy is `streaming`. Streaming aggregates emit per \
-                         group-boundary close, before correlation-commit, which \
-                         defeats the rollback window. Use `strategy: hash` (the \
-                         default) or remove `relaxed_correlation_key`.",
-                        name
-                    ),
-                    LabeledSpan::primary(node.span(), String::new()),
-                ));
-                e15y_present = true;
+        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
+            for node in dag.graph.node_weights() {
+                if let crate::plan::execution::PlanNode::Aggregation { name, config, .. } = node
+                    && matches!(
+                        config.strategy,
+                        crate::config::AggregateStrategyHint::Streaming
+                    )
+                    && crate::plan::execution::group_by_omits_any_ck_field(
+                        &config.group_by,
+                        Some(ck),
+                    )
+                {
+                    diags.push(Diagnostic::error(
+                        "E15Y",
+                        format!(
+                            "E15Y aggregate '{}' has `strategy: streaming` but its \
+                             `group_by` omits at least one correlation-key field, \
+                             which routes it through the retraction protocol. \
+                             Streaming aggregates emit per group-boundary close, \
+                             before correlation-commit, which defeats the rollback \
+                             window. Use `strategy: hash` (the default), or include \
+                             every correlation-key field in `group_by` so the \
+                             aggregate stays on the strict-collateral path.",
+                            name
+                        ),
+                        LabeledSpan::primary(node.span(), String::new()),
+                    ));
+                    e15y_present = true;
+                }
             }
         }
         if e15y_present {
@@ -1901,17 +1907,15 @@ impl PipelineConfig {
         // enriched so we see every Transform's `window_index` and every
         // Aggregate's resolved `group_by`.
         //
-        // Pass 1 (auto-extension): for every Aggregate downstream of a
-        // pipeline with `error_handling.correlation_key`, transparently
-        // append `$ck.<field>` shadow columns to the runtime
-        // `group_by` whenever the user-declared field is already
-        // listed. The user never types the engine-internal namespace
-        // in YAML; the engine routes frozen identity through the
-        // aggregation key by construction.
-        //
-        // Pass 2 (E150/E151): typed [`PlanError`] variants surfaced as
-        // user-visible diagnostics; runs after auto-extension so both
-        // checks see the user-natural shape.
+        // Auto-extension: for every Aggregate downstream of a pipeline
+        // with `error_handling.correlation_key`, transparently append
+        // `$ck.<field>` shadow columns to the runtime `group_by`
+        // whenever the user-declared field is already listed. The user
+        // never types the engine-internal namespace in YAML; the engine
+        // routes frozen identity through the aggregation key by
+        // construction. An aggregate whose `group_by` omits a
+        // correlation-key field activates the retraction protocol at
+        // runtime — it is not a compile-time error.
         if let Some(ck) = self.error_handling.correlation_key.as_ref() {
             let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
             extend_aggregate_group_by_with_shadow(&mut dag.graph, &key_fields);
@@ -1930,8 +1934,8 @@ impl PipelineConfig {
                     // Buffer-recompute mode lifts the E150 restriction:
                     // the orchestrator's commit phase reruns the window
                     // over surviving partition rows and emits per-output
-                    // Deltas, so a window downstream of a relaxed-CK
-                    // aggregate is safe to materialize even when
+                    // Deltas, so a window inside a retraction-active
+                    // pipeline is safe to materialize even when
                     // partitions span correlation-key boundaries.
                     let buffered = dag
                         .indices_to_build
@@ -1951,49 +1955,9 @@ impl PipelineConfig {
                     ));
                 }
             }
-            if let Some(ck) = self.error_handling.correlation_key.as_ref() {
-                let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
-                for node in dag.graph.node_weights() {
-                    if let crate::plan::execution::PlanNode::Aggregation {
-                        name,
-                        config,
-                        relaxed_correlation_key,
-                        ..
-                    } = node
-                    {
-                        // Relaxed-E151 opt-in bypasses the strict superset
-                        // requirement; the per-node CK-set lattice
-                        // intersects parent CK with `group_by` instead.
-                        // E15Y (relaxed + streaming) is checked earlier in
-                        // compile, before `select_aggregation_strategies`.
-                        if *relaxed_correlation_key {
-                            continue;
-                        }
-                        let group_by: Vec<&str> =
-                            config.group_by.iter().map(|s| s.as_str()).collect();
-                        let missing: Vec<String> = key_fields
-                            .iter()
-                            .filter(|f| !group_by.contains(&f.as_str()))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            let err =
-                                crate::plan::execution::PlanError::CorrelationKeyWithMixedAggregate {
-                                    aggregate: name.clone(),
-                                    missing_fields: missing,
-                                };
-                            diags.push(Diagnostic::error(
-                                "E151",
-                                err.to_string(),
-                                LabeledSpan::primary(node.span(), String::new()),
-                            ));
-                        }
-                    }
-                }
-            }
         }
 
-        // E15W — relaxed_correlation_key + non-deterministic operator
+        // E15W — content-relaxed aggregate + non-deterministic operator
         // downstream. The correlation-commit replay phase rewrites
         // affected aggregate output rows by re-running the deterministic
         // portion of the post-aggregate sub-DAG; a Transform that calls
@@ -2001,39 +1965,43 @@ impl PipelineConfig {
         // a different value on replay than at first execution, breaking
         // the post-retract substitution proof. Reject at compile time
         // so users see the limitation before they hit a silent diverge
-        // at runtime. Strict pipelines and pipelines without a
-        // relaxed-CK aggregate are unaffected.
-        let relaxed_aggs_present = dag.graph.node_weights().any(|n| {
-            matches!(
-                n,
-                crate::plan::execution::PlanNode::Aggregation {
-                    relaxed_correlation_key: true,
-                    ..
-                }
-            )
-        });
-        if relaxed_aggs_present && self.error_handling.correlation_key.is_some() {
-            for node in dag.graph.node_weights() {
-                if let crate::plan::execution::PlanNode::Transform {
-                    name,
-                    resolved: Some(payload),
-                    ..
-                } = node
-                    && crate::plan::execution::cxl_has_nondeterministic_call(&payload.typed)
-                {
-                    diags.push(Diagnostic::error(
-                        "E15W",
-                        format!(
-                            "E15W transform '{}' calls a non-deterministic CXL builtin (e.g. \
-                             `now`) under a relaxed_correlation_key aggregate downstream of \
-                             pipeline-level correlation_key. Replay during correlation-commit \
-                             would not produce the same row twice, breaking the post-retract \
-                             substitution proof. Remove the non-deterministic call or remove \
-                             `relaxed_correlation_key`.",
-                            name
-                        ),
-                        LabeledSpan::primary(node.span(), String::new()),
-                    ));
+        // at runtime. Pipelines whose every aggregate has
+        // `group_by ⊇ correlation_key` (or no correlation key at all)
+        // are unaffected.
+        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
+            let relaxed_aggs_present = dag.graph.node_weights().any(|n| {
+                matches!(
+                    n,
+                    crate::plan::execution::PlanNode::Aggregation { config, .. }
+                        if crate::plan::execution::group_by_omits_any_ck_field(
+                            &config.group_by, Some(ck))
+                )
+            });
+            if relaxed_aggs_present {
+                for node in dag.graph.node_weights() {
+                    if let crate::plan::execution::PlanNode::Transform {
+                        name,
+                        resolved: Some(payload),
+                        ..
+                    } = node
+                        && crate::plan::execution::cxl_has_nondeterministic_call(&payload.typed)
+                    {
+                        diags.push(Diagnostic::error(
+                            "E15W",
+                            format!(
+                                "E15W transform '{}' calls a non-deterministic CXL builtin \
+                                 (e.g. `now`) downstream of an aggregate that activates the \
+                                 retraction protocol. Replay during correlation-commit would \
+                                 not produce the same row twice, breaking the post-retract \
+                                 substitution proof. Remove the non-deterministic call, or \
+                                 include every correlation-key field in the aggregate's \
+                                 `group_by` so the aggregate stays on the strict-collateral \
+                                 path.",
+                                name
+                            ),
+                            LabeledSpan::primary(node.span(), String::new()),
+                        ));
+                    }
                 }
             }
         }
@@ -2215,6 +2183,14 @@ pub(crate) struct LoweringCtx<'a> {
     pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
     pub indices: &'a [crate::plan::index::IndexSpec],
     pub primary_source: &'a str,
+    /// Pipeline-level `error_handling.correlation_key`, threaded so
+    /// the Aggregate-lowering site can derive each aggregate's
+    /// retraction-mode flags from `group_by` content. `None` for
+    /// pipelines without a correlation key (every aggregate is strict
+    /// in that case) and for body-node lowering, where the body's
+    /// containing pipeline's correlation key is consulted at the
+    /// top-level lowering pass instead.
+    pub correlation_key: Option<&'a CorrelationKey>,
 }
 
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
@@ -2456,11 +2432,17 @@ pub(crate) fn lower_node_to_plan_node(
                     }
                 };
             // Plan-time derivation of the two retraction-strategy flags.
-            // Strict aggregates leave both `false`; relaxed aggregates
+            // Aggregates whose `group_by` includes every correlation-key
+            // field stay on the strict-collateral path with both flags
+            // `false`; aggregates that omit any correlation-key field
             // pick exactly one — lineage when every binding is
             // Reversible (O(1) inverse-op retract), buffer-mode when any
             // binding is BufferRequired (recompute from raw contributions).
-            compiled_agg.set_retraction_flags_for_relaxed(agg_body.relaxed_correlation_key);
+            let is_relaxed = crate::plan::execution::group_by_omits_any_ck_field(
+                &agg_cfg.group_by,
+                ctx.correlation_key,
+            );
+            compiled_agg.set_retraction_flags(is_relaxed);
             // `schema_from_bound` reads the typed `output_row` produced
             // by `propagate_aggregate` (group-by columns first, then
             // emits) and stamps engine-stamp metadata on the
@@ -2483,7 +2465,6 @@ pub(crate) fn lower_node_to_plan_node(
                 fallback_reason: None,
                 skipped_streaming_available: false,
                 qualified_sort_order: None,
-                relaxed_correlation_key: agg_body.relaxed_correlation_key,
             })
         }
         // Combine lowers to PlanNode::Combine. Inline fields here are

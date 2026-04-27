@@ -33,12 +33,14 @@ pub struct PipelineCounters {
     pub dlq_count: u64,
     pub filtered_count: u64,
     pub distinct_count: u64,
-    /// Counters for the relaxed correlation-key retraction protocol.
-    /// All fields stay zero on strict pipelines because the orchestrator
-    /// short-circuits to the fast path before any retraction phase runs;
-    /// non-zero values appear only on pipelines that opted at least one
-    /// Aggregate into `relaxed_correlation_key: true` and then triggered
-    /// at least one DLQ event.
+    /// Counters for the retraction protocol that fires when an
+    /// aggregate's `group_by` omits a correlation-key field. All fields
+    /// stay zero on pipelines whose every aggregate has
+    /// `group_by ⊇ correlation_key` (and on pipelines without a
+    /// correlation key) because the orchestrator short-circuits to the
+    /// fast path before any retraction phase runs; non-zero values
+    /// appear only on pipelines whose configuration activates the
+    /// retraction protocol and that triggered at least one DLQ event.
     pub retraction: RetractionCounters,
 }
 

@@ -94,9 +94,9 @@ nodes:
     assert_eq!(ck_set_for(&plan, "out"), expected);
 }
 
-/// Relaxed mode: aggregate omits the CK field from `group_by`, so that
-/// field disappears from the downstream CK set. E151 is bypassed by the
-/// opt-in.
+/// Relaxed mode: aggregate omits the CK field from `group_by`, so the
+/// engine routes it through the retraction protocol and that field
+/// disappears from the downstream CK set.
 #[test]
 fn ck_lattice_relaxed_aggregate_drops_omitted_ck_field() {
     let yaml = r#"
@@ -129,7 +129,6 @@ nodes:
     input: identity
     config:
       group_by: [department]
-      relaxed_correlation_key: true
       cxl: |
         emit total = sum(amount)
   - type: output
@@ -379,10 +378,11 @@ nodes:
     assert_eq!(ck_set_for(&plan, "out"), expected);
 }
 
-/// E15Y: `relaxed_correlation_key: true` plus `strategy: streaming`
-/// fails at compile time. Streaming aggregates emit at group-boundary
-/// close, before the terminal correlation commit, defeating the
-/// rollback window the relaxed opt-in needs.
+/// E15Y: an aggregate whose `group_by` omits a correlation-key field
+/// (so the engine routes it through retraction mode) plus
+/// `strategy: streaming` fails at compile time. Streaming aggregates
+/// emit at group-boundary close, before the terminal correlation
+/// commit, defeating the rollback window the retraction protocol needs.
 #[test]
 fn ck_lattice_relaxed_plus_streaming_emits_e15y() {
     let yaml = r#"
@@ -409,7 +409,6 @@ nodes:
     config:
       group_by: [department]
       strategy: streaming
-      relaxed_correlation_key: true
       cxl: |
         emit total = sum(amount)
   - type: output
@@ -423,7 +422,7 @@ nodes:
     let config: PipelineConfig = parse_config(yaml).expect("parse");
     let diags = config
         .compile(&CompileContext::default())
-        .expect_err("E15Y must reject relaxed + streaming");
+        .expect_err("E15Y must reject retraction-mode aggregate + streaming");
     assert!(
         diags.iter().any(|d| d.code == "E15Y"),
         "expected an E15Y diagnostic, got: {:?}",

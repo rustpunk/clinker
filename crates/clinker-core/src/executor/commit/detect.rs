@@ -96,16 +96,19 @@ pub(crate) fn detect_retract_scope(
         return scope;
     }
 
-    // Aggregates: every relaxed-CK aggregate node in the current DAG.
+    // Aggregates: every aggregate node whose `group_by` omits a
+    // correlation-key field — those activate the retraction protocol.
     // We don't pre-filter against the trigger's CK set here because
     // `retract_row` is idempotent on row IDs that don't appear in the
     // aggregator's lineage — the lookup either succeeds or returns an
     // error which the recompute phase routes to the degrade-fallback.
+    let correlation_key = ctx.config.error_handling.correlation_key.as_ref();
     for idx in current_dag.graph.node_indices() {
-        if let PlanNode::Aggregation {
-            relaxed_correlation_key: true,
-            ..
-        } = &current_dag.graph[idx]
+        if let PlanNode::Aggregation { config, .. } = &current_dag.graph[idx]
+            && crate::plan::execution::group_by_omits_any_ck_field(
+                &config.group_by,
+                correlation_key,
+            )
         {
             scope
                 .aggregates
