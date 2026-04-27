@@ -38,7 +38,6 @@ pub struct NodeProperties {
     /// downstream consumer, not the per-record runtime correlation
     /// buffer key (which remains keyed by the full pipeline-level
     /// correlation_key tuple).
-    #[serde(default)]
     pub ck_set: BTreeSet<String>,
 }
 
