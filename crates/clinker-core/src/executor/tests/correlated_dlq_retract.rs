@@ -11,12 +11,16 @@
 //!   default > documented `Any` default.
 //! * The replay-loop iteration cap — a fixture that would loop in a
 //!   buggy implementation panics with the documented message.
-//!
-//! End-to-end retraction across an aggregate → transform → output chain
-//! is exercised at the HashAggregator unit test level
-//! (`aggregation::spill_trigger_tests::test_buffer_mode_retract_*`) and
-//! at the accumulator unit test level (`accumulator::tests::test_*_retract_*`)
-//! per the bottom-up test pyramid.
+//! * End-to-end retraction across the source → transform → aggregate →
+//!   (transform →) output chain — fires a real DLQ trigger inside the
+//!   pipeline and asserts bit-for-bit equivalence between the
+//!   retract-corrected writer payload and a baseline rerun of the same
+//!   pipeline with the failing record omitted from the input. Covers
+//!   Reversible-only bindings (`sum`, `count`), BufferRequired-only
+//!   bindings (`min`, `max`, `avg`), and a downstream Transform that
+//!   derives a column from the aggregate output. Closes the integration
+//!   gap above the per-aggregator and per-accumulator retract unit
+//!   tests.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -271,6 +275,422 @@ nodes:
     assert_eq!(counters.dlq_count, 0);
     assert!(output.contains("A,100"));
     assert!(output.contains("B,200"));
+}
+
+/// End-to-end retraction: a relaxed-CK Aggregate over Reversible
+/// bindings (`sum`, `count`) produces output that matches a baseline
+/// rerun without the failing source row. The DLQ trigger fires
+/// upstream of the aggregate (a `to_int` validation that rejects a
+/// non-numeric sentinel), so the failing row never enters the
+/// aggregator's lineage. The orchestrator's detect phase observes the
+/// trigger row id, the recompute phase calls `retract_row` against the
+/// aggregator and gracefully treats the not-found id as a no-op, and
+/// the flush phase emits the surviving groups' aggregate output to the
+/// writer. The bit-for-bit equivalence assertion is the load-bearing
+/// claim — anything that breaks the chain (lineage drop, retract
+/// mis-attribution, replay overshoot) shows up as a value mismatch
+/// against the baseline rerun.
+#[test]
+fn end_to_end_retraction_reversible_matches_baseline_rerun() {
+    let yaml = r#"
+pipeline:
+  name: retract_reversible
+error_handling:
+  strategy: continue
+  correlation_key: order_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: string }
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit order_id = order_id
+
+      emit department = department
+
+      emit amount_int = amount.to_int()
+
+      '
+- type: aggregate
+  name: dept_totals
+  input: validate
+  config:
+    group_by: [department]
+    relaxed_correlation_key: true
+    cxl: 'emit department = department
+
+      emit total = sum(amount_int)
+
+      emit n = count(*)
+
+      '
+- type: output
+  name: out
+  input: dept_totals
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    // Twelve rows across two departments. Order O7 in HR carries the
+    // sentinel `BAD` amount; the validate transform's `to_int` fires
+    // the DLQ trigger on that row. Group HR has the bad row removed;
+    // group ENG is unaffected. Baseline (the same pipeline run with
+    // O7 omitted from the input) is computed below.
+    let csv = "\
+order_id,department,amount
+O1,HR,10
+O2,HR,20
+O3,HR,30
+O4,ENG,100
+O5,ENG,200
+O6,ENG,300
+O7,HR,BAD
+O8,HR,40
+O9,HR,50
+O10,ENG,400
+O11,ENG,500
+O12,HR,60
+";
+    let baseline_csv = "\
+order_id,department,amount
+O1,HR,10
+O2,HR,20
+O3,HR,30
+O4,ENG,100
+O5,ENG,200
+O6,ENG,300
+O8,HR,40
+O9,HR,50
+O10,ENG,400
+O11,ENG,500
+O12,HR,60
+";
+
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (baseline_counters, baseline_dlq, baseline_output) =
+        run_pipeline(yaml, baseline_csv).unwrap();
+
+    // Baseline is the canonical reference: it has zero DLQ entries
+    // (no bad rows) and the surviving groups' aggregate output reaches
+    // the writer.
+    assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
+    assert_eq!(baseline_counters.dlq_count, 0);
+
+    // The retract-corrected run records the bad row as a single
+    // trigger DLQ entry. The aggregate output rows for both
+    // departments land in distinct null-keyed buffer cells (group_by
+    // omits order_id, so no $ck.order_id propagates onto the
+    // aggregate output) — the trigger error lands in a separate
+    // CK-stamped cell that has no record slots, so its dispositioning
+    // is trigger-only with zero collateral.
+    assert_eq!(
+        dlq.len(),
+        1,
+        "exactly one DLQ entry — the bad O7 row's to_int failure"
+    );
+    assert!(dlq[0].trigger, "the bad row is the trigger");
+    assert_eq!(counters.dlq_count, 1);
+
+    // Bit-for-bit equivalence on the writer payload. The CSV writer
+    // emission order is hash-table arbitrary, so compare set-equal on
+    // sorted body lines (header is identical).
+    fn sort_body(s: &str) -> Vec<String> {
+        let mut lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+        if !lines.is_empty() {
+            let header = lines.remove(0);
+            lines.sort();
+            lines.insert(0, header);
+        }
+        lines
+    }
+    assert_eq!(
+        sort_body(&output),
+        sort_body(&baseline_output),
+        "retract-corrected output must equal baseline rerun output:\n\
+         got:\n{output}\nbaseline:\n{baseline_output}"
+    );
+
+    // Spot-check the aggregate values directly against the documented
+    // sums. HR survivors are O1+O2+O3+O8+O9+O12 = 10+20+30+40+50+60 = 210
+    // (count 6); ENG survivors are O4+O5+O6+O10+O11 = 100+200+300+400+500
+    // = 1500 (count 5).
+    assert!(
+        output.contains("HR,210,6"),
+        "HR sum=210 count=6 expected, got: {output}"
+    );
+    assert!(
+        output.contains("ENG,1500,5"),
+        "ENG sum=1500 count=5 expected, got: {output}"
+    );
+}
+
+/// End-to-end retraction over BufferRequired bindings (`min`, `max`,
+/// `avg`). The relaxed-CK aggregator runs in buffer-mode for these
+/// bindings, retains every contribution, and recomputes the finalize
+/// step in place after retract. As with the Reversible test, the DLQ
+/// trigger fires upstream of the aggregate so the bad row is never
+/// added to the aggregator's buffered contributions. The bit-for-bit
+/// equivalence assertion proves the buffer-mode aggregator's
+/// finalize-after-retract path produces the same min/max/avg across
+/// surviving rows that a clean rerun would produce.
+#[test]
+fn end_to_end_retraction_buffer_required_matches_baseline_rerun() {
+    let yaml = r#"
+pipeline:
+  name: retract_buffer_required
+error_handling:
+  strategy: continue
+  correlation_key: order_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: string }
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit order_id = order_id
+
+      emit department = department
+
+      emit amount_int = amount.to_int()
+
+      '
+- type: aggregate
+  name: dept_stats
+  input: validate
+  config:
+    group_by: [department]
+    relaxed_correlation_key: true
+    cxl: 'emit department = department
+
+      emit lo = min(amount_int)
+
+      emit hi = max(amount_int)
+
+      emit mean = avg(amount_int)
+
+      '
+- type: output
+  name: out
+  input: dept_stats
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    // Order O3 in HR carries the bad amount; the survivors are
+    // {10, 20, 40, 50}. Group ENG is clean.
+    let csv = "\
+order_id,department,amount
+O1,HR,10
+O2,HR,20
+O3,HR,BAD
+O4,ENG,100
+O5,ENG,200
+O6,ENG,300
+O7,HR,40
+O8,HR,50
+";
+    let baseline_csv = "\
+order_id,department,amount
+O1,HR,10
+O2,HR,20
+O4,ENG,100
+O5,ENG,200
+O6,ENG,300
+O7,HR,40
+O8,HR,50
+";
+
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
+
+    assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
+    assert_eq!(dlq.len(), 1, "one DLQ entry for the bad O3 row");
+    assert!(dlq[0].trigger);
+    assert_eq!(counters.dlq_count, 1);
+
+    fn sort_body(s: &str) -> Vec<String> {
+        let mut lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+        if !lines.is_empty() {
+            let header = lines.remove(0);
+            lines.sort();
+            lines.insert(0, header);
+        }
+        lines
+    }
+    assert_eq!(
+        sort_body(&output),
+        sort_body(&baseline_output),
+        "buffer-required retract-corrected output must equal baseline:\n\
+         got:\n{output}\nbaseline:\n{baseline_output}"
+    );
+
+    // HR survivors: {10, 20, 40, 50} → min=10, max=50, avg=30.0.
+    // ENG survivors: {100, 200, 300} → min=100, max=300, avg=200.0.
+    assert!(
+        output.contains("HR,10,50,30"),
+        "HR min=10 max=50 avg=30 expected, got: {output}"
+    );
+    assert!(
+        output.contains("ENG,100,300,200"),
+        "ENG min=100 max=300 avg=200 expected, got: {output}"
+    );
+}
+
+/// End-to-end retraction with a downstream Transform deriving a column
+/// from the relaxed-CK aggregate's output. The Transform is determined
+/// downstream — under the E15W policy it cannot use a non-deterministic
+/// builtin, so it computes a deterministic per-group derived value
+/// (`emit per_capita = total / n`). The bit-for-bit assertion proves
+/// the downstream Transform observes the retract-corrected aggregate
+/// state, not the pre-retract state: a stale aggregate output would
+/// surface as a wrong per_capita.
+#[test]
+fn end_to_end_retraction_downstream_transform_observes_corrected_state() {
+    let yaml = r#"
+pipeline:
+  name: retract_downstream_transform
+error_handling:
+  strategy: continue
+  correlation_key: order_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: string }
+- type: transform
+  name: validate
+  input: src
+  config:
+    cxl: 'emit order_id = order_id
+
+      emit department = department
+
+      emit amount_int = amount.to_int()
+
+      '
+- type: aggregate
+  name: dept_totals
+  input: validate
+  config:
+    group_by: [department]
+    relaxed_correlation_key: true
+    cxl: 'emit department = department
+
+      emit total = sum(amount_int)
+
+      emit n = count(*)
+
+      '
+- type: transform
+  name: per_capita
+  input: dept_totals
+  config:
+    cxl: 'emit department = department
+
+      emit total = total
+
+      emit n = n
+
+      emit per_capita = total / n
+
+      '
+- type: output
+  name: out
+  input: per_capita
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    // HR has bad row O4 (amount BAD); survivors are {10,20,30,40} →
+    // total=100 / n=4 → per_capita=25. ENG is clean: {100,200,300} →
+    // total=600 / n=3 → per_capita=200.
+    let csv = "\
+order_id,department,amount
+O1,HR,10
+O2,HR,20
+O3,HR,30
+O4,HR,BAD
+O5,ENG,100
+O6,ENG,200
+O7,ENG,300
+O8,HR,40
+";
+    let baseline_csv = "\
+order_id,department,amount
+O1,HR,10
+O2,HR,20
+O3,HR,30
+O5,ENG,100
+O6,ENG,200
+O7,ENG,300
+O8,HR,40
+";
+
+    let (counters, dlq, output) = run_pipeline(yaml, csv).unwrap();
+    let (_, baseline_dlq, baseline_output) = run_pipeline(yaml, baseline_csv).unwrap();
+
+    assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
+    assert_eq!(dlq.len(), 1, "one DLQ entry for the bad O4 row");
+    assert!(dlq[0].trigger);
+    assert_eq!(counters.dlq_count, 1);
+
+    fn sort_body(s: &str) -> Vec<String> {
+        let mut lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+        if !lines.is_empty() {
+            let header = lines.remove(0);
+            lines.sort();
+            lines.insert(0, header);
+        }
+        lines
+    }
+    assert_eq!(
+        sort_body(&output),
+        sort_body(&baseline_output),
+        "downstream-transform retract-corrected output must equal baseline:\n\
+         got:\n{output}\nbaseline:\n{baseline_output}"
+    );
+
+    // The downstream per_capita column is the load-bearing assertion
+    // here: a stale aggregate output would have produced a wrong
+    // per_capita ratio.
+    assert!(
+        output.contains("HR,100,4,25"),
+        "HR total=100 n=4 per_capita=25 expected, got: {output}"
+    );
+    assert!(
+        output.contains("ENG,600,3,200"),
+        "ENG total=600 n=3 per_capita=200 expected, got: {output}"
+    );
 }
 
 /// E15W rejection — a Transform downstream of a relaxed-CK aggregate
