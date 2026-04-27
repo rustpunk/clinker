@@ -282,6 +282,63 @@ pub(crate) struct ExecutorContext<'a> {
     /// buffering is disabled. Read by the Output arm before admitting
     /// a record into the buffer to detect overflow at admission time.
     pub(crate) correlation_max_group_buffer: u64,
+
+    /// Per-relaxed-CK-aggregate retained state. Populated by the
+    /// Aggregate dispatch arm BEFORE finalize when
+    /// `relaxed_correlation_key: true`; drained by the orchestrator's
+    /// recompute-aggregates phase. Empty for strict pipelines, so the
+    /// strict commit path observes zero overhead.
+    pub(crate) relaxed_aggregator_states: HashMap<NodeIndex, RetainedAggregatorState>,
+
+    /// Per-aggregate-node degraded set: aggregates whose retract path
+    /// failed (e.g. spilled state) and that the flush phase must roll
+    /// back wholesale via strict-collateral DLQ. Empty for strict
+    /// pipelines.
+    pub(crate) relaxed_aggregator_degrade: Vec<NodeIndex>,
+
+    /// Tracks which commit-step path the orchestrator selected. Read by
+    /// the zero-overhead-on-strict-pipeline test so the assertion
+    /// proves the short-circuit is taken on every strict workload.
+    pub(crate) commit_step_path: CommitStepPath,
+}
+
+/// Which commit-step body the orchestrator selected for the current
+/// pipeline. `FastPath` short-circuits to the strict body and is the
+/// only path strict pipelines ever touch; `FivePhase` runs the full
+/// detect → recompute → replay → flush sequence. Surfaced on
+/// `ExecutorContext` so the zero-overhead-invariant test can assert
+/// the FastPath branch fires on the existing `correlated_dlq.rs`
+/// workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitStepPath {
+    /// Default at executor start. Indicates the commit step has not
+    /// yet selected its path (a no-correlation-buffer pipeline never
+    /// fires the orchestrator and stays in this state).
+    NotSelected,
+    /// Strict pipeline (no relaxed-CK aggregate); orchestrator routed
+    /// straight to the existing two-phase commit body.
+    FastPath,
+    /// Relaxed pipeline (at least one `relaxed_correlation_key: true`
+    /// aggregate); orchestrator ran the full five-phase protocol.
+    FivePhase,
+}
+
+/// Per-aggregate state retained from the Aggregate dispatch arm so the
+/// orchestrator's recompute-aggregates phase can call `retract_row` +
+/// `finalize_in_place`. Populated only on relaxed-CK aggregates;
+/// strict pipelines never instantiate this struct.
+pub(crate) struct RetainedAggregatorState {
+    pub(crate) aggregator: Box<crate::aggregation::HashAggregator>,
+    /// Per-aggregate group-by column indices (mirroring
+    /// `CompiledAggregate.group_by_indices`). Used by the recompute
+    /// phase to extract group-key column values from finalized output
+    /// rows so pre-retract / post-retract pairs align.
+    pub(crate) group_by_indices: Vec<u32>,
+    /// Snapshot of the aggregate's original output rows produced by
+    /// the first `finalize_in_place` call. The recompute phase pairs
+    /// each entry against the post-retract finalize output to build
+    /// per-row deltas.
+    pub(crate) pre_retract_output_rows: Vec<crate::aggregation::SortRow>,
 }
 
 impl ExecutorContext<'_> {
@@ -992,6 +1049,7 @@ pub(crate) fn dispatch_plan_node(
             ref compiled,
             strategy: agg_strategy,
             ref output_schema,
+            relaxed_correlation_key,
             ..
         } => {
             // Hash-aggregation dispatch arm.
@@ -1117,46 +1175,123 @@ pub(crate) fn dispatch_plan_node(
             // `Continue` we route to the DLQ and emit zero rows
             // for the failed group. All other engine errors
             // propagate (Internal/Spill/Residual always abort).
+            //
+            // Relaxed-CK aggregates split the finalize path: instead
+            // of consuming the wrapper, the Hash-arm boxed aggregator
+            // is extracted and kept on `ExecutorContext.relaxed_aggregator_states`
+            // so the correlation-commit orchestrator can call
+            // `retract_row` + `finalize_in_place` against the same
+            // instance that produced these rows. Strict aggregates
+            // continue to consume-and-discard so non-relaxed
+            // pipelines pay zero overhead.
             let finalize_ctx = EvalContext {
                 stable: ctx.stable,
                 source_file: ctx.source_file_arc,
                 source_row: 0,
             };
-            let out_rows: Vec<AggSortRow> = match stream.finalize(&finalize_ctx, &mut emitted_rows)
-            {
-                Ok(()) => emitted_rows,
-                Err(HashAggError::Accumulator {
-                    transform,
-                    binding,
-                    source,
-                }) => match ctx.config.error_handling.strategy {
-                    ErrorStrategy::FailFast => {
-                        return Err(PipelineError::Accumulator {
-                            transform,
-                            binding,
-                            source,
+            let out_rows: Vec<AggSortRow> = if relaxed_correlation_key {
+                let mut hash_box = match stream.into_retained_hash() {
+                    Some(b) => b,
+                    None => {
+                        // Streaming arm under relaxed_correlation_key
+                        // is rejected at compile time (E15Y); reaching
+                        // this branch is a planner-pass bug.
+                        return Err(PipelineError::Internal {
+                            op: "aggregation",
+                            node: name.clone(),
+                            detail: "relaxed_correlation_key aggregate produced a non-Hash \
+                                 stream — E15Y should have rejected this at compile time"
+                                .to_string(),
                         });
                     }
-                    ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                        ctx.counters.dlq_count += 1;
-                        let synthetic = if let Some((rec, _)) = input.first() {
-                            rec.clone()
-                        } else {
-                            Record::new(Arc::clone(output_schema), Vec::new())
-                        };
-                        ctx.dlq_entries.push(DlqEntry {
-                            source_row: 0,
-                            category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                            error_message: format!("aggregate {transform}.{binding}: {source:?}"),
-                            original_record: synthetic,
-                            stage: Some(crate::dlq::stage_aggregate(name)),
-                            route: None,
-                            trigger: true,
-                        });
-                        Vec::new()
+                };
+                match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
+                    Ok(()) => {
+                        let group_by_indices = hash_box.group_by_indices().to_vec();
+                        let pre_retract_output_rows = emitted_rows.clone();
+                        ctx.relaxed_aggregator_states.insert(
+                            node_idx,
+                            RetainedAggregatorState {
+                                aggregator: hash_box,
+                                group_by_indices,
+                                pre_retract_output_rows,
+                            },
+                        );
+                        emitted_rows
                     }
-                },
-                Err(other) => return Err(other.into()),
+                    Err(HashAggError::Accumulator {
+                        transform,
+                        binding,
+                        source,
+                    }) => match ctx.config.error_handling.strategy {
+                        ErrorStrategy::FailFast => {
+                            return Err(PipelineError::Accumulator {
+                                transform,
+                                binding,
+                                source,
+                            });
+                        }
+                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                            ctx.counters.dlq_count += 1;
+                            let synthetic = if let Some((rec, _)) = input.first() {
+                                rec.clone()
+                            } else {
+                                Record::new(Arc::clone(output_schema), Vec::new())
+                            };
+                            ctx.dlq_entries.push(DlqEntry {
+                                source_row: 0,
+                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                error_message: format!(
+                                    "aggregate {transform}.{binding}: {source:?}"
+                                ),
+                                original_record: synthetic,
+                                stage: Some(crate::dlq::stage_aggregate(name)),
+                                route: None,
+                                trigger: true,
+                            });
+                            Vec::new()
+                        }
+                    },
+                    Err(other) => return Err(other.into()),
+                }
+            } else {
+                match stream.finalize(&finalize_ctx, &mut emitted_rows) {
+                    Ok(()) => emitted_rows,
+                    Err(HashAggError::Accumulator {
+                        transform,
+                        binding,
+                        source,
+                    }) => match ctx.config.error_handling.strategy {
+                        ErrorStrategy::FailFast => {
+                            return Err(PipelineError::Accumulator {
+                                transform,
+                                binding,
+                                source,
+                            });
+                        }
+                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                            ctx.counters.dlq_count += 1;
+                            let synthetic = if let Some((rec, _)) = input.first() {
+                                rec.clone()
+                            } else {
+                                Record::new(Arc::clone(output_schema), Vec::new())
+                            };
+                            ctx.dlq_entries.push(DlqEntry {
+                                source_row: 0,
+                                category: crate::dlq::DlqErrorCategory::AggregateFinalize,
+                                error_message: format!(
+                                    "aggregate {transform}.{binding}: {source:?}"
+                                ),
+                                original_record: synthetic,
+                                stage: Some(crate::dlq::stage_aggregate(name)),
+                                route: None,
+                                trigger: true,
+                            });
+                            Vec::new()
+                        }
+                    },
+                    Err(other) => return Err(other.into()),
+                }
             };
 
             ctx.collector
@@ -2302,7 +2437,13 @@ pub(crate) fn dispatch_plan_node(
             max_group_buffer,
             ..
         } => {
-            commit_correlation_buffers(ctx, name, commit_group_by, max_group_buffer)?;
+            crate::executor::commit::orchestrate(
+                ctx,
+                current_dag,
+                name,
+                commit_group_by,
+                max_group_buffer,
+            )?;
         }
     }
 
@@ -2374,7 +2515,13 @@ pub(crate) struct CorrelationErrorRecord {
 /// one per group. The phasing is necessary because every group flush
 /// would otherwise contend for `ctx.writers.remove(name)`, leaving
 /// subsequent groups silently dropped.
-fn commit_correlation_buffers(
+///
+/// Exposed at `pub(crate)` so the relaxed-CK orchestrator's flush
+/// phase can delegate to this body after the upstream phases have
+/// substituted retracted aggregate output rows into the buffer. Both
+/// strict and relaxed pipelines share the per-group emission shape;
+/// the only difference is which records reach this point.
+pub(crate) fn commit_correlation_buffers_strict(
     ctx: &mut ExecutorContext<'_>,
     _commit_node_name: &str,
     _commit_group_by: &[String],
@@ -2530,9 +2677,33 @@ fn commit_one_group(
         });
     }
     // Collateral entries: every other distinct row that flowed through
-    // the group's Output buffers but didn't itself error.
+    // the group's Output buffers but didn't itself error. The resolved
+    // CorrelationFanoutPolicy can spare individual slots; today the
+    // strict path always resolves to `Any` (every collateral DLQ'd) so
+    // sparing is a no-op here, but the wire is in place for the
+    // relaxed-CK orchestrator to substitute a different policy via
+    // per-Combine / per-Output overrides.
     for slot in &records {
         if seen_rows.contains(&slot.row_num) {
+            continue;
+        }
+        let policy = crate::executor::commit::output_fanout_policy(ctx, &slot.output_name);
+        // Strict path: every slot's CK identity already equals the
+        // group's CK identity by construction (the buffer key is
+        // shared). `is_full_tuple_match` is `true`; `is_primary_match`
+        // is also `true`. Under `Any` the slot DLQs; under `All` the
+        // slot DLQs (full match); under `Primary` the slot DLQs
+        // (primary match). The relaxed orchestrator's flush path
+        // populates these flags differently per slot when multi-CK
+        // fan-out makes the match partial.
+        let spare = crate::executor::commit::should_spare_collateral(policy, true, true);
+        if spare {
+            // Spared collateral lands in the per-output clean queue
+            // alongside the originally-clean records.
+            clean_per_output
+                .entry(slot.output_name.clone())
+                .or_default()
+                .push(slot.clone());
             continue;
         }
         if !seen_rows.insert(slot.row_num) {

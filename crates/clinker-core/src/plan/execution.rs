@@ -3372,6 +3372,74 @@ fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> 
     }
 }
 
+/// Detect whether a CXL `TypedProgram` calls any non-deterministic builtin.
+///
+/// Today's CXL surface has one non-deterministic builtin: `now` (the
+/// `now` keyword reads wall-clock time at evaluation). The walker
+/// returns `true` if any `Expr::Now` appears anywhere in the program's
+/// statements; the result drives the E15W diagnostic, which rejects a
+/// relaxed-CK aggregate feeding a Transform that calls a non-deterministic
+/// operator (replay would not produce the same row twice, breaking the
+/// post-retract substitution proof). New non-deterministic builtins
+/// added later in CXL must extend this walker — the central check
+/// keeps the planner consistent with whatever the language admits.
+pub(crate) fn cxl_has_nondeterministic_call(typed: &TypedProgram) -> bool {
+    use cxl::ast::Expr;
+
+    fn walk(e: &Expr) -> bool {
+        match e {
+            Expr::Now { .. } => true,
+            Expr::Binary { lhs, rhs, .. } => walk(lhs) || walk(rhs),
+            Expr::Unary { operand, .. } => walk(operand),
+            Expr::MethodCall { receiver, args, .. } => walk(receiver) || args.iter().any(walk),
+            Expr::Match { subject, arms, .. } => {
+                subject.as_deref().map(walk).unwrap_or(false)
+                    || arms.iter().any(|a| walk(&a.pattern) || walk(&a.body))
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                walk(condition)
+                    || walk(then_branch)
+                    || else_branch.as_deref().map(walk).unwrap_or(false)
+            }
+            Expr::Coalesce { lhs, rhs, .. } => walk(lhs) || walk(rhs),
+            Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => args.iter().any(walk),
+            Expr::Literal { .. }
+            | Expr::FieldRef { .. }
+            | Expr::QualifiedFieldRef { .. }
+            | Expr::PipelineAccess { .. }
+            | Expr::MetaAccess { .. }
+            | Expr::Wildcard { .. }
+            | Expr::AggSlot { .. }
+            | Expr::GroupKey { .. } => false,
+        }
+    }
+
+    for stmt in &typed.program.statements {
+        let mut exprs: Vec<&Expr> = Vec::new();
+        match stmt {
+            Statement::Emit { expr, .. } | Statement::Let { expr, .. } => exprs.push(expr),
+            Statement::Filter { predicate, .. } => exprs.push(predicate),
+            Statement::Trace { guard, message, .. } => {
+                if let Some(g) = guard.as_deref() {
+                    exprs.push(g);
+                }
+                exprs.push(message);
+            }
+            Statement::ExprStmt { expr, .. } => exprs.push(expr),
+            Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+        }
+        if exprs.iter().any(|e| walk(e)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect whether a CXL transform contains any `distinct` statement.
 ///
 /// Sibling of [`extract_write_set`] — sourced from the same `TypedProgram`

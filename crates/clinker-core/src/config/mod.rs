@@ -286,6 +286,15 @@ pub struct OutputConfig {
     /// multiple files based on record count or byte size limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitConfig>,
+    /// Optional per-Output override for the correlation fan-out policy.
+    /// Wins against the per-Combine override and the per-pipeline default
+    /// because the sink has the most context for whether collateral
+    /// rollback is acceptable (audit-style sinks typically opt down to
+    /// `Primary` or `All`; integrity-style sinks keep the default `Any`).
+    /// Additive opt-in: `None` defers to upstream resolution, preserving
+    /// today's behavior unchanged for every existing pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
@@ -1948,6 +1957,51 @@ impl PipelineConfig {
             }
         }
 
+        // E15W — relaxed_correlation_key + non-deterministic operator
+        // downstream. The correlation-commit replay phase rewrites
+        // affected aggregate output rows by re-running the deterministic
+        // portion of the post-aggregate sub-DAG; a Transform that calls
+        // `now` (or any future non-deterministic builtin) would produce
+        // a different value on replay than at first execution, breaking
+        // the post-retract substitution proof. Reject at compile time
+        // so users see the limitation before they hit a silent diverge
+        // at runtime. Strict pipelines and pipelines without a
+        // relaxed-CK aggregate are unaffected.
+        let relaxed_aggs_present = dag.graph.node_weights().any(|n| {
+            matches!(
+                n,
+                crate::plan::execution::PlanNode::Aggregation {
+                    relaxed_correlation_key: true,
+                    ..
+                }
+            )
+        });
+        if relaxed_aggs_present && self.error_handling.correlation_key.is_some() {
+            for node in dag.graph.node_weights() {
+                if let crate::plan::execution::PlanNode::Transform {
+                    name,
+                    resolved: Some(payload),
+                    ..
+                } = node
+                    && crate::plan::execution::cxl_has_nondeterministic_call(&payload.typed)
+                {
+                    diags.push(Diagnostic::error(
+                        "E15W",
+                        format!(
+                            "E15W transform '{}' calls a non-deterministic CXL builtin (e.g. \
+                             `now`) under a relaxed_correlation_key aggregate downstream of \
+                             pipeline-level correlation_key. Replay during correlation-commit \
+                             would not produce the same row twice, breaking the post-retract \
+                             substitution proof. Remove the non-deterministic call or remove \
+                             `relaxed_correlation_key`.",
+                            name
+                        ),
+                        LabeledSpan::primary(node.span(), String::new()),
+                    ));
+                }
+            }
+        }
+
         // Inject the terminal correlation-commit node once the DAG is
         // otherwise frozen. Re-derive topo afterward because the
         // commit node and its incoming edges change the order. No-op
@@ -2509,6 +2563,33 @@ fn default_max_group_buffer() -> Option<u64> {
     Some(100_000)
 }
 
+/// Selects how a triggered correlation group's collateral records are
+/// disposed at commit time.
+///
+/// Resolution precedence (latter wins): per-pipeline default →
+/// per-Combine override (per-input-set fan-out shape) → per-Output override
+/// (per-sink fan-out shape). The override surface lets audit-style sinks
+/// keep failing-group records that an integrity-style sink would discard.
+///
+/// * `Any` — every record sharing any correlation-key field with a
+///   triggering record is collateral-DLQ'd. The default; matches "if any
+///   contributing source had bad data, the joined output is suspect."
+/// * `All` — only records sharing the FULL correlation-key tuple with a
+///   trigger are collateral-DLQ'd. Records that derived only some CK
+///   columns from a failing source pass through to the writer.
+/// * `Primary` — only records on the primary correlation-key field
+///   (first-listed in `error_handling.correlation_key`) face collateral
+///   rollback. Audit-dump opt-out for sinks that retain enough provenance
+///   to accept partial-rollback semantics.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrelationFanoutPolicy {
+    #[default]
+    Any,
+    All,
+    Primary,
+}
+
 /// Error handling strategy and DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2533,6 +2614,12 @@ pub struct ErrorHandlingConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_group_buffer: Option<u64>,
+    /// Pipeline-level default for collateral fan-out at correlation commit.
+    /// Defaults to `Any` when `correlation_key` is set; pipelines without a
+    /// correlation key never observe this field. Per-Combine / per-Output
+    /// overrides win against this default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
 }
 
 impl Default for ErrorHandlingConfig {
@@ -2543,6 +2630,7 @@ impl Default for ErrorHandlingConfig {
             type_error_threshold: None,
             correlation_key: None,
             max_group_buffer: None,
+            correlation_fanout_policy: None,
         }
     }
 }

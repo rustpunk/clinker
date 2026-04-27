@@ -685,6 +685,19 @@ pub struct AggregatorGroupState {
     /// preserves which input rows folded into each group across the
     /// round trip.
     pub input_rows: Vec<u32>,
+    /// Per-row evaluated binding values, parallel to `input_rows`.
+    /// `retract_values[i]` is the per-binding `Vec<Value>` produced by
+    /// the i-th ingested row (in `CompiledAggregate.bindings[]` order),
+    /// stored only on the lineage path when retraction is enabled. Empty
+    /// otherwise (no allocation cost on the strict path).
+    ///
+    /// Necessary because `AccumulatorEnum::sub` needs the original
+    /// observed value to walk back its contribution; the folded
+    /// accumulator state alone has thrown that information away. Storage
+    /// shape mirrors `BufferedGroupState.contributions` so a future
+    /// convergence of the two retraction strategies can share one
+    /// per-row-Vec layout.
+    pub retract_values: Vec<Vec<Value>>,
 }
 
 impl AggregatorGroupState {
@@ -695,6 +708,7 @@ impl AggregatorGroupState {
             min_row_num: u64::MAX,
             group_index: 0,
             input_rows: Vec::new(),
+            retract_values: Vec::new(),
         }
     }
 }
@@ -1001,6 +1015,18 @@ impl AggregateStream {
             Self::Streaming(s) => s.flush(ctx, out),
         }
     }
+
+    /// Convert the stream into a boxed [`HashAggregator`] owning the
+    /// in-memory state, plus a snapshot of the Hash-arm group-by indices.
+    /// Returns `None` for the `Streaming` arm — that path is rejected
+    /// for relaxed-CK aggregates at compile time (E15Y), so the relaxed
+    /// commit orchestrator only ever calls this on a Hash-arm stream.
+    pub fn into_retained_hash(self) -> Option<Box<HashAggregator>> {
+        match self {
+            Self::Hash(h) => Some(h),
+            Self::Streaming(_) => None,
+        }
+    }
 }
 
 /// Hash aggregation engine — D1 default strategy.
@@ -1155,6 +1181,14 @@ impl HashAggregator {
         &self.groups
     }
 
+    /// Group-by column indices in the input record schema. Mirrors the
+    /// `CompiledAggregate.group_by_indices` projection the orchestrator's
+    /// recompute phase needs to align pre-/post-retract output rows by
+    /// group key.
+    pub fn group_by_indices(&self) -> &[u32] {
+        &self.group_by_indices
+    }
+
     /// Total bytes currently charged into the per-group value heap. Used
     /// by the spill trigger and by tests verifying memory accounting.
     pub fn value_heap_bytes(&self) -> usize {
@@ -1271,6 +1305,7 @@ impl HashAggregator {
         // entry are charged into `value_heap_bytes` so the existing 40%
         // value-heap spill threshold gates lineage memory without a
         // separate budget knob.
+        let lineage_active = self.lineage.is_some();
         if let Some(lin) = self.lineage.as_mut() {
             // `row_num` is u64 in the API; lineage stores u32 because
             // every existing aggregation pipeline is bounded by the
@@ -1289,10 +1324,86 @@ impl HashAggregator {
         }
 
         // 5. BindingArg dispatch hot loop (D1).
+        //
+        // Lineage path evaluates each binding's argument to a Value
+        // first, caches it on the per-group `retract_values`, and then
+        // folds it through the accumulator. Caching the Value lets the
+        // commit-step `retract_row` walk back exactly the same
+        // contribution; the alternative — re-evaluating the binding
+        // expression against the original record at retract time —
+        // would either need the original record retained (memory cost
+        // outpaces this Vec) or be impossible for bindings that close
+        // over now-expired Transform locals. The non-lineage strict
+        // path keeps the original tight per-binding dispatch.
         let bindings = self.factory.compiled().bindings.clone();
         let mut delta: usize = 0;
-        for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
-            delta += dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
+        if lineage_active {
+            let mut row_values: Vec<Value> = Vec::with_capacity(bindings.len());
+            let mut row_heap_bytes: usize = 0;
+            for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
+                match &binding.arg {
+                    BindingArg::Pair(a, b) => {
+                        let va = eval_binding_arg_value(a, record, ctx, &self.evaluator)?;
+                        let vb = eval_binding_arg_value(b, record, ctx, &self.evaluator)?;
+                        // Lineage + Pair only co-occur on a relaxed-CK
+                        // aggregate whose only Pair binding is
+                        // WeightedAvg, which is BufferRequired and would
+                        // route through buffer-mode instead. The branch
+                        // is kept defensively so a future Pair binding
+                        // that enters the Reversible set does not break
+                        // here.
+                        row_heap_bytes = row_heap_bytes
+                            .saturating_add(va.heap_size())
+                            .saturating_add(vb.heap_size());
+                        row_values.push(va.clone());
+                        row_values.push(vb.clone());
+                        acc.add_weighted(&va, &vb);
+                    }
+                    BindingArg::Field(idx) => {
+                        let v = record
+                            .values()
+                            .get(*idx as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        row_heap_bytes = row_heap_bytes.saturating_add(v.heap_size());
+                        delta += acc.add(&v);
+                        row_values.push(v);
+                    }
+                    BindingArg::Wildcard => {
+                        delta += acc.add(&Value::Null);
+                        row_values.push(Value::Null);
+                    }
+                    BindingArg::Expr(e) => {
+                        let env: std::collections::HashMap<String, Value> =
+                            std::collections::HashMap::new();
+                        let meta: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+                        let v = eval_expr::<NullStorage>(
+                            e,
+                            self.evaluator.typed(),
+                            ctx,
+                            record,
+                            None,
+                            &env,
+                            &meta,
+                        )?;
+                        row_heap_bytes = row_heap_bytes.saturating_add(v.heap_size());
+                        delta += acc.add(&v);
+                        row_values.push(v);
+                    }
+                }
+            }
+            // Charge the per-row retract-values cache: enum-tag bytes
+            // for each Value slot plus recursive heap plus the inner
+            // Vec's header.
+            let row_charge = std::mem::size_of::<Value>().saturating_mul(row_values.len())
+                + row_heap_bytes
+                + std::mem::size_of::<Vec<Value>>();
+            self.value_heap_bytes = self.value_heap_bytes.saturating_add(row_charge);
+            group_state.retract_values.push(row_values);
+        } else {
+            for (binding, acc) in bindings.iter().zip(group_state.row.iter_mut()) {
+                delta += dispatch_binding(&binding.arg, acc, record, ctx, &self.evaluator)?;
+            }
         }
         self.value_heap_bytes = self.value_heap_bytes.saturating_add(delta);
 
@@ -1554,6 +1665,157 @@ impl HashAggregator {
                     );
                     self.spill()?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Retract one previously-ingested row's contribution to its group.
+    ///
+    /// Looks up the group containing `input_row_id` via `self.lineage`
+    /// (fold-mode) or by linear scan over `BufferedGroupState.input_rows`
+    /// (buffer-mode), then walks back the row's contribution:
+    ///
+    /// * **Lineage / fold path** — for each binding's accumulator in the
+    ///   group, calls `acc.sub(&stored_value)` against the corresponding
+    ///   slot in `AggregatorGroupState.retract_values`. Reversible-only
+    ///   bindings are guaranteed by `set_retraction_flags_for_relaxed`.
+    /// * **Buffer path** — removes the matching entry from
+    ///   `BufferedGroupState.contributions`/`input_rows`. The next
+    ///   `finalize` call re-folds the surviving contributions through a
+    ///   fresh accumulator row, so `BufferRequired` bindings (`Min`,
+    ///   `Max`, `Avg`, `WeightedAvg`) recompute byte-identically to a
+    ///   feed-from-scratch over the surviving rows.
+    ///
+    /// Both paths return [`HashAggError::Spill`] when the row id is not
+    /// found in any in-memory group; spilled groups cannot be retracted
+    /// in-place because the on-disk encoding is finalized accumulator
+    /// state. The orchestrator's degrade-fallback surface catches that
+    /// case and routes the affected groups through strict-collateral DLQ
+    /// per the relaxed-CK fallback contract.
+    pub(crate) fn retract_row(&mut self, input_row_id: u32) -> Result<(), HashAggError> {
+        if !self.spill_files.is_empty() {
+            return Err(HashAggError::Spill(format!(
+                "retract_row {input_row_id} called on aggregator with spilled groups; \
+                 in-place retraction is only available against in-memory state"
+            )));
+        }
+
+        if self.buffer_mode {
+            for state in self.buffered_groups.values_mut() {
+                if let Some(idx) = state.input_rows.iter().position(|r| *r == input_row_id) {
+                    let removed = state.contributions.remove(idx);
+                    state.input_rows.remove(idx);
+                    let row_charge = std::mem::size_of::<Value>().saturating_mul(removed.len())
+                        + removed.iter().map(Value::heap_size).sum::<usize>()
+                        + std::mem::size_of::<Vec<Value>>()
+                        + std::mem::size_of::<u32>();
+                    self.value_heap_bytes = self.value_heap_bytes.saturating_sub(row_charge);
+                    return Ok(());
+                }
+            }
+            return Err(HashAggError::Spill(format!(
+                "retract_row {input_row_id} not found in any buffered group"
+            )));
+        }
+
+        // Lineage path: walk every group, find the row in `input_rows`,
+        // sub each binding's accumulator with the cached retract Value.
+        let bindings = self.factory.compiled().bindings.clone();
+        for state in self.groups.values_mut() {
+            let Some(idx) = state.input_rows.iter().position(|r| *r == input_row_id) else {
+                continue;
+            };
+            let values = state.retract_values.remove(idx);
+            state.input_rows.remove(idx);
+            let mut value_cursor = 0usize;
+            let mut total_delta: isize = 0;
+            for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
+                match &binding.arg {
+                    BindingArg::Pair(_, _) => {
+                        // Lineage + Pair only co-occurs through the
+                        // defensive branch in `add_record`; today every
+                        // Pair-shaped binding (`WeightedAvg`) is
+                        // BufferRequired and runs through the buffer
+                        // arm above.
+                        debug_assert!(false, "Pair binding under lineage path is unreachable");
+                        value_cursor += 2;
+                    }
+                    _ => {
+                        let v = values.get(value_cursor).cloned().unwrap_or(Value::Null);
+                        total_delta += acc.sub(&v);
+                        value_cursor += 1;
+                    }
+                }
+            }
+            // Apply the heap delta. The retract_values entry has already
+            // been removed; charge that off too.
+            let removed_row_charge = std::mem::size_of::<Value>().saturating_mul(values.len())
+                + values.iter().map(Value::heap_size).sum::<usize>()
+                + std::mem::size_of::<Vec<Value>>()
+                + std::mem::size_of::<u32>();
+            self.value_heap_bytes = self.value_heap_bytes.saturating_sub(removed_row_charge);
+            // Negative `total_delta` is a shrink; saturating-sub clamps
+            // at zero against the running total.
+            if total_delta < 0 {
+                self.value_heap_bytes = self
+                    .value_heap_bytes
+                    .saturating_sub((-total_delta) as usize);
+            } else {
+                self.value_heap_bytes = self.value_heap_bytes.saturating_add(total_delta as usize);
+            }
+            return Ok(());
+        }
+        Err(HashAggError::Spill(format!(
+            "retract_row {input_row_id} not found in any lineage group"
+        )))
+    }
+
+    /// Drive the aggregator to completion without consuming it. Used by
+    /// the relaxed-CK commit path so the orchestrator can call `retract_row`
+    /// against the same instance that produced the original output, then
+    /// re-finalize and produce updated rows.
+    ///
+    /// Cannot fold the spill-recovery path through this entry because
+    /// `finalize_with_spill` consumes spill files; the relaxed-CK path
+    /// rejects retract on a spilled aggregator (see [`Self::retract_row`])
+    /// so this routine only runs on in-memory state.
+    pub(crate) fn finalize_in_place(
+        &mut self,
+        ctx: &EvalContext,
+        out: &mut Vec<SortRow>,
+    ) -> Result<(), HashAggError> {
+        if !self.spill_files.is_empty() {
+            return Err(HashAggError::Spill(
+                "finalize_in_place called on aggregator with spilled groups".to_string(),
+            ));
+        }
+        if self.buffer_mode {
+            for (key, buffered) in self.buffered_groups.iter() {
+                let folded = fold_buffered_state(&self.factory, buffered.clone())?;
+                let record = finalize_group_inner(
+                    &self.factory,
+                    &self.output_schema,
+                    &self.transform_name,
+                    key,
+                    &folded,
+                )?;
+                let row_num = if folded.min_row_num == u64::MAX {
+                    0
+                } else {
+                    folded.min_row_num
+                };
+                out.push((record, row_num));
+            }
+        } else {
+            for (key, state) in self.groups.iter() {
+                let record = self.finalize_group(key, state, ctx)?;
+                let row_num = if state.min_row_num == u64::MAX {
+                    0
+                } else {
+                    state.min_row_num
+                };
+                out.push((record, row_num));
             }
         }
         Ok(())
@@ -2345,6 +2607,7 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
     // `dst`'s value — its post-merge identity is reassigned by the
     // recovery loop, so neither side's index is canonical here.
     dst.input_rows.extend(src.input_rows);
+    dst.retract_values.extend(src.retract_values);
 }
 
 /// Concatenate two `BufferedGroupState` partials produced by separate
@@ -2395,6 +2658,13 @@ fn fold_buffered_state(
         min_row_num: buffered.min_row_num,
         group_index: buffered.group_index,
         input_rows: buffered.input_rows,
+        // `fold_buffered_state` is the buffer→folded conversion driver
+        // that runs at finalize. Buffer-mode aggregators populate
+        // `BufferedGroupState.contributions` directly; the lineage-only
+        // `retract_values` cache is empty here because the resulting
+        // folded state is consumed by `finalize_group_inner` rather
+        // than re-handed to a retract pass.
+        retract_values: Vec::new(),
     })
 }
 
@@ -4092,5 +4362,221 @@ mod spill_trigger_tests {
         // contribution already exceeded the entire budget; the
         // post-spill hard-limit guard fires the panic.
         let _ = agg.add_record(&r, 0, &ctx_for(&stable, &file, 0));
+    }
+
+    // ----------------------------------------------------------------
+    // Buffer-mode retract round-trip — feed N, retract M, finalize_in_place
+    // equals feed-(N-M)-from-scratch byte-identically. One test per
+    // BufferRequired variant: Min, Max, Avg, WeightedAvg.
+    // ----------------------------------------------------------------
+
+    fn run_with_retract<F>(
+        cxl: &str,
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        rows: &[(Vec<Value>, u64)],
+        retract: &[u32],
+        feed_subset: F,
+    ) -> (Vec<Record>, Vec<Record>)
+    where
+        F: Fn(&[(Vec<Value>, u64)]) -> Vec<(Vec<Value>, u64)>,
+    {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let input = make_schema(&input_fields.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+
+        let mut full_agg = build_test_aggregator_relaxed(
+            input_fields,
+            group_by,
+            cxl,
+            10 * 1024 * 1024,
+            None,
+            true,
+        );
+        for (vals, rn) in rows {
+            full_agg
+                .add_record(
+                    &make_record(&input, vals.clone()),
+                    *rn,
+                    &ctx_for(&stable, &file, *rn),
+                )
+                .expect("add_record");
+        }
+        for &row_id in retract {
+            full_agg.retract_row(row_id).expect("retract_row");
+        }
+        let mut out_after_retract = Vec::new();
+        full_agg
+            .finalize_in_place(&ctx_for(&stable, &file, 0), &mut out_after_retract)
+            .expect("finalize_in_place");
+
+        // Baseline: feed only the surviving subset from scratch.
+        let surviving = feed_subset(rows);
+        let mut baseline_agg = build_test_aggregator_relaxed(
+            input_fields,
+            group_by,
+            cxl,
+            10 * 1024 * 1024,
+            None,
+            true,
+        );
+        for (vals, rn) in &surviving {
+            baseline_agg
+                .add_record(
+                    &make_record(&input, vals.clone()),
+                    *rn,
+                    &ctx_for(&stable, &file, *rn),
+                )
+                .expect("add_record");
+        }
+        let mut out_baseline = Vec::new();
+        baseline_agg
+            .finalize_in_place(&ctx_for(&stable, &file, 0), &mut out_baseline)
+            .expect("finalize_in_place");
+
+        let after: Vec<Record> = out_after_retract.into_iter().map(|(r, _)| r).collect();
+        let baseline: Vec<Record> = out_baseline.into_iter().map(|(r, _)| r).collect();
+        (after, baseline)
+    }
+
+    fn record_set_eq(a: &[Record], b: &[Record]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        for ra in a {
+            let mut matched = false;
+            for rb in b {
+                if ra.values().len() != rb.values().len() {
+                    continue;
+                }
+                if ra
+                    .values()
+                    .iter()
+                    .zip(rb.values().iter())
+                    .all(|(x, y)| match (x, y) {
+                        (Value::Float(fx), Value::Float(fy)) => {
+                            (fx - fy).abs() < 1e-9 || fx.to_bits() == fy.to_bits()
+                        }
+                        (Value::Integer(ix), Value::Integer(iy)) => ix == iy,
+                        (Value::String(sx), Value::String(sy)) => sx == sy,
+                        (Value::Null, Value::Null) => true,
+                        _ => false,
+                    })
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn test_buffer_mode_retract_min_single_group_matches_baseline() {
+        let rows = vec![
+            (vec![Value::String("g".into()), Value::Integer(10)], 0),
+            (vec![Value::String("g".into()), Value::Integer(5)], 1),
+            (vec![Value::String("g".into()), Value::Integer(20)], 2),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit lo = min(v)",
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            &rows,
+            &[1],
+            |all| all.iter().filter(|(_, rn)| *rn != 1).cloned().collect(),
+        );
+        assert!(
+            record_set_eq(&after, &baseline),
+            "Min retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn test_buffer_mode_retract_max_many_groups_matches_baseline() {
+        let rows = vec![
+            (vec![Value::String("g1".into()), Value::Integer(10)], 0),
+            (vec![Value::String("g1".into()), Value::Integer(5)], 1),
+            (vec![Value::String("g2".into()), Value::Integer(20)], 2),
+            (vec![Value::String("g2".into()), Value::Integer(30)], 3),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit hi = max(v)",
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            &rows,
+            &[3],
+            |all| all.iter().filter(|(_, rn)| *rn != 3).cloned().collect(),
+        );
+        assert!(
+            record_set_eq(&after, &baseline),
+            "Max retract many-groups: {after:?} != {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn test_buffer_mode_retract_avg_recomputes_from_survivors() {
+        let rows = vec![
+            (vec![Value::String("g".into()), Value::Float(1.0)], 0),
+            (vec![Value::String("g".into()), Value::Float(2.0)], 1),
+            (vec![Value::String("g".into()), Value::Float(3.0)], 2),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit a = avg(v)",
+            &[("k", Type::String), ("v", Type::Float)],
+            &["k"],
+            &rows,
+            &[2],
+            |all| all.iter().filter(|(_, rn)| *rn != 2).cloned().collect(),
+        );
+        assert!(
+            record_set_eq(&after, &baseline),
+            "Avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn test_buffer_mode_retract_weighted_avg_recomputes_from_survivors() {
+        let rows = vec![
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(1.0),
+                    Value::Float(2.0),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(2.0),
+                    Value::Float(1.0),
+                ],
+                1,
+            ),
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(4.0),
+                    Value::Float(3.0),
+                ],
+                2,
+            ),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit wa = weighted_avg(v, w)",
+            &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
+            &["k"],
+            &rows,
+            &[1],
+            |all| all.iter().filter(|(_, rn)| *rn != 1).cloned().collect(),
+        );
+        assert!(
+            record_set_eq(&after, &baseline),
+            "WeightedAvg retract: {after:?} != {baseline:?}"
+        );
     }
 }

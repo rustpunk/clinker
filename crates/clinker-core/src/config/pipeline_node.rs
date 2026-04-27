@@ -856,6 +856,15 @@ pub struct CombineBody {
     /// subset. Required field with no default: every existing combine
     /// migrates to an explicit value at field introduction.
     pub propagate_ck: PropagateCkSpec,
+    /// Optional override for the pipeline-level correlation fan-out
+    /// policy. When `Some`, the Combine's output records carry this
+    /// policy through the DLQ trigger walk; downstream Output overrides
+    /// can then override it again. Additive opt-in mirroring
+    /// `relaxed_correlation_key` — `None` falls through to whichever
+    /// pipeline default is in effect, preserving today's "trigger fans
+    /// out across the joined record set" semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_fanout_policy: Option<crate::config::CorrelationFanoutPolicy>,
 }
 
 /// Output variant body. Wraps the existing sink config.
@@ -1437,6 +1446,7 @@ nodes:
             drive: None,
             strategy: crate::config::CombineStrategyHint::Auto,
             propagate_ck: PropagateCkSpec::Driver,
+            correlation_fanout_policy: None,
         };
         let node = PipelineNode::Combine {
             header,

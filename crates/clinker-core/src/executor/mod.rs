@@ -1,7 +1,8 @@
 pub mod stage_metrics;
 
 pub mod combine;
-mod dispatch;
+pub(crate) mod commit;
+pub(crate) mod dispatch;
 mod schema_check;
 
 use std::collections::{HashMap, HashSet};
@@ -1356,6 +1357,9 @@ impl PipelineExecutor {
             indices,
             correlation_buffers,
             correlation_max_group_buffer,
+            relaxed_aggregator_states: HashMap::new(),
+            relaxed_aggregator_degrade: Vec::new(),
+            commit_step_path: dispatch::CommitStepPath::NotSelected,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2403,6 +2407,7 @@ mod tests {
     mod aggregation;
     mod branching;
     mod correlated_dlq;
+    mod correlated_dlq_retract;
     mod format_dispatch;
     mod multi_output;
 }
