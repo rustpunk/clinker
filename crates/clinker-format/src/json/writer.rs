@@ -24,6 +24,10 @@ pub struct JsonWriterConfig {
     pub format: JsonOutputMode,
     pub pretty: bool,
     pub preserve_nulls: bool,
+    /// Whether engine-stamped schema columns (`$ck.<field>` correlation
+    /// snapshots) appear as keys in the emitted JSON object. Defaults
+    /// to `false` to keep engine-internal namespaces out of output.
+    pub include_engine_stamped: bool,
 }
 
 impl Default for JsonWriterConfig {
@@ -32,6 +36,7 @@ impl Default for JsonWriterConfig {
             format: JsonOutputMode::Array,
             pretty: false,
             preserve_nulls: false,
+            include_engine_stamped: false,
         }
     }
 }
@@ -61,16 +66,26 @@ impl<W: Write> JsonWriter<W> {
     /// `preserve_nulls: false` omits keys with Null values. Metadata is
     /// stripped from the default output; callers that want to emit
     /// `$meta.*` keys into the JSON object must opt in at a higher
-    /// layer (the Output node's `include_metadata` flag).
+    /// layer (the Output node's `include_metadata` flag). Engine-stamped
+    /// columns follow the same rule via `include_engine_stamped`.
     fn record_to_json(&self, record: &Record) -> serde_json::Value {
         use serde_json::{Map, Value as Jv};
 
         let mut obj = Map::with_capacity(record.field_count());
-        for (col, val) in record.iter_all_fields() {
+        let emit = |obj: &mut Map<String, Jv>, col: &str, val: &Value| {
             if !self.config.preserve_nulls && val.is_null() {
-                continue;
+                return;
             }
             obj.insert(col.to_string(), clinker_to_json(val));
+        };
+        if self.config.include_engine_stamped {
+            for (col, val) in record.iter_all_fields() {
+                emit(&mut obj, col, val);
+            }
+        } else {
+            for (col, val) in record.iter_user_fields() {
+                emit(&mut obj, col, val);
+            }
         }
         Jv::Object(obj)
     }

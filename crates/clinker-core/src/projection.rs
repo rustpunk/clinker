@@ -81,17 +81,26 @@ pub fn project_output_from_record(
         || !config.include_metadata.is_none()
         || config.include_unmapped
         || drop_unmapped;
+    let include_engine_stamped = config.include_correlation_keys;
 
     if !needs_rewrite {
         // Fast path: no exclude, no mapping, no metadata merge — emit
         // all Record fields in natural iteration order, no
-        // intermediate allocation.
+        // intermediate allocation. Engine-stamped columns are dropped
+        // unless the Output node opts in.
         let field_count = input_record.total_field_count();
         let mut schema_builder = SchemaBuilder::with_capacity(field_count);
         let mut values: Vec<Value> = Vec::with_capacity(field_count);
-        for (name, value) in input_record.iter_all_fields() {
-            schema_builder = schema_builder.with_field(name);
-            values.push(value.clone());
+        if include_engine_stamped {
+            for (name, value) in input_record.iter_all_fields() {
+                schema_builder = schema_builder.with_field(name);
+                values.push(value.clone());
+            }
+        } else {
+            for (name, value) in input_record.iter_user_fields() {
+                schema_builder = schema_builder.with_field(name);
+                values.push(value.clone());
+            }
         }
         return Record::new(schema_builder.build(), values);
     }
@@ -101,8 +110,14 @@ pub fn project_output_from_record(
     // IndexMap's keyed access.
     let mut fields: IndexMap<String, Value> =
         IndexMap::with_capacity(input_record.total_field_count());
-    for (name, value) in input_record.iter_all_fields() {
-        fields.insert(name.to_string(), value.clone());
+    if include_engine_stamped {
+        for (name, value) in input_record.iter_all_fields() {
+            fields.insert(name.to_string(), value.clone());
+        }
+    } else {
+        for (name, value) in input_record.iter_user_fields() {
+            fields.insert(name.to_string(), value.clone());
+        }
     }
 
     // Restrict to user-emitted columns when the caller supplied the
@@ -262,6 +277,7 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            include_correlation_keys: false,
             schema: None,
             split: None,
             notes: None,
@@ -298,6 +314,7 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            include_correlation_keys: false,
             schema: None,
             split: None,
             notes: None,
@@ -327,6 +344,7 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            include_correlation_keys: false,
             schema: None,
             split: None,
             notes: None,
@@ -338,5 +356,62 @@ mod tests {
             result.get("given_name"),
             Some(&Value::String("Alice".into()))
         );
+    }
+
+    fn correlation_key_input() -> Record {
+        use clinker_record::FieldMetadata;
+        use clinker_record::SchemaBuilder;
+        let schema = SchemaBuilder::new()
+            .with_field("id")
+            .with_field("name")
+            .with_field_meta("$ck.id", FieldMetadata::snapshot_of("id"))
+            .build();
+        Record::new(
+            schema,
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".into()),
+                Value::Integer(1),
+            ],
+        )
+    }
+
+    fn fast_path_output_config(include_correlation_keys: bool) -> OutputConfig {
+        OutputConfig {
+            name: "out".into(),
+            format: crate::config::OutputFormat::Csv(None),
+            path: "/tmp/out.csv".into(),
+            include_unmapped: false,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_metadata: Default::default(),
+            include_correlation_keys,
+            schema: None,
+            split: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_projection_fast_path_strips_engine_stamped_by_default() {
+        let input = correlation_key_input();
+        let config = fast_path_output_config(false);
+        let result = project_output_from_record(&input, &config, None);
+        let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", "name"]);
+        assert!(result.get("$ck.id").is_none());
+    }
+
+    #[test]
+    fn test_projection_fast_path_keeps_engine_stamped_on_opt_in() {
+        let input = correlation_key_input();
+        let config = fast_path_output_config(true);
+        let result = project_output_from_record(&input, &config, None);
+        let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", "name", "$ck.id"]);
+        assert_eq!(result.get("$ck.id"), Some(&Value::Integer(1)));
     }
 }

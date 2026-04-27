@@ -17,6 +17,10 @@ pub struct XmlWriterConfig {
     pub root_element: String,
     pub record_element: String,
     pub preserve_nulls: bool,
+    /// Whether engine-stamped schema columns (`$ck.<field>` correlation
+    /// snapshots) emit as nested elements. Defaults to `false` so
+    /// engine-internal namespaces stay out of the XML output.
+    pub include_engine_stamped: bool,
 }
 
 impl Default for XmlWriterConfig {
@@ -25,6 +29,7 @@ impl Default for XmlWriterConfig {
             root_element: "Root".into(),
             record_element: "Record".into(),
             preserve_nulls: false,
+            include_engine_stamped: false,
         }
     }
 }
@@ -64,11 +69,15 @@ impl<W: Write> XmlWriter<W> {
     /// Collect schema fields as (name, value) pairs, then write them as
     /// nested XML elements. Metadata (`$meta.*`) is stripped from the
     /// default output; the Output-node `include_metadata` flag is the
-    /// opt-in for layers that want to surface it.
+    /// opt-in for layers that want to surface it. Engine-stamped
+    /// columns follow the same rule via `include_engine_stamped`.
     fn write_fields(&mut self, record: &Record) -> Result<(), FormatError> {
-        let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
+        let fields: Vec<(&str, &Value)> = if self.config.include_engine_stamped {
+            record.iter_all_fields().collect()
+        } else {
+            record.iter_user_fields().collect()
+        };
 
-        // Build a tree of field segments for nested expansion
         let tree = build_field_tree(&fields, self.config.preserve_nulls);
         self.write_field_tree(&tree)?;
 

@@ -189,6 +189,24 @@ impl Record {
             .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
 
+    /// Iterator over user-declared schema fields in schema order,
+    /// skipping engine-stamped columns (today: `$ck.<field>` correlation
+    /// snapshots). The default writer surface and the default projection
+    /// fast path consult this iterator so engine-internal namespaces do
+    /// not leak into output files unless the Output node opts in.
+    pub fn iter_user_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                self.schema
+                    .field_metadata(*i)
+                    .is_none_or(|m| !m.is_engine_stamped())
+            })
+            .map(|(i, name)| (name.as_ref(), &self.values[i]))
+    }
+
     /// Number of schema fields.
     pub fn field_count(&self) -> usize {
         self.schema.column_count()
@@ -313,6 +331,26 @@ mod tests {
         let values = vec![Value::Null; 5];
         let mut record = Record::new(schema, values);
         record.set("nonexistent", Value::Integer(1));
+    }
+
+    #[test]
+    fn test_record_iter_user_fields_skips_engine_stamped() {
+        use crate::schema::FieldMetadata;
+        let cols: Vec<Box<str>> = vec!["employee_id".into(), "$ck.employee_id".into()];
+        let meta = vec![None, Some(FieldMetadata::snapshot_of("employee_id"))];
+        let schema = Arc::new(Schema::with_metadata(cols, meta));
+        let record = Record::new(schema, vec![Value::Integer(7), Value::Integer(7)]);
+
+        let user_fields: Vec<(&str, &Value)> = record.iter_user_fields().collect();
+        assert_eq!(
+            user_fields.len(),
+            1,
+            "engine-stamped column must be skipped"
+        );
+        assert_eq!(user_fields[0].0, "employee_id");
+
+        let all_fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
+        assert_eq!(all_fields.len(), 2, "iter_all_fields keeps engine-stamped");
     }
 
     #[test]

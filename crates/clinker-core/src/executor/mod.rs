@@ -1829,10 +1829,12 @@ fn build_writer_factory(
     include_header: Option<bool>,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_record::schema_def::FieldDef>>,
+    include_engine_stamped: bool,
 ) -> WriterFactory {
     match format {
         crate::config::OutputFormat::Csv(opts) => {
-            let csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            csv_config.include_engine_stamped = include_engine_stamped;
             if repeat_header {
                 let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
                 let call_count = Arc::new(AtomicU32::new(0));
@@ -1867,7 +1869,8 @@ fn build_writer_factory(
             }
         }
         crate::config::OutputFormat::Json(opts) => {
-            let json_config = build_json_writer_config(opts.as_ref());
+            let mut json_config = build_json_writer_config(opts.as_ref());
+            json_config.include_engine_stamped = include_engine_stamped;
             Box::new(move |counting_writer, schema| {
                 Ok(Box::new(JsonWriter::new(
                     counting_writer,
@@ -1877,7 +1880,8 @@ fn build_writer_factory(
             })
         }
         crate::config::OutputFormat::Xml(opts) => {
-            let xml_config = build_xml_writer_config(opts.as_ref());
+            let mut xml_config = build_xml_writer_config(opts.as_ref());
+            xml_config.include_engine_stamped = include_engine_stamped;
             Box::new(move |counting_writer, schema| {
                 Ok(Box::new(XmlWriter::new(
                     counting_writer,
@@ -1925,6 +1929,7 @@ pub(crate) fn build_format_writer(
         output.include_header,
         repeat_header,
         field_defs,
+        output.include_correlation_keys,
     );
 
     if let Some(ref split) = output.split {

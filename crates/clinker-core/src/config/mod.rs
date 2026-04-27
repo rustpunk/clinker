@@ -270,6 +270,14 @@ pub struct OutputConfig {
     /// Default: none (metadata stripped from output).
     #[serde(default, skip_serializing_if = "IncludeMetadata::is_none")]
     pub include_metadata: IncludeMetadata,
+    /// Controls whether engine-stamped correlation snapshot columns
+    /// (`$ck.<field>`) appear in the default writer output. The shadow
+    /// columns preserve correlation-group identity through Transforms
+    /// that may rewrite the user-declared field; they are an internal
+    /// engine namespace and are stripped from output unless this flag
+    /// is set. Defaults to `false`.
+    #[serde(default)]
+    pub include_correlation_keys: bool,
     /// Explicit schema for output formats that require field definitions
     /// (e.g., fixed-width output needs field names, widths, and positions).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1812,10 +1820,28 @@ impl PipelineConfig {
             self.pipeline.memory_limit.as_deref(),
         );
 
-        // Correlation-key validity gates. Run AFTER the DAG is fully
+        // Correlation-key planner passes. Run AFTER the DAG is fully
         // enriched so we see every Transform's `window_index` and every
-        // Aggregate's resolved `group_by`. Both produce typed
-        // [`PlanError`] variants surfaced as user-visible diagnostics.
+        // Aggregate's resolved `group_by`.
+        //
+        // Pass 1 (auto-extension): for every Aggregate downstream of a
+        // pipeline with `error_handling.correlation_key`, transparently
+        // append `$ck.<field>` shadow columns to the runtime
+        // `group_by` whenever the user-declared field is already
+        // listed. The user never types the engine-internal namespace
+        // in YAML; the engine routes frozen identity through the
+        // aggregation key by construction.
+        //
+        // Pass 2 (E150/E151): typed [`PlanError`] variants surfaced as
+        // user-visible diagnostics; runs after auto-extension so both
+        // checks see the user-natural shape.
+        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
+            let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
+            extend_aggregate_group_by_with_shadow(&mut dag.graph, &key_fields);
+            for body in artifacts.composition_bodies.values_mut() {
+                extend_aggregate_group_by_with_shadow(&mut body.graph, &key_fields);
+            }
+        }
         if self.error_handling.correlation_key.is_some() {
             for node in dag.graph.node_weights() {
                 if let crate::plan::execution::PlanNode::Transform {
@@ -2761,4 +2787,120 @@ pub fn load_config_with_vars(
 /// Load and parse a pipeline config from a YAML file path.
 pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError> {
     load_config_with_vars(path, &[])
+}
+
+/// Auto-extend every `PlanNode::Aggregation.group_by` with the
+/// `$ck.<field>` shadow column when the user-declared correlation-key
+/// field is already listed. Engine-internal namespace stays out of
+/// user YAML; the engine routes frozen identity through the
+/// aggregation key by construction.
+///
+/// Walks `graph` once, mutating each Aggregation in place:
+/// - `config.group_by` gains the shadow column at the tail.
+/// - `compiled.group_by_fields` and `compiled.group_by_indices`
+///   gain the corresponding upstream-schema position.
+/// - `output_schema` is rebuilt to carry the shadow column with
+///   engine-stamp metadata so writers, projection, and downstream
+///   consumers can identify it as engine-stamped.
+fn extend_aggregate_group_by_with_shadow(
+    graph: &mut petgraph::graph::DiGraph<
+        crate::plan::execution::PlanNode,
+        crate::plan::execution::PlanEdge,
+    >,
+    key_fields: &[String],
+) {
+    use clinker_record::{FieldMetadata, Schema, SchemaBuilder};
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use std::sync::Arc;
+
+    struct ShadowAppend {
+        shadow_name: String,
+        source_field: String,
+        upstream_pos: u32,
+    }
+
+    fn upstream_schema(
+        graph: &petgraph::graph::DiGraph<
+            crate::plan::execution::PlanNode,
+            crate::plan::execution::PlanEdge,
+        >,
+        mut idx: NodeIndex,
+    ) -> Option<Arc<Schema>> {
+        loop {
+            let upstream = graph.neighbors_directed(idx, Direction::Incoming).next()?;
+            if let Some(s) = graph[upstream].stored_output_schema() {
+                return Some(Arc::clone(s));
+            }
+            idx = upstream;
+        }
+    }
+
+    // Collect work first so the upstream-schema borrow doesn't alias the
+    // mutable graph borrow used for in-place mutation below.
+    let mut work: Vec<(NodeIndex, Vec<ShadowAppend>)> = Vec::new();
+    for idx in graph.node_indices() {
+        let group_by = match &graph[idx] {
+            crate::plan::execution::PlanNode::Aggregation { config, .. } => config.group_by.clone(),
+            _ => continue,
+        };
+        let mut to_append: Vec<ShadowAppend> = Vec::new();
+        for ck_field in key_fields {
+            let shadow = format!("$ck.{ck_field}");
+            let user_present = group_by.iter().any(|f| f == ck_field);
+            let shadow_present = group_by.iter().any(|f| f == &shadow);
+            if !user_present || shadow_present {
+                continue;
+            }
+            let Some(input_schema) = upstream_schema(graph, idx) else {
+                continue;
+            };
+            let Some(upstream_idx) = input_schema.index(&shadow) else {
+                continue;
+            };
+            to_append.push(ShadowAppend {
+                shadow_name: shadow,
+                source_field: ck_field.clone(),
+                upstream_pos: upstream_idx as u32,
+            });
+        }
+        if !to_append.is_empty() {
+            work.push((idx, to_append));
+        }
+    }
+
+    for (idx, to_append) in work {
+        let crate::plan::execution::PlanNode::Aggregation {
+            config,
+            compiled,
+            output_schema,
+            ..
+        } = &mut graph[idx]
+        else {
+            continue;
+        };
+
+        let compiled_mut = Arc::make_mut(compiled);
+        for entry in &to_append {
+            config.group_by.push(entry.shadow_name.clone());
+            compiled_mut.group_by_fields.push(entry.shadow_name.clone());
+            compiled_mut.group_by_indices.push(entry.upstream_pos);
+        }
+
+        let mut builder =
+            SchemaBuilder::with_capacity(output_schema.column_count() + to_append.len());
+        for (i, col) in output_schema.columns().iter().enumerate() {
+            match output_schema.field_metadata(i) {
+                Some(meta) => builder = builder.with_field_meta(col.clone(), meta.clone()),
+                None => builder = builder.with_field(col.clone()),
+            }
+        }
+        for entry in &to_append {
+            builder = builder.with_field_meta(
+                entry.shadow_name.clone(),
+                FieldMetadata::snapshot_of(entry.source_field.as_str()),
+            );
+        }
+        *output_schema = builder.build();
+    }
 }

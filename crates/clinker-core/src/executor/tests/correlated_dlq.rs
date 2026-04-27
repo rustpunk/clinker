@@ -582,7 +582,6 @@ nodes:
   config:
     group_by:
     - employee_id
-    - $ck.employee_id
     cxl: 'emit employee_id = employee_id
 
       emit total = sum(val)
@@ -690,6 +689,84 @@ nodes:
         "only the original-A group (3 records) DLQ'd"
     );
     assert_eq!(counters.ok_count, 1, "the original-B group emitted");
+}
+
+#[test]
+fn aggregate_after_transform_rewrite_groups_by_original_identity() {
+    // When a Transform rewrites the user-declared correlation_key field
+    // and an Aggregate follows, the engine produces one aggregate row
+    // per ORIGINAL ingest group — not one coalesced row keyed on the
+    // rewritten value. The planner auto-extends the Aggregate's
+    // `group_by` with the `$ck.<field>` shadow column so frozen
+    // identity discriminates groups even when the user-declared field
+    // is uniformly overwritten upstream. The user's YAML stays clean
+    // of `$ck.*`.
+    let yaml = r#"
+pipeline:
+  name: rewrite_then_agg
+error_handling:
+  strategy: continue
+  correlation_key: employee_id
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: employee_id, type: string }
+      - { name: value, type: string }
+
+- type: transform
+  name: rewrite
+  input: src
+  config:
+    cxl: 'emit employee_id = "REWRITTEN"
+
+      emit val = value.to_int()
+
+      '
+- type: aggregate
+  name: agg
+  input: rewrite
+  config:
+    group_by:
+    - employee_id
+    cxl: 'emit employee_id = employee_id
+
+      emit total = sum(val)
+
+      '
+- type: output
+  name: out
+  input: agg
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "employee_id,value\nA,1\nA,3\nB,7\n";
+    let (counters, _dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+
+    assert_eq!(counters.dlq_count, 0, "no bad records → no DLQ");
+    assert_eq!(
+        counters.ok_count, 2,
+        "two original groups (A, B) → two aggregate rows; the engine must not coalesce on the rewritten employee_id",
+    );
+    assert!(
+        output.contains("REWRITTEN,4"),
+        "output should contain group A's aggregate (1+3=4): {output}",
+    );
+    assert!(
+        output.contains("REWRITTEN,7"),
+        "output should contain group B's aggregate (7): {output}",
+    );
+    assert!(
+        !output.contains("$ck.employee_id"),
+        "default writer must strip the engine-stamped column header: {output}",
+    );
 }
 
 #[test]

@@ -750,6 +750,7 @@ fn test_splitting_writer_json_produces_valid_files() {
         format: JsonOutputMode::Ndjson,
         pretty: false,
         preserve_nulls: false,
+        include_engine_stamped: false,
     };
 
     let json_factory: WriterFactory = Box::new(
@@ -819,6 +820,7 @@ fn test_splitting_writer_xml_produces_valid_files() {
         root_element: "items".into(),
         record_element: "item".into(),
         preserve_nulls: false,
+        include_engine_stamped: false,
     };
 
     let xml_factory: WriterFactory = Box::new(
