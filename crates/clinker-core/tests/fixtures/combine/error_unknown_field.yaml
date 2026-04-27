@@ -30,6 +30,7 @@ nodes:
       where: "orders.nonexistent == products.product_id"
       cxl: |
         emit order_id = orders.order_id
+      propagate_ck: driver
   - type: output
     name: bad_out
     input: bad

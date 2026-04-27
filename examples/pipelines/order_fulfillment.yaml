@@ -68,6 +68,7 @@ nodes:
         emit product_name = products.product_name
         emit category = products.category
         emit weight_kg = products.weight_kg
+      propagate_ck: driver
 
   # TODO(16c compositions): shipping_cost + order_classification composition imports stripped during 16b fixture migration.
 

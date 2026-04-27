@@ -118,6 +118,7 @@ nodes:
       emit order_c0 = orders.c0
       emit product_c1 = products.c1 ?? "UNKNOWN"
       emit product_c2 = products.c2 ?? "UNKNOWN"
+    propagate_ck: driver
 
 - type: output
   name: out

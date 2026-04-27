@@ -156,7 +156,7 @@ If `east_orders` and `west_orders` both contain rows for `order_id = ORD-42`, al
 
 ### Aggregate interaction
 
-Every correlation-key field must be in `group_by`. The engine auto-extends `group_by` to include the correlation-key fields when you omit them; if you specify a `group_by` that explicitly excludes a correlation-key field, the pipeline fails to compile with `E151`.
+By default, every correlation-key field must be in `group_by`. The engine auto-extends `group_by` to include the correlation-key fields when you omit them; if you specify a `group_by` that explicitly excludes a correlation-key field, the pipeline fails to compile with `E151`.
 
 ```yaml
 error_handling:
@@ -188,9 +188,33 @@ The reason is structural: aggregates emit one row per group, and the emitted row
 
 Aggregate output rows inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row -- but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
 
+#### Opting out: `relaxed_correlation_key`
+
+Set `relaxed_correlation_key: true` on an aggregate to bypass the strict superset requirement above. With the opt-in, a correlation group may span multiple aggregate groups; correlation-key fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output.
+
+```yaml
+error_handling:
+  correlation_key: order_id
+
+- type: aggregate
+  name: dept_totals
+  input: validate
+  config:
+    group_by: [department]
+    relaxed_correlation_key: true      # bypass E151
+    cxl: |
+      emit total = sum(amount)
+```
+
+The opt-in is purely additive: existing pipelines without it keep today's strict semantics. Combining `relaxed_correlation_key: true` with `strategy: streaming` is rejected at compile time with `E15Y`, because streaming aggregates emit at group-boundary close (before the terminal correlation commit) and that defeats the rollback window the opt-in is designed to support.
+
 ### Combine interaction
 
-A combine's output rows inherit the **driver** input's correlation identity. Build-side records contribute fields to the output but their group identity is consumed by the hash or sort-merge match -- they do not reach the writer directly.
+Every combine declares `propagate_ck:` to select which correlation-key fields its output rows carry:
+
+- `propagate_ck: driver` -- output inherits only the driver input's correlation identity. Build-side records contribute fields to the output but their group identity is consumed by the match. Default-equivalent behavior; today's strict-correlation pipelines stay on this setting.
+- `propagate_ck: all` -- output carries the union of correlation-key fields across every input. Use when the build side carries CK fields that downstream operators need to read (for example, a build-side stream is also subject to correlation-driven DLQ on its own keys).
+- `propagate_ck: { named: [<field>, ...] }` -- output carries exactly the named subset, intersected with what is actually present upstream. Use to project a multi-field correlation key down to a single field after a join.
 
 ```yaml
 error_handling:
@@ -209,13 +233,33 @@ error_handling:
       emit employee_id = o.employee_id
       emit amount = o.amount
       emit dept = d.dept
+    propagate_ck: driver
 ```
 
-Output rows from `enriched` carry the `$ck.employee_id` value from the driver record, regardless of which department record matched. A trigger error on a driver record DLQ's that driver's whole correlation group, including any combine output rows that were already produced for that group.
+```yaml
+error_handling:
+  correlation_key: employee_id
+
+- type: combine
+  name: enriched_all
+  input:
+    o: orders
+    d: departments
+  config:
+    where: "o.employee_id == d.employee_id"
+    cxl: |
+      emit employee_id = o.employee_id
+      emit dept = d.dept
+    propagate_ck: all                  # union of every input's CK columns
+```
+
+Under `propagate_ck: driver`, output rows from `enriched` carry the `$ck.employee_id` value from the driver record, regardless of which department record matched. A trigger error on a driver record DLQ's that driver's whole correlation group, including any combine output rows that were already produced for that group.
 
 This rule holds across all combine execution paths: the hash-join path, the IEJoin range-predicate path, and chained combines (combine consuming the output of another combine).
 
 The `drive:` field on a combine selects which input is the driver. Choose the side that carries the authoritative group identity for downstream DLQ routing -- typically the larger or more transactional stream.
+
+`propagate_ck` is a required field with no default value -- every combine must spell out which propagation mode it uses. Existing pipelines migrate by adding `propagate_ck: driver` to keep today's behavior.
 
 ### Composition interaction
 

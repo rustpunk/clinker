@@ -90,6 +90,26 @@ If your source declares a `sort_order:` that covers the group-by fields, the opt
 
 Hash aggregation works on unsorted input and is the safe default. It uses more memory but handles any data ordering. Memory-aware disk spill kicks in when RSS approaches the pipeline's `memory_limit`.
 
+## Correlation-key opt-out: `relaxed_correlation_key`
+
+By default, an aggregate downstream of a pipeline with `error_handling.correlation_key` must include every correlation-key field in `group_by` (compile error `E151` otherwise). Set `relaxed_correlation_key: true` to bypass that requirement and let one correlation group span multiple aggregate groups:
+
+```yaml
+error_handling:
+  correlation_key: order_id
+
+- type: aggregate
+  name: dept_totals
+  input: validate
+  config:
+    group_by: [department]               # omits order_id
+    relaxed_correlation_key: true        # bypass E151
+    cxl: |
+      emit total = sum(amount)
+```
+
+This is purely additive: pipelines without the field keep today's strict semantics. The opt-in is incompatible with `strategy: streaming` -- the combination is rejected with `E15Y` because streaming aggregates emit at group-boundary close, before the terminal correlation commit, and that defeats the rollback window the relaxed path needs. See [Correlation Keys](correlation-keys.md#aggregate-interaction) for the full lattice rules.
+
 ## Complete example
 
 ```yaml

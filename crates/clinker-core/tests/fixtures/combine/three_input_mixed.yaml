@@ -51,6 +51,7 @@ nodes:
         emit start = b.start
         emit fin = b.fin
         emit window_id = c.window_id
+      propagate_ck: driver
   - type: output
     name: joined_mixed_out
     input: joined_mixed

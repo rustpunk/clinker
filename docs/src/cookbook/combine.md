@@ -73,6 +73,7 @@ nodes:
         emit quantity = orders.quantity
         emit unit_price = orders.unit_price
         emit line_total = orders.quantity.to_float() * orders.unit_price
+      propagate_ck: driver
 
   - type: output
     name: result
@@ -116,6 +117,7 @@ A combine node declares every input in its `input:` map, binding each upstream s
     products: products
   config:
     where: "orders.product_id == products.product_id"
+    propagate_ck: driver
 ```
 
 The `config:` block carries four fields that shape behavior:
@@ -153,6 +155,7 @@ Emit one output row for every matching build-side record. This is 1:N fan-out --
     cxl: |
       emit employee_id = employees.employee_id
       emit benefit = benefits.benefit_name
+    propagate_ck: driver
 ```
 
 An employee in a department with three benefits produces three output records.
@@ -171,6 +174,7 @@ Gather every matching build-side record into a single Array-typed field on the o
     where: "orders.product_id == products.product_id"
     match: collect
     cxl: ""
+    propagate_ck: driver
 ```
 
 Use `collect` when you need the set of matches as a single structured value (e.g. every price history row for an order). Use `all` when you need one flat row per match.
@@ -218,6 +222,7 @@ Chain multiple equalities with `and` to combine on more than one field. Each con
       emit region = sales.region
       emit actual = sales.amount
       emit goal = targets.goal
+    propagate_ck: driver
 ```
 
 Both equalities must hold for a record pair to match.
@@ -242,6 +247,7 @@ The `where` clause can mix equi predicates with additional filter conjuncts. Non
       emit order_id = orders.order_id
       emit product_name = products.product_name
       emit amount = orders.amount
+    propagate_ck: driver
 ```
 
 The equi conjunct drives the hash lookup; the `amount >= 100` conjunct is evaluated as a post-filter. At least one cross-input equality is required in every combine.
@@ -268,6 +274,7 @@ Combine accepts any number of inputs. Each pair of inputs that should be related
       emit product_name = products.product_name
       emit category_name = categories.name
       emit amount = orders.amount
+    propagate_ck: driver
 ```
 
 Input order in the `input:` map is preserved, and downstream reasoning treats the first input as the default driving side unless a `drive:` hint overrides it.
@@ -290,6 +297,7 @@ By default the planner picks a driving (probe) input and builds hash tables for 
       emit product_id = products.product_id
       emit product_name = products.product_name
       emit sample_order_id = orders.order_id
+    propagate_ck: driver
 ```
 
 With `drive: products`, the pipeline emits one row per product enriched with a matching order, instead of one row per order enriched with its product.

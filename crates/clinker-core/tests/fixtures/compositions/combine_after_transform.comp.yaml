@@ -47,3 +47,4 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
         emit doubled_quantity = orders.doubled_quantity
+      propagate_ck: driver

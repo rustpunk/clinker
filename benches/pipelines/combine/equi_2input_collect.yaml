@@ -47,6 +47,7 @@ nodes:
       match: collect
       on_miss: null_fields
       cxl: ""
+      propagate_ck: driver
 
   - type: output
     name: drivers_with_trips_out

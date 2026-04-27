@@ -39,6 +39,7 @@ nodes:
         emit amount = orders.amount
         emit bracket_id = tax_brackets.bracket_id
         emit rate = tax_brackets.rate
+      propagate_ck: driver
   - type: output
     name: bracketed_out
     input: bracketed

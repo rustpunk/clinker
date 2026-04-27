@@ -56,6 +56,7 @@ nodes:
         emit b_val = b.b_val
         emit c_val = c.c_val
         emit d_val = d.d_val
+      propagate_ck: driver
   - type: output
     name: joined4_out
     input: joined4

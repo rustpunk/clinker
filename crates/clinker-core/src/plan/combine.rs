@@ -1736,6 +1736,7 @@ pub(crate) fn decompose_nary_combines(
             match_mode: original_match_mode,
             on_miss: original_on_miss,
             output_schema: original_output_schema,
+            propagate_ck: original_propagate_ck,
             ..
         } = plan.graph[original_idx].clone()
         else {
@@ -1890,6 +1891,7 @@ pub(crate) fn decompose_nary_combines(
                         predicate_summary,
                         match_mode: MatchMode::All,
                         on_miss: OnMiss::Skip,
+                        propagate_ck: original_propagate_ck.clone(),
                         decomposed_from: Some(original_name.clone()),
                         output_schema: Arc::clone(&step_output_schema),
                         resolved_column_map: Arc::clone(&step_resolved_map),
@@ -2298,6 +2300,7 @@ mod tests {
             predicate_summary,
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
+            propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
@@ -2462,7 +2465,7 @@ mod tests {
         // is a compile-time regression gate for the variant addition; the
         // hard lookup-regression coverage is `cargo test --workspace`, which
         // re-runs every existing lookup fixture test on every invocation.
-        use crate::config::pipeline_node::{MatchMode, OnMiss};
+        use crate::config::pipeline_node::{MatchMode, OnMiss, PropagateCkSpec};
         use crate::plan::execution::PlanNode;
         use crate::span::Span;
 
@@ -2475,6 +2478,7 @@ mod tests {
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
+            propagate_ck: PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
@@ -2608,6 +2612,7 @@ mod tests {
             ),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
+            propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),

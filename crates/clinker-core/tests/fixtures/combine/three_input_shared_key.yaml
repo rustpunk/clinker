@@ -54,6 +54,7 @@ nodes:
         emit product_name = products.name
         emit category_name = categories.category_name
         emit amount = orders.amount
+      propagate_ck: driver
   - type: output
     name: fully_enriched_out
     input: fully_enriched

@@ -34,6 +34,7 @@ nodes:
       where: "orders.product_id.nested == products.product_id"
       cxl: |
         emit order_id = orders.order_id
+      propagate_ck: driver
   - type: output
     name: three_part_out
     input: three_part

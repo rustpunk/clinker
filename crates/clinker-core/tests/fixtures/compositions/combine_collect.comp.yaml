@@ -31,3 +31,4 @@ nodes:
       match: collect
       on_miss: null_fields
       cxl: ""
+      propagate_ck: driver

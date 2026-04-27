@@ -25,6 +25,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit amount = orders.amount
+      propagate_ck: driver
   - type: output
     name: lonely_out
     input: lonely

@@ -44,6 +44,7 @@ nodes:
         emit driver_id = drivers.driver_id
         emit build_id = builds.build_id
         emit tag = builds.tag
+      propagate_ck: driver
   - type: output
     name: duplicate_match_out
     input: duplicate_match

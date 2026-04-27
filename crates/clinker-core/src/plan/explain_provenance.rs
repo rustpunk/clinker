@@ -217,6 +217,7 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E310" => Some(include_str!("../../../../docs/explain/E310.md")),
         "E311" => Some(include_str!("../../../../docs/explain/E311.md")),
         "E313" => Some(include_str!("../../../../docs/explain/E313.md")),
+        "E15Y" => Some(include_str!("../../../../docs/explain/E15Y.md")),
         "W101" => Some(include_str!("../../../../docs/explain/W101.md")),
         "W302" => Some(include_str!("../../../../docs/explain/W302.md")),
         "W305" => Some(include_str!("../../../../docs/explain/W305.md")),
@@ -312,8 +313,8 @@ mod tests {
     fn test_explain_docs_all_have_required_sections() {
         let codes = [
             "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E300", "E301", "E303",
-            "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311", "E313", "W101", "W302",
-            "W305", "W306",
+            "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311", "E313", "E15Y", "W101",
+            "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

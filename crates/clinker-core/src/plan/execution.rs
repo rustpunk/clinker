@@ -370,6 +370,13 @@ pub enum PlanNode {
         /// construction. `Some` iff resolved strategy is Streaming.
         #[serde(skip_serializing_if = "Option::is_none")]
         qualified_sort_order: Option<Vec<SortField>>,
+        /// Mirrors `AggregateBody.relaxed_correlation_key`. When `true`,
+        /// the strict E151 superset requirement is bypassed for this
+        /// aggregate and the per-node CK-set lattice intersects the
+        /// parent CK set with `group_by` (omitted CK fields disappear
+        /// from downstream visibility).
+        #[serde(default, skip_serializing_if = "is_false")]
+        relaxed_correlation_key: bool,
     },
     /// Composition call-site node. Lowered to `PlanNode::Composition` in
     /// Stage 5; body nodes live in `CompileArtifacts.composition_bodies`
@@ -449,6 +456,11 @@ pub enum PlanNode {
         predicate_summary: crate::plan::combine::CombinePredicateSummary,
         match_mode: crate::config::pipeline_node::MatchMode,
         on_miss: crate::config::pipeline_node::OnMiss,
+        /// Mirrors `CombineBody.propagate_ck`. Selects which correlation-key
+        /// fields the combine's output rows carry — driver-only, union of
+        /// all inputs, or an explicit named subset. Read by the per-node
+        /// CK-set lattice in `compute_one`.
+        propagate_ck: crate::config::pipeline_node::PropagateCkSpec,
         /// For synthetic binary combine nodes created by N-ary
         /// decomposition: name of the original N-ary combine node this
         /// was decomposed from. `None` for user-authored combine nodes.
@@ -2694,6 +2706,7 @@ impl ExecutionPlanDag {
     pub fn compute_node_properties(
         &mut self,
         inputs: &HashMap<String, SourceConfig>,
+        correlation_key_fields: &[String],
     ) -> Result<(), PipelineError> {
         assert!(
             self.node_properties.is_empty(),
@@ -2708,7 +2721,7 @@ impl ExecutionPlanDag {
                     .neighbors_directed(idx, petgraph::Direction::Incoming)
                     .filter_map(|p| self.node_properties.get(&p))
                     .collect();
-                compute_one(&self.graph[idx], &parents, inputs)
+                compute_one(&self.graph[idx], &parents, inputs, correlation_key_fields)
             };
             self.node_properties.insert(idx, props);
         }
@@ -2833,6 +2846,18 @@ impl ExecutionPlanDag {
                 *qualified_sort_order = resolved.qualified_sort_order.clone();
             }
 
+            // Preserve the CK set computed by `compute_one`. The post-pass
+            // overwrites ordering/partitioning to reflect the resolved
+            // strategy, but the CK lattice has already been computed and
+            // must survive the rewrite — the resolved strategy does not
+            // change which `$ck.<field>` columns this aggregate's output
+            // carries.
+            let preserved_ck_set = self
+                .node_properties
+                .get(&idx)
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+
             // Overwrite the side-table ordering for this aggregation node
             // (D77 — single source of truth for aggregation ordering).
             let new_props = match resolved.strategy {
@@ -2848,6 +2873,7 @@ impl ExecutionPlanDag {
                         kind: PartitioningKind::Single,
                         provenance: PartitioningProvenance::SingleStream,
                     },
+                    ck_set: preserved_ck_set.clone(),
                 },
                 AggregateStrategy::Hash => NodeProperties {
                     ordering: Ordering {
@@ -2861,6 +2887,7 @@ impl ExecutionPlanDag {
                         kind: PartitioningKind::Single,
                         provenance: PartitioningProvenance::SingleStream,
                     },
+                    ck_set: preserved_ck_set,
                 },
             };
             self.node_properties.insert(idx, new_props);
@@ -2891,6 +2918,7 @@ fn compute_one(
     node: &PlanNode,
     parents: &[&NodeProperties],
     inputs: &HashMap<String, SourceConfig>,
+    correlation_key_fields: &[String],
 ) -> NodeProperties {
     let single_stream_partitioning = || Partitioning {
         kind: PartitioningKind::Single,
@@ -2901,6 +2929,15 @@ fn compute_one(
             .first()
             .map(|p| p.partitioning.clone())
             .unwrap_or_else(single_stream_partitioning)
+    };
+    // Default lattice rule for nodes that do not transform CK visibility
+    // (Transform, Sort, Route, Output, Composition): preserve the first
+    // parent's CK set, or empty when there is no parent.
+    let preserve_parent_ck_set = || {
+        parents
+            .first()
+            .map(|p| p.ck_set.clone())
+            .unwrap_or_default()
     };
 
     match node {
@@ -2916,12 +2953,17 @@ fn compute_one(
             } else {
                 OrderingProvenance::NoOrdering
             };
+            // Source observes every pipeline-level CK field — they are
+            // shadow-stamped at ingest, so the column set is uniform
+            // across all sources.
+            let ck_set: BTreeSet<String> = correlation_key_fields.iter().cloned().collect();
             NodeProperties {
                 ordering: Ordering {
                     sort_order,
                     provenance,
                 },
                 partitioning: single_stream_partitioning(),
+                ck_set,
             }
         }
 
@@ -2935,6 +2977,7 @@ fn compute_one(
                 },
             },
             partitioning: parent_partitioning(),
+            ck_set: preserve_parent_ck_set(),
         },
 
         PlanNode::Transform {
@@ -2944,6 +2987,7 @@ fn compute_one(
             ..
         } => {
             let partitioning = parent_partitioning();
+            let ck_set = preserve_parent_ck_set();
 
             // Distinct destroys ordering unconditionally.
             if *has_distinct {
@@ -2956,6 +3000,7 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 };
             }
 
@@ -2971,6 +3016,7 @@ fn compute_one(
                             .unwrap_or(OrderingProvenance::NoOrdering),
                     },
                     partitioning,
+                    ck_set,
                 };
             };
 
@@ -2991,6 +3037,7 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 }
             } else {
                 NodeProperties {
@@ -3004,6 +3051,7 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 }
             }
         }
@@ -3029,6 +3077,7 @@ fn compute_one(
                     provenance,
                 },
                 partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
             }
         }
 
@@ -3048,6 +3097,20 @@ fn compute_one(
             } else {
                 parents[0].partitioning.clone()
             };
+            // Intersect CK sets across all parents: a CK column is visible
+            // post-merge only when every parent stream still carries it.
+            // If a sibling branch has already passed through a relaxed
+            // Aggregate that dropped a CK field, the smaller visible set
+            // wins downstream.
+            let ck_set: BTreeSet<String> = {
+                let mut iter = parents.iter().map(|p| p.ck_set.clone());
+                match iter.next() {
+                    Some(first) => iter.fold(first, |acc, next| {
+                        acc.intersection(&next).cloned().collect()
+                    }),
+                    None => BTreeSet::new(),
+                }
+            };
             if all_match {
                 let provenance = if first_so.is_some() {
                     OrderingProvenance::Preserved {
@@ -3062,6 +3125,7 @@ fn compute_one(
                         provenance,
                     },
                     partitioning,
+                    ck_set,
                 }
             } else {
                 NodeProperties {
@@ -3077,11 +3141,16 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 }
             }
         }
 
-        PlanNode::Aggregation { .. } => {
+        PlanNode::Aggregation {
+            config,
+            relaxed_correlation_key,
+            ..
+        } => {
             // Aggregation node ordering is the sole responsibility of
             // the `select_aggregation_strategies` post-pass, which runs
             // immediately after `compute_node_properties` and overwrites
@@ -3090,19 +3159,42 @@ fn compute_one(
             // bypasses the post-pass produces conservative
             // (correct-but-suboptimal) downstream eligibility decisions
             // rather than silently asserting a false ordering.
+            //
+            // CK lattice rule:
+            //   - strict (default): preserves parent CK set unchanged
+            //     because E151 still requires `group_by ⊇ correlation_key`.
+            //   - relaxed: intersects parent CK set with `group_by`. Any
+            //     CK column the user dropped from `group_by` stops being
+            //     visible to downstream consumers because the aggregator
+            //     no longer projects it onto its output rows.
+            let parent_ck = preserve_parent_ck_set();
+            let ck_set: BTreeSet<String> = if *relaxed_correlation_key {
+                let group_by_set: BTreeSet<&str> =
+                    config.group_by.iter().map(String::as_str).collect();
+                parent_ck
+                    .into_iter()
+                    .filter(|f| group_by_set.contains(f.as_str()))
+                    .collect()
+            } else {
+                parent_ck
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
                     provenance: OrderingProvenance::NoOrdering,
                 },
                 partitioning: single_stream_partitioning(),
+                ck_set,
             }
         }
 
         PlanNode::Output { name, .. } => {
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
-            // is non-None so explain chains through.
+            // is non-None so explain chains through. CK set is preserved at
+            // Output so the inclusion-flag interaction (writer-default
+            // strip vs `include_correlation_keys: true`) can consult the
+            // surviving CK columns.
             let parent = match parents.first() {
                 Some(p) => p,
                 None => return NodeProperties::unordered_single(),
@@ -3120,6 +3212,7 @@ fn compute_one(
                     provenance,
                 },
                 partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
             }
         }
 
@@ -3145,10 +3238,13 @@ fn compute_one(
                     provenance,
                 },
                 partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
             }
         }
 
-        PlanNode::Combine { name, .. } => {
+        PlanNode::Combine {
+            name, propagate_ck, ..
+        } => {
             // Combine always destroys parent ordering: hash-build/probe
             // (and IEJoin, grace hash) do not preserve driving-input
             // order. Emit `DestroyedByCombine { Proven }` so downstream
@@ -3156,6 +3252,31 @@ fn compute_one(
             // can chain through and suggest "add a sort step between
             // `{combine}` and `{consumer}`". Resolves Phase Combine
             // §OQ-6 and drill D12.
+            //
+            // CK lattice rule reads `propagate_ck`. The Combine
+            // post-pass `select_combine_strategies` runs AFTER
+            // `compute_node_properties`, so `driving_input` is empty
+            // here — declaration order (first parent = driver) is the
+            // fallback, which matches today's runtime driver-resolution
+            // behavior at dispatch.
+            use crate::config::pipeline_node::PropagateCkSpec;
+            let ck_set: BTreeSet<String> = match propagate_ck {
+                PropagateCkSpec::Driver => parents
+                    .first()
+                    .map(|p| p.ck_set.clone())
+                    .unwrap_or_default(),
+                PropagateCkSpec::All => parents
+                    .iter()
+                    .flat_map(|p| p.ck_set.iter().cloned())
+                    .collect(),
+                PropagateCkSpec::Named(names) => {
+                    let upstream_union: BTreeSet<String> = parents
+                        .iter()
+                        .flat_map(|p| p.ck_set.iter().cloned())
+                        .collect();
+                    names.intersection(&upstream_union).cloned().collect()
+                }
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
@@ -3165,6 +3286,7 @@ fn compute_one(
                     },
                 },
                 partitioning: single_stream_partitioning(),
+                ck_set,
             }
         }
 
@@ -3181,6 +3303,7 @@ fn compute_one(
                         provenance: OrderingProvenance::NoOrdering,
                     }),
                 partitioning: parent_partitioning(),
+                ck_set: preserve_parent_ck_set(),
             }
         }
     }

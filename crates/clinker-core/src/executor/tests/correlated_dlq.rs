@@ -843,6 +843,7 @@ nodes:
       emit employee_id = o.employee_id
       emit amount_int = o.amount_int
       emit dept = d.dept
+    propagate_ck: driver
 
 - type: output
   name: out
@@ -1018,6 +1019,7 @@ nodes:
       emit product_name = p.name
       emit category_name = c.category_name
       emit amount_int = o.amount_int
+    propagate_ck: driver
 
 - type: output
   name: out
@@ -1237,6 +1239,7 @@ nodes:
       emit amount_int = o.amount_int
       emit event_time = o.event_time
       emit session_start = s.session_start
+    propagate_ck: driver
 
 - type: output
   name: out

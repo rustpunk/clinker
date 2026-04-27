@@ -36,6 +36,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
         emit amount = orders.amount
+      propagate_ck: driver
   - type: transform
     name: upsize
     input: enriched

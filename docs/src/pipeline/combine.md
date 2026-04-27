@@ -20,6 +20,7 @@ Combine is distinct from merge: merge concatenates upstream branches that share 
       emit order_id = orders.order_id
       emit product_name = products.product_name
       emit amount = orders.amount
+    propagate_ck: driver
 ```
 
 Note the differences from other node types:
@@ -180,6 +181,7 @@ Combine accepts any number of inputs. Each pair of inputs that should be related
       emit product_name = products.product_name
       emit category_name = categories.name
       emit amount = orders.amount
+    propagate_ck: driver
 ```
 
 The planner builds a join tree by walking equalities pairwise and ordering the joins by selectivity.
@@ -259,6 +261,7 @@ nodes:
         emit product_name = products.product_name
         emit category = products.category
         emit amount = orders.amount
+      propagate_ck: driver
 
   - type: output
     name: result

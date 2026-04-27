@@ -33,6 +33,7 @@
 //!
 //! Per-variant body structs use the `*Body` family suffix.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -753,6 +754,22 @@ pub struct AggregateBody {
     pub cxl: CxlSource,
     #[serde(default)]
     pub strategy: crate::config::AggregateStrategyHint,
+    /// Opt out of the strict `group_by ⊇ correlation_key` requirement.
+    ///
+    /// When `false` (default), an Aggregate downstream of a pipeline-level
+    /// `error_handling.correlation_key` must list every correlation-key
+    /// field in `group_by` or compile fails with `E151`. When `true`, the
+    /// superset requirement is relaxed: a single correlation group may
+    /// span multiple aggregate groups, and the omitted CK fields stop
+    /// being visible to downstream consumers of this aggregate's output.
+    /// The `$ck.<field>` shadow columns themselves are still preserved
+    /// at ingest; the relaxation only affects the per-node CK-set
+    /// inference and the pipeline-level rollback shape.
+    ///
+    /// Additive opt-in: existing pipelines parse identically with this
+    /// field absent and keep today's strict semantics.
+    #[serde(default)]
+    pub relaxed_correlation_key: bool,
 }
 
 /// Route variant body. `conditions:` is an [`IndexMap`] so that branch
@@ -773,6 +790,34 @@ pub struct RouteBody {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MergeBody {}
+
+/// Selects which correlation-key columns a Combine's output records carry.
+///
+/// `Driver` keeps today's behavior — output rows inherit only the driver
+/// input's correlation identity. `All` widens the output to carry the
+/// union of CK columns from every input. `Named` selects an explicit
+/// subset of CK fields (used when only some upstream CK columns are
+/// meaningful at this combine boundary).
+///
+/// YAML serializations:
+/// - `propagate_ck: driver`
+/// - `propagate_ck: all`
+/// - `propagate_ck: { named: [order_id, customer_id] }`
+///
+/// `BTreeSet` for `Named` gives deterministic iteration order so the
+/// downstream lattice and `--explain` output are reproducible regardless
+/// of YAML key order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagateCkSpec {
+    /// Output rows inherit only the driver input's CK columns.
+    Driver,
+    /// Output rows carry the union of CK columns across all inputs.
+    All,
+    /// Output rows carry exactly the named CK fields, intersected with
+    /// what's actually present upstream.
+    Named(BTreeSet<String>),
+}
 
 /// Combine variant body. N-ary record combining with mixed predicates.
 ///
@@ -806,6 +851,11 @@ pub struct CombineBody {
     /// strategy instead. Mirrors `AggregateConfig::strategy`.
     #[serde(default)]
     pub strategy: crate::config::CombineStrategyHint,
+    /// Selects which correlation-key columns this combine's output rows
+    /// carry — driver-only, union of all inputs, or an explicit named
+    /// subset. Required field with no default: every existing combine
+    /// migrates to an explicit value at field introduction.
+    pub propagate_ck: PropagateCkSpec,
 }
 
 /// Output variant body. Wraps the existing sink config.
@@ -1190,6 +1240,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit product_name = products.name
+      propagate_ck: driver
 "#;
         let doc: PipelineConfig =
             crate::yaml::from_str(yaml).expect("two-input combine should parse");
@@ -1257,6 +1308,7 @@ nodes:
       where: "orders.product_id == products.product_id and products.product_id == categories.product_id"
       cxl: |
         emit order_id = orders.order_id
+      propagate_ck: driver
 "#;
         let doc: PipelineConfig =
             crate::yaml::from_str(yaml).expect("three-input combine should parse");
@@ -1305,6 +1357,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit products_list = products
+      propagate_ck: driver
 "#;
         let doc: PipelineConfig = crate::yaml::from_str(yaml).expect("match: collect should parse");
         let (_header, body) = parse_and_find_combine(&doc, "collected");
@@ -1344,6 +1397,7 @@ nodes:
       drive: products
       cxl: |
         emit product_id = products.product_id
+      propagate_ck: driver
 "#;
         let doc: PipelineConfig = crate::yaml::from_str(yaml).expect("drive: should parse");
         let (_header, body) = parse_and_find_combine(&doc, "product_driven");
@@ -1382,6 +1436,7 @@ nodes:
             cxl: CxlSource::unspanned("emit id = a.id"),
             drive: None,
             strategy: crate::config::CombineStrategyHint::Auto,
+            propagate_ck: PropagateCkSpec::Driver,
         };
         let node = PipelineNode::Combine {
             header,

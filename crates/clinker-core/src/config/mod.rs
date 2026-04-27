@@ -1742,7 +1742,13 @@ impl PipelineConfig {
             }
         };
         crate::plan::execution::assign_tiers(&mut dag.graph, &dag.topo_order);
-        if let Err(e) = dag.compute_node_properties(&inputs_map) {
+        let correlation_key_fields: Vec<String> = self
+            .error_handling
+            .correlation_key
+            .as_ref()
+            .map(|ck| ck.fields().into_iter().map(String::from).collect())
+            .unwrap_or_default();
+        if let Err(e) = dag.compute_node_properties(&inputs_map, &correlation_key_fields) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("node property derivation failed: {e}"),
@@ -1750,6 +1756,46 @@ impl PipelineConfig {
             ));
             return Err(diags);
         }
+
+        // E15Y: relaxed_correlation_key + streaming aggregator strategy
+        // is rejected at compile time. Streaming aggregates emit at
+        // group-boundary close, before the terminal CorrelationCommit,
+        // which defeats the rollback window the relaxed opt-in needs.
+        // Runs before `select_aggregation_strategies` so the post-pass's
+        // generic "explicit Streaming on ineligible input" diagnostic
+        // does not preempt the more specific E15Y message.
+        let mut e15y_present = false;
+        for node in dag.graph.node_weights() {
+            if let crate::plan::execution::PlanNode::Aggregation {
+                name,
+                config,
+                relaxed_correlation_key: true,
+                ..
+            } = node
+                && matches!(
+                    config.strategy,
+                    crate::config::AggregateStrategyHint::Streaming
+                )
+            {
+                diags.push(Diagnostic::error(
+                    "E15Y",
+                    format!(
+                        "E15Y aggregate '{}' opted into relaxed_correlation_key but \
+                         its strategy is `streaming`. Streaming aggregates emit per \
+                         group-boundary close, before correlation-commit, which \
+                         defeats the rollback window. Use `strategy: hash` (the \
+                         default) or remove `relaxed_correlation_key`.",
+                        name
+                    ),
+                    LabeledSpan::primary(node.span(), String::new()),
+                ));
+                e15y_present = true;
+            }
+        }
+        if e15y_present {
+            return Err(diags);
+        }
+
         // Aggregation-strategy post-pass: resolves the user `strategy`
         // hint on each `PlanNode::Aggregation` against upstream
         // `OrderingProvenance` and rewrites the node's stored ordering
@@ -1863,8 +1909,21 @@ impl PipelineConfig {
             if let Some(ck) = self.error_handling.correlation_key.as_ref() {
                 let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
                 for node in dag.graph.node_weights() {
-                    if let crate::plan::execution::PlanNode::Aggregation { name, config, .. } = node
+                    if let crate::plan::execution::PlanNode::Aggregation {
+                        name,
+                        config,
+                        relaxed_correlation_key,
+                        ..
+                    } = node
                     {
+                        // Relaxed-E151 opt-in bypasses the strict superset
+                        // requirement; the per-node CK-set lattice
+                        // intersects parent CK with `group_by` instead.
+                        // E15Y (relaxed + streaming) is checked earlier in
+                        // compile, before `select_aggregation_strategies`.
+                        if *relaxed_correlation_key {
+                            continue;
+                        }
                         let group_by: Vec<&str> =
                             config.group_by.iter().map(|s| s.as_str()).collect();
                         let missing: Vec<String> = key_fields
@@ -2328,6 +2387,7 @@ pub(crate) fn lower_node_to_plan_node(
                 fallback_reason: None,
                 skipped_streaming_available: false,
                 qualified_sort_order: None,
+                relaxed_correlation_key: agg_body.relaxed_correlation_key,
             })
         }
         // Combine lowers to PlanNode::Combine. Inline fields here are
@@ -2368,6 +2428,7 @@ pub(crate) fn lower_node_to_plan_node(
                 predicate_summary,
                 match_mode: config.match_mode,
                 on_miss: config.on_miss,
+                propagate_ck: config.propagate_ck.clone(),
                 decomposed_from: None,
                 output_schema: schema_from_bound(name),
                 resolved_column_map,
