@@ -1,6 +1,8 @@
 # Merge Nodes
 
-Merge nodes combine multiple upstream branches into a single stream. They are the counterpart to route nodes -- where a route splits one stream into many, a merge joins many streams back into one.
+Merge nodes concatenate multiple upstream branches into a single stream. They are the counterpart to route nodes -- where a route splits one stream into many, a merge joins many streams back into one.
+
+Merge is for streamwise concatenation of inputs that share a schema. For record-level joining across inputs that have different schemas, see [Combine Nodes](combine.md).
 
 ## Basic structure
 

@@ -117,6 +117,8 @@ For compound keys:
 
 This is useful for transactional data where partial processing of a group is worse than rejecting the entire group. For example, if one line item in an order fails validation, you may want to reject the entire order.
 
+For the full lifecycle and per-operator semantics (route, merge, aggregate, combine), see [Correlation Keys](correlation-keys.md).
+
 ### Max group buffer
 
 Limit the number of records buffered per correlation group:
