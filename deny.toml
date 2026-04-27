@@ -7,17 +7,14 @@
 multiple-versions = "warn"
 deny = [
     # Ban cmake — enforces pure Rust compilation
-    # Note: cc is allowed via skip (Dioxus/GTK transitive build dep)
     { name = "cmake" },
 ]
-# Allow pure Rust FFI crates and Dioxus build deps
+# Tolerate duplicate versions of Dioxus desktop's Windows binding crates
+# (multiple windows-sys / windows-targets versions are common in transitive
+# graphs that pull in different Dioxus subcrates).
 skip = [
-    { name = "libc" },
-    { name = "linux-raw-sys" },
-    { name = "mach2" },
     { name = "windows-sys" },
     { name = "windows-targets" },
-    { name = "cc" },
 ]
 
 [licenses]
@@ -32,19 +29,17 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
 ]
 
 [advisories]
 yanked = "deny"
 unmaintained = "all"
-# Dioxus desktop transitive deps: GTK3 bindings, instant, proc-macro-error
-# RUSTSEC-2026-0098/0099/0104: rustls-webpki advisories (name-constraints +
-# CRL parsing panic) reaching us transitively through dioxus-devtools →
-# tungstenite → rustls-webpki. Patched rustls-webpki not yet adopted by
-# tungstenite 0.28; tracked upstream. Clinker does not perform certificate-name-
-# constraint validation or CRL parsing directly.
+# Dioxus desktop transitive deps: GTK3 bindings, instant, proc-macro-error.
+# RUSTSEC-2026-0104: rustls-webpki CRL-parsing-panic advisory reaching us
+# transitively through dioxus-devtools → tungstenite → rustls-webpki. Patched
+# rustls-webpki not yet adopted by tungstenite 0.28; tracked upstream. Clinker
+# does not perform CRL parsing directly.
 ignore = [
     "RUSTSEC-2024-0370",
     "RUSTSEC-2024-0384",
@@ -58,7 +53,5 @@ ignore = [
     "RUSTSEC-2024-0419",
     "RUSTSEC-2024-0420",
     "RUSTSEC-2025-0057",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
 ]
