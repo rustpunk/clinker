@@ -1,0 +1,33 @@
+# Diagnostic-provenance fixture: a body-internal combine whose
+# `where:` predicate is non-Bool (`a.x + b.x` evaluates to int).
+# bind_combine is expected to emit E303 with a primary span that
+# points at the body file's combine line, NOT at the parent
+# pipeline's composition call-site line. Inner-error provenance is
+# load-bearing for users editing the body file directly: a span
+# pointing at the call site would scroll their editor to the wrong
+# file.
+_compose:
+  name: combine_bad_predicate
+  inputs:
+    a:
+      schema:
+        - { name: x, type: int }
+    b:
+      schema:
+        - { name: x, type: int }
+  outputs:
+    out: bad_join
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: bad_join
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x + b.x"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit x = a.x

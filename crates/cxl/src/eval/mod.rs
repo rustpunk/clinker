@@ -8,7 +8,7 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use clinker_record::{GroupByKey, GroupKeyError, Record, Value, value_to_group_key};
+use clinker_record::{GroupByKey, GroupKeyError, Value, value_to_group_key};
 
 use crate::ast::{BinOp, Expr, LiteralValue, Statement, UnaryOp};
 use crate::lexer::Span;
@@ -22,19 +22,12 @@ pub use error::{EvalError, EvalErrorKind};
 ///
 /// Returned by `ProgramEvaluator::eval_record()` and consumed by
 /// the executor to decide whether to emit, skip, or route a record.
-///
-/// Option-W positional layout: `values` is sized to and positionally
-/// aligned with the producing node's `OutputLayout::schema`. Callers
-/// materialize records via `Record::new(layout.schema.clone(), values)`.
-/// There is no name-keyed emitted map — the OutputLayout is the single
-/// oracle for "which columns are CXL-named".
 #[derive(Debug)]
 pub enum EvalResult {
     /// Record passed all filters and distinct checks — emit to output.
-    /// `values` = full positional output row (passthroughs + emits).
-    /// `metadata` = `$meta.*` writes (genuinely sparse per-record state).
+    /// `fields` = output field values, `metadata` = `$meta.*` writes.
     Emit {
-        values: Vec<Value>,
+        fields: indexmap::IndexMap<String, Value>,
         metadata: indexmap::IndexMap<String, Value>,
     },
     /// Record should be excluded from output.
@@ -42,11 +35,11 @@ pub enum EvalResult {
 }
 
 impl EvalResult {
-    /// Convenience: unwrap the positional values vector (panics on Skip).
-    pub fn into_values(self) -> Vec<Value> {
+    /// Convenience: unwrap the emitted fields (panics on Skip).
+    pub fn into_fields(self) -> indexmap::IndexMap<String, Value> {
         match self {
-            EvalResult::Emit { values, .. } => values,
-            EvalResult::Skip(_) => panic!("called into_values on Skip"),
+            EvalResult::Emit { fields, .. } => fields,
+            EvalResult::Skip(_) => panic!("called into_fields on Skip"),
         }
     }
 }
@@ -123,43 +116,17 @@ impl ProgramEvaluator {
     }
 
     /// Evaluate a record through the full program, returning Emit or Skip.
-    ///
-    /// `input` provides the positional source for `OutputLayout::passthroughs`
-    /// — its `values()` slice must be positionally aligned with the upstream
-    /// node's bound output schema (which is what the layout was computed
-    /// against). `resolver` provides name-keyed field lookups for CXL
-    /// expressions (`FieldRef`, `QualifiedFieldRef`, etc.); in the common
-    /// case this is the same object as `input`, but lookup paths pass a
-    /// composite `LookupResolver`.
-    ///
-    /// On `Emit`, returns `values: Vec<Value>` sized to
-    /// `layout.schema.column_count()`, with passthroughs copied and emits
-    /// written into their planner-allocated slots. Callers materialize
-    /// `Record::new(layout.schema.clone(), values)` directly.
     pub fn eval_record<'w, S: RecordStorage + 'w>(
         &mut self,
         ctx: &EvalContext<'_>,
-        input: &Record,
         resolver: &dyn FieldResolver,
         window: Option<&dyn WindowContext<'w, S>>,
     ) -> Result<EvalResult, EvalError> {
-        let layout = Arc::clone(&self.typed.output_layout);
         let mut env: HashMap<String, Value> = HashMap::new();
-        let mut values: Vec<Value> = vec![Value::Null; layout.schema.column_count()];
+        let mut output = indexmap::IndexMap::new();
         let mut meta_output = indexmap::IndexMap::new();
 
-        // Apply plan-time passthroughs positionally. `input.values()` is
-        // aligned to the upstream node's bound output schema; the layout
-        // tells us where each upstream column lands in this node's output.
-        for &(src, dst) in &layout.passthroughs {
-            let src = src as usize;
-            let dst = dst as usize;
-            if let Some(v) = input.values().get(src) {
-                values[dst] = v.clone();
-            }
-        }
-
-        for (stmt_idx, stmt) in self.typed.program.statements.iter().enumerate() {
+        for stmt in &self.typed.program.statements {
             match stmt {
                 Statement::Filter { predicate, .. } => {
                     let val = eval_expr(
@@ -201,14 +168,7 @@ impl ProgramEvaluator {
                     if *is_meta {
                         meta_output.insert(name.to_string(), val);
                     } else {
-                        // Plan-time slot — no name lookup at runtime.
-                        let slot = layout.emit_slots[stmt_idx].unwrap_or_else(|| {
-                            panic!(
-                                "OutputLayout: non-meta Emit {:?} at stmt {} has no slot",
-                                name, stmt_idx
-                            )
-                        });
-                        values[slot as usize] = val;
+                        output.insert(name.to_string(), val);
                     }
                 }
                 Statement::Trace {
@@ -275,7 +235,7 @@ impl ProgramEvaluator {
             }
         }
         Ok(EvalResult::Emit {
-            values,
+            fields: output,
             metadata: meta_output,
         })
     }
@@ -289,13 +249,16 @@ impl ProgramEvaluator {
     ) -> Result<Vec<GroupByKey>, EvalError> {
         match field {
             Some(name) => {
-                // Resolve from let-bindings first, then input fields
-                let val = env
-                    .get(name)
-                    .cloned()
-                    .or_else(|| resolver.resolve(name))
-                    .unwrap_or(Value::Null);
-                match value_to_group_key(&val, name, None, 0) {
+                // Resolve from let-bindings first, then input fields.
+                // `value_to_group_key` takes `&Value`, so the env and
+                // resolver hits can feed it by borrow without cloning;
+                // the null fallback hands out a reference to the
+                // shared `clinker_record::NULL` sentinel.
+                let val: &Value = match env.get(name) {
+                    Some(v) => v,
+                    None => resolver.resolve(name).unwrap_or(&clinker_record::NULL),
+                };
+                match value_to_group_key(val, name, None, 0) {
                     Ok(Some(gk)) => Ok(vec![gk]),
                     Ok(None) => Ok(vec![GroupByKey::Null]),
                     Err(e) => Err(group_key_error_to_eval_error(e)),
@@ -305,7 +268,7 @@ impl ProgramEvaluator {
                 // Bare distinct — hash all input fields
                 let mut key = Vec::new();
                 for (name, val) in resolver.iter_fields() {
-                    match value_to_group_key(&val, &name, None, 0) {
+                    match value_to_group_key(val, name, None, 0) {
                         Ok(Some(gk)) => key.push(gk),
                         Ok(None) => key.push(GroupByKey::Null),
                         Err(e) => return Err(group_key_error_to_eval_error(e)),
@@ -333,6 +296,90 @@ fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
     )
 }
 
+/// Evaluate a full CXL program against a record. Returns the output field map.
+pub fn eval_program<'w, S: RecordStorage + 'w>(
+    typed: &TypedProgram,
+    ctx: &EvalContext<'_>,
+    resolver: &dyn FieldResolver,
+    window: Option<&dyn WindowContext<'w, S>>,
+) -> Result<indexmap::IndexMap<String, Value>, EvalError> {
+    let mut env: HashMap<String, Value> = HashMap::new();
+    let mut output = indexmap::IndexMap::new();
+    let meta_state = indexmap::IndexMap::new();
+
+    for stmt in &typed.program.statements {
+        match stmt {
+            Statement::Let { name, expr, .. } => {
+                let val = eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
+                env.insert(name.to_string(), val);
+            }
+            Statement::Emit { name, expr, .. } => {
+                let val = eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
+                output.insert(name.to_string(), val);
+            }
+            Statement::Trace {
+                level,
+                guard,
+                message,
+                ..
+            } => {
+                let should_trace = if let Some(g) = guard {
+                    matches!(
+                        eval_expr(g, typed, ctx, resolver, window, &env, &meta_state)?,
+                        Value::Bool(true)
+                    )
+                } else {
+                    true
+                };
+                if should_trace {
+                    let msg = eval_expr(message, typed, ctx, resolver, window, &env, &meta_state)?;
+                    let msg_str = match &msg {
+                        Value::String(s) => s.to_string(),
+                        other => format!("{:?}", other),
+                    };
+                    match level.unwrap_or(crate::ast::TraceLevel::Trace) {
+                        crate::ast::TraceLevel::Trace => tracing::trace!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Debug => tracing::debug!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Info => tracing::info!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Warn => tracing::warn!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                        crate::ast::TraceLevel::Error => tracing::error!(
+                            source_row = ctx.source_row,
+                            source_file = %ctx.source_file,
+                            "{}", msg_str
+                        ),
+                    }
+                }
+            }
+            Statement::UseStmt { .. } => {} // Module imports handled at compile time
+            Statement::ExprStmt { expr, .. } => {
+                eval_expr(expr, typed, ctx, resolver, window, &env, &meta_state)?;
+            }
+            Statement::Filter { .. } | Statement::Distinct { .. } => {
+                // Handled by ProgramEvaluator::eval_record(). eval_program()
+                // is the legacy path — these statements are no-ops here.
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 /// Evaluate a single expression.
 pub fn eval_expr<'w, S: RecordStorage + 'w>(
     expr: &Expr,
@@ -351,14 +398,19 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             if let Some(val) = env.get(&**name) {
                 return Ok(val.clone());
             }
-            // Then field resolver
-            Ok(resolver.resolve(name).unwrap_or(Value::Null))
+            // Then field resolver — clone only at the eval-site that
+            // keeps the value past the next resolve() call. Short-circuits
+            // inside coalesce / filter that borrow the return don't pay
+            // the clone (they're gone by the time the owned `Value` is
+            // constructed here).
+            Ok(resolver.resolve(name).cloned().unwrap_or(Value::Null))
         }
 
         Expr::QualifiedFieldRef { parts, .. } => {
             match parts.len() {
                 2 => Ok(resolver
                     .resolve_qualified(&parts[0], &parts[1])
+                    .cloned()
                     .unwrap_or(Value::Null)),
                 3 => {
                     // Three-part path: source.record_type.field
@@ -366,6 +418,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                     let compound = format!("{}.{}", &parts[0], &parts[1]);
                     Ok(resolver
                         .resolve_qualified(&compound, &parts[2])
+                        .cloned()
                         .unwrap_or(Value::Null))
                 }
                 _ => Ok(Value::Null),
@@ -384,6 +437,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             // Fall back to Record metadata (set by earlier transforms)
             Ok(resolver
                 .resolve(&format!("$meta.{field}"))
+                .cloned()
                 .unwrap_or(Value::Null))
         }
 
@@ -632,7 +686,7 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
 
         // Extractor-produced leaves. Reaching the row-level evaluator means a
         // post-extraction residual was evaluated without an aggregate scope —
-        // the aggregate finalize path has its own evaluator (Task 16.3.12).
+        // the aggregate finalize path has its own evaluator.
         Expr::AggSlot { span, .. } => Err(EvalError::new(
             EvalErrorKind::TypeMismatch {
                 expected: "row-level expression",

@@ -184,6 +184,37 @@ fn bench_metadata(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Widened-schema set + get ───────────────────────────────────────
+
+fn bench_widened_schema_set_get(c: &mut Criterion) {
+    let mut group = c.benchmark_group("widened_schema_set_get");
+    for extra_count in [1, 10, 50] {
+        // Widen the schema to include every extra field up front. After
+        // the overflow rip, every `Record::set` emit site writes to a
+        // known slot; the benchmark reflects the post-rip contract.
+        let mut cols: Vec<Box<str>> = (0..5).map(|i| format!("f{i}").into_boxed_str()).collect();
+        cols.extend((0..extra_count).map(|i| format!("extra_{i}").into_boxed_str()));
+        let schema = Arc::new(clinker_record::Schema::new(cols));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(extra_count),
+            &extra_count,
+            |b, &count| {
+                b.iter(|| {
+                    let mut record =
+                        Record::new(Arc::clone(&schema), vec![Value::Null; 5 + count as usize]);
+                    for i in 0..count {
+                        record.set(&format!("extra_{i}"), Value::Integer(i as i64));
+                    }
+                    if count > 0 {
+                        black_box(record.get(&format!("extra_{}", count - 1)));
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 // ── Batch record generation throughput ─────────────────────────────
 
 fn bench_factory_throughput(c: &mut Criterion) {
@@ -210,6 +241,7 @@ criterion_group!(
     bench_value_from_string,
     bench_schema_index,
     bench_metadata,
+    bench_widened_schema_set_get,
     bench_factory_throughput,
 );
 criterion_main!(benches);

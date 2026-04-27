@@ -28,6 +28,16 @@ By default, output nodes write only the fields explicitly emitted by upstream tr
 
 When `true`, fields that were not explicitly emitted by transforms but exist on the record are included in the output. Useful for pass-through pipelines where you want all original fields plus a few computed ones.
 
+### Include correlation-key shadow columns
+
+```yaml
+    include_correlation_keys: true    # Default: false
+```
+
+When the pipeline declares `error_handling.correlation_key: <field>`, the engine adds shadow columns named `$ck.<field>` to the schema. These shadow columns preserve correlation-group identity through transforms that may rewrite the user-declared field. They are an internal engine namespace and are stripped from output by default.
+
+Set `include_correlation_keys: true` to surface the shadow columns in the writer output -- typically for debugging correlation-group routing or auditing DLQ behavior. See [Correlation Keys](correlation-keys.md) for the full lifecycle.
+
 ### Field mapping
 
 Rename fields at output time without changing upstream CXL:

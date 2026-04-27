@@ -1,23 +1,26 @@
 pub mod stage_metrics;
 
-use std::collections::HashMap;
+pub mod combine;
+mod dispatch;
+mod schema_check;
+
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, Value};
+use clinker_record::{PipelineCounters, Record, RecordStorage, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
-use crate::config::{ErrorStrategy, OutputConfig, PipelineConfig};
+use crate::config::{OutputConfig, PipelineConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::{GroupByKey, SecondaryIndex, value_to_group_key};
 use crate::pipeline::memory::rss_bytes;
 use crate::pipeline::sort;
 use crate::pipeline::window_context::PartitionWindowContext;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
-use crate::projection::project_output_with_meta;
+use crate::plan::execution::ExecutionPlanDag;
 use clinker_format::counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig, HeaderCapturingCsvWriter};
@@ -40,13 +43,13 @@ use cxl::eval::{
 use cxl::typecheck::{Type, TypedProgram};
 use petgraph::Direction;
 
-/// Phase 16b Task 16b.7 — executor-internal transform spec.
+/// Executor-internal transform spec.
 ///
 /// Produced by walking `PipelineConfig::nodes` directly and matching on
-/// `PipelineNode::{Transform, Aggregate, Route}` variants. Replaces the
-/// deleted `TransformSpec` for executor read paths that still
-/// consume a flat Vec-of-transforms view. The fields are the superset
-/// that executor sites read from; see `build_transform_specs`.
+/// `PipelineNode::{Transform, Aggregate, Route}` variants. Used by
+/// executor read paths that still consume a flat Vec-of-transforms view.
+/// The fields are the superset that executor sites read from; see
+/// `build_transform_specs`.
 #[derive(Debug, Clone)]
 pub struct TransformSpec {
     pub name: String,
@@ -85,7 +88,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                 let upstreams: Vec<String> = header
                     .inputs
                     .iter()
-                    .map(|ni| match ni {
+                    .map(|spanned_ni| match &spanned_ni.value {
                         NodeInput::Single(s) => s.clone(),
                         NodeInput::Port { node, port } => format!("{node}.{port}"),
                     })
@@ -124,7 +127,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     aggregate: None,
                     local_window: body.analytic_window.clone(),
                     route: None,
-                    input: project_input(&header.input),
+                    input: project_input(&header.input.value),
                 });
             }
             PipelineNode::Aggregate {
@@ -141,7 +144,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                     }),
                     local_window: None,
                     route: None,
-                    input: project_input(&header.input),
+                    input: project_input(&header.input.value),
                 });
             }
             PipelineNode::Route {
@@ -166,7 +169,7 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
                         branches,
                         default: body.default.clone(),
                     }),
-                    input: project_input(&header.input),
+                    input: project_input(&header.input.value),
                 });
             }
             _ => {}
@@ -202,12 +205,10 @@ pub struct ExecutionReport {
     pub counters: PipelineCounters,
     /// Records that were routed to the dead-letter queue.
     pub dlq_entries: Vec<DlqEntry>,
-    /// Human-readable execution summary (e.g., "Streaming", "TwoPass", "SortedStreaming").
+    /// Human-readable execution summary (e.g., "Streaming", "TwoPass").
     pub execution_summary: String,
     /// Whether any transform required arena allocation (window functions).
     pub required_arena: bool,
-    /// Whether any transform required sorted input (correlation key).
-    pub required_sorted_input: bool,
     /// Peak process RSS observed across chunk boundaries. `None` only on
     /// platforms where RSS measurement is unavailable (e.g., FreeBSD).
     pub peak_rss_bytes: Option<u64>,
@@ -255,12 +256,12 @@ fn sum_cpu_io_totals(
 
 /// Dummy storage type for streaming (no-window) evaluation.
 /// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
-struct NullStorage;
+pub(crate) struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
         None
     }
     fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -288,111 +289,41 @@ impl CompiledTransform {
     }
 }
 
-/// One captured record at an Output node under deferred-write
-/// semantics. Used by `OutputSink::Captured` during correlation-key
-/// per-group walker invocation.
-pub(crate) struct CapturedRow {
-    pub record: Record,
-    pub row_num: u64,
-    pub metadata: IndexMap<String, Value>,
-}
-
-/// Output dispatch target for the DAG walker's Output arm.
-///
-/// `Streamed` is the default: records are projected through the
-/// predecessor's `OutputLayout` and written directly to the configured
-/// `Write + Send` writer. Ownership of the writer map is transferred
-/// into the walker.
-///
-/// `Captured` is used by the correlation-key pre-DAG driver
-/// (Option W Shortcut #2) to defer writes until the group's
-/// success/failure decision is known. The walker pushes raw (pre-
-/// projection) records into a per-output-name `Vec`; the caller
-/// inspects the captured records and decides whether to flush them
-/// through the real writers or demote them to collateral DLQ.
-///
-/// One parameter encodes the choice structurally. "If capture is set,
-/// writers should be empty" is NOT expressible as two separate
-/// parameters without a conventional invariant — hence the enum.
-pub(crate) enum OutputSink<'a> {
-    Streamed(HashMap<String, Box<dyn Write + Send>>),
-    Captured(&'a mut HashMap<String, Vec<CapturedRow>>),
-}
-
 /// Compiled route branch: a named CXL boolean condition evaluator.
-struct CompiledRouteBranch {
+pub(crate) struct CompiledRouteBranch {
     name: String,
     evaluator: ProgramEvaluator,
 }
 
 /// Compiled route configuration for multi-output dispatch.
-struct CompiledRoute {
+pub(crate) struct CompiledRoute {
     branches: Vec<CompiledRouteBranch>,
     default: String,
     mode: crate::config::RouteMode,
 }
 
-/// Composite resolver for route predicate evaluation: the record
-/// resolves bare `FieldRef`s positionally (via `Record: FieldResolver`)
-/// while accumulated per-record metadata resolves `$meta.*` lookups.
-///
-/// Why not set_meta on the record and use the record as a sole resolver?
-/// Accumulated metadata across a multi-transform chain can exceed
-/// `Record`'s 64-key cap; keeping metadata side-by-side avoids that bound.
-struct RouteResolver<'a> {
-    record: &'a Record,
-    metadata: &'a IndexMap<String, Value>,
-}
-
-impl clinker_record::FieldResolver for RouteResolver<'_> {
-    fn resolve(&self, name: &str) -> Option<Value> {
-        if let Some(meta_key) = name.strip_prefix("$meta.") {
-            return self.metadata.get(meta_key).cloned();
-        }
-        self.record.resolve(name)
-    }
-    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
-        self.record.resolve_qualified(source, field)
-    }
-    fn available_fields(&self) -> Vec<&str> {
-        self.record.available_fields()
-    }
-    fn iter_fields(&self) -> Vec<(String, Value)> {
-        self.record.iter_fields()
-    }
-}
-
 impl CompiledRoute {
-    /// Evaluate route conditions against a positional record plus
-    /// accumulated metadata.
-    ///
-    /// Under Option W, the record carries the upstream transform's
-    /// bound output schema — all passthroughs and emits are resolvable
-    /// positionally via `Record: FieldResolver`. Route predicates may
-    /// reference any column of that schema, not just CXL-emitted ones:
-    /// the "emitted vs passthrough" distinction that the per-record
-    /// emit map used to preserve is now a compile-time property of the
-    /// upstream node's `OutputLayout`, not a runtime field-set filter.
-    /// Strictly stronger semantics — matches the single-oracle mandate
-    /// of `RESEARCH-runtime-record-layout.md`.
+    /// Evaluate route conditions against the authoritative Record.
     ///
     /// Returns the list of output names the record should be dispatched to.
     /// In Exclusive mode: first matching branch (or default).
     /// In Inclusive mode: all matching branches (or default if none match).
-    fn evaluate(
+    ///
+    /// Branch predicates resolve field references through the Record's
+    /// own [`FieldResolver`] impl — schema + overflow for bare names,
+    /// `$meta.*` prefix stripping for per-record metadata. No parallel
+    /// bookkeeping map is required (Invariant 3).
+    pub(crate) fn evaluate(
         &mut self,
         record: &Record,
-        metadata: &IndexMap<String, Value>,
         ctx: &EvalContext,
     ) -> Result<Vec<String>, cxl::eval::EvalError> {
-        let resolver = RouteResolver { record, metadata };
-
         match self.mode {
             crate::config::RouteMode::Exclusive => {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
-                        .eval_record::<NullStorage>(ctx, record, &resolver, None)?
+                        .eval_record::<NullStorage>(ctx, record, None)?
                     {
                         EvalResult::Emit { .. } => return Ok(vec![branch.name.clone()]),
                         EvalResult::Skip(_) => continue,
@@ -405,7 +336,7 @@ impl CompiledRoute {
                 for branch in &mut self.branches {
                     match branch
                         .evaluator
-                        .eval_record::<NullStorage>(ctx, record, &resolver, None)?
+                        .eval_record::<NullStorage>(ctx, record, None)?
                     {
                         EvalResult::Emit { .. } => matched.push(branch.name.clone()),
                         EvalResult::Skip(_) => {}
@@ -433,8 +364,7 @@ pub struct DlqEntry {
     /// Route branch name if error occurred during or after routing.
     /// None for pre-routing errors.
     pub route: Option<String>,
-    /// `true` if this record's own evaluation caused the DLQ entry (root cause).
-    /// `false` if DLQ'd due to correlated group failure (collateral).
+    /// `true` if this record's own evaluation caused the DLQ entry.
     /// Serialized as `_cxl_dlq_trigger` column in DLQ CSV.
     pub trigger: bool,
 }
@@ -461,26 +391,28 @@ impl DlqEntry {
     }
 }
 
-/// Unified pipeline executor.
-///
-/// Option-W single dispatch path: reads source records, optionally
-/// builds an Arena + SecondaryIndex pair when `plan.required_arena()`
-/// is true, and walks the DAG in topological order. One code path for
-/// transforms, windowed transforms, aggregates, routes, merges, sorts,
-/// and outputs.
+/// Unified pipeline executor. Plan-driven branching:
+/// - Streaming (single-pass) when no window functions
+/// - TwoPass (arena + indices) when windows are present
 pub struct PipelineExecutor;
 
 impl PipelineExecutor {
-    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming public entry point.
+    /// `&CompiledPlan`-consuming public entry point.
     ///
     /// Accepts the typed `CompiledPlan` handle returned by
     /// [`crate::config::PipelineConfig::compile`] and forwards to
     /// [`Self::run_with_readers_writers`] using the plan's embedded
-    /// [`PipelineConfig`]. This is the forward-compatible entry point;
-    /// the legacy `&PipelineConfig`-consuming variant is retained
-    /// pending the full executor-internal cutover in a follow-up.
+    /// [`PipelineConfig`].
     ///
-    /// D3b compile-fail guarantee — `&PipelineConfig` is NOT accepted:
+    /// The primary (driving) source is the first source node in
+    /// declaration order (`config.source_configs().next()`). Callers
+    /// that need to drive the pipeline from a non-first declared
+    /// source must use
+    /// [`Self::run_plan_with_readers_writers_with_primary`] instead —
+    /// declaration-order-as-primary is a convenience of this wrapper,
+    /// not a contract of the executor itself.
+    ///
+    /// Compile-fail guarantee — `&PipelineConfig` is NOT accepted:
     ///
     /// ```compile_fail
     /// use clinker_core::executor::PipelineExecutor;
@@ -501,15 +433,46 @@ impl PipelineExecutor {
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), readers, writers, params)
+        let config = plan.config();
+        let primary_name = config
+            .source_configs()
+            .next()
+            .map(|s| s.name.clone())
+            .ok_or_else(|| {
+                PipelineError::Config(crate::config::ConfigError::Validation(
+                    "pipeline declares no source nodes; cannot infer primary driving input"
+                        .to_string(),
+                ))
+            })?;
+        Self::run_with_readers_writers(config, &primary_name, readers, writers, params)
     }
 
-    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` text entry.
+    /// Same as [`Self::run_plan_with_readers_writers`] but with an
+    /// explicit `primary` driving-source name. Use this when the
+    /// driving input is not the first-declared source — e.g., lookup
+    /// baselines that put the reference table earlier in YAML for
+    /// readability but drive the pipeline from the probe source.
+    ///
+    /// `primary` must match the `name` of one of the source nodes
+    /// declared in the pipeline config, and a reader for that name
+    /// must be present in `readers`. Violations surface as
+    /// `PipelineError::Config(ConfigError::Validation(..))`.
+    pub fn run_plan_with_readers_writers_with_primary(
+        plan: &crate::plan::CompiledPlan,
+        primary: &str,
+        readers: HashMap<String, Box<dyn Read + Send>>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
+        params: &PipelineRunParams,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers(plan.config(), primary, readers, writers, params)
+    }
+
+    /// `&CompiledPlan`-consuming `--explain` text entry.
     pub fn explain_plan(plan: &crate::plan::CompiledPlan) -> Result<String, PipelineError> {
         Self::explain(plan.config())
     }
 
-    /// Phase 16b Wave 4ab — `&CompiledPlan`-consuming `--explain` DAG entry.
+    /// `&CompiledPlan`-consuming `--explain` DAG entry.
     pub fn explain_plan_dag(
         plan: &crate::plan::CompiledPlan,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
@@ -522,20 +485,39 @@ impl PipelineExecutor {
     /// the pipeline config. For single-input/output pipelines, pass single-entry
     /// HashMaps.
     ///
+    /// `primary` is the name of the source node that drives the
+    /// pipeline: its reader is consumed as the streaming input, and
+    /// every other entry in `readers` feeds combine-node build sides.
+    /// Source declaration order in YAML is irrelevant — `primary` is
+    /// chosen explicitly. If `primary` does not match a declared source
+    /// name, or no reader is registered under that name, the function
+    /// returns `PipelineError::Config(ConfigError::Validation(..))`.
+    ///
     /// Returns an [`ExecutionReport`] containing record counts, DLQ entries,
     /// execution mode, peak RSS, and wall-clock start/finish timestamps.
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
+        primary: &str,
         mut readers: HashMap<String, Box<dyn Read + Send>>,
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
-        // Extract the primary reader from the registry
+        // Resolve the primary source config by name. The driving
+        // input is chosen explicitly via `primary` — declaration
+        // order in `config.source_configs()` plays no role.
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let input = &source_configs[0];
+        let primary_idx = source_configs
+            .iter()
+            .position(|s| s.name == primary)
+            .ok_or_else(|| {
+                PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                    "primary source '{primary}' is not declared in the pipeline config",
+                )))
+            })?;
+        let input = &source_configs[primary_idx];
         let reader = readers.remove(&input.name).ok_or_else(|| {
             PipelineError::Config(crate::config::ConfigError::Validation(format!(
                 "no reader registered for input '{}'",
@@ -550,30 +532,34 @@ impl PipelineExecutor {
         let schema = format_reader.schema()?;
         collector.record(reader_timer.finish(0, 0));
 
-        // Phase 16b Task 16b.9 — compile-time CXL typecheck.
-        // `config.compile()` drives the unified nodes: pipeline
-        // through stages 1-4 (topology/path validation), then the
-        // stage-4.5 `bind_schema` pass that typechecks every CXL
-        // body against the author-declared source schema and
-        // propagates emitted columns downstream. Type errors surface
-        // as E200 diagnostics here, BEFORE any file handle opens.
+        // Single canonical compile path.
+        //
+        // `PipelineConfig::compile(&ctx)` drives the unified nodes
+        // pipeline through stages 1-4 (topology/path validation),
+        // stage 4.4 (workspace composition scan), stage 4.5 (CXL
+        // typecheck via `bind_schema`), and stage 5 (per-variant
+        // lowering + full enrichment: source DAG / indices / output
+        // projections / parallelism / correlation-sort / enforcer-
+        // sort / node properties / aggregation-strategy / combine-
+        // strategy post-passes). The runtime `ExecutionPlanDag` comes
+        // straight off `validated_plan.dag()` — no re-compile.
+        //
+        // Aggregate lowering reads `group_by_indices` from
+        // `typed.field_types`, which `bind_schema` already keyed and
+        // ordered by the upstream node's bound `Row`. The author-
+        // declared superset never reaches the index resolver.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        // Phase 16b Task 16b.9: ALL CXL typechecking happens at
-        // `config.compile()` time via the `bind_schema` stage-4.5 pass.
-        // The runtime never re-typechecks; it pulls each transform's
-        // pre-typechecked `Arc<TypedProgram>` straight from the
-        // `CompiledPlan`'s artifacts map, keyed by node name. There is
-        // no second typecheck pass — `compile_transforms` is gone.
-        let _ = &schema;
-        let validated_plan = config
-            .compile(&crate::config::CompileContext::default())
-            .map_err(|diags| PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: diags.iter().map(|d| d.message.clone()).collect(),
-            })?;
+        let compile_ctx = crate::config::CompileContext::default();
+        let validated_plan =
+            config
+                .compile(&compile_ctx)
+                .map_err(|diags| PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: diags.iter().map(|d| d.message.clone()).collect(),
+                })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
-        let compiled_transforms: Vec<CompiledTransform> = resolved_transforms
+        let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
                 let typed = validated_plan
@@ -595,6 +581,35 @@ impl PipelineExecutor {
             })
             .collect::<Result<_, _>>()?;
 
+        // Extend with body transforms. Composition bodies' Transform
+        // / Aggregate nodes have their typed programs sitting in
+        // `artifacts.typed` under the body's node name. The body
+        // dispatcher arm looks up `transform_by_name` in the same
+        // table the top-level walker uses, so every executable body
+        // node has to be present here too. Skip names already
+        // present so the top-level entry wins on collision.
+        let mut existing_names: std::collections::HashSet<String> =
+            compiled_transforms.iter().map(|c| c.name.clone()).collect();
+        for body in validated_plan.artifacts().composition_bodies.values() {
+            for idx in body.graph.node_indices() {
+                let body_node = &body.graph[idx];
+                let n = body_node.name();
+                if matches!(
+                    body_node,
+                    crate::plan::execution::PlanNode::Transform { .. }
+                        | crate::plan::execution::PlanNode::Aggregation { .. }
+                ) && !existing_names.contains(n)
+                    && let Some(typed) = validated_plan.artifacts().typed.get(n)
+                {
+                    compiled_transforms.push(CompiledTransform {
+                        name: n.to_string(),
+                        typed: typed.clone(),
+                    });
+                    existing_names.insert(n.to_string());
+                }
+            }
+        }
+
         // Compile route conditions if any transform has a route config.
         // Collect all emitted field names for route condition resolution.
         let compiled_route = {
@@ -615,39 +630,100 @@ impl PipelineExecutor {
                             }
                         }
                     }
+                    // Combine nodes also emit fields via their `cxl:` body;
+                    // those typed programs live in `artifacts.typed` keyed
+                    // by combine node name (not in `compiled_transforms`,
+                    // which is transform-only). A route downstream of a
+                    // combine sees the combine's emits, so every emit in
+                    // every typed program that's NOT a transform must be
+                    // surfaced to the route resolver.
+                    let transform_names: std::collections::HashSet<&str> = compiled_transforms
+                        .iter()
+                        .map(|ct| ct.name.as_str())
+                        .collect();
+                    for (node_name, typed) in &validated_plan.artifacts().typed {
+                        if transform_names.contains(node_name.as_str()) {
+                            continue;
+                        }
+                        for stmt in &typed.program.statements {
+                            if let Statement::Emit { name, .. } = stmt
+                                && !emitted_fields.contains(&name.to_string())
+                            {
+                                emitted_fields.push(name.to_string());
+                            }
+                        }
+                    }
                     Some(Self::compile_route(rc, &emitted_fields)?)
                 }
                 None => None,
             }
         };
 
-        // Build ExecutionPlanDag to determine mode
-        let compiled_refs: Vec<(&str, &TypedProgram)> = compiled_transforms
-            .iter()
-            .map(|ct| (ct.name.as_str(), ct.typed.as_ref()))
-            .collect();
+        // Compile body Routes alongside the top-level singleton.
+        // The dispatcher's Route arm consults
+        // `compiled_routes_by_name` first; any name found here wins
+        // over the singleton, which keeps the long-standing
+        // single-top-level-Route path intact while letting body
+        // Routes carry their own conditions.
+        let mut compiled_routes_by_name: std::collections::HashMap<String, CompiledRoute> =
+            std::collections::HashMap::new();
+        for body in validated_plan.artifacts().composition_bodies.values() {
+            for (route_name, route_body) in &body.route_bodies {
+                // Build the body Route's RouteConfig from its parsed
+                // RouteBody. The condition resolver needs the field
+                // set — for body context the body's input port
+                // schema(s) plus everything emitted upstream within
+                // the body.
+                let conditions: Vec<crate::config::RouteBranch> = route_body
+                    .conditions
+                    .iter()
+                    .map(|(name, cxl)| crate::config::RouteBranch {
+                        name: name.clone(),
+                        condition: cxl.source.as_str().to_string(),
+                    })
+                    .collect();
+                let route_config = crate::config::RouteConfig {
+                    mode: route_body.mode,
+                    branches: conditions,
+                    default: route_body.default.clone(),
+                };
+                // Use the union of port column names + any emit on
+                // body upstream nodes. A union of declared body
+                // schemas is overinclusive but safe — branches'
+                // typecheck already passed at bind time, so resolver
+                // false-positives won't surface here.
+                let mut emitted_fields: Vec<String> = Vec::new();
+                for row in body.input_port_rows.values() {
+                    for qf in row.field_names() {
+                        let s = qf.name.to_string();
+                        if !emitted_fields.contains(&s) {
+                            emitted_fields.push(s);
+                        }
+                    }
+                }
+                for (n, typed) in &validated_plan.artifacts().typed {
+                    if !body.name_to_idx.contains_key(n.as_str()) {
+                        continue;
+                    }
+                    for stmt in &typed.program.statements {
+                        if let Statement::Emit { name: en, .. } = stmt {
+                            let s = en.to_string();
+                            if !emitted_fields.contains(&s) {
+                                emitted_fields.push(s);
+                            }
+                        }
+                    }
+                }
+                let cr = Self::compile_route(&route_config, &emitted_fields)?;
+                compiled_routes_by_name.insert(route_name.clone(), cr);
+            }
+        }
 
-        let runtime_input_schema: Vec<String> =
-            schema.columns().iter().map(|c| c.to_string()).collect();
-        let plan = ExecutionPlanDag::compile_with_bound_schemas(
-            config,
-            &compiled_refs,
-            Some(&validated_plan.artifacts().bound_schemas),
-            Some(&runtime_input_schema),
-            // Bind-time output_layouts map — the planner augments this
-            // with inheritance for synthesised nodes and stores the
-            // complete map on the DAG.
-            Some(&validated_plan.artifacts().output_layouts),
-        )
-        .map_err(|e| PipelineError::Compilation {
-            transform_name: String::new(),
-            messages: vec![e.to_string()],
-        })?;
+        let plan = validated_plan.dag();
         collector.record(compile_timer.finish(0, 0));
 
         let execution_summary = plan.execution_summary();
         let required_arena = plan.required_arena();
-        let required_sorted_input = plan.required_sorted_input();
 
         // Validate that all configured outputs have registered writers.
         for output in &output_configs {
@@ -661,45 +737,20 @@ impl PipelineExecutor {
             }
         }
 
-        // ── Build lookup tables for transforms with `lookup:` config ──
-        let lookup_tables = Self::build_lookup_tables(config, &mut readers, &source_configs)?;
-
-        // Option-W runtime layout: materialize each node's bound
-        // output `Arc<Schema>` from `bind_schema`'s `BoundSchemas` so
-        // every record produced at a node's output is positionally
-        // aligned to the schema that downstream positional consumers
-        // (aggregator `group_by_indices`, sort keys) resolve against.
-        let bound_output_schemas: HashMap<String, Arc<Schema>> = validated_plan
-            .artifacts()
-            .bound_schemas
-            .iter_outputs()
-            .filter_map(|(name, _row)| {
-                validated_plan
-                    .artifacts()
-                    .bound_schemas
-                    .schema_of(name)
-                    .map(|s| (name.to_string(), s))
-            })
-            .collect();
-
-        // Option W Amendment A7: per-plan-node `OutputLayout` map is
-        // authoritative on the DAG itself — populated at plan-compile
-        // time with synthesized-node inheritance already applied. No
-        // runtime derivation: read and consult.
-        let bound_output_layouts = &plan.output_layouts;
-
         let (counters, dlq_entries, peak_rss_bytes) = Self::execute_dag(
             config,
+            input,
             format_reader,
+            &mut readers,
+            &source_configs,
             writers,
             &compiled_transforms,
             compiled_route,
-            &plan,
+            compiled_routes_by_name,
+            plan,
+            validated_plan.artifacts(),
             params,
             &mut collector,
-            lookup_tables,
-            &bound_output_schemas,
-            bound_output_layouts,
         )?;
 
         let stages = collector.into_stages();
@@ -711,7 +762,6 @@ impl PipelineExecutor {
             dlq_entries,
             execution_summary,
             required_arena,
-            required_sorted_input,
             peak_rss_bytes,
             total_cpu_user_ns,
             total_cpu_sys_ns,
@@ -723,69 +773,127 @@ impl PipelineExecutor {
         })
     }
 
-    /// Option-W unified execute entry point — single DAG-driven dispatch.
+    /// Single DAG-driven execution entry point — replaces execute_streaming,
+    /// execute_two_pass, and execute_correlated_streaming.
     ///
-    /// Reads every record from the source, optionally builds an `Arena`
-    /// and `SecondaryIndex`es when `plan.required_arena()` is true, then
-    /// dispatches to the single DAG walker (`execute_dag_branching`) for
-    /// every pipeline shape — transforms, routes, merges, aggregates,
-    /// sorts, and windowed transforms. There is no longer a separate
-    /// chunk-based closed loop, no `has_branching` dispatch gate, and
-    /// no `requires_sorted_input` early-bailout: the unified walker
-    /// handles all of it.
-    ///
-    /// Rayon chunk-parallelism (previously gated by
-    /// `can_parallelize(plan)` in the arena path) has been removed.
-    /// Parallel re-entry via `ParallelismClass` annotations on DAG
-    /// nodes is explicit future work per
-    /// `RESEARCH-runtime-record-layout.md` Failure mode #7's "pool
-    /// later if measured" guardrail.
+    /// Walks the DAG in topological order and dispatches per-node based on
+    /// `NodeExecutionReqs`. Handles all three execution modes internally:
+    /// 1. RequiresArena → build Arena + indices first, then walk DAG with window context
+    /// 2. RequiresSortedInput → read all, sort, then walk DAG with group-boundary logic
+    /// 3. Streaming → read all, walk DAG with per-record evaluation
     ///
     /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
     #[allow(clippy::too_many_arguments)]
     fn execute_dag(
         config: &PipelineConfig,
+        input: &crate::config::SourceConfig,
         mut format_reader: Box<dyn FormatReader>,
+        readers: &mut HashMap<String, Box<dyn Read + Send>>,
+        source_configs: &[crate::config::SourceConfig],
         writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
-        mut compiled_route: Option<CompiledRoute>,
+        compiled_route: Option<CompiledRoute>,
+        compiled_routes_by_name: HashMap<String, CompiledRoute>,
         plan: &ExecutionPlanDag,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
         collector: &mut stage_metrics::StageCollector,
-        lookup_tables: HashMap<String, RuntimeLookup>,
-        bound_output_schemas: &HashMap<String, Arc<Schema>>,
-        bound_output_layouts: &HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let mut counters = PipelineCounters::default();
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
-        // Read every source record. Arena construction, when required,
-        // consumes the reader directly (it streams through the same
-        // reader with a field-projection filter); otherwise we collect
-        // into `all_records` here for the DAG walker.
-        let source_configs: Vec<_> = config.source_configs().cloned().collect();
-        let input = &source_configs[0];
+        let requires_arena = plan.required_arena();
 
-        #[allow(clippy::type_complexity)]
-        let (arena_opt, indices_opt, all_records): (
-            Option<Arc<Arena>>,
-            Option<Vec<SecondaryIndex>>,
-            Vec<(Record, u64)>,
-        ) = if plan.required_arena() {
+        // ── Phase 0: source materialization ──
+        // Drain the primary reader into `all_records` carrying the
+        // full source schema. Records flow through the dispatcher
+        // unchanged; the windowed Transform arm reads through arena
+        // (a projected columnar view) for `$window.*` lookups but
+        // the records themselves keep every source field for
+        // downstream transforms / outputs that reference them.
+        // `MetadataCapExceeded` is recoverable per-record (DLQ);
+        // every other reader error short-circuits.
+        let mut all_records: Vec<(Record, u64)> = Vec::new();
+        let mut row_num: u64 = 0;
+        loop {
+            match format_reader.next_record() {
+                Ok(Some(record)) => {
+                    row_num += 1;
+                    counters.total_count += 1;
+                    all_records.push((record, row_num));
+                }
+                Ok(None) => break,
+                Err(clinker_format::error::FormatError::MetadataCapExceeded {
+                    record,
+                    key,
+                    count,
+                }) => {
+                    row_num += 1;
+                    counters.total_count += 1;
+                    counters.dlq_count += 1;
+                    dlq_entries.push(DlqEntry {
+                        source_row: row_num,
+                        category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
+                        error_message: format!(
+                            "per-record metadata cap exceeded at key {key:?} (count={count})"
+                        ),
+                        original_record: record,
+                        stage: Some(DlqEntry::stage_source()),
+                        route: None,
+                        trigger: true,
+                    });
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        // Build arena + per-source secondary indices when the plan
+        // declares analytic windows. The arena projects each record
+        // to the windowed transforms' `arena_fields` set; the index
+        // partitions group-key → arena positions for the windowed
+        // Transform arm's partition lookup. Records remain
+        // full-schema in `all_records`; arena/indices are a side
+        // structure consulted only by `$window.*` evaluation.
+        let (arena_for_ctx, indices_for_ctx) = if requires_arena && !all_records.is_empty() {
             let arena_fields =
                 crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
             let memory_limit = parse_memory_limit(config);
             let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
-            let arena = Arena::build(
-                &mut *format_reader,
-                &arena_fields,
-                memory_limit,
-                params.shutdown_token.as_ref(),
-            )
-            .map_err(|e| PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![e.to_string()],
-            })?;
+
+            let source_schema = Arc::clone(all_records[0].0.schema());
+            let arena_schema: Arc<Schema> = arena_fields
+                .iter()
+                .map(|f| f.clone().into_boxed_str())
+                .collect::<SchemaBuilder>()
+                .build();
+            let field_indices: Vec<Option<usize>> = arena_fields
+                .iter()
+                .map(|f| source_schema.index(f))
+                .collect();
+            let mut bytes_used: usize = 0;
+            let mut minimal_records: Vec<clinker_record::MinimalRecord> =
+                Vec::with_capacity(all_records.len());
+            for (record, _) in &all_records {
+                let projected: Vec<Value> = field_indices
+                    .iter()
+                    .map(|idx| {
+                        idx.and_then(|i| record.values().get(i).cloned())
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                let minimal = clinker_record::MinimalRecord::new(projected);
+                bytes_used += crate::pipeline::arena::estimated_size(&minimal);
+                if bytes_used > memory_limit {
+                    return Err(PipelineError::Compilation {
+                        transform_name: String::new(),
+                        messages: vec![format!(
+                            "arena memory budget exceeded: {bytes_used} > {memory_limit}"
+                        )],
+                    });
+                }
+                minimal_records.push(minimal);
+            }
+            let arena = Arena::from_parts(arena_schema, minimal_records);
             let arena_len = arena.record_count() as u64;
             collector.record(arena_timer.finish(arena_len, arena_len));
 
@@ -818,7 +926,9 @@ impl PipelineExecutor {
                 indices.push(idx);
             }
 
-            // Sort partitions per spec, same as the former arena path.
+            // Sort partitions whose source is not already in the
+            // required order; the windowed Transform arm assumes
+            // partition slices are sorted by `IndexSpec.sort_by`.
             for (i, spec) in plan.indices_to_build.iter().enumerate() {
                 if !spec.already_sorted {
                     for partition in indices[i].groups.values_mut() {
@@ -829,324 +939,281 @@ impl PipelineExecutor {
                 }
             }
 
-            // Materialize arena records into Records aligned to the
-            // source's bound output schema (what the DAG walker feeds
-            // into the Source node arm).
-            let arena_schema = Arc::clone(arena.schema());
-            let record_count = arena.record_count();
-            let mut recs: Vec<(Record, u64)> = Vec::with_capacity(record_count as usize);
-            for pos in 0..record_count {
-                let values: Vec<Value> = arena_schema
-                    .columns()
-                    .iter()
-                    .map(|col| arena.resolve_field(pos, col).unwrap_or(Value::Null))
-                    .collect();
-                recs.push((
-                    Record::new(Arc::clone(&arena_schema), values),
-                    pos as u64 + 1,
-                ));
-            }
-            (Some(Arc::new(arena)), Some(indices), recs)
+            (Some(Arc::new(arena)), Some(Arc::new(indices)))
         } else {
-            let mut all_records: Vec<(Record, u64)> = Vec::new();
-            let mut row_num: u64 = 0;
-            while let Some(record) = format_reader.next_record()? {
-                row_num += 1;
-                counters.total_count += 1;
-                all_records.push((record, row_num));
-            }
-            (None, None, all_records)
+            (None, None)
         };
 
-        if plan.required_arena() {
-            counters.total_count = all_records.len() as u64;
+        // D12: a global-fold aggregate (group_by: []) must still emit one
+        // row over empty input, so we cannot early-return when the plan
+        // contains an Aggregation node — the DAG walk needs to fire the
+        // aggregator's empty-input special case.
+        if all_records.is_empty() && !plan.has_branching() {
+            return Ok((counters, dlq_entries, rss_bytes()));
         }
 
-        // Option W Shortcut #2: correlation-key atomic failure-domain
-        // batching. When `error_handling.correlation_key` is set, group
-        // source records by the key and invoke the walker PER GROUP
-        // with a Captured output sink. If any record in a group
-        // produces a DLQ entry, demote ALL captured records in that
-        // group to collateral DLQ (`trigger: false`); otherwise flush
-        // the captured records through the real writer.
+        // ── Pre-load combine build-side sources ──
+        // Every combine input whose upstream source is NOT the primary
+        // driving reader needs its records materialized before the DAG
+        // walk. `execute_dag_branching`'s `PlanNode::Source` arm consults
+        // this map first; primary-sourced entries fall back to
+        // `all_records`.
         //
-        // Combined with window/arena operations this combination is
-        // rejected at plan time (see `plan/execution.rs` E150
-        // diagnostic) — per-group Arena construction is documented
-        // follow-up work.
-        if let Some(corr_key) = config.error_handling.correlation_key.clone() {
-            return Self::execute_dag_with_correlation(
-                config,
-                all_records,
-                writers,
-                transforms,
-                compiled_route,
-                plan,
-                params,
-                counters,
-                dlq_entries,
-                collector,
-                &lookup_tables,
-                bound_output_schemas,
-                bound_output_layouts,
-                arena_opt.as_deref(),
-                indices_opt.as_deref(),
-                &corr_key,
-            );
+        // Scope: every source name referenced by `artifacts.combine_inputs`
+        // as a build-side upstream whose reader is still in the `readers`
+        // registry (primary was removed at function entry). Drained here
+        // so the readers are consumed exactly once.
+        //
+        // Body-context translation: `combine_input.upstream_name` is the
+        // raw value from the combine's `input:` map. For top-level
+        // combines that's a parent-scope source name. For combines
+        // inside a composition body that's a port name — resolved here
+        // by walking the live edge graph one composition layer at a
+        // time. Each step finds the parent scope's incoming edge to
+        // the current body's composition node tagged with the current
+        // port name, follows to the producer, and recurses if the
+        // producer is the parent body's own synthetic-port-source
+        // (i.e., the composition's input was itself a port in the
+        // enclosing scope). The walk terminates on a non-port producer
+        // and returns its name (typically a top-level Source). This
+        // keeps reader setup aligned with the dispatcher's port
+        // resolution: both consult the live edge graph, so any
+        // planner-pass rewrite that updates edges automatically flows
+        // through both paths without a parallel name snapshot.
+        //
+        // Two reverse lookups: combine-node-name → owning body, and
+        // body → (enclosing scope, composition NodeIndex in that scope).
+        // Top-level combines are absent from `combine_owning_body`;
+        // bodies whose composition node lives in the top-level pipeline
+        // have `parent_body_id = None` in `body_to_parent`.
+        use petgraph::Direction;
+        use petgraph::graph::NodeIndex;
+        use petgraph::visit::EdgeRef;
+        let mut combine_owning_body: HashMap<
+            &str,
+            crate::plan::composition_body::CompositionBodyId,
+        > = HashMap::new();
+        for (body_id, body) in &artifacts.composition_bodies {
+            for combine_name in body.name_to_idx.keys() {
+                if artifacts.combine_inputs.contains_key(combine_name) {
+                    combine_owning_body.insert(combine_name.as_str(), *body_id);
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct BodyParentScope {
+            parent_body_id: Option<crate::plan::composition_body::CompositionBodyId>,
+            composition_node_idx: NodeIndex,
+        }
+        let mut body_to_parent: HashMap<
+            crate::plan::composition_body::CompositionBodyId,
+            BodyParentScope,
+        > = HashMap::new();
+        for idx in plan.graph.node_indices() {
+            if let crate::plan::execution::PlanNode::Composition { body, .. } = &plan.graph[idx] {
+                body_to_parent.insert(
+                    *body,
+                    BodyParentScope {
+                        parent_body_id: None,
+                        composition_node_idx: idx,
+                    },
+                );
+            }
+        }
+        for (parent_id, parent_body) in &artifacts.composition_bodies {
+            for idx in parent_body.graph.node_indices() {
+                if let crate::plan::execution::PlanNode::Composition { body, .. } =
+                    &parent_body.graph[idx]
+                {
+                    body_to_parent.insert(
+                        *body,
+                        BodyParentScope {
+                            parent_body_id: Some(*parent_id),
+                            composition_node_idx: idx,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Edge-walk a body-context port reference to its terminal name
+        // in the topmost enclosing scope. At each step the current name
+        // must be a port in the current body (otherwise it's already
+        // body-internal, terminal). The corresponding parent scope's
+        // incoming edge to the body's composition node carries the port
+        // tag; the producer of that edge is either:
+        //   - the parent body's synthetic-port-source for one of its
+        //     own input ports → recurse one layer up, AND
+        //   - any other node → terminal (return its name).
+        // Distinguishes the synthetic-port-source case by exact
+        // NodeIndex match against the parent body's
+        // `port_name_to_node_idx`, not just by name, because port names
+        // can legally collide with body-internal node names.
+        let resolve_upstream = |start_body_id: crate::plan::composition_body::CompositionBodyId,
+                                start_name: &str|
+         -> String {
+            let mut current_body_id = start_body_id;
+            let mut current_name = start_name.to_string();
+            loop {
+                let Some(body) = artifacts.composition_bodies.get(&current_body_id) else {
+                    return current_name;
+                };
+                if !body.port_name_to_node_idx.contains_key(&current_name) {
+                    // Not a port in this body — body-internal node
+                    // name (Transform/Aggregate/Source declared in the
+                    // body); terminal.
+                    return current_name;
+                }
+                let Some(scope) = body_to_parent.get(&current_body_id).copied() else {
+                    return current_name;
+                };
+                let parent_graph = match scope.parent_body_id {
+                    None => &plan.graph,
+                    Some(pid) => match artifacts.composition_bodies.get(&pid) {
+                        Some(b) => &b.graph,
+                        None => return current_name,
+                    },
+                };
+                let mut producer_idx_opt: Option<NodeIndex> = None;
+                for edge in
+                    parent_graph.edges_directed(scope.composition_node_idx, Direction::Incoming)
+                {
+                    if edge.weight().port.as_deref() == Some(current_name.as_str()) {
+                        producer_idx_opt = Some(edge.source());
+                        break;
+                    }
+                }
+                let Some(producer_idx) = producer_idx_opt else {
+                    // No port-tagged incoming edge — planner-pass
+                    // invariant violation; the dispatcher would also
+                    // surface this as PipelineError::Internal at the
+                    // composition arm. Return current_name; the caller
+                    // (reader setup) will silently skip if no reader
+                    // matches, mirroring the existing fall-through.
+                    return current_name;
+                };
+                let producer_name = parent_graph[producer_idx].name().to_string();
+                match scope.parent_body_id {
+                    None => {
+                        // Parent is top-level; producer is a top-level
+                        // node (typically a Source).
+                        return producer_name;
+                    }
+                    Some(pid) => {
+                        let parent_body = match artifacts.composition_bodies.get(&pid) {
+                            Some(b) => b,
+                            None => return producer_name,
+                        };
+                        // Synthetic-port-source identification: the
+                        // producer's NodeIndex must match the parent
+                        // body's port_name_to_node_idx entry for that
+                        // name. Name-only check is unsafe — port and
+                        // body-internal namespaces can legally collide.
+                        if parent_body
+                            .port_name_to_node_idx
+                            .get(&producer_name)
+                            .copied()
+                            == Some(producer_idx)
+                        {
+                            current_body_id = pid;
+                            current_name = producer_name;
+                        } else {
+                            return producer_name;
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut combine_source_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+        for (combine_name, combine_inputs) in &artifacts.combine_inputs {
+            let owning_body_id = combine_owning_body.get(combine_name.as_str()).copied();
+            for combine_input in combine_inputs.values() {
+                let raw_upstream = combine_input.upstream_name.as_ref();
+                let resolved = match owning_body_id {
+                    Some(body_id) => resolve_upstream(body_id, raw_upstream),
+                    None => raw_upstream.to_string(),
+                };
+                let upstream: &str = resolved.as_str();
+                if upstream == input.name {
+                    // Primary source — records already live in
+                    // `all_records`.
+                    continue;
+                }
+                if combine_source_records.contains_key(upstream) {
+                    continue;
+                }
+                let Some(reader) = readers.remove(upstream) else {
+                    // Another combine already drained the reader (safe —
+                    // the map is shared across all combine inputs).
+                    continue;
+                };
+                let src_cfg = source_configs
+                    .iter()
+                    .find(|s| s.name == upstream)
+                    .ok_or_else(|| {
+                        PipelineError::Config(crate::config::ConfigError::Validation(format!(
+                            "combine build-side source '{upstream}' not declared in the pipeline",
+                        )))
+                    })?;
+                let raw_reader = build_format_reader(src_cfg, reader)?;
+                let mut src_reader = wrap_with_schema_coercion(raw_reader, config, upstream)?;
+                let mut recs: Vec<(Record, u64)> = Vec::new();
+                let mut rn: u64 = 0;
+                loop {
+                    match src_reader.next_record() {
+                        Ok(Some(record)) => {
+                            rn += 1;
+                            recs.push((record, rn));
+                        }
+                        Ok(None) => break,
+                        Err(clinker_format::error::FormatError::MetadataCapExceeded {
+                            record,
+                            key,
+                            count,
+                        }) => {
+                            rn += 1;
+                            counters.dlq_count += 1;
+                            dlq_entries.push(DlqEntry {
+                                source_row: rn,
+                                category: crate::dlq::DlqErrorCategory::MetadataCapExceeded,
+                                error_message: format!(
+                                    "per-record metadata cap exceeded at key {key:?} \
+                                     (count={count}) reading combine build-side source \
+                                     {upstream:?}"
+                                ),
+                                original_record: record,
+                                stage: Some(DlqEntry::stage_source()),
+                                route: None,
+                                trigger: true,
+                            });
+                        }
+                        Err(other) => return Err(other.into()),
+                    }
+                }
+                combine_source_records.insert(upstream.to_string(), recs);
+            }
         }
 
         Self::execute_dag_branching(
             config,
+            input,
             all_records,
-            OutputSink::Streamed(writers),
+            combine_source_records,
+            writers,
             transforms,
-            compiled_route.as_mut(),
+            compiled_route,
+            compiled_routes_by_name,
             plan,
+            artifacts,
             params,
             &mut counters,
             &mut dlq_entries,
             collector,
-            &lookup_tables,
-            bound_output_schemas,
-            bound_output_layouts,
-            arena_opt.as_deref(),
-            indices_opt.as_deref(),
+            arena_for_ctx,
+            indices_for_ctx,
         )
-    }
-
-    /// Per-group correlation-key execution driver. See
-    /// [`execute_dag`]'s comment at the branch for semantics. Produces
-    /// the same `(PipelineCounters, Vec<DlqEntry>, Option<u64>)` tuple
-    /// as the non-correlated path, with group-demotion accounting
-    /// folded into the counters and DLQ entries.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_dag_with_correlation(
-        config: &PipelineConfig,
-        all_records: Vec<(Record, u64)>,
-        mut writers: HashMap<String, Box<dyn Write + Send>>,
-        transforms: &[CompiledTransform],
-        mut compiled_route: Option<CompiledRoute>,
-        plan: &ExecutionPlanDag,
-        params: &PipelineRunParams,
-        mut counters: PipelineCounters,
-        mut dlq_entries: Vec<DlqEntry>,
-        collector: &mut stage_metrics::StageCollector,
-        lookup_tables: &HashMap<String, RuntimeLookup>,
-        bound_output_schemas: &HashMap<String, Arc<Schema>>,
-        bound_output_layouts: &HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
-        arena: Option<&Arena>,
-        indices: Option<&[SecondaryIndex]>,
-        correlation_key: &crate::config::CorrelationKey,
-    ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let max_buffer = config.error_handling.max_group_buffer.unwrap_or(100_000);
-
-        // Phase 1: group records by correlation key with sticky
-        // overflow flag. `IndexMap` preserves first-seen insertion
-        // order so group flushing is deterministic.
-        struct GroupState {
-            records: Vec<(Record, u64)>,
-            /// Sticky: once true, the group is pre-failed (overflow).
-            /// All further records of this group append to `records`
-            /// for DLQ accounting but never reach the walker.
-            failed: bool,
-        }
-        let mut groups: IndexMap<Vec<GroupByKey>, GroupState> = IndexMap::new();
-        for (record, rn) in all_records {
-            let key = extract_correlation_key(&record, correlation_key);
-            let state = groups.entry(key).or_insert_with(|| GroupState {
-                records: Vec::new(),
-                failed: false,
-            });
-            if !state.failed && state.records.len() as u64 >= max_buffer {
-                state.failed = true;
-            }
-            state.records.push((record, rn));
-        }
-
-        // Accumulator for captured records from successful groups.
-        // Flushed once after all groups are processed to ensure a
-        // single FormatWriter per output across all successful groups
-        // (writers are owned; `writers.remove` only succeeds once).
-        let mut successful_captures: HashMap<String, Vec<CapturedRow>> = HashMap::new();
-
-        // Phase 2: per-group walker invocation with deferred output.
-        for (key, state) in groups {
-            if state.failed {
-                // Overflow: synthesise a `GroupSizeExceeded` root-cause
-                // DLQ entry (trigger: true) tied to the last appended
-                // record, plus collateral entries for every record in
-                // the group. The walker is NOT invoked for overflowing
-                // groups.
-                let key_fmt = format_group_key(&key);
-                let count = state.records.len() as u64;
-                let overflow_msg = format!(
-                    "correlation-key group {key_fmt:?} exceeded \
-                     max_group_buffer={max_buffer} after {count} records"
-                );
-                // Root cause: the offending (last-appended) record.
-                if let Some((trigger_rec, trigger_rn)) = state.records.last().cloned() {
-                    dlq_entries.push(DlqEntry {
-                        source_row: trigger_rn,
-                        category: crate::dlq::DlqErrorCategory::GroupSizeExceeded,
-                        error_message: overflow_msg.clone(),
-                        original_record: trigger_rec,
-                        stage: Some("correlation_group_overflow".to_string()),
-                        route: None,
-                        trigger: true,
-                    });
-                }
-                // Collaterals: every OTHER record in the group.
-                let last_idx = state.records.len().saturating_sub(1);
-                for (idx, (rec, rn)) in state.records.into_iter().enumerate() {
-                    if idx == last_idx {
-                        continue;
-                    }
-                    dlq_entries.push(DlqEntry {
-                        source_row: rn,
-                        category: crate::dlq::DlqErrorCategory::Correlated,
-                        error_message: format!("correlated with failure in group: {overflow_msg}"),
-                        original_record: rec,
-                        stage: Some("correlation_group_overflow".to_string()),
-                        route: None,
-                        trigger: false,
-                    });
-                }
-                counters.dlq_count += count;
-                continue;
-            }
-
-            // Non-overflowing group: invoke walker with Captured sink.
-            //
-            // Note: `execute_dag_branching` uses `std::mem::take` on the
-            // counters/dlq &mut params at the end, packaging them into
-            // its return tuple. So we must read from the return tuple,
-            // NOT from the `group_counters`/`group_dlq` bindings we
-            // pass in (which will be reset to default post-call).
-            let mut group_capture: HashMap<String, Vec<CapturedRow>> = HashMap::new();
-            let mut counters_slot = PipelineCounters::default();
-            let mut dlq_slot: Vec<DlqEntry> = Vec::new();
-            let (group_counters, mut group_dlq, _group_rss) = Self::execute_dag_branching(
-                config,
-                state.records,
-                OutputSink::Captured(&mut group_capture),
-                transforms,
-                compiled_route.as_mut(),
-                plan,
-                params,
-                &mut counters_slot,
-                &mut dlq_slot,
-                collector,
-                lookup_tables,
-                bound_output_schemas,
-                bound_output_layouts,
-                arena,
-                indices,
-            )?;
-
-            if group_dlq.is_empty() {
-                // Group succeeded: accumulate captured records for
-                // post-loop flush. We defer the actual writer build +
-                // write until ALL groups are processed so multiple
-                // successful groups can share a single FormatWriter
-                // per output (writers are owned once; `writers.remove`
-                // can only succeed once per output name).
-                for (out_name, rows) in group_capture {
-                    successful_captures
-                        .entry(out_name)
-                        .or_default()
-                        .extend(rows);
-                }
-                counters.ok_count += group_counters.ok_count;
-                counters.filtered_count += group_counters.filtered_count;
-                counters.distinct_count += group_counters.distinct_count;
-            } else {
-                // Group failed: demote every captured OK record to
-                // collateral DLQ (trigger: false) with the first
-                // root-cause's message. Root-cause DLQ entries already
-                // carry trigger: true from the walker.
-                let root_msg = group_dlq
-                    .first()
-                    .map(|e| e.error_message.clone())
-                    .unwrap_or_else(|| "group failed".to_string());
-                let mut collateral_count: u64 = 0;
-                for (out_name, rows) in group_capture {
-                    for row in rows {
-                        dlq_entries.push(DlqEntry {
-                            source_row: row.row_num,
-                            category: crate::dlq::DlqErrorCategory::Correlated,
-                            error_message: format!("correlated with failure in group: {root_msg}"),
-                            original_record: row.record,
-                            stage: Some(format!("output:{out_name}")),
-                            route: None,
-                            trigger: false,
-                        });
-                        collateral_count += 1;
-                    }
-                }
-                // Accept the walker's DLQ entries verbatim (they have
-                // trigger: true / real categories already).
-                dlq_entries.append(&mut group_dlq);
-                counters.dlq_count += group_counters.dlq_count + collateral_count;
-                counters.filtered_count += group_counters.filtered_count;
-                counters.distinct_count += group_counters.distinct_count;
-            }
-        }
-
-        // Phase 3: flush accumulated successful-group captures to real
-        // writers. One FormatWriter per output spans all successful
-        // groups; records preserve source-row order within each group
-        // and are emitted in group-insertion (IndexMap) order across
-        // groups.
-        for (out_name, rows) in successful_captures {
-            if rows.is_empty() {
-                continue;
-            }
-            let out_cfg = config
-                .output_configs()
-                .find(|o| o.name == out_name)
-                .cloned()
-                .ok_or_else(|| PipelineError::Internal {
-                    op: "correlation_group_flush",
-                    node: out_name.clone(),
-                    detail: "Output node not in config".to_string(),
-                })?;
-            // The Output node's projection layout = its single
-            // predecessor's entry in `plan.output_layouts`. Planner
-            // populated the map for every top-level + synthesized
-            // passthrough node at compile time; a direct lookup is
-            // authoritative. No on-demand graph walk needed.
-            let layout = plan
-                .graph
-                .node_indices()
-                .find(|&i| plan.graph[i].name() == out_name)
-                .and_then(|idx| {
-                    plan.graph
-                        .neighbors_directed(idx, petgraph::Direction::Incoming)
-                        .find_map(|p| bound_output_layouts.get(plan.graph[p].name()).cloned())
-                });
-            let Some(layout) = layout else {
-                // Edge case (direct Source → Output with no wired
-                // predecessor): write nothing, mirroring Streamed-mode.
-                continue;
-            };
-            let Some(raw_writer) = writers.remove(&out_name) else {
-                continue;
-            };
-            let first = &rows[0];
-            let first_projected =
-                project_output_with_meta(&first.record, &layout, &first.metadata, &out_cfg);
-            let mut w =
-                build_format_writer(&out_cfg, raw_writer, Arc::clone(first_projected.schema()))?;
-            w.write_record(&first_projected)?;
-            for row in &rows[1..] {
-                let projected =
-                    project_output_with_meta(&row.record, &layout, &row.metadata, &out_cfg);
-                w.write_record(&projected)?;
-            }
-            w.flush()?;
-        }
-
-        Ok((counters, dlq_entries, rss_bytes()))
     }
 
     /// Execute a branching DAG by walking nodes in topological order.
@@ -1162,41 +1229,29 @@ impl PipelineExecutor {
     /// branch-level fork-join — scheduling overhead exceeds benefit at
     /// typical ETL branch sizes (2-4 branches, millisecond chains).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn execute_dag_branching(
         config: &PipelineConfig,
+        input: &crate::config::SourceConfig,
         all_records: Vec<(Record, u64)>,
-        mut sink: OutputSink<'_>,
+        combine_source_records: HashMap<String, Vec<(Record, u64)>>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
         transforms: &[CompiledTransform],
-        // Option W Shortcut #2: passed by `&mut` rather than owned so
-        // the per-group correlation-key driver can invoke the walker N
-        // times against the same CompiledRoute (route evaluators carry
-        // per-record mutable state). Serial per-group execution means
-        // exclusive borrow across calls is sound.
-        mut compiled_route: Option<&mut CompiledRoute>,
+        compiled_route: Option<CompiledRoute>,
+        compiled_routes_by_name: HashMap<String, CompiledRoute>,
         plan: &ExecutionPlanDag,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
         params: &PipelineRunParams,
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
-        lookup_tables: &HashMap<String, RuntimeLookup>,
-        bound_output_schemas: &HashMap<String, Arc<Schema>>,
-        bound_output_layouts: &HashMap<String, Arc<cxl::typecheck::OutputLayout>>,
-        arena: Option<&Arena>,
-        indices: Option<&[SecondaryIndex]>,
+        arena: Option<Arc<crate::pipeline::arena::Arena>>,
+        indices: Option<Arc<Vec<crate::pipeline::index::SecondaryIndex>>>,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
-        let _ = arena;
-        let _ = indices;
-        use petgraph::graph::NodeIndex;
-
-        let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
-        let input = &source_configs[0];
-        let primary_output = &output_configs[0];
         let pipeline_start_time = chrono::Local::now().naive_local();
 
-        // Pipeline-stable evaluation context (D59 / Task 16.3.13a). Built once
-        // here, reused (via borrow) at every per-record dispatch site below.
+        // Pipeline-stable evaluation context. Built once here, reused
+        // (via borrow) at every per-record dispatch site below.
         let stable = build_stable_eval_context(
             config,
             pipeline_start_time,
@@ -1207,961 +1262,129 @@ impl PipelineExecutor {
         let source_file_arc: Arc<str> = Arc::from(input.path.as_str());
 
         let strategy = config.error_handling.strategy;
-        let mut transform_timer = stage_metrics::CumulativeTimer::new();
-        let mut route_timer = stage_metrics::CumulativeTimer::new();
-        let mut projection_timer = stage_metrics::CumulativeTimer::new();
-        let mut write_timer = stage_metrics::CumulativeTimer::new();
         let total_records = all_records.len() as u64;
-        let mut records_emitted: u64 = 0;
 
-        // Build transform name -> index map for looking up CompiledTransform by name
+        // Name → index map for looking up `CompiledTransform` by node
+        // name. Borrowed by the dispatcher's Transform / Aggregation
+        // arms.
         let transform_by_name: HashMap<&str, usize> = transforms
             .iter()
             .enumerate()
             .map(|(i, t)| (t.name.as_str(), i))
             .collect();
 
-        // Inter-node buffers: each node produces records into its buffer.
-        // Records are (Record, row_number, accumulated_emitted, accumulated_metadata).
-        // Option-W: per-node buffer tuple is (record, row_num, metadata).
-        // Emits live positionally on the record via its bound output
-        // schema; the per-record emitted side-map has been eliminated
-        // (single oracle, Failure mode #5).
-        type NodeRow = (Record, u64, IndexMap<String, Value>);
-        let mut node_buffers: HashMap<NodeIndex, Vec<NodeRow>> = HashMap::new();
+        // Pipeline-scoped spill directory. One TempDir per pipeline
+        // run; every spilling operator borrows its path. Drop runs at
+        // the end of the walk (normal exit) or during stack unwinding
+        // (panic), so any individual spill file an operator left
+        // behind mid-flight gets swept by the directory's recursive
+        // remove. This is the secondary cleanup sweep that closes the
+        // panic-leak hole; primary cleanup remains per-file via
+        // `tempfile::TempPath` Drop.
+        let spill_root = Arc::new(
+            tempfile::Builder::new()
+                .prefix("clinker-spill-")
+                .tempdir()
+                .map_err(|e| PipelineError::Internal {
+                    op: "executor",
+                    node: String::new(),
+                    detail: format!("failed to allocate pipeline spill root: {e}"),
+                })?,
+        );
+        let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
-        // Walk DAG in topological order
-        for &node_idx in &plan.topo_order {
-            let node = plan.graph[node_idx].clone();
-            match node {
-                PlanNode::Source { ref name, .. } => {
-                    // Option-W: widen source records onto the source's
-                    // bound output schema (the author-declared schema),
-                    // so every record produced by this node carries
-                    // the same `Arc<Schema>` that downstream positional
-                    // consumers (aggregator `group_by_indices`, sort
-                    // keys) resolve against.
-                    //
-                    // The CSV/JSON reader produces records whose
-                    // schema reflects what's actually in the file
-                    // (a subset of the declared schema); `bind_schema`
-                    // walks the author-declared schema (a superset).
-                    // Left unreconciled, indices resolve at the wrong
-                    // slot — widen here once at source ingress.
-                    let source_schema = bound_output_schemas.get(name.as_str()).cloned();
-                    let records: Vec<_> = all_records
-                        .iter()
-                        .map(|(r, rn)| {
-                            let widened = if let Some(schema) = source_schema.as_ref() {
-                                widen_to_schema(r, schema)
-                            } else {
-                                r.clone()
-                            };
-                            (widened, *rn, IndexMap::<String, Value>::new())
-                        })
-                        .collect();
-                    node_buffers.insert(node_idx, records);
+        // Correlation grouping context. `Some(...)` iff
+        // `error_handling.correlation_key` is set; the planner's
+        // `inject_correlation_commit` pass guarantees a terminal
+        // `PlanNode::CorrelationCommit` is also present so the
+        // dispatcher walks the buffers at end-of-DAG. Group identity
+        // travels through the schema as `$ck.<field>` shadow columns
+        // stamped at Source ingest; the dispatcher reads them via the
+        // `FieldMetadata.snapshot_of` annotation, so the executor
+        // context only needs to know whether buffering is active and
+        // the per-group cap.
+        let (correlation_buffers, correlation_max_group_buffer) =
+            match config.error_handling.correlation_key.as_ref() {
+                Some(_) => {
+                    let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
+                    (Some(HashMap::new()), cap)
                 }
+                None => (None, 0),
+            };
 
-                PlanNode::Transform { ref name, .. } => {
-                    // Get input records: first check own buffer (set by Route
-                    // node for branch dispatch), then fall back to predecessor.
-                    let input_records = if let Some(own_buf) = node_buffers.remove(&node_idx) {
-                        own_buf
-                    } else {
-                        let predecessors: Vec<NodeIndex> = plan
-                            .graph
-                            .neighbors_directed(node_idx, Direction::Incoming)
-                            .collect();
-                        if predecessors.len() == 1 {
-                            node_buffers.remove(&predecessors[0]).unwrap_or_default()
-                        } else {
-                            predecessors
-                                .iter()
-                                .find_map(|p| node_buffers.remove(p))
-                                .unwrap_or_default()
-                        }
-                    };
+        // Construct the dispatcher context. Mutable per-walk state
+        // (node_buffers, counters, DLQ, timers, output writers,
+        // output errors, the visited-source set backing the
+        // dual-counter semantic) lives on the context; the immutable
+        // plan-time refs are borrowed for the lifetime of the walk.
+        //
+        // `counters` and `dlq_entries` are taken out of their `&mut`
+        // borrows here, mutated through the dispatcher, and written
+        // back at the end of the walk.
+        let mut ctx = dispatch::ExecutorContext {
+            config,
+            artifacts,
+            output_configs: &output_configs,
+            primary_output: &output_configs[0],
+            compiled_transforms: transforms,
+            transform_by_name,
+            stable: &stable,
+            source_file_arc: &source_file_arc,
+            strategy,
 
-                    // Find the CompiledTransform for this node
-                    let transform_idx = match transform_by_name.get(name.as_str()) {
-                        Some(&idx) => idx,
-                        None => {
-                            // No transform found — pass through
-                            node_buffers.insert(node_idx, input_records);
-                            continue;
-                        }
-                    };
+            node_buffers: HashMap::new(),
+            combine_source_records,
+            all_records,
+            writers,
+            compiled_route,
+            counters: std::mem::take(counters),
+            dlq_entries: std::mem::take(dlq_entries),
+            output_errors: Vec::new(),
+            ok_source_rows: HashSet::new(),
+            records_emitted: 0,
+            transform_timer: stage_metrics::CumulativeTimer::new(),
+            route_timer: stage_metrics::CumulativeTimer::new(),
+            projection_timer: stage_metrics::CumulativeTimer::new(),
+            write_timer: stage_metrics::CumulativeTimer::new(),
+            collector,
+            recursion_depth: 0,
+            compiled_routes_by_name,
+            current_body_node_input_refs: None,
+            spill_root,
+            spill_root_path,
+            arena,
+            indices,
+            correlation_buffers,
+            correlation_max_group_buffer,
+        };
 
-                    let mut evaluator = ProgramEvaluator::new(
-                        Arc::clone(&transforms[transform_idx].typed),
-                        transforms[transform_idx].has_distinct(),
-                    );
-
-                    // Option-W: every record emitted by this Transform
-                    // carries the node's bound output schema (single
-                    // oracle — the same Arc as transforms[i].typed
-                    // .output_layout.schema).
-                    let node_output_schema = bound_output_schemas
-                        .get(name.as_str())
-                        .cloned()
-                        .expect("Option W: every CXL-bearing node has a bound output schema");
-
-                    let mut output_records = Vec::with_capacity(input_records.len());
-
-                    for (record, rn, mut all_metadata) in input_records {
-                        let ctx = EvalContext {
-                            stable: &stable,
-                            source_file: &source_file_arc,
-                            source_row: rn,
-                        };
-
-                        // Check if this transform has a lookup table
-                        if let Some(rt_lookup) = lookup_tables.get(name.as_str()) {
-                            let _guard = transform_timer.guard();
-                            let matches = crate::pipeline::lookup::find_matches(
-                                &rt_lookup.table,
-                                &record,
-                                &mut rt_lookup
-                                    .where_evaluator
-                                    .lock()
-                                    .expect("lookup evaluator lock"),
-                                &ctx,
-                                rt_lookup.match_mode,
-                                rt_lookup.equality_index.as_ref(),
-                            )
-                            .map_err(|e| {
-                                PipelineError::Compilation {
-                                    transform_name: name.clone(),
-                                    messages: vec![e.to_string()],
-                                }
-                            })?;
-
-                            if matches.is_empty() {
-                                match rt_lookup.on_miss {
-                                    crate::config::pipeline_node::OnMiss::Skip => {
-                                        counters.filtered_count += 1;
-                                        continue;
-                                    }
-                                    crate::config::pipeline_node::OnMiss::Error => {
-                                        return Err(PipelineError::Compilation {
-                                            transform_name: name.clone(),
-                                            messages: vec![format!(
-                                                "no matching row in lookup source '{}'",
-                                                rt_lookup.table.source_name()
-                                            )],
-                                        });
-                                    }
-                                    crate::config::pipeline_node::OnMiss::NullFields => {
-                                        let resolver =
-                                            crate::pipeline::lookup::LookupResolver::no_match(
-                                                &record,
-                                                rt_lookup.table.source_name(),
-                                            );
-                                        match evaluator
-                                            .eval_record::<NullStorage>(
-                                                &ctx, &record, &resolver, None,
-                                            )
-                                            .map_err(|e| (name.clone(), e))
-                                        {
-                                            Ok(EvalResult::Emit { values, metadata }) => {
-                                                let mut rec = Record::new(
-                                                    Arc::clone(&node_output_schema),
-                                                    values,
-                                                );
-                                                if record.has_meta() {
-                                                    for (k, v) in record.iter_meta() {
-                                                        let _ = rec.set_meta(k, v.clone());
-                                                    }
-                                                }
-                                                for (k, v) in &metadata {
-                                                    let _ = rec.set_meta(k, v.clone());
-                                                }
-                                                all_metadata.extend(metadata);
-                                                output_records.push((rec, rn, all_metadata));
-                                            }
-                                            Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                                counters.filtered_count += 1;
-                                            }
-                                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                                counters.distinct_count += 1;
-                                            }
-                                            Err((tn, eval_err)) => {
-                                                if strategy == ErrorStrategy::FailFast {
-                                                    return Err(eval_err.into());
-                                                }
-                                                counters.dlq_count += 1;
-                                                dlq_entries.push(DlqEntry {
-                                                    source_row: rn,
-                                                    category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                                    error_message: eval_err.to_string(),
-                                                    original_record: record,
-                                                    stage: Some(DlqEntry::stage_transform(&tn)),
-                                                    route: None,
-                                                    trigger: true,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Emit one output record per match
-                                for &idx in &matches {
-                                    let matched_row = &rt_lookup.table.records()[idx];
-                                    let resolver = crate::pipeline::lookup::LookupResolver::matched(
-                                        &record,
-                                        rt_lookup.table.source_name(),
-                                        matched_row,
-                                    );
-                                    match evaluator
-                                        .eval_record::<NullStorage>(&ctx, &record, &resolver, None)
-                                        .map_err(|e| (name.clone(), e))
-                                    {
-                                        Ok(EvalResult::Emit { values, metadata }) => {
-                                            let mut rec = Record::new(
-                                                Arc::clone(&node_output_schema),
-                                                values,
-                                            );
-                                            if record.has_meta() {
-                                                for (k, v) in record.iter_meta() {
-                                                    let _ = rec.set_meta(k, v.clone());
-                                                }
-                                            }
-                                            for (k, v) in &metadata {
-                                                let _ = rec.set_meta(k, v.clone());
-                                            }
-                                            let mut mt = all_metadata.clone();
-                                            mt.extend(metadata);
-                                            output_records.push((rec, rn, mt));
-                                        }
-                                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                            counters.filtered_count += 1;
-                                        }
-                                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                            counters.distinct_count += 1;
-                                        }
-                                        Err((tn, eval_err)) => {
-                                            if strategy == ErrorStrategy::FailFast {
-                                                return Err(eval_err.into());
-                                            }
-                                            counters.dlq_count += 1;
-                                            dlq_entries.push(DlqEntry {
-                                                source_row: rn,
-                                                category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                                error_message: eval_err.to_string(),
-                                                original_record: record.clone(),
-                                                stage: Some(DlqEntry::stage_transform(&tn)),
-                                                route: None,
-                                                trigger: true,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // No lookup — single-transform evaluation.
-                            // Windowed transforms dispatch with a
-                            // `PartitionWindowContext` derived from the
-                            // arena + secondary index built in
-                            // `execute_dag` before the walker runs; the
-                            // record's position in the arena is passed as
-                            // `rn - 1` (source row numbers are 1-based).
-                            let window_idx =
-                                plan.graph.node_weight(node_idx).and_then(|n| match n {
-                                    PlanNode::Transform { window_index, .. } => *window_index,
-                                    _ => None,
-                                });
-                            type TransformEvalResult = Result<
-                                (Record, Result<IndexMap<String, Value>, SkipReason>),
-                                (String, cxl::eval::EvalError),
-                            >;
-                            let eval_result: TransformEvalResult = {
-                                let _guard = transform_timer.guard();
-                                if let (Some(widx), Some(arena_ref), Some(indices_ref)) =
-                                    (window_idx, arena, indices)
-                                {
-                                    let record_pos = rn.saturating_sub(1) as u32;
-                                    let spec = &plan.indices_to_build[widx];
-                                    let index = &indices_ref[widx];
-                                    let key: Option<Vec<GroupByKey>> = spec
-                                        .group_by
-                                        .iter()
-                                        .map(|field| {
-                                            let val =
-                                                record.get(field).cloned().unwrap_or(Value::Null);
-                                            value_to_group_key(&val, field, None, record_pos)
-                                                .ok()
-                                                .flatten()
-                                        })
-                                        .collect();
-                                    let result: Result<EvalResult, cxl::eval::EvalError> =
-                                        if let Some(key) = key {
-                                            if let Some(partition) = index.get(&key) {
-                                                let pos_in_partition = partition
-                                                    .iter()
-                                                    .position(|&p| p == record_pos)
-                                                    .unwrap_or(0);
-                                                let wctx = PartitionWindowContext::new(
-                                                    arena_ref,
-                                                    partition,
-                                                    pos_in_partition,
-                                                );
-                                                evaluator.eval_record(
-                                                    &ctx,
-                                                    &record,
-                                                    &record,
-                                                    Some(&wctx),
-                                                )
-                                            } else {
-                                                evaluator.eval_record::<Arena>(
-                                                    &ctx, &record, &record, None,
-                                                )
-                                            }
-                                        } else {
-                                            evaluator
-                                                .eval_record::<Arena>(&ctx, &record, &record, None)
-                                        };
-                                    match result {
-                                        Ok(EvalResult::Emit { values, metadata }) => {
-                                            let mut out_record = Record::new(
-                                                Arc::clone(&node_output_schema),
-                                                values,
-                                            );
-                                            if record.has_meta() {
-                                                for (k, v) in record.iter_meta() {
-                                                    let _ = out_record.set_meta(k, v.clone());
-                                                }
-                                            }
-                                            for (k, v) in &metadata {
-                                                let _ = out_record.set_meta(k, v.clone());
-                                            }
-                                            Ok((out_record, Ok(metadata)))
-                                        }
-                                        Ok(EvalResult::Skip(reason)) => {
-                                            Ok((record.clone(), Err(reason)))
-                                        }
-                                        Err(e) => Err((name.clone(), e)),
-                                    }
-                                } else {
-                                    evaluate_single_transform(
-                                        &record,
-                                        name,
-                                        &mut evaluator,
-                                        &ctx,
-                                        &node_output_schema,
-                                    )
-                                }
-                            };
-                            match eval_result {
-                                Ok((modified_record, Ok(metadata))) => {
-                                    all_metadata.extend(metadata);
-                                    output_records.push((modified_record, rn, all_metadata));
-                                }
-                                Ok((_record, Err(SkipReason::Filtered))) => {
-                                    counters.filtered_count += 1;
-                                }
-                                Ok((_record, Err(SkipReason::Duplicate))) => {
-                                    counters.distinct_count += 1;
-                                }
-                                Err((transform_name, eval_err)) => {
-                                    if strategy == ErrorStrategy::FailFast {
-                                        return Err(eval_err.into());
-                                    }
-                                    counters.dlq_count += 1;
-                                    dlq_entries.push(DlqEntry {
-                                        source_row: rn,
-                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                        error_message: eval_err.to_string(),
-                                        original_record: record,
-                                        stage: Some(DlqEntry::stage_transform(&transform_name)),
-                                        route: None,
-                                        trigger: true,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    node_buffers.insert(node_idx, output_records);
-                }
-
-                PlanNode::Route {
-                    ref name,
-                    mode,
-                    branches: _,
-                    default: _,
-                    ..
-                } => {
-                    // Get input records from predecessor
-                    let predecessors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let input_records = predecessors
-                        .iter()
-                        .find_map(|p| node_buffers.remove(p))
-                        .unwrap_or_default();
-
-                    // Get successor nodes (branch transform nodes)
-                    let successors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Outgoing)
-                        .collect();
-
-                    // Build branch_name -> successor NodeIndex mapping.
-                    //
-                    // Two successor shapes are supported:
-                    //
-                    // 1. **Branch transforms** whose `input:` is
-                    //    "route_parent.branch_name" (classic fan-out:
-                    //    Route → Transform → Output). The branch name is
-                    //    the suffix after the route parent.
-                    //
-                    // 2. **Output nodes** directly downstream of the Route
-                    //    whose name matches a branch name in the route
-                    //    config (multi-output split: Route → Output[name]).
-                    //    This is the shape used by
-                    //    `route: { conditions: { high: ... }, default: low }`
-                    //    with two `output` nodes named `high` and `low`.
-                    let route_parent = name.strip_prefix("route_").unwrap_or(name);
-                    let mut branch_to_succ: HashMap<String, NodeIndex> = HashMap::new();
-                    for &succ in &successors {
-                        let succ_name = plan.graph[succ].name().to_string();
-                        let mut matched = false;
-                        for tc in crate::executor::build_transform_specs(config) {
-                            if tc.name == succ_name
-                                && let Some(crate::config::TransformInput::Single(ref input_ref)) =
-                                    tc.input
-                                && let Some(branch) =
-                                    input_ref.strip_prefix(&format!("{}.", route_parent))
-                            {
-                                branch_to_succ.insert(branch.to_string(), succ);
-                                matched = true;
-                            }
-                        }
-                        // Shape 2: Output node directly downstream of Route
-                        // — the output's name IS the branch label.
-                        if !matched && matches!(plan.graph[succ], PlanNode::Output { .. }) {
-                            branch_to_succ.insert(succ_name, succ);
-                        }
-                    }
-
-                    // Initialize per-successor buffers
-                    let mut branch_buffers: HashMap<NodeIndex, Vec<_>> = HashMap::new();
-                    for &succ in &successors {
-                        branch_buffers.insert(succ, Vec::new());
-                    }
-
-                    // Use compiled_route to evaluate conditions
-                    if let Some(ref mut route) = compiled_route {
-                        for (record, rn, all_metadata) in input_records {
-                            let ctx = EvalContext {
-                                stable: &stable,
-                                source_file: &source_file_arc,
-                                source_row: rn,
-                            };
-
-                            let route_result = {
-                                let _guard = route_timer.guard();
-                                route.evaluate(&record, &all_metadata, &ctx)
-                            };
-                            match route_result {
-                                Ok(targets) => {
-                                    for target in &targets {
-                                        if let Some(&succ) = branch_to_succ.get(target.as_str()) {
-                                            branch_buffers.entry(succ).or_default().push((
-                                                record.clone(),
-                                                rn,
-                                                all_metadata.clone(),
-                                            ));
-                                        }
-                                        // Exclusive mode: stop after first match
-                                        if mode == crate::config::RouteMode::Exclusive {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(route_err) => {
-                                    if strategy == ErrorStrategy::FailFast {
-                                        return Err(route_err.into());
-                                    }
-                                    counters.dlq_count += 1;
-                                    dlq_entries.push(DlqEntry {
-                                        source_row: rn,
-                                        category: crate::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                        error_message: route_err.to_string(),
-                                        original_record: record,
-                                        stage: Some(DlqEntry::stage_route_eval()),
-                                        route: None,
-                                        trigger: true,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Put branch buffers into node_buffers keyed by successor
-                    for (succ_idx, buf) in branch_buffers {
-                        node_buffers.insert(succ_idx, buf);
-                    }
-                }
-
-                PlanNode::Merge { ref name, .. } => {
-                    // Concatenate predecessor buffers in declaration order.
-                    // Declaration order = order in the `input:` array of the
-                    // merge's downstream transform.
-                    let predecessors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-
-                    // The Merge node is named "merge_{transform}". Find the
-                    // transform's input: array to determine declaration order.
-                    let merge_transform_name = name.strip_prefix("merge_").unwrap_or(name);
-                    let declaration_order: Vec<String> =
-                        crate::executor::build_transform_specs(config)
-                            .into_iter()
-                            .find(|tc| tc.name == merge_transform_name)
-                            .and_then(|tc| {
-                                if let Some(crate::config::TransformInput::Multiple(ref inputs)) =
-                                    tc.input
-                                {
-                                    Some(inputs.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-
-                    // Sort predecessors by declaration order
-                    let mut sorted_preds = predecessors.clone();
-                    sorted_preds.sort_by_key(|p| {
-                        let pred_name = plan.graph[*p].name();
-                        declaration_order
-                            .iter()
-                            .position(|d| d == pred_name)
-                            .unwrap_or(usize::MAX)
-                    });
-
-                    let total: usize = sorted_preds
-                        .iter()
-                        .map(|p| node_buffers.get(p).map_or(0, |b| b.len()))
-                        .sum();
-                    let mut merged = Vec::with_capacity(total);
-                    for pred in &sorted_preds {
-                        if let Some(buf) = node_buffers.remove(pred) {
-                            merged.extend(buf);
-                        }
-                    }
-                    node_buffers.insert(node_idx, merged);
-                }
-
-                PlanNode::Sort {
-                    ref name,
-                    ref sort_fields,
-                    ..
-                } => {
-                    let _ = name;
-                    let _ = sort_fields;
-                    // Enforcer-sort dispatch (Task 16.0.5.8). Reuses the
-                    // generalized `SortBuffer<P>` carrying per-record sidecar
-                    // (row_num + emitted/accumulated metadata maps) through
-                    // the sort permutation. See
-                    // docs/research/RESEARCH-sort-node-sidecar-payload.md.
-                    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-
-                    type SortPayload = (u64, IndexMap<String, Value>);
-                    type SortRow = (Record, u64, IndexMap<String, Value>);
-
-                    let predecessors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let input_records: Vec<_> = predecessors
-                        .iter()
-                        .find_map(|p| node_buffers.remove(p))
-                        .unwrap_or_default();
-
-                    if input_records.is_empty() {
-                        node_buffers.insert(node_idx, Vec::new());
-                        continue;
-                    }
-
-                    let schema = input_records[0].0.schema().clone();
-                    let memory_limit = parse_memory_limit(config);
-                    let mut buf: SortBuffer<SortPayload> =
-                        SortBuffer::new(sort_fields.clone(), memory_limit, None, schema);
-
-                    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
-                    let sort_count = input_records.len() as u64;
-                    for (record, row_num, accumulated) in input_records {
-                        buf.push(record, (row_num, accumulated));
-                        if buf.should_spill() {
-                            buf.sort_and_spill().map_err(|e| {
-                                PipelineError::Io(std::io::Error::other(format!(
-                                    "sort enforcer '{name}' spill failed: {e}"
-                                )))
-                            })?;
-                        }
-                    }
-
-                    let sorted = buf.finish().map_err(|e| {
-                        PipelineError::Io(std::io::Error::other(format!(
-                            "sort enforcer '{name}' finish failed: {e}"
-                        )))
-                    })?;
-
-                    let mut out: Vec<SortRow> = Vec::with_capacity(sort_count as usize);
-                    match sorted {
-                        SortedOutput::InMemory(pairs) => {
-                            for (record, (row_num, accumulated)) in pairs {
-                                out.push((record, row_num, accumulated));
-                            }
-                        }
-                        SortedOutput::Spilled(files) => {
-                            if files.len() > 1 {
-                                return Err(PipelineError::Io(std::io::Error::other(format!(
-                                    "sort enforcer '{name}' produced {} spill files; \
-                                     k-way merge for enforcer sort is not yet implemented \
-                                     (memory_limit too small for input)",
-                                    files.len()
-                                ))));
-                            }
-                            for file in files {
-                                let reader = file.reader().map_err(|e| {
-                                    PipelineError::Io(std::io::Error::other(format!(
-                                        "sort enforcer '{name}' spill read failed: {e}"
-                                    )))
-                                })?;
-                                for entry in reader {
-                                    let (record, (row_num, accumulated)) = entry.map_err(|e| {
-                                        PipelineError::Io(std::io::Error::other(format!(
-                                            "sort enforcer '{name}' spill decode failed: {e}"
-                                        )))
-                                    })?;
-                                    out.push((record, row_num, accumulated));
-                                }
-                            }
-                        }
-                    }
-                    collector.record(sort_timer.finish(sort_count, sort_count));
-                    node_buffers.insert(node_idx, out);
-                }
-
-                PlanNode::Aggregation {
-                    ref name,
-                    ref compiled,
-                    strategy: agg_strategy,
-                    ref output_schema,
-                    ..
-                } => {
-                    // Task 16.3.13 — hash-aggregation dispatch arm.
-                    //
-                    // DataFusion PR #9241 / #12086 lesson: any
-                    // `PipelineError::Internal` raised here (e.g. via
-                    // `single_predecessor`, or via the wrapper enum's
-                    // Streaming-not-yet-implemented arm) MUST hard-abort
-                    // regardless of `error_strategy`. We achieve this
-                    // structurally by propagating those errors via `?`
-                    // before reaching the per-record FailFast/Continue
-                    // match — internal invariants always abort.
-                    use crate::aggregation::{
-                        AggregateStream, HashAggError, SortRow as AggSortRow,
-                    };
-
-                    let pred = single_predecessor(plan, node_idx, "aggregation", name)?;
-                    let input = node_buffers.remove(&pred).unwrap_or_default();
-
-                    // Build the per-aggregation runtime artifacts. The
-                    // executor owns the evaluator + spill metadata; the
-                    // wrapper enum owns the engine.
-                    let transform_idx = transform_by_name.get(name.as_str()).copied();
-                    let evaluator = match transform_idx {
-                        Some(idx) => ProgramEvaluator::new(
-                            Arc::clone(&transforms[idx].typed),
-                            transforms[idx].has_distinct(),
-                        ),
-                        None => {
-                            return Err(PipelineError::Internal {
-                                op: "aggregation",
-                                node: name.clone(),
-                                detail: "no compiled transform found for aggregate node"
-                                    .to_string(),
-                            });
-                        }
-                    };
-
-                    // Spill schema follows the format used by
-                    // `HashAggregator::spill`: group-by columns ++
-                    // `__acc_state` ++ `__meta_tracker`.
-                    let mut spill_columns: Vec<Box<str>> = compiled
-                        .group_by_fields
-                        .iter()
-                        .map(|s| Box::<str>::from(s.as_str()))
-                        .collect();
-                    spill_columns.push(Box::<str>::from("__acc_state"));
-                    spill_columns.push(Box::<str>::from("__meta_tracker"));
-                    let spill_schema = Arc::new(Schema::new(spill_columns));
-
-                    let memory_limit = parse_memory_limit(config);
-
-                    let mut stream = AggregateStream::for_node(
-                        Arc::clone(compiled),
-                        evaluator,
-                        agg_strategy,
-                        Arc::clone(output_schema),
-                        spill_schema,
-                        memory_limit,
-                        None,
-                        name.clone(),
-                    )?;
-
-                    let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
-                    let input_count = input.len() as u64;
-
-                    let mut emitted_rows: Vec<AggSortRow> = Vec::with_capacity(64);
-                    for (record, row_num, accumulated) in &input {
-                        let ctx = EvalContext {
-                            stable: &stable,
-                            source_file: &source_file_arc,
-                            source_row: *row_num,
-                        };
-                        if let Err(e) = stream.add_record(
-                            record,
-                            *row_num,
-                            accumulated,
-                            &ctx,
-                            &mut emitted_rows,
-                        ) {
-                            match config.error_handling.strategy {
-                                ErrorStrategy::FailFast => return Err(e.into()),
-                                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                                    counters.dlq_count += 1;
-                                    dlq_entries.push(DlqEntry {
-                                        source_row: *row_num,
-                                        category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                        error_message: format!("aggregate {name}: {e}"),
-                                        original_record: record.clone(),
-                                        stage: Some(crate::dlq::stage_aggregate(name)),
-                                        route: None,
-                                        trigger: true,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Finalize. Accumulator finalize errors get the
-                    // typed `PipelineError::Accumulator` mapping; under
-                    // `Continue` we route to the DLQ and emit zero rows
-                    // for the failed group. All other engine errors
-                    // propagate (Internal/Spill/Residual always abort).
-                    let ctx = EvalContext {
-                        stable: &stable,
-                        source_file: &source_file_arc,
-                        source_row: 0,
-                    };
-                    let out_rows: Vec<AggSortRow> = match stream.finalize(&ctx, &mut emitted_rows) {
-                        Ok(()) => emitted_rows,
-                        Err(HashAggError::Accumulator {
-                            transform,
-                            binding,
-                            source,
-                        }) => match config.error_handling.strategy {
-                            ErrorStrategy::FailFast => {
-                                return Err(PipelineError::Accumulator {
-                                    transform,
-                                    binding,
-                                    source,
-                                });
-                            }
-                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
-                                counters.dlq_count += 1;
-                                let synthetic = if let Some((rec, _, _)) = input.first() {
-                                    rec.clone()
-                                } else {
-                                    Record::new(Arc::clone(output_schema), Vec::new())
-                                };
-                                dlq_entries.push(DlqEntry {
-                                    source_row: 0,
-                                    category: crate::dlq::DlqErrorCategory::AggregateFinalize,
-                                    error_message: format!(
-                                        "aggregate {transform}.{binding}: {source:?}"
-                                    ),
-                                    original_record: synthetic,
-                                    stage: Some(crate::dlq::stage_aggregate(name)),
-                                    route: None,
-                                    trigger: true,
-                                });
-                                Vec::new()
-                            }
-                        },
-                        Err(other) => return Err(other.into()),
-                    };
-
-                    collector.record(agg_timer.finish(input_count, out_rows.len() as u64));
-                    node_buffers.insert(node_idx, out_rows);
-                }
-
-                PlanNode::Output { ref name, .. } => {
-                    // Get input records: check own buffer first (Route
-                    // nodes store records at the successor's index), then
-                    // fall back to predecessor buffers.
-                    //
-                    // Locate the predecessor node so we can fetch its
-                    // canonical `OutputLayout` from `bound_output_layouts`
-                    // (Option W: the predecessor's layout is the single
-                    // oracle for the CXL-emitted vs passthrough distinction
-                    // that drives `include_unmapped: false` semantics).
-                    let predecessors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let input_records = if let Some(own_buf) = node_buffers.remove(&node_idx) {
-                        own_buf
-                    } else {
-                        predecessors
-                            .iter()
-                            .find_map(|&p| {
-                                // When multiple outputs share a predecessor,
-                                // clone the buffer for all but the last
-                                // consumer to avoid starving siblings.
-                                let remaining_consumers = plan
-                                    .graph
-                                    .neighbors_directed(p, Direction::Outgoing)
-                                    .filter(|&succ| succ > node_idx)
-                                    .count();
-                                if remaining_consumers == 0 {
-                                    node_buffers.remove(&p)
-                                } else {
-                                    node_buffers.get(&p).cloned()
-                                }
-                            })
-                            .unwrap_or_default()
-                    };
-
-                    // Count ok records
-                    let output_record_count = input_records.len() as u64;
-                    counters.ok_count += output_record_count;
-                    records_emitted += output_record_count;
-
-                    // Derive output schema from first emitted record
-                    let scan_timer =
-                        stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
-                    let out_cfg = output_configs
-                        .iter()
-                        .find(|o| o.name == *name)
-                        .unwrap_or(primary_output);
-
-                    // Option W Amendment A7: use the predecessor's bound
-                    // `OutputLayout` as the single oracle for projection.
-                    // For Transform/Aggregate/Route predecessors the layout
-                    // carries real `emit_slots` (CXL-named columns); for
-                    // Source/Merge predecessors it's an identity-passthrough
-                    // layout. `include_unmapped: false` correctly filters
-                    // to emits-only because the layout knows the truth.
-                    //
-                    // Edge case: a direct Source → Output pipeline (no
-                    // transform between them) has NO edge wired in the
-                    // plan DAG — the planner's output-wiring logic at
-                    // `plan/execution.rs:1273-1297` only connects Output
-                    // nodes when `prev_transform_key` is Some. In that
-                    // case `input_records` is empty (handled below) and
-                    // no projection happens. We mirror this by only
-                    // looking up a layout when we actually have records.
-                    let layout = predecessors
-                        .first()
-                        .map(|&p| plan.graph[p].name())
-                        .and_then(|pred_name| bound_output_layouts.get(pred_name));
-
-                    match sink {
-                        OutputSink::Captured(ref mut cap) => {
-                            // Correlation-key pre-DAG driver: buffer raw
-                            // records pending group success/failure. No
-                            // projection, no write — caller decides.
-                            let buf = cap.entry(name.clone()).or_default();
-                            for (record, rn, metadata) in &input_records {
-                                buf.push(CapturedRow {
-                                    record: record.clone(),
-                                    row_num: *rn,
-                                    metadata: metadata.clone(),
-                                });
-                            }
-                            collector.record(
-                                scan_timer
-                                    .finish(input_records.len() as u64, input_records.len() as u64),
-                            );
-                        }
-                        OutputSink::Streamed(ref mut writers) => {
-                            let output_schema = match (input_records.first(), layout) {
-                                (Some((rec, _, metadata)), Some(layout)) => {
-                                    let projected = {
-                                        let _guard = projection_timer.guard();
-                                        project_output_with_meta(rec, layout, metadata, out_cfg)
-                                    };
-                                    Arc::clone(projected.schema())
-                                }
-                                _ => {
-                                    // No records or no predecessor — nothing
-                                    // to write. Record the scan metric and
-                                    // continue.
-                                    collector.record(scan_timer.finish(0, 0));
-                                    continue;
-                                }
-                            };
-                            let layout = layout.expect(
-                                "Option W invariant: layout lookup succeeded \
-                                 above implies predecessor in bound_output_layouts",
-                            );
-
-                            if let Some(raw_writer) = writers.remove(name) {
-                                let mut csv_writer = build_format_writer(
-                                    out_cfg,
-                                    raw_writer,
-                                    Arc::clone(&output_schema),
-                                )?;
-                                collector.record(scan_timer.finish(1, 1));
-
-                                for (record, _rn, metadata) in &input_records {
-                                    let projected = {
-                                        let _guard = projection_timer.guard();
-                                        project_output_with_meta(record, layout, metadata, out_cfg)
-                                    };
-                                    {
-                                        let _guard = write_timer.guard();
-                                        csv_writer.write_record(&projected)?;
-                                    }
-                                }
-                                {
-                                    let _guard = write_timer.guard();
-                                    csv_writer.flush()?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                PlanNode::Composition { ref name, body, .. } => {
-                    // Composition runtime expansion deferred to Phase 16c.3.
-                    // For now, pass records through unchanged — the body is
-                    // lowered for --explain and property derivation only.
-                    debug_assert_ne!(
-                        body,
-                        crate::plan::composition_body::CompositionBodyId::SENTINEL,
-                        "composition {name:?}: body_id is sentinel — bind_composition did not run"
-                    );
-                    let predecessors: Vec<NodeIndex> = plan
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Incoming)
-                        .collect();
-                    let input_records = predecessors
-                        .iter()
-                        .find_map(|p| node_buffers.remove(p))
-                        .unwrap_or_default();
-                    node_buffers.insert(node_idx, input_records);
-                }
-            }
+        // Walk DAG in topological order. `topo_order` is cloned so
+        // the iterator does not hold a whole-struct immutable borrow
+        // of `plan` for the loop body — `&mut ctx` already borrows
+        // `ctx.current_dag` (which aliases `plan`) at the field
+        // granularity through every dispatcher call.
+        for node_idx in plan.topo_order.clone() {
+            dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
         }
+
+        // Take the pipeline-scoped TempDir out of the context. Held
+        // until the very end of the walk so any operator-side spill
+        // files survive the topo loop; dropped explicitly below
+        // after the metrics flush so the directory's recursive
+        // remove runs after every reader has gone away.
+        let pipeline_spill_root = ctx.spill_root().clone();
+
+        // Drain mutable per-walk state out of the context for the
+        // post-walk reporting + caller-facing return tuple.
+        let transform_timer = ctx.transform_timer;
+        let route_timer = ctx.route_timer;
+        let projection_timer = ctx.projection_timer;
+        let write_timer = ctx.write_timer;
+        let records_emitted = ctx.records_emitted;
+        let output_errors = ctx.output_errors;
+        let collector = ctx.collector;
+        *counters = ctx.counters;
+        *dlq_entries = ctx.dlq_entries;
 
         collector.record(transform_timer.finish(
             stage_metrics::StageName::TransformEval,
@@ -2184,6 +1407,24 @@ impl PipelineExecutor {
             records_emitted,
         ));
 
+        // Aggregate Output errors collected during the topo walk.
+        // Single error → bare error; ≥2 errors →
+        // `PipelineError::Multiple` (the DataFusion collection-pattern
+        // shape). Zero errors → fall through to Ok.
+        match output_errors.len() {
+            0 => {}
+            1 => return Err(output_errors.into_iter().next().unwrap()),
+            _ => return Err(PipelineError::Multiple(output_errors)),
+        }
+
+        // Release the pipeline-scoped TempDir Arc clone last; the
+        // directory drops once the original `ctx.spill_root` and
+        // this clone are both gone. Spill operators have already
+        // released their per-file `TempPath` handles by this point;
+        // any path the dispatcher couldn't drain still lives inside
+        // this directory, and its Drop now sweeps the filesystem.
+        drop(pipeline_spill_root);
+
         Ok((
             std::mem::take(counters),
             std::mem::take(dlq_entries),
@@ -2200,9 +1441,9 @@ impl PipelineExecutor {
         route_config: &crate::config::RouteConfig,
         emitted_fields: &[String],
     ) -> Result<CompiledRoute, PipelineError> {
-        let type_cols: IndexMap<String, Type> = emitted_fields
+        let type_cols: IndexMap<cxl::typecheck::QualifiedField, Type> = emitted_fields
             .iter()
-            .map(|f| (f.clone(), Type::Any))
+            .map(|f| (cxl::typecheck::QualifiedField::bare(f.as_str()), Type::Any))
             .collect();
         let type_schema = cxl::typecheck::Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
         let field_refs: Vec<&str> = emitted_fields.iter().map(|s| s.as_str()).collect();
@@ -2264,145 +1505,6 @@ impl PipelineExecutor {
         })
     }
 
-    /// Build lookup tables for all transforms that have a `lookup:` config.
-    ///
-    /// Extracts readers from the `readers` registry for each unique lookup source,
-    /// loads them into in-memory `LookupTable`s, and compiles the `where:` predicate
-    /// as a CXL filter evaluator. Returns a map from transform name → RuntimeLookup.
-    fn build_lookup_tables(
-        config: &PipelineConfig,
-        readers: &mut HashMap<String, Box<dyn Read + Send>>,
-        source_configs: &[crate::config::SourceConfig],
-    ) -> Result<HashMap<String, RuntimeLookup>, PipelineError> {
-        use crate::config::PipelineNode;
-        use crate::pipeline::lookup::LookupTable;
-
-        let mut lookup_tables: HashMap<String, RuntimeLookup> = HashMap::new();
-
-        // Walk nodes to find transforms with lookup config
-        for spanned in &config.nodes {
-            if let PipelineNode::Transform {
-                header,
-                config: body,
-            } = &spanned.value
-                && let Some(lookup_config) = &body.lookup
-            {
-                let transform_name = &header.name;
-                let source_name = &lookup_config.source;
-
-                // Find the source config for this lookup source
-                let source_cfg = source_configs
-                        .iter()
-                        .find(|s| s.name == *source_name)
-                        .ok_or_else(|| PipelineError::Config(
-                            crate::config::ConfigError::Validation(format!(
-                                "transform '{}' has lookup source '{}' which is not declared as a source node",
-                                transform_name, source_name,
-                            )),
-                        ))?;
-
-                // Extract the reader for this source
-                let reader = readers.remove(source_name).ok_or_else(|| {
-                    PipelineError::Config(crate::config::ConfigError::Validation(format!(
-                        "no reader registered for lookup source '{}'",
-                        source_name,
-                    )))
-                })?;
-
-                // Build format reader with schema coercion and load into LookupTable
-                let raw_reader = build_format_reader(source_cfg, reader)?;
-                let mut format_reader = wrap_with_schema_coercion(raw_reader, config, source_name)?;
-                let memory_limit = parse_memory_limit(config);
-                let table =
-                    LookupTable::build(source_name.clone(), &mut *format_reader, memory_limit)
-                        .map_err(|e| PipelineError::Compilation {
-                            transform_name: transform_name.clone(),
-                            messages: vec![e.to_string()],
-                        })?;
-
-                // Compile the where predicate as a CXL filter program.
-                // Collect field names from the primary source schema so the
-                // resolver can recognize bare field references. Qualified
-                // references (source.field) are resolved at runtime by the
-                // LookupResolver and don't need to be registered here.
-                // Normalize newlines to spaces so YAML block scalars
-                // (where: |) with line breaks between `and` clauses parse
-                // correctly — the CXL parser treats newlines as statement
-                // boundaries.
-                let where_expr = lookup_config.where_expr.replace('\n', " ");
-                let where_expr = where_expr.trim();
-                let filter_source = format!("filter {}", where_expr);
-                let parse_result = cxl::parser::Parser::parse(&filter_source);
-                if !parse_result.errors.is_empty() {
-                    return Err(PipelineError::Compilation {
-                        transform_name: transform_name.clone(),
-                        messages: parse_result
-                            .errors
-                            .iter()
-                            .map(|e| format!("lookup where parse error: {}", e.message))
-                            .collect(),
-                    });
-                }
-                // Collect field names from ALL source node schemas so
-                // the CXL resolver accepts bare field references from
-                // both the input source and the lookup source.
-                let mut field_names: Vec<String> = Vec::new();
-                for s in &config.nodes {
-                    if let PipelineNode::Source { config: body, .. } = &s.value {
-                        for col in &body.schema.columns {
-                            if !field_names.contains(&col.name) {
-                                field_names.push(col.name.clone());
-                            }
-                        }
-                    }
-                }
-                let field_refs: Vec<&str> = field_names.iter().map(|s| s.as_str()).collect();
-                let resolved = cxl::resolve::resolve_program(
-                    parse_result.ast,
-                    &field_refs,
-                    parse_result.node_count,
-                )
-                .map_err(|diags| PipelineError::Compilation {
-                    transform_name: transform_name.clone(),
-                    messages: diags
-                        .into_iter()
-                        .map(|d| format!("lookup where resolve error: {}", d.message))
-                        .collect(),
-                })?;
-                let schema_row = cxl::typecheck::Row::closed(
-                    indexmap::IndexMap::new(),
-                    cxl::lexer::Span::new(0, 0),
-                );
-                let typed = cxl::typecheck::type_check(resolved, &schema_row).map_err(|diags| {
-                    PipelineError::Compilation {
-                        transform_name: transform_name.clone(),
-                        messages: diags
-                            .iter()
-                            .map(|d| format!("lookup where type error: {}", d.message))
-                            .collect(),
-                    }
-                })?;
-                let typed = Arc::new(typed);
-                let equality_index =
-                    crate::pipeline::lookup::build_equality_index(&typed, source_name, &table);
-                let evaluator = ProgramEvaluator::new(typed, false);
-
-                lookup_tables.insert(
-                    transform_name.clone(),
-                    RuntimeLookup {
-                        table,
-                        where_evaluator: std::sync::Mutex::new(evaluator),
-                        on_miss: lookup_config.on_miss,
-                        match_mode: lookup_config.match_mode,
-                        equality_index,
-                    },
-                );
-            }
-        }
-
-        Ok(lookup_tables)
-    }
-
     /// Compile execution plan and return `--explain` output without reading data.
     ///
     /// Input files are NOT opened. Field names are extracted from CXL AST
@@ -2414,43 +1516,23 @@ impl PipelineExecutor {
 
     /// Compile execution plan and return the DAG for format-specific rendering.
     ///
-    /// Phase 16b Task 16b.9: drives `config.compile()` so the
-    /// stage-4.5 `bind_schema` pass produces the typed programs;
-    /// `--explain` no longer parses CXL twice.
+    /// `PipelineConfig::compile(&ctx)` is the single canonical compile
+    /// entry point. It produces a fully-enriched `ExecutionPlanDag` via
+    /// `bind_schema` (stage 4.5) and stage 5 lowering + enrichment.
+    /// Aggregate lowering reads `group_by_indices` from
+    /// `typed.field_types`, which is keyed by the upstream node's bound
+    /// `Row` — the same path the runtime executor uses, so `--explain`
+    /// matches runtime layout without needing live reader columns.
     pub(crate) fn explain_dag(
         config: &PipelineConfig,
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
-        // Phase 16b Task 16b.9 — compile-time typecheck via bind_schema.
-        // The validated plan gives us pre-typechecked `Arc<TypedProgram>`s
-        // per node; feed them straight into `ExecutionPlanDag::compile`
-        // (the full planner path that derives output projections,
-        // parallelism profiles, and physical properties) WITHOUT
-        // re-typechecking.
         let validated_plan = config
             .compile(&crate::config::CompileContext::default())
             .map_err(|diags| PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),
             })?;
-        let resolved_transforms_owned = crate::executor::build_transform_specs(config);
-        let compiled_refs: Vec<(&str, &TypedProgram)> = resolved_transforms_owned
-            .iter()
-            .map(|t| {
-                let typed = validated_plan
-                    .artifacts()
-                    .typed
-                    .get(&t.name)
-                    .expect("bind_schema must produce a typed program for every transform");
-                (t.name.as_str(), typed.as_ref())
-            })
-            .collect();
-        let plan = ExecutionPlanDag::compile(config, &compiled_refs).map_err(|e| {
-            PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: vec![e.to_string()],
-            }
-        })?;
-        Ok((plan, ()))
+        Ok((validated_plan.dag().clone(), ()))
     }
 }
 
@@ -2747,10 +1829,12 @@ fn build_writer_factory(
     include_header: Option<bool>,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_record::schema_def::FieldDef>>,
+    include_engine_stamped: bool,
 ) -> WriterFactory {
     match format {
         crate::config::OutputFormat::Csv(opts) => {
-            let csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            csv_config.include_engine_stamped = include_engine_stamped;
             if repeat_header {
                 let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
                 let call_count = Arc::new(AtomicU32::new(0));
@@ -2785,7 +1869,8 @@ fn build_writer_factory(
             }
         }
         crate::config::OutputFormat::Json(opts) => {
-            let json_config = build_json_writer_config(opts.as_ref());
+            let mut json_config = build_json_writer_config(opts.as_ref());
+            json_config.include_engine_stamped = include_engine_stamped;
             Box::new(move |counting_writer, schema| {
                 Ok(Box::new(JsonWriter::new(
                     counting_writer,
@@ -2795,7 +1880,8 @@ fn build_writer_factory(
             })
         }
         crate::config::OutputFormat::Xml(opts) => {
-            let xml_config = build_xml_writer_config(opts.as_ref());
+            let mut xml_config = build_xml_writer_config(opts.as_ref());
+            xml_config.include_engine_stamped = include_engine_stamped;
             Box::new(move |counting_writer, schema| {
                 Ok(Box::new(XmlWriter::new(
                     counting_writer,
@@ -2825,7 +1911,7 @@ fn build_writer_factory(
 ///
 /// For split outputs: creates a `SplittingWriter` with a file factory and writer factory.
 /// For non-split outputs: creates a single writer wrapped in `CountedFormatWriter`.
-fn build_format_writer(
+pub(crate) fn build_format_writer(
     output: &OutputConfig,
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
@@ -2843,6 +1929,7 @@ fn build_format_writer(
         output.include_header,
         repeat_header,
         field_defs,
+        output.include_correlation_keys,
     );
 
     if let Some(ref split) = output.split {
@@ -2911,7 +1998,7 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
     parent.join(filename).to_string_lossy().into_owned()
 }
 
-/// Build the pipeline-stable evaluation context (D59 / Task 16.3.13a).
+/// Build the pipeline-stable evaluation context.
 ///
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
 /// returned `StableEvalContext` is reused (via borrow) at every per-record
@@ -2938,119 +2025,232 @@ fn build_stable_eval_context(
     }
 }
 
-/// Extract the correlation-key value(s) from a record.
+/// Evaluate a single transform against a record, returning the
+/// modified record with emitted fields and metadata merged in.
 ///
-/// For a compound key (`CorrelationKey::Compound(["a", "b"])`) returns
-/// one `GroupByKey` per field. Missing or null values — as well as
-/// empty strings (CSV's null stand-in) — produce `GroupByKey::Null`.
+/// Used by the DAG-walking executor for per-node evaluation. The
+/// record schema is widened in-place (rebuilt onto a schema that
+/// includes every emitted field) so `Record::set` always hits a
+/// known slot. Downstream positional-index consumers (aggregation
+/// `group_by_indices`) rely on the upstream layout, so the widened
+/// schema preserves every upstream column at its original index.
 ///
-/// Re-instated from commit `74a06c7` as part of Option W Shortcut #2
-/// (correlation-key DLQ failure-domain batching).
-fn extract_correlation_key(
-    record: &Record,
-    correlation_key: &crate::config::CorrelationKey,
-) -> Vec<GroupByKey> {
-    let fields = correlation_key.fields();
-    fields
-        .iter()
-        .map(|field| match record.get(field) {
-            Some(value) if !value.is_null() => {
-                // Treat empty strings as null (CSV has no native null concept).
-                if let Value::String(s) = value
-                    && s.is_empty()
-                {
-                    return GroupByKey::Null;
-                }
-                match value_to_group_key(value, field, None, 0) {
-                    Ok(Some(gk)) => gk,
-                    Ok(None) => GroupByKey::Null,
-                    Err(_) => GroupByKey::Null,
-                }
-            }
-            _ => GroupByKey::Null,
-        })
-        .collect()
-}
-
-/// Format a compound group key for diagnostics (e.g., collateral DLQ
-/// messages, `CorrelationGroupOverflow` carriage).
-fn format_group_key(key: &[GroupByKey]) -> String {
-    key.iter()
-        .map(|k| format!("{k:?}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Option-W source widening: materialize a record onto the declared
-/// source schema. The reader-produced record's schema reflects what was
-/// in the file (possibly a subset of declared columns); this helper
-/// pads to the full declared schema positionally. Replaces the former
-/// `reproject_record(input, schema, &IndexMap::new())` source-arm call.
-fn widen_to_schema(input: &Record, target: &Arc<Schema>) -> Record {
-    if Arc::ptr_eq(input.schema(), target) {
-        return input.clone();
-    }
-    let values: Vec<Value> = target
-        .columns()
-        .iter()
-        .map(|c| input.get(c.as_ref()).cloned().unwrap_or(Value::Null))
-        .collect();
-    let mut rec = Record::new(Arc::clone(target), values);
-    if input.has_meta() {
-        for (k, v) in input.iter_meta() {
-            let _ = rec.set_meta(k, v.clone());
-        }
-    }
-    rec
-}
-
-/// Apply an eval result to a branch (Option-W positional). The
-/// evaluator's output `values: Vec<Value>` is positionally aligned to
-/// the producing node's `OutputLayout::schema`, which is passed in as
-/// `output_schema`.
-/// Evaluate a single transform against a record (Option-W positional).
-///
-/// The evaluator writes its output positionally into `values: Vec<Value>`
-/// aligned to the transform's bound output schema (`output_schema`).
-/// Callers materialize the output record via `Record::new(output_schema,
-/// values)` — no reprojection, no name lookups.
-///
-/// Returns `Ok((output_record, Ok(metadata)))` on emit,
-/// `Ok((input_clone, Err(SkipReason)))` on skip.
-/// On error, returns `(transform_name, EvalError)`.
-#[allow(clippy::type_complexity)]
-fn evaluate_single_transform(
+/// Returns `Ok((modified_record, Ok(())))` on emit,
+/// `Ok((record, Err(SkipReason)))` on skip. On error, returns
+/// `(transform_name, EvalError)`.
+pub(crate) fn evaluate_single_transform(
     record: &Record,
     transform_name: &str,
     evaluator: &mut ProgramEvaluator,
     ctx: &EvalContext,
-    output_schema: &Arc<Schema>,
-) -> Result<(Record, Result<IndexMap<String, Value>, SkipReason>), (String, cxl::eval::EvalError)> {
+    _output_schema: &Arc<Schema>,
+) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
+    let input = record;
     match evaluator
-        .eval_record::<NullStorage>(ctx, record, record, None)
+        .eval_record::<NullStorage>(ctx, input, None)
         .map_err(|e| (transform_name.to_string(), e))?
     {
-        EvalResult::Emit { values, metadata } => {
-            let mut out_record = Record::new(Arc::clone(output_schema), values);
-            if record.has_meta() {
-                for (k, v) in record.iter_meta() {
-                    let _ = out_record.set_meta(k, v.clone());
-                }
+        EvalResult::Emit {
+            fields: emitted,
+            metadata,
+        } => {
+            let mut out = record_with_emitted_fields(input, &emitted);
+            for (name, value) in &emitted {
+                out.set(name, value.clone());
             }
             for (key, value) in &metadata {
-                let _ = out_record.set_meta(key, value.clone());
+                let _ = out.set_meta(key, value.clone());
             }
-            Ok((out_record, Ok(metadata)))
+            Ok((out, Ok(())))
+        }
+        EvalResult::Skip(reason) => Ok((input.clone(), Err(reason))),
+    }
+}
+
+/// Same as [`evaluate_single_transform`] but threads a
+/// [`PartitionWindowContext`] derived from the per-source `arena` and
+/// `indices` so `$window.*` expressions resolve against the
+/// transform's analytic window. `window_index` indexes
+/// `plan.indices_to_build`; the matching [`SecondaryIndex`] is looked
+/// up via `indices[window_index]`.
+///
+/// `record_pos` is the record's arena position (zero-based). The
+/// caller derives it from `EvalContext::source_row - 1`, which holds
+/// because Phase-0 setup materializes records in arena order with
+/// `source_row = pos + 1` and intervening dispatcher arms preserve
+/// the row number through transform/route/merge buffers.
+///
+/// If the record's group-by values do not resolve to a partition
+/// (null in any group key, or no matching partition), the evaluator
+/// runs without a window context — matching the legacy inline arena
+/// path's behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_single_transform_windowed(
+    record: &Record,
+    transform_name: &str,
+    evaluator: &mut ProgramEvaluator,
+    ctx: &EvalContext,
+    plan: &ExecutionPlanDag,
+    window_index: usize,
+    arena: &Arena,
+    indices: &[SecondaryIndex],
+    record_pos: u32,
+) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
+    let spec = &plan.indices_to_build[window_index];
+    let index = &indices[window_index];
+
+    let key: Option<Vec<GroupByKey>> = spec
+        .group_by
+        .iter()
+        .map(|field| {
+            let val = record.get(field).cloned().unwrap_or(Value::Null);
+            value_to_group_key(&val, field, None, record_pos)
+                .ok()
+                .flatten()
+        })
+        .collect();
+
+    let result = if let Some(key) = key {
+        if let Some(partition) = index.get(&key) {
+            let pos_in_partition = partition.iter().position(|&p| p == record_pos).unwrap_or(0);
+            let wctx = PartitionWindowContext::new(arena, partition, pos_in_partition);
+            evaluator
+                .eval_record(ctx, record, Some(&wctx))
+                .map_err(|e| (transform_name.to_string(), e))?
+        } else {
+            evaluator
+                .eval_record::<Arena>(ctx, record, None)
+                .map_err(|e| (transform_name.to_string(), e))?
+        }
+    } else {
+        evaluator
+            .eval_record::<Arena>(ctx, record, None)
+            .map_err(|e| (transform_name.to_string(), e))?
+    };
+
+    match result {
+        EvalResult::Emit {
+            fields: emitted,
+            metadata,
+        } => {
+            let mut out = record_with_emitted_fields(record, &emitted);
+            for (name, value) in &emitted {
+                out.set(name, value.clone());
+            }
+            for (key, value) in &metadata {
+                let _ = out.set_meta(key, value.clone());
+            }
+            Ok((out, Ok(())))
         }
         EvalResult::Skip(reason) => Ok((record.clone(), Err(reason))),
     }
+}
+
+/// Re-project `input` onto `target`: allocate a fresh `Record` whose
+/// schema is `target`, copying over any upstream field that `target`
+/// still declares. Used at operator boundaries to canonicalize the
+/// `Arc<Schema>` on the Record so downstream `Arc::ptr_eq` checks hit
+/// the fast path.
+pub(crate) fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Record {
+    if Arc::ptr_eq(input.schema(), target) {
+        return input.clone();
+    }
+    let mut values: Vec<clinker_record::Value> = Vec::with_capacity(target.column_count());
+    for (i, col) in target.columns().iter().enumerate() {
+        let v = match input.get(col.as_ref()) {
+            Some(v) => v.clone(),
+            None => recover_engine_stamped_value(input, target, i, col.as_ref()),
+        };
+        values.push(v);
+    }
+    let mut out = Record::new(Arc::clone(target), values);
+    for (k, v) in input.iter_meta() {
+        let _ = out.set_meta(k, v.clone());
+    }
+    out
+}
+
+/// Recover an engine-stamped column's value when the input does not
+/// expose it under the target column name. The N-ary combine
+/// decomposition encodes intermediate-step columns as
+/// `__<qualifier>__<name>`, so a `$ck.<field>` snapshot column
+/// arrives at the final step's body construction under
+/// `__<driver>__$ck.<field>` rather than `$ck.<field>` directly.
+/// Walk the input schema for any column ending in `__<col>` and
+/// recover the value; otherwise default to `Value::Null` (the column
+/// remains an unstamped slot, matching the behavior for build sources
+/// that never declared the correlation-key field).
+fn recover_engine_stamped_value(
+    input: &Record,
+    target: &Arc<Schema>,
+    target_idx: usize,
+    target_col: &str,
+) -> clinker_record::Value {
+    let is_engine_stamped = target
+        .field_metadata(target_idx)
+        .is_some_and(|m| m.is_engine_stamped());
+    if !is_engine_stamped {
+        return clinker_record::Value::Null;
+    }
+    let suffix = format!("__{target_col}");
+    if let Some(j) = input
+        .schema()
+        .columns()
+        .iter()
+        .position(|n| n.as_ref().ends_with(&suffix))
+    {
+        return input.values()[j].clone();
+    }
+    clinker_record::Value::Null
+}
+
+/// Widen `input`'s schema in place to include every key in `emitted`
+/// that is not already declared. Allocates a fresh `Arc<Schema>` only
+/// when new names appear; otherwise clones `input`. Used by the legacy
+/// linear pipeline path where the emit set is determined at eval time
+/// rather than via a plan-time `output_schema`.
+fn record_with_emitted_fields(
+    input: &Record,
+    emitted: &IndexMap<String, clinker_record::Value>,
+) -> Record {
+    let mut missing: Vec<&str> = Vec::new();
+    for key in emitted.keys() {
+        if input.schema().index(key).is_none() {
+            missing.push(key.as_str());
+        }
+    }
+    if missing.is_empty() {
+        return input.clone();
+    }
+    let n = input.schema().column_count();
+    let mut builder = SchemaBuilder::with_capacity(n + missing.len());
+    // Preserve every existing column AND its `FieldMetadata`. Without
+    // explicit forwarding the engine-stamp annotation on `$ck.<field>`
+    // shadow columns is dropped and downstream readers (the buffer-key
+    // extractor at the Output arm, the projection fast path) treat the
+    // column as a user-declared one.
+    for i in 0..n {
+        let name = input
+            .schema()
+            .column_name(i)
+            .expect("column_name within column_count");
+        match input.schema().field_metadata(i) {
+            Some(meta) => builder = builder.with_field_meta(name, meta.clone()),
+            None => builder = builder.with_field(name),
+        }
+    }
+    for name in missing {
+        builder = builder.with_field(name);
+    }
+    let widened = builder.build();
+    widen_record_to_schema(input, &widened)
 }
 
 /// Parse memory limit from config (default 512MB).
 /// Plan-invariant predecessor lookup for nodes that require exactly one
 /// upstream input (currently `PlanNode::Aggregation`). Returns
 /// `PipelineError::Internal` on misshapen plans — never panics. Mirrors
-/// DataFusion's `internal_err!` macro per drill pass 7 D58.
+/// DataFusion's `internal_err!` macro.
 pub(crate) fn single_predecessor(
     plan: &ExecutionPlanDag,
     node_idx: petgraph::graph::NodeIndex,
@@ -3071,7 +2271,7 @@ pub(crate) fn single_predecessor(
     }
 }
 
-fn parse_memory_limit(config: &PipelineConfig) -> usize {
+pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
     config
         .pipeline
         .memory_limit
@@ -3089,13 +2289,66 @@ fn parse_memory_limit(config: &PipelineConfig) -> usize {
         .unwrap_or(512 * 1024 * 1024) // 512MB default
 }
 
-/// Runtime lookup context for a transform with `lookup:` config.
-/// Holds the in-memory reference table, compiled where-predicate
-/// evaluator, and match/miss policies.
-pub(crate) struct RuntimeLookup {
-    pub table: crate::pipeline::lookup::LookupTable,
-    pub where_evaluator: std::sync::Mutex<ProgramEvaluator>,
-    pub on_miss: crate::config::pipeline_node::OnMiss,
-    pub match_mode: crate::config::pipeline_node::MatchMode,
-    pub equality_index: Option<crate::pipeline::lookup::EqualityIndex>,
+#[cfg(test)]
+mod tests {
+    //! Executor-level tests — submodules below each target a specific
+    //! executor concern (aggregation dispatch, multi-output routing,
+    //! branching/DAG, format dispatch, correlated DLQ).
+    //!
+    //! Each submodule starts with `use super::*;` and expects the
+    //! executor's public-in-crate symbols (`PipelineExecutor`,
+    //! `PipelineRunParams`, `DlqEntry`, `CompiledRoute`, `PipelineError`,
+    //! etc.) plus a shared `run_test(yaml, csv)` helper (defined here).
+
+    use super::*;
+
+    /// Run a single-source, single-output pipeline with the given YAML
+    /// config and CSV input. Returns `(counters, dlq_entries, output_csv)`.
+    ///
+    /// This mirrors `integration_tests::run_pipeline` but lives inside
+    /// the `executor` module so submodules can reference it via
+    /// `crate::executor::tests::run_test`.
+    pub(super) fn run_test(
+        yaml: &str,
+        csv_input: &str,
+    ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+        let config = crate::config::parse_config(yaml).unwrap();
+        let output_buf = clinker_bench_support::io::SharedBuffer::new();
+
+        let primary = config.source_configs().next().unwrap().name.clone();
+        let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
+            primary.clone(),
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        )]);
+        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+            config.output_configs().next().unwrap().name.clone(),
+            Box::new(output_buf.clone()) as Box<dyn Write + Send>,
+        )]);
+
+        let pipeline_vars = config
+            .pipeline
+            .vars
+            .as_ref()
+            .map(crate::config::convert_pipeline_vars)
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "test-exec-id".to_string(),
+            batch_id: "test-batch-id".to_string(),
+            pipeline_vars,
+            shutdown_token: None,
+        };
+
+        let report = PipelineExecutor::run_with_readers_writers(
+            &config, &primary, readers, writers, &params,
+        )?;
+
+        let output = output_buf.as_string();
+        Ok((report.counters, report.dlq_entries, output))
+    }
+
+    mod aggregation;
+    mod branching;
+    mod correlated_dlq;
+    mod format_dispatch;
+    mod multi_output;
 }

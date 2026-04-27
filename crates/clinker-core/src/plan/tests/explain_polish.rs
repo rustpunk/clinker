@@ -1,4 +1,4 @@
-//! Task 16b.8 — `--explain` polish gate tests.
+//! `--explain` polish gate tests.
 //!
 //! These tests pin the contract for the enhanced `explain_text` output:
 //!   1. Route nodes render as a sibling line at their topo position,
@@ -24,46 +24,16 @@ use crate::plan::execution::*;
 /// path so `PlanNode::Aggregation` lowering is exercised. Mirrors
 /// `dag::compile_fixture` but honors aggregate-mode typecheck so
 /// group-by transforms lower correctly.
-fn compile_legacy(config: &PipelineConfig, fields: &[&str]) -> ExecutionPlanDag {
-    let transforms: Vec<_> = crate::executor::build_transform_specs(config);
-    let typed_programs: Vec<_> = transforms
-        .iter()
-        .map(|tc| compile_cxl_for_spec(tc, fields))
-        .collect();
-    let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
-        .iter()
-        .zip(typed_programs.iter())
-        .map(|(tc, tp)| (tc.name.as_str(), tp))
-        .collect();
-    ExecutionPlanDag::compile(config, &compiled_refs).unwrap()
-}
-
-fn compile_cxl_for_spec(
-    spec: &crate::executor::TransformSpec,
-    fields: &[&str],
-) -> cxl::typecheck::pass::TypedProgram {
-    let source = spec.cxl_source();
-    let parsed = cxl::parser::Parser::parse(source);
-    assert!(
-        parsed.errors.is_empty(),
-        "parse errors: {:?}",
-        parsed.errors
-    );
-    let resolved =
-        cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let cols: indexmap::IndexMap<String, cxl::typecheck::types::Type> = fields
-        .iter()
-        .map(|f| (f.to_string(), cxl::typecheck::types::Type::Any))
-        .collect();
-    let schema = cxl::typecheck::Row::closed(cols, cxl::lexer::Span::new(0, 0));
-    let mode = if let Some(agg) = &spec.aggregate {
-        cxl::typecheck::AggregateMode::GroupBy {
-            group_by_fields: agg.group_by.iter().cloned().collect(),
-        }
-    } else {
-        cxl::typecheck::AggregateMode::Row
-    };
-    cxl::typecheck::type_check_with_mode(resolved, &schema, mode).unwrap()
+fn compile_legacy(config: &PipelineConfig, _fields: &[&str]) -> ExecutionPlanDag {
+    // The canonical compile entry point produces the DAG directly.
+    // `bind_schema` inside `compile_with_diagnostics` typechecks every
+    // CXL body against author-declared source schemas, so test callers
+    // no longer need to pre-build typed programs.
+    config
+        .compile(&crate::config::CompileContext::default())
+        .expect("compile")
+        .dag()
+        .clone()
 }
 
 /// Fixture with a single aggregate node and an upstream source.
@@ -80,6 +50,7 @@ nodes:
       path: data.csv
       schema:
         - { name: amount, type: int }
+        - { name: dept, type: string }
 
   - type: aggregate
     name: by_dept

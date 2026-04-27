@@ -93,14 +93,32 @@ fn rss_bytes_impl() -> Option<u64> {
 /// Polled once per chunk at the start of Phase 2 processing.
 /// Streaming: RSS is the only signal. Blocking stage spill triggers
 /// (sort, distinct) are implemented in Phase 8.
+///
+/// `max_spill_bytes` adds an optional disk-spill quota distinct from
+/// the RSS hard limit: even when memory pressure is fine, an unbounded
+/// stream of spill files can still exhaust local disk. Operators that
+/// already poll `should_spill()` poll `record_spill_bytes()` after each
+/// spill commit; on overflow the operator surfaces E310 with a partition
+/// + spill-bytes diagnostic rather than continuing to fill the disk.
 pub struct MemoryBudget {
-    /// Total memory limit in bytes. Default: 512MB.
+    /// Total memory limit in bytes (the hard limit). Default: 512MB.
     pub limit: u64,
-    /// Fraction of limit at which spill triggers. Default: 0.60.
+    /// Fraction of limit at which proactive spill triggers (the soft limit).
+    /// Default: 0.80. Dual-threshold model: 80% soft / 100% hard / 20% spike
+    /// allowance — OTel Memory Limiter consensus.
     pub spill_threshold_pct: f64,
     /// Peak RSS observed across all `observe()` / `should_spill()` calls.
     /// `None` on platforms where RSS measurement is unavailable.
     pub peak_rss: Option<u64>,
+    /// Optional disk-spill quota in bytes. `u64::MAX` = unlimited.
+    /// Polled by spill operators alongside `should_spill()`. When
+    /// cumulative spill bytes exceed this value, the operator emits
+    /// E310 with a partition + spill-bytes diagnostic.
+    pub max_spill_bytes: u64,
+    /// Cumulative bytes written across all spill operators in this
+    /// pipeline run. Updated by callers via `record_spill_bytes()`.
+    /// Stays at zero until the first spill writer commits a file.
+    pub cumulative_spill_bytes: u64,
 }
 
 impl MemoryBudget {
@@ -109,13 +127,21 @@ impl MemoryBudget {
             limit,
             spill_threshold_pct,
             peak_rss: None,
+            max_spill_bytes: u64::MAX,
+            cumulative_spill_bytes: 0,
         }
     }
 
     /// Build from config memory_limit string ("512M", "2G", raw bytes).
+    ///
+    /// Uses the 0.80 default for `spill_threshold_pct` (dual-threshold model:
+    /// 80% soft / 100% hard / 20% spike allowance). `max_spill_bytes`
+    /// defaults to `u64::MAX` (unlimited disk quota); the surface is
+    /// not yet wired to a config field — callers that want a quota
+    /// set it directly on the constructed budget.
     pub fn from_config(memory_limit: Option<&str>) -> Self {
         let limit = parse_memory_limit_bytes(memory_limit);
-        Self::new(limit, 0.60)
+        Self::new(limit, 0.80)
     }
 
     /// Poll current RSS and update `peak_rss` if it exceeds the recorded peak.
@@ -138,6 +164,50 @@ impl MemoryBudget {
     /// Spill threshold in absolute bytes.
     pub fn spill_threshold_bytes(&self) -> u64 {
         (self.limit as f64 * self.spill_threshold_pct) as u64
+    }
+
+    /// Soft limit: point at which proactive spill begins.
+    /// Equals limit * spill_threshold_pct (default 0.80).
+    pub fn soft_limit(&self) -> u64 {
+        (self.limit as f64 * self.spill_threshold_pct) as u64
+    }
+
+    /// Hard limit: the absolute budget. RSS above this = abort.
+    pub fn hard_limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Spike allowance between soft and hard limits (default 20%).
+    pub fn spike_allowance(&self) -> u64 {
+        self.hard_limit() - self.soft_limit()
+    }
+
+    /// True when RSS exceeds hard limit. Check periodically in probe loops
+    /// (every 10K output records) to prevent unbounded fan-out.
+    pub fn should_abort(&mut self) -> bool {
+        self.observe();
+        self.peak_rss.is_some_and(|rss| rss > self.limit)
+    }
+
+    /// Disk-spill quota in bytes. `u64::MAX` indicates unlimited.
+    pub fn disk_quota(&self) -> u64 {
+        self.max_spill_bytes
+    }
+
+    /// Cumulative spill bytes recorded so far across every spill
+    /// operator polling this budget.
+    pub fn cumulative_spill_bytes(&self) -> u64 {
+        self.cumulative_spill_bytes
+    }
+
+    /// Add `n` bytes to the cumulative spill counter. Returns `true`
+    /// when the running total has exceeded `max_spill_bytes` — the
+    /// operator's signal to surface E310 instead of continuing to
+    /// write. Saturating-add keeps an overflowing pipeline from
+    /// wrapping back below the quota silently.
+    pub fn record_spill_bytes(&mut self, n: u64) -> bool {
+        self.cumulative_spill_bytes = self.cumulative_spill_bytes.saturating_add(n);
+        self.cumulative_spill_bytes > self.max_spill_bytes
     }
 }
 
@@ -193,8 +263,8 @@ mod tests {
 
     #[test]
     fn test_memory_budget_below_threshold() {
-        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
-        // Test process RSS should be well under 307MB (60% of 512MB)
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
+        // Test process RSS should be well under 410MB (80% of 512MB)
         if rss_bytes().is_some() {
             assert!(!budget.should_spill());
         }
@@ -203,7 +273,7 @@ mod tests {
     #[test]
     fn test_memory_budget_above_threshold() {
         // Budget of 1MB — any running process exceeds this
-        let mut budget = MemoryBudget::new(1024 * 1024, 0.60);
+        let mut budget = MemoryBudget::new(1024 * 1024, 0.80);
         if rss_bytes().is_some() {
             assert!(budget.should_spill());
         }
@@ -211,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_memory_budget_peak_rss_tracked() {
-        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.60);
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
         if rss_bytes().is_none() {
             return; // Skip on unsupported platforms
         }
@@ -230,7 +300,45 @@ mod tests {
     fn test_memory_budget_default_values() {
         let budget = MemoryBudget::from_config(None);
         assert_eq!(budget.limit, 512 * 1024 * 1024);
-        assert!((budget.spill_threshold_pct - 0.60).abs() < f64::EPSILON);
+        assert!((budget.spill_threshold_pct - 0.80).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_disk_quota_default_unlimited() {
+        let budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
+        assert_eq!(budget.disk_quota(), u64::MAX);
+        assert_eq!(budget.cumulative_spill_bytes(), 0);
+    }
+
+    #[test]
+    fn test_record_spill_bytes_under_quota() {
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
+        budget.max_spill_bytes = 1024;
+        assert!(!budget.record_spill_bytes(256));
+        assert_eq!(budget.cumulative_spill_bytes(), 256);
+        assert!(!budget.record_spill_bytes(512));
+        assert_eq!(budget.cumulative_spill_bytes(), 768);
+    }
+
+    #[test]
+    fn test_record_spill_bytes_overflows_quota() {
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
+        budget.max_spill_bytes = 1024;
+        assert!(!budget.record_spill_bytes(1024));
+        assert!(budget.record_spill_bytes(1));
+        assert_eq!(budget.cumulative_spill_bytes(), 1025);
+    }
+
+    #[test]
+    fn test_record_spill_bytes_saturates_on_overflow() {
+        // Saturating-add on a u64 counter: even an absurdly large
+        // accumulation cannot wrap below the configured quota and
+        // silently disable the gate.
+        let mut budget = MemoryBudget::new(512 * 1024 * 1024, 0.80);
+        budget.max_spill_bytes = 1024;
+        budget.cumulative_spill_bytes = u64::MAX - 10;
+        assert!(budget.record_spill_bytes(100));
+        assert_eq!(budget.cumulative_spill_bytes(), u64::MAX);
     }
 
     #[test]

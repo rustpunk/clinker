@@ -1,0 +1,43 @@
+# Error fixture (RESOLUTION EC-6): 3-part `Expr::QualifiedFieldRef`
+# (e.g. `a.b.c`) in a predicate hits `ColumnLookup::Unknown` →
+# E304 with a clear "unknown field" diagnostic. Combine does not
+# support nested / multi-record references at the where-clause level.
+#
+# C.1.2 gate test `test_combine_3part_ref_residual`.
+pipeline:
+  name: error_3part_ref
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: three_part
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id.nested == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+  - type: output
+    name: three_part_out
+    input: three_part
+    config:
+      name: three_part_out
+      type: csv
+      path: /tmp/error_3part_ref.csv

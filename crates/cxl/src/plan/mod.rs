@@ -1,10 +1,9 @@
 //! Plan-compile artifacts for CXL aggregate transforms.
 //!
-//! Task 16.3.3: this module defines the IR produced by
-//! `extract_aggregates` (Task 16.3.4) and consumed by the
-//! `PlanNode::Aggregation` executor dispatch arm (Task 16.3.13).
+//! This module defines the IR produced by `extract_aggregates` and consumed
+//! by the `PlanNode::Aggregation` executor dispatch arm.
 //!
-//! Design (drill 2026-04-06, decisions D1, D2, D9):
+//! Design:
 //! - Aggregate arguments are pre-classified as `BindingArg` so the hot
 //!   loop can dispatch `Field(idx)` in O(1) without re-walking the AST
 //!   for the 90% case (`sum(salary)`, `count(*)`). Composed arguments
@@ -15,18 +14,16 @@
 //!   `FieldRef` by `Expr::GroupKey`. At finalize time the residual is
 //!   evaluated in a scope where those leaves resolve against the
 //!   group's accumulator row and key tuple.
-//! - **NOT serde-derivable.** Per `RESEARCH-compiled-aggregate-spill-serde.md`
-//!   (2026-04-06), all twelve investigated prior-art systems — DataFusion,
-//!   Databend, Polars, Spark, DuckDB, Trino, ClickHouse, Beam, Flink, NiFi,
-//!   Kettle, Informatica — spill **only runtime state** (group keys +
-//!   accumulator bytes). The plan lives on the operator that authored the
-//!   spill and interprets the bytes on read-back. `CompiledAggregate` is
-//!   held in memory behind `Arc` on `PlanNode::Aggregation` with
-//!   `#[serde(skip)]`; the spill payload (Task 16.3.10) is
-//!   `[GroupByKey || AccumulatorRow || MetadataCommonTracker]`, all of
-//!   which are serde-derived in `clinker-record`. Keeping `Expr` serde-free
-//!   matches DataFusion's architectural decision (see
-//!   apache/arrow-datafusion#1832).
+//! - **NOT serde-derivable.** Prior-art systems (DataFusion, Databend,
+//!   Polars, Spark, DuckDB, Trino, ClickHouse, Beam, Flink, NiFi, Kettle,
+//!   Informatica) spill **only runtime state** (group keys + accumulator
+//!   bytes). The plan lives on the operator that authored the spill and
+//!   interprets the bytes on read-back. `CompiledAggregate` is held in
+//!   memory behind `Arc` on `PlanNode::Aggregation` with `#[serde(skip)]`;
+//!   the spill payload is `[GroupByKey || AccumulatorRow ||
+//!   MetadataCommonTracker]`, all of which are serde-derived in
+//!   `clinker-record`. Keeping `Expr` serde-free matches DataFusion's
+//!   architectural decision (see apache/arrow-datafusion#1832).
 
 use clinker_record::accumulator::AggregateType;
 

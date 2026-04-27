@@ -9,7 +9,7 @@ use std::sync::Arc;
 use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -276,19 +276,44 @@ impl<R: BufRead> XmlReader<R> {
         }
     }
 
-    /// Convert raw field pairs to a Record (Option-W: fields not
-    /// declared in the source schema are dropped).
-    fn fields_to_record(&self, fields: Vec<(String, String)>, schema: &Arc<Schema>) -> Record {
+    /// Convert raw field pairs to a Record, applying array_paths and type inference.
+    ///
+    /// Unknown elements (names absent from the declared schema) route to
+    /// `$meta.*` via `Record::set_meta`. The metadata map caps at 64
+    /// keys; the 65th key raises `FormatError::MetadataCapExceeded`
+    /// carrying the partial record so the executor can route it to DLQ.
+    fn fields_to_record(
+        &self,
+        fields: Vec<(String, String)>,
+        schema: &Arc<Schema>,
+    ) -> Result<Record, FormatError> {
         let mut values = vec![Value::Null; schema.column_count()];
+        let mut overflow: Vec<(String, Value)> = Vec::new();
 
         for (key, val) in fields {
             let value = infer_value(&val);
             if let Some(idx) = schema.index(&key) {
                 values[idx] = value;
+            } else {
+                overflow.push((key, value));
             }
         }
 
-        Record::new(Arc::clone(schema), values)
+        let mut record = Record::new(Arc::clone(schema), values);
+        let mut meta_count = 0usize;
+        for (key, val) in overflow {
+            match record.set_meta(&key, val) {
+                Ok(()) => meta_count += 1,
+                Err(_) => {
+                    return Err(FormatError::MetadataCapExceeded {
+                        record,
+                        key,
+                        count: meta_count,
+                    });
+                }
+            }
+        }
+        Ok(record)
     }
 }
 
@@ -302,7 +327,7 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
         let first = match first {
             Some(fields) => fields,
             None => {
-                let s = Arc::new(Schema::new(vec![]));
+                let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.done = true;
                 return Ok(s);
@@ -311,7 +336,7 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
 
         // Infer schema from first record's field names (preserving order)
         let mut seen = std::collections::HashSet::new();
-        let columns: Vec<Box<str>> = first
+        let schema = first
             .iter()
             .filter_map(|(k, _)| {
                 if seen.insert(k.clone()) {
@@ -320,12 +345,12 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
                     None
                 }
             })
-            .collect();
-        let schema = Arc::new(Schema::new(columns));
+            .collect::<SchemaBuilder>()
+            .build();
         self.schema = Some(Arc::clone(&schema));
 
         // Buffer the first record
-        self.pending = Some(self.fields_to_record(first, &schema));
+        self.pending = Some(self.fields_to_record(first, &schema)?);
 
         Ok(schema)
     }
@@ -342,7 +367,7 @@ impl<R: BufRead + Send> FormatReader for XmlReader<R> {
 
         let fields = self.read_next_record_raw()?;
         match fields {
-            Some(f) => Ok(Some(self.fields_to_record(f, &schema))),
+            Some(f) => Ok(Some(self.fields_to_record(f, &schema)?)),
             None => Ok(None),
         }
     }
@@ -542,5 +567,69 @@ mod tests {
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 0);
         assert!(r.next_record().unwrap().is_none());
+    }
+
+    /// XML elements absent from the inferred schema route to `$meta.*`
+    /// via `Record::set_meta`; `iter_all_fields()` (schema-only)
+    /// does not surface them.
+    #[test]
+    fn test_xml_reader_unknown_element_routes_to_meta() {
+        // The first record's element set seeds the inferred schema.
+        // The second record carries an extra `bonus` element that is
+        // absent from that schema — post-rip it lands in metadata.
+        let xml = r#"<Root>
+            <Items>
+                <Item><id>1</id><name>Alice</name></Item>
+                <Item><id>2</id><name>Bob</name><bonus>flagged</bonus></Item>
+            </Items>
+        </Root>"#;
+        let mut r = reader_from_str(xml, default_config_with_path("Root/Items/Item"));
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
+        assert_eq!(r2.get("bonus"), None);
+        assert_eq!(r2.get_meta("bonus"), Some(&Value::String("flagged".into())));
+        // iter_all_fields is schema-only; `bonus` does not appear.
+        assert!(
+            !r2.iter_all_fields().any(|(k, _)| k == "bonus"),
+            "iter_all_fields must not surface off-schema elements"
+        );
+    }
+
+    /// Reading XML with more than 64 unknown elements on one record
+    /// surfaces `FormatError::MetadataCapExceeded` carrying the
+    /// partial record + offending key + count, rather than silently
+    /// dropping. The Source task pattern-matches this error and
+    /// routes the record to DLQ.
+    #[test]
+    fn test_xml_reader_meta_cap_exceeded_surfaces_diagnostic() {
+        // Seed the inferred schema with a narrow first record (only
+        // `id`); the second record carries 65 elements absent from
+        // that schema — the 65th unknown triggers the cap.
+        let mut xml = String::from("<Root><Items><Item><id>1</id></Item><Item><id>2</id>");
+        for i in 0..65 {
+            xml.push_str(&format!("<extra_{i}>v{i}</extra_{i}>"));
+        }
+        xml.push_str("</Item></Items></Root>");
+        let mut r = reader_from_str(&xml, default_config_with_path("Root/Items/Item"));
+        let s = r.schema().unwrap();
+        assert_eq!(s.columns().len(), 1, "inferred schema should be just `id`");
+        let _r1 = r.next_record().unwrap().unwrap();
+        match r.next_record() {
+            Err(FormatError::MetadataCapExceeded { record, key, count }) => {
+                assert_eq!(count, 64, "cap captures exactly 64 keys before raising");
+                assert!(
+                    key.starts_with("extra_"),
+                    "offending key {key:?} should be an off-schema element"
+                );
+                assert!(
+                    record.schema().index("id").is_some(),
+                    "partial record must carry the schema field(s) captured pre-cap"
+                );
+            }
+            other => panic!("expected MetadataCapExceeded, got {other:?}"),
+        }
     }
 }

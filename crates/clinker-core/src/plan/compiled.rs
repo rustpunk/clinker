@@ -1,4 +1,4 @@
-//! Phase 16b — `CompiledPlan` newtype boundary.
+//! `CompiledPlan` newtype boundary.
 //!
 //! `CompiledPlan` is the typed-handle output of the
 //! [`crate::config::PipelineConfig::compile`] lowering path. It wraps
@@ -14,7 +14,7 @@ use super::execution::ExecutionPlanDag;
 use crate::config::PipelineConfig;
 use crate::config::composition::ProvenanceDb;
 
-/// Content-hash identity for a compiled channel overlay (LD-16c-18).
+/// Content-hash identity for a compiled channel overlay.
 ///
 /// Two plans with identical `ChannelIdentity` are byte-equivalent and
 /// do not need re-materialization (SQLMesh Virtual Environments model).
@@ -75,13 +75,13 @@ impl CompiledPlan {
     ///
     /// Returns `None` for nodes that didn't participate in `bind_schema`
     /// (e.g. compositions whose binding failed).
-    pub fn schema_for_node_name(&self, name: &str) -> Option<&Row> {
-        self.artifacts.bound_schemas.output_of(name)
+    pub fn typed_output_row(&self, name: &str) -> Option<&Row> {
+        self.artifacts.typed.get(name).map(|tp| &tp.output_row)
     }
 
     /// Side-table of provenance-tracked config values for composition nodes.
     /// Populated during `bind_schema`; consumed by the Kiln inspector and
-    /// channel overlay (16c.4).
+    /// channel overlay.
     pub fn provenance(&self) -> &ProvenanceDb {
         &self.artifacts.provenance
     }

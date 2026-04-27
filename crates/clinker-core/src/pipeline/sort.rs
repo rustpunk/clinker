@@ -23,7 +23,7 @@ pub fn sort_partition<S: RecordStorage>(
         if sf.null_order == Some(NullOrder::Drop) {
             positions.retain(|&pos| {
                 let val = storage.resolve_field(pos, &sf.field);
-                !val.as_ref().is_none_or(|v| v.is_null())
+                !val.is_none_or(|v| v.is_null())
             });
         }
     }
@@ -53,7 +53,7 @@ fn compare_records<S: RecordStorage>(
         let vb = storage.resolve_field(b, &sf.field);
         let null_order = sf.null_order.unwrap_or(NullOrder::Last);
 
-        let ord = compare_values_with_nulls(va.as_ref(), vb.as_ref(), sf.order, null_order);
+        let ord = compare_values_with_nulls(va, vb, sf.order, null_order);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -148,11 +148,11 @@ mod tests {
     }
 
     impl RecordStorage for TestStorage {
-        fn resolve_field(&self, index: u32, name: &str) -> Option<Value> {
+        fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
             let col = self.schema.index(name)?;
-            self.records.get(index as usize)?.get(col).cloned()
+            self.records.get(index as usize)?.get(col)
         }
-        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
             None
         }
         fn available_fields(&self, _: u32) -> Vec<&str> {

@@ -1,4 +1,4 @@
-//! `CompileContext` — per-compile-invocation input bag (LD-16c-12).
+//! `CompileContext` — per-compile-invocation input bag.
 //!
 //! Threads workspace root and future compile-time options through
 //! [`crate::config::PipelineConfig::compile`] without relying on
@@ -8,10 +8,10 @@
 //! (CLI flag, `.clinker.toml` discovery walk, or explicit argument) and
 //! pass the resulting context down. Tests use [`CompileContext::default`]
 //! which reads CWD at call time — a convenience that is explicitly not
-//! sanctioned for production callers per LD-16c-12.
+//! sanctioned for production callers.
 //!
 //! Field cap: 5. If growth pressure exceeds that, split the context
-//! per LD-16c-12's god-object guard rather than letting it sprawl.
+//! into purpose-specific bags rather than letting it sprawl.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 pub struct CompileContext {
     /// Absolute, canonicalized path to the workspace root.
     ///
-    /// Used by the Phase 1 `.comp.yaml` scanner and any future compile
+    /// Used by the `.comp.yaml` workspace scanner and any future compile
     /// stages that need filesystem-relative resolution. Production callers
     /// MUST resolve this once at the entry point.
     pub workspace_root: PathBuf,

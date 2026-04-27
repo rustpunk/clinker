@@ -1,0 +1,24 @@
+# Body whose Transform converts `value` to int. Used to verify a
+# transform error inside a composition body still propagates through
+# the deferred-commit Output buffer: the failing record is the trigger
+# and the surviving records of its correlation group DLQ as collaterals
+# across the composition boundary, leaving clean groups untouched.
+_compose:
+  name: correlated_validate
+  inputs:
+    inp:
+      schema:
+        - { name: employee_id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: validate
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: validate
+    input: inp
+    config:
+      cxl: |
+        emit employee_id = employee_id
+        emit val = value.to_int()

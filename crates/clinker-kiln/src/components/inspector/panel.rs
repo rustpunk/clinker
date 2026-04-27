@@ -26,9 +26,9 @@ pub fn InspectorPanel(stage_id: String) -> Element {
         return rsx! {};
     };
 
-    // Phase 16b Task 16b.5: dispatch inspector content on the
-    // `PipelineNode` variant tag. Every variant is handled explicitly so
-    // adding a new one is a compile break here.
+    // Dispatch inspector content on the `PipelineNode` variant tag. Every
+    // variant is handled explicitly so adding a new one is a compile break
+    // here.
     use clinker_core::config::PipelineNode;
     let Some(node_spanned) = config.nodes.iter().find(|n| n.value.name() == stage_id) else {
         return rsx! {};
@@ -70,6 +70,15 @@ pub fn InspectorPanel(stage_id: String) -> Element {
             "merge",
             format!("{} inputs", header.inputs.len()),
             None,
+        ),
+        PipelineNode::Combine {
+            header,
+            config: body,
+        } => (
+            "COMBINE",
+            "combine",
+            format!("{} inputs", header.input.len()),
+            Some(body.cxl.as_ref().to_string()),
         ),
         PipelineNode::Output { config: body, .. } => {
             ("OUTPUT", "output", body.output.path.clone(), None)

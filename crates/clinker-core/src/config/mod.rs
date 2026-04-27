@@ -26,14 +26,14 @@ use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
 ///
-/// Phase 16b Task 16b.7: only the unified `nodes:` YAML shape parses.
-/// Legacy top-level `inputs:`/`outputs:`/`transformations:` sections are
-/// rejected by serde at deserialization time.
+/// Only the unified `nodes:` YAML shape parses. Legacy top-level
+/// `inputs:`/`outputs:`/`transformations:` sections are rejected by
+/// serde at deserialization time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
-    /// Unified pipeline node taxonomy (Phase 16b). Each node carries its
+    /// Unified pipeline node taxonomy. Each node carries its
     /// YAML source span via the [`Spanned`] outer wrap.
     #[serde(skip_serializing)]
     pub nodes: Vec<Spanned<PipelineNode>>,
@@ -106,7 +106,7 @@ pub struct SourceConfig {
     /// Distinct from the CXL-type-level `SourceBody.schema` declared
     /// at the parent `SourceBody` scope — this one points at on-disk
     /// format metadata, the other declares column CXL types for
-    /// compile-time typecheck (Phase 16b Task 16b.9).
+    /// compile-time typecheck.
     #[serde(rename = "format_schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,6 +270,14 @@ pub struct OutputConfig {
     /// Default: none (metadata stripped from output).
     #[serde(default, skip_serializing_if = "IncludeMetadata::is_none")]
     pub include_metadata: IncludeMetadata,
+    /// Controls whether engine-stamped correlation snapshot columns
+    /// (`$ck.<field>`) appear in the default writer output. The shadow
+    /// columns preserve correlation-group identity through Transforms
+    /// that may rewrite the user-declared field; they are an internal
+    /// engine namespace and are stripped from output unless this flag
+    /// is set. Defaults to `false`.
+    #[serde(default)]
+    pub include_correlation_keys: bool,
     /// Explicit schema for output formats that require field definitions
     /// (e.g., fixed-width output needs field names, widths, and positions).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -712,12 +720,12 @@ impl<'de> Deserialize<'de> for TransformInput {
 /// User-supplied hint for aggregation execution strategy.
 ///
 /// `Auto` (default) lets the optimizer pick Hash vs Streaming based on
-/// upstream `OrderingProvenance` and the `qualifies_for_streaming` rules
-/// (see Task 16.4.6 / 16.4.9). `Hash` and `Streaming` are user overrides
-/// modeled on Informatica's `sorted_input` flag — `Streaming` is a
-/// declared performance contract: if the input is not provably sorted
-/// for the group-by keys, the planner hard-errors at compile time
-/// rather than silently inserting a sort (D78).
+/// upstream `OrderingProvenance` and the `qualifies_for_streaming` rules.
+/// `Hash` and `Streaming` are user overrides modeled on Informatica's
+/// `sorted_input` flag — `Streaming` is a declared performance contract:
+/// if the input is not provably sorted for the group-by keys, the
+/// planner hard-errors at compile time rather than silently inserting
+/// a sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateStrategyHint {
@@ -733,8 +741,8 @@ pub enum AggregateStrategyHint {
 
 /// Configuration for GROUP BY aggregation on a transform.
 ///
-/// Research: RESEARCH-aggregate-yaml-config.md — nested block is universal ETL
-/// pattern (Beam YAML Combine, SOPE group_by, Informatica Aggregator).
+/// Nested `aggregate:` block follows the universal ETL pattern (Beam YAML
+/// Combine, SOPE `group_by`, Informatica Aggregator).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregateConfig {
@@ -748,6 +756,30 @@ pub struct AggregateConfig {
     /// `select_aggregation_strategies` post-pass in 16.4.9.
     #[serde(default)]
     pub strategy: AggregateStrategyHint,
+}
+
+/// User-supplied hint for combine execution strategy.
+///
+/// `Auto` (default) lets [`crate::plan::combine::select_combine_strategies`]
+/// pick from predicate shape and cardinality estimates. `GraceHash` is a
+/// user override that forces the disk-spilling partitioned hash join even
+/// when cardinality estimates are absent or below the soft-limit threshold
+/// — useful for benchmarks and for production pipelines where the user
+/// knows the build side does not fit in memory.
+///
+/// Mirrors [`AggregateStrategyHint`] in shape. `GraceHash` only applies to
+/// pure-equi predicates; the planner ignores the hint on mixed equi+range
+/// or pure-range nodes, where partition-IEJoin / IEJoin / SortMerge remain
+/// the correct strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CombineStrategyHint {
+    /// Optimizer picks the strategy (default).
+    #[default]
+    Auto,
+    /// Force grace hash join — disk-spilling partitioned hash. Applies
+    /// only to pure-equi predicates; ignored otherwise.
+    GraceHash,
 }
 
 /// A declarative validation attached to a transform.
@@ -827,8 +859,8 @@ pub enum LogLevel {
     Error,
 }
 
-/// Phase 16b Wave 4ab D3a — lightweight read-only view over a
-/// transform-like node (`Transform`, `Aggregate`, `Route`) yielded by
+/// Lightweight read-only view over a transform-like node
+/// (`Transform`, `Aggregate`, `Route`) yielded by
 /// [`PipelineConfig::transform_views`]. Carries the fields the Kiln IDE
 /// and schema-validation passes need; callers that need variant-specific
 /// bodies (`TransformBody`, `AggregateBody`, etc.) should walk
@@ -856,7 +888,7 @@ impl<'a> TransformView<'a> {
 }
 
 impl PipelineConfig {
-    /// Phase 16b Wave 4ab D3a — public iterator over source nodes.
+    /// Public iterator over source nodes.
     pub fn source_configs(&self) -> impl Iterator<Item = &SourceConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
             PipelineNode::Source { config: body, .. } => Some(&body.source),
@@ -864,7 +896,7 @@ impl PipelineConfig {
         })
     }
 
-    /// Phase 16b Wave 4ab D3a — public iterator over output nodes.
+    /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
             PipelineNode::Output { config: body, .. } => Some(&body.output),
@@ -982,19 +1014,18 @@ impl PipelineConfig {
             .count()
     }
 
-    /// Phase 16b Wave 1: validation pre-pass over the unified `nodes:`
-    /// taxonomy. Runs the four name/topology stages in fixed order,
-    /// accumulating diagnostics:
+    /// Validation pre-pass over the unified `nodes:` taxonomy. Runs the
+    /// four name/topology stages in fixed order, accumulating diagnostics:
     ///
     ///   1. Duplicate names (`E001` exact dup, `W002` case-only dup)
     ///   2. Self-loops (`E002`)
     ///   3. General cycles (`E003` via `tarjan_scc`)
     ///   4. Path validation (delegates to `security::validate_all_config_paths`)
     ///
-    /// Stage 5 (per-variant lowering to `PlanNode`) is Wave 2 work and
-    /// is intentionally omitted here. This method returns either an
-    /// empty diagnostics vector (the unified topology is consistent)
-    /// or a populated one (caller decides whether to abort).
+    /// Stage 5 (per-variant lowering to `PlanNode`) is intentionally
+    /// omitted here. This method returns either an empty diagnostics
+    /// vector (the unified topology is consistent) or a populated one
+    /// (caller decides whether to abort).
     ///
     /// Stages run to completion and append rather than short-circuit,
     /// matching the rustc `Session::has_errors` pattern. Self-loops
@@ -1071,12 +1102,21 @@ impl PipelineConfig {
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
                 | PipelineNode::Composition { header, .. } => {
-                    if input_target(&header.input) == name {
+                    if input_target(&header.input.value) == name {
                         self_ref = true;
                     }
                 }
                 PipelineNode::Merge { header, .. } => {
-                    if header.inputs.iter().any(|i| input_target(i) == name) {
+                    if header.inputs.iter().any(|i| input_target(&i.value) == name) {
+                        self_ref = true;
+                    }
+                }
+                PipelineNode::Combine { header, .. } => {
+                    if header
+                        .input
+                        .values()
+                        .any(|i| input_target(&i.value) == name)
+                    {
                         self_ref = true;
                     }
                 }
@@ -1105,14 +1145,22 @@ impl PipelineConfig {
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. }
                 | PipelineNode::Composition { header, .. } => {
-                    let producer = input_target(&header.input);
+                    let producer = input_target(&header.input.value);
                     if producer != consumer && graph.index_of(producer).is_some() {
                         graph.add_edge(producer, consumer);
                     }
                 }
                 PipelineNode::Merge { header, .. } => {
                     for i in &header.inputs {
-                        let producer = input_target(i);
+                        let producer = input_target(&i.value);
+                        if producer != consumer && graph.index_of(producer).is_some() {
+                            graph.add_edge(producer, consumer);
+                        }
+                    }
+                }
+                PipelineNode::Combine { header, .. } => {
+                    for i in header.input.values() {
+                        let producer = input_target(&i.value);
                         if producer != consumer && graph.index_of(producer).is_some() {
                             graph.add_edge(producer, consumer);
                         }
@@ -1129,9 +1177,18 @@ impl PipelineConfig {
             ));
         }
 
+        // ── Stage 3.5: unified input-reference resolution (E004) ────
+        // A single pass walks every node's declared input(s), looks them
+        // up in the unified node-name table, and emits E004 with a
+        // structured payload for each undeclared reference (covering
+        // both standalone-node and combine-arm references with one code).
+        //
+        // This pass runs BEFORE bind_schema so undeclared-input
+        // diagnostics surface even when a sibling node has a CXL
+        // error that would otherwise short-circuit the compile.
+        resolve_all_input_references(&self.nodes, &mut diags);
+
         // ── Stage 4: path validation ────────────────────────────────
-        // Wave 1 reuses 16b.1.5's `validate_all_config_paths` against
-        // the legacy projection. Wave 2 walks `nodes:` directly.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let allow_absolute =
             ctx.allow_absolute_paths || std::env::var("CLINKER_ALLOW_ABSOLUTE_PATHS").is_ok();
@@ -1204,22 +1261,15 @@ impl PipelineConfig {
         diags
     }
 
-    /// Phase 16b Wave 2 — parallel stage-5 lowering path.
+    /// Compile `self.nodes` into a [`crate::plan::CompiledPlan`].
     ///
-    /// Walks `self.nodes` (the unified `nodes:` taxonomy ONLY — legacy
-    /// `inputs:`/`outputs:`/`transformations:` are ignored here) and
-    /// builds a [`crate::plan::CompiledPlan`]. The returned plan wraps
-    /// an [`crate::plan::execution::ExecutionPlanDag`] populated with
+    /// Walks the unified `nodes:` taxonomy and builds a
+    /// [`crate::plan::CompiledPlan`] wrapping an
+    /// [`crate::plan::execution::ExecutionPlanDag`] populated with
     /// enriched [`crate::plan::execution::PlanNode`] variants whose
     /// `span` fields point back into the originating YAML document and
     /// whose `resolved` payloads carry the fully-resolved per-variant
     /// configuration.
-    ///
-    /// Wave 2 lives alongside the legacy
-    /// [`crate::plan::execution::ExecutionPlanDag::compile`] entry-point;
-    /// the executor signature is unchanged. Wave 3 cuts the executor
-    /// over to consume `&CompiledPlan` exclusively and deletes the
-    /// legacy planner.
     ///
     /// On error, returns the accumulated diagnostics from the topology
     /// pre-pass plus any per-variant lowering errors. Composition binding
@@ -1264,7 +1314,7 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        // Stage 4.4: Phase 16c.1 Task 16c.1.3 — workspace composition scan.
+        // Stage 4.4: workspace composition scan.
         // If this pipeline has any composition nodes, scan the workspace
         // root resolved in `ctx` for `.comp.yaml` signatures and append
         // any scan-level diagnostics (E101) to the compile diagnostics
@@ -1272,8 +1322,8 @@ impl PipelineConfig {
         // non-composition tests and benches are not coupled to workspace
         // fixture validity.
         //
-        // The resulting symbol table is built and dropped here — Phase 2
-        // body resolution (16c.2) will carry it forward onto CompiledPlan.
+        // The resulting symbol table is built and dropped here — body
+        // resolution carries it forward onto CompiledPlan.
         let has_compositions = self
             .nodes
             .iter()
@@ -1296,20 +1346,21 @@ impl PipelineConfig {
             indexmap::IndexMap::new()
         };
 
-        // Stage 4.5: Phase 16b Task 16b.9 — compile-time CXL typecheck.
+        // Stage 4.5: compile-time CXL typecheck.
         // Walks `self.nodes` in declaration order (topologically sound
         // per stage-3 validation), seeds each source's schema from its
         // author-declared `schema:` block, and typechecks every
         // CXL-bearing node against the propagated upstream schema.
-        // E200 diagnostics surface here with per-node spans.
-        // Phase 16c.2: also recurses into composition bodies via
-        // bind_composition, populating CompileArtifacts.composition_bodies.
-        let artifacts = crate::plan::bind_schema::bind_schema(
+        // E200 diagnostics surface here with per-node spans. Also
+        // recurses into composition bodies via bind_composition,
+        // populating CompileArtifacts.composition_bodies.
+        let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
             ctx,
             &symbol_table,
             &ctx.pipeline_dir,
+            self.error_handling.correlation_key.as_ref(),
         );
         // Only abort on non-composition CXL errors (E200/E201). Composition
         // binding errors (E102–E109) are non-fatal for the rest of the
@@ -1322,22 +1373,192 @@ impl PipelineConfig {
             return Err(diags);
         }
 
-        // ── Stage 5: per-variant lowering ───────────────────────────
+        // ── Stage 5: per-variant lowering + enrichment ─────────────
+        //
+        // The lowering step produces a structurally complete
+        // `ExecutionPlanDag` that the executor can run without
+        // re-compilation. Per-variant lowering gets its enrichment
+        // inputs (analyzer report, window configs, dedup'd indices)
+        // from the helpers below, all of which were previously only
+        // exercised by the deleted
+        // `ExecutionPlanDag::compile_with_runtime_schema` path — the
+        // two compile sites have converged onto this one.
+        let source_configs: Vec<crate::config::SourceConfig> =
+            self.source_configs().cloned().collect();
+        let output_configs: Vec<crate::config::OutputConfig> =
+            self.output_configs().cloned().collect();
+        let primary_source: String = source_configs
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+
+        // Harvest planner entries (name + analytic_window) directly off
+        // Transform/Aggregate/Route nodes in declaration order. The
+        // resulting `entries` array is parallel to `window_configs`;
+        // its index is reused as the `transform_index` in raw index
+        // requests and the `spec_idx` lookup below feeds `LoweringCtx`.
+        // Source/Output/Merge/Composition/Combine variants do not
+        // contribute (they don't carry `analytic_window` or CXL
+        // programs the analyzer pass would consume).
+        struct PlannerEntry {
+            name: String,
+            analytic_window: Option<serde_json::Value>,
+        }
+        let entries: Vec<PlannerEntry> = self
+            .nodes
+            .iter()
+            .filter_map(|spanned| match &spanned.value {
+                PipelineNode::Transform {
+                    header,
+                    config: body,
+                } => Some(PlannerEntry {
+                    name: header.name.clone(),
+                    analytic_window: body.analytic_window.clone(),
+                }),
+                PipelineNode::Aggregate { header, .. } => Some(PlannerEntry {
+                    name: header.name.clone(),
+                    analytic_window: None,
+                }),
+                PipelineNode::Route { header, .. } => Some(PlannerEntry {
+                    name: header.name.clone(),
+                    analytic_window: None,
+                }),
+                PipelineNode::Source { .. }
+                | PipelineNode::Output { .. }
+                | PipelineNode::Merge { .. }
+                | PipelineNode::Composition { .. }
+                | PipelineNode::Combine { .. } => None,
+            })
+            .collect();
+        let mut entries_by_name: HashMap<String, usize> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            entries_by_name.insert(e.name.clone(), i);
+        }
+        let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = entries
+            .iter()
+            .filter_map(|e| {
+                artifacts
+                    .typed
+                    .get(&e.name)
+                    .map(|tp| (e.name.as_str(), tp.as_ref()))
+            })
+            .collect();
+        let report = cxl::analyzer::analyze_all(&compiled_refs);
+        // Keep an analysis-by-name index so we can surface the analysis
+        // alongside its matching entry regardless of filter order.
+        let mut analysis_by_name: HashMap<String, &cxl::analyzer::TransformAnalysis> =
+            HashMap::new();
+        for a in &report.transforms {
+            analysis_by_name.insert(a.name.clone(), a);
+        }
+        let window_configs: Vec<Option<crate::plan::index::LocalWindowConfig>> = entries
+            .iter()
+            .map(|e| crate::plan::index::parse_analytic_window_value(&e.analytic_window, &e.name))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                vec![Diagnostic::error(
+                    "E003",
+                    format!("analytic_window parse error: {e}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                )]
+            })?;
+        // Validate: if a transform uses window.* but has no local_window, error.
+        for (i, analysis) in report.transforms.iter().enumerate() {
+            if !analysis.window_calls.is_empty() {
+                let entry_idx = entries_by_name.get(&analysis.name).copied().unwrap_or(i);
+                if window_configs
+                    .get(entry_idx)
+                    .map(|w| w.is_none())
+                    .unwrap_or(true)
+                {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "transform '{}' uses window.* functions but declares no local_window",
+                            analysis.name
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+            }
+        }
+        // Build raw index requests + deduplicate.
+        let mut raw_index_requests: Vec<crate::plan::index::RawIndexRequest> = Vec::new();
+        for (i, wc_opt) in window_configs.iter().enumerate() {
+            if let Some(wc) = wc_opt {
+                let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
+                if !source_configs.iter().any(|inp| inp.name == source) {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "transform '{}' references unknown source '{}' in local_window",
+                            entries[i].name, source
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+                let mut arena_fields: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for gb in &wc.group_by {
+                    arena_fields.insert(gb.clone());
+                }
+                for sf in &wc.sort_by {
+                    arena_fields.insert(sf.field.clone());
+                }
+                for f in &report.transforms[i].accessed_fields {
+                    arena_fields.insert(f.clone());
+                }
+                let already_sorted = crate::plan::execution::check_already_sorted(
+                    &source_configs,
+                    &source,
+                    &wc.sort_by,
+                );
+                raw_index_requests.push(crate::plan::index::RawIndexRequest {
+                    source,
+                    group_by: wc.group_by.clone(),
+                    sort_by: wc.sort_by.clone(),
+                    arena_fields: arena_fields.into_iter().collect(),
+                    already_sorted,
+                    transform_index: i,
+                });
+            }
+        }
+        let indices = crate::plan::index::deduplicate_indices(raw_index_requests);
+        // Build source DAG + output projections.
+        let source_dag = crate::plan::execution::build_source_dag(
+            &source_configs,
+            &window_configs,
+            &primary_source,
+        )
+        .map_err(|e| {
+            vec![Diagnostic::error(
+                "E003",
+                format!("source DAG construction failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            )]
+        })?;
+        let output_projections: Vec<crate::plan::execution::OutputSpec> = output_configs
+            .iter()
+            .map(|o| crate::plan::execution::OutputSpec {
+                name: o.name.clone(),
+                mapping: o.mapping.clone().unwrap_or_default(),
+                exclude: o.exclude.clone().unwrap_or_default(),
+                include_unmapped: o.include_unmapped,
+            })
+            .collect();
+
         let mut graph = DiGraph::<PlanNode, PlanEdge>::new();
         let mut name_to_idx: HashMap<String, NodeIndex> = HashMap::new();
 
-        // Phase 1: insert one PlanNode per source spanned-PipelineNode.
-        // Aggregate variants are deferred to Wave 3 (require CXL
-        // type-checking) — they emit a TODO diagnostic and are skipped.
+        // Phase 1: insert one PlanNode per spanned-PipelineNode.
+        // Transform + Aggregate variants draw their enrichment from
+        // the analyzer report / window configs / indices built above;
+        // other variants ignore the LoweringCtx fields.
         for spanned in &self.nodes {
             // Thread the real source line number off the saphyr
-            // `Spanned<PipelineNode>::referenced` Location. We do not
-            // yet have a `SourceDb`/`FileId` threaded through
-            // `compile()` (that lands when the CLI parses via a helper
-            // that interns into a SourceDb, Phase 16c), so we encode
-            // the line via `Span::line_only` — a synthetic span whose
-            // `start` field carries the 1-based line number.
-            //
+            // `Spanned<PipelineNode>::referenced` Location.
             // (c) If saphyr did not capture a line (the documented
             // tagged-enum + flatten edge case), fall back to
             // `Span::SYNTHETIC`.
@@ -1349,14 +1570,15 @@ impl PipelineConfig {
             };
             let node = &spanned.value;
             let name = node.name().to_string();
-            let plan_node = lower_node_to_plan_node(
-                node,
-                &name,
-                span,
-                &artifacts,
-                LowerScope::TopLevel,
-                &mut diags,
-            );
+            let entry_idx = entries_by_name.get(&name).copied();
+            let lowering_ctx = LoweringCtx {
+                analysis: analysis_by_name.get(name.as_str()).copied(),
+                window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
+                indices: &indices,
+                primary_source: primary_source.as_str(),
+            };
+            let plan_node =
+                lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
             if let Some(pn) = plan_node {
                 let idx = graph.add_node(pn);
                 name_to_idx.insert(name, idx);
@@ -1364,41 +1586,67 @@ impl PipelineConfig {
         }
 
         // Phase 2: wire edges from each consumer's input(s) to itself.
+        // Undeclared producer references were already diagnosed by the
+        // unified `resolve_all_input_references` pass at stage 3.5.
+        // This loop only adds graph edges; missing producers are
+        // silently skipped here because the diagnostic has already fired.
+        fn strip_port_for_edge(r: &str) -> &str {
+            r.split('.').next().unwrap_or(r)
+        }
         for spanned in &self.nodes {
             let node = &spanned.value;
             let consumer_name = node.name();
             let Some(&consumer_idx) = name_to_idx.get(consumer_name) else {
                 continue;
             };
+            let mut wire = |producer_full: &str, port: Option<String>| {
+                let producer_key = strip_port_for_edge(producer_full);
+                if let Some(&producer_idx) = name_to_idx.get(producer_key) {
+                    graph.add_edge(
+                        producer_idx,
+                        consumer_idx,
+                        PlanEdge {
+                            dependency_type: DependencyType::Data,
+                            port,
+                        },
+                    );
+                }
+            };
             match node {
-                PipelineNode::Source { .. } | PipelineNode::Composition { .. } => {}
+                PipelineNode::Source { .. } => {}
                 PipelineNode::Transform { header, .. }
                 | PipelineNode::Aggregate { header, .. }
                 | PipelineNode::Route { header, .. }
                 | PipelineNode::Output { header, .. } => {
-                    let producer = input_target(&header.input);
-                    if let Some(&producer_idx) = name_to_idx.get(producer) {
-                        graph.add_edge(
-                            producer_idx,
-                            consumer_idx,
-                            PlanEdge {
-                                dependency_type: DependencyType::Data,
-                            },
-                        );
+                    wire(&input_full_reference(&header.input.value), None);
+                }
+                PipelineNode::Composition {
+                    inputs: call_inputs,
+                    ..
+                } => {
+                    // Composition's named-port `inputs:` map is the
+                    // authoritative call-site binding. Each entry
+                    // produces one port-tagged incoming edge — the
+                    // dispatcher walks live incoming edges and reads
+                    // the tag at composition entry to harvest
+                    // per-port records. `header.input:` is YAML-shape
+                    // obligation on the shared `NodeHeader` struct
+                    // and adds no information beyond what `inputs:`
+                    // already covers (every required port is
+                    // validated to be present in `inputs:` per E104),
+                    // so it does not produce its own edge.
+                    for (port_name, upstream) in call_inputs {
+                        wire(upstream, Some(port_name.clone()));
                     }
                 }
                 PipelineNode::Merge { header, .. } => {
                     for inp in &header.inputs {
-                        let producer = input_target(inp);
-                        if let Some(&producer_idx) = name_to_idx.get(producer) {
-                            graph.add_edge(
-                                producer_idx,
-                                consumer_idx,
-                                PlanEdge {
-                                    dependency_type: DependencyType::Data,
-                                },
-                            );
-                        }
+                        wire(&input_full_reference(&inp.value), None);
+                    }
+                }
+                PipelineNode::Combine { header, .. } => {
+                    for node_input in header.input.values() {
+                        wire(&input_full_reference(&node_input.value), None);
                     }
                 }
             }
@@ -1422,40 +1670,268 @@ impl PipelineConfig {
             }
         };
 
-        // Sort enforcer adaptation: Wave 2 lowering does not yet derive
-        // `RequiresSortedInput` requirements (those come from the CXL
-        // analyzer which Wave 3 plumbs in), so the enforcer pass is a
-        // structural no-op here. The hook is wired so Wave 3 can flip
-        // it on without re-shaping the lowering pipeline.
-        // (Equivalent to legacy `insert_enforcer_sorts` over an empty
-        // requirement set.)
+        // Per-transform parallelism profile. Derived by walking the
+        // topo order; Transform nodes contribute their `parallelism_class`,
+        // everything else is skipped.
+        let parallelism = ParallelismProfile {
+            per_transform: topo_order
+                .iter()
+                .filter_map(|&idx| match &graph[idx] {
+                    PlanNode::Transform {
+                        parallelism_class, ..
+                    } => Some(*parallelism_class),
+                    _ => None,
+                })
+                .collect(),
+            worker_threads: self
+                .pipeline
+                .concurrency
+                .as_ref()
+                .and_then(|c| c.threads)
+                .unwrap_or(4),
+        };
 
-        let dag = ExecutionPlanDag {
+        let mut dag = ExecutionPlanDag {
             graph,
             topo_order,
-            source_dag: Vec::new(),
-            indices_to_build: Vec::new(),
-            output_projections: Vec::new(),
-            parallelism: ParallelismProfile {
-                per_transform: Vec::new(),
-                worker_threads: self
-                    .pipeline
-                    .concurrency
-                    .as_ref()
-                    .and_then(|c| c.threads)
-                    .unwrap_or(4),
-            },
-            correlation_sort_note: None,
+            source_dag,
+            indices_to_build: indices,
+            output_projections,
+            parallelism,
             node_properties: HashMap::new(),
-            // CompiledPlan's lowering path is a thin bind_schema-stage
-            // synthesis used only for composition/config validation
-            // preview (no CXL execution). It does not seed runtime
-            // `output_layouts`; the real path is
-            // `ExecutionPlanDag::compile_with_bound_schemas` at
-            // execute time, which takes the bind-time layouts map as
-            // input and augments it with synthesized-node inheritance.
-            output_layouts: HashMap::new(),
         };
+
+        // ── Enrichment pipeline ─────────────────────────────────────
+        let inputs_map: HashMap<String, crate::config::SourceConfig> = source_configs
+            .iter()
+            .map(|i| (i.name.clone(), i.clone()))
+            .collect();
+        // Pipeline-level correlation-sort injection runs before the
+        // operator-level enforcer pass so the latter sees the
+        // correlation sort already in place. The correlation pass is
+        // a no-op when `error_handling.correlation_key` is unset.
+        if let Err(e) = dag.inject_correlation_sort(&self.error_handling, &source_configs) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("correlation-sort injection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        if let Err(e) = dag.insert_enforcer_sorts(&inputs_map) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("enforcer-sort insertion failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        // Enforcer insertion may have grown the graph; re-derive topo
+        // + tiers before property derivation walks it.
+        dag.topo_order = match petgraph::algo::toposort(&dag.graph, None) {
+            Ok(order) => order,
+            Err(cycle) => {
+                let cycle_path =
+                    crate::plan::execution::extract_cycle_path(&dag.graph, cycle.node_id());
+                diags.push(Diagnostic::error(
+                    "E003",
+                    format!("cycle detected post-enforcer-insertion: {cycle_path}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            }
+        };
+        crate::plan::execution::assign_tiers(&mut dag.graph, &dag.topo_order);
+        if let Err(e) = dag.compute_node_properties(&inputs_map) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("node property derivation failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        // Aggregation-strategy post-pass: resolves the user `strategy`
+        // hint on each `PlanNode::Aggregation` against upstream
+        // `OrderingProvenance` and rewrites the node's stored ordering
+        // provenance accordingly. DataFusion `PhysicalOptimizerRule`
+        // pattern: a frozen-plan walk that mutates only strategy +
+        // side-table ordering, never the graph topology.
+        if let Err(e) = dag.select_aggregation_strategies() {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("aggregation strategy selection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+
+        // N-ary combine decomposition. Rewrites every `PlanNode::Combine`
+        // with input count > 2 into a left-deep chain of binary combines
+        // so the strategy pass below sees only N=2 nodes. Runs against
+        // the fully-enriched DAG; emits E300 (input cap) and E305
+        // (disconnected join graph). Mutates `artifacts` in place to
+        // add per-step `combine_inputs` / `combine_predicates` /
+        // `combine_driving` entries, and grows the graph with
+        // (N-2) synthetic chain nodes per N-ary combine.
+        crate::plan::combine::decompose_nary_combines(&mut dag, &mut artifacts, &mut diags);
+
+        // Synthetic chain nodes pushed by `decompose_nary_combines`
+        // are not in `dag.topo_order` — that vector was built from the
+        // pre-decomposition graph. Re-derive the topological order so
+        // the executor walks every chain step in dependency order.
+        // The graph remains acyclic by construction (each step has
+        // exactly two distinct upstream edges chosen from previously
+        // placed nodes).
+        dag.topo_order = match petgraph::algo::toposort(&dag.graph, None) {
+            Ok(order) => order,
+            Err(cycle) => {
+                let cycle_path =
+                    crate::plan::execution::extract_cycle_path(&dag.graph, cycle.node_id());
+                diags.push(Diagnostic::error(
+                    "E003",
+                    format!("cycle detected post-combine-decomposition: {cycle_path}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            }
+        };
+
+        // Combine strategy + driving-input post-pass. Runs after the
+        // DAG is fully enriched (so every PlanNode::Combine is present
+        // and property derivation has stamped ordering provenance) and
+        // after N-ary decomposition (so this pass only sees binary
+        // nodes). The pass mutates PlanNode::Combine in place,
+        // replacing construction-time placeholders for `strategy` and
+        // `driving_input`.
+        crate::plan::combine::select_combine_strategies(
+            &mut dag,
+            &artifacts,
+            &mut diags,
+            self.pipeline.memory_limit.as_deref(),
+        );
+        // Companion sweep over composition body mini-DAGs. Body
+        // graphs hold their own `PlanNode::Combine` nodes that the
+        // top-level pass above cannot reach, so without this call
+        // body-context combines never get their strategy + driving
+        // qualifier stamped and short-circuit at dispatch.
+        crate::plan::combine::select_combine_strategies_in_bodies(
+            &mut artifacts,
+            &mut diags,
+            self.pipeline.memory_limit.as_deref(),
+        );
+
+        // Correlation-key planner passes. Run AFTER the DAG is fully
+        // enriched so we see every Transform's `window_index` and every
+        // Aggregate's resolved `group_by`.
+        //
+        // Pass 1 (auto-extension): for every Aggregate downstream of a
+        // pipeline with `error_handling.correlation_key`, transparently
+        // append `$ck.<field>` shadow columns to the runtime
+        // `group_by` whenever the user-declared field is already
+        // listed. The user never types the engine-internal namespace
+        // in YAML; the engine routes frozen identity through the
+        // aggregation key by construction.
+        //
+        // Pass 2 (E150/E151): typed [`PlanError`] variants surfaced as
+        // user-visible diagnostics; runs after auto-extension so both
+        // checks see the user-natural shape.
+        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
+            let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
+            extend_aggregate_group_by_with_shadow(&mut dag.graph, &key_fields);
+            for body in artifacts.composition_bodies.values_mut() {
+                extend_aggregate_group_by_with_shadow(&mut body.graph, &key_fields);
+            }
+        }
+        if self.error_handling.correlation_key.is_some() {
+            for node in dag.graph.node_weights() {
+                if let crate::plan::execution::PlanNode::Transform {
+                    name,
+                    window_index: Some(_),
+                    ..
+                } = node
+                {
+                    let err = crate::plan::execution::PlanError::CorrelationKeyWithArena {
+                        transform: name.clone(),
+                    };
+                    diags.push(Diagnostic::error(
+                        "E150",
+                        err.to_string(),
+                        LabeledSpan::primary(node.span(), String::new()),
+                    ));
+                }
+            }
+            if let Some(ck) = self.error_handling.correlation_key.as_ref() {
+                let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
+                for node in dag.graph.node_weights() {
+                    if let crate::plan::execution::PlanNode::Aggregation { name, config, .. } = node
+                    {
+                        let group_by: Vec<&str> =
+                            config.group_by.iter().map(|s| s.as_str()).collect();
+                        let missing: Vec<String> = key_fields
+                            .iter()
+                            .filter(|f| !group_by.contains(&f.as_str()))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            let err =
+                                crate::plan::execution::PlanError::CorrelationKeyWithMixedAggregate {
+                                    aggregate: name.clone(),
+                                    missing_fields: missing,
+                                };
+                            diags.push(Diagnostic::error(
+                                "E151",
+                                err.to_string(),
+                                LabeledSpan::primary(node.span(), String::new()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inject the terminal correlation-commit node once the DAG is
+        // otherwise frozen. Re-derive topo afterward because the
+        // commit node and its incoming edges change the order. No-op
+        // when `error_handling.correlation_key` is unset.
+        if let Err(e) = dag.inject_correlation_commit(&self.error_handling) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("correlation-commit injection failed: {e}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+        if dag.graph.node_weights().any(|n| {
+            matches!(
+                n,
+                crate::plan::execution::PlanNode::CorrelationCommit { .. }
+            )
+        }) {
+            dag.topo_order = match petgraph::algo::toposort(&dag.graph, None) {
+                Ok(order) => order,
+                Err(cycle) => {
+                    let cycle_path =
+                        crate::plan::execution::extract_cycle_path(&dag.graph, cycle.node_id());
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!("cycle detected post-correlation-commit: {cycle_path}"),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+            };
+        }
+
+        // E152 — every PlanNode::Composition's incoming edges must carry
+        // a `PlanEdge.port` tag. Compile-time guard for the dispatcher's
+        // collect_port_records invariant: a planner pass that splices an
+        // intermediate node between a producer and a composition without
+        // preserving the port tag would silently drop records at
+        // dispatch. Runs after every edge-rewriting pass so the final
+        // plan state is what's verified.
+        diags.extend(crate::plan::execution::diagnose_untagged_composition_edges(
+            &dag, &artifacts,
+        ));
 
         // If lowering accumulated any non-composition error-severity
         // diagnostics, return them. Composition binding errors
@@ -1480,39 +1956,176 @@ fn input_target(input: &node_header::NodeInput) -> &str {
     }
 }
 
-/// Lower a single `PipelineNode` into its `PlanNode` counterpart.
-///
-/// Returns `None` for variants that are not yet lowered (Aggregate stub)
-/// or for compositions whose binding failed (no body assignment in
-/// `artifacts`). Called from `PipelineConfig::compile()` Stage 5 for
-/// top-level nodes and from `bind_composition` for body nodes.
-/// Scope discriminator for `lower_node_to_plan_node` lookups into
-/// `CompileArtifacts`. TOP-LEVEL DAG nodes read TypedPrograms from
-/// `artifacts.typed`; composition body nodes read from
-/// `artifacts.composition_body_typed`. This makes the split of
-/// top-level vs body TypedProgram storage structurally visible at
-/// every lowering call site (Option W execution-debt closure).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LowerScope {
-    TopLevel,
-    Body,
+/// Render a [`NodeInput`] back into a human-readable reference string.
+/// `Single("foo")` → `"foo"`; `Port { node: "route", port: "high" }` →
+/// `"route.high"`. Used in diagnostic messages so the user sees the
+/// reference exactly as they wrote it.
+fn input_full_reference(input: &node_header::NodeInput) -> String {
+    match input {
+        node_header::NodeInput::Single(s) => s.clone(),
+        node_header::NodeInput::Port { node, port } => format!("{node}.{port}"),
+    }
 }
 
+/// Unified input-reference resolution pass. Walks every node's
+/// declared input(s) and emits [`Diagnostic`] code `E004` with a
+/// structured [`crate::error::DiagnosticPayload::InputRefUndeclared`]
+/// payload for each reference that doesn't resolve to a declared node
+/// name — covering both standalone-node `input:` references and
+/// combine-arm per-port references with a single code.
+///
+/// Runs BEFORE `bind_schema` so undeclared-input diagnostics surface
+/// independently of CXL errors. Per-input spans
+/// (`Spanned<NodeInput>::referenced.line()`) are preserved on the
+/// emitted diagnostic so span-level assertions can verify placement.
+fn resolve_all_input_references(
+    nodes: &[Spanned<PipelineNode>],
+    diags: &mut Vec<crate::error::Diagnostic>,
+) {
+    use crate::error::{Diagnostic, DiagnosticPayload, LabeledSpan};
+    use crate::span::Span;
+
+    let declared_names: std::collections::HashSet<String> =
+        nodes.iter().map(|s| s.value.name().to_string()).collect();
+
+    fn strip_port(r: &str) -> &str {
+        r.split('.').next().unwrap_or(r)
+    }
+
+    let mut emit = |consumer_name: &str,
+                    qualifier: Option<&str>,
+                    input_node: &Spanned<node_header::NodeInput>| {
+        let reference_full = input_full_reference(&input_node.value);
+        let producer_key = strip_port(&reference_full);
+        if declared_names.contains(producer_key) {
+            return;
+        }
+        let line = input_node.referenced.line() as u32;
+        let span = if line > 0 {
+            Span::line_only(line)
+        } else {
+            Span::SYNTHETIC
+        };
+        let message = match qualifier {
+            Some(q) => format!(
+                "at line {line}: combine '{consumer_name}' input '{q}' references undeclared upstream '{reference_full}'"
+            ),
+            None => format!(
+                "node {consumer_name:?} input {reference_full:?} references an undeclared node"
+            ),
+        };
+        diags.push(
+            Diagnostic::error("E004", message, LabeledSpan::primary(span, String::new()))
+                .with_payload(DiagnosticPayload::InputRefUndeclared {
+                    consumer: consumer_name.to_string(),
+                    qualifier: qualifier.map(str::to_string),
+                    reference: reference_full,
+                }),
+        );
+    };
+
+    for spanned in nodes {
+        let node = &spanned.value;
+        let consumer_name = node.name();
+        match node {
+            PipelineNode::Source { .. } | PipelineNode::Composition { .. } => {}
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. } => {
+                emit(consumer_name, None, &header.input);
+            }
+            PipelineNode::Merge { header, .. } => {
+                for inp in &header.inputs {
+                    emit(consumer_name, None, inp);
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for (qualifier, node_input) in &header.input {
+                    emit(consumer_name, Some(qualifier.as_str()), node_input);
+                }
+            }
+        }
+    }
+}
+
+/// Cross-cutting inputs threaded into [`lower_node_to_plan_node`] for
+/// variants that need derived fields (Transform, Aggregate).
+///
+/// Top-level callers in `compile_with_diagnostics` populate every field
+/// from the already-computed analyzer report / window configs / index
+/// specs; body-node callers in `bind_composition` use
+/// [`LoweringCtx::default`] (all fields `None`/empty), which falls back
+/// to minimal placeholder lowering suitable for Kiln drill-in
+/// inspection. Body nodes are not executed directly — the top-level
+/// DAG produced by `compile_with_diagnostics` is the single source of
+/// truth for runtime planning.
+#[derive(Default)]
+pub(crate) struct LoweringCtx<'a> {
+    pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
+    pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
+    pub indices: &'a [crate::plan::index::IndexSpec],
+    pub primary_source: &'a str,
+}
+
+/// Lower a single `PipelineNode` into its `PlanNode` counterpart.
+///
+/// Returns `None` for compositions whose binding failed (no body
+/// assignment in `artifacts`) or Transforms whose typechecking failed
+/// (no typed program in `artifacts.typed`). Called from
+/// `PipelineConfig::compile_with_diagnostics` Stage 5 with a populated
+/// `LoweringCtx` for top-level nodes, and from `bind_composition` with
+/// `LoweringCtx::default()` for body nodes.
 pub(crate) fn lower_node_to_plan_node(
     node: &PipelineNode,
     name: &str,
     span: crate::span::Span,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
-    scope: LowerScope,
+    ctx: &LoweringCtx<'_>,
     diags: &mut Vec<crate::error::Diagnostic>,
 ) -> Option<crate::plan::execution::PlanNode> {
+    use crate::aggregation::AggregateStrategy;
     use crate::error::{Diagnostic, LabeledSpan};
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
-        NodeExecutionReqs, ParallelismClass, PlanNode, PlanOutputPayload, PlanSourcePayload,
-        PlanTransformPayload,
+        NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanOutputPayload,
+        PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
+        extract_write_set,
     };
-    use std::collections::BTreeSet;
+    use crate::plan::index::find_index_for;
+    use clinker_record::{FieldMetadata, SchemaBuilder};
+    use std::sync::Arc;
+
+    // Build an `Arc<Schema>` from the bound output row for this node.
+    // Returns an empty sentinel if bind_schema didn't record one — the
+    // caller skips lowering in every such case, so the sentinel never
+    // reaches the executor.
+    //
+    // Columns whose name has the `$ck.` prefix carry engine-stamp
+    // metadata pointing at the user-declared source field (the shadow
+    // is named `$ck.<field>` and stamps `snapshot_of: <field>`). The
+    // marker travels with the column through the DAG: when a Transform
+    // / Aggregate / Combine output row inherits a `$ck.*` column, its
+    // own `Arc<Schema>` recovers the same metadata here. LD-005's
+    // reserved-`$` prefix guarantees no user-declared column collides.
+    let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
+        match artifacts.typed.get(node_name) {
+            Some(tp) => {
+                let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
+                for (qf, _) in tp.output_row.fields() {
+                    let col = qf.name.as_ref();
+                    builder = match col.strip_prefix("$ck.") {
+                        Some(field) => {
+                            builder.with_field_meta(col, FieldMetadata::snapshot_of(field))
+                        }
+                        None => builder.with_field(col),
+                    };
+                }
+                builder.build()
+            }
+            None => SchemaBuilder::new().build(),
+        }
+    };
 
     match node {
         PipelineNode::Source { config, .. } => Some(PlanNode::Source {
@@ -1522,24 +2135,65 @@ pub(crate) fn lower_node_to_plan_node(
                 source: config.source.clone(),
                 validated_path: None,
             })),
+            output_schema: schema_from_bound(name),
         }),
         PipelineNode::Transform { config, .. } => {
             // Missing typed program means bind_schema hit a CXL error
-            // (E108, E200, etc.) on this node — skip lowering. Look up
-            // in the scope-appropriate map: top-level DAG Transforms
-            // live in `artifacts.typed` (runtime-canonical layouts);
-            // body Transforms live in `artifacts.composition_body_typed`
-            // (standalone layouts).
-            let typed = match scope {
-                LowerScope::TopLevel => match artifacts.typed.get(name) {
-                    Some(t) => t.clone(),
-                    None => return None,
-                },
-                LowerScope::Body => match artifacts.composition_body_typed.get(name) {
-                    Some(t) => t.clone(),
-                    None => return None,
-                },
+            // (E108, E200, etc.) on this node — skip lowering.
+            let typed = match artifacts.typed.get(name) {
+                Some(t) => t.clone(),
+                None => return None,
             };
+            // When the caller supplied a populated `LoweringCtx` (top-level
+            // compile path), derive every enrichment field from the
+            // analyzer report + window config + dedup'd indices. Body-node
+            // callers (`bind_composition`) pass the default ctx, which
+            // collapses all of the below to the unified-diagnostic placeholder
+            // shape — this is fine for Kiln drill-in inspection; body
+            // nodes never execute through this DAG.
+            let (parallelism_class, execution_reqs, window_index, partition_lookup) =
+                if let Some(analysis) = ctx.analysis {
+                    let pc = derive_parallelism_class(
+                        analysis,
+                        &ctx.window_config.cloned(),
+                        ctx.primary_source,
+                    );
+                    let reqs = if ctx.window_config.is_some() {
+                        NodeExecutionReqs::RequiresArena
+                    } else {
+                        NodeExecutionReqs::Streaming
+                    };
+                    let wi = ctx.window_config.and_then(|wc| {
+                        let source = wc
+                            .source
+                            .clone()
+                            .unwrap_or_else(|| ctx.primary_source.to_string());
+                        find_index_for(ctx.indices, &source, &wc.group_by, &wc.sort_by)
+                    });
+                    let pl = ctx.window_config.map(|wc| {
+                        let source = wc
+                            .source
+                            .clone()
+                            .unwrap_or_else(|| ctx.primary_source.to_string());
+                        if source == ctx.primary_source && wc.on.is_none() {
+                            PartitionLookupKind::SameSource
+                        } else {
+                            PartitionLookupKind::CrossSource {
+                                on_expr: wc.on.clone(),
+                            }
+                        }
+                    });
+                    (pc, reqs, wi, pl)
+                } else {
+                    (
+                        ParallelismClass::Stateless,
+                        NodeExecutionReqs::Streaming,
+                        None,
+                        None,
+                    )
+                };
+            let write_set = extract_write_set(&typed);
+            let has_distinct = extract_has_distinct(&typed);
             Some(PlanNode::Transform {
                 name: name.to_string(),
                 span,
@@ -1550,13 +2204,14 @@ pub(crate) fn lower_node_to_plan_node(
                     dlq_node: None,
                     typed,
                 })),
-                parallelism_class: ParallelismClass::Stateless,
+                parallelism_class,
                 tier: 0,
-                execution_reqs: NodeExecutionReqs::Streaming,
-                window_index: None,
-                partition_lookup: None,
-                write_set: BTreeSet::new(),
-                has_distinct: false,
+                execution_reqs,
+                window_index,
+                partition_lookup,
+                write_set,
+                has_distinct,
+                output_schema: schema_from_bound(name),
             })
         }
         PipelineNode::Output { config, .. } => Some(PlanNode::Output {
@@ -1577,6 +2232,7 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Merge { .. } => Some(PlanNode::Merge {
             name: name.to_string(),
             span,
+            output_schema: schema_from_bound(name),
         }),
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
@@ -1590,64 +2246,145 @@ pub(crate) fn lower_node_to_plan_node(
             if body_id == CompositionBodyId::SENTINEL {
                 return None;
             }
+            // Composition's output schema is the first declared
+            // output port's row, not the call-site node name (which
+            // has no entry in `artifacts.typed` — compositions don't
+            // carry their own CXL body). The downstream
+            // `expected_input_schema_in` walk uses this Arc to
+            // schema-check records flowing out of the composition.
+            let comp_output_schema = artifacts
+                .composition_bodies
+                .get(&body_id)
+                .and_then(|body| body.output_port_rows.values().next())
+                .map(|row| {
+                    row.fields()
+                        .map(|(qf, _)| qf.name.as_ref())
+                        .collect::<SchemaBuilder>()
+                        .build()
+                })
+                .unwrap_or_else(|| SchemaBuilder::new().build());
             Some(PlanNode::Composition {
                 name: name.to_string(),
                 span,
                 body: body_id,
+                output_schema: comp_output_schema,
             })
         }
-        PipelineNode::Aggregate { .. } => {
-            diags.push(Diagnostic::warning(
-                "W100",
-                format!("aggregate node {name:?} lowering deferred to Phase 16b Wave 3"),
-                LabeledSpan::primary(span, String::new()),
-            ));
-            None
+        PipelineNode::Aggregate {
+            config: agg_body, ..
+        } => {
+            // Skip if bind_schema produced no typed program (CXL error).
+            let typed = match artifacts.typed.get(name) {
+                Some(t) => t.clone(),
+                None => return None,
+            };
+            let agg_cfg = crate::config::AggregateConfig {
+                group_by: agg_body.group_by.clone(),
+                cxl: agg_body.cxl.source.as_str().to_string(),
+                strategy: agg_body.strategy,
+            };
+            // `typed.field_types` is keyed and ordered by `bind_schema`'s
+            // upstream `Row`, so iterating its keys yields the live
+            // column layout the aggregator will project against — no
+            // separate runtime-schema thread is needed.
+            let input_schema: Vec<String> = typed
+                .field_types
+                .keys()
+                .map(|qf| qf.name.to_string())
+                .collect();
+            let compiled_agg =
+                match cxl::plan::extract_aggregates(&typed, &agg_cfg.group_by, &input_schema) {
+                    Ok(c) => c,
+                    Err(errs) => {
+                        for e in errs {
+                            diags.push(Diagnostic::error(
+                                "E210",
+                                format!("aggregate extraction failed for {name:?}: {}", e.message),
+                                LabeledSpan::primary(span, String::new()),
+                            ));
+                        }
+                        return None;
+                    }
+                };
+            // `schema_from_bound` reads the typed `output_row` produced
+            // by `propagate_aggregate` (group-by columns first, then
+            // emits) and stamps engine-stamp metadata on the
+            // `$ck.<field>` shadow columns that propagate through. The
+            // emit-only path used previously omitted any group-by
+            // column the user could not cover with an explicit emit
+            // (the CXL parser rejects `emit $ck.* = ...`), so engine-
+            // stamped group-by columns silently dropped from the
+            // aggregate's `output_schema` and the runtime
+            // `finalize_group_inner` had no slot to populate from the
+            // group key.
+            let output_schema = schema_from_bound(name);
+            Some(PlanNode::Aggregation {
+                name: name.to_string(),
+                span,
+                config: agg_cfg,
+                compiled: Arc::new(compiled_agg),
+                strategy: AggregateStrategy::Hash,
+                output_schema,
+                fallback_reason: None,
+                skipped_streaming_available: false,
+                qualified_sort_order: None,
+            })
+        }
+        // Combine lowers to PlanNode::Combine. Inline fields here are
+        // the ones the `ExecutionPlanDag` serializer (which does not see
+        // `CompileArtifacts`) must emit for `--explain`:
+        //   - `strategy` — planner default is `HashBuildProbe`; the
+        //     `select_combine_strategies` post-pass may rewrite it.
+        //   - `driving_input` / `build_inputs` — empty until that same
+        //     post-pass selects the driver.
+        //   - `predicate_summary` — filled here from
+        //     `CompileArtifacts.combine_predicates[name]` (populated by
+        //     `bind_schema` before lowering runs). Zero-valued when the
+        //     combine failed predicate decomposition; the E3xx diagnostic
+        //     is already emitted elsewhere in that case.
+        //   - `decomposed_from` — non-`None` only on synthetic binary
+        //     combines produced by N-ary decomposition; user-authored
+        //     nodes lower with `None`.
+        // The heavy decomposed programs and per-input schema rows stay
+        // in `CompileArtifacts` — no duplication.
+        PipelineNode::Combine { config, .. } => {
+            use crate::plan::combine::{CombinePredicateSummary, CombineStrategy};
+            let predicate_summary = artifacts
+                .combine_predicates
+                .get(name)
+                .map(CombinePredicateSummary::from_decomposed)
+                .unwrap_or_default();
+            let resolved_column_map = artifacts
+                .combine_resolved_columns
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(std::collections::HashMap::new()));
+            Some(crate::plan::execution::PlanNode::Combine {
+                name: name.to_string(),
+                span,
+                strategy: CombineStrategy::HashBuildProbe,
+                driving_input: String::new(),
+                build_inputs: Vec::new(),
+                predicate_summary,
+                match_mode: config.match_mode,
+                on_miss: config.on_miss,
+                decomposed_from: None,
+                output_schema: schema_from_bound(name),
+                resolved_column_map,
+            })
         }
     }
 }
 
-/// Correlation key for grouped DLQ rejection. Defines an **atomic
-/// failure domain**: records sharing a key value form a correlation
-/// group, and the entire group succeeds or fails atomically.
+/// Correlation key for grouped DLQ rejection.
 ///
-/// # Semantics
-///
-/// - If any record in a group produces a DLQ entry during pipeline
-///   execution, the entire group is rejected. Root-cause records land
-///   in DLQ with `trigger: true`. OK records from the same group are
-///   demoted to collateral DLQ with `trigger: false` and the
-///   error message `"correlated with failure in group: {first_failure_msg}"`.
-/// - Otherwise (all records in the group succeed), every record flows
-///   through to the configured output.
-///
-/// # Structural consequences
-///
-/// correlation_key **partitions the pipeline into per-group
-/// execution**. Transforms, routes, and aggregates run within a single
-/// correlation group at a time. Aggregates in the downstream DAG thus
-/// aggregate per-group — which is the direct consequence of treating
-/// the group as an atomicity unit.
-///
-/// # Unsupported combinations
-///
-/// Combining `correlation_key` with window operations or other
-/// arena-required nodes is rejected at plan time with
-/// `PlanError::CorrelationKeyWithArena` (E150). Per-group arena
-/// construction is planned follow-up work; see
-/// `docs/internal/FOLLOWUP-correlation-with-arena.md`.
-///
-/// # Group size
-///
-/// A per-group buffer cap is configured via
-/// `ErrorHandlingConfig::max_group_buffer` (default 100,000). A group
-/// exceeding this cap is DLQ'd in its entirety with a
-/// `DlqErrorCategory::GroupSizeExceeded` root-cause entry plus
-/// collateral entries for every buffered peer.
-///
-/// # Config
-///
-/// Custom `Deserialize`: accepts `"field"` string or `["f1", "f2"]` array.
+/// When set on [`ErrorHandlingConfig`], every record in a group sharing a
+/// correlation-key value is DLQ'd atomically if any single record in that
+/// group fails Transform / Route eval / Output write. Group identity is
+/// fixed at ingest: a Transform that rewrites the key field does not
+/// change a row's group. Custom [`Deserialize`] accepts a YAML scalar
+/// (`correlation_key: foo`) for a single-field key or a sequence
+/// (`correlation_key: [a, b]`) for a compound key.
 #[derive(Debug, Clone, Serialize)]
 pub enum CorrelationKey {
     Single(String),
@@ -1655,7 +2392,7 @@ pub enum CorrelationKey {
 }
 
 impl CorrelationKey {
-    /// Return the field names that make up this correlation key.
+    /// Field names that compose this correlation key, in declaration order.
     pub fn fields(&self) -> Vec<&str> {
         match self {
             Self::Single(f) => vec![f.as_str()],
@@ -1715,12 +2452,15 @@ pub struct ErrorHandlingConfig {
     pub dlq: Option<DlqConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
-    /// Correlation key for grouped DLQ rejection. When set, all records sharing
-    /// a key value are DLQ'd atomically if any record in the group fails.
+    /// Correlation key for grouped DLQ rejection. When set, records sharing
+    /// this key value are DLQ'd as a unit if ANY record in the group fails
+    /// Transform / Route eval / Output write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_key: Option<CorrelationKey>,
-    /// Maximum records buffered per correlation group. Groups exceeding this cap
-    /// are DLQ'd entirely with a `group_size_exceeded` summary entry. Default: 100,000.
+    /// Maximum buffered records per correlation group. Once a group reaches
+    /// this cap, the group is DLQ'd with a `group_size_exceeded` root-cause
+    /// entry plus collateral entries for every other buffered record of the
+    /// group. Default: 100_000.
     #[serde(
         default = "default_max_group_buffer",
         skip_serializing_if = "Option::is_none"
@@ -2047,4 +2787,120 @@ pub fn load_config_with_vars(
 /// Load and parse a pipeline config from a YAML file path.
 pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError> {
     load_config_with_vars(path, &[])
+}
+
+/// Auto-extend every `PlanNode::Aggregation.group_by` with the
+/// `$ck.<field>` shadow column when the user-declared correlation-key
+/// field is already listed. Engine-internal namespace stays out of
+/// user YAML; the engine routes frozen identity through the
+/// aggregation key by construction.
+///
+/// Walks `graph` once, mutating each Aggregation in place:
+/// - `config.group_by` gains the shadow column at the tail.
+/// - `compiled.group_by_fields` and `compiled.group_by_indices`
+///   gain the corresponding upstream-schema position.
+/// - `output_schema` is rebuilt to carry the shadow column with
+///   engine-stamp metadata so writers, projection, and downstream
+///   consumers can identify it as engine-stamped.
+fn extend_aggregate_group_by_with_shadow(
+    graph: &mut petgraph::graph::DiGraph<
+        crate::plan::execution::PlanNode,
+        crate::plan::execution::PlanEdge,
+    >,
+    key_fields: &[String],
+) {
+    use clinker_record::{FieldMetadata, Schema, SchemaBuilder};
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use std::sync::Arc;
+
+    struct ShadowAppend {
+        shadow_name: String,
+        source_field: String,
+        upstream_pos: u32,
+    }
+
+    fn upstream_schema(
+        graph: &petgraph::graph::DiGraph<
+            crate::plan::execution::PlanNode,
+            crate::plan::execution::PlanEdge,
+        >,
+        mut idx: NodeIndex,
+    ) -> Option<Arc<Schema>> {
+        loop {
+            let upstream = graph.neighbors_directed(idx, Direction::Incoming).next()?;
+            if let Some(s) = graph[upstream].stored_output_schema() {
+                return Some(Arc::clone(s));
+            }
+            idx = upstream;
+        }
+    }
+
+    // Collect work first so the upstream-schema borrow doesn't alias the
+    // mutable graph borrow used for in-place mutation below.
+    let mut work: Vec<(NodeIndex, Vec<ShadowAppend>)> = Vec::new();
+    for idx in graph.node_indices() {
+        let group_by = match &graph[idx] {
+            crate::plan::execution::PlanNode::Aggregation { config, .. } => config.group_by.clone(),
+            _ => continue,
+        };
+        let mut to_append: Vec<ShadowAppend> = Vec::new();
+        for ck_field in key_fields {
+            let shadow = format!("$ck.{ck_field}");
+            let user_present = group_by.iter().any(|f| f == ck_field);
+            let shadow_present = group_by.iter().any(|f| f == &shadow);
+            if !user_present || shadow_present {
+                continue;
+            }
+            let Some(input_schema) = upstream_schema(graph, idx) else {
+                continue;
+            };
+            let Some(upstream_idx) = input_schema.index(&shadow) else {
+                continue;
+            };
+            to_append.push(ShadowAppend {
+                shadow_name: shadow,
+                source_field: ck_field.clone(),
+                upstream_pos: upstream_idx as u32,
+            });
+        }
+        if !to_append.is_empty() {
+            work.push((idx, to_append));
+        }
+    }
+
+    for (idx, to_append) in work {
+        let crate::plan::execution::PlanNode::Aggregation {
+            config,
+            compiled,
+            output_schema,
+            ..
+        } = &mut graph[idx]
+        else {
+            continue;
+        };
+
+        let compiled_mut = Arc::make_mut(compiled);
+        for entry in &to_append {
+            config.group_by.push(entry.shadow_name.clone());
+            compiled_mut.group_by_fields.push(entry.shadow_name.clone());
+            compiled_mut.group_by_indices.push(entry.upstream_pos);
+        }
+
+        let mut builder =
+            SchemaBuilder::with_capacity(output_schema.column_count() + to_append.len());
+        for (i, col) in output_schema.columns().iter().enumerate() {
+            match output_schema.field_metadata(i) {
+                Some(meta) => builder = builder.with_field_meta(col.clone(), meta.clone()),
+                None => builder = builder.with_field(col.clone()),
+            }
+        }
+        for entry in &to_append {
+            builder = builder.with_field_meta(
+                entry.shadow_name.clone(),
+                FieldMetadata::snapshot_of(entry.source_field.as_str()),
+            );
+        }
+        *output_schema = builder.build();
+    }
 }

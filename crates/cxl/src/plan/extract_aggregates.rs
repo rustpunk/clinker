@@ -4,8 +4,6 @@
 //! emit residuals. Group-by `Expr::FieldRef`s are likewise replaced
 //! with `Expr::GroupKey` leaves.
 //!
-//! Task 16.3.4 (drill 2026-04-06, decisions D1, D2, D8, D9, D14).
-//!
 //! Mirrors DataFusion's `find_aggregate_exprs`, DuckDB's
 //! `Binder::BindAggregate`, and Spark Catalyst's
 //! `ResolveAggregateFunctions`. Runs once at plan-compile time; the
@@ -725,9 +723,9 @@ mod tests {
         let field_names: Vec<&str> = schema_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let cols: IndexMap<String, Type> = schema_fields
+        let cols: IndexMap<crate::typecheck::QualifiedField, Type> = schema_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (crate::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let schema = Row::closed(cols, Span::new(0, 0));
         let mode = AggregateMode::GroupBy {

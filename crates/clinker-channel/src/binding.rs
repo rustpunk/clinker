@@ -3,7 +3,7 @@
 //! A `.channel.yaml` file declares a named channel that targets a pipeline
 //! or composition and overlays config/resource values onto its parameters.
 //! Parsing computes a BLAKE3 content hash from the raw file bytes for
-//! cache-invalidation identity (LD-16c-18).
+//! cache-invalidation identity.
 
 use std::path::{Path, PathBuf};
 
@@ -105,7 +105,8 @@ pub enum ChannelTarget {
 /// A parsed `.channel.yaml` file.
 ///
 /// The `config_default` / `config_fixed` split maps to `LayerKind::ChannelDefault`
-/// and `LayerKind::ChannelFixed` respectively (LD-16c-16). Resources follow
+/// and `LayerKind::ChannelFixed` respectively; channel-fixed layers merge with
+/// deterministic precedence over variable (default) layers. Resources follow
 /// the same split pattern.
 #[derive(Debug, Clone)]
 pub struct ChannelBinding {
@@ -116,7 +117,7 @@ pub struct ChannelBinding {
     pub resources_default: IndexMap<DottedPath, serde_json::Value>,
     pub resources_fixed: IndexMap<DottedPath, serde_json::Value>,
     pub source_path: PathBuf,
-    /// BLAKE3 hash of the raw file bytes (LD-16c-18).
+    /// BLAKE3 hash of the raw file bytes, used as cache-invalidation identity.
     pub channel_hash: [u8; 32],
 }
 

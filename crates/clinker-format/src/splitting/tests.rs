@@ -423,8 +423,9 @@ fn test_split_csv_repeat_header() {
 
 #[test]
 fn test_split_csv_header_consistent() {
-    // All split files have identical headers (captured from first file).
-    // Option-W: the schema IS the header — no overflow side-channel.
+    // All split files share an identical header captured from the
+    // schema; there is no per-record overflow side-channel for column
+    // names.
     let schema = make_schema(&["id", "extra"]);
     let registry = FileRegistry::new();
     let policy = SplitPolicy {
@@ -453,7 +454,6 @@ fn test_split_csv_header_consistent() {
 
     let contents = registry.file_contents();
     assert_eq!(contents.len(), 2);
-    // Both files should have identical headers.
     let header1 = contents[0].lines().next().unwrap();
     let header2 = contents[1].lines().next().unwrap();
     assert_eq!(header1, "id,extra");
@@ -750,6 +750,7 @@ fn test_splitting_writer_json_produces_valid_files() {
         format: JsonOutputMode::Ndjson,
         pretty: false,
         preserve_nulls: false,
+        include_engine_stamped: false,
     };
 
     let json_factory: WriterFactory = Box::new(
@@ -819,6 +820,7 @@ fn test_splitting_writer_xml_produces_valid_files() {
         root_element: "items".into(),
         record_element: "item".into(),
         preserve_nulls: false,
+        include_engine_stamped: false,
     };
 
     let xml_factory: WriterFactory = Box::new(

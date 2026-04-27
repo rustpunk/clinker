@@ -56,6 +56,7 @@ quick-xml = "0.37"
 clinker-bench-support = { path = "crates/clinker-bench-support" }
 tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
+proptest = "1.11"
 
 [workspace.metadata.release]
 shared-version = true
@@ -65,3 +66,8 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

@@ -1,0 +1,48 @@
+# 2-input combine, pure range predicate.
+# Pattern: assign each order to a tax bracket by amount range.
+# Tax brackets cover 0..=1000 in contiguous non-overlapping ranges.
+pipeline:
+  name: two_input_range
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: tax_brackets
+    config:
+      name: tax_brackets
+      type: csv
+      path: tests/fixtures/combine/data/tax_brackets.csv
+      schema:
+        - { name: bracket_id, type: string }
+        - { name: min_amount, type: int }
+        - { name: max_amount, type: int }
+        - { name: rate, type: float }
+  - type: combine
+    name: bracketed
+    input:
+      orders: orders
+      tax_brackets: tax_brackets
+    config:
+      where: "orders.amount >= tax_brackets.min_amount and orders.amount < tax_brackets.max_amount"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit amount = orders.amount
+        emit bracket_id = tax_brackets.bracket_id
+        emit rate = tax_brackets.rate
+  - type: output
+    name: bracketed_out
+    input: bracketed
+    config:
+      name: bracketed_out
+      type: csv
+      path: /tmp/bracketed_two_input_range.csv

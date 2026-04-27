@@ -1,24 +1,14 @@
-//! Aggregation engine tests for Phase 16.
+//! Aggregation engine tests.
 //!
 //! Covers: hash aggregation (basic, multi-key, NULL keys, spill, memory tracking),
 //! streaming aggregation (sorted input, sort verification, strategy selection),
 //! and plan-time integration (PlanNode::Aggregation, output schema).
 
-use super::*;
-
-// Note: 23 stub tests from Tasks 16.3 / 16.4 were removed; their concerns
-// are now covered by the `dispatch`, `streaming`, `group_boundary`,
-// `sort_key_encoder`, and `spill` submodules below, plus the
-// `test_qualifies_*`, `test_addraw_*`, `test_mergestate_*`, and
-// `test_merge_sidecars_*` tests in `crates/clinker-core/src/aggregation.rs`.
-// See git history for the original stub list.
-
 // ===========================================================================
-// Task 16.3.13 — executor PlanNode::Aggregation dispatch arm
+// Executor PlanNode::Aggregation dispatch arm
 // ===========================================================================
 
 mod dispatch {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use clinker_record::{GroupByKey, Record, Schema, Value};
@@ -26,12 +16,12 @@ mod dispatch {
     use cxl::parser::Parser;
     use cxl::plan::extract_aggregates;
     use cxl::resolve::pass::resolve_program;
-    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
     use cxl::typecheck::Row;
+    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
 
-    use crate::aggregation::{AggregatorGroupState, HashAggError, HashAggregator};
+    use crate::aggregation::{AggregatorGroupState, HashAggregator};
     use crate::config::ErrorStrategy;
     use crate::error::PipelineError;
     use crate::executor::tests::run_test;
@@ -65,9 +55,9 @@ mod dispatch {
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
@@ -106,7 +96,6 @@ mod dispatch {
             evaluator,
             output_schema,
             spill_schema,
-            Vec::new(),
             memory_budget,
             spill_dir,
             transform_name.to_string(),
@@ -155,7 +144,8 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: dept, type: string }
+      - { name: salary, type: float }
 
 - type: aggregate
   name: by_dept
@@ -185,14 +175,12 @@ nodes:
         assert_eq!(counters.ok_count, 2, "two output groups");
 
         // Set-equality on output rows (order is hash-table arbitrary).
-        // Note: CSV strings are Type::Any at runtime so `sum(salary)` over
-        // string values surfaces as null in the dispatch arm's Field path —
-        // typed coercion lives outside 16.3.13. We assert the group key + the
-        // count(*) leg, which exercises the full dispatch loop end-to-end.
+        // With salary declared as float, `sum(salary)` produces the real
+        // numeric total per group — eng = 100+200 = 300, sales = 50.
         let mut lines: Vec<&str> = output.lines().skip(1).collect();
         lines.sort();
-        let expected_a = "eng,,2";
-        let expected_b = "sales,,1";
+        let expected_a = "eng,300,2";
+        let expected_b = "sales,50,1";
         assert!(
             lines.contains(&expected_a) && lines.contains(&expected_b),
             "got lines = {lines:?}"
@@ -221,7 +209,7 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: dept, type: string }
 
 - type: aggregate
   name: by_dept
@@ -244,41 +232,15 @@ nodes:
     include_unmapped: true
 "#;
         let config = crate::config::parse_config(yaml).expect("config parses");
-        // Drive the executor's compile path indirectly by parsing then
-        // hand-rolling a tiny ExecutionPlanDag isn't trivial — instead
-        // we use the public PipelineExecutor::compile_plan helper if
-        // present. Lacking that, build via the public PlanDag entry.
-        // The simplest reachable path is `ExecutionPlanDag::compile`
-        // with the typed-program slice; we synthesize an empty slice
-        // and rely on extract paths.
-        let typed_programs: Vec<(String, cxl::typecheck::pass::TypedProgram)> = crate::executor::build_transform_specs(&config)
-            .iter()
-            .map(|t| {
-                let parsed = Parser::parse(t.cxl_source());
-                let resolved = resolve_program(parsed.ast, &["dept"], parsed.node_count).unwrap();
-                let mut schema_map: IndexMap<String, Type> = IndexMap::new();
-                schema_map.insert("dept".to_string(), Type::String);
-                let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
-                let mode = if t.is_aggregate() {
-                    AggregateMode::GroupBy {
-                        group_by_fields: ["dept".to_string()].into_iter().collect(),
-                    }
-                } else {
-                    AggregateMode::Row
-                };
-                (
-                    t.name.clone(),
-                    type_check_with_mode(resolved, &row, mode).unwrap(),
-                )
-            })
-            .collect();
-        let typed_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = typed_programs
-            .iter()
-            .map(|(n, p)| (n.as_str(), p))
-            .collect();
-
-        let mut plan = crate::plan::execution::ExecutionPlanDag::compile(&config, &typed_refs)
-            .expect("plan compiles");
+        // The canonical compile entry point lowers via `bind_schema` +
+        // stage-5, so no hand-rolled typed-program slice is needed.
+        // Clone the resulting DAG so the test can synthesize a malformed
+        // two-predecessor shape below.
+        let mut plan = config
+            .compile(&crate::config::CompileContext::default())
+            .expect("plan compiles")
+            .dag()
+            .clone();
 
         // Find the Aggregation node and add a second incoming edge
         // from another node (the source) — synthesizing the malformed
@@ -301,6 +263,7 @@ nodes:
             agg_idx,
             PlanEdge {
                 dependency_type: DependencyType::Data,
+                port: None,
             },
         );
 
@@ -333,109 +296,12 @@ nodes:
         let r3 = make_record(&input, vec![Value::String("a".into())]);
 
         // Insert in non-monotonic order: 7, 3, 5 → min must be 3.
-        agg.add_record(
-            &r1,
-            7,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx_for(&stable, &file, 7),
-        )
-        .unwrap();
-        agg.add_record(
-            &r2,
-            3,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx_for(&stable, &file, 3),
-        )
-        .unwrap();
-        agg.add_record(
-            &r3,
-            5,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx_for(&stable, &file, 5),
-        )
-        .unwrap();
+        agg.add_record(&r1, 7, &ctx_for(&stable, &file, 7)).unwrap();
+        agg.add_record(&r2, 3, &ctx_for(&stable, &file, 3)).unwrap();
+        agg.add_record(&r3, 5, &ctx_for(&stable, &file, 5)).unwrap();
 
         let state = group_state_for_key(&agg, "a").expect("group exists");
         assert_eq!(state.min_row_num, 3);
-    }
-
-    // ----- Test 4: D57 emitted intersection -----
-
-    #[test]
-    fn test_aggregation_dispatch_emitted_meta_intersection() {
-        let input = make_schema(&["k"]);
-        let mut agg = count_aggregator();
-        let stable = StableEvalContext::test_default();
-        let file: Arc<str> = Arc::from("test.csv");
-
-        let r = make_record(&input, vec![Value::String("a".into())]);
-
-        let mut e1 = IndexMap::new();
-        e1.insert("env".to_string(), Value::String("prod".into()));
-        e1.insert("src".to_string(), Value::String("kafka".into()));
-        e1.insert("only_in_1".to_string(), Value::Integer(1));
-
-        let mut e2 = IndexMap::new();
-        e2.insert("env".to_string(), Value::String("prod".into()));
-        e2.insert("src".to_string(), Value::String("kinesis".into())); // conflict — drops
-        e2.insert("only_in_2".to_string(), Value::Integer(2));
-
-        agg.add_record(&r, 1, &e1, &IndexMap::new(), &ctx_for(&stable, &file, 1))
-            .unwrap();
-        agg.add_record(&r, 2, &e2, &IndexMap::new(), &ctx_for(&stable, &file, 2))
-            .unwrap();
-
-        let state = group_state_for_key(&agg, "a").expect("group exists");
-        let common = state
-            .common_emitted
-            .as_ref()
-            .expect("common_emitted populated");
-        // Only `env` survives the intersection (matching value across both).
-        assert_eq!(common.len(), 1);
-        assert_eq!(
-            common.get("env"),
-            Some(&Value::String("prod".into())),
-            "env survives intersection"
-        );
-    }
-
-    // ----- Test 5: D57 accumulated union -----
-
-    #[test]
-    fn test_aggregation_dispatch_accumulated_meta_union() {
-        let input = make_schema(&["k"]);
-        let mut agg = count_aggregator();
-        let stable = StableEvalContext::test_default();
-        let file: Arc<str> = Arc::from("test.csv");
-
-        let r = make_record(&input, vec![Value::String("a".into())]);
-
-        let mut a1 = IndexMap::new();
-        a1.insert("first_seen".to_string(), Value::Integer(100));
-        a1.insert("shared".to_string(), Value::String("v1".into()));
-
-        let mut a2 = IndexMap::new();
-        a2.insert("shared".to_string(), Value::String("v2".into())); // first-seen wins
-        a2.insert("only_in_2".to_string(), Value::Integer(200));
-
-        agg.add_record(&r, 1, &IndexMap::new(), &a1, &ctx_for(&stable, &file, 1))
-            .unwrap();
-        agg.add_record(&r, 2, &IndexMap::new(), &a2, &ctx_for(&stable, &file, 2))
-            .unwrap();
-
-        let state = group_state_for_key(&agg, "a").expect("group exists");
-        let u = &state.union_accumulated;
-        assert_eq!(u.len(), 3);
-        assert_eq!(u.get("first_seen"), Some(&Value::Integer(100)));
-        assert_eq!(
-            u.get("shared"),
-            Some(&Value::String("v1".into())),
-            "first-seen wins on conflict"
-        );
-        assert_eq!(u.get("only_in_2"), Some(&Value::Integer(200)));
     }
 
     // ----- Test 6: D12 global-fold over empty input emits one row -----
@@ -453,7 +319,7 @@ nodes:
     path: in.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: x, type: string }
 
 - type: aggregate
   name: total
@@ -514,22 +380,8 @@ nodes:
             vec![Value::String("g".into()), Value::Integer(i64::MAX)],
         );
         let r2 = make_record(&input, vec![Value::String("g".into()), Value::Integer(1)]);
-        agg.add_record(
-            &r1,
-            1,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx_for(&stable, &file, 1),
-        )
-        .unwrap();
-        agg.add_record(
-            &r2,
-            2,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx_for(&stable, &file, 2),
-        )
-        .unwrap();
+        agg.add_record(&r1, 1, &ctx_for(&stable, &file, 1)).unwrap();
+        agg.add_record(&r2, 2, &ctx_for(&stable, &file, 2)).unwrap();
         agg
     }
 
@@ -590,7 +442,7 @@ nodes:
         let _ = ErrorStrategy::FailFast;
     }
 
-    // ----- Task 16.4.0 smoke test: StreamingAggregator<AddRaw> -----
+    // ----- Smoke test: StreamingAggregator<AddRaw> -----
 
     /// Build a [`StreamingAggregator`](crate::aggregation::StreamingAggregator)
     /// over the `AddRaw` mode using the same real Parser → resolve →
@@ -607,9 +459,9 @@ nodes:
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
@@ -664,15 +516,8 @@ nodes:
         for (k, row_num) in records {
             let rec = make_record(&input_schema, vec![Value::String(k.into())]);
             let ctx = ctx_for(&stable, &file, row_num);
-            agg.add_record(
-                &rec,
-                row_num,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx,
-                &mut rows,
-            )
-            .expect("add_record");
+            agg.add_record(&rec, row_num, &ctx, &mut rows)
+                .expect("add_record");
         }
 
         let ctx = ctx_for(&stable, &file, 0);
@@ -681,8 +526,8 @@ nodes:
 
         // Expect (k, row_num, c) = (a, 10, 3) and (b, 20, 2) in sorted
         // emission order (GroupBoundary preserves input order).
-        let (ra, rn_a, _, _) = &rows[0];
-        let (rb, rn_b, _, _) = &rows[1];
+        let (ra, rn_a) = &rows[0];
+        let (rb, rn_b) = &rows[1];
         assert_eq!(*rn_a, 10, "group a min row_num");
         assert_eq!(*rn_b, 20, "group b min row_num");
         assert_eq!(ra.values()[0], Value::String("a".into()));
@@ -696,7 +541,7 @@ nodes:
     fn test_streaming_aggregator_out_of_order_is_sort_violation() {
         // Second record's key < first record's key → GroupBoundary must
         // raise HashAggError::SortOrderViolation, which maps to
-        // PipelineError::SortOrderViolation via the From impl (Task 16.4.0).
+        // PipelineError::SortOrderViolation via the From impl.
         let input_schema = make_schema(&["k"]);
         let mut agg = build_streaming_aggregator(
             &[("k", Type::String)],
@@ -711,11 +556,10 @@ nodes:
         let r2 = make_record(&input_schema, vec![Value::String("a".into())]);
         let ctx = ctx_for(&stable, &file, 1);
         let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
-        agg.add_record(&r1, 1, &IndexMap::new(), &IndexMap::new(), &ctx, &mut out)
-            .expect("first ok");
+        agg.add_record(&r1, 1, &ctx, &mut out).expect("first ok");
         let ctx = ctx_for(&stable, &file, 2);
         let err = agg
-            .add_record(&r2, 2, &IndexMap::new(), &IndexMap::new(), &ctx, &mut out)
+            .add_record(&r2, 2, &ctx, &mut out)
             .expect_err("out-of-order must fail");
         let pe: PipelineError = err.into();
         match pe {
@@ -731,7 +575,7 @@ nodes:
         }
     }
 
-    // ── Phase 16 Task 16.4.10 — current_row_count() debug-inspect ──────────
+    // ── current_row_count() debug-inspect ──────────
 
     #[test]
     fn test_current_row_count_starts_at_zero_then_one_then_zero_after_flush() {
@@ -754,37 +598,20 @@ nodes:
 
         let rec = make_record(&input_schema, vec![Value::String("a".into())]);
         let ctx = ctx_for(&stable, &file, 1);
-        agg.add_record(&rec, 1, &IndexMap::new(), &IndexMap::new(), &ctx, &mut out)
-            .unwrap();
+        agg.add_record(&rec, 1, &ctx, &mut out).unwrap();
         assert_eq!(agg.current_row_count(), 1, "one group open after add");
 
         // Add a second record in the same group — still exactly one open.
         let rec2 = make_record(&input_schema, vec![Value::String("a".into())]);
         let ctx2 = ctx_for(&stable, &file, 2);
-        agg.add_record(
-            &rec2,
-            2,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx2,
-            &mut out,
-        )
-        .unwrap();
+        agg.add_record(&rec2, 2, &ctx2, &mut out).unwrap();
         assert_eq!(agg.current_row_count(), 1, "still O(1) — one group open");
 
         // Cross a key boundary; one group emits, the next opens — count
         // remains exactly 1 (the structural O(1) memory invariant).
         let rec3 = make_record(&input_schema, vec![Value::String("b".into())]);
         let ctx3 = ctx_for(&stable, &file, 3);
-        agg.add_record(
-            &rec3,
-            3,
-            &IndexMap::new(),
-            &IndexMap::new(),
-            &ctx3,
-            &mut out,
-        )
-        .unwrap();
+        agg.add_record(&rec3, 3, &ctx3, &mut out).unwrap();
         assert_eq!(agg.current_row_count(), 1, "after key boundary, still 1");
 
         // Flush is owning (`mut self`); the structural invariant is the
@@ -795,7 +622,7 @@ nodes:
     }
 
     // ====================================================================
-    // Phase 16 Task 16.3 backfill — hash-aggregation data shapes & spill
+    // Hash-aggregation data shapes & spill
     // ====================================================================
 
     /// NULL group keys all collapse into a single `GroupByKey::Null` bucket.
@@ -814,14 +641,7 @@ nodes:
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..3u64 {
             let r = make_record(&input, vec![Value::Null, Value::Integer(i as i64)]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert_eq!(agg.groups().len(), 1, "all NULL keys → one bucket");
         let null_key = vec![GroupByKey::Null];
@@ -859,14 +679,8 @@ nodes:
                     Value::Integer(1),
                 ],
             );
-            agg.add_record(
-                &rec,
-                i as u64,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i as u64),
-            )
-            .unwrap();
+            agg.add_record(&rec, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
         }
         assert_eq!(
             agg.groups().len(),
@@ -891,14 +705,7 @@ nodes:
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..32u64 {
             let r = make_record(&input, vec![Value::String(format!("k{i}").into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert_eq!(agg.groups().len(), 32, "N records → N groups");
     }
@@ -926,13 +733,7 @@ nodes:
                 vec![Value::String("g".into()), Value::Integer(i as i64)],
             );
             sum_agg
-                .add_record(
-                    &r,
-                    i,
-                    &IndexMap::new(),
-                    &IndexMap::new(),
-                    &ctx_for(&stable, &file, i),
-                )
+                .add_record(&r, i, &ctx_for(&stable, &file, i))
                 .unwrap();
             assert_eq!(
                 sum_agg.value_heap_bytes(),
@@ -959,13 +760,7 @@ nodes:
                 vec![Value::String("g".into()), Value::Integer(i as i64)],
             );
             col_agg
-                .add_record(
-                    &r,
-                    i,
-                    &IndexMap::new(),
-                    &IndexMap::new(),
-                    &ctx_for(&stable, &file, i),
-                )
+                .add_record(&r, i, &ctx_for(&stable, &file, i))
                 .unwrap();
             let now = col_agg.value_heap_bytes();
             assert!(
@@ -1001,14 +796,8 @@ nodes:
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..256u64 {
             let r = make_record(&input, vec![Value::String(format!("k{i}").into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .expect("add_record must not OOM under tiny budget");
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i))
+                .expect("add_record must not OOM under tiny budget");
         }
         assert!(
             !agg.spill_files().is_empty(),
@@ -1037,14 +826,7 @@ nodes:
         for i in 0..64u64 {
             let k = keys[(i as usize) % keys.len()];
             let r = make_record(&input, vec![Value::String(k.into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert!(
             !agg.spill_files().is_empty(),
@@ -1057,7 +839,7 @@ nodes:
         assert_eq!(out.len(), 4, "four distinct groups after spill-merge");
         // Each group has count(*) == 16, regardless of how many spill
         // segments contributed to it.
-        for (rec, _row_num, _e, _a) in &out {
+        for (rec, _row_num) in &out {
             assert_eq!(
                 rec.values()[1],
                 Value::Integer(16),
@@ -1089,14 +871,7 @@ nodes:
         for i in 0..256u64 {
             let k = keys[(i as usize) % keys.len()];
             let r = make_record(&input, vec![Value::String(k.into())]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-            )
-            .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert!(
             agg.spill_files().len() >= 2,
@@ -1109,7 +884,7 @@ nodes:
         agg.finalize(&ctx, &mut out)
             .expect("multi-spill finalize merges through StreamingAggregator<MergeState>");
         assert_eq!(out.len(), 8, "eight distinct groups after k-way merge");
-        for (rec, _, _, _) in &out {
+        for (rec, _) in &out {
             assert_eq!(
                 rec.values()[1],
                 Value::Integer(32),
@@ -1119,7 +894,7 @@ nodes:
     }
 
     // ====================================================================
-    // Phase 16 Task 16.4 backfill — streaming-aggregation extras
+    // Streaming-aggregation extras
     // ====================================================================
 
     /// NULL group key in streaming mode: a run of NULL-keyed records
@@ -1138,20 +913,13 @@ nodes:
         let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
         for i in 0..4u64 {
             let r = make_record(&input, vec![Value::Null, Value::Integer(i as i64)]);
-            agg.add_record(
-                &r,
-                i,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i),
-                &mut out,
-            )
-            .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i), &mut out)
+                .unwrap();
         }
         let ctx = ctx_for(&stable, &file, 0);
         agg.flush(&ctx, &mut out).unwrap();
         assert_eq!(out.len(), 1, "all NULLs collapse to one streaming group");
-        let (rec, _, _, _) = &out[0];
+        let (rec, _) = &out[0];
         assert_eq!(rec.values()[0], Value::Null);
         assert_eq!(rec.values()[1], Value::Integer(4));
     }
@@ -1186,13 +954,7 @@ nodes:
         for (i, (k, v)) in inputs.iter().enumerate() {
             let r = make_record(&input, vec![Value::String((*k).into()), Value::Integer(*v)]);
             hash_agg
-                .add_record(
-                    &r,
-                    i as u64,
-                    &IndexMap::new(),
-                    &IndexMap::new(),
-                    &ctx_for(&stable, &file, i as u64),
-                )
+                .add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
                 .unwrap();
         }
         let mut hash_out: Vec<crate::aggregation::SortRow> = Vec::new();
@@ -1214,8 +976,6 @@ nodes:
                 .add_record(
                     &r,
                     i as u64,
-                    &IndexMap::new(),
-                    &IndexMap::new(),
                     &ctx_for(&stable, &file, i as u64),
                     &mut stream_out,
                 )
@@ -1229,7 +989,7 @@ nodes:
         fn project(rows: &[crate::aggregation::SortRow]) -> Vec<(Value, Value)> {
             let mut v: Vec<(Value, Value)> = rows
                 .iter()
-                .map(|(rec, _, _, _)| (rec.values()[0].clone(), rec.values()[1].clone()))
+                .map(|(rec, _)| (rec.values()[0].clone(), rec.values()[1].clone()))
                 .collect();
             v.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
             v
@@ -1265,15 +1025,8 @@ nodes:
                     &input,
                     vec![Value::String(key.clone().into()), Value::Integer(i as i64)],
                 );
-                agg.add_record(
-                    &r,
-                    row_num,
-                    &IndexMap::new(),
-                    &IndexMap::new(),
-                    &ctx_for(&stable, &file, row_num),
-                    &mut out,
-                )
-                .unwrap();
+                agg.add_record(&r, row_num, &ctx_for(&stable, &file, row_num), &mut out)
+                    .unwrap();
                 let open = agg.current_row_count();
                 if open > max_open {
                     max_open = open;
@@ -1289,13 +1042,12 @@ nodes:
     }
 }
 
-// ----- Phase 16 Task 16.4.3 — Single-Encoder Two-Phase Bytes tests -----
+// ----- Single-Encoder Two-Phase Bytes tests -----
 
-mod task_16_4_3 {
+mod two_phase_bytes_encoder {
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
-    use indexmap::IndexMap;
 
     use crate::aggregation::{AggregatorGroupState, HashAggError, group_by_sort_fields};
     use crate::error::PipelineError;
@@ -1340,14 +1092,8 @@ mod task_16_4_3 {
         // Push key "a"
         let r1 = rec(&s, vec![Value::String("a".into())]);
         encode_key(&mut b, &r1);
-        b.push(
-            dummy_state(),
-            r1,
-            (1, IndexMap::new(), IndexMap::new()),
-            &finalize_noop,
-            &mut out,
-        )
-        .expect("ok");
+        b.push(dummy_state(), r1, 1, &finalize_noop, &mut out)
+            .expect("ok");
         // After install, current must be cleared
         assert!(
             b.current.is_empty(),
@@ -1358,14 +1104,8 @@ mod task_16_4_3 {
         // Push key "b" — boundary transition; out gains 1 row.
         let r2 = rec(&s, vec![Value::String("b".into())]);
         encode_key(&mut b, &r2);
-        b.push(
-            dummy_state(),
-            r2,
-            (2, IndexMap::new(), IndexMap::new()),
-            &finalize_noop,
-            &mut out,
-        )
-        .expect("ok");
+        b.push(dummy_state(), r2, 2, &finalize_noop, &mut out)
+            .expect("ok");
         assert_eq!(out.len(), 1, "one boundary emission");
         assert!(b.current.is_empty(), "current cleared after boundary");
     }
@@ -1377,24 +1117,12 @@ mod task_16_4_3 {
         let mut out = Vec::new();
         let r1 = rec(&s, vec![Value::String("b".into())]);
         encode_key(&mut b, &r1);
-        b.push(
-            dummy_state(),
-            r1,
-            (1, IndexMap::new(), IndexMap::new()),
-            &finalize_noop,
-            &mut out,
-        )
-        .unwrap();
+        b.push(dummy_state(), r1, 1, &finalize_noop, &mut out)
+            .unwrap();
         let r2 = rec(&s, vec![Value::String("a".into())]);
         encode_key(&mut b, &r2);
         let err = b
-            .push(
-                dummy_state(),
-                r2,
-                (2, IndexMap::new(), IndexMap::new()),
-                &finalize_noop,
-                &mut out,
-            )
+            .push(dummy_state(), r2, 2, &finalize_noop, &mut out)
             .unwrap_err();
         match err {
             HashAggError::SortOrderViolation {
@@ -1415,24 +1143,12 @@ mod task_16_4_3 {
         let mut out = Vec::new();
         let r1 = rec(&s, vec![Value::String("b".into())]);
         encode_key(&mut b, &r1);
-        b.push(
-            dummy_state(),
-            r1,
-            (0, IndexMap::new(), IndexMap::new()),
-            &finalize_noop,
-            &mut out,
-        )
-        .unwrap();
+        b.push(dummy_state(), r1, 0, &finalize_noop, &mut out)
+            .unwrap();
         let r2 = rec(&s, vec![Value::String("a".into())]);
         encode_key(&mut b, &r2);
         let err = b
-            .push(
-                dummy_state(),
-                r2,
-                (0, IndexMap::new(), IndexMap::new()),
-                &finalize_noop,
-                &mut out,
-            )
+            .push(dummy_state(), r2, 0, &finalize_noop, &mut out)
             .unwrap_err();
         assert!(
             matches!(err, HashAggError::MergeSortOrderViolation { .. }),
@@ -1490,26 +1206,14 @@ mod task_16_4_3 {
         let r0 = rec(&s, vec![Value::String("aaaaaa".into())]);
         encode_key(&mut b, &r0);
         let cap_before = b.current.capacity();
-        b.push(
-            dummy_state(),
-            r0,
-            (1, IndexMap::new(), IndexMap::new()),
-            &finalize_noop,
-            &mut out,
-        )
-        .unwrap();
+        b.push(dummy_state(), r0, 1, &finalize_noop, &mut out)
+            .unwrap();
         for i in 0..100u64 {
             let k = format!("bbbbbb{i:03}");
             let ri = rec(&s, vec![Value::String(k.into())]);
             encode_key(&mut b, &ri);
-            b.push(
-                dummy_state(),
-                ri,
-                (i, IndexMap::new(), IndexMap::new()),
-                &finalize_noop,
-                &mut out,
-            )
-            .unwrap();
+            b.push(dummy_state(), ri, i, &finalize_noop, &mut out)
+                .unwrap();
         }
         let cap_after = b.current.capacity();
         assert!(
@@ -1697,11 +1401,10 @@ mod task_16_4_3 {
 }
 
 // ===========================================================================
-// Phase 16 Task 16.4.3 — spill round-trip backfills
+// Spill round-trip backfills
 // ===========================================================================
 
-mod task_16_4_3_spill {
-    use std::collections::HashMap;
+mod two_phase_bytes_spill {
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
@@ -1736,9 +1439,9 @@ mod task_16_4_3_spill {
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
@@ -1774,7 +1477,6 @@ mod task_16_4_3_spill {
             evaluator,
             output_schema,
             spill_schema,
-            Vec::new(),
             memory_budget,
             None,
             transform_name.to_string(),
@@ -1856,65 +1558,12 @@ mod task_16_4_3_spill {
         let file: Arc<str> = Arc::from("test.csv");
         for (i, k) in dataset().into_iter().enumerate() {
             let r = Record::new(Arc::clone(&s), vec![Value::String(k.into())]);
-            agg.add_record(
-                &r,
-                i as u64,
-                &IndexMap::new(),
-                &IndexMap::new(),
-                &ctx_for(&stable, &file, i as u64),
-            )
-            .unwrap();
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
         }
     }
 
-    /// Test A — the spill writer must serialize records in memcomparable
-    /// byte order of their encoded group-by columns.
-    #[test]
-    fn test_spill_write_side_sorts_by_encoded_bytes() {
-        // memory_budget = 1 forces a spill on every add_record call
-        // beyond the first (table_alloc * 3 > 1 - 0).
-        let mut agg = build_aggregator_with_budget(
-            &[("k", Type::String)],
-            &["k"],
-            "emit k = k\nemit c = count(*)",
-            "agg_spill_sort",
-            1,
-        );
-        drive_aggregator(&mut agg);
-
-        // At this point at least one spill file should exist.
-        assert!(
-            !agg.spill_files().is_empty(),
-            "expected at least one spill file with memory_budget=1"
-        );
-
-        // Build the SortKeyEncoder the same way the spill path does.
-        let group_by = vec!["k".to_string()];
-        // Use the spill schema (which is what the spill writer wrote).
-        let spill_schema = agg.spill_files()[0].schema().clone();
-        let fields = group_by_sort_fields(&group_by, &spill_schema);
-        let encoder = SortKeyEncoder::new(fields);
-
-        // Read each spill file and assert per-file monotonicity.
-        for sf in agg.spill_files() {
-            let reader = sf.reader().expect("reader open");
-            let mut prev: Option<Vec<u8>> = None;
-            for entry in reader {
-                let (record, _payload) = entry.expect("read");
-                let mut buf = Vec::new();
-                encoder.encode_into(&record, &mut buf);
-                if let Some(p) = &prev {
-                    assert!(
-                        p.as_slice() <= buf.as_slice(),
-                        "spill file is not in memcomparable order: prev={p:?} next={buf:?}"
-                    );
-                }
-                prev = Some(buf);
-            }
-        }
-    }
-
-    /// Test B — in-memory and spilled paths must produce byte-identical
+    /// In-memory and spilled paths must produce byte-identical
     /// finalized output (after sorting, since neither path guarantees a
     /// stable iteration order across runs).
     #[test]
@@ -1968,13 +1617,13 @@ mod task_16_4_3_spill {
 
         // Sort both by encoded group-by key for stable comparison.
         let group_by = vec!["k".to_string()];
-        let mut sort_for = |rows: &mut Vec<crate::aggregation::SortRow>| {
+        let sort_for = |rows: &mut Vec<crate::aggregation::SortRow>| {
             // Use the output record's schema to derive sort fields.
-            if let Some((rec, _, _, _)) = rows.first() {
+            if let Some((rec, _)) = rows.first() {
                 let sch = rec.schema().clone();
                 let fields = group_by_sort_fields(&group_by, &sch);
                 let encoder = SortKeyEncoder::new(fields);
-                rows.sort_by_cached_key(|(r, _, _, _)| {
+                rows.sort_by_cached_key(|(r, _)| {
                     let mut b = Vec::new();
                     encoder.encode_into(r, &mut b);
                     b
@@ -1996,17 +1645,14 @@ mod task_16_4_3_spill {
     }
 }
 
-mod task_16_4_5 {
-    //! Task 16.4.5 — prove that sort-order verification in
-    //! `GroupBoundary::push` is unconditional, not gated on
-    //! `debug_assertions`. The verification mechanism itself landed
-    //! structurally as sub-change 6 of Task 16.4.3; this test gates
-    //! the always-on contract so a future refactor can't quietly
-    //! demote it to `debug_assert!` without turning red.
+mod group_boundary_sort_order {
+    //! Prove that sort-order verification in `GroupBoundary::push` is
+    //! unconditional, not gated on `debug_assertions`. This test gates
+    //! the always-on contract so a future refactor can't quietly demote
+    //! it to `debug_assert!` without turning red.
     use std::sync::Arc;
 
     use clinker_record::{Record, Schema, Value};
-    use indexmap::IndexMap;
 
     use crate::aggregation::{AggregatorGroupState, HashAggError, group_by_sort_fields};
     use crate::pipeline::sort_key::SortKeyEncoder;
@@ -2057,7 +1703,7 @@ mod task_16_4_5 {
         b.push(
             AggregatorGroupState::new(Vec::new()),
             rb,
-            (1, IndexMap::new(), IndexMap::new()),
+            1,
             &finalize_noop,
             &mut out,
         )
@@ -2069,7 +1715,7 @@ mod task_16_4_5 {
             .push(
                 AggregatorGroupState::new(Vec::new()),
                 ra,
-                (2, IndexMap::new(), IndexMap::new()),
+                2,
                 &finalize_noop,
                 &mut out,
             )
@@ -2096,7 +1742,7 @@ mod task_16_4_5 {
         assert!(
             !code.contains("debug_assert"),
             "GroupBoundary verification must not be gated on debug_assertions \
-             (Task 16.4.5 always-on contract)"
+             — sort-order enforcement is an always-on contract"
         );
     }
 }

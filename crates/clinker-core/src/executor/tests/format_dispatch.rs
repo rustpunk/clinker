@@ -5,7 +5,7 @@
 //! Uses small in-memory payloads (5-10 records) for correctness, not benchmarks.
 
 use super::*;
-use crate::test_helpers::SharedBuffer;
+use clinker_bench_support::io::SharedBuffer;
 use std::io::Cursor;
 
 /// Construct a minimal NDJSON input as in-memory bytes.
@@ -35,46 +35,6 @@ fn xml_input(root: &str, record_el: &str, records: &[Vec<(&str, &str)>]) -> Curs
 /// Construct minimal fixed-width input as in-memory bytes.
 fn fixed_width_input(lines: &[&str]) -> Cursor<Vec<u8>> {
     Cursor::new(lines.join("\n").into_bytes())
-}
-
-/// Compute `Vec<FieldDef>` with `start` as running sum of preceding widths.
-///
-/// Fixed-width reader requires `start` on every `FieldDef`. This helper takes
-/// `(name, width, field_type)` tuples and produces positioned `FieldDef`s.
-fn compute_field_layout(
-    fields: &[(&str, usize, clinker_record::schema_def::FieldType)],
-) -> Vec<clinker_record::schema_def::FieldDef> {
-    let mut start = 0;
-    fields
-        .iter()
-        .map(|(name, width, ftype)| {
-            let field = clinker_record::schema_def::FieldDef {
-                name: name.to_string(),
-                field_type: Some(ftype.clone()),
-                start: Some(start),
-                width: Some(*width),
-                required: None,
-                format: None,
-                coerce: None,
-                default: None,
-                allowed_values: None,
-                alias: None,
-                inherits: None,
-                end: None,
-                justify: None,
-                pad: None,
-                trim: None,
-                truncation: None,
-                precision: None,
-                scale: None,
-                path: None,
-                drop: None,
-                record: None,
-            };
-            start += width;
-            field
-        })
-        .collect()
 }
 
 /// Build a PipelineRunParams with test defaults.
@@ -107,7 +67,8 @@ fn run_format_test(
     )]);
 
     let params = test_params();
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, input_name, readers, writers, &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))
@@ -409,7 +370,7 @@ nodes:
     name: src
     type: fixed_width
     path: input.dat
-    schema:
+    format_schema:
       fields:
       - name: name
         type: string
@@ -420,7 +381,8 @@ nodes:
         start: 10
         width: 5
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: output
   name: dest

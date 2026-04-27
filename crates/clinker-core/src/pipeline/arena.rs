@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
-use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
+use clinker_record::{MinimalRecord, RecordStorage, Schema, SchemaBuilder, Value};
 
 /// Columnar-projected record storage for Phase 1 indexing.
 /// Stores only the fields needed by window expressions.
@@ -47,9 +47,11 @@ impl Arena {
         let source_schema = reader.schema()?;
 
         // Build the projected schema (only the requested fields, in order)
-        let projected_columns: Vec<Box<str>> =
-            fields.iter().map(|f| f.clone().into_boxed_str()).collect();
-        let schema = Arc::new(Schema::new(projected_columns));
+        let schema = fields
+            .iter()
+            .map(|f| f.clone().into_boxed_str())
+            .collect::<SchemaBuilder>()
+            .build();
 
         // Map field names to their column indices in the source schema
         let field_indices: Vec<Option<usize>> =
@@ -67,6 +69,23 @@ impl Arena {
                 if shutdown.is_some_and(|t| t.is_requested()) {
                     return Err(ArenaError::ShutdownRequested);
                 }
+            }
+            // D5 defense-in-depth: every record fed into the Arena must
+            // carry the same schema the Arena was initialized against.
+            // `field_indices` was computed once at the top of this
+            // function; a mid-stream Arc or column-list shift would
+            // silently misproject `values()` positions. Fast path is
+            // `Arc::ptr_eq`; the structural fallback exists for
+            // streaming drift surfaces (IPC boundaries, spill rehydrate)
+            // where the upstream emits a fresh Arc whose columns are
+            // still structurally identical.
+            if !Arc::ptr_eq(record.schema(), &source_schema)
+                && record.schema().columns() != source_schema.columns()
+            {
+                return Err(ArenaError::SchemaMismatch {
+                    expected: Arc::clone(&source_schema),
+                    actual: Arc::clone(record.schema()),
+                });
             }
             // Project: extract only the requested fields
             let projected_values: Vec<Value> = field_indices
@@ -110,12 +129,12 @@ impl Arena {
 }
 
 impl RecordStorage for Arena {
-    fn resolve_field(&self, index: u32, name: &str) -> Option<Value> {
+    fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
         let col = self.schema.index(name)?;
-        self.records.get(index as usize)?.get(col).cloned()
+        self.records.get(index as usize)?.get(col)
     }
 
-    fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<&Value> {
         None // Arena is single-source; qualified lookups go through PartitionLookup
     }
 
@@ -129,7 +148,7 @@ impl RecordStorage for Arena {
 }
 
 /// Estimate the in-memory size of a MinimalRecord (rough heuristic).
-fn estimated_size(record: &MinimalRecord) -> usize {
+pub(crate) fn estimated_size(record: &MinimalRecord) -> usize {
     let base = std::mem::size_of::<MinimalRecord>();
     let fields: usize = (0..record.len())
         .map(|i| match record.get(i) {
@@ -149,6 +168,14 @@ pub enum ArenaError {
     ReadError(clinker_format::error::FormatError),
     /// Shutdown was requested during Arena construction (SIGINT/SIGTERM).
     ShutdownRequested,
+    /// Record arrived with a schema whose column list diverges from the
+    /// reader schema the Arena was initialized against. Arena storage
+    /// depends on column-position alignment, so mid-stream drift would
+    /// corrupt projected values — raise E314 at the ingest boundary.
+    SchemaMismatch {
+        expected: Arc<Schema>,
+        actual: Arc<Schema>,
+    },
 }
 
 impl std::fmt::Display for ArenaError {
@@ -166,6 +193,29 @@ impl std::fmt::Display for ArenaError {
             ArenaError::ReadError(e) => write!(f, "arena read error: {}", e),
             ArenaError::ShutdownRequested => {
                 write!(f, "arena construction interrupted by shutdown signal")
+            }
+            ArenaError::SchemaMismatch { expected, actual } => {
+                let exp = expected
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{c}@{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let act = actual
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{c}@{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "E314 Schema mismatch at operator 'arena' (kind=arena, input from 'source'): \
+                     expected {} columns: [{exp}] record has {} columns: [{act}]",
+                    expected.column_count(),
+                    actual.column_count(),
+                )
             }
         }
     }
@@ -239,7 +289,7 @@ mod tests {
         // Projected fields resolve correctly
         assert_eq!(
             arena.resolve_field(0, "dept"),
-            Some(Value::String("A".into()))
+            Some(&Value::String("A".into()))
         );
     }
 
@@ -256,8 +306,8 @@ mod tests {
         .unwrap();
 
         let view = RecordView::new(&arena, 5);
-        assert_eq!(view.resolve("dept"), Some(Value::String("F".into())));
-        assert_eq!(view.resolve("amount"), Some(Value::String("600".into())));
+        assert_eq!(view.resolve("dept"), Some(&Value::String("F".into())));
+        assert_eq!(view.resolve("amount"), Some(&Value::String("600".into())));
     }
 
     #[test]
@@ -321,6 +371,85 @@ mod tests {
                 assert_eq!(limit, 100);
             }
             other => panic!("Expected MemoryBudgetExceeded, got: {:?}", other),
+        }
+    }
+
+    /// D5 defense-in-depth: feeding records with a divergent schema into
+    /// one Arena raises E314 (`ArenaError::SchemaMismatch`). Mocks a
+    /// reader whose first record establishes a 2-column schema and
+    /// whose second record carries a 3-column schema — the Arena loop
+    /// catches the drift before projection misaligns.
+    #[test]
+    fn test_arena_entry_asserts_schema_homogeneity() {
+        use clinker_format::error::FormatError;
+        use clinker_format::traits::FormatReader;
+        use clinker_record::Record;
+
+        struct HeterogenousReader {
+            first_schema: Arc<Schema>,
+            second_schema: Arc<Schema>,
+            emitted: usize,
+        }
+
+        impl FormatReader for HeterogenousReader {
+            fn schema(&mut self) -> Result<Arc<Schema>, FormatError> {
+                Ok(Arc::clone(&self.first_schema))
+            }
+            fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+                match self.emitted {
+                    0 => {
+                        self.emitted += 1;
+                        Ok(Some(Record::new(
+                            Arc::clone(&self.first_schema),
+                            vec![Value::String("A".into()), Value::String("100".into())],
+                        )))
+                    }
+                    1 => {
+                        self.emitted += 1;
+                        // Divergent schema — three columns vs the first
+                        // record's two. The Arena's projection would
+                        // misalign `values()` positions without the
+                        // defense-in-depth guard.
+                        Ok(Some(Record::new(
+                            Arc::clone(&self.second_schema),
+                            vec![
+                                Value::String("B".into()),
+                                Value::String("200".into()),
+                                Value::String("extra".into()),
+                            ],
+                        )))
+                    }
+                    _ => Ok(None),
+                }
+            }
+        }
+
+        let first_schema = Arc::new(Schema::new(vec!["dept".into(), "amount".into()]));
+        let second_schema = Arc::new(Schema::new(vec![
+            "dept".into(),
+            "amount".into(),
+            "extra".into(),
+        ]));
+        let mut reader = HeterogenousReader {
+            first_schema: Arc::clone(&first_schema),
+            second_schema: Arc::clone(&second_schema),
+            emitted: 0,
+        };
+        let result = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+        );
+        match result {
+            Err(ArenaError::SchemaMismatch { expected, actual }) => {
+                assert!(Arc::ptr_eq(&expected, &first_schema));
+                assert!(Arc::ptr_eq(&actual, &second_schema));
+                let rendered = format!("{}", ArenaError::SchemaMismatch { expected, actual });
+                assert!(rendered.contains("E314"));
+                assert!(rendered.contains("arena"));
+            }
+            other => panic!("expected SchemaMismatch, got: {other:?}"),
         }
     }
 }

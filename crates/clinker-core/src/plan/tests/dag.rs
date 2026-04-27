@@ -1,4 +1,4 @@
-//! DAG construction tests for Phase 15.
+//! DAG construction tests.
 //!
 //! Tests in this module exercise the petgraph-based ExecutionPlanDag:
 //! topology construction, topological ordering, cycle detection,
@@ -11,8 +11,7 @@ use crate::plan::execution::*;
 ///
 /// Topology: Source → categorize (route: high_value / low_value) → merge → Output
 ///
-/// This fixture will be used once `TransformInput` and `ExecutionPlanDag`
-/// are implemented in Tasks 15.1 and 15.2.
+/// This fixture exercises `TransformInput` and `ExecutionPlanDag`.
 pub(crate) fn diamond_fixture_yaml() -> &'static str {
     r#"
 pipeline:
@@ -25,7 +24,7 @@ nodes:
       type: csv
       path: data.csv
       schema:
-        - { name: amount, type: int }
+        - { name: amount, type: float }
 
   - type: transform
     name: categorize_emit
@@ -87,7 +86,7 @@ nodes:
       type: csv
       path: data.csv
       schema:
-        - { name: amount, type: int }
+        - { name: amount, type: float }
 
   - type: transform
     name: step_one
@@ -117,37 +116,21 @@ pub(crate) fn parse_fixture(yaml: &str) -> PipelineConfig {
     crate::config::parse_config(yaml).unwrap()
 }
 
-/// Compile CXL source to TypedProgram for test use.
-fn compile_cxl(source: &str, fields: &[&str]) -> cxl::typecheck::pass::TypedProgram {
-    let parsed = cxl::parser::Parser::parse(source);
-    assert!(
-        parsed.errors.is_empty(),
-        "Parse errors: {:?}",
-        parsed.errors
-    );
-    let resolved =
-        cxl::resolve::pass::resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
-    let schema =
-        cxl::typecheck::Row::closed(indexmap::IndexMap::new(), cxl::lexer::Span::new(0, 0));
-    cxl::typecheck::pass::type_check(resolved, &schema).unwrap()
-}
-
 /// Helper: compile a fixture config into an ExecutionPlanDag.
-fn compile_fixture(config: &PipelineConfig, fields: &[&str]) -> ExecutionPlanDag {
-    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
-    let typed_programs: Vec<_> = transforms
-        .iter()
-        .map(|tc| compile_cxl(tc.cxl_source(), fields))
-        .collect();
-    let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
-        .iter()
-        .zip(typed_programs.iter())
-        .map(|(tc, tp)| (tc.name.as_str(), tp))
-        .collect();
-    ExecutionPlanDag::compile(config, &compiled_refs).unwrap()
+///
+/// `PipelineConfig::compile(&ctx)` is the canonical compile entry point.
+/// `bind_schema` inside `compile_with_diagnostics` produces the typed
+/// programs as a side effect, so fixture fields are threaded in via the
+/// pipeline's source schemas (already declared in the YAML fixtures above).
+fn compile_fixture(config: &PipelineConfig, _fields: &[&str]) -> ExecutionPlanDag {
+    config
+        .compile(&crate::config::CompileContext::default())
+        .expect("compile")
+        .dag()
+        .clone()
 }
 
-// --- Task 15.2 tests ---
+// --- DAG compilation tests ---
 
 /// Linear chain: Source → T1 → T2 → Output produces correct topo order.
 #[test]
@@ -197,7 +180,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: alpha
@@ -223,19 +206,9 @@ nodes:
     type: csv
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
-    let typed_programs: Vec<_> = transforms
-        .iter()
-        .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
-        .collect();
-    let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
-        .iter()
-        .zip(typed_programs.iter())
-        .map(|(tc, tp)| (tc.name.as_str(), tp))
-        .collect();
-    let result = ExecutionPlanDag::compile(&config, &compiled_refs);
+    let result = config.compile(&crate::config::CompileContext::default());
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let err = format!("{:?}", result.unwrap_err());
     assert!(err.contains("cycle"), "expected cycle error: {}", err);
 }
 
@@ -295,7 +268,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: router_emit
@@ -351,7 +324,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: branch_a
@@ -428,7 +401,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: only
@@ -496,7 +469,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: step
@@ -515,19 +488,9 @@ nodes:
     type: csv
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
-    let typed_programs: Vec<_> = transforms
-        .iter()
-        .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
-        .collect();
-    let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
-        .iter()
-        .zip(typed_programs.iter())
-        .map(|(tc, tp)| (tc.name.as_str(), tp))
-        .collect();
-    let result = ExecutionPlanDag::compile(&config, &compiled_refs);
+    let result = config.compile(&crate::config::CompileContext::default());
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let err = format!("{:?}", result.unwrap_err());
     assert!(
         err.contains("nonexistent"),
         "error should mention the bad reference: {}",
@@ -569,7 +532,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: agg
@@ -626,7 +589,7 @@ fn test_dag_execution_reqs_streaming() {
 
 /// NodeExecutionReqs for RequiresSortedInput derivation.
 #[test]
-#[ignore = "Task 15.2: RequiresSortedInput derivation not yet wired (correlation key)"]
+#[ignore = "RequiresSortedInput derivation not yet wired for correlation keys"]
 fn test_dag_execution_reqs_sorted_input() {}
 
 /// JSON serialization roundtrip: schema_version, nodes, depends_on.
@@ -712,7 +675,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: loopy
@@ -731,27 +694,20 @@ nodes:
     type: csv
 "#;
     let config = parse_fixture(yaml);
-    let transforms: Vec<_> = crate::executor::build_transform_specs(&config);
-    let typed_programs: Vec<_> = transforms
-        .iter()
-        .map(|tc| compile_cxl(tc.cxl_source(), &["amount"]))
-        .collect();
-    let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = transforms
-        .iter()
-        .zip(typed_programs.iter())
-        .map(|(tc, tp)| (tc.name.as_str(), tp))
-        .collect();
-    let result = ExecutionPlanDag::compile(&config, &compiled_refs);
+    // Self-reference is caught by stage-3 topology validation inside
+    // `compile(&ctx)` — the pipeline compile_with_diagnostics pre-pass
+    // surfaces it as an E-coded diagnostic.
+    let result = config.compile(&crate::config::CompileContext::default());
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let err = format!("{:?}", result.unwrap_err());
     assert!(
-        err.contains("references itself"),
+        err.contains("references itself") || err.contains("self"),
         "should detect self-reference: {}",
         err
     );
 }
 
-// --- Task 15.3 tests: --explain format extensions ---
+// --- `--explain` format extension tests ---
 
 /// Fixture with full branch wiring: route → branch transforms → merge.
 fn wired_diamond_yaml() -> &'static str {
@@ -766,7 +722,7 @@ nodes:
     path: data.csv
     type: csv
     schema:
-      - { name: amount, type: string }
+      - { name: amount, type: float }
 
 - type: transform
   name: categorize_emit

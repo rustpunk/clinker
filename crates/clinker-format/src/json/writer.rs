@@ -24,6 +24,10 @@ pub struct JsonWriterConfig {
     pub format: JsonOutputMode,
     pub pretty: bool,
     pub preserve_nulls: bool,
+    /// Whether engine-stamped schema columns (`$ck.<field>` correlation
+    /// snapshots) appear as keys in the emitted JSON object. Defaults
+    /// to `false` to keep engine-internal namespaces out of output.
+    pub include_engine_stamped: bool,
 }
 
 impl Default for JsonWriterConfig {
@@ -32,13 +36,18 @@ impl Default for JsonWriterConfig {
             format: JsonOutputMode::Array,
             pretty: false,
             preserve_nulls: false,
+            include_engine_stamped: false,
         }
     }
 }
 
 pub struct JsonWriter<W: Write> {
     writer: W,
-    schema: Arc<Schema>,
+    /// Schema held for the writer's lifetime. Post-rip the writer emits
+    /// records via `Record::iter_all_fields` (schema-positional) so the
+    /// field is not read per-record, but keeping the `Arc` pins the
+    /// schema against unintended drop by factory callers.
+    _schema: Arc<Schema>,
     config: JsonWriterConfig,
     records_written: u64,
 }
@@ -47,28 +56,37 @@ impl<W: Write> JsonWriter<W> {
     pub fn new(writer: W, schema: Arc<Schema>, config: JsonWriterConfig) -> Self {
         Self {
             writer,
-            schema,
+            _schema: schema,
             config,
             records_written: 0,
         }
     }
 
-    /// Serialize a record to a JSON object, schema fields in order
-    /// (Option-W: no overflow side-channel).
-    /// `preserve_nulls: false` omits keys with Null values.
+    /// Serialize a record to a JSON object in schema-column order.
+    /// `preserve_nulls: false` omits keys with Null values. Metadata is
+    /// stripped from the default output; callers that want to emit
+    /// `$meta.*` keys into the JSON object must opt in at a higher
+    /// layer (the Output node's `include_metadata` flag). Engine-stamped
+    /// columns follow the same rule via `include_engine_stamped`.
     fn record_to_json(&self, record: &Record) -> serde_json::Value {
         use serde_json::{Map, Value as Jv};
 
-        let mut obj = Map::with_capacity(record.total_field_count());
-
-        for col in self.schema.columns() {
-            let val = record.get(col).unwrap_or(&Value::Null);
+        let mut obj = Map::with_capacity(record.field_count());
+        let emit = |obj: &mut Map<String, Jv>, col: &str, val: &Value| {
             if !self.config.preserve_nulls && val.is_null() {
-                continue;
+                return;
             }
             obj.insert(col.to_string(), clinker_to_json(val));
+        };
+        if self.config.include_engine_stamped {
+            for (col, val) in record.iter_all_fields() {
+                emit(&mut obj, col, val);
+            }
+        } else {
+            for (col, val) in record.iter_user_fields() {
+                emit(&mut obj, col, val);
+            }
         }
-
         Jv::Object(obj)
     }
 }
@@ -273,11 +291,33 @@ mod tests {
     }
 
     #[test]
+    fn test_json_writer_emits_schema_fields_only() {
+        // Default writer contract: schema columns only; metadata (and
+        // the `$meta.*` namespace) does not leak into the JSON object
+        // unless a higher layer opts in.
+        let schema = Arc::new(Schema::new(vec!["a".into()]));
+        let mut record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        record
+            .set_meta("ignored", Value::String("in_meta".into()))
+            .unwrap();
+        let output = write_records(JsonWriterConfig::default(), &[record], &schema);
+        assert!(output.contains("\"a\""));
+        assert!(!output.contains("ignored"));
+        assert!(!output.contains("in_meta"));
+    }
+
+    #[test]
     fn test_json_write_field_ordering() {
-        let schema = Arc::new(Schema::new(vec!["z_field".into(), "a_field".into()]));
+        // Schema fields emit in schema order — the widened schema is
+        // authoritative; there is no overflow ordering to reason about.
+        let schema = Arc::new(Schema::new(vec![
+            "z_field".into(),
+            "a_field".into(),
+            "m_field".into(),
+        ]));
         let record = Record::new(
             Arc::clone(&schema),
-            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
         );
 
         let config = JsonWriterConfig {
@@ -285,10 +325,11 @@ mod tests {
             ..Default::default()
         };
         let output = write_records(config, &[record], &schema);
-        // z_field should appear before a_field (schema order).
         let z_pos = output.find("z_field").unwrap();
         let a_pos = output.find("a_field").unwrap();
-        assert!(z_pos < a_pos, "Schema field z should come before a");
+        let m_pos = output.find("m_field").unwrap();
+        assert!(z_pos < a_pos, "schema field z comes before a");
+        assert!(a_pos < m_pos, "schema fields emit in schema order");
     }
 
     #[test]

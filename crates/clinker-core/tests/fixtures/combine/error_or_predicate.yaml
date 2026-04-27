@@ -1,0 +1,47 @@
+# Decomposition fixture: OR always becomes residual — never decomposed
+# into equality/range conjuncts. Universal consensus across 8+ engines
+# (DataFusion, DuckDB, Spark, PostgreSQL, Calcite, CockroachDB).
+#
+# C.1.2 gate test `test_combine_decompose_or_is_residual`.
+# Named `error_*` by plan convention but represents a
+# degraded-performance residual case, not a hard error.
+pipeline:
+  name: error_or_predicate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: combine_or
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id or orders.order_id == products.name"
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+  - type: output
+    name: combine_or_out
+    input: combine_or
+    config:
+      name: combine_or_out
+      type: csv
+      path: /tmp/error_or_predicate.csv

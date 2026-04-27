@@ -1,0 +1,60 @@
+# Mixed equi+range combine driving the IEJoin executor at bench scale.
+# Equality on `entity_id` plus a half-open range on `income`
+# (`>= bracket_lo` and `< bracket_hi`) — the canonical tax-bracket
+# assignment shape. Cross-bench RSS/CPU coverage for the IEJoin path;
+# the focused performance measurement lives in
+# `crates/clinker-core/benches/combine_iejoin.rs`.
+
+pipeline:
+  name: bench-combine-mixed-equi-range
+
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: bench://employees.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+
+  - type: source
+    name: brackets
+    config:
+      name: brackets
+      type: csv
+      path: bench://brackets.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: int }
+
+  - type: combine
+    name: assign_bracket
+    input:
+      employees: employees
+      brackets: brackets
+    config:
+      where: "employees.f0 == brackets.f0 and employees.f2 >= brackets.f2 and employees.f2 < brackets.f3"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit entity_id = employees.f0
+        emit income = employees.f2
+        emit bracket = brackets.f1 ?? "UNASSIGNED"
+
+  - type: output
+    name: assigned_out
+    input: assign_bracket
+    config:
+      name: assigned_out
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

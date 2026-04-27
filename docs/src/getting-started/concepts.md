@@ -18,7 +18,7 @@ the graph is acyclic, and determines execution order automatically.
 ## The `nodes:` list
 
 Every pipeline has a single flat list of nodes. Each node has a `type:`
-discriminator that determines its behavior. The seven node types are:
+discriminator that determines its behavior. The eight node types are:
 
 | Type          | Purpose                                                     |
 |---------------|-------------------------------------------------------------|
@@ -26,7 +26,8 @@ discriminator that determines its behavior. The seven node types are:
 | `transform`   | Apply CXL logic to reshape, filter, or enrich records       |
 | `aggregate`   | Group records and compute summary values (sum, count, etc.) |
 | `route`       | Split a stream into named ports based on conditions          |
-| `merge`       | Combine multiple streams into one                            |
+| `merge`       | Concatenate multiple streams that share a schema             |
+| `combine`     | Join records across N inputs with cross-input predicates     |
 | `output`      | Write data to a file                                         |
 | `composition` | Embed a reusable sub-pipeline                                |
 

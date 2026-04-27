@@ -1,0 +1,44 @@
+# Error fixture (V-7-1): literal-only predicate `where: "true"` has
+# zero cross-input comparisons → E305. Cross joins are not supported
+# via combine; the user must express them as an explicit Merge or
+# expand to a real predicate.
+#
+# C.1.2 gate test `test_combine_e305_literal_true`.
+pipeline:
+  name: error_literal_true
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: cross
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "true"
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+  - type: output
+    name: cross_out
+    input: cross
+    config:
+      name: cross_out
+      type: csv
+      path: /tmp/error_literal_true.csv

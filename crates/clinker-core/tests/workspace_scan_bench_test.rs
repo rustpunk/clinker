@@ -1,7 +1,7 @@
-//! Integration test: workspace scan performance (Phase 16c.7.2).
+//! Integration test: workspace scan performance.
 //!
 //! Verifies that scanning 50 synthetic `.comp.yaml` files completes
-//! in under 50ms (LD-16c-5 performance budget).
+//! in under 50ms.
 
 use std::time::Instant;
 
@@ -56,7 +56,7 @@ fn test_workspace_scan_under_50ms_for_50_files() {
     let table = result.unwrap();
     assert_eq!(table.len(), 50, "must discover all 50 compositions");
 
-    // 50ms budget per LD-16c-5.
+    // 50ms budget.
     assert!(
         elapsed.as_millis() < 50,
         "workspace scan took {}ms, budget is 50ms",

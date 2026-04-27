@@ -76,7 +76,8 @@ Every pipeline has a flat `nodes:` list. Each entry is a node with a `type:` dis
 | `transform` | Applies CXL expressions to each record |
 | `aggregate` | Groups and summarizes records |
 | `route` | Splits records into named branches by condition |
-| `merge` | Combines multiple upstream branches |
+| `merge` | Concatenates multiple upstream branches that share a schema |
+| `combine` | Joins records across N inputs with `where:` predicates |
 | `output` | Writes records to a file |
 | `composition` | Imports a reusable transform fragment |
 

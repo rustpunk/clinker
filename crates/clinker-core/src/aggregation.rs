@@ -1,7 +1,6 @@
-//! Hash + streaming aggregation engine for Phase 16.
+//! Hash + streaming aggregation engine.
 //!
-//! Task 16.3.7 introduces the runtime types referenced by
-//! `PlanNode::Aggregation`'s executor dispatch (16.3.13):
+//! Runtime types referenced by `PlanNode::Aggregation`'s executor dispatch:
 //!
 //! * [`AggregateStrategy`] — plan-time enum (also surfaced on the plan
 //!   node) selecting the per-group hash table or the streaming
@@ -47,10 +46,10 @@ use crate::pipeline::loser_tree::LoserTree;
 /// implements `FieldResolver`); the storage parameter is unused.
 struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
         None
     }
     fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -63,10 +62,9 @@ impl RecordStorage for NullStorage {
 
 /// Aggregation strategy selected at plan-compile time.
 ///
-/// `Hash` is the universal default. `Streaming` is wired by Task 16.4
-/// when the input is provably sorted on the full group-by prefix —
-/// allowing a one-group-at-a-time fold that never materializes a hash
-/// table.
+/// `Hash` is the universal default. `Streaming` is used when the input
+/// is provably sorted on the full group-by prefix — allowing a
+/// one-group-at-a-time fold that never materializes a hash table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateStrategy {
@@ -76,8 +74,7 @@ pub enum AggregateStrategy {
 
 /// Input to an aggregator's `add` path. Live input records and
 /// recovered spilled state both flow through the same dispatch so the
-/// merge phase (Task 16.3.11) can reuse the hash table without a
-/// separate code path.
+/// merge phase can reuse the hash table without a separate code path.
 pub enum AggregateInput {
     /// A freshly produced input record from the upstream stage.
     RawRecord(Record),
@@ -155,16 +152,12 @@ fn estimated_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> u
     // elements are on the heap.
     let acc_heap = factory.compiled().bindings.len() * std::mem::size_of::<AccumulatorEnum>();
 
-    // IndexMap base overhead for common_emitted + union_accumulated.
-    // An empty IndexMap is ~128 bytes; two of them per group.
-    let sidecar_maps = 256;
-
     // MetadataCommonTracker: empty HashMap base allocation + headroom for
     // a few observed keys.
     let meta_base = std::mem::size_of::<MetadataCommonTracker>() + 128;
 
     // hashbrown targets ~87.5% load factor → ~1.15x bucket overallocation.
-    let raw = bucket_entry + key_heap + acc_heap + sidecar_maps + meta_base;
+    let raw = bucket_entry + key_heap + acc_heap + meta_base;
     (raw as f64 * 1.15) as usize
 }
 
@@ -184,9 +177,7 @@ pub struct AggregateEvalScope<'a> {
 }
 
 /// Errors that can arise while evaluating a residual in aggregate
-/// scope. The full taxonomy lands with Task 16.3.13 (`PipelineError`
-/// integration); for the 16.3.7 surface area we need just enough to
-/// compile.
+/// scope.
 #[derive(Debug, Clone)]
 pub enum AggregateEvalError {
     /// `Expr::AggSlot { slot }` referenced a slot index outside the
@@ -197,9 +188,8 @@ pub enum AggregateEvalError {
     /// the key tuple.
     GroupKeyOutOfRange { slot: u32, key_count: usize },
     /// A residual contained a construct that the finalize-time
-    /// evaluator does not yet support. Task 16.3.12 expands the
-    /// supported surface area; until then any unsupported expression
-    /// is reported via this variant rather than panicking.
+    /// evaluator does not yet support. Unsupported expressions are
+    /// reported via this variant rather than panicking.
     UnsupportedResidual { what: &'static str },
 }
 
@@ -230,8 +220,7 @@ impl std::error::Error for AggregateEvalError {}
 /// coalesce / `if` / unary nodes recursively. Constructs that need a
 /// row context (`FieldRef`, `MethodCall`, `WindowCall`, `Match`,
 /// metadata access) are surfaced as
-/// [`AggregateEvalError::UnsupportedResidual`] until Task 16.3.12
-/// extends the surface area in lockstep with the executor dispatch.
+/// [`AggregateEvalError::UnsupportedResidual`].
 pub fn eval_expr_in_agg_scope(
     expr: &Expr,
     scope: &AggregateEvalScope<'_>,
@@ -377,7 +366,7 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, AggregateEvalError> {
 }
 
 // ---------------------------------------------------------------------------
-// MetadataCommonTracker (Task 16.3.8a, Decision D11 revised)
+// MetadataCommonTracker
 // ---------------------------------------------------------------------------
 
 /// Per-key state inside a [`MetadataCommonTracker`].
@@ -406,7 +395,7 @@ pub struct CommonState {
 /// emitted; everything else is dropped (visible by absence).
 ///
 /// The tracker is serde-derived because it travels with the per-group
-/// `AccumulatorRow` through the spill path — see Task 16.3.10.
+/// `AccumulatorRow` through the spill path.
 /// Recovery merges partial trackers via [`MetadataCommonTracker::merge`]
 /// which is associative: any disagreement on either side, or any
 /// already-`conflicting` slot, transitions the merged slot to
@@ -421,10 +410,8 @@ pub struct MetadataCommonTracker {
 /// Both pieces of information are needed by the hash aggregator hot
 /// loop: `heap_delta` is folded into `value_heap_bytes` for memory
 /// accounting, while `became_conflict` triggers a one-shot structured
-/// WARN log via `meta_conflict_logged`. The phase-16 spec quotes both
-/// behaviors but is internally inconsistent on a single return type;
-/// the struct surfaces them together to satisfy both call sites without
-/// a hidden second lookup.
+/// WARN log via `meta_conflict_logged`. The struct surfaces both
+/// together so the caller never does a hidden second lookup.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ObserveResult {
     /// Bytes added to `value_heap_bytes` by this observation. Always
@@ -665,7 +652,7 @@ mod tracker_tests {
 }
 
 // ---------------------------------------------------------------------------
-// HashAggregator (Task 16.3.8)
+// HashAggregator
 // ---------------------------------------------------------------------------
 
 /// Per-group state held inside the hash table.
@@ -679,17 +666,12 @@ mod tracker_tests {
 pub struct AggregatorGroupState {
     pub row: AccumulatorRow,
     pub meta_tracker: MetadataCommonTracker,
-    /// D57 sidecar — minimum `row_num` across every input record folded
-    /// into this group. Initialized to `u64::MAX`; the executor stores the
-    /// reduced value into the SortRow tuple at finalize time. The
-    /// global-fold empty-input case (D12) emits `0` because no record
-    /// ever updates this field.
+    /// Minimum `row_num` across every input record folded into this
+    /// group. Initialized to `u64::MAX`; finalize emits this as the
+    /// `SortRow` row-number so downstream sort-stable operators preserve
+    /// the earliest input row's position. The global-fold empty-input
+    /// case emits `0` because no record ever updates this field.
     pub min_row_num: u64,
-    /// D57 sidecar — union of every record's `accumulated` IndexMap
-    /// (the executor's per-record "accumulated metadata" sidecar). On
-    /// key conflicts the **first** value wins (insertion order); this
-    /// matches the existing `MetadataCommonTracker` first-seen semantics.
-    pub union_accumulated: IndexMap<String, Value>,
 }
 
 impl AggregatorGroupState {
@@ -698,28 +680,17 @@ impl AggregatorGroupState {
             row,
             meta_tracker: MetadataCommonTracker::new(),
             min_row_num: u64::MAX,
-            union_accumulated: IndexMap::new(),
-        }
-    }
-}
-
-/// D57 helper — first-seen union: keep `dst` values where they exist,
-/// insert from `src` only when the key is missing. Mirrors the
-/// `MetadataCommonTracker` first-seen-wins precedent.
-fn union_accumulated_into(dst: &mut IndexMap<String, Value>, src: &IndexMap<String, Value>) {
-    for (k, v) in src {
-        if !dst.contains_key(k) {
-            dst.insert(k.clone(), v.clone());
         }
     }
 }
 
 /// Per-node-buffer row produced by every executor node that emits into
-/// `node_buffers`. Option-W collapse: emits live on the Record
-/// positionally (via its bound schema); the per-record sidecar that
-/// remains is just the accumulated metadata (genuinely sparse, not
-/// schema-bound).
-pub type SortRow = (Record, u64, IndexMap<String, Value>);
+/// `node_buffers`. The Record is authoritative: all emitted fields have
+/// been applied via `Record::set` onto the widened schema, and all
+/// `$meta.*` writes via `Record::set_meta`. Downstream nodes resolve
+/// field references against the Record directly (no parallel
+/// bookkeeping threading).
+pub type SortRow = (Record, u64);
 
 /// Errors raised by the hash aggregator hot loop. The 16.3.13 dispatch
 /// arm wraps these into `PipelineError` for DLQ routing; until then the
@@ -758,9 +729,8 @@ pub enum HashAggError {
     /// either the upstream ordering contract was wrong or the plan
     /// property pass qualified streaming aggregation on a node whose
     /// output was not actually sorted (DataFusion #12086-class bug).
-    /// Phase 16 Task 16.4.3 — widened from `{ message: String }` so the
-    /// `GroupBoundary` can hand the executor both pre/next encoded keys
-    /// for diagnostics. The user-input vs spill-merge distinction is
+    /// `GroupBoundary` hands the executor both pre/next encoded keys for
+    /// diagnostics. The user-input vs spill-merge distinction is
     /// captured in two separate variants because the two cases route
     /// differently through `From<HashAggError> for PipelineError`.
     SortOrderViolation {
@@ -768,7 +738,7 @@ pub enum HashAggError {
         next_key_debug: String,
     },
     /// Spill-merge produced an out-of-order key — Clinker bug, not a
-    /// user data error. Always hard-aborts. Phase 16 Task 16.4.3.
+    /// user data error. Always hard-aborts.
     MergeSortOrderViolation {
         prev_key_debug: String,
         next_key_debug: String,
@@ -880,22 +850,18 @@ impl From<HashAggError> for PipelineError {
 }
 
 // ---------------------------------------------------------------------------
-// AggregateStream wrapper enum (Task 16.3.13)
+// AggregateStream wrapper enum
 // ---------------------------------------------------------------------------
 
 /// Executor-facing aggregation dispatch wrapper.
 ///
-/// Single variant in 16.3.13. The `#[non_exhaustive]` attribute lets
-/// Task 16.4 add a `Streaming(StreamingAggregator<AddRaw>)` variant
-/// non-breakingly, in the same commit that introduces the real
-/// `AccumulatorOp` / `AddRaw` types — avoiding the DataFusion #12086
-/// failure mode of placeholder generic parameters in dispatch enums.
+/// The `#[non_exhaustive]` attribute reserves the option of adding new
+/// variants non-breakingly — avoiding the DataFusion #12086 failure
+/// mode of placeholder generic parameters in dispatch enums.
 #[non_exhaustive]
 pub enum AggregateStream {
     Hash(Box<HashAggregator>),
-    /// Streaming aggregation over a pre-sorted upstream. Landed in
-    /// Phase 16 Task 16.4.0 alongside the real `AccumulatorOp` /
-    /// `AddRaw` types and the shared streaming-merge module.
+    /// Streaming aggregation over a pre-sorted upstream.
     Streaming(Box<StreamingAggregator<AddRaw>>),
 }
 
@@ -905,8 +871,7 @@ impl AggregateStream {
     /// Streaming strategy is rejected with a fallible
     /// `PipelineError::Internal` (NOT `todo!()` / `unreachable!()`) per
     /// the DataFusion #12086 lesson on unreachable arms in long-lived
-    /// executor dispatch tables. The real `Streaming` arm lands in Task
-    /// 16.4 alongside its inner `StreamingAggregator<AddRaw>`.
+    /// executor dispatch tables.
     #[allow(clippy::too_many_arguments)]
     pub fn for_node(
         compiled: Arc<CompiledAggregate>,
@@ -943,22 +908,20 @@ impl AggregateStream {
     /// Drive one input record through the wrapper. The Hash arm ignores
     /// `out` (it defers all emission to `finalize`). The Streaming arm
     /// pushes one finalized `SortRow` into `out` for every key boundary
-    /// crossed by this record. Phase 16 Task 16.4.3 (D-α/D-γ debt).
-    #[allow(clippy::too_many_arguments)]
+    /// crossed by this record.
     pub fn add_record(
         &mut self,
         record: &Record,
         row_num: u64,
-        accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
         match self {
             Self::Hash(h) => {
                 let _ = &out; // Hash defers emission to finalize.
-                h.add_record(record, row_num, accumulated, ctx)
+                h.add_record(record, row_num, ctx)
             }
-            Self::Streaming(s) => s.add_record(record, row_num, accumulated, ctx, out),
+            Self::Streaming(s) => s.add_record(record, row_num, ctx, out),
         }
     }
 
@@ -1046,13 +1009,13 @@ impl HashAggregator {
             .collect();
         let factory = AccumulatorFactory::new(compiled);
         let estimated = estimated_bytes_per_group(&factory, group_by_indices.len());
-        // `.max(1)` clamp: `(memory_budget * 60 / 100) / estimated` integer-
-        // divides to 0 when a single group's estimated footprint exceeds the
-        // 60% share of the budget. Without the clamp the downstream check
-        // `self.groups.len() >= self.max_groups` is `usize >= 0` — always
-        // true — and spill fires on every single record insertion. Clamping
-        // to 1 means "allow at least one group before spilling", the minimum
-        // sensible semantics at pathologically small budgets.
+        // `.max(1)` clamp: integer division yields 0 when a single group's
+        // estimated footprint exceeds the 60% share of the budget. Without
+        // the clamp the downstream check `self.groups.len() >= self.max_groups`
+        // is `usize >= 0` — always true — and spill fires on every record
+        // insertion. Clamping to 1 lets at least one group land before
+        // spilling, the minimum sensible behavior at pathologically small
+        // budgets.
         let max_groups = if memory_budget > 0 && estimated > 0 {
             ((memory_budget * 60 / 100) / estimated).max(1)
         } else {
@@ -1123,7 +1086,6 @@ impl HashAggregator {
         &mut self,
         record: &Record,
         row_num: u64,
-        accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
     ) -> Result<(), HashAggError> {
         // 1. Pre-aggregation filter (D9).
@@ -1179,16 +1141,13 @@ impl HashAggregator {
             .entry(key)
             .or_insert_with(|| AggregatorGroupState::new(self.factory.create_accumulators()));
 
-        // D57 sidecar reductions — fold the per-record (row_num, accumulated)
-        // pair into the per-group state. Under Option W, "emitted" is no
-        // longer carried as a per-record side-map (the record itself is
-        // positional against the upstream's OutputLayout); the old
-        // `common_emitted` intersection was dead state (finalize rebuilt
-        // from the output record) and has been removed.
+        // Track the minimum row_num across every input record folded
+        // into this group — emitted as the finalized SortRow's row
+        // number so downstream sort-stable operators preserve the
+        // earliest input row's position.
         if row_num < group_state.min_row_num {
             group_state.min_row_num = row_num;
         }
-        union_accumulated_into(&mut group_state.union_accumulated, accumulated);
 
         // 5. BindingArg dispatch hot loop (D1).
         let bindings = self.factory.compiled().bindings.clone();
@@ -1262,15 +1221,16 @@ impl HashAggregator {
         Ok(())
     }
 
-    /// Spill the in-memory groups to disk as length-prefixed postcard
-    /// records inside an LZ4 frame.
+    /// Spill the in-memory groups to disk as postcard + LZ4.
     ///
     /// 1. Drain `self.groups` into a Vec.
     /// 2. Encode sort keys and sort by memcmp bytes so the k-way merge
     ///    can walk entries in group-key order.
-    /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) via
-    ///    postcard into an LZ4 frame-compressed temp file with a
-    ///    little-endian `u32` length prefix per entry.
+    /// 3. Write each `AggSpillEntry` (sort_key + group_key + state) as a
+    ///    length-prefixed postcard record into an LZ4 frame-compressed
+    ///    temp file. Postcard is a compact binary format with no
+    ///    self-describing framing of its own; the explicit length prefix
+    ///    delimits records inside the LZ4 frame.
     /// 4. Push the resulting `AggSpillFile` onto `self.spill_files`.
     /// 5. Reset `value_heap_bytes = 0`.
     fn spill(&mut self) -> Result<(), HashAggError> {
@@ -1299,7 +1259,7 @@ impl HashAggregator {
         }
         prepared.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // 3. Write sorted entries as length-prefixed postcard + LZ4.
+        // 3. Write sorted entries as postcard + LZ4.
         let mut writer = AggSpillWriter::new(self.spill_dir.as_deref())?;
         for (sort_key, idx) in prepared {
             let (key, state) = &drained[idx];
@@ -1341,13 +1301,13 @@ impl HashAggregator {
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
-        // D12: global-fold empty-input special case. Delegated to the
-        // shared `empty_global_fold_row` helper so the streaming path
-        // produces a byte-identical record (Phase 16 Task 16.4.3).
+        // Global-fold empty-input special case. Delegated to the shared
+        // `empty_global_fold_row` helper so the streaming path produces
+        // a byte-identical record.
         if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
-            out.push((record, 0, IndexMap::new()));
+            out.push((record, 0));
             return Ok(());
         }
 
@@ -1362,14 +1322,7 @@ impl HashAggregator {
                 } else {
                     state.min_row_num
                 };
-                // Option W: downstream reads emits positionally from the
-                // record via the Aggregate node's OutputLayout. No
-                // per-record emitted side-map is carried forward —
-                // single oracle (Failure mode #5). Metadata on the
-                // output SortRow starts empty; any aggregator-emitted
-                // `$meta.*` is already set on `record` itself via
-                // set_meta by finalize_group_inner.
-                out.push((record, row_num, IndexMap::new()));
+                out.push((record, row_num));
             }
             Ok(())
         } else {
@@ -1461,7 +1414,7 @@ impl HashAggregator {
                     } else {
                         state.min_row_num
                     };
-                    out.push((record, row_num, IndexMap::new()));
+                    out.push((record, row_num));
                 }
                 // Start new group from the winner.
                 current_key = Some(winner.sort_key.clone());
@@ -1482,7 +1435,7 @@ impl HashAggregator {
             } else {
                 state.min_row_num
             };
-            out.push((record, row_num, IndexMap::new()));
+            out.push((record, row_num));
         }
 
         let _ = ctx; // reserved for future per-group eval scope
@@ -1524,6 +1477,20 @@ pub(crate) fn finalize_group_inner(
     let compiled = factory.compiled();
     let mut values: Vec<Value> = vec![Value::Null; output_schema.column_count()];
     let mut user_meta: IndexMap<Box<str>, Value> = IndexMap::new();
+    // Stamp every group-by column from the group key tuple. The CXL
+    // parser blocks `emit $ck.* = ...` so engine-stamped group-by
+    // columns (`$ck.<field>` shadow columns) have no covering emit
+    // and would otherwise leave the slot at `Value::Null`. User-emit
+    // statements still run after this loop and override the slot for
+    // any group-by column they cover, so explicit `emit X = X` writes
+    // win on collision.
+    for (key_idx, gb_name) in compiled.group_by_fields.iter().enumerate() {
+        if let Some(out_idx) = output_schema.index(gb_name)
+            && let Some(gk) = key.get(key_idx)
+        {
+            values[out_idx] = gk.to_value();
+        }
+    }
     for emit in &compiled.emits {
         let v = eval_expr_in_agg_scope(&emit.residual, &scope).map_err(HashAggError::Residual)?;
         if emit.is_meta {
@@ -1548,16 +1515,7 @@ pub(crate) fn finalize_group_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Binary aggregation spill infrastructure (postcard + length-prefix + LZ4).
-//
-// Framing: each entry is written as a little-endian `u32` payload length
-// followed by that many postcard-encoded bytes. bincode — the prior
-// choice — is unmaintained as of the bincode 3.0.0 release notice (see
-// https://docs.rs/bincode/latest/bincode/ and research notes at
-// `docs/internal/research/RESEARCH-spill-format.md`). postcard is the
-// maintained serde-compatible successor; the explicit length prefix
-// mirrors the per-record framing used by Vector, Fluent Bit, and NiFi
-// so arbitrary-size entries stream with bounded per-entry memory.
+// Binary aggregation spill infrastructure (postcard + LZ4)
 // ---------------------------------------------------------------------------
 
 /// Merge entry for the binary aggregation spill path. Ordered by
@@ -1593,10 +1551,12 @@ struct AggSpillEntry {
     state: AggregatorGroupState,
 }
 
-/// Binary aggregation spill writer. Writes `AggSpillEntry` via postcard
-/// into an LZ4 frame-compressed temp file with a per-entry little-endian
-/// `u32` length prefix. No schema header — the caller knows the
-/// group-by layout at construction time.
+/// Binary aggregation spill writer. Writes `AggSpillEntry` records as
+/// length-prefixed postcard payloads into an LZ4 frame-compressed temp
+/// file. Postcard has no record-level framing of its own, so each entry
+/// is preceded by a 4-byte little-endian u32 holding the encoded
+/// payload length. No schema header — the caller knows the group-by
+/// layout at construction time.
 struct AggSpillWriter {
     encoder: lz4_flex::frame::FrameEncoder<std::io::BufWriter<tempfile::NamedTempFile>>,
 }
@@ -1616,22 +1576,14 @@ impl AggSpillWriter {
 
     fn write_entry(&mut self, entry: &AggSpillEntry) -> Result<(), HashAggError> {
         use std::io::Write;
-        let payload = postcard::to_stdvec(entry)
-            .map_err(|e| HashAggError::Spill(format!("postcard encode: {e}")))?;
-        // `u32` payload length is sufficient: a single `AggregatorGroupState`
-        // larger than 4 GiB would itself be an OOM-class bug well before
-        // reaching the spill writer.
-        let len = u32::try_from(payload.len()).map_err(|_| {
-            HashAggError::Spill(format!(
-                "spill entry exceeds u32 length prefix ({} bytes)",
-                payload.len()
-            ))
-        })?;
+        let bytes = postcard::to_stdvec(entry).map_err(|e| HashAggError::Spill(e.to_string()))?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| HashAggError::Spill("spill entry exceeds 4 GiB".to_string()))?;
         self.encoder
             .write_all(&len.to_le_bytes())
             .map_err(|e| HashAggError::Spill(e.to_string()))?;
         self.encoder
-            .write_all(&payload)
+            .write_all(&bytes)
             .map_err(|e| HashAggError::Spill(e.to_string()))?;
         Ok(())
     }
@@ -1662,42 +1614,36 @@ impl AggSpillFile {
         let buf_reader = std::io::BufReader::new(decoder);
         Ok(AggSpillReader {
             reader: buf_reader,
-            payload: Vec::new(),
+            len_buf: [0u8; 4],
         })
     }
 }
 
-/// Binary aggregation spill reader. Yields `AggMergeEntry` values by
-/// reading a little-endian `u32` length prefix followed by that many
-/// postcard-encoded bytes from an LZ4 frame-compressed file. `payload`
-/// is reused across entries to avoid reallocating the decode scratch.
+/// Binary aggregation spill reader. Yields `AggMergeEntry` by reading a
+/// 4-byte little-endian length prefix followed by a postcard-encoded
+/// payload from an LZ4 frame-compressed file. A clean-boundary EOF on
+/// the length prefix terminates the stream cleanly; any other read or
+/// decode failure surfaces as `HashAggError::Spill`.
 struct AggSpillReader {
     reader: std::io::BufReader<lz4_flex::frame::FrameDecoder<std::fs::File>>,
-    payload: Vec<u8>,
+    len_buf: [u8; 4],
 }
 
 impl AggSpillReader {
     fn next_entry(&mut self) -> Result<Option<AggMergeEntry>, HashAggError> {
         use std::io::Read;
-
-        // Clean EOF at an entry boundary is the expected terminator:
-        // `read_exact` on the length prefix returns `UnexpectedEof` when
-        // the frame decoder has exhausted the file, which we translate
-        // to `Ok(None)`. Any other IO error (or a partial read inside
-        // the payload) is propagated as a spill error.
-        let mut len_buf = [0u8; 4];
-        match self.reader.read_exact(&mut len_buf) {
+        match self.reader.read_exact(&mut self.len_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(HashAggError::Spill(e.to_string())),
         }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        self.payload.resize(len, 0);
+        let len = u32::from_le_bytes(self.len_buf) as usize;
+        let mut buf = vec![0u8; len];
         self.reader
-            .read_exact(&mut self.payload)
+            .read_exact(&mut buf)
             .map_err(|e| HashAggError::Spill(e.to_string()))?;
-        let entry: AggSpillEntry = postcard::from_bytes(&self.payload)
-            .map_err(|e| HashAggError::Spill(format!("postcard decode: {e}")))?;
+        let entry: AggSpillEntry =
+            postcard::from_bytes(&buf).map_err(|e| HashAggError::Spill(e.to_string()))?;
         Ok(Some(AggMergeEntry {
             sort_key: entry.sort_key,
             group_key: entry.group_key,
@@ -1708,7 +1654,7 @@ impl AggSpillReader {
 
 /// Single source of truth for the `Vec<SortField>` configuration used
 /// to encode group-by columns for the streaming aggregator and the
-/// spill write/read paths. Phase 16 Task 16.4.3 (D74).
+/// spill write/read paths.
 ///
 /// Returns one ASC nulls-first `SortField` per group-by column. The
 /// schema parameter is currently unused but is plumbed so a future
@@ -1725,13 +1671,13 @@ pub(crate) fn group_by_sort_fields(group_by_fields: &[String], _schema: &Schema)
         .collect()
 }
 
-/// Single source of truth for the empty-input global-fold record (D12).
+/// Single source of truth for the empty-input global-fold record.
 ///
 /// Both the hash path (`HashAggregator::finalize`) and the streaming
 /// path (`StreamingAggregator::flush`) call this to produce one
 /// defaulted output record when an empty stream and an empty group-by
 /// would otherwise yield zero rows. Mirrors DataFusion's
-/// `AggregateStream` empty-input branch. Phase 16 Task 16.4.3 (D73).
+/// `AggregateStream` empty-input branch.
 pub(crate) fn empty_global_fold_row(
     factory: &AccumulatorFactory,
     output_schema: &Arc<Schema>,
@@ -1814,11 +1760,11 @@ fn eval_binding_arg_value(
 }
 
 // ---------------------------------------------------------------------------
-// StreamingAggregator<Op: AccumulatorOp> — raw + merge modes (Task 16.4.0)
+// StreamingAggregator<Op: AccumulatorOp> — raw + merge modes
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// AccumulatorOp trait + AddRaw / MergeState impls (Task 16.4.2)
+// AccumulatorOp trait + AddRaw / MergeState impls
 // ---------------------------------------------------------------------------
 //
 // The trait lives here in `clinker-core/src/aggregation.rs` (NOT
@@ -1826,8 +1772,7 @@ fn eval_binding_arg_value(
 // `AggregatorGroupState`, which in turn holds a `MetadataCommonTracker`
 // defined alongside the hash aggregator. `clinker-record` has no
 // dependency on `cxl`, so the `apply_row` signature — which takes
-// `&[AggregateBinding]` — would also be unexpressible there. Phase 16
-// Task 16.4.2 explicitly specifies `aggregation.rs` as the location.
+// `&[AggregateBinding]` — would also be unexpressible there.
 
 /// Monomorphization marker trait for the streaming aggregator's
 /// ingestion hot loop.
@@ -1848,13 +1793,12 @@ fn eval_binding_arg_value(
 ///   wired the fast path to a non-trivial binding arg.
 /// * [`MergeState`] — `Input = (Vec<u8>, AggregatorGroupState)`. Each
 ///   call carries an encoded sort key (read by the LoserTree
-///   comparator) plus the FULL per-group state: the `AccumulatorRow`,
-///   the three D57 sidecar fields (`min_row_num`, `common_emitted`,
-///   `union_accumulated`), and the `MetadataCommonTracker`. `apply_row`
-///   folds the incoming state into the currently-open per-group
-///   `row` via `AccumulatorEnum::merge`. The sidecar / tracker merges
-///   live on `GroupBoundary::push` because they operate on the open
-///   group's full `AggregatorGroupState`, not on the `row` alone.
+///   comparator) plus the full per-group state: the `AccumulatorRow`,
+///   `min_row_num`, and the `MetadataCommonTracker`. `apply_row` folds
+///   the incoming state into the currently-open per-group `row` via
+///   `AccumulatorEnum::merge`. The `min_row_num` + tracker merges live
+///   on `GroupBoundary::push` because they operate on the open group's
+///   full `AggregatorGroupState`, not on the `row` alone.
 ///
 /// **Audit fix Gap B:** pre-drill-pass-6 wording had
 /// `MergeState::Input = (Vec<u8>, AccumulatorRow)`, which silently
@@ -1876,7 +1820,7 @@ pub trait AccumulatorOp: Default + 'static {
 }
 
 /// Ingestion mode: raw upstream `Record` values arriving in verified
-/// pre-sorted order on the group-by prefix. Phase 16 Task 16.4.2.
+/// pre-sorted order on the group-by prefix.
 #[derive(Debug, Default)]
 pub struct AddRaw;
 
@@ -1891,9 +1835,9 @@ impl AccumulatorOp for AddRaw {
         // an `EvalContext` + `ProgramEvaluator`, which this narrow
         // trait signature intentionally does not plumb — callers that
         // hit those variants drop to the general `dispatch_binding`
-        // path. This fast-path specialization is what Task 16.4.2
-        // reserves for future hot-loop optimization (DataFusion
-        // blog 2023-08-05 per-record allocation pattern).
+        // path. This fast-path specialization is reserved for future
+        // hot-loop optimization (DataFusion blog 2023-08-05 per-record
+        // allocation pattern).
         for (binding, acc) in bindings.iter().zip(row.iter_mut()) {
             match &binding.arg {
                 BindingArg::Field(idx) => {
@@ -1922,7 +1866,7 @@ impl AccumulatorOp for AddRaw {
 
 /// Ingestion mode: merge pre-aggregated per-group state coming from a
 /// spill file (or any upstream that already folded rows into an
-/// `AggregatorGroupState`). Phase 16 Task 16.4.2.
+/// `AggregatorGroupState`).
 ///
 /// `Input` carries the **full** state so sidecar reductions (D57) and
 /// the metadata common tracker (D11 revised) survive spill recovery
@@ -1933,15 +1877,14 @@ pub struct MergeState;
 impl AccumulatorOp for MergeState {
     /// Encoded sort key (read by the LoserTree comparator) + the full
     /// per-group state. The sort key is produced by `SortKeyEncoder`
-    /// (Task 16.4.1) and matches the declared sort-order direction.
+    /// and matches the declared sort-order direction.
     type Input = (Vec<u8>, AggregatorGroupState);
 
     #[inline(always)]
     fn apply_row(row: &mut AccumulatorRow, _bindings: &[AggregateBinding], input: &Self::Input) {
         // Merge the incoming `AccumulatorRow` into the currently-open
         // group's row slot-by-slot via `AccumulatorEnum::merge`. The
-        // sidecar fields (`min_row_num`, `common_emitted`,
-        // `union_accumulated`) and the `MetadataCommonTracker` live on
+        // `min_row_num` and `MetadataCommonTracker` live on
         // `AggregatorGroupState` and are merged by
         // [`crate::pipeline::streaming_merge::GroupBoundary::push`]
         // when it installs / folds the open group — `apply_row` stays
@@ -1954,9 +1897,9 @@ impl AccumulatorOp for MergeState {
     }
 }
 
-/// Associative merge of the D57 sidecar fields plus the metadata
+/// Associative merge of per-group `min_row_num` plus the metadata
 /// common tracker. Operates on a currently-open group's
-/// `AggregatorGroupState` and folds another state's sidecars in.
+/// `AggregatorGroupState` and folds another state's state in.
 ///
 /// Separated out so both the `GroupBoundary` state machine (for the
 /// raw-streaming path) and the spill-recovery path can call the
@@ -1966,8 +1909,6 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
     if src.min_row_num < dst.min_row_num {
         dst.min_row_num = src.min_row_num;
     }
-    // `union_accumulated`: first-seen-wins union.
-    union_accumulated_into(&mut dst.union_accumulated, &src.union_accumulated);
     // `MetadataCommonTracker`: associative merge per D11 revised.
     dst.meta_tracker.merge(src.meta_tracker);
 }
@@ -1984,7 +1925,7 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
 ///   pre-aggregated partials. The spill-recovery path currently lives
 ///   in `HashAggregator::finalize_with_spill`, which is what the
 ///   executor actually uses; the `MergeState` inherent impl exists so
-///   the decisions-log type surface survives for Phase 17+ work.
+///   the type surface survives for future out-of-core work.
 ///
 /// Both variants share the [`GroupBoundary`](crate::pipeline::streaming_merge::GroupBoundary)
 /// state machine (DataFusion PR #4301 pattern), guaranteeing that all
@@ -2061,8 +2002,8 @@ impl StreamingAggregator<AddRaw> {
     /// 3. Build a fresh per-group state seeded with a clone of the
     ///    factory prototype.
     /// 4. Fold each binding via `dispatch_binding` into that state.
-    /// 5. Populate the D57 sidecar fields from the per-record
-    ///    `row_num` / `emitted` / `accumulated` inputs.
+    /// 5. Record the minimum `row_num` for the group so finalize
+    ///    preserves the earliest input row's position.
     /// 6. Push into the shared `GroupBoundary` detector; on a key
     ///    boundary the previous group's finalized `SortRow` lands in
     ///    `self.pending`. A strictly lesser key is routed through
@@ -2071,7 +2012,6 @@ impl StreamingAggregator<AddRaw> {
         &mut self,
         record: &Record,
         row_num: u64,
-        accumulated: &IndexMap<String, Value>,
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
@@ -2149,11 +2089,10 @@ impl StreamingAggregator<AddRaw> {
             }
         }
 
-        // D57 sidecar seed — single-record values feed directly into
-        // the freshly-constructed per-group state. `GroupBoundary`'s
-        // `push` merges these in per-group once the key is installed.
+        // Seed `min_row_num` on the fresh per-group state; the boundary
+        // detector's merge-peer path keeps the minimum across input
+        // records folded into the same open group.
         state.min_row_num = row_num;
-        state.union_accumulated = accumulated.clone();
 
         // Encode the group-by columns into boundary.current via the
         // owned encoder. We feed it the input record directly.
@@ -2203,27 +2142,21 @@ impl StreamingAggregator<AddRaw> {
             out.append(&mut self.pending);
         }
         let _ = key;
-        self.boundary.push(
-            state,
-            record.clone(),
-            (row_num, accumulated.clone()),
-            &finalize_closure,
-            out,
-        )?;
+        self.boundary
+            .push(state, record.clone(), row_num, &finalize_closure, out)?;
 
         let _ = ctx; // ctx already used above
         Ok(())
     }
 
     /// Drain all emitted boundary rows plus the final open group.
-    /// Phase 16 Task 16.4.3 — D12 special case.
     pub fn flush(mut self, _ctx: &EvalContext, out: &mut Vec<SortRow>) -> Result<(), HashAggError> {
-        // D12 special case: empty input + empty group_by → emit one
-        // defaulted global-fold row.
+        // Empty input + empty group_by → emit one defaulted global-fold
+        // row.
         if self.rows_seen == 0 && self.group_by_indices.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
-            out.push((record, 0, IndexMap::new()));
+            out.push((record, 0));
             return Ok(());
         }
         if !self.pending.is_empty() {
@@ -2265,8 +2198,8 @@ impl StreamingAggregator<AddRaw> {
 
 impl StreamingAggregator<MergeState> {
     /// Construct a merge-mode streaming aggregator. Retained as a
-    /// forward-compat stub for Phase 17+ out-of-core merge recovery;
-    /// the executor's spill-recovery path currently lives inside
+    /// forward-compat stub for future out-of-core merge recovery; the
+    /// executor's spill-recovery path currently lives inside
     /// `HashAggregator::finalize_with_spill`.
     pub fn new_for_merge(
         compiled: Arc<CompiledAggregate>,
@@ -2309,9 +2242,9 @@ impl StreamingAggregator<MergeState> {
 }
 
 impl<Op: AccumulatorOp> StreamingAggregator<Op> {
-    /// Task 16.4.10 — debug-inspect accessor used by the structural O(1)
-    /// memory test (G7) and by the Kiln debugger's streaming-agg state
-    /// overlay. Returns 1 when a per-group state is currently open
+    /// Debug-inspect accessor used by the structural O(1) memory test
+    /// and by the Kiln debugger's streaming-agg state overlay. Returns
+    /// 1 when a per-group state is currently open
     /// (between key boundaries), 0 when no group is open (before the
     /// first record or immediately after a flush).
     ///
@@ -2325,13 +2258,13 @@ impl<Op: AccumulatorOp> StreamingAggregator<Op> {
 }
 
 // ---------------------------------------------------------------------------
-// Task 16.4.6 — plan-time streaming eligibility
+// Plan-time streaming eligibility
 // ---------------------------------------------------------------------------
 
 /// Outcome of evaluating whether an aggregation can run in streaming mode
 /// given its parent node's physical properties. Returned by
-/// [`qualifies_for_streaming`] and consumed by the planner lowering in
-/// Task 16.4.9a to pick between `PlanNode::StreamingAggregation` and
+/// [`qualifies_for_streaming`] and consumed by the planner lowering to
+/// pick between `PlanNode::StreamingAggregation` and
 /// `PlanNode::HashAggregation`.
 #[derive(Debug, Clone)]
 pub enum StreamingEligibility {
@@ -2353,7 +2286,7 @@ pub enum StreamingEligibility {
 /// [`StreamingEligibility`] describing whether streaming is allowed and, if
 /// so, the effective group-by order and qualified sort prefix.
 ///
-/// Rules (see phase-16-aggregation.md Task 16.4.6 for provenance):
+/// Rules:
 /// - Global fold (`group_by` empty) always streams — a single output row
 ///   with no sort requirement.
 /// - `Single` partitioning passes; `HashPartitioned` passes iff its keys
@@ -2481,6 +2414,9 @@ fn ordering_provenance_summary(p: &crate::plan::properties::OrderingProvenance) 
         OP::DestroyedByMergeMismatch { at_node, .. } => {
             format!("destroyed by merge mismatch at `{}`", at_node)
         }
+        OP::DestroyedByCombine { at_node, .. } => {
+            format!("destroyed by combine `{}`", at_node)
+        }
         OP::IntroducedByStreamingAggregate { at_node, .. } => {
             format!("introduced by streaming aggregate `{}`", at_node)
         }
@@ -2519,27 +2455,6 @@ mod accumulator_op_tests {
         let src = state_with_row(Vec::new()); // min_row_num = u64::MAX
         merge_group_sidecars(&mut dst, src);
         assert_eq!(dst.min_row_num, 7, "u64::MAX must act as identity");
-    }
-
-    // Removed test_merge_sidecars_emitted_intersect_keeps_agreeing_keys —
-    // the `common_emitted` per-record intersection was dead state under
-    // Option W (finalize rebuilt emits from the output record, not
-    // from the sidecar), and has been removed along with the `emitted`
-    // parameter to add_record.
-
-    #[test]
-    fn test_merge_sidecars_accumulated_union_first_seen_wins() {
-        let mut dst = state_with_row(Vec::new());
-        dst.union_accumulated.insert("k1".to_string(), sv("first"));
-
-        let mut src = state_with_row(Vec::new());
-        src.union_accumulated
-            .insert("k1".to_string(), sv("SHOULD_NOT_WIN"));
-        src.union_accumulated.insert("k2".to_string(), sv("new"));
-
-        merge_group_sidecars(&mut dst, src);
-        assert_eq!(dst.union_accumulated.get("k1"), Some(&sv("first")));
-        assert_eq!(dst.union_accumulated.get("k2"), Some(&sv("new")));
     }
 
     #[test]
@@ -2615,21 +2530,20 @@ mod accumulator_op_tests {
     fn test_mergestate_input_type_carries_full_group_state() {
         // Compile-time proof that the `Input` associated type is the
         // full `(Vec<u8>, AggregatorGroupState)` (audit fix Gap B).
-        // If Task 16.4.2 ever regresses to `(Vec<u8>, AccumulatorRow)`
-        // this test stops compiling.
+        // If `MergeState::Input` ever regresses to
+        // `(Vec<u8>, AccumulatorRow)` this test stops compiling.
         fn assert_input_is_full_state(_: &<MergeState as AccumulatorOp>::Input) {}
         let st = state_with_row(Vec::new());
         let input: (Vec<u8>, AggregatorGroupState) = (Vec::new(), st);
         assert_input_is_full_state(&input);
-        // And confirm sidecar + tracker fields are addressable on the
+        // Confirm `min_row_num` + tracker are addressable on the
         // `Input` type — if they are missing this line fails to
         // compile.
         let _ = input.1.min_row_num;
-        let _ = &input.1.union_accumulated;
         let _ = &input.1.meta_tracker;
     }
 
-    // ----- qualifies_for_streaming (Task 16.4.6) -----
+    // ----- qualifies_for_streaming -----
 
     use crate::config::SortOrder as SO;
     use crate::plan::properties::{
@@ -2821,9 +2735,9 @@ mod spill_trigger_tests {
         let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
         let resolved =
             resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
-        let schema_map: IndexMap<String, Type> = input_fields
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
             .iter()
-            .map(|(n, t)| ((*n).to_string(), t.clone()))
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
             .collect();
         let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
         let mode = AggregateMode::GroupBy {
@@ -2912,7 +2826,7 @@ mod spill_trigger_tests {
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..500u64 {
             let r = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
-            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i))
                 .expect("add_record");
         }
         assert!(
@@ -2940,8 +2854,7 @@ mod spill_trigger_tests {
         let file: Arc<str> = Arc::from("t.csv");
         for i in 0..10u64 {
             let r = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
-            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
-                .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert!(
             agg.spill_files().is_empty(),
@@ -2970,8 +2883,7 @@ mod spill_trigger_tests {
         for i in 0..64u64 {
             let k = keys[(i as usize) % keys.len()];
             let r = make_record(&input, vec![Value::String(k.into())]);
-            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
-                .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert!(
             !agg.spill_files().is_empty(),
@@ -2982,7 +2894,7 @@ mod spill_trigger_tests {
         let mut out: Vec<SortRow> = Vec::new();
         agg.finalize(&ctx, &mut out).expect("finalize after spill");
         assert_eq!(out.len(), 4, "four distinct groups after spill-merge");
-        for (rec, _row_num, _a) in &out {
+        for (rec, _row_num) in &out {
             assert_eq!(
                 rec.values()[1],
                 Value::Integer(16),
@@ -3012,8 +2924,7 @@ mod spill_trigger_tests {
         for i in 0..256u64 {
             let k = keys[(i as usize) % keys.len()];
             let r = make_record(&input, vec![Value::String(k.into())]);
-            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
-                .unwrap();
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
         }
         assert!(
             agg.spill_files().len() >= 2,
@@ -3026,7 +2937,7 @@ mod spill_trigger_tests {
         agg.finalize(&ctx, &mut out)
             .expect("multi-spill finalize merges correctly");
         assert_eq!(out.len(), 8, "eight distinct groups after k-way merge");
-        for (rec, _, _) in &out {
+        for (rec, _) in &out {
             assert_eq!(
                 rec.values()[1],
                 Value::Integer(32),
@@ -3080,7 +2991,7 @@ mod spill_trigger_tests {
         for i in 0..5_000u64 {
             let key = format!("k{}", i % 10);
             let r = make_record(&input, vec![Value::String(key.into())]);
-            agg.add_record(&r, i, &IndexMap::new(), &ctx_for(&stable, &file, i))
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i))
                 .expect("add_record");
         }
         assert!(

@@ -1,0 +1,11 @@
+---
+source: crates/clinker-core/tests/combine_test.rs
+expression: canonicalize_csv(result.primary_output())
+---
+employee_id,department,project
+E001,Engineering,Atlas
+E001,Engineering,Phoenix
+E002,Sales,Borealis
+E003,Engineering,Atlas
+E003,Engineering,Phoenix
+E003,Engineering,Vega

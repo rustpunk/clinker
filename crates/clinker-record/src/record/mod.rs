@@ -2,28 +2,23 @@ use crate::resolver::FieldResolver;
 use crate::schema::Schema;
 use crate::value::Value;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Maximum number of metadata keys per record.
 const MAX_METADATA_KEYS: usize = 64;
 
-/// Schema-indexed record (Option-W runtime layout).
+/// Schema-indexed row record.
 ///
-/// Every `Record` carries the **producing node's bound output schema**
-/// on `schema`, with `values` positionally aligned to it. There is no
-/// overflow side-channel: fields not declared in the node's bound
-/// output schema simply do not exist on records produced by that node.
-/// Emits land in positional slots baked in at plan time by
-/// `bind_schema` + the Option-W projection pass in the executor.
+/// Values live in a positional `Vec<Value>` whose length equals
+/// `schema.column_count()`. Every write lands at a known schema slot;
+/// there is no side map for unknown fields. Plan-time schema widening
+/// guarantees every emit site addresses a column declared on the
+/// operator's `Arc<Schema>`.
 ///
-/// Per the 2026-04-13 research (`docs/internal/research/RESEARCH-runtime-record-layout.md`):
-/// this is the universal pattern in Kettle/Apache Hop, PostgreSQL,
-/// Spark Tungsten, DataFusion, DuckDB, Velox, CockroachDB, Materialize,
-/// Polars, and SQLite VDBE — every row-major / typed tabular engine
-/// surveyed. The overflow side-channel previously on this struct was
-/// Option-Y (no prior art across 20+ engines; documented failure
-/// pattern in every system that grew a two-record-type split) and has
-/// been removed as part of landing Option-W.
+/// Per-record framing data (unknown keys discovered by readers,
+/// reader/writer context) lives in the separate `metadata` map under
+/// the `$meta.*` namespace, capped at 64 keys per record.
 #[derive(Debug, Clone)]
 pub struct Record {
     schema: Arc<Schema>,
@@ -31,6 +26,53 @@ pub struct Record {
     /// Per-record metadata. Stripped from output unless `include_metadata` is set.
     /// Lazy-initialized on first `set_meta()` call. Deep-cloned on `Record::clone`.
     metadata: Option<Box<IndexMap<Box<str>, Value>>>,
+}
+
+/// Wire payload for a [`Record`] in binary spill streams.
+///
+/// Schema is not embedded — the spill stream writes the schema once in
+/// a header line, so each record body carries only positional values and
+/// optional per-record metadata. Callers reconstruct a full `Record` via
+/// [`RecordPayload::into_record`].
+///
+/// Wire format (postcard): `(Vec<Value>, Option<Vec<(Box<str>, Value)>>)`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecordPayload {
+    /// Positional field values in schema column order.
+    pub values: Vec<Value>,
+    /// Per-record metadata entries, or `None` if the record has no metadata.
+    pub metadata: Option<Vec<(Box<str>, Value)>>,
+}
+
+impl RecordPayload {
+    /// Reconstruct a [`Record`] from this payload using a caller-supplied schema.
+    pub fn into_record(self, schema: Arc<Schema>) -> Record {
+        let mut record = Record::new(schema, self.values);
+        if let Some(meta_pairs) = self.metadata {
+            for (k, v) in meta_pairs {
+                // Metadata cap errors are ignored on deserialization — the cap
+                // is a write-time guard, not a wire-format invariant.
+                let _ = record.set_meta(&k, v);
+            }
+        }
+        record
+    }
+}
+
+impl Serialize for Record {
+    /// Serializes this record as a [`RecordPayload`] (values + metadata).
+    ///
+    /// The schema is not included in the wire output. Callers that need
+    /// schema information must write it separately (e.g., as a header line)
+    /// and supply it on deserialization via [`RecordPayload::into_record`].
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let meta = self.metadata_pairs();
+        RecordPayload {
+            values: self.values.clone(),
+            metadata: if meta.is_empty() { None } else { Some(meta) },
+        }
+        .serialize(serializer)
+    }
 }
 
 impl Record {
@@ -56,21 +98,29 @@ impl Record {
         }
     }
 
+    /// Returns the schema-indexed value for `name`, or `None` when the
+    /// name is not declared on this record's schema.
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.schema.index(name).and_then(|idx| self.values.get(idx))
+        self.schema.index(name).and_then(|i| self.values.get(i))
     }
 
-    /// Set a schema field positionally by name. Returns `true` if the
-    /// name is in the record's schema, `false` otherwise (the value is
-    /// **not** stored). Callers that need to emit a field not in the
-    /// record's current schema must construct a new `Record` with the
-    /// producing node's bound output schema (Option-W contract).
-    pub fn set(&mut self, name: &str, value: Value) -> bool {
-        if let Some(idx) = self.schema.index(name) {
-            self.values[idx] = value;
-            return true;
+    /// Writes `value` to the schema-indexed slot for `name`. Plan-time
+    /// widening guarantees `name` is in schema at every emit site;
+    /// `debug_assert` surfaces widening bugs in debug builds. In release,
+    /// writes to unknown fields are silently dropped — this is a
+    /// defense-in-depth no-op behind the debug guard, not a recovery
+    /// mechanism.
+    pub fn set(&mut self, name: &str, value: Value) {
+        match self.schema.index(name) {
+            Some(idx) => self.values[idx] = value,
+            None => {
+                debug_assert!(
+                    false,
+                    "Record::set called with unknown field {name:?}; plan-time widening should have \
+                     added it to the operator's output schema",
+                );
+            }
         }
-        false
     }
 
     pub fn schema(&self) -> &Arc<Schema> {
@@ -114,9 +164,23 @@ impl Record {
             .flat_map(|m| m.iter().map(|(k, v)| (k.as_ref(), v)))
     }
 
+    /// Collect all metadata entries as owned `(Box<str>, Value)` pairs.
+    ///
+    /// Returns an empty `Vec` when the record has no metadata. Used by
+    /// [`crate::Record`]'s `Serialize` impl to produce a [`RecordPayload`]
+    /// for binary spill encoding.
+    pub fn metadata_pairs(&self) -> Vec<(Box<str>, Value)> {
+        match &self.metadata {
+            None => Vec::new(),
+            Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
     // ── Fields ─────────────────────────────────────────────────────
 
-    /// Iterator over schema fields in declaration order.
+    /// Iterator over every schema field in schema order. Metadata is
+    /// exposed separately via [`Record::iter_meta`]; writers that want
+    /// to include metadata in their output layer the two iterators.
     pub fn iter_all_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.schema
             .columns()
@@ -125,22 +189,41 @@ impl Record {
             .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
 
+    /// Iterator over user-declared schema fields in schema order,
+    /// skipping engine-stamped columns (today: `$ck.<field>` correlation
+    /// snapshots). The default writer surface and the default projection
+    /// fast path consult this iterator so engine-internal namespaces do
+    /// not leak into output files unless the Output node opts in.
+    pub fn iter_user_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                self.schema
+                    .field_metadata(*i)
+                    .is_none_or(|m| !m.is_engine_stamped())
+            })
+            .map(|(i, name)| (name.as_ref(), &self.values[i]))
+    }
+
     /// Number of schema fields.
     pub fn field_count(&self) -> usize {
         self.schema.column_count()
     }
 
-    /// Total number of fields (same as field_count under Option-W; the
-    /// old overflow side-channel has been removed).
+    /// Total number of fields — identical to [`Record::field_count`]
+    /// now that overflow storage no longer exists. Retained as an alias
+    /// for call-site readability at heap-accounting sites.
     pub fn total_field_count(&self) -> usize {
         self.schema.column_count()
     }
 
     /// Estimated heap bytes owned by this record.
     ///
-    /// Includes `Vec<Value>` backing store + per-value heap
-    /// allocations (strings, arrays) + metadata `IndexMap` if present.
-    /// Used by SortBuffer for self-tracking allocation counting.
+    /// Includes `Vec<Value>` backing store, per-value heap allocations
+    /// (strings, arrays), and the metadata IndexMap (if present). Used
+    /// by `SortBuffer` for self-tracking allocation counting.
     pub fn estimated_heap_size(&self) -> usize {
         let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
         let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
@@ -159,26 +242,24 @@ impl Record {
 }
 
 impl FieldResolver for Record {
-    fn resolve(&self, name: &str) -> Option<Value> {
+    fn resolve(&self, name: &str) -> Option<&Value> {
         // Handle $meta.* namespace: resolve from per-record metadata map.
         if let Some(meta_key) = name.strip_prefix("$meta.") {
-            return self.get_meta(meta_key).cloned();
+            return self.get_meta(meta_key);
         }
-        self.get(name).cloned()
+        self.get(name)
     }
 
-    fn resolve_qualified(&self, _source: &str, field: &str) -> Option<Value> {
-        self.get(field).cloned()
+    fn resolve_qualified(&self, _source: &str, field: &str) -> Option<&Value> {
+        self.get(field)
     }
 
     fn available_fields(&self) -> Vec<&str> {
         self.schema().columns().iter().map(|c| &**c).collect()
     }
 
-    fn iter_fields(&self) -> Vec<(String, Value)> {
-        self.iter_all_fields()
-            .map(|(name, val)| (name.to_string(), val.clone()))
-            .collect()
+    fn iter_fields(&self) -> Vec<(&str, &Value)> {
+        self.iter_all_fields().collect()
     }
 }
 
@@ -217,16 +298,95 @@ mod tests {
         assert_eq!(record.get("name"), Some(&Value::String("Bob".into())));
     }
 
+    /// Structural assertion: `Record` holds exactly `schema`, `values`,
+    /// and `metadata`. Adding or renaming a field fails compilation.
     #[test]
-    fn test_record_set_unknown_field_returns_false() {
+    fn test_record_struct_has_exactly_schema_values_metadata_fields() {
+        let schema = test_schema();
+        let values = vec![Value::Null; 5];
+        let rec = Record::new(schema, values);
+        let Record {
+            schema: _,
+            values: _,
+            metadata: _,
+        } = rec;
+    }
+
+    #[test]
+    fn test_record_set_writes_schema_slot() {
         let schema = test_schema();
         let values = vec![Value::Null; 5];
         let mut record = Record::new(schema, values);
-        // Under Option-W, setting a field not declared in the record's
-        // bound schema is a no-op — callers must construct a new
-        // Record with the correct schema.
-        assert!(!record.set("nonexistent", Value::Integer(1)));
-        assert_eq!(record.get("nonexistent"), None);
+        record.set("name", Value::String("Alice".into()));
+        assert_eq!(record.get("name"), Some(&Value::String("Alice".into())),);
+        assert_eq!(record.values()[1], Value::String("Alice".into()));
+    }
+
+    /// Writing an unknown field in debug panics via `debug_assert`.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Record::set called with unknown field")]
+    fn test_record_set_unknown_field_debug_panics() {
+        let schema = test_schema();
+        let values = vec![Value::Null; 5];
+        let mut record = Record::new(schema, values);
+        record.set("nonexistent", Value::Integer(1));
+    }
+
+    #[test]
+    fn test_record_iter_user_fields_skips_engine_stamped() {
+        use crate::schema::FieldMetadata;
+        let cols: Vec<Box<str>> = vec!["employee_id".into(), "$ck.employee_id".into()];
+        let meta = vec![None, Some(FieldMetadata::snapshot_of("employee_id"))];
+        let schema = Arc::new(Schema::with_metadata(cols, meta));
+        let record = Record::new(schema, vec![Value::Integer(7), Value::Integer(7)]);
+
+        let user_fields: Vec<(&str, &Value)> = record.iter_user_fields().collect();
+        assert_eq!(
+            user_fields.len(),
+            1,
+            "engine-stamped column must be skipped"
+        );
+        assert_eq!(user_fields[0].0, "employee_id");
+
+        let all_fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
+        assert_eq!(all_fields.len(), 2, "iter_all_fields keeps engine-stamped");
+    }
+
+    #[test]
+    fn test_record_iter_all_fields_is_schema_only() {
+        let schema = test_schema();
+        let values = vec![
+            Value::Integer(1),
+            Value::String("Alice".into()),
+            Value::Integer(30),
+            Value::String("alice@test.com".into()),
+            Value::Bool(true),
+        ];
+        let record = Record::new(schema, values);
+
+        let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0].0, "id");
+        assert_eq!(fields[1].0, "name");
+        assert_eq!(fields[4].0, "active");
+    }
+
+    /// Metadata round-trip survives the overflow rip — the metadata map
+    /// is preserved as the sole off-schema per-record storage.
+    #[test]
+    fn test_record_metadata_preserved() {
+        let schema = test_schema();
+        let values = vec![Value::Null; 5];
+        let mut record = Record::new(schema, values);
+
+        assert!(!record.has_meta());
+        record.set_meta("k", Value::Integer(1)).unwrap();
+        assert!(record.has_meta());
+        assert_eq!(record.get_meta("k"), Some(&Value::Integer(1)));
+        let collected: Vec<(&str, &Value)> = record.iter_meta().collect();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0, "k");
     }
 
     #[test]
@@ -244,25 +404,6 @@ mod tests {
         assert_eq!(record.get("id"), Some(&Value::Integer(1)));
         assert_eq!(record.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(record.get("age"), Some(&Value::Null));
-    }
-
-    #[test]
-    fn test_record_iter_all_fields_ordering() {
-        let schema = test_schema();
-        let values = vec![
-            Value::Integer(1),
-            Value::String("Alice".into()),
-            Value::Integer(30),
-            Value::String("alice@test.com".into()),
-            Value::Bool(true),
-        ];
-        let record = Record::new(schema, values);
-
-        let fields: Vec<(&str, &Value)> = record.iter_all_fields().collect();
-        assert_eq!(fields[0].0, "id");
-        assert_eq!(fields[1].0, "name");
-        assert_eq!(fields[4].0, "active");
-        assert_eq!(fields.len(), 5);
     }
 
     #[test]
@@ -292,14 +433,14 @@ mod tests {
             schema,
             vec![Value::String("Ada".into()), Value::Integer(30)],
         );
-        assert_eq!(record.resolve("name"), Some(Value::String("Ada".into())));
-        assert_eq!(record.resolve("age"), Some(Value::Integer(30)));
+        assert_eq!(record.resolve("name"), Some(&Value::String("Ada".into())));
+        assert_eq!(record.resolve("age"), Some(&Value::Integer(30)));
         assert_eq!(record.resolve("unknown"), None);
 
         // Qualified lookup delegates to unqualified
         assert_eq!(
             record.resolve_qualified("any_source", "name"),
-            Some(Value::String("Ada".into()))
+            Some(&Value::String("Ada".into()))
         );
 
         let mut fields = record.available_fields();

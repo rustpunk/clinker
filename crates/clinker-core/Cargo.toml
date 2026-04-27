@@ -58,6 +58,7 @@ rayon = "1"
 fastrand = { workspace = true }
 insta = "1"
 serial_test = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "sort"
@@ -85,5 +86,21 @@ harness = false
 
 [[bench]]
 name = "composition"
+harness = false
+
+[[bench]]
+name = "combine"
+harness = false
+
+[[bench]]
+name = "combine_iejoin"
+harness = false
+
+[[bench]]
+name = "combine_nary_3input"
+harness = false
+
+[[bench]]
+name = "combine_grace_hash"
 harness = false
 

@@ -1,24 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
-use clinker_record::Schema;
 use indexmap::IndexMap;
 use regex::Regex;
 
-use super::row::{ColumnLookup, Row};
+use super::row::{ColumnLookup, QualifiedField, Row};
 use super::types::Type;
 use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement, UnaryOp};
 use crate::builtins::BuiltinRegistry;
 use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
 
-/// Return type inference for aggregate function calls (Phase 16).
+/// Return type inference for aggregate function calls.
 ///
 /// - `sum(Integer)` → Integer, `sum(Float)` → Float, `sum(Numeric/Any)` → Numeric
 /// - `count(...)` → Integer (always)
 /// - `avg(...)` → Float
 /// - `min(T)` / `max(T)` → T (preserving input type)
-/// - `collect(T)` → Array (Phase 16 treats it as Array; element type is erased)
+/// - `collect(T)` → Array (element type is currently erased)
 /// - `weighted_avg(_, _)` → Float
 /// - Unknown names → Any (caller emits a diagnostic via the parser lookahead set)
 fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
@@ -48,8 +46,9 @@ fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
 /// `aggregate:` YAML block and additionally enforces that bare field
 /// references outside an aggregate call appear in the `group_by` field set.
 ///
-/// Research: RESEARCH-aggregate-typecheck-context.md — PostgreSQL
-/// `parseCheckAggregates` + Spark `CheckAnalysis` pattern.
+/// Mirrors the PostgreSQL `parseCheckAggregates` / Spark `CheckAnalysis`
+/// two-mode pattern: aggregate-context typecheck is a separate pass gated by
+/// this flag.
 #[derive(Debug, Clone)]
 pub enum AggregateMode {
     /// Row-level transform. Any `Expr::AggCall` is an error.
@@ -78,76 +77,6 @@ struct FieldConstraint {
     span: Span,
 }
 
-/// Plan-time positional slot table for a node's output (Option-W codegen).
-///
-/// One per CXL-bearing node, attached to its [`TypedProgram`]. Holds the
-/// authoritative `Arc<Schema>` that runtime [`clinker_record::Record`] values
-/// produced by this node are aligned to, plus the precomputed `(name → slot)`
-/// resolution baked in at compile time. The evaluator never looks up emit
-/// names at runtime — it writes directly into `values[emit_slots[i]]`.
-///
-/// Sourced from `BoundSchemas.schema_of(node_name)` when constructed by
-/// `bind_schema`. When constructed standalone (REPL / unit tests with no
-/// upstream Row), the schema is derived from the program's non-meta emit
-/// names in statement order, with no passthroughs.
-///
-/// **Invariant** (debug_assert at construction):
-/// `schema.column_count() == passthroughs.len() + non_meta_emit_count`.
-/// **Drift guardrail (Failure mode #5 of RESEARCH-runtime-record-layout.md):**
-/// the executor checks `Arc::ptr_eq` between this `schema` and
-/// `BoundSchemas.schema_of(node_name)` at walker entry.
-#[derive(Debug, Clone)]
-pub struct OutputLayout {
-    /// The node's bound output schema. When attached by `bind_schema`, this
-    /// is the *same Arc* as `BoundSchemas.schema_of(name)` — one oracle.
-    pub schema: Arc<Schema>,
-    /// Indexed by statement position in `program.statements`. `Some(slot)`
-    /// iff the statement is a non-meta `Statement::Emit` whose `name` is at
-    /// `slot` in `schema`. `None` for Let / Filter / Distinct / Trace /
-    /// UseStmt / ExprStmt and for meta emits.
-    pub emit_slots: Vec<Option<u32>>,
-    /// `(upstream_slot, output_slot)` copies applied to the output `values`
-    /// vector before statement evaluation. One entry per upstream column NOT
-    /// shadowed by an emit with the same name. Standalone layouts (no
-    /// upstream context) carry an empty vector.
-    pub passthroughs: Vec<(u32, u32)>,
-}
-
-impl OutputLayout {
-    /// Build a *standalone* layout for a TypedProgram that has no upstream
-    /// context (REPL / unit tests). Schema is constructed from the non-meta
-    /// emit names in statement order; passthroughs are empty; `emit_slots[i]`
-    /// matches the emit's position in that schema.
-    ///
-    /// `bind_schema` produces an upstream-aware layout via
-    /// `build_output_layout` and replaces this one through
-    /// `TypedProgram::with_output_layout`.
-    pub fn standalone(program: &Program) -> Arc<Self> {
-        let mut emit_names: Vec<Box<str>> = Vec::new();
-        let mut emit_slots: Vec<Option<u32>> = Vec::with_capacity(program.statements.len());
-        for stmt in &program.statements {
-            match stmt {
-                Statement::Emit {
-                    name,
-                    is_meta: false,
-                    ..
-                } => {
-                    let slot = emit_names.len() as u32;
-                    emit_names.push(Box::<str>::from(name.as_ref()));
-                    emit_slots.push(Some(slot));
-                }
-                _ => emit_slots.push(None),
-            }
-        }
-        let schema = Arc::new(Schema::new(emit_names));
-        Arc::new(Self {
-            schema,
-            emit_slots,
-            passthroughs: Vec::new(),
-        })
-    }
-}
-
 /// Output of the type checker. Flat struct — takes ownership of ResolvedProgram fields.
 /// Distinct type: compiler enforces Program → ResolvedProgram → TypedProgram ordering.
 /// Must be Send + Sync for Arc sharing across rayon workers.
@@ -157,33 +86,26 @@ pub struct TypedProgram {
     pub bindings: Vec<Option<ResolvedBinding>>,
     /// Per-node type annotation, indexed by NodeId.
     pub types: Vec<Option<Type>>,
-    /// Inferred field types for runtime DLQ validation. Deterministic iteration order.
-    pub field_types: IndexMap<String, Type>,
+    /// Inferred field types for runtime DLQ validation. Deterministic
+    /// iteration order.
+    ///
+    /// Keyed by `QualifiedField` to match the `Row.declared`
+    /// representation — schema-declared fields may carry a qualifier
+    /// (combine merged rows, Phase Combine C.1.0). For non-combine
+    /// nodes every entry is bare. Callers that need a flat string list
+    /// should use `.keys().map(|qf| qf.name.to_string())`.
+    pub field_types: IndexMap<QualifiedField, Type>,
     /// Pre-compiled regex literals, indexed by NodeId.
     pub regexes: Vec<Option<Regex>>,
     /// Total node count.
     pub node_count: u32,
-    /// Plan-time positional slot table for output materialization (Option W).
-    /// Always present: `type_check_with_mode` builds a standalone layout
-    /// unconditionally; `bind_schema` replaces it with an upstream-aware
-    /// layout via [`Self::with_output_layout`]. Single oracle, structural
-    /// invariant — no `Option`, no lazy init.
-    pub output_layout: Arc<OutputLayout>,
-}
-
-impl TypedProgram {
-    /// Replace the standalone layout with an upstream-aware one. Called by
-    /// `bind_schema` after `propagate_row` / `propagate_aggregate` produces
-    /// the node's bound output Row.
-    pub fn with_output_layout(mut self, layout: Arc<OutputLayout>) -> Self {
-        debug_assert_eq!(
-            layout.emit_slots.len(),
-            self.program.statements.len(),
-            "OutputLayout::emit_slots length must equal program.statements length"
-        );
-        self.output_layout = layout;
-        self
-    }
+    /// Bound output row for the node this program was typechecked for.
+    /// Populated by `bind_schema` after running shape-specific row
+    /// propagation (Transform widens, Aggregate projects group-by +
+    /// aggregates, Combine emits a fresh body row). The input-seeded
+    /// value is `Row::closed(IndexMap::new(), Span::default())`;
+    /// consumers observe the populated row after `bind_schema` completes.
+    pub output_row: Row,
 }
 
 /// Run Phase C: type-check a resolved program in row-level mode (the
@@ -250,11 +172,6 @@ pub fn type_check_with_mode(
     let types = checker.types;
     let regexes = checker.regexes;
 
-    // Build the standalone layout from the program's own emits. `bind_schema`
-    // replaces this with an upstream-aware layout via `with_output_layout`
-    // before exposing the TypedProgram to the executor.
-    let output_layout = OutputLayout::standalone(&program);
-
     Ok(TypedProgram {
         program,
         bindings,
@@ -262,7 +179,7 @@ pub fn type_check_with_mode(
         field_types,
         regexes,
         node_count,
-        output_layout,
+        output_row: Row::closed(IndexMap::new(), Span::default()),
     })
 }
 
@@ -404,11 +321,32 @@ impl<'a> TypeChecker<'a> {
                         match self.schema.lookup(name) {
                             ColumnLookup::Declared(declared) => declared.clone(),
                             ColumnLookup::PassThrough(_tail_id) => {
-                                // TODO: LD-16c-22 — upgrade to Type::PassThrough(TailVarId)
-                                // when 16c.2 needs tail identity for composition unification.
+                                // TODO: upgrade to Type::PassThrough(TailVarId)
+                                // once composition unification needs tail identity.
                                 Type::Any
                             }
                             ColumnLookup::Unknown => Type::Any, // Will be inferred from usage
+                            ColumnLookup::Ambiguous(matches) => {
+                                // Bare `FieldRef` over a combine merged row
+                                // where `name` resolves to multiple declared
+                                // fields. Emit a loud error with a precise
+                                // "qualify with X or Y" suggestion rather
+                                // than silently typing as Any. Reachable only
+                                // from combine body typechecks (C.1.3).
+                                let suggestions: Vec<String> =
+                                    matches.iter().map(|qf| qf.to_string()).collect();
+                                self.error(
+                                    *span,
+                                    format!(
+                                        "field '{name}' is ambiguous — matches multiple inputs"
+                                    ),
+                                    Some(format!(
+                                        "qualify the reference: `{}`",
+                                        suggestions.join("` or `")
+                                    )),
+                                );
+                                Type::Any
+                            }
                         }
                     }
                     Some(ResolvedBinding::LetVar(_)) => Type::Any, // Inferred from RHS
@@ -420,9 +358,27 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
-            Expr::QualifiedFieldRef { node_id, .. } => {
-                self.set_type(*node_id, Type::Any);
-                Type::Any
+            Expr::QualifiedFieldRef { node_id, parts, .. } => {
+                // Phase Combine C.1.0.4 — resolve 2-part refs against the
+                // input row via `lookup_qualified`. Exact match on the
+                // `(qualifier, name)` pair means `Ambiguous` is
+                // structurally unreachable (defensively flattened to
+                // `Any`). 3+ part refs are not decomposable (e.g.
+                // multi-record `source.record_type.field`); they stay
+                // `Type::Any` and will surface as E304 / E308 in the
+                // combine bind_schema arm (C.1.1 / C.1.3).
+                let ty = if parts.len() == 2 {
+                    match self.schema.lookup_qualified(&parts[0], &parts[1]) {
+                        ColumnLookup::Declared(declared) => declared.clone(),
+                        ColumnLookup::PassThrough(_)
+                        | ColumnLookup::Unknown
+                        | ColumnLookup::Ambiguous(_) => Type::Any,
+                    }
+                } else {
+                    Type::Any
+                };
+                self.set_type(*node_id, ty.clone());
+                ty
             }
 
             Expr::PipelineAccess { node_id, field, .. } => {
@@ -839,9 +795,9 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            // D59 / Task 16.3.13a: per-record provenance fields
-            // (`pipeline.source_row` / `pipeline.source_file`) cannot appear
-            // outside an aggregate function inside an aggregate transform —
+            // Per-record provenance fields (`pipeline.source_row` /
+            // `pipeline.source_file`) cannot appear outside an aggregate
+            // function inside an aggregate transform —
             // the residual evaluator at finalize() does not have a current
             // record. Universal SQL practice (Postgres SQLSTATE 42803,
             // DuckDB binder, Trino `$row_id` scan-only, Spark functional-
@@ -1127,17 +1083,25 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Build the FieldTypeMap from collected constraints and schema.
-    fn build_field_type_map(&self) -> IndexMap<String, Type> {
+    ///
+    /// Keyed by `QualifiedField` — matches `Row.declared` representation
+    /// so combine merged rows (Phase Combine C.1) do not collapse
+    /// qualified fields to bare names. Inferred constraints from the
+    /// body (collected during the walk) are always bare; schema fields
+    /// carry whatever qualification the upstream row carried.
+    fn build_field_type_map(&self) -> IndexMap<QualifiedField, Type> {
         let mut map = IndexMap::new();
 
         // Schema-declared types first (authoritative)
-        for (field, ty) in &self.schema.declared {
+        for (field, ty) in self.schema.fields() {
             map.insert(field.clone(), ty.clone());
         }
 
-        // Inferred types from constraints
+        // Inferred types from constraints (always bare — `field_constraints`
+        // keys are the raw names from `Expr::FieldRef`)
         for (field, constraints) in &self.field_constraints {
-            if map.contains_key(field) {
+            let qf = QualifiedField::bare(field.as_str());
+            if map.contains_key(&qf) {
                 continue; // Schema takes precedence
             }
             // Use the first constraint's type (they should all be unified by now)
@@ -1149,7 +1113,7 @@ impl<'a> TypeChecker<'a> {
                         unified = u;
                     }
                 }
-                map.insert(field.clone(), unified);
+                map.insert(qf, unified);
             }
         }
 
@@ -1353,12 +1317,16 @@ mod tests {
         );
         // amount should be inferred as Numeric, name as String
         assert!(
-            typed.field_types.contains_key("amount"),
+            typed
+                .field_types
+                .contains_key(&QualifiedField::bare("amount")),
             "Expected amount in field_types, got: {:?}",
             typed.field_types
         );
         assert!(
-            typed.field_types.contains_key("name"),
+            typed
+                .field_types
+                .contains_key(&QualifiedField::bare("name")),
             "Expected name in field_types, got: {:?}",
             typed.field_types
         );
@@ -1411,7 +1379,7 @@ mod tests {
         );
     }
 
-    // ── Phase 16 Task 16.2 — aggregate typecheck tests ─────────────────
+    // ── aggregate typecheck tests ──────────────────────────────────────
 
     fn agg_mode(keys: &[&str]) -> AggregateMode {
         AggregateMode::GroupBy {
@@ -1589,8 +1557,8 @@ mod tests {
         let _ = agg_ok("emit run = $pipeline.execution_id", &["dept"], &["dept"]);
     }
 
-    // D59 / Task 16.3.13a: per-record provenance fields cannot appear
-    // bare in an aggregate residual; must be wrapped in an aggregate.
+    // Per-record provenance fields cannot appear bare in an aggregate
+    // residual; must be wrapped in an aggregate.
     #[test]
     fn test_typecheck_rejects_pipeline_source_row_in_agg_residual() {
         let errs = agg_err("emit row = $pipeline.source_row", &["dept"], &["dept"]);
@@ -1802,7 +1770,7 @@ mod tests {
         assert_eq!(first_emit_expr_type(&typed), Type::Float);
     }
 
-    // ── Phase 16c.1.4 hard-gate tests — Row integration ──────────────
+    // ── Row integration tests ─────────────────────────────────────────
 
     #[test]
     fn test_cxl_type_check_accepts_row_closed() {
@@ -1812,7 +1780,7 @@ mod tests {
         // `emit x = a` should succeed — `a` is declared.
         let typed = typecheck_ok("emit x = a", &["a"], &schema);
         assert!(
-            typed.field_types.contains_key("a"),
+            typed.field_types.contains_key(&QualifiedField::bare("a")),
             "expected 'a' in field_types"
         );
     }
@@ -1868,5 +1836,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Phase Combine C.1.0 gate: qualified field ref resolution --------
+
+    /// C.1.0 corrective: a bare `FieldRef` against a merged row where
+    /// the name is ambiguous (matches multiple declared fields under
+    /// different qualifiers) must produce a loud typecheck error
+    /// suggesting `qualifier.name` — NOT silently degrade to Type::Any.
+    #[test]
+    fn test_bare_fieldref_ambiguous_errors() {
+        use super::super::row::QualifiedField;
+
+        // Merged row with two `id` fields under different qualifiers.
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::qualified("orders", "id"), Type::Int);
+        cols.insert(QualifiedField::qualified("products", "id"), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+
+        // `emit v = id` — bare ref that resolves ambiguously.
+        let parsed = Parser::parse("emit v = id");
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = resolve_program(parsed.ast, &["id"], parsed.node_count).unwrap();
+        let result = type_check(resolved, &schema);
+
+        let diags = result.expect_err("ambiguous bare ref must error");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("ambiguous") && d.message.contains("'id'")),
+            "expected 'ambiguous' diagnostic mentioning 'id'; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // Suggestion mentions both qualified alternatives.
+        let help_msgs: Vec<&String> = diags.iter().filter_map(|d| d.help.as_ref()).collect();
+        assert!(
+            help_msgs
+                .iter()
+                .any(|h| h.contains("orders.id") && h.contains("products.id")),
+            "expected help mentioning both `orders.id` and `products.id`; got: {help_msgs:?}"
+        );
+    }
+
+    /// C.1.0 gate (RESOLUTION T-5): a 2-part `QualifiedFieldRef` against
+    /// a row containing qualified fields resolves via `lookup_qualified`
+    /// to the declared type, not `Type::Any`. Smoke test that the new
+    /// `Expr::QualifiedFieldRef` handler in pass.rs actually calls into
+    /// the new `Row::lookup_qualified` method.
+    #[test]
+    fn test_qualified_field_ref_resolves() {
+        use super::super::row::QualifiedField;
+
+        // Build a merged-row style schema: orders.product_id: Int,
+        // products.product_id: String. Two fields share bare name
+        // "product_id" under different qualifiers.
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::qualified("orders", "product_id"), Type::Int);
+        cols.insert(
+            QualifiedField::qualified("products", "product_id"),
+            Type::String,
+        );
+        let schema = Row::closed(cols, Span::new(0, 0));
+
+        // `emit v = orders.product_id` — the typechecker must resolve
+        // the 2-part ref via `lookup_qualified("orders", "product_id")`
+        // and set the expr type to Int, not Any.
+        let parsed = Parser::parse("emit v = orders.product_id");
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        // `orders` is the left-most identifier in `orders.product_id` —
+        // the resolver treats it as a field binding. Register it in the
+        // field_refs slice so resolve succeeds.
+        let resolved = resolve_program(parsed.ast, &["orders"], parsed.node_count)
+            .expect("resolve should succeed for qualified ref");
+        let typed = type_check(resolved, &schema).expect("typecheck should succeed");
+
+        assert_eq!(
+            first_emit_expr_type(&typed),
+            Type::Int,
+            "orders.product_id must resolve to Int via lookup_qualified, not Any"
+        );
+
+        // And the products.product_id side must independently resolve to
+        // String — same mechanism, different qualifier.
+        let parsed = Parser::parse("emit v = products.product_id");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program(parsed.ast, &["products"], parsed.node_count).unwrap();
+        let typed = type_check(resolved, &schema).unwrap();
+        assert_eq!(
+            first_emit_expr_type(&typed),
+            Type::String,
+            "products.product_id must resolve to String via lookup_qualified"
+        );
     }
 }

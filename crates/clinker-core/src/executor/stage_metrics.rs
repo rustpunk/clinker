@@ -46,12 +46,28 @@ pub enum StageName {
     SchemaScan,
     Sort,
     ArenaBuild,
-    IndexBuild { name: String },
+    IndexBuild {
+        name: String,
+    },
     TransformEval,
     Projection,
     RouteEval,
     Write,
     GroupFlush,
+    /// Combine hash-build phase, scoped to a single combine node.
+    /// `name` is the combine node's name; emitted once per combine
+    /// invocation when the build buffer is drained into the
+    /// hash table.
+    CombineBuild {
+        name: String,
+    },
+    /// Combine hash-probe phase, scoped to a single combine node.
+    /// `name` is the combine node's name; emitted once per combine
+    /// invocation, covering the per-driver-row probe loop including
+    /// residual evaluation, body eval, and on_miss dispatch.
+    CombineProbe {
+        name: String,
+    },
 }
 
 impl fmt::Display for StageName {
@@ -68,6 +84,8 @@ impl fmt::Display for StageName {
             StageName::RouteEval => write!(f, "RouteEval"),
             StageName::Write => write!(f, "Write"),
             StageName::GroupFlush => write!(f, "GroupFlush"),
+            StageName::CombineBuild { name } => write!(f, "combine-build[{name}]"),
+            StageName::CombineProbe { name } => write!(f, "combine-probe[{name}]"),
         }
     }
 }
@@ -513,5 +531,19 @@ mod tests {
         assert_eq!(StageName::RouteEval.to_string(), "RouteEval");
         assert_eq!(StageName::Write.to_string(), "Write");
         assert_eq!(StageName::GroupFlush.to_string(), "GroupFlush");
+        assert_eq!(
+            StageName::CombineBuild {
+                name: "enriched".into()
+            }
+            .to_string(),
+            "combine-build[enriched]"
+        );
+        assert_eq!(
+            StageName::CombineProbe {
+                name: "enriched".into()
+            }
+            .to_string(),
+            "combine-probe[enriched]"
+        );
     }
 }

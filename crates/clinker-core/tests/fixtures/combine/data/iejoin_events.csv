@@ -1,0 +1,6 @@
+group_id,event_id,start,end
+grp-1,evt-001,10,20
+grp-1,evt-002,15,25
+grp-1,evt-003,40,50
+grp-2,evt-004,5,12
+grp-2,evt-005,30,35

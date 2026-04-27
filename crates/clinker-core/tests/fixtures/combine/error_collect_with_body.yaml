@@ -1,0 +1,40 @@
+# C.2.4.2 — `match: collect` with a non-empty `cxl:` body must trigger
+# E311 at compile time. Per Phase Combine R1, Collect mode auto-derives
+# the output row as `{ driver fields, <build_qualifier>: Array }` and
+# runs no body; declaring emit statements is therefore a structural
+# error.
+pipeline:
+  name: error_collect_with_body
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: bad_collect
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name

@@ -1,0 +1,8 @@
+---
+source: crates/clinker-core/tests/path_a_parity.rs
+expression: shape
+---
+[source] sales
+[transform] active_only <- sales
+[aggregation] by_dept <- active_only
+[output] dept_totals <- by_dept

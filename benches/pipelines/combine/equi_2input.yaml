@@ -1,0 +1,63 @@
+# Canonical 2-input equi combine with `match: first` and
+# `on_miss: null_fields`. Single integer join key per side —
+# exercises the simple hash-build-probe path with left-outer
+# semantics. Driver is `orders`; build side is `customers`.
+
+pipeline:
+  name: bench-combine-equi-2input
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: bench://input.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: bench://customers.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+
+  - type: combine
+    name: enrich
+    input:
+      orders: orders
+      customers: customers
+    config:
+      where: "orders.f0 == customers.f0"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.f0
+        emit order_sku = orders.f1
+        emit order_qty = orders.f2
+        emit order_region = orders.f3
+        emit customer_id = customers.f0
+        emit customer_name = customers.f1 ?? "UNKNOWN"
+        emit customer_tier = customers.f3 ?? "standard"
+
+  - type: output
+    name: enriched_out
+    input: enrich
+    config:
+      name: enriched_out
+      type: csv
+      path: bench://output.csv
+      include_unmapped: true

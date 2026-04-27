@@ -1,0 +1,7 @@
+---
+source: crates/clinker-core/tests/path_a_parity.rs
+expression: shape
+---
+[source] employees
+[transform] tier_flag <- employees
+[output] results <- tier_flag

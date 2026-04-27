@@ -1,17 +1,16 @@
 use std::collections::HashMap;
 use std::process;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use clinker_record::{Record, RecordStorage, Schema, Value};
+use clinker_record::{RecordStorage, Value};
 
 /// Dummy storage for no-window evaluation.
 struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
         None
     }
     fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -292,34 +291,14 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
     };
 
     let resolver = HashMapResolver::new(record_map);
-    // Option-W: one evaluator. No upstream context → standalone layout
-    // with empty passthroughs; the empty `Record` carries the positional
-    // passthrough source (unused here).
-    let empty_schema = Arc::new(Schema::new(Vec::<Box<str>>::new()));
-    let empty_input = Record::new(empty_schema, Vec::new());
-    let has_distinct = typed
-        .program
-        .statements
-        .iter()
-        .any(|s| matches!(s, cxl::ast::Statement::Distinct { .. }));
-    let layout = Arc::clone(&typed.output_layout);
-    let mut evaluator = cxl::eval::ProgramEvaluator::new(Arc::new(typed), has_distinct);
-    match evaluator.eval_record::<NullStorage>(&ctx, &empty_input, &resolver, None) {
-        Ok(cxl::eval::EvalResult::Emit { values, .. }) => {
-            // Format positional values using the layout's schema for labels.
-            // One oracle — same path as the executor uses for output schema.
-            let json_out: serde_json::Map<String, serde_json::Value> = layout
-                .schema
-                .columns()
-                .iter()
-                .zip(values)
-                .map(|(name, v)| (name.as_ref().to_string(), value_to_json(v)))
+
+    match cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None) {
+        Ok(output) => {
+            let json_out: serde_json::Map<String, serde_json::Value> = output
+                .into_iter()
+                .map(|(k, v)| (k, value_to_json(v)))
                 .collect();
             println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
-        }
-        Ok(cxl::eval::EvalResult::Skip(_)) => {
-            // Record was filtered or deduplicated; print empty object.
-            println!("{{}}");
         }
         Err(e) => {
             eprintln!("error[eval]: {}", e);
@@ -713,19 +692,8 @@ mod tests {
         };
 
         let resolver = HashMapResolver::new(HashMap::new());
-        let empty_schema = Arc::new(Schema::new(Vec::<Box<str>>::new()));
-        let empty_input = Record::new(empty_schema, Vec::new());
-        let layout = Arc::clone(&typed.output_layout);
-        let mut evaluator = cxl::eval::ProgramEvaluator::new(Arc::new(typed), false);
-        let result = evaluator
-            .eval_record::<NullStorage>(&ctx, &empty_input, &resolver, None)
-            .unwrap();
-        let values = match result {
-            cxl::eval::EvalResult::Emit { values, .. } => values,
-            cxl::eval::EvalResult::Skip(_) => panic!("expected Emit"),
-        };
-        let slot = layout.schema.index("result").expect("result slot");
-        assert_eq!(values[slot], Value::Integer(3));
+        let output = cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+        assert_eq!(output.get("result"), Some(&Value::Integer(3)));
     }
 
     #[test]
@@ -766,19 +734,8 @@ mod tests {
         };
 
         let resolver = HashMapResolver::new(fields);
-        let empty_schema = Arc::new(Schema::new(Vec::<Box<str>>::new()));
-        let empty_input = Record::new(empty_schema, Vec::new());
-        let layout = Arc::clone(&typed.output_layout);
-        let mut evaluator = cxl::eval::ProgramEvaluator::new(Arc::new(typed), false);
-        let result = evaluator
-            .eval_record::<NullStorage>(&ctx, &empty_input, &resolver, None)
-            .unwrap();
-        let values = match result {
-            cxl::eval::EvalResult::Emit { values, .. } => values,
-            cxl::eval::EvalResult::Skip(_) => panic!("expected Emit"),
-        };
-        let slot = layout.schema.index("total").expect("total slot");
-        assert_eq!(values[slot], Value::Float(31.5));
+        let output = cxl::eval::eval_program::<NullStorage>(&typed, &ctx, &resolver, None).unwrap();
+        assert_eq!(output.get("total"), Some(&Value::Float(31.5)));
     }
 
     #[test]

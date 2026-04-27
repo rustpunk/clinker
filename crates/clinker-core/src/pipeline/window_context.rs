@@ -62,11 +62,11 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
         for &pos in self.partition {
             match self.arena.resolve_field(pos, field) {
                 Some(Value::Integer(i)) => {
-                    total += i as f64;
+                    total += *i as f64;
                     has_numeric = true;
                 }
                 Some(Value::Float(f)) => {
-                    total += f;
+                    total += *f;
                     has_numeric = true;
                 }
                 _ => {}
@@ -85,11 +85,11 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
         for &pos in self.partition {
             match self.arena.resolve_field(pos, field) {
                 Some(Value::Integer(i)) => {
-                    total += i as f64;
+                    total += *i as f64;
                     count += 1;
                 }
                 Some(Value::Float(f)) => {
-                    total += f;
+                    total += *f;
                     count += 1;
                 }
                 _ => {}
@@ -103,7 +103,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
     }
 
     fn min(&self, field: &str) -> Value {
-        let mut result: Option<Value> = None;
+        let mut result: Option<&Value> = None;
         for &pos in self.partition {
             if let Some(val) = self.arena.resolve_field(pos, field) {
                 if val.is_null() {
@@ -112,7 +112,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
                 result = Some(match result {
                     None => val,
                     Some(current) => {
-                        if val_less_than(&val, &current) {
+                        if val_less_than(val, current) {
                             val
                         } else {
                             current
@@ -121,11 +121,11 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
                 });
             }
         }
-        result.unwrap_or(Value::Null)
+        result.cloned().unwrap_or(Value::Null)
     }
 
     fn max(&self, field: &str) -> Value {
-        let mut result: Option<Value> = None;
+        let mut result: Option<&Value> = None;
         for &pos in self.partition {
             if let Some(val) = self.arena.resolve_field(pos, field) {
                 if val.is_null() {
@@ -134,7 +134,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
                 result = Some(match result {
                     None => val,
                     Some(current) => {
-                        if val_less_than(&current, &val) {
+                        if val_less_than(current, val) {
                             val
                         } else {
                             current
@@ -143,7 +143,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
                 });
             }
         }
-        result.unwrap_or(Value::Null)
+        result.cloned().unwrap_or(Value::Null)
     }
 
     fn partition_len(&self) -> usize {
@@ -160,6 +160,7 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
             .iter()
             .filter_map(|&pos| self.arena.resolve_field(pos, field))
             .filter(|v| !v.is_null())
+            .cloned()
             .collect();
         Value::Array(values)
     }
@@ -172,9 +173,9 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
                 if val.is_null() {
                     continue;
                 }
-                let key = value_hash_key(&val);
+                let key = value_hash_key(val);
                 if seen.insert(key) {
-                    values.push(val);
+                    values.push(val.clone());
                 }
             }
         }
@@ -245,9 +246,9 @@ mod tests {
         let ctx = PartitionWindowContext::new(&arena, &partition, 1);
 
         let first = ctx.first().unwrap();
-        assert_eq!(first.resolve("name"), Some(Value::String("Alice".into())));
+        assert_eq!(first.resolve("name"), Some(&Value::String("Alice".into())));
         let last = ctx.last().unwrap();
-        assert_eq!(last.resolve("name"), Some(Value::String("Carol".into())));
+        assert_eq!(last.resolve("name"), Some(&Value::String("Carol".into())));
     }
 
     #[test]
@@ -260,9 +261,9 @@ mod tests {
         let ctx = PartitionWindowContext::new(&arena, &partition, 3);
 
         let lag = ctx.lag(1).unwrap();
-        assert_eq!(lag.resolve("name"), Some(Value::String("C".into())));
+        assert_eq!(lag.resolve("name"), Some(&Value::String("C".into())));
         let lead = ctx.lead(1).unwrap();
-        assert_eq!(lead.resolve("name"), Some(Value::String("E".into())));
+        assert_eq!(lead.resolve("name"), Some(&Value::String("E".into())));
     }
 
     #[test]
@@ -331,7 +332,7 @@ mod tests {
 
         assert_eq!(ctx.partition_len(), 3);
         let rec = ctx.partition_record(1);
-        assert_eq!(rec.resolve("amount"), Some(Value::String("150".into())));
+        assert_eq!(rec.resolve("amount"), Some(&Value::String("150".into())));
     }
 
     #[test]

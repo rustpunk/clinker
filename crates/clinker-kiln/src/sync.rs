@@ -1,6 +1,5 @@
-/// YAML text ↔ PipelineConfig sync.
-///
-/// Phase 16b: composition / channel features removed. Single-model sync only.
+/// YAML text ↔ PipelineConfig sync. Single-model sync only (no composition
+/// or channel overlay reconciliation).
 use std::collections::HashMap;
 use std::path::Path;
 

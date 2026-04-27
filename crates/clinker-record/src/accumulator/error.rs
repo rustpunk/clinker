@@ -2,8 +2,7 @@
 //!
 //! Leaf error type in the foundation crate, following the same convention as
 //! `clinker_format::FormatError` and `cxl::eval::EvalError`. Wrapped into
-//! `clinker_core::PipelineError` via a `From` impl at the integration point
-//! (Task 16.3). See `docs/research/RESEARCH-error-crate-layering.md`.
+//! `clinker_core::PipelineError` via a `From` impl at the integration point.
 
 use std::fmt;
 
@@ -14,10 +13,11 @@ pub enum AccumulatorError {
     ///
     /// Raised by Sum, Avg, and WeightedAvg when their integer-path result
     /// cannot be represented as i64. The `field` name is populated by the
-    /// aggregation engine when known (Task 16.3).
+    /// aggregation engine when known.
     ///
-    /// Research: RESEARCH-sum-overflow.md — DuckDB `HUGEINT` pattern.
-    /// Never use `as i64` in finalize; always `i64::try_from`.
+    /// Finalize uses `i64::try_from` on the internal i128 sum — never
+    /// `as i64` — so overflow surfaces as this error rather than silently
+    /// wrapping. Mirrors DuckDB's `HUGEINT` overflow-on-finalize pattern.
     SumOverflow { field: Option<String> },
 }
 

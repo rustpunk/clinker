@@ -35,10 +35,9 @@ pub const MAX_STRING_OUTPUT: usize = 10 * 1024 * 1024; // 10 MB
 /// members EXCEPT per-record provenance (`source_file`, `source_row`)
 /// resolve against this struct.
 ///
-/// D59 (Phase 16 drill pass 4): mirrors DataFusion `Arc<TaskContext>`,
-/// Apache Beam `FinishBundleContext`, Flink `RuntimeContext`. Killed the
-/// per-record `String::clone` + `IndexMap::clone` profile that the prior
-/// `EvalContext` allocated at every dispatch site.
+/// Mirrors DataFusion `Arc<TaskContext>`, Apache Beam `FinishBundleContext`,
+/// Flink `RuntimeContext`. Replaces an earlier per-record `String::clone` +
+/// `IndexMap::clone` profile that allocated at every dispatch site.
 pub struct StableEvalContext {
     /// Clock for `now` keyword. WallClock in production, FixedClock in tests.
     pub clock: Box<dyn Clock>,

@@ -1,0 +1,41 @@
+# Error fixture: where-clause has only same-input comparisons → E305.
+# Both sides reference the same qualifier — no cross-input equality or
+# range conjuncts are extractable. C.1.2 gate test
+# `test_combine_e305_no_cross_input`.
+pipeline:
+  name: error_no_cross_input
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: bad
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.order_id == orders.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+  - type: output
+    name: bad_out
+    input: bad
+    config:
+      name: bad_out
+      type: csv
+      path: /tmp/error_no_cross_input.csv

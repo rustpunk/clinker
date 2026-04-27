@@ -1,10 +1,9 @@
 //! Per-item fallback parser for graceful degradation (Kiln IDE).
 //!
-//! Phase 16b Task 16b.7: rewritten to walk the unified `nodes:` array
-//! directly. Sources and outputs deserialize into `SourceConfig`/`OutputConfig`
-//! via the Body wrappers; transforms/aggregates/routes produce a
-//! lightweight [`PartialTransform`] tile with only the fields the canvas
-//! renders.
+//! Walks the unified `nodes:` array directly. Sources and outputs
+//! deserialize into `SourceConfig`/`OutputConfig` via the Body wrappers;
+//! transforms/aggregates/routes produce a lightweight [`PartialTransform`]
+//! tile with only the fields the canvas renders.
 
 use crate::config::{
     ErrorHandlingConfig, OutputConfig, PipelineMeta, SourceConfig, interpolate_env_vars,

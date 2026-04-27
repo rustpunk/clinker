@@ -1,4 +1,4 @@
-//! Integration tests for the provenance and resource subsystems (Phase 16c.3).
+//! Integration tests for the provenance and resource subsystems.
 
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ fn scaffold_compiles() {
 }
 
 // ---------------------------------------------------------------------
-// Task 16c.3.2 gate tests — ResolvedValue + ProvenanceLayer
+// ResolvedValue + ProvenanceLayer tests
 // ---------------------------------------------------------------------
 
 #[test]
@@ -108,7 +108,7 @@ fn test_apply_layer_inspector_edit_wins_over_channel_fixed() {
 }
 
 // ---------------------------------------------------------------------
-// Task 16c.3.3 gate tests — bind_schema integration + size budget
+// bind_schema integration + size-budget tests
 // ---------------------------------------------------------------------
 
 #[test]
@@ -149,7 +149,7 @@ fn test_resolved_value_size_within_budget() {
     // Belt-and-suspenders runtime check (mirrors compile-time assert in provenance.rs).
     assert!(
         std::mem::size_of::<ProvenanceLayer>() <= 64,
-        "ProvenanceLayer must fit in 64 bytes (D-H.5 / LD-16c-11), got {}",
+        "ProvenanceLayer must fit in 64 bytes (cache-line budget), got {}",
         std::mem::size_of::<ProvenanceLayer>()
     );
 }

@@ -1,0 +1,6 @@
+entity_id,employee_id,income
+ent-A,emp-001,42000
+ent-A,emp-002,
+ent-A,emp-003,87500
+ent-B,emp-004,
+ent-B,emp-005,15000

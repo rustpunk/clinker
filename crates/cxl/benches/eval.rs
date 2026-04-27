@@ -14,10 +14,10 @@ use std::sync::Arc;
 struct NullStorage;
 
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<Value> {
+    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
         None
     }
     fn available_fields(&self, _: u32) -> Vec<&str> {
@@ -75,7 +75,7 @@ fn bench_eval_simple_emit(c: &mut Criterion) {
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -106,7 +106,7 @@ emit out = f1.upper().trim().replace("A", "X")
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -138,7 +138,7 @@ emit out = x.to_float().round(2).abs()
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -169,7 +169,7 @@ emit out = if f0 > 500000 then "high" else if f0 > 250000 then "medium" else "lo
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -207,7 +207,7 @@ emit out = match f1 {
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -239,7 +239,7 @@ emit out = f1 ?? f3 ?? f5 ?? "default"
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -276,7 +276,7 @@ fn bench_eval_filter(c: &mut Criterion) {
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });
@@ -305,7 +305,7 @@ fn bench_eval_full_transform(c: &mut Criterion) {
                 let mut evaluator = ProgramEvaluator::new(Arc::clone(&typed), false);
                 for rec in &records {
                     let resolver = resolver_from_record(rec, &schema);
-                    let _result = evaluator.eval_record::<NullStorage>(&ctx, rec, &resolver, None);
+                    let _result = evaluator.eval_record::<NullStorage>(&ctx, &resolver, None);
                     black_box(&_result);
                 }
             });

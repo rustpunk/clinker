@@ -1,7 +1,5 @@
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use indexmap::IndexMap;
-use serde::Serialize;
-use serde::ser::{SerializeMap, SerializeSeq};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -20,36 +18,178 @@ pub enum Value {
     Map(Box<IndexMap<Box<str>, Value>>),
 }
 
+// ── Serialize (tagged, postcard-compatible) ────────────────────────────────
+//
+// Wire form: variant index (varint u32 in postcard; values 0-8 fit in 1 byte)
+// followed by the variant payload.
+//
+// Discriminant assignment:
+//   0=Null  1=Bool  2=Integer  3=Float  4=String
+//   5=Date  6=DateTime  7=Array  8=Map
+//
+// Date payload: i32 days from proleptic Gregorian ordinal
+//   (chrono::Datelike::num_days_from_ce, where 1 = 0001-01-01).
+// DateTime payload: i64 nanoseconds since Unix epoch (1970-01-01T00:00:00 UTC).
+//   Sub-second resolution is preserved; subsecond = nanos % 1_000_000_000.
+//
+// Array payload: Vec<Value> (length-prefixed by serde/postcard).
+// Map payload:   Vec<(String, Value)> pairs in insertion order.
+//
+// Both Date and DateTime round-trip exactly through postcard. JSON output
+// (via serde_json::to_string) will produce externally-tagged form, e.g.
+// {"Integer":42}. Production JSON output uses the `clinker_to_json` helper
+// in clinker-format and clinker-core, which bypasses serde Value dispatch.
+
+use serde::de::{self, Deserializer, EnumAccess, VariantAccess, Visitor};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+
 impl Serialize for Value {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // serialize_newtype_variant: binary formats (postcard) emit VARINT(index) + payload.
+        // Text formats (JSON) emit {"VariantName": payload}.
         match self {
-            Value::Null => serializer.serialize_unit(),
-            Value::Bool(b) => serializer.serialize_bool(*b),
-            Value::Integer(n) => serializer.serialize_i64(*n),
-            Value::Float(f) => serializer.serialize_f64(*f),
-            Value::String(s) => serializer.serialize_str(s),
-            Value::Date(d) => serializer.serialize_str(&d.format("%Y-%m-%d").to_string()),
+            Value::Null => serializer.serialize_unit_variant("Value", 0, "Null"),
+            Value::Bool(b) => serializer.serialize_newtype_variant("Value", 1, "Bool", b),
+            Value::Integer(n) => serializer.serialize_newtype_variant("Value", 2, "Integer", n),
+            Value::Float(f) => serializer.serialize_newtype_variant("Value", 3, "Float", f),
+            Value::String(s) => {
+                serializer.serialize_newtype_variant("Value", 4, "String", s.as_ref())
+            }
+            Value::Date(d) => {
+                // days from proleptic Gregorian ordinal (1 = 0001-01-01)
+                serializer.serialize_newtype_variant("Value", 5, "Date", &d.num_days_from_ce())
+            }
             Value::DateTime(dt) => {
-                serializer.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+                // nanoseconds since Unix epoch
+                let nanos = dt.and_utc().timestamp_nanos_opt().unwrap_or(0);
+                serializer.serialize_newtype_variant("Value", 6, "DateTime", &nanos)
             }
             Value::Array(arr) => {
-                let mut seq = serializer.serialize_seq(Some(arr.len()))?;
-                for v in arr {
-                    seq.serialize_element(v)?;
-                }
-                seq.end()
+                serializer.serialize_newtype_variant("Value", 7, "Array", arr.as_slice())
             }
             Value::Map(m) => {
-                let mut map = serializer.serialize_map(Some(m.len()))?;
-                for (k, v) in m.iter() {
-                    map.serialize_entry(k.as_ref(), v)?;
-                }
-                map.end()
+                // Serialize as vec of (key, value) pairs to preserve insertion order.
+                let pairs: Vec<(&str, &Value)> = m.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+                serializer.serialize_newtype_variant("Value", 8, "Map", &pairs)
             }
         }
+    }
+}
+
+// ── Deserialize (tagged, mirrors Serialize) ────────────────────────────────
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const VARIANTS: &[&str] = &[
+            "Null", "Bool", "Integer", "Float", "String", "Date", "DateTime", "Array", "Map",
+        ];
+        deserializer.deserialize_enum("Value", VARIANTS, ValueVisitor)
+    }
+}
+
+struct ValueVisitor;
+
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a tagged CXL Value enum")
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Value, A::Error> {
+        let (idx, va): (VariantIdx, _) = data.variant()?;
+        match idx.0 {
+            0 => {
+                va.unit_variant()?;
+                Ok(Value::Null)
+            }
+            1 => Ok(Value::Bool(va.newtype_variant()?)),
+            2 => Ok(Value::Integer(va.newtype_variant()?)),
+            3 => Ok(Value::Float(va.newtype_variant()?)),
+            4 => {
+                let s: std::string::String = va.newtype_variant()?;
+                Ok(Value::String(s.into_boxed_str()))
+            }
+            5 => {
+                let days: i32 = va.newtype_variant()?;
+                NaiveDate::from_num_days_from_ce_opt(days)
+                    .map(Value::Date)
+                    .ok_or_else(|| de::Error::custom(format!("invalid date ordinal: {days}")))
+            }
+            6 => {
+                let nanos: i64 = va.newtype_variant()?;
+                let secs = nanos.div_euclid(1_000_000_000);
+                let subsec = nanos.rem_euclid(1_000_000_000) as u32;
+                let dt = chrono::DateTime::from_timestamp(secs, subsec)
+                    .ok_or_else(|| de::Error::custom(format!("invalid timestamp nanos: {nanos}")))?
+                    .naive_utc();
+                Ok(Value::DateTime(dt))
+            }
+            7 => {
+                let arr: Vec<Value> = va.newtype_variant()?;
+                Ok(Value::Array(arr))
+            }
+            8 => {
+                let pairs: Vec<(std::string::String, Value)> = va.newtype_variant()?;
+                let mut m = IndexMap::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    m.insert(k.into_boxed_str(), v);
+                }
+                Ok(Value::Map(Box::new(m)))
+            }
+            other => Err(de::Error::unknown_variant(
+                &other.to_string(),
+                &["0", "1", "2", "3", "4", "5", "6", "7", "8"],
+            )),
+        }
+    }
+}
+
+// ── VariantIdx: maps variant name or u32 index ────────────────────────────
+
+/// Maps a variant identifier (string name or numeric index) to a `u32`.
+///
+/// Binary formats (postcard) emit numeric indices; text formats (JSON)
+/// emit string names. This wrapper accepts both.
+struct VariantIdx(u32);
+
+impl<'de> Deserialize<'de> for VariantIdx {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct VIdxVisitor;
+        impl<'de> Visitor<'de> for VIdxVisitor {
+            type Value = VariantIdx;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a Value variant name or index")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<VariantIdx, E> {
+                Ok(VariantIdx(v as u32))
+            }
+            fn visit_u32<E: de::Error>(self, v: u32) -> Result<VariantIdx, E> {
+                Ok(VariantIdx(v))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<VariantIdx, E> {
+                match v {
+                    "Null" => Ok(VariantIdx(0)),
+                    "Bool" => Ok(VariantIdx(1)),
+                    "Integer" => Ok(VariantIdx(2)),
+                    "Float" => Ok(VariantIdx(3)),
+                    "String" => Ok(VariantIdx(4)),
+                    "Date" => Ok(VariantIdx(5)),
+                    "DateTime" => Ok(VariantIdx(6)),
+                    "Array" => Ok(VariantIdx(7)),
+                    "Map" => Ok(VariantIdx(8)),
+                    other => Err(de::Error::unknown_variant(
+                        other,
+                        &[
+                            "Null", "Bool", "Integer", "Float", "String", "Date", "DateTime",
+                            "Array", "Map",
+                        ],
+                    )),
+                }
+            }
+        }
+        d.deserialize_identifier(VIdxVisitor)
     }
 }
 
@@ -118,6 +258,16 @@ impl fmt::Display for Value {
         }
     }
 }
+
+/// Shared `Value::Null` sentinel used by `FieldResolver` implementations
+/// that need to hand out a `&Value` for a logically-absent field.
+///
+/// Lets `CombineResolver::resolve_qualified` surface
+/// `Some(&NULL)` for build-side lookups under `on_miss: null_fields`
+/// without materializing a fresh owned `Value::Null` per call —
+/// the trait surface returns borrowed values, and a constructed
+/// `Value` has no backing storage to borrow from.
+pub static NULL: Value = Value::Null;
 
 impl Value {
     /// Returns the CXL type name as a static string.
@@ -203,90 +353,15 @@ impl Value {
     }
 }
 
-use serde::Deserialize;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-
-impl<'de> Deserialize<'de> for Value {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ValueVisitor;
-
-        impl<'de> Visitor<'de> for ValueVisitor {
-            type Value = Value;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "a CXL value")
-            }
-
-            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
-                Ok(Value::Bool(v))
-            }
-
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
-                Ok(Value::Integer(v))
-            }
-
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-                if v <= i64::MAX as u64 {
-                    Ok(Value::Integer(v as i64))
-                } else {
-                    Ok(Value::Float(v as f64))
-                }
-            }
-
-            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
-                Ok(Value::Float(v))
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
-                // Try DateTime first (more specific), then Date, then String
-                if let Ok(dt) = NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S") {
-                    return Ok(Value::DateTime(dt));
-                }
-                if let Ok(dt) = NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S") {
-                    return Ok(Value::DateTime(dt));
-                }
-                if let Ok(d) = NaiveDate::parse_from_str(v, "%Y-%m-%d") {
-                    return Ok(Value::Date(d));
-                }
-                Ok(Value::String(v.into()))
-            }
-
-            fn visit_none<E: de::Error>(self) -> Result<Value, E> {
-                Ok(Value::Null)
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
-                Ok(Value::Null)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-                let mut arr = Vec::new();
-                while let Some(v) = seq.next_element()? {
-                    arr.push(v);
-                }
-                Ok(Value::Array(arr))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-                let mut m = IndexMap::new();
-                while let Some((k, v)) = map.next_entry::<String, Value>()? {
-                    m.insert(k.into_boxed_str(), v);
-                }
-                Ok(Value::Map(Box::new(m)))
-            }
-        }
-
-        deserializer.deserialize_any(ValueVisitor)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    fn roundtrip(v: &Value) -> Value {
+        let bytes = postcard::to_stdvec(v).expect("postcard serialize failed");
+        postcard::from_bytes(&bytes).expect("postcard deserialize failed")
+    }
 
     #[test]
     fn test_value_display_all_variants() {
@@ -304,19 +379,85 @@ mod tests {
     }
 
     #[test]
-    fn test_value_serde_roundtrip() {
+    fn test_value_postcard_roundtrip_all_variants() {
+        let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let dt = d.and_hms_opt(10, 30, 0).unwrap();
         let cases = vec![
             Value::Null,
             Value::Bool(false),
+            Value::Bool(true),
+            Value::Integer(0),
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
             Value::Integer(42),
+            Value::Float(0.0),
             Value::Float(3.14),
-            Value::String("test".into()),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(f64::NAN),
+            Value::String("".into()),
+            Value::String("hello world".into()),
+            Value::Date(d),
+            Value::Date(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+            Value::Date(NaiveDate::from_ymd_opt(2000, 2, 29).unwrap()),
+            Value::DateTime(dt),
+            Value::Array(vec![]),
             Value::Array(vec![Value::Integer(1), Value::Bool(true)]),
+            Value::Array(vec![Value::Null, Value::String("x".into())]),
         ];
-        for original in cases {
-            let json = serde_json::to_string(&original).unwrap();
-            let recovered: Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(original, recovered);
+        for original in &cases {
+            let recovered = roundtrip(original);
+            assert_eq!(*original, recovered, "roundtrip failed for: {original:?}");
+        }
+    }
+
+    #[test]
+    fn test_value_postcard_roundtrip_map() {
+        let m = Value::map([
+            ("a", Value::Integer(1)),
+            ("b", Value::String("hello".into())),
+            ("c", Value::Bool(true)),
+        ]);
+        let recovered = roundtrip(&m);
+        assert_eq!(m, recovered);
+    }
+
+    #[test]
+    fn test_value_postcard_roundtrip_nested() {
+        let nested = Value::Array(vec![
+            Value::map([("x", Value::Integer(10)), ("y", Value::Float(1.5))]),
+            Value::Array(vec![Value::Null, Value::Bool(false)]),
+        ]);
+        let recovered = roundtrip(&nested);
+        assert_eq!(nested, recovered);
+    }
+
+    #[test]
+    fn test_value_postcard_roundtrip_date_boundary() {
+        // Dates near the Unix epoch and CE epoch
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let pre_epoch = NaiveDate::from_ymd_opt(1969, 12, 31).unwrap();
+        let far_past = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+        let far_future = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap();
+        for d in [epoch, pre_epoch, far_past, far_future] {
+            let v = Value::Date(d);
+            assert_eq!(v, roundtrip(&v), "date boundary roundtrip failed: {d}");
+        }
+    }
+
+    #[test]
+    fn test_value_postcard_roundtrip_datetime_boundary() {
+        let epoch_dt = NaiveDate::from_ymd_opt(1970, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let future_dt = NaiveDate::from_ymd_opt(2100, 12, 31)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap();
+        for dt in [epoch_dt, future_dt] {
+            let v = Value::DateTime(dt);
+            assert_eq!(v, roundtrip(&v), "datetime boundary roundtrip failed: {dt}");
         }
     }
 
@@ -358,36 +499,6 @@ mod tests {
         let neg_zero = Value::Float(-0.0_f64);
         let pos_zero = Value::Float(0.0_f64);
         assert_ne!(neg_zero, pos_zero);
-    }
-
-    #[test]
-    fn test_value_serde_roundtrip_with_dates() {
-        let date = Value::Date(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
-        let json = serde_json::to_string(&date).unwrap();
-        assert_eq!(json, r#""2024-01-15""#);
-        let recovered: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(recovered, date);
-
-        let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-        let dt = Value::DateTime(d.and_hms_opt(10, 30, 0).unwrap());
-        let json = serde_json::to_string(&dt).unwrap();
-        let recovered: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(recovered, dt);
-    }
-
-    #[test]
-    fn test_value_serde_plain_string_not_date() {
-        let json = r#""hello""#;
-        let v: Value = serde_json::from_str(json).unwrap();
-        assert!(matches!(v, Value::String(_)));
-    }
-
-    #[test]
-    fn test_value_serde_integer_not_float() {
-        let v: Value = serde_json::from_str("42").unwrap();
-        assert!(matches!(v, Value::Integer(42)));
-        let v: Value = serde_json::from_str("42.0").unwrap();
-        assert!(matches!(v, Value::Float(_)));
     }
 
     #[test]
@@ -433,7 +544,7 @@ mod tests {
         assert_eq!(Value::empty_map().type_name(), "map");
     }
 
-    // --- Value::Map tests (Phase 13, Task 13.1) ---
+    // --- Value::Map tests ---
 
     #[test]
     fn test_map_construction() {
@@ -501,8 +612,7 @@ mod tests {
             ("b", Value::String("hello".into())),
             ("c", Value::Bool(true)),
         ]);
-        let json = serde_json::to_string(&m).unwrap();
-        let recovered: Value = serde_json::from_str(&json).unwrap();
+        let recovered = roundtrip(&m);
         assert_eq!(m, recovered);
     }
 

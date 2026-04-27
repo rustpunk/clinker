@@ -1,87 +1,182 @@
-use std::sync::Arc;
+use std::collections::HashMap;
 
-use clinker_record::{Record, Schema, Value};
-use cxl::typecheck::OutputLayout;
+use clinker_record::{Record, SchemaBuilder, Value};
 use indexmap::IndexMap;
 
 use crate::config::{ConfigError, IncludeMetadata, OutputConfig};
 use crate::error::PipelineError;
 
-/// Apply output projection to a fully-materialized positional record
-/// (Option-W): gather → exclude → mapping. No per-record emitted map —
-/// the record already carries all output columns in their planner-
-/// allocated slots; the producing node's `OutputLayout` identifies
-/// which of those columns are CXL-named (emits) vs passthroughs.
+/// Apply schema aliases to emitted fields: rename keys from original to alias names.
 ///
-/// 1. **Gather**: Start with CXL-named columns (positional slots in
-///    `layout.emit_slots`). If `include_unmapped`, add all remaining
-///    columns of `record.schema()` (passthroughs).
+/// Alias creates an identity boundary (SQL model): CXL uses original field names,
+/// but output-facing code (mapping, writers) sees the post-alias names.
+pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<String, String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let entries: Vec<(String, Value)> = emitted.drain(..).collect();
+    for (name, value) in entries {
+        let output_name = aliases.get(&name).cloned().unwrap_or(name);
+        emitted.insert(output_name, value);
+    }
+}
+
+/// Apply output projection: gather → exclude → mapping.
+///
+/// 1. **Gather**: Start with CXL-emitted fields. If `include_unmapped`,
+///    add all input fields not already emitted.
 /// 2. **Exclude**: Remove any field in `exclude` list (by current name).
 /// 3. **Mapping**: Rename surviving fields per `mapping` table.
 pub fn project_output(
     input_record: &Record,
-    layout: &OutputLayout,
+    emitted: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
-    project_output_with_meta(input_record, layout, &IndexMap::new(), config)
+    project_output_with_meta(input_record, emitted, &IndexMap::new(), config)
 }
 
-/// Project output with explicit metadata map (from EvalResult::Emit).
+/// Project output directly from a Record (Invariant 3 — no parallel
+/// bookkeeping map input).
 ///
-/// Metadata is sourced from the `metadata` parameter, not from
-/// `input_record.iter_meta()`, because `evaluate_record` works on a
-/// clone and the original input record has no metadata.
+/// Gather order follows `Record::iter_all_fields`: schema columns in
+/// declaration order, then overflow entries in insertion (emit) order.
+/// Metadata writes land through `Record::set_meta` upstream, so
+/// `include_metadata` drives off `record.iter_meta()` here instead of
+/// a separately-threaded map.
+///
+/// Builds the output record in one pass when the config has no
+/// exclude / mapping / metadata merge — the hot path avoids an
+/// intermediate `IndexMap` entirely. Config-driven rewrites fall into
+/// the slow path, which keeps an owned `IndexMap` only for the
+/// duration of the call.
 pub fn project_output_with_meta(
     input_record: &Record,
-    layout: &OutputLayout,
-    metadata: &IndexMap<String, Value>,
+    _emitted: &IndexMap<String, Value>,
+    _metadata: &IndexMap<String, Value>,
     config: &OutputConfig,
 ) -> Record {
-    // Precompute: which positional slots in `layout.schema` correspond
-    // to CXL-named emits vs passthroughs. `layout.emit_slots` is
-    // indexed by Statement position; we project it to "is this column
-    // slot an emit?" as a fast `Vec<bool>` keyed by column slot.
-    let mut is_emit: Vec<bool> = vec![false; layout.schema.column_count()];
-    for slot in layout.emit_slots.iter().flatten() {
-        is_emit[*slot as usize] = true;
+    project_output_from_record(input_record, config, None)
+}
+
+/// Record-driven projection (Invariant 3 implementation).
+///
+/// `include_unmapped: true` surfaces every column on the record AND any
+/// off-schema reader columns captured into `$meta.*` during schema
+/// reprojection.
+///
+/// `include_unmapped: false`: when `cxl_emit_names` is `Some`, the output
+/// is restricted to those names — upstream passthroughs the user did
+/// NOT explicitly emit are dropped. This matches the documented Output
+/// projection semantic. When `cxl_emit_names` is `None` (caller has no
+/// upstream PlanNode handle), all upstream columns survive — the
+/// permissive fallback used by tests and ad-hoc projections.
+pub fn project_output_from_record(
+    input_record: &Record,
+    config: &OutputConfig,
+    cxl_emit_names: Option<&[String]>,
+) -> Record {
+    let drop_unmapped = !config.include_unmapped && cxl_emit_names.is_some();
+    let needs_rewrite = config.exclude.is_some()
+        || config.mapping.is_some()
+        || !config.include_metadata.is_none()
+        || config.include_unmapped
+        || drop_unmapped;
+    let include_engine_stamped = config.include_correlation_keys;
+
+    if !needs_rewrite {
+        // Fast path: no exclude, no mapping, no metadata merge — emit
+        // all Record fields in natural iteration order, no
+        // intermediate allocation. Engine-stamped columns are dropped
+        // unless the Output node opts in.
+        let field_count = input_record.total_field_count();
+        let mut schema_builder = SchemaBuilder::with_capacity(field_count);
+        let mut values: Vec<Value> = Vec::with_capacity(field_count);
+        if include_engine_stamped {
+            for (name, value) in input_record.iter_all_fields() {
+                schema_builder = schema_builder.with_field(name);
+                values.push(value.clone());
+            }
+        } else {
+            for (name, value) in input_record.iter_user_fields() {
+                schema_builder = schema_builder.with_field(name);
+                values.push(value.clone());
+            }
+        }
+        return Record::new(schema_builder.build(), values);
     }
 
-    // Step 1: Gather — walk the record positionally using layout.schema.
-    let mut fields: IndexMap<String, Value> = IndexMap::new();
-    for (i, col) in layout.schema.columns().iter().enumerate() {
-        if is_emit[i] || config.include_unmapped {
-            fields.insert(col.as_ref().to_string(), input_record.values()[i].clone());
+    // Slow path: config requires rewriting field names / dropping
+    // fields / merging metadata, which all want the temporary
+    // IndexMap's keyed access.
+    let mut fields: IndexMap<String, Value> =
+        IndexMap::with_capacity(input_record.total_field_count());
+    if include_engine_stamped {
+        for (name, value) in input_record.iter_all_fields() {
+            fields.insert(name.to_string(), value.clone());
+        }
+    } else {
+        for (name, value) in input_record.iter_user_fields() {
+            fields.insert(name.to_string(), value.clone());
         }
     }
 
-    // Step 1b: Merge metadata into output when include_metadata is set.
-    // Metadata fields are prefixed with `meta.` in the output.
+    // Restrict to user-emitted columns when the caller supplied the
+    // upstream node's emit-name list and `include_unmapped: false`.
+    // Walk the emit list to preserve declaration order; metadata fields
+    // (meta-prefixed below) are added after this restriction so they
+    // survive even though they are not in `cxl_emit_names`.
+    if drop_unmapped {
+        let allowed: std::collections::HashSet<&str> =
+            cxl_emit_names.unwrap().iter().map(|s| s.as_str()).collect();
+        let kept: IndexMap<String, Value> = cxl_emit_names
+            .unwrap()
+            .iter()
+            .filter_map(|name| fields.get(name.as_str()).map(|v| (name.clone(), v.clone())))
+            .collect();
+        fields = kept;
+        let _ = allowed;
+    }
+
+    // Merge metadata into output when include_metadata is set (key is
+    // `meta.<name>`) or when include_unmapped is set (key is `<name>`,
+    // mirroring the pre-rip overflow-passthrough shape). Both paths
+    // share the `iter_meta` iterator; include_unmapped uses the bare
+    // key so downstream tools that consumed overflow fields see the
+    // same field names they did pre-rip.
     if !config.include_metadata.is_none() {
-        let meta_iter: Vec<(&str, &Value)> = match &config.include_metadata {
+        let meta_iter: Vec<(String, Value)> = match &config.include_metadata {
             IncludeMetadata::None => vec![],
-            IncludeMetadata::All => metadata.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            IncludeMetadata::Allowlist(allow) => metadata
-                .iter()
+            IncludeMetadata::All => input_record
+                .iter_meta()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            IncludeMetadata::Allowlist(allow) => input_record
+                .iter_meta()
                 .filter(|(k, _)| allow.iter().any(|a| a.as_str() == *k))
-                .map(|(k, v)| (k.as_str(), v))
+                .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
         };
         for (key, value) in meta_iter {
             let output_name = format!("meta.{key}");
             if !fields.contains_key(&output_name) {
-                fields.insert(output_name, value.clone());
+                fields.insert(output_name, value);
+            }
+        }
+    }
+    if config.include_unmapped {
+        for (key, value) in input_record.iter_meta() {
+            if !fields.contains_key(key) {
+                fields.insert(key.to_string(), value.clone());
             }
         }
     }
 
-    // Step 2: Exclude
     if let Some(ref exclude_list) = config.exclude {
         for name in exclude_list {
             fields.swap_remove(name.as_str());
         }
     }
 
-    // Step 3: Mapping (rename)
     if let Some(ref mapping) = config.mapping {
         let mut renamed = IndexMap::with_capacity(fields.len());
         for (name, value) in fields {
@@ -91,9 +186,11 @@ pub fn project_output_with_meta(
         fields = renamed;
     }
 
-    // Build output Record
-    let column_names: Vec<Box<str>> = fields.keys().map(|k| k.as_str().into()).collect();
-    let schema = Arc::new(Schema::new(column_names));
+    let schema = fields
+        .keys()
+        .map(|k| Box::<str>::from(k.as_str()))
+        .collect::<SchemaBuilder>()
+        .build();
     let values: Vec<Value> = fields.into_values().collect();
     Record::new(schema, values)
 }
@@ -135,59 +232,39 @@ pub fn merge_metadata_into_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_record::Schema;
+    use std::sync::Arc;
 
-    /// Build a test layout where `full_name` is the CXL-emitted column
-    /// (slot 3) and `first_name`/`last_name`/`secret` are passthroughs
-    /// (slots 0/1/2 from the input).
-    fn make_layout_with_full_name_emit() -> OutputLayout {
-        // Output schema: input cols (passthroughs) followed by `full_name` emit.
+    fn make_input() -> Record {
+        // Schema is pre-widened to include every field the post-transform
+        // Record would carry — `full_name` is declared up front so
+        // `Record::set` hits a known slot.
         let schema = Arc::new(Schema::new(vec![
             "first_name".into(),
             "last_name".into(),
             "secret".into(),
             "full_name".into(),
         ]));
-        // One statement: Emit full_name. emit_slots[0] = Some(3).
-        OutputLayout {
+        Record::new(
             schema,
-            emit_slots: vec![Some(3)],
-            passthroughs: vec![(0, 0), (1, 1), (2, 2)],
-        }
-    }
-
-    fn make_identity_layout(schema: Arc<Schema>) -> OutputLayout {
-        // Pure passthrough — no emits, upstream == output.
-        let n = schema.column_count() as u32;
-        OutputLayout {
-            schema,
-            emit_slots: vec![],
-            passthroughs: (0..n).map(|i| (i, i)).collect(),
-        }
-    }
-
-    /// Input record aligned to the layout's schema (Option-W: record
-    /// carries the producing node's bound output schema). For the
-    /// `full_name` emit case this means a 4-column record.
-    fn make_record_for_layout(layout: &OutputLayout) -> Record {
-        let n = layout.schema.column_count();
-        let mut values = Vec::with_capacity(n);
-        for col in layout.schema.columns() {
-            let v = match col.as_ref() {
-                "first_name" => Value::String("Alice".into()),
-                "last_name" => Value::String("Smith".into()),
-                "secret" => Value::String("password123".into()),
-                "full_name" => Value::String("Alice Smith".into()),
-                _ => Value::Null,
-            };
-            values.push(v);
-        }
-        Record::new(Arc::clone(&layout.schema), values)
+            vec![
+                Value::String("Alice".into()),
+                Value::String("Smith".into()),
+                Value::String("password123".into()),
+                Value::Null,
+            ],
+        )
     }
 
     #[test]
     fn test_gather_emitted_plus_unmapped() {
-        let layout = make_layout_with_full_name_emit();
-        let input = make_record_for_layout(&layout);
+        // project_output drives off the Record itself, so emitted fields
+        // must land on the Record before the projection is invoked. The
+        // widened schema guarantees every `Record::set` at emit sites
+        // hits a known slot.
+        let mut input = make_input();
+        input.set("full_name", Value::String("Alice Smith".into()));
+        let emitted = IndexMap::new();
 
         let config = OutputConfig {
             name: "out".into(),
@@ -200,12 +277,13 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            include_correlation_keys: false,
             schema: None,
             split: None,
             notes: None,
         };
 
-        let result = project_output(&input, &layout, &config);
+        let result = project_output(&input, &emitted, &config);
         assert_eq!(
             result.get("full_name"),
             Some(&Value::String("Alice Smith".into()))
@@ -222,20 +300,8 @@ mod tests {
 
     #[test]
     fn test_exclude_removes_fields() {
-        let schema = Arc::new(Schema::new(vec![
-            "first_name".into(),
-            "last_name".into(),
-            "secret".into(),
-        ]));
-        let layout = make_identity_layout(Arc::clone(&schema));
-        let input = Record::new(
-            schema,
-            vec![
-                Value::String("Alice".into()),
-                Value::String("Smith".into()),
-                Value::String("password123".into()),
-            ],
-        );
+        let input = make_input();
+        let emitted = IndexMap::new();
 
         let config = OutputConfig {
             name: "out".into(),
@@ -248,32 +314,21 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            include_correlation_keys: false,
             schema: None,
             split: None,
             notes: None,
         };
 
-        let result = project_output(&input, &layout, &config);
+        let result = project_output(&input, &emitted, &config);
         assert!(result.get("secret").is_none());
         assert!(result.get("first_name").is_some());
     }
 
     #[test]
     fn test_mapping_renames() {
-        let schema = Arc::new(Schema::new(vec![
-            "first_name".into(),
-            "last_name".into(),
-            "secret".into(),
-        ]));
-        let layout = make_identity_layout(Arc::clone(&schema));
-        let input = Record::new(
-            schema,
-            vec![
-                Value::String("Alice".into()),
-                Value::String("Smith".into()),
-                Value::String("password123".into()),
-            ],
-        );
+        let input = make_input();
+        let emitted = IndexMap::new();
 
         let mut mapping = IndexMap::new();
         mapping.insert("first_name".to_string(), "given_name".to_string());
@@ -289,16 +344,74 @@ mod tests {
             sort_order: None,
             preserve_nulls: None,
             include_metadata: Default::default(),
+            include_correlation_keys: false,
             schema: None,
             split: None,
             notes: None,
         };
 
-        let result = project_output(&input, &layout, &config);
+        let result = project_output(&input, &emitted, &config);
         assert!(result.get("first_name").is_none());
         assert_eq!(
             result.get("given_name"),
             Some(&Value::String("Alice".into()))
         );
+    }
+
+    fn correlation_key_input() -> Record {
+        use clinker_record::FieldMetadata;
+        use clinker_record::SchemaBuilder;
+        let schema = SchemaBuilder::new()
+            .with_field("id")
+            .with_field("name")
+            .with_field_meta("$ck.id", FieldMetadata::snapshot_of("id"))
+            .build();
+        Record::new(
+            schema,
+            vec![
+                Value::Integer(1),
+                Value::String("Alice".into()),
+                Value::Integer(1),
+            ],
+        )
+    }
+
+    fn fast_path_output_config(include_correlation_keys: bool) -> OutputConfig {
+        OutputConfig {
+            name: "out".into(),
+            format: crate::config::OutputFormat::Csv(None),
+            path: "/tmp/out.csv".into(),
+            include_unmapped: false,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_metadata: Default::default(),
+            include_correlation_keys,
+            schema: None,
+            split: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_projection_fast_path_strips_engine_stamped_by_default() {
+        let input = correlation_key_input();
+        let config = fast_path_output_config(false);
+        let result = project_output_from_record(&input, &config, None);
+        let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", "name"]);
+        assert!(result.get("$ck.id").is_none());
+    }
+
+    #[test]
+    fn test_projection_fast_path_keeps_engine_stamped_on_opt_in() {
+        let input = correlation_key_input();
+        let config = fast_path_output_config(true);
+        let result = project_output_from_record(&input, &config, None);
+        let cols: Vec<&str> = result.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", "name", "$ck.id"]);
+        assert_eq!(result.get("$ck.id"), Some(&Value::Integer(1)));
     }
 }

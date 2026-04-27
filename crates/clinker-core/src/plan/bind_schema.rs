@@ -1,6 +1,5 @@
 //! Compile-time CXL typecheck + schema propagation (`bind_schema`).
 //!
-//! Lifted from `config/cxl_compile.rs` in Phase 16c.1.4 (LD-16c-24).
 //! Walks the unified `nodes:` DAG in topological order, seeds each
 //! source's schema from its author-declared `schema:` block, typechecks
 //! every Transform/Aggregate/Route body against the upstream Row, and
@@ -10,7 +9,7 @@
 //!
 //! For `PipelineNode::Composition` nodes, `bind_composition` recursively
 //! binds the composition body at the call-site boundary using
-//! row-polymorphic type propagation (LD-16c-21, Leijen 2005).
+//! row-polymorphic type propagation (Leijen 2005).
 //!
 //! Errors surface as E200 diagnostics (CXL type error), E201
 //! diagnostics (missing source schema), and E102–E109 / W101
@@ -21,7 +20,10 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cxl::typecheck::{AggregateMode, OutputLayout, Row, RowTail, Type, TypedProgram};
+use cxl::ast::{Expr, Statement};
+use cxl::typecheck::{
+    AggregateMode, ColumnLookup, QualifiedField, Row, RowTail, Type, TypedProgram,
+};
 use indexmap::IndexMap;
 
 use crate::config::compile_context::CompileContext;
@@ -29,62 +31,29 @@ use crate::config::composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, OutputAlias,
     PortDecl, ProvenanceDb, ResolvedValue,
 };
-use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
+use crate::config::node_header::CombineHeader;
+use crate::config::pipeline_node::{CombineBody, MatchMode, PipelineNode, SchemaDecl};
 use crate::error::{Diagnostic, LabeledSpan};
-use crate::plan::bound_schemas::BoundSchemas;
+use crate::plan::combine::{
+    CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
+};
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::span::{FileId, Span};
 use crate::yaml::Spanned;
 
-/// Maximum composition nesting depth before E107 fires.
-const MAX_COMPOSITION_DEPTH: u32 = 50;
+/// Maximum composition nesting depth.
+///
+/// Compile-time depth violations emit E107 from `bind_composition`.
+/// The runtime composition-body executor reuses this same constant as
+/// its recursion-depth guard and emits a distinct E112 on overflow,
+/// so log-grep on either code finds exactly one emission site.
+pub(crate) const MAX_COMPOSITION_DEPTH: u32 = 50;
 
 /// Compile artifacts produced by `bind_schema` — one entry per node name
 /// whose CXL body successfully type-checked, plus per-node row types.
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
-    /// TypedPrograms for TOP-LEVEL DAG nodes only (depth == 0).
-    ///
-    /// Invariant: every entry's `output_layout` has a closed-tail,
-    /// upstream-aware layout produced by `build_output_layout` or
-    /// `build_aggregate_output_layout`. `Arc<Schema>` identity equal
-    /// to `canonical_schemas[name]` and `bound_schemas.schema_of(name)`.
-    /// These are the ONLY runtime-canonical layouts.
     pub typed: HashMap<String, Arc<TypedProgram>>,
-    /// TypedPrograms for composition BODY nodes (depth > 0).
-    ///
-    /// Invariant: every entry's `output_layout` is the standalone
-    /// layout produced by `type_check_with_mode` (no upstream context;
-    /// `passthroughs` empty). Valid for isolated-scope evaluation and
-    /// --explain; NOT runtime-canonical. Body upstream rows are
-    /// open-tailed (row-polymorphic composition port rows) so
-    /// `build_output_layout`'s closed-tail invariant intentionally
-    /// never applies here. Split prevents accidental cross-use with
-    /// top-level runtime-canonical entries.
-    pub composition_body_typed: HashMap<String, Arc<TypedProgram>>,
-    /// Per-top-level-node canonical `Arc<OutputLayout>` for the
-    /// executor's Output arm predecessor-lookup. Populated for every
-    /// top-level DAG node (Source, Transform, Aggregate, Route, Merge).
-    /// Composition and Output nodes have NO entry.
-    ///
-    /// For Transform/Aggregate/Route: `Arc::clone(&typed[name].output_layout)`
-    /// — ptr-equal, single-oracle, zero drift. For Source/Merge:
-    /// synthesised identity-passthrough layout (`emit_slots: all None`,
-    /// `passthroughs: identity`) because Source/Merge columns are
-    /// passthroughs by nature — no CXL-emitted columns exist at those
-    /// boundaries.
-    pub output_layouts: HashMap<String, Arc<OutputLayout>>,
-    /// Per-node bound row types (LD-16c-23). Populated during the
-    /// `bind_schema` walk; persisted on `CompiledPlan` for downstream
-    /// phases to consume.
-    pub bound_schemas: BoundSchemas,
-    /// Pre-materialized canonical `Arc<Schema>` per node, keyed by name.
-    /// Populated inline during `bind_schema_inner` for EVERY top-level
-    /// node type (Source/Transform/Aggregate/Route/Merge) so every
-    /// node's `OutputLayout.schema` shares `Arc` identity with
-    /// `BoundSchemas.schema_of(name)`. One oracle — the executor
-    /// `Arc::ptr_eq` drift guardrail holds.
-    pub canonical_schemas: HashMap<String, Arc<clinker_record::Schema>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -98,9 +67,46 @@ pub struct CompileArtifacts {
     pub composition_body_assignments: HashMap<String, CompositionBodyId>,
     /// Monotonic counter for allocating fresh `FileId`s for body re-parses.
     next_file_id: u32,
-    /// Side-table of provenance-tracked config values (D-H.5 / LD-16c-11).
-    /// Populated by `bind_composition` for each composition node's config params.
+    /// Side-table of provenance-tracked config values. Populated by
+    /// `bind_composition` for each composition node's config params.
     pub provenance: ProvenanceDb,
+    /// Decomposed `where:` predicates per combine node, keyed by combine
+    /// node name. Populated by the predicate-decomposition pass; consumed
+    /// by combine strategy selection.
+    pub combine_predicates: HashMap<String, DecomposedPredicate>,
+    /// Per-input metadata per combine node, keyed by combine node name.
+    /// The inner `IndexMap` preserves declaration order of the inputs
+    /// (matches `CombineHeader.input` iteration order). Populated during
+    /// schema propagation.
+    pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
+    /// Driving-input qualifier per combine node, chosen at `bind_combine`
+    /// time by [`select_driving_input`] (explicit `drive:` → cardinality
+    /// → first-in-IndexMap default). The `select_combine_strategies`
+    /// post-pass reads this to stamp the runtime
+    /// `PlanNode::Combine.driving_input` field. Combines that fail driver
+    /// selection (E306) are absent from this map and their post-pass
+    /// entry is skipped.
+    pub combine_driving: HashMap<String, String>,
+    /// User-supplied [`CombineStrategyHint`] per combine node, keyed by
+    /// node name. Populated from `CombineBody.strategy` during
+    /// `bind_combine`. The `select_combine_strategies` post-pass reads
+    /// this to override the planner's predicate-shape default — today
+    /// only `GraceHash` on pure-equi predicates produces a non-default
+    /// outcome. Combines absent from this map default to
+    /// [`CombineStrategyHint::Auto`].
+    pub combine_strategy_hints: HashMap<String, crate::config::CombineStrategyHint>,
+    /// Per-combine pre-resolved column map produced by the CXL
+    /// typechecker's combine-body walk. Key is the combine node's
+    /// name; value is the `ResolvedColumnMap` shape expected by
+    /// `CombineResolverMapping::from_pre_resolved`. Combines that fail
+    /// body typecheck (or the collect-mode path, which has no body)
+    /// surface an empty map here.
+    pub combine_resolved_columns: HashMap<String, crate::plan::execution::ResolvedColumnMap>,
+    /// Monotonic counter for fresh tail-variable IDs allocated during
+    /// row-polymorphic propagation (composition input-port binding).
+    /// Threaded as `&mut u32` into `build_input_port_rows`; IDs are
+    /// only comparable within a single `compile()` run.
+    pub next_tail_var: u32,
 }
 
 impl CompileArtifacts {
@@ -151,6 +157,12 @@ pub(crate) struct BindContext<'a> {
     /// pipeline this is typically `"pipelines/"` or similar; for nested
     /// compositions it's the directory of the `.comp.yaml` file.
     pub origin_dir: PathBuf,
+    /// Pipeline-level `error_handling.correlation_key`, threaded so the
+    /// Source-arm widening pass can synthesize one `$ck.<field>` shadow
+    /// column per declared correlation field. `None` when the pipeline
+    /// has no correlation key. Composition bodies inherit the parent
+    /// pipeline's key — they have no `error_handling` of their own.
+    pub correlation_key: Option<&'a crate::config::CorrelationKey>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -161,12 +173,21 @@ pub(crate) struct BindContext<'a> {
 /// `pipeline_dir` is the workspace-relative directory of the pipeline
 /// file being compiled. Used to resolve relative `use:` paths on
 /// `PipelineNode::Composition` nodes. Pass `""` if unknown.
+///
+/// `correlation_key` is the pipeline-level
+/// `error_handling.correlation_key`. When `Some`, every `Source` node's
+/// declared schema is widened with one `$ck.<field>` shadow column per
+/// listed field, tail-appended in declaration order. The shadow columns
+/// preserve correlation-group identity through downstream Transforms
+/// that may rewrite the user-declared field. Composition body Sources
+/// inherit the same widening through the recursive walk.
 pub fn bind_schema(
     nodes: &[Spanned<PipelineNode>],
     diags: &mut Vec<Diagnostic>,
     ctx: &CompileContext,
     symbol_table: &CompositionSymbolTable,
     pipeline_dir: &Path,
+    correlation_key: Option<&crate::config::CorrelationKey>,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
@@ -177,6 +198,7 @@ pub fn bind_schema(
         depth: 0,
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
+        correlation_key,
     };
     bind_schema_inner(
         nodes,
@@ -186,206 +208,24 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
-    // Persist all bound rows into BoundSchemas (LD-16c-23). When the
-    // node has a pre-materialized canonical `Arc<Schema>` from
-    // layout construction (CXL-bearing Transform/Aggregate/Route), reuse
-    // that exact Arc so `BoundSchemas::schema_of(name)` ptr-equals the
-    // node's `OutputLayout::schema`. One oracle. For Source/Merge/Output
-    // nodes that have no TypedProgram, we fall through to `set_output`
-    // which materializes a fresh Arc.
-    for (node_name, row) in schema_by_name {
-        if let Some(canonical) = artifacts.canonical_schemas.remove(&node_name) {
-            artifacts
-                .bound_schemas
-                .set_output_with_schema(node_name, row, canonical);
-        } else {
-            artifacts.bound_schemas.set_output(node_name, row);
-        }
-    }
-
     artifacts
 }
 
-// ─── OutputLayout construction (Option-W codegen) ──────────────────────
-
-/// Materialize an `Arc<Schema>` from a bound output `Row`'s declared
-/// columns. The resulting Arc is the canonical schema for records
-/// produced by the node; it is shared with the node's
-/// [`cxl::typecheck::OutputLayout::schema`] and (at top-level flush) with
-/// [`BoundSchemas::schema_of`].
-fn materialize_schema(row: &Row) -> Arc<clinker_record::Schema> {
-    let cols: Vec<Box<str>> = row
-        .declared
-        .keys()
-        .map(|k| Box::<str>::from(k.as_str()))
-        .collect();
-    Arc::new(clinker_record::Schema::new(cols))
-}
-
-/// Build the Option-W positional layout for a Transform/Route node:
-///
-/// - `emit_slots[i]` = position of the i-th statement's name in `out` if it
-///   is a non-meta Emit, else `None`.
-/// - `passthroughs` = `(upstream_slot, out_slot)` copies for every upstream
-///   column NOT shadowed by a non-meta emit (emit-name shadowing matches
-///   `propagate_row`'s IndexMap::insert semantics).
-///
-/// Invariant: `out.tail == RowTail::Closed`. Open-tailed rows are a
-/// composition-scope concern and never reach the layout constructor for
-/// the top-level DAG.
-fn build_output_layout(
-    upstream: &Row,
-    out: &Row,
-    typed: &TypedProgram,
-    schema: Arc<clinker_record::Schema>,
-) -> OutputLayout {
-    // Amendment A1 (restored): closed-row outputs are the only
-    // architecturally-valid inputs to this layout constructor.
-    // Open-tailed rows are a composition-body concern and are routed
-    // via `CompileArtifacts.composition_body_typed` without layout
-    // replacement — they never reach this constructor.
-    debug_assert!(
-        matches!(out.tail, RowTail::Closed),
-        "build_output_layout requires a closed-tail output row; \
-         open-tailed rows arise only in composition bodies and must \
-         route to composition_body_typed without layout replacement"
-    );
-    debug_assert_eq!(
-        out.declared.len(),
-        schema.column_count(),
-        "out.declared.len() != schema.column_count()"
-    );
-
-    // Out-column name → slot index (positional in schema).
-    let out_index: HashMap<&str, u32> = out
-        .declared
-        .keys()
-        .enumerate()
-        .map(|(i, k)| (k.as_str(), i as u32))
-        .collect();
-
-    // Collect non-meta emit names for passthrough shadow detection.
-    let mut emit_name_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit {
-            name,
-            is_meta: false,
-            ..
-        } = stmt
-        {
-            emit_name_set.insert(name.as_ref());
-        }
+/// Build a placeholder `TypedProgram` carrying only `output_row`, for
+/// node variants without a CXL body (Source/Merge/Output/Composition).
+fn synthetic_typed_program(output_row: Row) -> TypedProgram {
+    TypedProgram {
+        program: cxl::ast::Program {
+            statements: Vec::new(),
+            span: cxl::lexer::Span::default(),
+        },
+        bindings: Vec::new(),
+        types: Vec::new(),
+        field_types: IndexMap::new(),
+        regexes: Vec::new(),
+        node_count: 0,
+        output_row,
     }
-
-    // emit_slots: per-statement positional slot, or None.
-    let mut emit_slots: Vec<Option<u32>> = Vec::with_capacity(typed.program.statements.len());
-    for stmt in &typed.program.statements {
-        match stmt {
-            cxl::ast::Statement::Emit {
-                name,
-                is_meta: false,
-                ..
-            } => {
-                let slot = out_index
-                    .get(name.as_ref())
-                    .copied()
-                    .expect("emit name must be present in out row");
-                emit_slots.push(Some(slot));
-            }
-            _ => emit_slots.push(None),
-        }
-    }
-
-    // passthroughs: upstream_slot → out_slot for every upstream column not
-    // shadowed by an emit with the same name.
-    let mut passthroughs: Vec<(u32, u32)> = Vec::new();
-    for (upstream_slot, upstream_name) in upstream.declared.keys().enumerate() {
-        if emit_name_set.contains(upstream_name.as_str()) {
-            continue;
-        }
-        if let Some(&out_slot) = out_index.get(upstream_name.as_str()) {
-            passthroughs.push((upstream_slot as u32, out_slot));
-        }
-    }
-
-    OutputLayout {
-        schema,
-        emit_slots,
-        passthroughs,
-    }
-}
-
-/// Build the Option-W layout for an Aggregate node. The aggregate's
-/// output row is `group_by ++ emits` (fresh — no passthroughs from the
-/// upstream record; aggregate finalize constructs values from
-/// accumulator state). `emit_slots` still maps non-meta Emit statements
-/// to their positional slot in the output schema, used by any
-/// post-finalize residual evaluation path.
-fn build_aggregate_output_layout(
-    out: &Row,
-    typed: &TypedProgram,
-    schema: Arc<clinker_record::Schema>,
-) -> OutputLayout {
-    debug_assert!(matches!(out.tail, RowTail::Closed));
-    debug_assert_eq!(out.declared.len(), schema.column_count());
-
-    let out_index: HashMap<&str, u32> = out
-        .declared
-        .keys()
-        .enumerate()
-        .map(|(i, k)| (k.as_str(), i as u32))
-        .collect();
-
-    let mut emit_slots: Vec<Option<u32>> = Vec::with_capacity(typed.program.statements.len());
-    for stmt in &typed.program.statements {
-        match stmt {
-            cxl::ast::Statement::Emit {
-                name,
-                is_meta: false,
-                ..
-            } => {
-                let slot = out_index
-                    .get(name.as_ref())
-                    .copied()
-                    .expect("aggregate emit name must be present in out row");
-                emit_slots.push(Some(slot));
-            }
-            _ => emit_slots.push(None),
-        }
-    }
-
-    OutputLayout {
-        schema,
-        emit_slots,
-        passthroughs: Vec::new(),
-    }
-}
-
-/// Synthesise an identity-passthrough `OutputLayout` for Source and
-/// Merge nodes. Source/Merge columns are all passthroughs by nature
-/// — no CXL `emit` statement produces them — so `emit_slots` is all
-/// `None` and `passthroughs` is the identity mapping `(i, i)` for
-/// every column of the node's bound output schema.
-///
-/// The inserted layout's `schema` field shares `Arc` identity with
-/// `artifacts.canonical_schemas[name]` (and therefore with
-/// `bound_schemas.schema_of(name)` at finalisation). This upholds the
-/// Option W ptr-eq drift guardrail uniformly across all top-level node
-/// types.
-fn insert_identity_layout(
-    artifacts: &mut CompileArtifacts,
-    name: &str,
-    schema: &Arc<clinker_record::Schema>,
-) {
-    let n = schema.column_count();
-    let layout = OutputLayout {
-        schema: Arc::clone(schema),
-        emit_slots: vec![None; n],
-        passthroughs: (0..n as u32).map(|i| (i, i)).collect(),
-    };
-    artifacts
-        .output_layouts
-        .insert(name.to_string(), Arc::new(layout));
 }
 
 // ─── Internal recursive bind_schema ─────────────────────────────────
@@ -417,28 +257,17 @@ fn bind_schema_inner(
         match node {
             PipelineNode::Source { config, .. } => {
                 let schema_decl: &SchemaDecl = &config.schema;
-                let columns = columns_from_decl(schema_decl);
+                let columns = columns_from_decl(schema_decl, bind_ctx.correlation_key);
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
                 let row = Row::closed(columns, cxl_span);
-                if bind_ctx.depth == 0 {
-                    // Option W: populate canonical_schemas and
-                    // output_layouts for every top-level node so the
-                    // executor's uniform Arc<OutputLayout> lookup works
-                    // across Source/Transform/Aggregate/Route/Merge.
-                    // Sources' columns are all passthroughs (no CXL
-                    // emits), so the synthesised layout has
-                    // emit_slots: all None, passthroughs: identity.
-                    let out_schema = materialize_schema(&row);
-                    artifacts
-                        .canonical_schemas
-                        .insert(name.clone(), Arc::clone(&out_schema));
-                    insert_identity_layout(artifacts, &name, &out_schema);
-                }
-                schema_by_name.insert(name, row);
+                schema_by_name.insert(name.clone(), row.clone());
+                artifacts
+                    .typed
+                    .insert(name, Arc::new(synthetic_typed_program(row)));
             }
             PipelineNode::Transform { header, config } => {
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
-                if let Some(target) = upstream_target_name(&header.input)
+                if let Some(target) = upstream_target_name(&header.input.value)
                     && !schema_by_name.contains_key(target)
                     && bind_ctx.enclosing_scope_names.contains(target)
                 {
@@ -452,7 +281,7 @@ fn bind_schema_inner(
                     ));
                     continue;
                 }
-                let upstream = match upstream_schema(&header.input, schema_by_name) {
+                let upstream = match upstream_schema(&header.input.value, schema_by_name) {
                     Some(s) => s.clone(),
                     None => continue,
                 };
@@ -463,53 +292,24 @@ fn bind_schema_inner(
                     AggregateMode::Row,
                     span,
                 ) {
-                    Ok(typed) => {
+                    Ok(mut typed) => {
                         let out = propagate_row(&upstream, &typed);
-                        if bind_ctx.depth == 0 {
-                            // Top-level: build upstream-aware layout
-                            // (closed-tail invariant structurally
-                            // guaranteed); insert into runtime-canonical
-                            // `typed` + populate output_layouts.
-                            let out_schema = materialize_schema(&out);
-                            let layout = build_output_layout(
-                                &upstream,
-                                &out,
-                                &typed,
-                                Arc::clone(&out_schema),
-                            );
-                            let typed_with_layout = typed.with_output_layout(Arc::new(layout));
-                            artifacts.canonical_schemas.insert(name.clone(), out_schema);
-                            artifacts
-                                .output_layouts
-                                .insert(name.clone(), Arc::clone(&typed_with_layout.output_layout));
-                            schema_by_name.insert(name.clone(), out);
-                            artifacts.typed.insert(name, Arc::new(typed_with_layout));
-                        } else {
-                            // Composition body: upstream row is
-                            // open-tailed (row-polymorphic port row).
-                            // Keep the standalone layout built by
-                            // `type_check_with_mode`; insert into
-                            // composition_body_typed. `build_output_layout`
-                            // is NOT called — its closed-tail invariant
-                            // would fire on open upstream.
-                            schema_by_name.insert(name.clone(), out);
-                            artifacts
-                                .composition_body_typed
-                                .insert(name, Arc::new(typed));
-                        }
+                        schema_by_name.insert(name.clone(), out.clone());
+                        typed.output_row = out;
+                        artifacts.typed.insert(name, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
                 }
             }
             PipelineNode::Aggregate { header, config } => {
-                let upstream = match upstream_schema(&header.input, schema_by_name) {
+                let upstream = match upstream_schema(&header.input.value, schema_by_name) {
                     Some(s) => s.clone(),
                     None => continue,
                 };
                 // Validate group_by fields exist in the upstream schema.
                 let mut missing = Vec::new();
                 for gb in &config.group_by {
-                    if !upstream.declared.contains_key(gb) {
+                    if !upstream.has_field(gb) {
                         missing.push(gb.clone());
                     }
                 }
@@ -534,193 +334,65 @@ fn bind_schema_inner(
                     group_by_fields: config.group_by.iter().cloned().collect(),
                 };
                 match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
-                    Ok(typed) => {
+                    Ok(mut typed) => {
                         let out = propagate_aggregate(&config.group_by, &upstream, &typed);
-                        if bind_ctx.depth == 0 {
-                            // Top-level: build aggregate output layout
-                            // (closed-tail invariant structurally
-                            // guaranteed); insert into `typed` +
-                            // populate output_layouts.
-                            let out_schema = materialize_schema(&out);
-                            let layout = build_aggregate_output_layout(
-                                &out,
-                                &typed,
-                                Arc::clone(&out_schema),
-                            );
-                            let typed_with_layout = typed.with_output_layout(Arc::new(layout));
-                            artifacts.canonical_schemas.insert(name.clone(), out_schema);
-                            artifacts
-                                .output_layouts
-                                .insert(name.clone(), Arc::clone(&typed_with_layout.output_layout));
-                            schema_by_name.insert(name.clone(), out);
-                            artifacts.typed.insert(name, Arc::new(typed_with_layout));
-                        } else {
-                            // Composition body aggregate: keep
-                            // standalone layout from type_check; insert
-                            // into composition_body_typed. (Note:
-                            // body Aggregates are W100-deferred at
-                            // lowering today — pre-existing latent
-                            // issue, out of scope for this fix.)
-                            schema_by_name.insert(name.clone(), out);
-                            artifacts
-                                .composition_body_typed
-                                .insert(name, Arc::new(typed));
-                        }
+                        schema_by_name.insert(name.clone(), out.clone());
+                        typed.output_row = out;
+                        artifacts.typed.insert(name, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
                 }
             }
             PipelineNode::Route { header, config: _ } => {
-                if let Some(upstream) = upstream_schema(&header.input, schema_by_name) {
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
-                    if let Ok(empty) = typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span) {
-                        if bind_ctx.depth == 0 {
-                            // Top-level: Route is transparent — it
-                            // dispatches to branches without changing
-                            // record shape. We maintain TWO layouts with
-                            // distinct purposes:
-                            //
-                            // 1. `artifacts.typed[route].output_layout`:
-                            //    RUNTIME EVALUATOR layout. Must match the
-                            //    upstream schema column-wise so the
-                            //    ProgramEvaluator produces correctly-sized
-                            //    output records (Route's CXL is empty —
-                            //    no emits, identity passthroughs copy all
-                            //    upstream columns through).
-                            //
-                            // 2. `artifacts.output_layouts[route]`:
-                            //    PROJECTION layout for the Output arm.
-                            //    Inherits the upstream's layout (emit
-                            //    semantics preserved through transparent
-                            //    Route). Using an identity layout here
-                            //    would drop upstream's CXL-named emit
-                            //    slots and break `include_unmapped: false`
-                            //    semantics.
-                            //
-                            // Both purposes are architecturally distinct
-                            // (evaluator record construction vs
-                            // projection filtering); having them diverge
-                            // at Route/Merge boundaries is not a
-                            // single-oracle violation.
-                            let out_schema = materialize_schema(&cloned);
-                            // (1) Evaluator layout = identity passthrough.
-                            let eval_layout = build_output_layout(
-                                &cloned,
-                                &cloned,
-                                &empty,
-                                Arc::clone(&out_schema),
-                            );
-                            let typed_with_layout = empty.with_output_layout(Arc::new(eval_layout));
-                            // (2) Projection layout = upstream's layout.
-                            let upstream_name = input_target(&header.input);
-                            let projection_layout = artifacts
-                                .output_layouts
-                                .get(upstream_name)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    // Upstream has no emits (e.g., Source);
-                                    // fall back to evaluator layout (they
-                                    // coincide in the emit-free case).
-                                    Arc::clone(&typed_with_layout.output_layout)
-                                });
-                            artifacts.canonical_schemas.insert(name.clone(), out_schema);
-                            artifacts
-                                .output_layouts
-                                .insert(name.clone(), projection_layout);
-                            artifacts
-                                .typed
-                                .insert(name.clone(), Arc::new(typed_with_layout));
-                        } else {
-                            // Composition body route: keep standalone
-                            // layout; insert into composition_body_typed.
-                            artifacts
-                                .composition_body_typed
-                                .insert(name.clone(), Arc::new(empty));
-                        }
+                    if let Ok(mut empty) =
+                        typecheck_cxl(&name, "", &cloned, AggregateMode::Row, span)
+                    {
+                        empty.output_row = cloned.clone();
+                        artifacts.typed.insert(name.clone(), Arc::new(empty));
                     }
                     schema_by_name.insert(name, cloned);
                 }
             }
             PipelineNode::Merge { header, .. } => {
-                // Option-W invariant: under positional records, every
-                // predecessor of a Merge must share the same bound output
-                // schema. If branches emitted divergent columns, records
-                // would arrive with incompatible Arc<Schema>s and
-                // positional access would be wrong. Enforce row equality
-                // on the declared key set; type-level differences are
-                // tolerated (typecheck upstream has already unified).
-                let expected_keys: Option<Vec<&String>> = header
-                    .inputs
-                    .first()
-                    .and_then(|first| schema_by_name.get(input_target(first)))
-                    .map(|row| row.declared.keys().collect());
-                let mut divergent = false;
-                if let Some(ref expected) = expected_keys {
-                    for inp in header.inputs.iter().skip(1) {
-                        if let Some(row) = schema_by_name.get(input_target(inp)) {
-                            let keys: Vec<&String> = row.declared.keys().collect();
-                            if keys != *expected {
-                                divergent = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if divergent {
-                    diags.push(
-                        Diagnostic::error(
-                            "E202",
-                            format!(
-                                "merge {name:?}: predecessor output rows differ — \
-                                 Option-W positional records require all inputs to a \
-                                 Merge node to share identical declared column sets in \
-                                 the same order"
-                            ),
-                            LabeledSpan::primary(span, String::new()),
-                        )
-                        .with_help(
-                            "ensure each upstream transform emits the same columns in \
-                             the same order, or insert a reshaping transform before the merge",
-                        ),
-                    );
-                    continue;
-                }
                 if let Some(first) = header.inputs.first()
-                    && let Some(upstream) = schema_by_name.get(input_target(first))
+                    && let Some(upstream) = schema_by_name.get(input_target(&first.value))
                 {
-                    let cloned = upstream.clone();
-                    if bind_ctx.depth == 0 {
-                        // Option W: Merge is a TRANSPARENT passthrough
-                        // (concatenates predecessors without changing
-                        // shape; Amendment A5 enforces predecessors share
-                        // declared row). Its runtime output layout
-                        // inherits from ANY input's layout — they are
-                        // equivalent. Using an identity-passthrough layout
-                        // here would drop upstream emit information.
-                        let first_input_name = input_target(first);
-                        let upstream_layout =
-                            artifacts.output_layouts.get(first_input_name).cloned();
-                        let out_schema = materialize_schema(&cloned);
-                        artifacts
-                            .canonical_schemas
-                            .insert(name.clone(), Arc::clone(&out_schema));
-                        if let Some(upstream_layout) = upstream_layout {
-                            artifacts
-                                .output_layouts
-                                .insert(name.clone(), upstream_layout);
-                        } else {
-                            // All Merge inputs are Source-like (no
-                            // emits): synthesise identity layout.
-                            insert_identity_layout(artifacts, &name, &out_schema);
-                        }
-                    }
-                    schema_by_name.insert(name, cloned);
+                    let row = upstream.clone();
+                    schema_by_name.insert(name.clone(), row.clone());
+                    artifacts
+                        .typed
+                        .insert(name, Arc::new(synthetic_typed_program(row)));
                 }
             }
             PipelineNode::Output { header, .. } => {
-                if let Some(upstream) = upstream_schema(&header.input, schema_by_name) {
-                    schema_by_name.insert(name, upstream.clone());
+                if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
+                    let row = upstream.clone();
+                    schema_by_name.insert(name.clone(), row.clone());
+                    artifacts
+                        .typed
+                        .insert(name, Arc::new(synthetic_typed_program(row)));
                 }
+            }
+            // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
+            //
+            // Combine compile runs as a single pass in `bind_combine`.
+            // Every mature engine does merged-schema build, predicate
+            // typecheck, body typecheck, and output-row publication as
+            // a single bottom-up traversal. Splitting them into three
+            // side-table handoffs is the pattern Spark SPIP-49834 is
+            // actively migrating away from.
+            PipelineNode::Combine { header, config } => {
+                bind_combine(
+                    &name,
+                    header,
+                    config,
+                    span,
+                    diags,
+                    artifacts,
+                    schema_by_name,
+                );
             }
             PipelineNode::Composition {
                 r#use,
@@ -754,7 +426,7 @@ fn bind_schema_inner(
 ///
 /// This is the `PipelineNode::Composition` arm of `bind_schema_inner`.
 /// It recursively binds the body as a sub-problem within a nested scope
-/// per LD-16c-21 (preserve-and-recurse, not flatten-and-splice).
+/// (preserve-and-recurse, not flatten-and-splice).
 #[allow(clippy::too_many_arguments)]
 fn bind_composition(
     node_name: &str,
@@ -830,7 +502,7 @@ fn bind_composition(
         has_errors = true;
     }
 
-    // 5. Validate resources (stub for 16c.2).
+    // 5. Validate resources (stub pending full Resource enum).
     if !validate_resources(call_resources, signature, node_name, span, diags) {
         has_errors = true;
     }
@@ -854,7 +526,7 @@ fn bind_composition(
         call_inputs,
         signature,
         parent_schema_by_name,
-        &mut artifacts.bound_schemas,
+        &mut artifacts.next_tail_var,
         node_name,
         span,
         diags,
@@ -942,42 +614,295 @@ fn bind_composition(
         })
         .collect();
 
-    // 12. Persist body BoundSchemas from body_schema_by_name.
-    let mut body_bound_schemas = BoundSchemas::default();
-    for (node_name, row) in &body_schema_by_name {
-        body_bound_schemas.set_output(node_name.clone(), row.clone());
+    // 12. Persist body per-node rows.
+    let body_rows: HashMap<String, Row> = body_schema_by_name.clone();
+
+    // 13. Empty-body rejection (E111). A composition with zero body
+    // nodes has nothing to execute and would silently no-op at runtime,
+    // which is the strict rejection pattern enforced by
+    // StreamSets / Camel / Logstash. Reject at bind time so authors
+    // see the bug at compile rather than as missing output rows.
+    if body_file.nodes.is_empty() {
+        diags.push(Diagnostic::error(
+            "E111",
+            format!(
+                "composition node {node_name:?}: body file {} has zero nodes",
+                resolved_path.display()
+            ),
+            LabeledSpan::primary(span, String::new()),
+        ));
+        return;
     }
 
-    // 13. Lower body nodes to PlanNodes via the shared lowering function.
-    let body_plan_nodes: Vec<crate::plan::execution::PlanNode> = body_file
-        .nodes
-        .iter()
-        .filter_map(|spanned| {
-            let saphyr_line = spanned.referenced.line();
-            let body_span = if saphyr_line > 0 {
-                crate::span::Span::line_only(saphyr_line as u32)
-            } else {
-                crate::span::Span::SYNTHETIC
-            };
-            let n = &spanned.value;
-            let n_name = n.name().to_string();
-            crate::config::lower_node_to_plan_node(
-                n,
-                &n_name,
-                body_span,
-                artifacts,
-                crate::config::LowerScope::Body,
-                diags,
-            )
-        })
-        .collect();
+    // 14. Lower body nodes to PlanNodes via the shared lowering
+    // function and build a mini-DAG keyed by NodeIndex. The body
+    // executor walks this graph topologically using the same
+    // dispatcher entry as the top-level walker — edges come from
+    // each body node's declared `input:` field, mirroring the
+    // edge-wiring loop in top-level `PipelineConfig::compile()`.
+    use crate::plan::execution::{DependencyType, PlanEdge};
+    use petgraph::graph::DiGraph;
 
-    // 14. Build and insert BoundBody.
+    let mut body_graph: DiGraph<crate::plan::execution::PlanNode, PlanEdge> = DiGraph::new();
+    let mut body_name_to_idx: std::collections::HashMap<String, petgraph::graph::NodeIndex> =
+        std::collections::HashMap::new();
+
+    // 14a. Synthesize a `PlanNode::Source` per declared input port. The
+    // body's mini-DAG sees ports as first-class root nodes — body
+    // consumers reference them by name through the same edge-wiring
+    // pass that handles body-internal references, and the dispatcher
+    // walks them via the standard Source arm with pre-seeded records
+    // from the parent scope. Without these synthetics, multi-port
+    // consumers (notably combine, whose `input:` map keys ARE port
+    // names) would have no incoming edges in the body DAG and fail
+    // their predecessor-by-name lookup at dispatch time.
+    //
+    // The synthetic node's `output_schema` adopts the parent source's
+    // declared columns (the schema records actually carry at runtime),
+    // not the port's declared columns — port rows declare a subset
+    // and rely on Open-tail pass-through, but records flowing in
+    // already carry every parent column.
+    for (port_name, _port_row) in &input_port_rows {
+        let parent_node_name = match call_inputs.get(port_name) {
+            Some(n) => n.as_str(),
+            None => continue, // optional port not bound — skip
+        };
+        let parent_row = match parent_schema_by_name.get(parent_node_name) {
+            Some(r) => r,
+            None => continue, // upstream missing — already diagnosed
+        };
+        let port_schema =
+            schema_from_field_names(parent_row.field_names().map(|qf| qf.name.as_ref()));
+        let port_source = crate::plan::execution::PlanNode::Source {
+            name: port_name.clone(),
+            span,
+            resolved: None,
+            output_schema: port_schema,
+        };
+        let idx = body_graph.add_node(port_source);
+        body_name_to_idx.insert(port_name.clone(), idx);
+    }
+
+    for spanned in &body_file.nodes {
+        let saphyr_line = spanned.referenced.line();
+        let body_span = if saphyr_line > 0 {
+            crate::span::Span::line_only(saphyr_line as u32)
+        } else {
+            crate::span::Span::SYNTHETIC
+        };
+        let n = &spanned.value;
+        let n_name = n.name().to_string();
+        // Body nodes are lowered with a default `LoweringCtx` — they
+        // run inside the body executor's mini-DAG and don't need the
+        // top-level parallelism/index/aggregate enrichment. The
+        // top-level `compile_with_diagnostics` path supplies a
+        // populated ctx for runtime-executed top-level nodes.
+        let lower_ctx = crate::config::LoweringCtx::default();
+        if let Some(plan_node) = crate::config::lower_node_to_plan_node(
+            n, &n_name, body_span, artifacts, &lower_ctx, diags,
+        ) {
+            let idx = body_graph.add_node(plan_node);
+            body_name_to_idx.insert(n_name, idx);
+        }
+    }
+
+    // Wire edges by walking each body node's `input:` reference(s).
+    // `input_full_reference` strips ports lazily; the producer key is
+    // the bare node name (the part before `.`).
+    fn body_strip_port(r: &str) -> &str {
+        r.split('.').next().unwrap_or(r)
+    }
+    for spanned in &body_file.nodes {
+        let n = &spanned.value;
+        let consumer_name = n.name();
+        let Some(&consumer_idx) = body_name_to_idx.get(consumer_name) else {
+            continue;
+        };
+        let mut wire = |producer_full: &str, port: Option<String>| {
+            let producer_key = body_strip_port(producer_full);
+            // Body-internal references resolve through name_to_idx;
+            // references to a signature input port don't produce a
+            // graph edge — port seeding is handled at composition
+            // entry by the executor through the live edge graph.
+            if let Some(&producer_idx) = body_name_to_idx.get(producer_key) {
+                body_graph.add_edge(
+                    producer_idx,
+                    consumer_idx,
+                    PlanEdge {
+                        dependency_type: DependencyType::Data,
+                        port,
+                    },
+                );
+            }
+        };
+        match n {
+            // Sources are roots and Compositions inside the body are
+            // call-sites whose own input(s) come from upstream nodes
+            // in the body — wire those, the same way top-level
+            // compile() does.
+            PipelineNode::Source { .. } => {}
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. } => {
+                let r = match &header.input.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                };
+                wire(&r, None);
+            }
+            PipelineNode::Composition {
+                inputs: nested_inputs,
+                ..
+            } => {
+                // Composition's named-port `inputs:` map is the
+                // authoritative call-site binding. Each entry produces
+                // one port-tagged edge — the dispatcher walks
+                // incoming edges and reads the tag to harvest records
+                // per port. `header.input:` is YAML-shape obligation
+                // for the shared `NodeHeader` struct but is redundant
+                // for a Composition's wiring (every required port is
+                // already covered by `inputs:` per E104), so it does
+                // not produce its own edge.
+                for (port_name, upstream) in nested_inputs {
+                    wire(upstream, Some(port_name.clone()));
+                }
+            }
+            PipelineNode::Merge { header, .. } => {
+                for inp in &header.inputs {
+                    let r = match &inp.value {
+                        crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                        crate::config::node_header::NodeInput::Port { node, port } => {
+                            format!("{node}.{port}")
+                        }
+                    };
+                    wire(&r, None);
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for ni in header.input.values() {
+                    let r = match &ni.value {
+                        crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                        crate::config::node_header::NodeInput::Port { node, port } => {
+                            format!("{node}.{port}")
+                        }
+                    };
+                    wire(&r, None);
+                }
+            }
+        }
+    }
+
+    // Topo sort. Cycles inside a body are surfaced as bind-time
+    // errors with the composition node's call-site span — distinct
+    // from E108 (enclosing-scope reference) which fires earlier on
+    // body-internal CXL evaluation.
+    let body_topo = match petgraph::algo::toposort(&body_graph, None) {
+        Ok(order) => order,
+        Err(_) => {
+            diags.push(Diagnostic::error(
+                "E107",
+                format!("cycle detected inside composition body for node {node_name:?}"),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            return;
+        }
+    };
+
+    // Resolve each input port name to its synthetic-source NodeIndex.
+    // The synthetic port-source was added to `body_name_to_idx` in
+    // step 14a; the body executor seeds parent-scope records into
+    // that index's buffer at composition entry, and the dispatcher's
+    // standard Source arm reads them through. Each port owns its own
+    // NodeIndex — multi-port consumers (notably combine) read each
+    // port's records from a distinct buffer slot, with no collision.
+    let mut port_name_to_node_idx: std::collections::HashMap<String, petgraph::graph::NodeIndex> =
+        std::collections::HashMap::new();
+    for port_name in signature.inputs.keys() {
+        if let Some(&idx) = body_name_to_idx.get(port_name.as_str()) {
+            port_name_to_node_idx.insert(port_name.clone(), idx);
+        }
+    }
+
+    // `output_port_to_node_idx` resolves each declared output port
+    // alias to the body NodeIndex that produces it. Aliases of the
+    // form `node_name` or `node_name.channel` strip to the bare
+    // node name; the executor harvests records from this index at
+    // end of the body walk.
+    let mut output_port_to_node_idx: IndexMap<String, petgraph::graph::NodeIndex> = IndexMap::new();
+    for (port_name, alias) in &signature.outputs {
+        let internal_ref = &alias.internal_ref.value;
+        let bare = internal_ref.split('.').next().unwrap_or(internal_ref);
+        if let Some(&idx) = body_name_to_idx.get(bare) {
+            output_port_to_node_idx.insert(port_name.clone(), idx);
+        }
+    }
+
+    // Populate `node_input_refs` and `route_bodies` from the body
+    // file so the body executor can resolve `<route>.<branch>`
+    // references and compile per-route conditions without having to
+    // re-parse the .comp.yaml at runtime.
+    let mut node_input_refs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut route_bodies: HashMap<String, crate::config::pipeline_node::RouteBody> = HashMap::new();
+    for spanned in &body_file.nodes {
+        let n = &spanned.value;
+        let n_name = n.name().to_string();
+        let inputs: Vec<String> = match n {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Composition { header, .. }
+            | PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. } => {
+                vec![match &header.input.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                }]
+            }
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .map(|inp| match &inp.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .map(|ni| match &ni.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect(),
+        };
+        node_input_refs.insert(n_name.clone(), inputs);
+
+        if let PipelineNode::Route { config, .. } = n {
+            route_bodies.insert(n_name, config.clone());
+        }
+    }
+
+    // 15. Build and insert BoundBody.
     let bound_body = BoundBody {
         signature_path: resolved_path,
-        nodes: body_plan_nodes,
-        bound_schemas: body_bound_schemas,
+        graph: body_graph,
+        topo_order: body_topo,
+        name_to_idx: body_name_to_idx,
+        port_name_to_node_idx,
+        body_rows,
+        node_input_refs,
+        route_bodies,
         output_port_rows: output_port_rows.clone(),
+        output_port_to_node_idx,
         input_port_rows,
         nested_body_ids,
     };
@@ -986,7 +911,7 @@ fn bind_composition(
         .composition_body_assignments
         .insert(node_name.to_string(), body_id);
 
-    // 15. Write composition's output row to parent scope.
+    // 16. Write composition's output row to parent scope.
     // Use the first output port's row as the composition node's output.
     if let Some((_, row)) = output_port_rows.into_iter().next() {
         parent_schema_by_name.insert(node_name.to_string(), row);
@@ -1084,8 +1009,8 @@ fn validate_config(
     ok
 }
 
-/// Validate call-site `resources:` — stub for 16c.2. Real validation
-/// lands in 16c.3 when the Resource enum is fully defined.
+/// Validate call-site `resources:` — stub pending full Resource enum. Real validation
+/// lands when the Resource enum is fully defined.
 fn validate_resources(
     _call_site: &IndexMap<String, serde_json::Value>,
     _signature: &CompositionSignature,
@@ -1103,7 +1028,7 @@ fn validate_resources(
 /// - The signature's default if present.
 ///
 /// All values at this stage are tagged as [`LayerKind::CompositionDefault`]
-/// since channel-level resolution does not exist until 16c.4.
+/// since channel-level resolution is not yet wired.
 fn populate_config_provenance(
     call_site: &IndexMap<String, serde_json::Value>,
     signature: &CompositionSignature,
@@ -1150,7 +1075,7 @@ fn build_input_port_rows(
     call_inputs: &IndexMap<String, String>,
     signature: &CompositionSignature,
     parent_schemas: &HashMap<String, Row>,
-    bound_schemas: &mut BoundSchemas,
+    next_tail_var: &mut u32,
     node_name: &str,
     span: Span,
     diags: &mut Vec<Diagnostic>,
@@ -1192,24 +1117,25 @@ fn build_input_port_rows(
         // Validate declared minimum columns against upstream.
         let declared_columns = port_columns(port_decl);
         for (col_name, col_type) in &declared_columns {
-            match upstream_row.declared.get(col_name) {
-                None => {
-                    // Column might be available via pass-through (Open tail).
-                    if matches!(upstream_row.tail, RowTail::Closed) {
-                        diags.push(Diagnostic::error(
-                            "E102",
-                            format!(
-                                "composition node {node_name:?}: input port {port_name:?} \
-                                 requires column {col_name:?} but upstream {upstream_name:?} \
-                                 does not provide it"
-                            ),
-                            LabeledSpan::primary(span, String::new()),
-                        ));
-                        has_errors = true;
-                    }
+            let col_str = col_name.name.as_ref();
+            match upstream_row.lookup(col_str) {
+                cxl::typecheck::ColumnLookup::Unknown => {
+                    // Closed upstream, no match — required column missing.
+                    diags.push(Diagnostic::error(
+                        "E102",
+                        format!(
+                            "composition node {node_name:?}: input port {port_name:?} \
+                             requires column {col_str:?} but upstream {upstream_name:?} \
+                             does not provide it"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    has_errors = true;
+                }
+                cxl::typecheck::ColumnLookup::PassThrough(_) => {
                     // Open upstream: column may pass through — allow it.
                 }
-                Some(upstream_type) => {
+                cxl::typecheck::ColumnLookup::Declared(upstream_type) => {
                     // Type compatibility check: Any matches anything.
                     if *upstream_type != Type::Any
                         && *col_type != Type::Any
@@ -1219,7 +1145,7 @@ fn build_input_port_rows(
                             "E102",
                             format!(
                                 "composition node {node_name:?}: input port {port_name:?} \
-                                 declares column {col_name:?} as {col_type:?} but upstream \
+                                 declares column {col_str:?} as {col_type:?} but upstream \
                                  {upstream_name:?} provides {upstream_type:?}"
                             ),
                             LabeledSpan::primary(span, String::new()),
@@ -1227,30 +1153,60 @@ fn build_input_port_rows(
                         has_errors = true;
                     }
                 }
+                cxl::typecheck::ColumnLookup::Ambiguous(_) => {
+                    // Composition ports don't traffic in qualified fields —
+                    // an ambiguous match can only arise from a misconstructed
+                    // upstream row. Report as E102.
+                    diags.push(Diagnostic::error(
+                        "E102",
+                        format!(
+                            "composition node {node_name:?}: input port {port_name:?} \
+                             column {col_str:?} is ambiguous in upstream {upstream_name:?}"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    has_errors = true;
+                }
             }
         }
 
+        // Append the parent's engine-stamped tail columns ($ck.<field>
+        // shadow columns from `error_handling.correlation_key` widening)
+        // to the body's port declared set. The runtime port-synthetic
+        // Source built at body entry adopts every parent column, so the
+        // body sees these at runtime; declaring them here keeps the
+        // compile-time Row aligned with that runtime shape — without
+        // this step the open-tail mechanism would silently drop
+        // engine-stamped columns from the body's compile-time view and
+        // surface as a schema mismatch when records flow back to the
+        // parent (the composition's `output_schema` is derived from the
+        // body's terminal Row).
+        let mut declared_columns = declared_columns;
+        for (qf, ty) in upstream_row.fields() {
+            if qf.name.starts_with("$ck.") && !declared_columns.contains_key(qf) {
+                declared_columns.insert(qf.clone(), ty.clone());
+            }
+        }
         // Build Row::open(declared, fresh_tail) for the port.
-        let tail_var = bound_schemas.fresh_tail();
+        let tail_var = cxl::typecheck::row::TailVarId(*next_tail_var);
+        *next_tail_var += 1;
         let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
-        let row = Row {
-            declared: declared_columns,
-            declared_span: cxl_span,
-            tail: RowTail::Open(tail_var),
-        };
+        let row = Row::open(declared_columns, cxl_span, tail_var);
         rows.insert(port_name.clone(), row);
     }
 
     if has_errors { None } else { Some(rows) }
 }
 
-/// Extract declared columns from a `PortDecl` as an `IndexMap<String, Type>`.
-fn port_columns(decl: &PortDecl) -> IndexMap<String, Type> {
+/// Extract declared columns from a `PortDecl` as bare
+/// `IndexMap<QualifiedField, Type>`. Composition ports never carry
+/// qualifiers — qualification is a Combine-only concept.
+fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
     match &decl.schema {
         Some(schema) => schema
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.ty.clone()))
+            .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
             .collect(),
         None => IndexMap::new(),
     }
@@ -1333,17 +1289,20 @@ fn check_w101_shadows(
 ) {
     // Collect all columns declared in input ports (the minimum-required set).
     // Columns NOT in this set but flowing through via Open tail are pass-throughs.
+    // Composition ports are never qualified, so `.name.as_ref()` is the
+    // full identifier.
     let mut input_declared: HashSet<String> = HashSet::new();
     for row in input_port_rows.values() {
-        for col_name in row.declared.keys() {
-            input_declared.insert(col_name.clone());
+        for qf in row.field_names() {
+            input_declared.insert(qf.name.to_string());
         }
     }
 
     // For each output row, check if any body-added column has the same name
     // as a column that would pass through from the input tail.
     for (port_name, output_row) in output_port_rows {
-        for col_name in output_row.declared.keys() {
+        for col_qf in output_row.field_names() {
+            let col_name = col_qf.name.as_ref();
             // If this column is NOT in the input declared set but COULD
             // pass through via an Open tail, and the body also declares it,
             // that's a shadow. However, in practice the shadow case is:
@@ -1443,11 +1402,65 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 // ─── Upstream schema helpers ────────────────────────────────────────
 
-fn columns_from_decl(decl: &SchemaDecl) -> IndexMap<String, Type> {
-    decl.columns
+/// Build a runtime `Arc<Schema>` from an iterator of column names,
+/// stamping engine-stamp metadata on every column whose name begins
+/// with the `$ck.` prefix. The metadata's `snapshot_of` records the
+/// suffix (the user-declared source field). Mirrors the deduction in
+/// `lower_node_to_plan_node`'s `schema_from_bound` closure so a
+/// composition body's port-synthetic Source carries the same marker.
+pub(crate) fn schema_from_field_names<'a, I>(names: I) -> Arc<clinker_record::Schema>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    use clinker_record::{FieldMetadata, SchemaBuilder};
+    let mut builder = SchemaBuilder::new();
+    for name in names {
+        builder = match name.strip_prefix("$ck.") {
+            Some(field) => builder.with_field_meta(name, FieldMetadata::snapshot_of(field)),
+            None => builder.with_field(name),
+        };
+    }
+    builder.build()
+}
+
+/// Build the `Row.declared` map for a Source from its author-declared
+/// `schema:` block, optionally tail-appending one `$ck.<field>` shadow
+/// column per `correlation_key` field.
+///
+/// Each shadow column is typed identically to the user-declared field
+/// of the same name; if a listed correlation field is not declared on
+/// the source schema, that shadow column is skipped (E15X surfaces the
+/// missing-field case elsewhere — this function only widens the rows
+/// it can type unambiguously). Tail-append preserves user-declared
+/// positional indices, mirroring Spark `_metadata`.
+fn columns_from_decl(
+    decl: &SchemaDecl,
+    correlation_key: Option<&crate::config::CorrelationKey>,
+) -> IndexMap<QualifiedField, Type> {
+    let mut cols: IndexMap<QualifiedField, Type> = decl
+        .columns
         .iter()
-        .map(|c| (c.name.clone(), c.ty.clone()))
-        .collect()
+        .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
+        .collect();
+    if let Some(ck) = correlation_key {
+        for field in ck.fields() {
+            // Type the shadow column identically to the user-declared
+            // field. When the source schema does not declare `field`,
+            // skip — a missing correlation-key field is surfaced by
+            // the validation pass (config/mod.rs:1818-) and would only
+            // produce a phantom $ck. column with no source value.
+            if let Some(ty) = decl
+                .columns
+                .iter()
+                .find(|c| c.name.as_str() == field)
+                .map(|c| c.ty.clone())
+            {
+                let shadow_name = format!("$ck.{field}");
+                cols.insert(QualifiedField::bare(shadow_name), ty);
+            }
+        }
+    }
+    cols
 }
 
 fn upstream_schema<'a>(
@@ -1490,7 +1503,13 @@ fn typecheck_cxl(
             LabeledSpan::primary(span, String::new()),
         ));
     }
-    let field_refs: Vec<&str> = schema.declared.keys().map(|s| s.as_str()).collect();
+    // Collect unqualified field names for CXL resolve. In the non-combine
+    // case all fields are bare; in the combine case (C.1.1+) qualified
+    // fields collapse to their `.name` — the resolver only needs to know
+    // which identifiers are "field-like," and combine bodies address
+    // qualified fields via `Expr::QualifiedFieldRef` (handled in
+    // typecheck/pass.rs, not resolve).
+    let field_refs: Vec<&str> = schema.field_names().map(|qf| qf.name.as_ref()).collect();
     let resolved =
         cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
             .map_err(|diags| {
@@ -1530,46 +1549,1064 @@ fn typecheck_cxl(
     })
 }
 
+/// Propagate an upstream row through a Transform node: start with all
+/// upstream fields, then append (or overwrite) one entry per `emit`
+/// statement. Output field names come from the `emit name = expr` LHS
+/// and are always bare (`QualifiedField::bare`). Preserves the upstream
+/// tail (Closed / Open) so pass-through semantics propagate across
+/// Transform boundaries.
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
-    let mut out = upstream.declared.clone();
+    let mut out = upstream.declared_map().clone();
     for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
+        if let cxl::ast::Statement::Emit {
+            name,
+            expr,
+            is_meta,
+            ..
+        } = stmt
+        {
+            // Meta emits write to per-record metadata (`$meta.*`), not
+            // to the output row — skip them so the row/schema view
+            // downstream operators see only reflects user-visible data
+            // fields.
+            if *is_meta {
+                continue;
+            }
             let emit_type = typed
                 .types
                 .get(expr.node_id().0 as usize)
                 .and_then(|t| t.clone())
                 .unwrap_or(Type::Any);
-            out.insert(name.to_string(), emit_type);
+            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
     }
-    Row {
-        declared: out,
-        declared_span: upstream.declared_span,
-        tail: upstream.tail.clone(),
+    Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
+}
+
+/// Propagate an upstream row through an Aggregate node: start with the
+/// `group_by` fields (typed against upstream), then append one entry
+/// per `emit` statement. All output fields are bare.
+fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram) -> Row {
+    let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
+    for gb in group_by {
+        let t = match upstream.lookup(gb) {
+            cxl::typecheck::ColumnLookup::Declared(ty) => ty.clone(),
+            _ => Type::Any,
+        };
+        out.insert(QualifiedField::bare(gb.as_str()), t);
+    }
+    for stmt in &typed.program.statements {
+        if let cxl::ast::Statement::Emit {
+            name,
+            expr,
+            is_meta,
+            ..
+        } = stmt
+        {
+            if *is_meta {
+                continue;
+            }
+            let emit_type = typed
+                .types
+                .get(expr.node_id().0 as usize)
+                .and_then(|t| t.clone())
+                .unwrap_or(Type::Any);
+            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
+        }
+    }
+    Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
+}
+
+// ─── Combine arm (Phase Combine C.1.1 + C.1.2 + C.1.3) ──────────────
+
+/// Bind a `PipelineNode::Combine` node in one bottom-up traversal.
+///
+/// Architecture: a single pass does merged-schema construction (C.1.1),
+/// where-clause typecheck + predicate decomposition, body typecheck +
+/// output-row publication. Splitting these into three passes with
+/// intermediate side-table handoffs is the pattern Spark SPIP-49834 is
+/// actively migrating away from.
+///
+/// Per-input metadata is keyed by node-visible upstream NAME (not a
+/// graph-layer `NodeIndex`) because `bind_schema` runs before
+/// `ExecutionPlanDag` is built. See `CombineInput` rustdoc for the full
+/// rationale.
+///
+/// Diagnostics emitted:
+/// - E300 — fewer than 2 inputs
+/// - E301 — reserved-namespace or dotted qualifier
+/// - E303 — where-clause does not evaluate to Bool
+/// - E304 — where-clause references unknown or 3+ part qualified field
+/// - E305 — no cross-input equality/range extractable from predicate
+/// - E308 — cxl body references unknown or 3+ part qualified field
+/// - E309 — cxl body has no emit statements
+///
+/// E307 (undeclared upstream reference) is NOT emitted here — it fires
+/// from `ExecutionPlanDag::compile` during DAG wiring.
+#[allow(clippy::too_many_arguments)]
+fn bind_combine(
+    name: &str,
+    header: &CombineHeader,
+    config: &CombineBody,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+    artifacts: &mut CompileArtifacts,
+    schema_by_name: &mut HashMap<String, Row>,
+) {
+    // E300: combine requires at least 2 inputs.
+    if header.input.len() < 2 {
+        diags.push(combine_e300(name, header.input.len(), span));
+        return;
+    }
+
+    // Build merged row + collect per-input metadata. Any E301 violation
+    // short-circuits this combine's downstream processing — cascading
+    // E303/E304/E305/E308 errors from a partly-broken merged row are
+    // pure noise. Callers who want to see multiple E301 errors can fix
+    // them and re-run.
+    let mut merged_declared: IndexMap<QualifiedField, Type> = IndexMap::new();
+    let mut combine_inputs_entries: IndexMap<String, CombineInput> = IndexMap::new();
+    let mut e301_fired = false;
+
+    for (qualifier, node_input_spanned) in &header.input {
+        if qualifier.starts_with('$') {
+            diags.push(combine_e301_reserved(name, qualifier, span));
+            e301_fired = true;
+            continue;
+        }
+        if qualifier.contains('.') {
+            diags.push(combine_e301_dotted(name, qualifier, span));
+            e301_fired = true;
+            continue;
+        }
+        let upstream_target = input_target(&node_input_spanned.value);
+        // E307 (undeclared upstream) fires at DAG wiring time. In the
+        // standalone bind_schema path missing upstreams are silently
+        // skipped — DAG-level reporting owns that diagnostic.
+        let upstream_row = match schema_by_name.get(upstream_target) {
+            Some(r) => r,
+            None => continue,
+        };
+        for (field, ty) in upstream_row.fields() {
+            let qf = QualifiedField::qualified(qualifier.as_str(), field.name.clone());
+            // Collision is structurally impossible: outer qualifier
+            // uniqueness (IndexMap in CombineHeader.input) + inner field
+            // uniqueness (IndexMap per upstream Row) → combined
+            // `(qualifier, name)` key is always fresh. E302 was retired
+            // in the C.1.0 corrective (Decisions Log #15).
+            merged_declared.insert(qf, ty.clone());
+        }
+        combine_inputs_entries.insert(
+            qualifier.clone(),
+            CombineInput {
+                upstream_name: Arc::from(upstream_target),
+                row: upstream_row.clone(),
+                estimated_cardinality: None,
+            },
+        );
+    }
+
+    if e301_fired {
+        return;
+    }
+
+    // Select the driving (probe) input — explicit `drive:` hint, then
+    // cardinality, then first-in-IndexMap. E306 fires for an unknown
+    // hint; we still proceed with the rest of bind_combine so the user
+    // sees any other diagnostics in one pass, but `combine_driving`
+    // stays empty for this combine and the post-pass skips it.
+    if let Some(driver) = select_driving_input(
+        &combine_inputs_entries,
+        config.drive.as_deref(),
+        name,
+        span,
+        diags,
+    ) {
+        artifacts.combine_driving.insert(name.to_string(), driver);
+    }
+
+    artifacts
+        .combine_inputs
+        .insert(name.to_string(), combine_inputs_entries);
+    artifacts
+        .combine_strategy_hints
+        .insert(name.to_string(), config.strategy);
+
+    let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
+    let merged_row = Row::closed(merged_declared, cxl_span);
+
+    // ── Where-clause typecheck ─────────────────────────────────────
+    let typed_where =
+        match typecheck_combine_where(name, config.where_expr.as_ref(), &merged_row, span) {
+            Ok(t) => Arc::new(t),
+            Err(mut new_diags) => {
+                diags.append(&mut new_diags);
+                return;
+            }
+        };
+
+    // Post-walk for E304 (unknown / 3-part qualified refs in where).
+    let e304_before = diags.iter().filter(|d| d.code == "E304").count();
+    if let Some(Statement::Filter { predicate, .. }) = typed_where.program.statements.first() {
+        walk_for_unknown_refs(
+            predicate,
+            &merged_row,
+            name,
+            "E304",
+            "where-clause",
+            span,
+            diags,
+        );
+    }
+    let e304_fired = diags.iter().filter(|d| d.code == "E304").count() > e304_before;
+
+    // Decompose predicate → DecomposedPredicate. The shared typed_where
+    // Arc is threaded through so each EqualityConjunct captures the
+    // typed program needed by `cxl::eval::eval_expr` at runtime — no
+    // re-typecheck per side, since equality sub-`Expr`s preserve their
+    // NodeIds and the where-program's regex cache covers them.
+    let decomposed = match decompose_predicate(&typed_where, &merged_row, cxl_span) {
+        Ok(d) => d,
+        Err(type_diags) => {
+            for td in type_diags {
+                if !td.is_warning {
+                    diags.push(Diagnostic::error(
+                        "E200",
+                        format!("combine {name:?} residual predicate: {}", td.message),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                }
+            }
+            return;
+        }
+    };
+
+    // E305: no extractable cross-input comparisons. Fires independently
+    // of E304 — a combine with an unknown field AND no cross-input
+    // extraction gets both diagnostics, which is correct.
+    if decomposed.equalities.is_empty() && decomposed.ranges.is_empty() {
+        diags.push(combine_e305(name, span));
+    }
+
+    artifacts
+        .combine_predicates
+        .insert(name.to_string(), decomposed);
+
+    // If the where-clause was structurally broken (E304), short-circuit
+    // to avoid cascading body errors. The body may be fine, but without
+    // a sound predicate the output isn't trustworthy.
+    if e304_fired {
+        return;
+    }
+
+    // ── Collect-mode short-circuit (R1) ────────────────────────────
+    // Per Phase Combine R1, `match: collect` REJECTS any non-empty
+    // `cxl:` body at compile time (E311). The output row is auto-
+    // derived from `(driver fields ++ build_qualifier as Array)` so
+    // downstream nodes can bind against it without an emit. The
+    // executor synthesizes the output record at probe time; no body
+    // evaluator runs for Collect.
+    //
+    // Auto-derivation is only meaningful for N=2. The N-ary
+    // decomposition pass rewrites N>2 combines into a chain of binary
+    // steps before strategy selection, so a Collect-mode N>2 fixture
+    // would lose its single build_qualifier — skip the auto-derivation
+    // here and let downstream passes surface diagnostics on the
+    // decomposed chain.
+    if matches!(config.match_mode, MatchMode::Collect) {
+        if !config.cxl.source.trim().is_empty() {
+            diags.push(combine_e311_collect_with_body(name, span));
+            return;
+        }
+        let driving = match artifacts.combine_driving.get(name).cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let inputs = artifacts
+            .combine_inputs
+            .get(name)
+            .expect("combine_inputs populated above");
+        if inputs.len() != 2 {
+            return;
+        }
+        let driver_input = inputs
+            .get(&driving)
+            .expect("driving qualifier present in combine_inputs");
+        let build_qualifier = inputs
+            .keys()
+            .find(|k| k.as_str() != driving)
+            .expect("N=2 guarantees a non-driver qualifier");
+
+        // Pre-resolve qualified field references that appear in the
+        // where-clause — collect mode has no body, but the residual
+        // predicate (if any) still drives a `CombineResolver` at
+        // probe time.
+        let mut resolved_map: HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> =
+            HashMap::new();
+        for stmt in &typed_where.program.statements {
+            for sub in statement_exprs(stmt) {
+                walk_expr_for_qualified_refs(Some(sub), inputs, Some(&driving), &mut resolved_map);
+            }
+        }
+        artifacts
+            .combine_resolved_columns
+            .insert(name.to_string(), Arc::new(resolved_map));
+
+        let mut output_decl: IndexMap<QualifiedField, Type> = IndexMap::new();
+        for (qf, ty) in driver_input.row.fields() {
+            output_decl.insert(qf.clone(), ty.clone());
+        }
+        output_decl.insert(QualifiedField::bare(build_qualifier.as_str()), Type::Array);
+        let output_row = Row::closed(output_decl, cxl_span);
+        schema_by_name.insert(name.to_string(), output_row.clone());
+        artifacts.typed.insert(
+            name.to_string(),
+            Arc::new(synthetic_typed_program(output_row)),
+        );
+        return;
+    }
+
+    // ── Body typecheck ─────────────────────────────────────────────
+    let body_typed = match typecheck_cxl(
+        name,
+        &config.cxl.source,
+        &merged_row,
+        AggregateMode::Row,
+        span,
+    ) {
+        Ok(t) => t,
+        Err(d) => {
+            diags.push(d);
+            return;
+        }
+    };
+
+    // Post-walk for E308 (unknown / 3-part qualified refs in body).
+    for stmt in &body_typed.program.statements {
+        walk_statement_exprs(stmt, &merged_row, name, "E308", "cxl body", span, diags);
+    }
+
+    // E309: combine must produce at least one non-meta emit. Unlike
+    // Transform (which has pass-through semantics), combine's output
+    // row is defined entirely by its emits — zero emits means zero
+    // output fields.
+    let has_emit = body_typed
+        .program
+        .statements
+        .iter()
+        .any(|s| matches!(s, Statement::Emit { is_meta: false, .. }));
+    if !has_emit {
+        diags.push(combine_e309(name, span));
+    }
+
+    let driver_row = artifacts
+        .combine_driving
+        .get(name)
+        .and_then(|q| artifacts.combine_inputs.get(name).and_then(|m| m.get(q)))
+        .map(|input| input.row.clone());
+    let output_row = combine_output_row(&body_typed, driver_row.as_ref(), cxl_span);
+    schema_by_name.insert(name.to_string(), output_row.clone());
+    let mut body_typed = body_typed;
+    body_typed.output_row = output_row;
+
+    // Resolve every qualified field reference in the body AND in the
+    // where-clause into `(JoinSide, column-index)` against each input's
+    // declared schema. The executor's
+    // `CombineResolverMapping::from_pre_resolved` consumes this map so
+    // probe-time field resolution is a direct `Vec<Value>` index read
+    // rather than a name-keyed hash lookup. `combine_driving` is
+    // `None` only when driver selection failed upstream (E306); in
+    // that case every qualifier lands on `JoinSide::Build`, which is
+    // harmless because the post-pass skips stamping the combine's
+    // runtime fields and the executor never reaches it.
+    let driver_qualifier = artifacts.combine_driving.get(name).cloned();
+    let inputs_for_resolve = artifacts
+        .combine_inputs
+        .get(name)
+        .expect("combine_inputs populated above");
+    let mut resolved_map =
+        resolve_combine_body_columns(&body_typed, inputs_for_resolve, driver_qualifier.as_deref());
+    for stmt in &typed_where.program.statements {
+        for sub in statement_exprs(stmt) {
+            walk_expr_for_qualified_refs(
+                Some(sub),
+                inputs_for_resolve,
+                driver_qualifier.as_deref(),
+                &mut resolved_map,
+            );
+        }
+    }
+    artifacts
+        .combine_resolved_columns
+        .insert(name.to_string(), Arc::new(resolved_map));
+
+    artifacts
+        .typed
+        .insert(name.to_string(), Arc::new(body_typed));
+}
+
+/// Walk every `Expr::QualifiedFieldRef { parts: [qualifier, name] }` in
+/// `typed.program` and emit `(QualifiedField, (JoinSide, column-index))`
+/// entries resolved against the combine's per-input declared rows.
+///
+/// Qualifiers that match `driver_qualifier` land on `JoinSide::Probe`;
+/// all others land on `JoinSide::Build`. The column index is the
+/// qualified field's position within that input's declared row —
+/// exactly what the executor needs to pull the value out of the
+/// positional `Vec<Value>` without a name-keyed hash lookup.
+fn resolve_combine_body_columns(
+    typed: &TypedProgram,
+    inputs: &IndexMap<String, crate::plan::combine::CombineInput>,
+    driver_qualifier: Option<&str>,
+) -> HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)> {
+    use crate::executor::combine::JoinSide;
+
+    let mut out: HashMap<QualifiedField, (JoinSide, u32)> = HashMap::new();
+    for stmt in &typed.program.statements {
+        for sub in statement_exprs(stmt) {
+            walk_expr_for_qualified_refs(Some(sub), inputs, driver_qualifier, &mut out);
+        }
+    }
+    out
+}
+
+/// Every top-level `Expr` sub-tree owned by a CXL statement. The outer
+/// recursion in `walk_expr_for_qualified_refs` handles the descent;
+/// this just surfaces the roots so statements with multiple expression
+/// slots (trace guard + message) don't lose the guard.
+fn statement_exprs(stmt: &Statement) -> Vec<&Expr> {
+    match stmt {
+        Statement::Let { expr, .. } => vec![expr],
+        Statement::Emit { expr, .. } => vec![expr],
+        Statement::Filter { predicate, .. } => vec![predicate],
+        Statement::ExprStmt { expr, .. } => vec![expr],
+        Statement::Trace { guard, message, .. } => {
+            let mut v = vec![message];
+            if let Some(g) = guard.as_deref() {
+                v.push(g);
+            }
+            v
+        }
+        Statement::Distinct { .. } | Statement::UseStmt { .. } => Vec::new(),
     }
 }
 
-fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram) -> Row {
-    let mut out: IndexMap<String, Type> = IndexMap::new();
-    for gb in group_by {
-        let t = upstream.declared.get(gb).cloned().unwrap_or(Type::Any);
-        out.insert(gb.clone(), t);
+/// Recursive descent over `Expr` emitting `(QualifiedField,
+/// (JoinSide, idx))` entries for every 2-part qualified reference.
+///
+/// 3-part references (namespaces like `$pipeline.x.y`) are skipped —
+/// they're accepted by the typechecker only for system namespaces
+/// that the executor resolves elsewhere.
+fn walk_expr_for_qualified_refs(
+    expr: Option<&Expr>,
+    inputs: &IndexMap<String, crate::plan::combine::CombineInput>,
+    driver_qualifier: Option<&str>,
+    out: &mut HashMap<QualifiedField, (crate::executor::combine::JoinSide, u32)>,
+) {
+    use crate::executor::combine::JoinSide;
+
+    let Some(expr) = expr else {
+        return;
+    };
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } => {
+            if parts.len() == 2 {
+                let qualifier = parts[0].as_ref();
+                let field_name = parts[1].as_ref();
+                if let Some(input) = inputs.get(qualifier)
+                    && let Some(idx) = input
+                        .row
+                        .fields()
+                        .position(|(qf, _)| qf.name.as_ref() == field_name)
+                {
+                    let side = match driver_qualifier {
+                        Some(d) if d == qualifier => JoinSide::Probe,
+                        _ => JoinSide::Build,
+                    };
+                    let qf = QualifiedField::qualified(qualifier, Arc::from(field_name));
+                    out.insert(qf, (side, idx as u32));
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            walk_expr_for_qualified_refs(Some(lhs), inputs, driver_qualifier, out);
+            walk_expr_for_qualified_refs(Some(rhs), inputs, driver_qualifier, out);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_expr_for_qualified_refs(Some(operand), inputs, driver_qualifier, out);
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            walk_expr_for_qualified_refs(Some(receiver), inputs, driver_qualifier, out);
+            for a in args {
+                walk_expr_for_qualified_refs(Some(a), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_expr_for_qualified_refs(Some(condition), inputs, driver_qualifier, out);
+            walk_expr_for_qualified_refs(Some(then_branch), inputs, driver_qualifier, out);
+            if let Some(e) = else_branch.as_ref() {
+                walk_expr_for_qualified_refs(Some(e), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject.as_deref() {
+                walk_expr_for_qualified_refs(Some(s), inputs, driver_qualifier, out);
+            }
+            for arm in arms {
+                walk_expr_for_qualified_refs(Some(&arm.pattern), inputs, driver_qualifier, out);
+                walk_expr_for_qualified_refs(Some(&arm.body), inputs, driver_qualifier, out);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                walk_expr_for_qualified_refs(Some(a), inputs, driver_qualifier, out);
+            }
+        }
+        _ => {}
     }
+}
+
+/// Typecheck a combine's `where:` source against the merged row,
+/// returning a `TypedProgram` whose first statement is the Filter
+/// carrying the predicate `Expr`.
+///
+/// Wraps the source as `"filter {where_src}"` so the CXL parser
+/// produces a `Statement::Filter`. Routes diagnostics by category:
+/// - Parse / name-resolution failures → E200 (general compile error)
+/// - Typecheck "filter predicate must be type Bool" → E303
+/// - Other typecheck errors → E200
+fn typecheck_combine_where(
+    combine_name: &str,
+    where_src: &str,
+    merged_row: &Row,
+    span: Span,
+) -> Result<TypedProgram, Vec<Diagnostic>> {
+    let wrapped = format!("filter {where_src}");
+    let parse_result = cxl::parser::Parser::parse(&wrapped);
+    if !parse_result.errors.is_empty() {
+        let msg = parse_result
+            .errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(vec![Diagnostic::error(
+            "E200",
+            format!("combine {combine_name:?} where-clause parse error: {msg}"),
+            LabeledSpan::primary(span, String::new()),
+        )]);
+    }
+
+    let field_refs: Vec<&str> = merged_row
+        .field_names()
+        .map(|qf| qf.name.as_ref())
+        .collect();
+    let resolved =
+        match cxl::resolve::resolve_program(parse_result.ast, &field_refs, parse_result.node_count)
+        {
+            Ok(r) => r,
+            Err(rd) => {
+                let msg = rd
+                    .into_iter()
+                    .map(|d| d.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(vec![Diagnostic::error(
+                    "E200",
+                    format!("combine {combine_name:?} where-clause name resolution: {msg}"),
+                    LabeledSpan::primary(span, String::new()),
+                )]);
+            }
+        };
+
+    match cxl::typecheck::type_check(resolved, merged_row) {
+        Ok(typed) => Ok(typed),
+        Err(type_diags) => {
+            let mut out = Vec::new();
+            for td in type_diags.into_iter().filter(|d| !d.is_warning) {
+                // Typechecker's Filter-statement check emits a specific
+                // error message when the predicate's type is neither
+                // Bool nor Any — that is exactly E303 territory.
+                if td.message.starts_with("filter predicate must be type Bool") {
+                    out.push(
+                        Diagnostic::error(
+                            "E303",
+                            format!(
+                                "combine {combine_name:?} where-clause is not boolean: {}",
+                                td.message
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help(
+                            "the `where:` predicate must return Bool — use a comparison \
+                             (e.g. `a.id == b.id`)",
+                        ),
+                    );
+                } else {
+                    out.push(Diagnostic::error(
+                        "E200",
+                        format!(
+                            "combine {combine_name:?} where-clause type error: {}",
+                            td.message
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                }
+            }
+            Err(out)
+        }
+    }
+}
+
+/// Emit E304/E308 for `QualifiedFieldRef`s that don't match the merged
+/// row, or that have 3+ parts (unsupported in combine context).
+///
+/// Bare unqualified `FieldRef`s are handled by the typechecker itself
+/// (which emits a loud `Ambiguous` error for multi-match bare refs in
+/// a qualified merged row). This walker only visits the qualified-ref
+/// forms.
+#[allow(clippy::too_many_arguments)]
+fn walk_for_unknown_refs(
+    expr: &Expr,
+    merged_row: &Row,
+    combine_name: &str,
+    err_code: &str,
+    context: &str,
+    combine_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match expr {
+        Expr::QualifiedFieldRef { parts, .. } => {
+            if parts.len() > 2 {
+                let joined: Vec<&str> = parts.iter().map(|s| s.as_ref()).collect();
+                diags.push(
+                    Diagnostic::error(
+                        err_code.to_string(),
+                        format!(
+                            "combine {combine_name:?} {context} references {:?} ({} parts); \
+                             combine supports only 2-part qualified references \
+                             (`qualifier.field`)",
+                            joined.join("."),
+                            parts.len()
+                        ),
+                        LabeledSpan::primary(combine_span, String::new()),
+                    )
+                    .with_help(
+                        "drop the extra path segment, or move multi-record logic into a \
+                         Transform before the combine",
+                    ),
+                );
+            } else if parts.len() == 2
+                && matches!(
+                    merged_row.lookup_qualified(&parts[0], &parts[1]),
+                    ColumnLookup::Unknown
+                )
+            {
+                diags.push(
+                    Diagnostic::error(
+                        err_code.to_string(),
+                        format!(
+                            "combine {combine_name:?} {context} references unknown field \
+                             `{}.{}`",
+                            parts[0], parts[1]
+                        ),
+                        LabeledSpan::primary(combine_span, String::new()),
+                    )
+                    .with_help(
+                        "declare the field in the upstream source's `schema:` block, or \
+                         fix the qualifier name",
+                    ),
+                );
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_for_unknown_refs(
+                lhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                rhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Expr::Unary { operand, .. } => walk_for_unknown_refs(
+            operand,
+            merged_row,
+            combine_name,
+            err_code,
+            context,
+            combine_span,
+            diags,
+        ),
+        Expr::Coalesce { lhs, rhs, .. } => {
+            walk_for_unknown_refs(
+                lhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                rhs,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_for_unknown_refs(
+                condition,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            walk_for_unknown_refs(
+                then_branch,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            if let Some(eb) = else_branch {
+                walk_for_unknown_refs(
+                    eb,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject {
+                walk_for_unknown_refs(
+                    s,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+            for arm in arms {
+                walk_for_unknown_refs(
+                    &arm.pattern,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+                walk_for_unknown_refs(
+                    &arm.body,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            walk_for_unknown_refs(
+                receiver,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+            for a in args {
+                walk_for_unknown_refs(
+                    a,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                walk_for_unknown_refs(
+                    a,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+        }
+        Expr::FieldRef { .. }
+        | Expr::Literal { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::MetaAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
+    }
+}
+
+/// Walk every `Expr` inside a `Statement` and apply the unknown-ref
+/// check. Used for the body post-walk where statements may be Emit,
+/// Let, ExprStmt, Filter, or Trace.
+#[allow(clippy::too_many_arguments)]
+fn walk_statement_exprs(
+    stmt: &Statement,
+    merged_row: &Row,
+    combine_name: &str,
+    err_code: &str,
+    context: &str,
+    combine_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match stmt {
+        Statement::Emit { expr, .. }
+        | Statement::Let { expr, .. }
+        | Statement::ExprStmt { expr, .. } => {
+            walk_for_unknown_refs(
+                expr,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Statement::Filter { predicate, .. } => {
+            walk_for_unknown_refs(
+                predicate,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Statement::Trace { guard, message, .. } => {
+            if let Some(g) = guard {
+                walk_for_unknown_refs(
+                    g,
+                    merged_row,
+                    combine_name,
+                    err_code,
+                    context,
+                    combine_span,
+                    diags,
+                );
+            }
+            walk_for_unknown_refs(
+                message,
+                merged_row,
+                combine_name,
+                err_code,
+                context,
+                combine_span,
+                diags,
+            );
+        }
+        Statement::UseStmt { .. } | Statement::Distinct { .. } => {}
+    }
+}
+
+/// Build a combine's output row from its cxl body's emit statements.
+///
+/// Unlike `propagate_row` (Transform), combine's output is a FRESH
+/// closed row — no pass-through of the merged row's qualified fields.
+/// Emit LHS names are always unqualified (`QualifiedField::bare`).
+/// Meta emits (`emit $meta.x = ...`) don't contribute to the output
+/// row schema; they write to per-record metadata, not the record
+/// itself.
+fn combine_output_row(
+    typed: &TypedProgram,
+    driver_row: Option<&Row>,
+    span: cxl::lexer::Span,
+) -> Row {
+    let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for stmt in &typed.program.statements {
-        if let cxl::ast::Statement::Emit { name, expr, .. } = stmt {
+        if let Statement::Emit {
+            name,
+            expr,
+            is_meta,
+            ..
+        } = stmt
+        {
+            if *is_meta {
+                continue;
+            }
             let emit_type = typed
                 .types
                 .get(expr.node_id().0 as usize)
                 .and_then(|t| t.clone())
                 .unwrap_or(Type::Any);
-            out.insert(name.to_string(), emit_type);
+            out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
     }
-    Row {
-        declared: out,
-        declared_span: upstream.declared_span,
-        tail: upstream.tail.clone(),
+    // Auto-append the driver's engine-stamped tail (`$ck.<field>`
+    // shadow columns) so the combined record's schema carries the
+    // driver's frozen-identity snapshot through the join boundary.
+    // The runtime `widen_record_to_schema` picks up the values from
+    // the driver record by name; without these slots the combined
+    // record would silently drop the snapshot and lose its
+    // correlation-group identity. Mirrors how the dispatch arm
+    // forwards `iter_meta()` from the driver, but for schema columns.
+    if let Some(driver) = driver_row {
+        for (qf, ty) in driver.fields() {
+            if qf.name.starts_with("$ck.") {
+                let bare = QualifiedField::bare(qf.name.clone());
+                if !out.contains_key(&bare) {
+                    out.insert(bare, ty.clone());
+                }
+            }
+        }
     }
+    Row::closed(out, span)
+}
+
+// ─── Combine diagnostics (Phase Combine C.1.1 + C.1.2 + C.1.3) ──────
+
+/// E300 — combine requires at least 2 declared inputs.
+fn combine_e300(combine_name: &str, input_count: usize, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E300",
+        format!(
+            "combine {combine_name:?} declares {input_count} input(s); combine requires at least 2"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add one or more upstream inputs under `input:`, e.g.\n  input:\n    orders: orders_source\n    products: products_source",
+    )
+}
+
+/// E301 — combine input qualifier starts with `$`, colliding with CXL
+/// system namespaces (`$pipeline`, `$window`, `$meta`).
+fn combine_e301_reserved(combine_name: &str, qualifier: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E301",
+        format!(
+            "combine {combine_name:?} input qualifier {qualifier:?} starts with `$`, which is \
+             reserved for CXL system namespaces (`$pipeline`, `$window`, `$meta`)"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help("rename the qualifier to a plain identifier (e.g. `orders`, `products`)")
+}
+
+/// E301 — combine input qualifier contains `.`, which would alias a
+/// genuine 3-part CXL reference (RESOLUTION EC-4).
+fn combine_e301_dotted(combine_name: &str, qualifier: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E301",
+        format!(
+            "combine {combine_name:?} input qualifier {qualifier:?} contains `.`; dotted \
+             qualifiers would be indistinguishable from 3-part field references in the \
+             `where:` and `cxl:` bodies"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help("rename the qualifier to avoid the `.` character")
+}
+
+/// E305 — combine where-clause has no cross-input comparisons. This
+/// fires for same-input-only predicates (`a.x == a.y`), OR-only
+/// predicates (which are always residual), literal-only predicates
+/// (`true` — V-7-1), and mixed-qualifier predicates where no conjunct
+/// is cleanly cross-input.
+fn combine_e305(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E305",
+        format!(
+            "combine {combine_name:?} where-clause has no cross-input comparisons; combine \
+             requires at least one equality or range between two different inputs"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add a cross-input comparison (e.g. `a.id == b.id`); cross joins are not supported \
+         — if all records should combine, use an explicit Merge node",
+    )
+}
+
+/// E311 — `match: collect` rejects any non-empty `cxl:` body. The
+/// Collect output row is auto-derived as `{ driver fields,
+/// <build_qualifier>: Array }`; downstream Transform composes any
+/// projection once CXL grows array primitives. Per Phase Combine R1.
+fn combine_e311_collect_with_body(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E311",
+        format!(
+            "combine {combine_name:?} has `match: collect` AND a non-empty `cxl:` body; \
+             collect mode auto-derives the output row as \
+             `{{ driver fields, <build_qualifier>: Array }}` and runs no body"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "remove the `cxl:` body, or change `match:` to `first` / `all` to evaluate per-match \
+         emit statements",
+    )
+}
+
+/// E309 — combine cxl body has no non-meta emit statements. Unlike
+/// Transform (which has pass-through semantics on an Open row), combine
+/// always produces a fresh closed row defined entirely by its emits.
+fn combine_e309(combine_name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E309",
+        format!(
+            "combine {combine_name:?} cxl body has no emit statements; combine requires at \
+             least one emit to produce an output row"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "add `emit field_name = expr;` statements — combine has no pass-through semantics, \
+         so every output field must be emitted explicitly",
+    )
 }
 
 /// E201 diagnostic for a Source with no `schema:` field.

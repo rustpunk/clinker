@@ -1,0 +1,65 @@
+# 4-input combine, transitive shared equi key. Decomposes into a
+# left-deep chain of three binary combines: a ⨝ b, then ⨝ c, then ⨝ d.
+pipeline:
+  name: four_input_equi
+nodes:
+  - type: source
+    name: a_src
+    config:
+      name: a_src
+      type: csv
+      path: tests/fixtures/combine/data/four_input_a.csv
+      schema:
+        - { name: id, type: string }
+        - { name: a_val, type: string }
+  - type: source
+    name: b_src
+    config:
+      name: b_src
+      type: csv
+      path: tests/fixtures/combine/data/four_input_b.csv
+      schema:
+        - { name: id, type: string }
+        - { name: b_val, type: string }
+  - type: source
+    name: c_src
+    config:
+      name: c_src
+      type: csv
+      path: tests/fixtures/combine/data/four_input_c.csv
+      schema:
+        - { name: id, type: string }
+        - { name: c_val, type: string }
+  - type: source
+    name: d_src
+    config:
+      name: d_src
+      type: csv
+      path: tests/fixtures/combine/data/four_input_d.csv
+      schema:
+        - { name: id, type: string }
+        - { name: d_val, type: string }
+  - type: combine
+    name: joined4
+    input:
+      a: a_src
+      b: b_src
+      c: c_src
+      d: d_src
+    config:
+      where: "a.id == b.id and b.id == c.id and c.id == d.id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = a.id
+        emit a_val = a.a_val
+        emit b_val = b.b_val
+        emit c_val = c.c_val
+        emit d_val = d.d_val
+  - type: output
+    name: joined4_out
+    input: joined4
+    config:
+      name: joined4_out
+      type: csv
+      path: four_input_equi_out.csv

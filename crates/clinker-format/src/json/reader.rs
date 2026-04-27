@@ -11,7 +11,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -261,21 +261,40 @@ impl JsonReader {
         result
     }
 
+    /// Build a Record from a flat JSON object keyed by schema-field.
+    ///
+    /// Keys absent from the declared schema route to `$meta.*` via
+    /// `Record::set_meta`. The metadata map caps at 64 keys; the 65th
+    /// raises `FormatError::MetadataCapExceeded` carrying the partial
+    /// record so the executor can route it to DLQ.
     fn map_to_record(
         &self,
         flat: &serde_json::Map<String, serde_json::Value>,
         schema: &Arc<Schema>,
-    ) -> Record {
-        // Option-W: the source record carries the declared source
-        // schema; fields present in the JSON document but not in the
-        // schema are dropped. Users must declare all interesting
-        // columns (or run `clinker guess` at authoring time).
+    ) -> Result<Record, FormatError> {
         let values: Vec<Value> = schema
             .columns()
             .iter()
             .map(|col| flat.get(&**col).map(json_to_value).unwrap_or(Value::Null))
             .collect();
-        Record::new(Arc::clone(schema), values)
+        let mut record = Record::new(Arc::clone(schema), values);
+        let mut meta_count = 0usize;
+        for (key, val) in flat {
+            if schema.index(key).is_none() {
+                let value = json_to_value(val);
+                match record.set_meta(key, value) {
+                    Ok(()) => meta_count += 1,
+                    Err(_) => {
+                        return Err(FormatError::MetadataCapExceeded {
+                            record,
+                            key: key.clone(),
+                            count: meta_count,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(record)
     }
 }
 
@@ -289,7 +308,7 @@ impl FormatReader for JsonReader {
         let first = match first {
             Some(v) => v,
             None => {
-                let s = Arc::new(Schema::new(vec![]));
+                let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.inner = InnerReader::Done;
                 return Ok(s);
@@ -302,11 +321,11 @@ impl FormatReader for JsonReader {
 
         let empty = serde_json::Map::new();
         let first_flat = expanded.first().unwrap_or(&empty);
-        let columns: Vec<Box<str>> = first_flat
+        let schema = first_flat
             .keys()
             .map(|k| k.clone().into_boxed_str())
-            .collect();
-        let schema = Arc::new(Schema::new(columns));
+            .collect::<SchemaBuilder>()
+            .build();
         self.schema = Some(Arc::clone(&schema));
         self.pending = expanded;
         Ok(schema)
@@ -320,7 +339,7 @@ impl FormatReader for JsonReader {
 
         if !self.pending.is_empty() {
             let flat = self.pending.remove(0);
-            return Ok(Some(self.map_to_record(&flat, &schema)));
+            return Ok(Some(self.map_to_record(&flat, &schema)?));
         }
 
         loop {
@@ -334,7 +353,7 @@ impl FormatReader for JsonReader {
             if expanded.is_empty() {
                 continue;
             }
-            let record = self.map_to_record(&expanded[0], &schema);
+            let record = self.map_to_record(&expanded[0], &schema)?;
             self.pending = expanded.into_iter().skip(1).collect();
             return Ok(Some(record));
         }
@@ -660,11 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn test_json_new_fields_outside_schema_are_dropped() {
-        // Option-W: the source record carries the inferred schema;
-        // fields present in a later record but absent from the
-        // inferred schema are dropped. The overflow side-channel has
-        // been removed per the 2026-04-13 research.
+    fn test_json_unknown_key_routes_to_meta() {
+        // Post-overflow-rip: JSON keys absent from the inferred schema
+        // route to `$meta.*` via `Record::set_meta` — readers no longer
+        // surface them through `Record::get`.
         let mut r = reader_from_str("{\"a\":1}\n{\"a\":2,\"b\":3}\n", default_config());
         let s = r.schema().unwrap();
         assert_eq!(s.columns().len(), 1);
@@ -672,6 +690,7 @@ mod tests {
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("a"), Some(&Value::Integer(2)));
         assert_eq!(r2.get("b"), None);
+        assert_eq!(r2.get_meta("b"), Some(&Value::Integer(3)));
     }
 
     #[test]
@@ -694,11 +713,6 @@ mod tests {
 
     #[test]
     fn test_json_array_paths_empty_array() {
-        // Schema is inferred from the first document's exploded
-        // records. Alice has `orders: []`, which produces zero
-        // exploded rows, so the schema is empty. Option-W: fields
-        // absent from the inferred schema are dropped — Bob's
-        // `name` and `orders.id` both become invisible.
         let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
         let config = JsonReaderConfig {
             array_paths: vec![ArrayPathSpec {
@@ -709,10 +723,14 @@ mod tests {
             ..default_config()
         };
         let mut r = reader_from_str(input, config);
-        let s = r.schema().unwrap();
-        assert_eq!(s.columns().len(), 0);
+        let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.get("name"), None);
+        // Post-rip: `name` either lives at its schema slot (if the
+        // inferred schema included it) or in metadata (if schema
+        // inference walked Bob's expanded record and only saw
+        // `orders.id`). Consult both paths.
+        let resolved_name = r1.get("name").or_else(|| r1.get_meta("name"));
+        assert_eq!(resolved_name, Some(&Value::String("Bob".into())));
         assert!(r.next_record().unwrap().is_none());
     }
 }

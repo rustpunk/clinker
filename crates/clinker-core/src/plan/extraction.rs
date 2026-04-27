@@ -1,4 +1,4 @@
-//! Extract-as-composition boundary analysis and YAML serialization (Phase 16c.6).
+//! Extract-as-composition boundary analysis and YAML serialization.
 //!
 //! Provides [`analyze_extraction_boundary`] to identify crossing edges when
 //! extracting a subgraph into a composition, and [`write_extracted_composition`]
@@ -195,7 +195,7 @@ pub fn analyze_extraction_boundary(
 }
 
 // =========================================================================
-// Composition writer (Task 16c.6.3)
+// Composition writer
 // =========================================================================
 
 /// Error from writing an extracted composition.
@@ -414,6 +414,7 @@ mod tests {
             name: name.to_owned(),
             span: Span::SYNTHETIC,
             resolved: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
         }
     }
 
@@ -429,6 +430,7 @@ mod tests {
             partition_lookup: None,
             write_set: BTreeSet::new(),
             has_distinct: false,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
         }
     }
 
@@ -453,6 +455,7 @@ mod tests {
     fn data_edge() -> PlanEdge {
         PlanEdge {
             dependency_type: DependencyType::Data,
+            port: None,
         }
     }
 
@@ -473,9 +476,7 @@ mod tests {
                 per_transform: vec![],
                 worker_threads: 1,
             },
-            correlation_sort_note: None,
             node_properties: Default::default(),
-            output_layouts: Default::default(),
         }
     }
 
@@ -608,7 +609,7 @@ mod tests {
         assert!(errors[0].message.contains("nonexistent"));
     }
 
-    // ---- Writer tests (Task 16c.6.3) ----
+    // ---- Writer tests ----
 
     /// Helper: build a PipelineConfig from a YAML fixture path.
     fn load_fixture_config(fixture_name: &str) -> PipelineConfig {

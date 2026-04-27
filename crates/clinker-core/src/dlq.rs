@@ -19,16 +19,23 @@ pub enum DlqErrorCategory {
     ValidationFailure,
     /// Aggregate finalize-time failure (e.g. SumOverflow during finalize()).
     /// Distinct from `AggregateTypeError`, which fires during the per-record
-    /// add path. Routed by the Phase 16 executor dispatch arm (Task 16.3.13).
+    /// add path. Routed by the executor's aggregation dispatch arm.
     AggregateFinalize,
-    /// Collateral demotion: this record passed its own evaluation but
-    /// belongs to a `correlation_key` group where another record failed.
-    /// Always emitted with `trigger: false`. See
-    /// `error_handling.correlation_key` in config docs.
+    /// Reader captured >64 off-schema keys on a single record. Surfaced
+    /// by the Source task when a `FormatError::MetadataCapExceeded`
+    /// bubbles up from an XML/JSON reader; the partial record (first
+    /// 64 unknown keys in `$meta.*`) is quarantined and the pipeline
+    /// continues reading subsequent records.
+    MetadataCapExceeded,
+    /// Collateral entry emitted for non-failing records in a correlation
+    /// group whose group was DLQ'd because some other record failed. The
+    /// sibling root-cause entry carries `trigger: true` and the original
+    /// failure category; collaterals carry `trigger: false` and this
+    /// category. Emitted only by the `CorrelationCommit` arm.
     Correlated,
-    /// A correlation-key group exceeded `max_group_buffer`. One summary
-    /// entry with `trigger: true` per overflowing group; peer records in
-    /// the group land as collateral.
+    /// A correlation-key group exceeded `error_handling.max_group_buffer`.
+    /// One entry per group with `trigger: true` plus collaterals for the
+    /// other buffered records of the same group.
     GroupSizeExceeded,
 }
 
@@ -42,13 +49,14 @@ impl DlqErrorCategory {
             Self::AggregateTypeError => "aggregate_type_error",
             Self::ValidationFailure => "validation_failure",
             Self::AggregateFinalize => "aggregate_finalize",
+            Self::MetadataCapExceeded => "metadata_cap_exceeded",
             Self::Correlated => "correlated",
             Self::GroupSizeExceeded => "group_size_exceeded",
         }
     }
 }
 
-/// Stage label helper for aggregate-transform DLQ entries (Task 16.3.13).
+/// Stage label helper for aggregate-transform DLQ entries.
 pub fn stage_aggregate(transform: &str) -> String {
     format!("aggregate:{transform}")
 }

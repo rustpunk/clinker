@@ -11,6 +11,12 @@ use crate::traits::FormatWriter;
 pub struct CsvWriterConfig {
     pub delimiter: u8,
     pub include_header: bool,
+    /// Whether engine-stamped schema columns (today: `$ck.<field>`
+    /// correlation snapshots) are emitted into the CSV. Defaults to
+    /// `false` — engine-internal namespaces are stripped from the
+    /// default output unless the Output node opts in via
+    /// `include_correlation_keys: true`.
+    pub include_engine_stamped: bool,
 }
 
 impl Default for CsvWriterConfig {
@@ -18,6 +24,7 @@ impl Default for CsvWriterConfig {
         Self {
             delimiter: b',',
             include_header: true,
+            include_engine_stamped: false,
         }
     }
 }
@@ -66,20 +73,29 @@ impl<W: Write> CsvWriter<W> {
 
 impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // Write header on first record
+        // Header is built from the writer's pinned schema. Engine-stamped
+        // columns (today: `$ck.<field>`) are stripped unless the Output
+        // node opts in. Framing metadata stays in `$meta.*` and only
+        // surfaces via `iter_meta` when `include_metadata` is set on the
+        // Output node.
         if self.config.include_header && !self.header_written {
-            let header: Vec<&str> = self.schema.columns().iter().map(|c| c.as_ref()).collect();
+            let header: Vec<&str> =
+                filtered_header_columns(&self.schema, self.config.include_engine_stamped);
             self.inner.write_record(&header)?;
             self.header_written = true;
         }
 
-        // Schema fields in schema order (Option-W: no overflow side-channel).
-        let fields: Vec<String> = self
-            .schema
-            .columns()
-            .iter()
-            .map(|col| record.get(col).map(value_to_csv_cell).unwrap_or_default())
-            .collect();
+        let fields: Vec<String> = if self.config.include_engine_stamped {
+            record
+                .iter_all_fields()
+                .map(|(_, v)| value_to_csv_cell(v))
+                .collect()
+        } else {
+            record
+                .iter_user_fields()
+                .map(|(_, v)| value_to_csv_cell(v))
+                .collect()
+        };
 
         self.inner.write_record(&fields)?;
         Ok(())
@@ -91,7 +107,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     }
 }
 
-/// CSV writer wrapper that captures the header (schema + overflow fields)
+/// CSV writer wrapper that captures the header (schema columns only)
 /// from the first record into shared state for replay on split rotation.
 ///
 /// Only used by the CSV writer factory when splitting is enabled.
@@ -122,9 +138,24 @@ impl<W: Write> HeaderCapturingCsvWriter<W> {
 impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
         if !self.captured {
-            // Capture schema columns for split-rotation replay (Option-W:
-            // no overflow side-channel, so the schema is the full header).
-            let header: Vec<Box<str>> = self.schema.columns().to_vec();
+            // Capture header so split rotations replay the same column
+            // set; engine-stamped columns are filtered identically to
+            // the inner CSV writer.
+            let include = self.inner.config.include_engine_stamped;
+            let header: Vec<Box<str>> = self
+                .schema
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    include
+                        || self
+                            .schema
+                            .field_metadata(*i)
+                            .is_none_or(|m| !m.is_engine_stamped())
+                })
+                .map(|(_, name)| name.clone())
+                .collect();
             *self.shared_header.lock().unwrap() = Some(header);
             self.captured = true;
         }
@@ -134,6 +165,23 @@ impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
     fn flush(&mut self) -> Result<(), FormatError> {
         self.inner.flush()
     }
+}
+
+/// Build the CSV header name list from `schema`, optionally including
+/// engine-stamped columns.
+fn filtered_header_columns(schema: &Arc<Schema>, include_engine_stamped: bool) -> Vec<&str> {
+    schema
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            include_engine_stamped
+                || schema
+                    .field_metadata(*i)
+                    .is_none_or(|m| !m.is_engine_stamped())
+        })
+        .map(|(_, c)| c.as_ref())
+        .collect()
 }
 
 /// Serialize a Value to a CSV cell string.
@@ -252,6 +300,66 @@ mod tests {
         let output = write_to_string(&schema, CsvWriterConfig::default(), &records);
         // Null becomes empty string between delimiters
         assert_eq!(output, "a,b,c\nx,,z\n");
+    }
+
+    fn make_schema_with_engine_stamp(user_col: &str, stamp_col: &str) -> Arc<Schema> {
+        use clinker_record::FieldMetadata;
+        use clinker_record::SchemaBuilder;
+        SchemaBuilder::new()
+            .with_field(user_col)
+            .with_field_meta(stamp_col, FieldMetadata::snapshot_of(user_col))
+            .build()
+    }
+
+    #[test]
+    fn test_csv_writer_strips_engine_stamped_by_default() {
+        let schema = make_schema_with_engine_stamp("id", "$ck.id");
+        let record = make_record(&schema, vec![Value::Integer(7), Value::Integer(7)]);
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "id\n7\n");
+        assert!(!output.contains("$ck.id"));
+    }
+
+    #[test]
+    fn test_csv_writer_includes_engine_stamped_on_opt_in() {
+        let schema = make_schema_with_engine_stamp("id", "$ck.id");
+        let record = make_record(&schema, vec![Value::Integer(7), Value::Integer(7)]);
+        let config = CsvWriterConfig {
+            include_engine_stamped: true,
+            ..Default::default()
+        };
+        let output = write_to_string(&schema, config, &[record]);
+        assert_eq!(output, "id,$ck.id\n7,7\n");
+    }
+
+    #[test]
+    fn test_csv_writer_emits_schema_fields_only() {
+        // Writer contract after the overflow rip: metadata stays in
+        // `$meta.*` and is stripped from the default output.
+        let schema = make_schema(&["id"]);
+        let mut record = make_record(&schema, vec![Value::Integer(1)]);
+        record.set_meta("zulu", Value::String("z".into())).unwrap();
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "id\n1\n");
+    }
+
+    #[test]
+    fn test_csv_writer_widened_schema_emit_order() {
+        // Widened schema controls output order; the fixture now declares
+        // every emitted column up front, so record.set always lands at a
+        // known slot and iter_all_fields walks them in schema order.
+        let schema = make_schema(&["id", "zulu", "alpha", "mike"]);
+        let record = make_record(
+            &schema,
+            vec![
+                Value::Integer(1),
+                Value::String("z".into()),
+                Value::String("a".into()),
+                Value::String("m".into()),
+            ],
+        );
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "id,zulu,alpha,mike\n1,z,a,m\n");
     }
 
     #[test]

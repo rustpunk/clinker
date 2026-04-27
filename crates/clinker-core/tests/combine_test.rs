@@ -1,0 +1,4511 @@
+//! Integration tests for Phase Combine.
+//!
+//! - C.0.0 scaffolds (`test_combine_scaffold_compiles`,
+//!   `test_combine_fixtures_exist`) remain in place as smoke gates.
+//! - C.0.4 adds DAG-edge gate tests: verify that combine fixtures
+//!   compile through `ExecutionPlanDag::compile` with the correct number
+//!   of incoming edges and that the combine node appears after its
+//!   inputs in topological order.
+//! - C.2.0 adds end-to-end execution helpers (`run_combine_fixture`,
+//!   `assert_records_match`, `canonicalize_csv`) and captures lookup
+//!   regression snapshots as the C.2.3 migration baseline. The
+//!   lookup-baseline tests run lookup pipelines through today's runtime
+//!   and write `.snap` files to `tests/snapshots/` that PERSIST after
+//!   C.2.3 deletes the lookup infrastructure — migrated combine tests in
+//!   C.2.3.4 read these snapshots verbatim to assert output equivalence.
+
+#[cfg(test)]
+mod tests {
+    use clinker_bench_support::io::SharedBuffer;
+    use clinker_core::config::{CompileContext, PipelineConfig};
+    use clinker_core::error::{Diagnostic, PipelineError};
+    use clinker_core::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+    use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+
+    /// Verifies the test module compiles and is discovered by cargo test.
+    #[test]
+    fn test_combine_scaffold_compiles() {
+        // This test passing means the module is correctly wired and discovered
+        // by `cargo test --test combine_test`. An empty body is sufficient;
+        // the signal is "this test ran", not any runtime assertion.
+    }
+
+    /// Bench file layout gate. The Combine performance suite is split
+    /// across one shared file (`combine.rs` — equi 2-input regression
+    /// gate plus the predicate-decomposition placeholder) and three
+    /// strategy-dedicated files (`combine_iejoin.rs`,
+    /// `combine_nary_3input.rs`, `combine_grace_hash.rs`).
+    ///
+    /// Criterion benches are not discovered by `cargo test`, so this
+    /// is the only in-`cargo test` signal that every bench is wired
+    /// correctly. Compile-time verification is covered separately by
+    /// `cargo check --benches --workspace` in the pre-commit checklist.
+    #[test]
+    fn test_bench_combine_scaffold_compiles() {
+        let bench_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches");
+
+        // (file, required-function-substrings) — every entry is a
+        // separate Criterion harness with its own `criterion_main!`.
+        let files: &[(&str, &[&str])] = &[
+            (
+                "combine.rs",
+                &[
+                    "fn bench_combine_equi_2input",
+                    "fn bench_predicate_decomposition",
+                ],
+            ),
+            (
+                "combine_iejoin.rs",
+                &[
+                    "fn bench_combine_iejoin",
+                    "fn bench_combine_iejoin_nested_loop",
+                ],
+            ),
+            ("combine_nary_3input.rs", &["fn bench_combine_nary_3input"]),
+            ("combine_grace_hash.rs", &["fn bench_combine_grace_hash"]),
+        ];
+
+        for (filename, required_fns) in files {
+            let path = bench_dir.join(filename);
+            assert!(path.exists(), "missing bench file: {}", path.display());
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            assert!(!source.is_empty(), "empty bench file: {filename}");
+            for func in *required_fns {
+                assert!(
+                    source.contains(func),
+                    "benches/{filename} missing required fn: {func}"
+                );
+            }
+            assert!(
+                source.contains("criterion_group!"),
+                "benches/{filename} missing criterion_group! macro"
+            );
+            assert!(
+                source.contains("criterion_main!"),
+                "benches/{filename} missing criterion_main! macro"
+            );
+        }
+    }
+
+    /// Verifies all 10 fixture YAML files exist and are readable.
+    #[test]
+    fn test_combine_fixtures_exist() {
+        let fixture_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/combine");
+        let expected = [
+            "two_input_equi.yaml",
+            "two_input_range.yaml",
+            "two_input_mixed.yaml",
+            "three_input_shared_key.yaml",
+            "match_all.yaml",
+            "match_collect.yaml",
+            "on_miss_skip.yaml",
+            "on_miss_error.yaml",
+            "drive_hint.yaml",
+            "error_one_input.yaml",
+        ];
+        for name in expected {
+            let path = fixture_dir.join(name);
+            assert!(path.exists(), "missing fixture: {}", path.display());
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            assert!(!content.is_empty(), "empty fixture: {}", path.display());
+        }
+    }
+
+    // --- C.0.4 helpers ---------------------------------------------------
+
+    /// Load a combine fixture YAML from `tests/fixtures/combine/`.
+    fn load_fixture(name: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/combine")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    }
+
+    /// Parse YAML into a `PipelineConfig`.
+    fn parse_fixture(yaml: &str) -> PipelineConfig {
+        clinker_core::yaml::from_str::<PipelineConfig>(yaml)
+            .unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    // --- C.1.0 helpers ---------------------------------------------------
+
+    /// Compile a combine fixture through `bind_schema` and return the
+    /// resulting `CompileArtifacts` plus every diagnostic emitted. The
+    /// direct `bind_schema` path (rather than the full
+    /// `PipelineConfig::compile`) lets tests inspect `artifacts`
+    /// regardless of whether the fixture was expected to succeed or
+    /// fail — full compile short-circuits on the first error severity.
+    ///
+    /// Error fixtures (`error_*.yaml`) populate `diags` with the
+    /// expected E3xx codes; success fixtures leave `diags` empty (modulo
+    /// warnings).
+    ///
+    /// Fixture name is passed without the `.yaml` extension —
+    /// `compile_combine_fixture("two_input_equi")`.
+    #[allow(dead_code)] // Used by C.1.1+ tests; referenced here as a gate.
+    fn compile_combine_fixture(
+        name: &str,
+    ) -> (
+        clinker_core::plan::bind_schema::CompileArtifacts,
+        Vec<clinker_core::error::Diagnostic>,
+    ) {
+        let yaml = load_fixture(&format!("{name}.yaml"));
+        let config = parse_fixture(&yaml);
+        let ctx = clinker_core::config::CompileContext::default();
+        let symbol_table = indexmap::IndexMap::new();
+        let mut diags = Vec::new();
+        let artifacts = clinker_core::plan::bind_schema::bind_schema(
+            &config.nodes,
+            &mut diags,
+            &ctx,
+            &symbol_table,
+            std::path::Path::new(""),
+            config.error_handling.correlation_key.as_ref(),
+        );
+        (artifacts, diags)
+    }
+
+    /// Assert that the node's output row (as published on
+    /// `TypedProgram.output_row`) has exactly the expected bare field
+    /// names in declaration order. Defined alongside
+    /// `compile_combine_fixture` so the test surface is one-stop.
+    #[allow(dead_code)] // Pre-existing helper retained for combine gate tests.
+    fn assert_output_row(
+        artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
+        node_name: &str,
+        expected_fields: &[&str],
+    ) {
+        let row = artifacts
+            .typed
+            .get(node_name)
+            .map(|tp| &tp.output_row)
+            .unwrap_or_else(|| panic!("no bound output row for node {node_name:?}"));
+        let actual: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
+        let expected: Vec<String> = expected_fields.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            actual, expected,
+            "output row mismatch for {node_name:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    /// Assert the decomposed predicate recorded in
+    /// `CompileArtifacts.combine_predicates[node_name]` has the
+    /// expected `(equality, range, has_residual)` shape. Combine-side
+    /// table populated in C.1.2 — helper defined here for early
+    /// availability.
+    #[allow(dead_code)] // Exercised by C.1.2+ tests.
+    fn assert_predicate_decomposition(
+        artifacts: &clinker_core::plan::bind_schema::CompileArtifacts,
+        node_name: &str,
+        expected_equalities: usize,
+        expected_ranges: usize,
+        expected_has_residual: bool,
+    ) {
+        let pred = artifacts
+            .combine_predicates
+            .get(node_name)
+            .unwrap_or_else(|| panic!("no decomposed predicate for combine {node_name:?}"));
+        assert_eq!(
+            pred.equalities.len(),
+            expected_equalities,
+            "equalities count mismatch for {node_name:?}"
+        );
+        assert_eq!(
+            pred.ranges.len(),
+            expected_ranges,
+            "ranges count mismatch for {node_name:?}"
+        );
+        assert_eq!(
+            pred.residual.is_some(),
+            expected_has_residual,
+            "residual presence mismatch for {node_name:?}"
+        );
+    }
+
+    // --- C.1.0 gate test -------------------------------------------------
+
+    /// C.1.0 gate: `compile_combine_fixture` is invokable against a
+    /// real fixture and returns `(artifacts, diagnostics)`.
+    ///
+    /// Post-C.1.1 the Combine arm actively builds a merged `Row` out of
+    /// the upstream schemas; `two_input_equi` still produces zero
+    /// diagnostics because both qualifiers are plain identifiers and
+    /// both upstreams are declared sources.
+    #[test]
+    fn test_combine_schema_scaffold_compiles() {
+        let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.0 sanity sweep (not a gate): every front-loaded C.1
+    /// fixture parses through `PipelineConfig` YAML deserialization.
+    /// Catches shape/syntax errors in the new fixtures immediately so
+    /// C.1.1–C.1.4 tests don't fail for parse reasons masking real
+    /// bind_schema bugs.
+    #[test]
+    fn test_c1_fixtures_parse() {
+        let c1_fixtures = [
+            // C.1.1 error fixtures
+            "error_reserved_namespace.yaml",
+            "error_dotted_qualifier.yaml",
+            // C.1.2 fixtures (errors + decomposition cases)
+            "error_where_not_bool.yaml",
+            "error_unknown_field.yaml",
+            "error_no_cross_input.yaml",
+            "error_literal_true.yaml",
+            "error_or_predicate.yaml",
+            "error_3part_ref.yaml",
+            "expression_equi.yaml",
+            "mixed_qualifier_expr.yaml",
+            // C.1.3 fixtures
+            "error_body_unknown_field.yaml",
+            "error_no_emit.yaml",
+            "combine_then_transform.yaml",
+        ];
+        for name in c1_fixtures {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/combine")
+                .join(name);
+            assert!(path.exists(), "missing C.1 fixture: {}", path.display());
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            clinker_core::yaml::from_str::<PipelineConfig>(&yaml)
+                .unwrap_or_else(|e| panic!("fixture {name} failed to parse: {e}"));
+        }
+    }
+
+    // --- C.1.1 gate tests ------------------------------------------------
+    //
+    // The merged row built inside `bind_schema_inner` for a
+    // `PipelineNode::Combine` is a LOCAL INTERMEDIATE — it feeds the
+    // where-clause typecheck in C.1.2 and the body typecheck in C.1.3,
+    // but it is not published anywhere the test can inspect it. The
+    // observable contract at C.1.1 is therefore "diagnostics match the
+    // fixture's intent": clean fixtures produce no diagnostics; error
+    // fixtures produce exactly one of E300 / E301.
+
+    /// C.1.1 gate: a 2-input combine with plain qualifiers and declared
+    /// upstreams binds with zero diagnostics. Confirms the merged-row
+    /// construction path runs end-to-end for the canonical shape.
+    #[test]
+    fn test_combine_merged_row_two_inputs() {
+        let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly at C.1.1; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate: a 3-input combine binds cleanly — qualifier/field
+    /// pairs stay unique across all three upstream rows, and no E301
+    /// fires because each qualifier is a plain identifier.
+    ///
+    /// C.2.4.3 update: W306 is an expected planner warning for 3+
+    /// inputs without cardinality estimates (no `drive:` hint either),
+    /// emitted by `select_driving_input`. The C.1.1 invariant is that
+    /// no *errors* fire during merged-row construction — informational
+    /// warnings are out of scope for this gate.
+    #[test]
+    fn test_combine_merged_row_three_inputs() {
+        let (_artifacts, diags) = compile_combine_fixture("three_input_shared_key");
+        let errors: Vec<&str> = diags
+            .iter()
+            .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+            .map(|d| d.code.as_str())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "three_input_shared_key must bind without errors at C.1.1; got error codes: {errors:?}"
+        );
+    }
+
+    /// C.1.1 gate: fewer than 2 declared inputs → E300.
+    #[test]
+    fn test_combine_e300_one_input() {
+        let (_artifacts, diags) = compile_combine_fixture("error_one_input");
+        assert!(
+            diags.iter().any(|d| d.code == "E300"),
+            "error_one_input must produce E300; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate: a `$`-prefixed qualifier collides with CXL system
+    /// namespaces (`$pipeline`, `$window`, `$meta`) → E301.
+    #[test]
+    fn test_combine_e301_reserved_namespace() {
+        let (_artifacts, diags) = compile_combine_fixture("error_reserved_namespace");
+        assert!(
+            diags.iter().any(|d| d.code == "E301"),
+            "error_reserved_namespace must produce E301; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.1 gate (RESOLUTION EC-4): a qualifier containing `.` would
+    /// alias a genuine 3-part CXL reference → E301.
+    #[test]
+    fn test_combine_e301_dotted_qualifier() {
+        let (_artifacts, diags) = compile_combine_fixture("error_dotted_qualifier");
+        assert!(
+            diags.iter().any(|d| d.code == "E301"),
+            "error_dotted_qualifier must produce E301; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    // --- C.1.2 gate tests ------------------------------------------------
+    //
+    // The where-clause is parsed, typechecked against the merged row,
+    // and decomposed into cross-input equality + range conjuncts + a
+    // residual `TypedProgram`. Residual is re-typechecked (drill D8);
+    // the original where-clause `TypedProgram` is a local intermediate
+    // that does NOT survive past `bind_schema`.
+
+    /// C.1.2 gate: a valid cross-input where-clause typechecks, decomposes,
+    /// and populates `artifacts.combine_predicates`.
+    #[test]
+    fn test_combine_where_typecheck_bool() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = artifacts
+            .combine_predicates
+            .get("enriched")
+            .expect("combine_predicates['enriched'] must exist");
+        assert!(
+            !pred.equalities.is_empty(),
+            "two_input_equi must produce at least one equality conjunct"
+        );
+    }
+
+    /// C.1.2 gate: a where-clause whose predicate is a non-Bool type → E303.
+    #[test]
+    fn test_combine_e303_where_not_bool() {
+        let (_artifacts, diags) = compile_combine_fixture("error_where_not_bool");
+        assert!(
+            diags.iter().any(|d| d.code == "E303"),
+            "error_where_not_bool must produce E303; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate: a where-clause that references a non-existent qualified
+    /// field → E304.
+    #[test]
+    fn test_combine_e304_unknown_field() {
+        let (_artifacts, diags) = compile_combine_fixture("error_unknown_field");
+        assert!(
+            diags.iter().any(|d| d.code == "E304"),
+            "error_unknown_field must produce E304; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate: a where-clause with only same-input comparisons yields
+    /// no cross-input extractables → E305.
+    #[test]
+    fn test_combine_e305_no_cross_input() {
+        let (_artifacts, diags) = compile_combine_fixture("error_no_cross_input");
+        assert!(
+            diags.iter().any(|d| d.code == "E305"),
+            "error_no_cross_input must produce E305; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate (V-7-1): a literal-only predicate (`where: "true"`) has
+    /// zero cross-input comparisons → E305. Combine does not support
+    /// cross joins; users must add a real predicate or use a Merge node.
+    #[test]
+    fn test_combine_e305_literal_true() {
+        let (_artifacts, diags) = compile_combine_fixture("error_literal_true");
+        assert!(
+            diags.iter().any(|d| d.code == "E305"),
+            "error_literal_true must produce E305; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.2 gate: pure equi predicate `a.id == b.id` → 1 equality, 0 ranges,
+    /// no residual.
+    #[test]
+    fn test_combine_decompose_pure_equi() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(diags.is_empty(), "expected clean compile");
+        let pred = &artifacts.combine_predicates["enriched"];
+        assert_eq!(pred.equalities.len(), 1, "1 equality expected");
+        assert_eq!(pred.ranges.len(), 0, "0 ranges expected");
+        assert!(
+            pred.residual.is_none(),
+            "no residual expected for pure equi"
+        );
+    }
+
+    /// C.1.2 gate (RESOLUTION T-8): mixed predicate
+    /// `a.id == b.id and a.amt >= b.min and a.amt < b.max` →
+    /// 1 equality + 2 ranges. Strengthened asserts on `ranges[0]`
+    /// verify that `split_conjunction` preserves source order and
+    /// `classify_conjunct` maps `BinOp::Gte → RangeOp::Ge` correctly.
+    #[test]
+    fn test_combine_decompose_mixed() {
+        use clinker_core::plan::combine::RangeOp;
+
+        let (artifacts, diags) = compile_combine_fixture("two_input_mixed");
+        assert!(
+            diags.is_empty(),
+            "two_input_mixed must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = &artifacts.combine_predicates["qualified"];
+        assert_eq!(pred.equalities.len(), 1, "1 equality expected");
+        assert_eq!(pred.ranges.len(), 2, "2 ranges expected");
+        assert!(matches!(pred.ranges[0].op, RangeOp::Ge));
+        assert_eq!(pred.ranges[0].left_input.as_ref(), "orders");
+        assert_eq!(pred.ranges[0].right_input.as_ref(), "products");
+    }
+
+    /// C.2.4.2 gate (R1): `match: collect` with a non-empty `cxl:` body
+    /// is a structural error. `bind_combine` emits E311 and stops
+    /// processing the combine.
+    #[test]
+    fn test_combine_e311_collect_with_body() {
+        let (artifacts, diags) = compile_combine_fixture("error_collect_with_body");
+        assert!(
+            diags.iter().any(|d| d.code == "E311"),
+            "error_collect_with_body must emit E311; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        assert!(
+            artifacts.typed.get("bad_collect").is_none(),
+            "no output row published when E311 fires"
+        );
+    }
+
+    /// C.2.4.2 gate (R1): `match: collect` with an empty `cxl:` body
+    /// auto-derives the output row as `{ driver fields,
+    /// <build_qualifier>: Array }`. The build qualifier becomes one
+    /// new bare field carrying the gathered records.
+    /// r1.5 gate: the CXL typechecker's combine-body walk emits one
+    /// `(QualifiedField, (JoinSide, column-index))` entry per qualified
+    /// field reference. Driver-side qualifier lands on `JoinSide::Probe`;
+    /// build-side qualifier lands on `JoinSide::Build`; column index is
+    /// the field's position within its declared input row.
+    #[test]
+    fn test_typecheck_combine_resolves_qualified_field_refs_to_indices() {
+        use clinker_core::executor::combine::JoinSide;
+        use cxl::typecheck::QualifiedField;
+
+        let (artifacts, diags) = compile_combine_fixture("match_all");
+        assert!(
+            diags.is_empty(),
+            "match_all must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let resolved = artifacts
+            .combine_resolved_columns
+            .get("fanned")
+            .expect("bind_combine must publish a resolved_column_map");
+
+        // Per `match_all.yaml`, driver = orders (declared first).
+        // orders row: order_id@0, product_id@1, amount@2
+        // products row: product_id@0, name@1, category@2
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "orders",
+                std::sync::Arc::from("order_id")
+            )),
+            Some(&(JoinSide::Probe, 0))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "orders",
+                std::sync::Arc::from("product_id")
+            )),
+            Some(&(JoinSide::Probe, 1))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "orders",
+                std::sync::Arc::from("amount")
+            )),
+            Some(&(JoinSide::Probe, 2))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "products",
+                std::sync::Arc::from("product_id")
+            )),
+            Some(&(JoinSide::Build, 0))
+        );
+        assert_eq!(
+            resolved.get(&QualifiedField::qualified(
+                "products",
+                std::sync::Arc::from("name")
+            )),
+            Some(&(JoinSide::Build, 1))
+        );
+    }
+
+    #[test]
+    fn test_combine_collect_output_row_auto_derived() {
+        use cxl::typecheck::{QualifiedField, Type};
+
+        let (artifacts, diags) = compile_combine_fixture("match_collect");
+        assert!(
+            diags.is_empty(),
+            "match_collect must bind cleanly under R1; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let row = artifacts
+            .typed
+            .get("collected")
+            .map(|tp| &tp.output_row)
+            .expect("collected publishes a bound output row");
+
+        // Driver = orders (default first-in-IndexMap, no `drive:` hint).
+        // Driver fields: order_id, product_id, amount. Plus auto-added
+        // `products` field of Type::Array.
+        let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "order_id".to_string(),
+                "product_id".to_string(),
+                "amount".to_string(),
+                "products".to_string(),
+            ],
+            "auto-derived row = driver fields + (build_qualifier: Array)"
+        );
+        let array_type = row
+            .fields()
+            .find(|(qf, _)| qf == &&QualifiedField::bare("products"))
+            .map(|(_, t)| t.clone());
+        assert_eq!(array_type, Some(Type::Array));
+    }
+
+    /// C.2.4.3 gate: explicit `drive: products` hint on `drive_hint.yaml`
+    /// stamps `combine_driving["product_driven"] == "products"` in
+    /// `CompileArtifacts`. Verifies that `bind_combine` calls
+    /// `select_driving_input` and threads the explicit hint through.
+    #[test]
+    fn test_combine_driving_input_explicit_drive() {
+        let (artifacts, diags) = compile_combine_fixture("drive_hint");
+        assert!(
+            diags.is_empty(),
+            "drive_hint must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let driver = artifacts
+            .combine_driving
+            .get("product_driven")
+            .expect("combine_driving entry for product_driven");
+        assert_eq!(driver, "products", "explicit drive wins over default");
+    }
+
+    /// C.2.4.3 gate: `drive: ghost` references an input not declared on
+    /// the combine → bind_combine emits E306 and skips populating
+    /// `combine_driving` for that node.
+    #[test]
+    fn test_combine_e306_invalid_drive() {
+        let (artifacts, diags) = compile_combine_fixture("error_invalid_drive");
+        assert!(
+            diags.iter().any(|d| d.code == "E306"),
+            "error_invalid_drive must emit E306; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        assert!(
+            !artifacts.combine_driving.contains_key("bad_drive"),
+            "no combine_driving entry written when drive selection fails"
+        );
+    }
+
+    /// C.2.4.3 gate: with no explicit drive and no cardinality estimates,
+    /// `select_driving_input` falls back to declaration order. For
+    /// `two_input_equi.yaml` the input map declares `orders` first.
+    #[test]
+    fn test_combine_driving_input_default_first_in_indexmap() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let driver = artifacts
+            .combine_driving
+            .get("enriched")
+            .expect("combine_driving entry for enriched");
+        assert_eq!(driver, "orders", "first declared input drives by default");
+    }
+
+    /// C.2.4.1 gate: every `EqualityConjunct` produced by predicate
+    /// decomposition carries an `Arc<TypedProgram>` on each side. Both
+    /// sides share the where-clause TypedProgram (same `Arc`), so the
+    /// runtime `KeyExtractor` can call `cxl::eval::eval_expr` against
+    /// the shared regex cache without per-side re-typecheck.
+    #[test]
+    fn test_combine_equality_program_compiled() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = &artifacts.combine_predicates["enriched"];
+        assert!(!pred.equalities.is_empty(), "expected at least 1 equality");
+        for eq in &pred.equalities {
+            assert!(
+                std::sync::Arc::ptr_eq(&eq.left_program, &eq.right_program),
+                "left/right_program must share the same Arc<TypedProgram> (where-clause)"
+            );
+            assert!(
+                !eq.left_program.program.statements.is_empty(),
+                "left_program must contain the where-clause Filter statement"
+            );
+            assert!(
+                eq.left_program.node_count > 0,
+                "left_program node_count must cover the predicate AST"
+            );
+        }
+    }
+
+    /// C.1.2 gate: an OR expression at the top level is NEVER decomposed
+    /// (drill D7 — universal consensus across engines) → 0 eq/range,
+    /// residual holds the whole OR.
+    #[test]
+    fn test_combine_decompose_or_is_residual() {
+        let (artifacts, _diags) = compile_combine_fixture("error_or_predicate");
+        let pred = &artifacts.combine_predicates["combine_or"];
+        assert_eq!(pred.equalities.len(), 0);
+        assert_eq!(pred.ranges.len(), 0);
+        assert!(pred.residual.is_some(), "residual must hold the OR whole");
+    }
+
+    /// C.1.2 gate: expression-based equality `a.name.lower() ==
+    /// b.name.lower()` extracts as a single equality conjunct. Verifies
+    /// that `EqualityConjunct.{left,right}_expr` can hold arbitrary
+    /// expressions per drill D5.
+    #[test]
+    fn test_combine_decompose_expression_equality() {
+        let (artifacts, diags) = compile_combine_fixture("expression_equi");
+        assert!(
+            diags.is_empty(),
+            "expression_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        let pred = &artifacts.combine_predicates["expr_combine"];
+        assert_eq!(pred.equalities.len(), 1, "1 equality expected");
+        assert_eq!(pred.equalities[0].left_input.as_ref(), "orders");
+        assert_eq!(pred.equalities[0].right_input.as_ref(), "products");
+    }
+
+    /// C.1.2 gate: a conjunct with mixed-qualifier operands (one side
+    /// references both inputs) is residual, not a cross-input conjunct.
+    /// Matches DataFusion `find_valid_equijoin_key_pair` and Spark
+    /// `canEvaluate` semantics.
+    #[test]
+    fn test_combine_decompose_mixed_qualifier_residual() {
+        let (artifacts, _diags) = compile_combine_fixture("mixed_qualifier_expr");
+        let pred = &artifacts.combine_predicates["mixed_combine"];
+        assert_eq!(pred.equalities.len(), 0);
+        assert_eq!(pred.ranges.len(), 0);
+        assert!(pred.residual.is_some());
+    }
+
+    /// C.1.2 gate (RESOLUTION EC-6): a 3-part qualified ref (`a.b.c`) in
+    /// the where-clause is not supported and produces E304 with a clear
+    /// "only 2-part references are supported" message.
+    #[test]
+    fn test_combine_3part_ref_residual() {
+        let (_artifacts, diags) = compile_combine_fixture("error_3part_ref");
+        assert!(
+            diags.iter().any(|d| d.code == "E304"),
+            "error_3part_ref must produce E304; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    // --- C.1.3 gate tests ------------------------------------------------
+    //
+    // The cxl body is typechecked against the merged row. Output fields
+    // are the LHS names of non-meta `emit` statements, always bare
+    // (`QualifiedField::bare`). The output row lands on
+    // `TypedProgram.output_row` so downstream nodes see it via
+    // `CompiledPlan::typed_output_row`; the body TypedProgram lives in
+    // `artifacts.typed[name]`.
+
+    /// Emit statements publish an output row whose declared field
+    /// names (bare) are exactly the LHS emit names in source order.
+    /// Also asserts `artifacts.typed[name]` is populated with the
+    /// body TypedProgram.
+    #[test]
+    fn test_combine_output_row_from_emit() {
+        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        assert!(
+            diags.is_empty(),
+            "two_input_equi must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+        assert_output_row(
+            &artifacts,
+            "enriched",
+            &[
+                "order_id",
+                "product_id",
+                "product_name",
+                "category",
+                "amount",
+            ],
+        );
+        assert!(
+            artifacts.typed.contains_key("enriched"),
+            "artifacts.typed['enriched'] must be populated with body TypedProgram"
+        );
+    }
+
+    /// C.1.3 gate: a Transform after a combine resolves the combine's
+    /// emitted (bare) output fields. Proves downstream binding sees the
+    /// output row, not the internal merged qualified row.
+    #[test]
+    fn test_combine_downstream_sees_output() {
+        let (_artifacts, diags) = compile_combine_fixture("combine_then_transform");
+        assert!(
+            diags.is_empty(),
+            "combine_then_transform must bind cleanly; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.3 gate: cxl body referencing a nonexistent qualified field
+    /// → E308.
+    #[test]
+    fn test_combine_e308_unknown_merged_field() {
+        let (_artifacts, diags) = compile_combine_fixture("error_body_unknown_field");
+        assert!(
+            diags.iter().any(|d| d.code == "E308"),
+            "error_body_unknown_field must produce E308; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// C.1.3 gate: cxl body with zero emit statements → E309. Combine
+    /// has no pass-through semantics; every output field must be emitted.
+    #[test]
+    fn test_combine_e309_no_emit() {
+        let (_artifacts, diags) = compile_combine_fixture("error_no_emit");
+        assert!(
+            diags.iter().any(|d| d.code == "E309"),
+            "error_no_emit must produce E309; got codes: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// Compile a parsed `PipelineConfig` into an `ExecutionPlanDag` via the
+    /// canonical compile path. `bind_schema` typechecks every CXL-bearing
+    /// node against the author-declared source schemas; Combine nodes
+    /// lower to `PlanNode::Combine` in stage 5 via
+    /// `lower_node_to_plan_node`.
+    fn compile_plan(config: &PipelineConfig) -> ExecutionPlanDag {
+        // Combine fixtures declare output paths under /tmp/ (standard test
+        // scratch directory); opt in to absolute paths so E-SEC-001 does
+        // not reject them here. Production CLI sets this via
+        // `--allow-absolute-paths` / `CLINKER_ALLOW_ABSOLUTE_PATHS`.
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        config
+            .compile(&ctx)
+            .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
+            .dag()
+            .clone()
+    }
+
+    /// Find the `NodeIndex` of the combine node named `name` in the DAG.
+    /// Panics with a helpful message if no matching node is found.
+    fn find_combine_node(plan: &ExecutionPlanDag, name: &str) -> NodeIndex {
+        for idx in plan.graph.node_indices() {
+            if let PlanNode::Combine {
+                name: node_name, ..
+            } = &plan.graph[idx]
+                && node_name == name
+            {
+                return idx;
+            }
+        }
+        let all: Vec<String> = plan
+            .graph
+            .node_weights()
+            .map(|n| format!("{}:{}", n.type_tag(), n.name()))
+            .collect();
+        panic!(
+            "combine node {name:?} not in plan; nodes: [{}]",
+            all.join(", ")
+        );
+    }
+
+    // --- C.0.4 gate tests ------------------------------------------------
+
+    /// Gate test: a 2-input combine has exactly 2 incoming `Data` edges
+    /// in the compiled DAG. Uses the `two_input_equi.yaml` fixture whose
+    /// combine node named `enriched` pulls from sources `orders` and
+    /// `products`.
+    #[test]
+    fn test_combine_dag_edges_two_input() {
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+
+        let combine_idx = find_combine_node(&plan, "enriched");
+        let incoming = plan
+            .graph
+            .edges_directed(combine_idx, Direction::Incoming)
+            .count();
+        assert_eq!(
+            incoming, 2,
+            "two_input_equi: combine 'enriched' should have 2 incoming edges, got {incoming}"
+        );
+    }
+
+    /// The N-ary decomposition pass rewrites a 3-input combine into a
+    /// chain of 2 binary combines. Compile must succeed (no error
+    /// diagnostics), no `PlanNode::Combine` may carry the original
+    /// author-visible name, and the chain must contain exactly two
+    /// nodes whose `decomposed_from` points at the original.
+    #[test]
+    fn test_combine_three_input_decomposes_to_binary_chain() {
+        let yaml = load_fixture("three_input_shared_key.yaml");
+        let config = parse_fixture(&yaml);
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        let (plan, diags) = config
+            .compile_with_diagnostics(&ctx)
+            .unwrap_or_else(|e| panic!("3-input combine must compile after decomposition: {e:?}"));
+
+        let errors: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| matches!(d.severity, clinker_core::error::Severity::Error))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "compile must produce no error diagnostics; got: {errors:?}"
+        );
+
+        let combines: Vec<&PlanNode> = plan
+            .dag()
+            .graph
+            .node_weights()
+            .filter(|n| matches!(n, PlanNode::Combine { .. }))
+            .collect();
+        assert_eq!(
+            combines.len(),
+            2,
+            "expected 2 binary combines after 3-input decomposition; got {}",
+            combines.len()
+        );
+        for n in &combines {
+            if let PlanNode::Combine {
+                name,
+                decomposed_from,
+                ..
+            } = n
+            {
+                assert_eq!(
+                    decomposed_from.as_deref(),
+                    Some("fully_enriched"),
+                    "synthetic step {name:?} must record its origin combine"
+                );
+                assert!(
+                    name != "fully_enriched",
+                    "original combine name must be gone after decomposition"
+                );
+            }
+        }
+    }
+
+    /// End-to-end execution of the 3-input shared-key combine fixture.
+    /// orders ⨝ products on product_id, then chain-intermediate ⨝
+    /// categories on category_id. Every driver row matches exactly one
+    /// product and one category by construction; the chain-intermediate
+    /// schema's encoded columns are the load-bearing invariant — step 1
+    /// reads `b.category_id` from the `__products__category_id` slot of
+    /// the encoded driver record.
+    #[test]
+    fn test_nary_three_input_exec_correct() {
+        let yaml = load_fixture("three_input_shared_key.yaml");
+        let orders_csv =
+            "order_id,product_id,amount\nord-1,p-1,100\nord-2,p-2,200\nord-3,p-3,300\n";
+        let products_csv = "product_id,name,category_id\n\
+            p-1,Apple,c-fruit\n\
+            p-2,Bread,c-grain\n\
+            p-3,Carrot,c-veg\n";
+        let categories_csv = "category_id,category_name\n\
+            c-fruit,Fruit\n\
+            c-grain,Grain\n\
+            c-veg,Vegetable\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("orders", orders_csv),
+                ("products", products_csv),
+                ("categories", categories_csv),
+            ],
+            Some("orders"),
+        )
+        .expect("3-input shared-key fixture must execute end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        let expected = canonicalize_csv(
+            "order_id,product_id,product_name,category_name,amount\n\
+            ord-1,p-1,Apple,Fruit,100\n\
+            ord-2,p-2,Bread,Grain,200\n\
+            ord-3,p-3,Carrot,Vegetable,300\n",
+        );
+        assert_eq!(
+            canon, expected,
+            "3-input chain output must match the hand-computed transitive join; got:\n{canon}"
+        );
+    }
+
+    /// End-to-end execution of a 4-input combine that decomposes into
+    /// a 3-step chain: a ⨝ b, then ⨝ c, then ⨝ d. Each step is
+    /// pure-equi on the shared `id` column so every step uses
+    /// HashBuildProbe; both intermediate steps emit encoded passthrough
+    /// records that the next step's resolver mapping reads positionally.
+    #[test]
+    fn test_nary_four_input_exec_correct() {
+        let yaml = load_fixture("four_input_equi.yaml");
+        let a_csv = "id,a_val\n1,a-one\n2,a-two\n3,a-three\n";
+        let b_csv = "id,b_val\n1,b-one\n2,b-two\n3,b-three\n";
+        let c_csv = "id,c_val\n1,c-one\n2,c-two\n3,c-three\n";
+        let d_csv = "id,d_val\n1,d-one\n2,d-two\n3,d-three\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("a_src", a_csv),
+                ("b_src", b_csv),
+                ("c_src", c_csv),
+                ("d_src", d_csv),
+            ],
+            Some("a_src"),
+        )
+        .expect("4-input combine fixture must execute end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        let expected = canonicalize_csv(
+            "id,a_val,b_val,c_val,d_val\n\
+            1,a-one,b-one,c-one,d-one\n\
+            2,a-two,b-two,c-two,d-two\n\
+            3,a-three,b-three,c-three,d-three\n",
+        );
+        assert_eq!(
+            canon, expected,
+            "4-input chain output must match the hand-computed transitive join; got:\n{canon}"
+        );
+    }
+
+    /// End-to-end execution of a 3-input mixed-predicate combine. Step
+    /// 0 = a ⨝ b on `a.id == b.id` (pure equi → HashBuildProbe); step 1
+    /// = (a,b) ⨝ c on `b.start >= c.begin and b.fin < c.finish` (pure
+    /// range → IEJoin). Strategy selection runs per chain step against
+    /// each step's predicate slice, so this fixture exercises the
+    /// hash-then-IEJoin transition across the chain boundary.
+    #[test]
+    fn test_nary_three_input_mixed_exec_correct() {
+        let yaml = load_fixture("three_input_mixed.yaml");
+        let a_csv = "id,seq\n1,1\n2,2\n3,3\n";
+        let b_csv = "id,start,fin\n1,10,20\n2,30,40\n3,50,60\n";
+        let c_csv = "begin,finish,window_id\n5,25,W-EARLY\n25,45,W-MID\n45,65,W-LATE\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[("a_src", a_csv), ("b_src", b_csv), ("c_src", c_csv)],
+            Some("a_src"),
+        )
+        .expect("3-input mixed-predicate fixture must execute end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        // Hand-computed: each (a,b) row falls into exactly one c
+        // window. (1, 10..20) → W-EARLY (5..25); (2, 30..40) → W-MID
+        // (25..45); (3, 50..60) → W-LATE (45..65).
+        let expected = canonicalize_csv(
+            "id,seq,start,fin,window_id\n\
+            1,1,10,20,W-EARLY\n\
+            2,2,30,40,W-MID\n\
+            3,3,50,60,W-LATE\n",
+        );
+        assert_eq!(
+            canon, expected,
+            "mixed-predicate chain output must match hand-computed expected rows; got:\n{canon}"
+        );
+    }
+
+    /// Pure-range combine compiles successfully under the IEJoin
+    /// planner: the `select_combine_strategies` post-pass emits
+    /// W305 (advisory: no equality conjuncts) and selects the
+    /// `IEJoin` strategy. Hard E313 still fires for predicates with
+    /// neither equi NOR range conjuncts (covered separately by the
+    /// in-source `test_combine_strategy_non_decomposable_e313`).
+    #[test]
+    fn test_combine_pure_range_compiles_with_iejoin_strategy() {
+        let yaml = load_fixture("two_input_range.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+        let combine = plan
+            .graph
+            .node_weights()
+            .find_map(|n| match n {
+                PlanNode::Combine { strategy, .. } => Some(strategy),
+                _ => None,
+            })
+            .expect("plan contains a combine node");
+        assert!(
+            matches!(
+                combine,
+                clinker_core::plan::combine::CombineStrategy::IEJoin
+            ),
+            "expected CombineStrategy::IEJoin for pure-range combine; got {combine:?}"
+        );
+    }
+
+    /// Gate: serialized `ExecutionPlanDag` JSON for a 2-input equi
+    /// combine surfaces the planner-selected strategy, the chosen
+    /// driving input, the build-side inputs, and the decomposed
+    /// predicate shape. This is the contract Kiln's canvas consumes
+    /// via `clinker explain --format json`.
+    #[test]
+    fn test_combine_explain_shows_strategy() {
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+
+        let json: serde_json::Value =
+            serde_json::to_value(&plan).expect("ExecutionPlanDag must serialize cleanly");
+        let nodes = json["nodes"]
+            .as_array()
+            .expect("explain JSON carries a nodes array");
+
+        let combine = nodes
+            .iter()
+            .find(|n| n["type"] == "combine" && n["name"] == "enriched")
+            .unwrap_or_else(|| panic!("no combine node named 'enriched' in nodes: {nodes:#?}"));
+
+        assert_eq!(
+            combine["strategy"], "hash_build_probe",
+            "strategy must be hash_build_probe for pure-equi 2-input combine; got {combine:#?}"
+        );
+
+        let driving = combine["driving_input"]
+            .as_str()
+            .unwrap_or_else(|| panic!("driving_input must be a string; got {combine:#?}"));
+        assert!(
+            !driving.is_empty(),
+            "driving_input must be stamped by select_combine_strategies; got empty: {combine:#?}"
+        );
+
+        let build = combine["build_inputs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("build_inputs must be an array; got {combine:#?}"));
+        assert!(
+            !build.is_empty(),
+            "build_inputs must contain at least one non-driver input; got empty: {combine:#?}"
+        );
+        for bi in build {
+            let bi_str = bi.as_str().expect("build_inputs entries are strings");
+            assert_ne!(
+                bi_str, driving,
+                "build_inputs must not contain the driver {driving:?}; got {build:#?}"
+            );
+        }
+        // The two-input_equi fixture declares `orders` and `products`;
+        // together with the driver this must cover the full input set.
+        let mut all_inputs: Vec<&str> = build.iter().map(|v| v.as_str().unwrap()).collect();
+        all_inputs.push(driving);
+        all_inputs.sort();
+        assert_eq!(
+            all_inputs,
+            vec!["orders", "products"],
+            "driver + build_inputs must reconstruct the combine's declared inputs"
+        );
+
+        let summary = &combine["predicate_summary"];
+        assert!(
+            summary.is_object(),
+            "predicate_summary must be an object; got {summary:#?}"
+        );
+        let equalities = summary["equalities"].as_u64().unwrap_or_else(|| {
+            panic!("predicate_summary.equalities must be a number; got {summary:#?}")
+        });
+        assert!(
+            equalities >= 1,
+            "two_input_equi has one `==` conjunct so equalities must be >= 1; got {equalities}"
+        );
+        assert_eq!(
+            summary["ranges"].as_u64().unwrap(),
+            0,
+            "two_input_equi has no range conjuncts"
+        );
+        assert!(
+            !summary["has_residual"].as_bool().unwrap(),
+            "two_input_equi predicate decomposes fully; residual must be absent"
+        );
+    }
+
+    /// Compile a fixture and return the full `CompiledPlan` so tests can
+    /// reach `.dag()`, `.config()`, and `.artifacts()` without re-running
+    /// the lowering pipeline. Mirrors `compile_plan`'s scratch-path opt-in.
+    fn compile_full_plan(config: &PipelineConfig) -> clinker_core::plan::CompiledPlan {
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        config
+            .compile(&ctx)
+            .unwrap_or_else(|e| panic!("compile failed: {e:?}"))
+    }
+
+    /// Gate: text `--explain` for a 2-input combine emits a multi-line
+    /// per-combine block that names the strategy, the driving input, the
+    /// predicate-shape detail (Equalities / Ranges / Residual), the match
+    /// mode, and the planned-share memory budget. The 2-input fixture
+    /// `two_input_range.yaml` is the canonical pure-range case; combined
+    /// with `two_input_equi.yaml` it exercises both predicate buckets.
+    #[test]
+    fn test_explain_combine_strategy() {
+        let yaml = load_fixture("two_input_range.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+
+        assert!(
+            text.contains("Combine 'bracketed':"),
+            "explain must carry the per-combine block header; got:\n{text}",
+        );
+        assert!(
+            text.contains("Driving input:"),
+            "explain must label the driving input; got:\n{text}",
+        );
+        assert!(
+            text.contains("Build input:"),
+            "explain must label at least one build input; got:\n{text}",
+        );
+        // pure-range predicate → "Ranges:" detail header
+        assert!(
+            text.contains("Ranges:"),
+            "two_input_range fixture is pure-range; explain detail must include Ranges:; got:\n{text}",
+        );
+        assert!(
+            text.contains("Match: first"),
+            "explain must surface the match mode; got:\n{text}",
+        );
+        assert!(
+            text.contains("On miss: null_fields"),
+            "explain must surface the on-miss policy; got:\n{text}",
+        );
+        assert!(
+            text.contains("Memory budget (planned share):"),
+            "explain must surface the planned-share memory budget line; got:\n{text}",
+        );
+    }
+
+    /// Gate: a 3-input combine — decomposed at plan time into a chain of
+    /// 2 binary combines — renders in the explain block under the
+    /// original user-declared name with numbered step lines. The
+    /// `decomposed_from` field on `PlanNode::Combine` drives the grouping.
+    #[test]
+    fn test_explain_nary_decomposition() {
+        let yaml = load_fixture("three_input_shared_key.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+
+        assert!(
+            text.contains("Combine 'fully_enriched' (3 inputs, binary decomposition):"),
+            "explain must group the chain under the original name with the 'binary decomposition' qualifier; got:\n{text}",
+        );
+        assert!(
+            text.contains("Step 1:"),
+            "decomposed chain must enumerate Step 1; got:\n{text}",
+        );
+        assert!(
+            text.contains("Step 2:"),
+            "decomposed chain must enumerate Step 2; got:\n{text}",
+        );
+        // The original name appears exactly once at the group header.
+        // The synthetic step nodes carry rewritten names (containing
+        // `__decomposed`) that include the original as a substring,
+        // so we count the literal `Combine 'fully_enriched'` prefix
+        // (apostrophe-bounded) — that prefix only matches the header.
+        let header_hits = text.matches("Combine 'fully_enriched'").count();
+        assert_eq!(
+            header_hits, 1,
+            "original combine name must appear exactly once at the group header; got {header_hits} hits in:\n{text}",
+        );
+    }
+
+    /// Gate: JSON `--explain` for a combine carries the rich predicate
+    /// detail (`equalities[].left/.right`), the inputs map (with role +
+    /// estimated_rows), the planned-share memory budget bytes, and a
+    /// `decomposed_from` field that is JSON null for a singleton combine.
+    #[test]
+    fn test_explain_combine_json() {
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let view = clinker_core::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let json: serde_json::Value =
+            serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
+
+        let nodes = json["nodes"]
+            .as_array()
+            .expect("explain JSON must carry a nodes array");
+        let combine = nodes
+            .iter()
+            .find(|n| n["type"] == "combine" && n["name"] == "enriched")
+            .unwrap_or_else(|| panic!("no combine node 'enriched' in nodes: {nodes:#?}"));
+
+        // Preserved fields from the plain ExecutionPlanDag serializer.
+        assert!(combine.get("strategy").is_some());
+        assert!(combine.get("driving_input").is_some());
+        assert!(combine.get("build_inputs").is_some());
+        assert!(combine.get("predicate_summary").is_some());
+        assert!(combine.get("match_mode").is_some());
+        assert!(combine.get("on_miss").is_some());
+
+        // New rich predicate object.
+        let predicate = combine
+            .get("predicate")
+            .unwrap_or_else(|| panic!("missing predicate; got {combine:#?}"));
+        let eqs = predicate["equalities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("predicate.equalities must be an array; got {predicate:#?}"));
+        assert!(
+            !eqs.is_empty(),
+            "two_input_equi has at least one equality conjunct; got {predicate:#?}",
+        );
+        let first_eq = &eqs[0];
+        assert!(
+            first_eq["left"].is_string(),
+            "equality left must be a string; got {first_eq:#?}",
+        );
+        assert!(
+            first_eq["right"].is_string(),
+            "equality right must be a string; got {first_eq:#?}",
+        );
+        let left_str = first_eq["left"].as_str().unwrap();
+        // Both sides are qualified `<input>.<field>` form.
+        assert!(
+            left_str.contains('.'),
+            "qualified field reference must contain a dot; got {left_str:?}",
+        );
+
+        // New inputs map: each declared input has role + estimated_rows,
+        // estimated_rows is JSON null when no cardinality estimate exists.
+        let inputs = combine
+            .get("inputs")
+            .unwrap_or_else(|| panic!("missing inputs; got {combine:#?}"));
+        let inputs_obj = inputs
+            .as_object()
+            .unwrap_or_else(|| panic!("inputs must be an object; got {inputs:#?}"));
+        assert!(
+            inputs_obj.contains_key("orders") && inputs_obj.contains_key("products"),
+            "inputs must enumerate every declared qualifier; got {inputs:#?}",
+        );
+        for (qual, entry) in inputs_obj {
+            assert!(
+                entry["role"].is_string(),
+                "inputs[{qual}].role must be a string; got {entry:#?}",
+            );
+            // Without an explicit cardinality hint, estimated_rows is null.
+            let est = &entry["estimated_rows"];
+            assert!(
+                est.is_null() || est.is_number(),
+                "inputs[{qual}].estimated_rows must be a number or null; got {entry:#?}",
+            );
+        }
+
+        // Memory budget bytes — concrete u64.
+        let mb = combine
+            .get("memory_budget_bytes")
+            .unwrap_or_else(|| panic!("missing memory_budget_bytes; got {combine:#?}"));
+        assert!(
+            mb.as_u64().is_some_and(|n| n > 0),
+            "memory_budget_bytes must be a positive integer; got {mb:#?}",
+        );
+
+        // decomposed_from is JSON null for a singleton combine (the
+        // `#[serde(skip_serializing_if = ...)]` derived behavior may
+        // omit the key when None — accept either omission or null).
+        match combine.get("decomposed_from") {
+            None => {}
+            Some(v) => assert!(
+                v.is_null(),
+                "decomposed_from must be null for a singleton combine; got {v:#?}",
+            ),
+        }
+    }
+
+    /// Gate: a combine whose `combine_predicates` entry is missing (no
+    /// decomposed predicate stored — the kind of state a compile-time
+    /// E303 leaves the artifacts side-table in) must not panic during
+    /// explain rendering. Mirrors the existing `display_name()` defensive
+    /// rendering at execution.rs that falls back to `<unselected>` for an
+    /// empty driving input. We construct this state by compiling a
+    /// successful plan and then mutating the artifacts to drop the
+    /// predicate entry — closer to the real failure mode (artifacts
+    /// state inconsistent with PlanNode) than fabricating a synthetic
+    /// PlanNode from scratch.
+    #[test]
+    fn test_explain_combine_with_e3xx_error() {
+        use std::collections::HashMap;
+
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        // Build a CompileArtifacts mirror with an empty
+        // combine_predicates table. The rest of the side-tables stay
+        // intact (combine_inputs etc.) because the explain block falls
+        // back to summary-only when predicate detail is unavailable —
+        // it doesn't crash through downstream lookups.
+        let original = plan.artifacts();
+        let mut censored = original.clone();
+        censored.combine_predicates = HashMap::new();
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), &censored);
+        // The block still renders — header + summary line — without
+        // panic. The detail bucket headers (Equalities:/Ranges:/
+        // Residual:) are absent because the predicate is unreachable.
+        assert!(
+            text.contains("Combine 'enriched':"),
+            "explain must still render the block header on missing predicate; got:\n{text}",
+        );
+        assert!(
+            text.contains("Predicate: equalities="),
+            "explain must still render the count summary on missing predicate; got:\n{text}",
+        );
+    }
+
+    /// Gate: an 8-input combine — the C.4 input cap — decomposes into a
+    /// chain of 7 binary combines. Explain must enumerate Step 1 through
+    /// Step 7 and report `(8 inputs, binary decomposition)` at the
+    /// header.
+    #[test]
+    fn test_explain_combine_8ary_decomposition() {
+        let mut yaml = String::new();
+        yaml.push_str("pipeline:\n  name: eight_input_chain\nnodes:\n");
+        for c in 'a'..='h' {
+            yaml.push_str(&format!(
+                concat!(
+                    "  - type: source\n    name: {c}_src\n    config:\n",
+                    "      name: {c}_src\n      type: csv\n",
+                    "      path: tests/fixtures/combine/data/eight_input_{c}.csv\n",
+                    "      schema:\n        - {{ name: id, type: string }}\n",
+                    "        - {{ name: {c}_val, type: string }}\n",
+                ),
+                c = c,
+            ));
+        }
+        yaml.push_str("  - type: combine\n    name: joined8\n    input:\n");
+        for c in 'a'..='h' {
+            yaml.push_str(&format!("      {c}: {c}_src\n", c = c));
+        }
+        yaml.push_str("    config:\n      where: \"");
+        // Equi key shared across consecutive pairs: a.id == b.id and
+        // b.id == c.id ... so every input participates in the join graph.
+        let letters: Vec<char> = ('a'..='h').collect();
+        let pairs: Vec<String> = letters
+            .windows(2)
+            .map(|w| format!("{}.id == {}.id", w[0], w[1]))
+            .collect();
+        yaml.push_str(&pairs.join(" and "));
+        yaml.push_str("\"\n      match: first\n      on_miss: skip\n      cxl: |\n");
+        yaml.push_str("        emit id = a.id\n");
+        for c in 'a'..='h' {
+            yaml.push_str(&format!("        emit {c}_val = {c}.{c}_val\n", c = c));
+        }
+        yaml.push_str("  - type: output\n    name: joined8_out\n    input: joined8\n    config:\n");
+        yaml.push_str("      name: joined8_out\n      type: csv\n      path: /tmp/joined8.csv\n");
+
+        let config: PipelineConfig =
+            clinker_core::yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+        assert!(
+            text.contains("(8 inputs, binary decomposition):"),
+            "8-input combine must label the group header with `(8 inputs, binary decomposition):`; got:\n{text}",
+        );
+        for step in 1..=7 {
+            let needle = format!("Step {step}:");
+            assert!(
+                text.contains(&needle),
+                "8-input chain must enumerate {needle}; got:\n{text}",
+            );
+        }
+        assert!(
+            !text.contains("Step 8:"),
+            "8-input chain decomposes into 7 binary combines; Step 8 must NOT appear; got:\n{text}",
+        );
+    }
+
+    /// Gate: a combine with `match: collect` round-trips that mode through
+    /// both the text and JSON explain paths. The text path must surface
+    /// `Match: collect`; the JSON path must serialize `match_mode` as the
+    /// stable kebab-case string.
+    #[test]
+    fn test_explain_combine_collect_mode() {
+        let yaml = load_fixture("match_collect.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_full_plan(&config);
+
+        let text = plan
+            .dag()
+            .explain_text_with_artifacts(plan.config(), plan.artifacts());
+        assert!(
+            text.contains("Match: collect"),
+            "match: collect must surface in the text explain block; got:\n{text}",
+        );
+
+        let view = clinker_core::plan::execution::ExplainJson::new(plan.dag(), plan.artifacts());
+        let json: serde_json::Value =
+            serde_json::to_value(&view).expect("ExplainJson must serialize cleanly");
+        let nodes = json["nodes"]
+            .as_array()
+            .expect("explain JSON must carry a nodes array");
+        let combine = nodes
+            .iter()
+            .find(|n| n["type"] == "combine")
+            .unwrap_or_else(|| panic!("no combine node in nodes: {nodes:#?}"));
+        assert_eq!(
+            combine["match_mode"], "collect",
+            "match_mode must round-trip as 'collect' through JSON; got {combine:#?}",
+        );
+    }
+
+    /// Sweep of combine fixtures that compile all the way through the
+    /// canonical path under the current feature set: 2-input equi,
+    /// 2-input mixed-predicate, match-mode variants, on-miss variants,
+    /// and drive-hint. Pure-range, 3+-input, and 1-input fixtures are
+    /// held out in their own dedicated gate tests because they
+    /// intentionally fail to compile — the first two until the
+    /// sort-merge / iejoin and N-ary combine planners land, the last
+    /// as the fixture for the combine-requires-at-least-2-inputs rule.
+    #[test]
+    fn test_currently_supported_combine_fixtures_compile() {
+        let fixtures = [
+            "two_input_equi.yaml",
+            "two_input_mixed.yaml",
+            "match_all.yaml",
+            "match_collect.yaml",
+            "on_miss_skip.yaml",
+            "on_miss_error.yaml",
+            "drive_hint.yaml",
+        ];
+        // Combine fixture outputs live under /tmp/; opt in to absolute
+        // paths so E-SEC-001 does not reject them in test.
+        let mut ctx = clinker_core::config::CompileContext::default();
+        ctx.allow_absolute_paths = true;
+        for name in fixtures {
+            let yaml = load_fixture(name);
+            let config = parse_fixture(&yaml);
+            let plan = config.compile(&ctx).unwrap_or_else(|diags| {
+                panic!("fixture {name}: compile failed with {diags:?}");
+            });
+            let plan = plan.dag();
+            let combine_count = plan
+                .graph
+                .node_weights()
+                .filter(|n| matches!(n, PlanNode::Combine { .. }))
+                .count();
+            assert_eq!(combine_count, 1, "fixture {name}: expected 1 combine node");
+            for idx in plan.graph.node_indices() {
+                if matches!(&plan.graph[idx], PlanNode::Combine { .. }) {
+                    let incoming = plan.graph.edges_directed(idx, Direction::Incoming).count();
+                    assert!(
+                        incoming >= 1,
+                        "fixture {name}: combine has no incoming edges"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- Field-level span gate tests ---------------------------
+    //
+    // These tests lock in the contract of the custom-Deserialize on
+    // consumer headers: every consumer header carries `Spanned<NodeInput>`
+    // at field level, undeclared-reference errors carry a real span, and
+    // parity holds across Merge and Transform headers. If any of these
+    // tests regress, the refactor has leaked — do NOT weaken the asserts.
+
+    /// Gate: CombineHeader's `input: IndexMap<String, Spanned<NodeInput>>`
+    /// captures real YAML line numbers per entry. Parses the
+    /// `two_input_equi.yaml` fixture and verifies the span of the
+    /// `orders:` entry points at its actual line in the file.
+    #[test]
+    fn test_combine_input_carries_field_level_span() {
+        use clinker_core::config::PipelineNode;
+        use clinker_core::yaml::Location;
+
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+
+        let combine = config
+            .nodes
+            .iter()
+            .find_map(|s| match &s.value {
+                PipelineNode::Combine { header, .. } if header.name == "enriched" => Some(header),
+                _ => None,
+            })
+            .expect("combine node 'enriched' must be present");
+
+        let orders_entry = combine
+            .input
+            .get("orders")
+            .expect("combine must declare 'orders' qualifier");
+        let products_entry = combine
+            .input
+            .get("products")
+            .expect("combine must declare 'products' qualifier");
+
+        assert_ne!(
+            orders_entry.referenced,
+            Location::UNKNOWN,
+            "combine.input['orders'] must carry a real YAML location (pre-C.1 gate)"
+        );
+        assert_ne!(
+            products_entry.referenced,
+            Location::UNKNOWN,
+            "combine.input['products'] must carry a real YAML location (pre-C.1 gate)"
+        );
+
+        let orders_line = orders_entry.referenced.line();
+        let products_line = products_entry.referenced.line();
+        assert!(
+            orders_line >= 1,
+            "orders entry line must be >= 1, got {orders_line}"
+        );
+        // `products_line > orders_line` proves the spans are really
+        // being read from the YAML (not just a global constant).
+        assert!(
+            products_line > orders_line,
+            "products entry must come after orders in the YAML; got orders={orders_line} products={products_line}"
+        );
+
+        // Verify against the literal fixture contents: find the line
+        // whose 0-based index matches what saphyr reported (1-based).
+        let lines: Vec<&str> = yaml.lines().collect();
+        let orders_text = lines
+            .get((orders_line as usize).saturating_sub(1))
+            .copied()
+            .unwrap_or("");
+        assert!(
+            orders_text.contains("orders:") && orders_text.contains("orders"),
+            "line {orders_line} must contain the 'orders: orders' mapping; got {orders_text:?}"
+        );
+    }
+
+    /// Gate: combine edge wiring in `PipelineConfig::compile` emits an
+    /// E004 `Diagnostic` when a combine input references an undeclared
+    /// upstream. The diagnostic's primary span carries the `line_only`
+    /// synthetic span of the offending `products: nowhere` reference
+    /// (populated from `Spanned<NodeInput>::referenced`) and the
+    /// structured `DiagnosticPayload::InputRefUndeclared` payload pins
+    /// the consumer/qualifier/reference triple — transposing any of the
+    /// three identifiers fails the assertion (strictly stronger than
+    /// substring matching on the message).
+    #[test]
+    fn test_combine_undeclared_input_diagnostic_has_real_span() {
+        let yaml = r#"
+pipeline:
+  name: e300_gate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: combine
+    name: broken
+    input:
+      orders: orders
+      products: nowhere
+    config:
+      where: "orders.order_id == products.order_id"
+      cxl: |
+        emit order_id = orders.order_id
+"#;
+        let config = parse_fixture(yaml);
+        let diags = config
+            .compile(&clinker_core::config::CompileContext::default())
+            .expect_err("combine referencing undeclared upstream must fail");
+        let e004 = diags
+            .iter()
+            .find(|d| {
+                d.code == "E004" && d.input_ref_payload().is_some_and(|(_, q, _)| q.is_some())
+            })
+            .unwrap_or_else(|| {
+                panic!("expected E004 diagnostic with combine-arm payload; got: {diags:#?}")
+            });
+        // Structured-payload assertion — strictly stronger than substring
+        // matching: transposing any of the three identifiers fails here.
+        let (consumer, qualifier, reference) = e004
+            .input_ref_payload()
+            .expect("E004 must carry InputRefUndeclared payload");
+        assert_eq!(consumer, "broken", "consumer name");
+        assert_eq!(qualifier, Some("products"), "combine qualifier");
+        assert_eq!(reference, "nowhere", "undeclared upstream");
+
+        // The primary span carries the real source line of the offending
+        // `products: nowhere` reference (≥ 10 lines into the fixture).
+        let line = e004.primary.span.synthetic_line_number().unwrap_or(0);
+        assert!(
+            line >= 10,
+            "E004 span must encode a non-zero line inside the combine input block; got {line} (span={:?})",
+            e004.primary.span
+        );
+        assert!(
+            e004.message.contains(&format!("line {line}")),
+            "E004 message must include 'line {line}', got: {}",
+            e004.message
+        );
+    }
+
+    /// Regression: combine-undeclared input surfaces as a
+    /// structural-stage E004 with combine-arm payload even when a
+    /// sibling node would have triggered a CXL error in bind_schema.
+    ///
+    /// Previously combine undeclared-input emission lived in stage-5
+    /// edge wiring AFTER bind_schema. A fixture with both an E200 (CXL)
+    /// on one node and a combine-undeclared on another would surface
+    /// ONLY the E200; the combine typo was invisible until the user
+    /// fixed the unrelated CXL error first. The unified
+    /// `resolve_all_input_references` pass moves combine-undeclared
+    /// forward to the structural stage so it fires regardless of what
+    /// bind_schema would have done.
+    ///
+    /// `compile_topology_only`'s early return still short-circuits
+    /// bind_schema once any structural-stage E004 exists, so this
+    /// fixture surfaces ONLY E004 (not both E200 and E004 in the same
+    /// pass). The load-bearing user-facing fix — combine typo no
+    /// longer hidden by a sibling CXL error — is what this regression
+    /// locks in.
+    #[test]
+    fn test_combine_undeclared_input_fires_even_when_bind_schema_would_error() {
+        let yaml = r#"
+pipeline:
+  name: e300_independence_gate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: transform
+    name: cxl_broken
+    input: orders
+    config:
+      cxl: |
+        emit value = unknown_field + 1
+  - type: combine
+    name: broken_combine
+    input:
+      orders: orders
+      products: nowhere
+    config:
+      where: "orders.order_id == products.order_id"
+      cxl: |
+        emit order_id = orders.order_id
+"#;
+        let config = parse_fixture(yaml);
+        let diags = config
+            .compile(&clinker_core::config::CompileContext::default())
+            .expect_err("fixture has E004 (undeclared combine input) — must fail");
+
+        // The load-bearing assertion: combine-undeclared is visible
+        // here, with the structured payload identifying the broken
+        // qualifier. Pre-remediation this combine typo would have been
+        // hidden behind cxl_broken's sibling E200 (because E307 lived
+        // in stage-5 Phase-2 after bind_schema's early return).
+        let combine_e004 = diags
+            .iter()
+            .find(|d| {
+                d.code == "E004" && d.input_ref_payload().is_some_and(|(_, q, _)| q.is_some())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an E004 with combine-arm payload from \
+                     broken_combine.products → nowhere even though \
+                     cxl_broken would have triggered an E200 in bind_schema. \
+                     The unified input-reference pass at stage 3.5 must \
+                     fire BEFORE bind_schema. got: {diags:#?}"
+                )
+            });
+
+        let (consumer, qualifier, reference) = combine_e004
+            .input_ref_payload()
+            .expect("combine E004 must carry InputRefUndeclared payload");
+        assert_eq!(consumer, "broken_combine");
+        assert_eq!(qualifier, Some("products"));
+        assert_eq!(reference, "nowhere");
+    }
+
+    /// Gate: `MergeHeader.inputs: Vec<Spanned<NodeInput>>` — every input
+    /// in a merge fixture carries a real span. Parity with Combine.
+    #[test]
+    fn test_nodeinput_span_preserved_for_merge_header() {
+        use clinker_core::config::PipelineNode;
+        use clinker_core::yaml::Location;
+
+        let yaml = r#"
+pipeline:
+  name: merge_span_gate
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: string }
+  - type: merge
+    name: combined
+    inputs:
+      - a
+      - b
+"#;
+        let config = parse_fixture(yaml);
+        let merge = config
+            .nodes
+            .iter()
+            .find_map(|s| match &s.value {
+                PipelineNode::Merge { header, .. } if header.name == "combined" => Some(header),
+                _ => None,
+            })
+            .expect("merge 'combined' must be present");
+        assert_eq!(merge.inputs.len(), 2);
+        for (i, entry) in merge.inputs.iter().enumerate() {
+            assert_ne!(
+                entry.referenced,
+                Location::UNKNOWN,
+                "merge.inputs[{i}] must carry a real YAML location"
+            );
+            assert!(
+                entry.referenced.line() >= 1,
+                "merge.inputs[{i}] line must be >= 1, got {}",
+                entry.referenced.line()
+            );
+        }
+        // Spans must differ — proves we're reading per-entry, not a
+        // global constant.
+        assert_ne!(
+            merge.inputs[0].referenced.line(),
+            merge.inputs[1].referenced.line(),
+            "merge entries must have distinct line numbers"
+        );
+    }
+
+    /// Gate: `NodeHeader.input: Spanned<NodeInput>` on a single-input
+    /// Transform header carries a real span. Parity with Combine.
+    #[test]
+    fn test_nodeinput_span_preserved_for_transform_header() {
+        use clinker_core::config::PipelineNode;
+        use clinker_core::yaml::Location;
+
+        let yaml = r#"
+pipeline:
+  name: transform_span_gate
+nodes:
+  - type: source
+    name: raw
+    config:
+      name: raw
+      type: csv
+      path: raw.csv
+      schema:
+        - { name: id, type: string }
+  - type: transform
+    name: clean
+    input: raw
+    config:
+      cxl: "emit id = id"
+"#;
+        let config = parse_fixture(yaml);
+        let transform = config
+            .nodes
+            .iter()
+            .find_map(|s| match &s.value {
+                PipelineNode::Transform { header, .. } if header.name == "clean" => Some(header),
+                _ => None,
+            })
+            .expect("transform 'clean' must be present");
+        assert_ne!(
+            transform.input.referenced,
+            Location::UNKNOWN,
+            "transform.input must carry a real YAML location (pre-C.1)"
+        );
+        assert!(
+            transform.input.referenced.line() >= 1,
+            "transform.input line must be >= 1, got {}",
+            transform.input.referenced.line()
+        );
+    }
+
+    /// Gate test: the topo order places every upstream input BEFORE the
+    /// combine node. Uses `two_input_equi.yaml` (combine 'enriched' over
+    /// sources 'orders' and 'products').
+    #[test]
+    fn test_combine_topo_sort_correct() {
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+
+        let combine_idx = find_combine_node(&plan, "enriched");
+        let combine_pos = plan
+            .topo_order
+            .iter()
+            .position(|&idx| idx == combine_idx)
+            .expect("combine node must appear in topo order");
+
+        // Collect the topo positions of every upstream (incoming) node.
+        let upstream_positions: Vec<usize> = plan
+            .graph
+            .neighbors_directed(combine_idx, Direction::Incoming)
+            .map(|pred| {
+                plan.topo_order
+                    .iter()
+                    .position(|&idx| idx == pred)
+                    .expect("every predecessor must appear in topo order")
+            })
+            .collect();
+        assert_eq!(
+            upstream_positions.len(),
+            2,
+            "expected 2 upstream inputs for 'enriched'"
+        );
+        for pos in &upstream_positions {
+            assert!(
+                *pos < combine_pos,
+                "upstream at topo pos {pos} must precede combine at pos {combine_pos}"
+            );
+        }
+    }
+
+    // --- C.1.4 gate tests ------------------------------------------------
+
+    // ─── C.2.0 helpers + execution scaffold ──────────────────────────────
+    //
+    // `run_combine_fixture` is the canonical end-to-end executor entry for
+    // combine (and lookup, during the C.2 migration) integration tests. It
+    // wraps the public
+    // `PipelineExecutor::run_plan_with_readers_writers_with_primary` entry.
+    //
+    // Error handling: structured `CombineFixtureError` preserves parse,
+    // compile, and run distinctions. Tests that assert on specific
+    // diagnostic codes (E306 / E311 / E313, etc.) can destructure the
+    // `Compile(Vec<Diagnostic>)` variant and inspect per-diagnostic
+    // codes rather than fuzzy-matching message strings.
+    //
+    // Output capture: every declared output node gets its own
+    // `SharedBuffer`; the returned `CombineFixtureResult.outputs` is a
+    // `HashMap<String, String>` keyed by output name. `primary_output()`
+    // returns the first-declared output for single-output tests;
+    // multi-output tests (Route downstream of combine) index by name.
+
+    /// Structured error for `run_combine_fixture`. Preserves the original
+    /// parse / compile / run signal so tests can destructure to assert on
+    /// specific diagnostic codes.
+    #[derive(Debug)]
+    #[allow(dead_code)] // Variants accessed via Debug and pattern matching.
+    pub(crate) enum CombineFixtureError {
+        /// YAML parse failure before compilation.
+        Parse(String),
+        /// Compile-time diagnostics (E2xx/E3xx codes, etc.). Full
+        /// `Vec<Diagnostic>` preserved — tests can assert on code,
+        /// severity, span, and message independently.
+        Compile(Vec<Diagnostic>),
+        /// Runtime / executor-layer failure.
+        Run(PipelineError),
+        /// Caller-provided inputs violated a helper precondition (e.g.
+        /// empty inputs and no primary override, no outputs declared).
+        Precondition(String),
+    }
+
+    impl std::fmt::Display for CombineFixtureError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Parse(msg) => write!(f, "parse failed: {msg}"),
+                Self::Compile(diags) => {
+                    writeln!(f, "compile failed with {} diagnostic(s):", diags.len())?;
+                    for d in diags {
+                        writeln!(f, "  [{}] {}", d.code, d.message)?;
+                    }
+                    Ok(())
+                }
+                Self::Run(err) => write!(f, "runtime failure: {err}"),
+                Self::Precondition(msg) => write!(f, "precondition violation: {msg}"),
+            }
+        }
+    }
+
+    impl std::error::Error for CombineFixtureError {}
+
+    /// Result of running a fixture pipeline.
+    #[derive(Debug)]
+    #[allow(dead_code)] // Fields accessed via named getters; field access is lint-silent.
+    pub(crate) struct CombineFixtureResult {
+        pub report: ExecutionReport,
+        /// Captured output bytes per declared output node, keyed by
+        /// output `name`. Every output node registered in the pipeline
+        /// YAML gets an entry — including empty buffers for outputs that
+        /// received zero records.
+        pub outputs: HashMap<String, String>,
+        /// YAML-declaration-order name of the first output. Used by
+        /// `primary_output()` for single-output tests.
+        pub primary_output_name: Option<String>,
+    }
+
+    impl CombineFixtureResult {
+        /// Single-output convenience: captured bytes from the FIRST
+        /// declared output node (by YAML declaration order). Panics if
+        /// the pipeline declared no outputs.
+        #[allow(dead_code)]
+        pub fn primary_output(&self) -> &str {
+            let name = self.primary_output_name.as_deref().expect(
+                "CombineFixtureResult::primary_output called on a pipeline with no outputs",
+            );
+            self.outputs
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or_else(|| panic!("primary_output_name {name:?} missing from outputs map"))
+        }
+
+        /// Look up a named output by its YAML `name` field. Returns
+        /// `None` for unknown names.
+        #[allow(dead_code)]
+        pub fn output(&self, name: &str) -> Option<&str> {
+            self.outputs.get(name).map(String::as_str)
+        }
+    }
+
+    /// Run a combine (or lookup) pipeline end-to-end through the public
+    /// executor with the given named in-memory CSV inputs. Returns a
+    /// `CombineFixtureResult` containing the full `ExecutionReport` and
+    /// every declared output's captured bytes.
+    ///
+    /// `inputs` is `&[(source_name, csv_bytes_as_str)]`. `primary_override`
+    /// pins a specific source as the driving input; pass `None` to
+    /// default to the first entry in `inputs`.
+    #[allow(dead_code)] // Wired by C.2.0+ tests; gate test enforces it compiles.
+    fn run_combine_fixture(
+        yaml: &str,
+        inputs: &[(&str, &str)],
+        primary_override: Option<&str>,
+    ) -> Result<CombineFixtureResult, CombineFixtureError> {
+        let config: PipelineConfig = clinker_core::yaml::from_str(yaml)
+            .map_err(|e| CombineFixtureError::Parse(e.to_string()))?;
+        let ctx = CompileContext::default();
+        let plan = config.compile(&ctx).map_err(CombineFixtureError::Compile)?;
+
+        let primary: String = match primary_override {
+            Some(name) => name.to_string(),
+            None => inputs
+                .first()
+                .map(|(n, _)| (*n).to_string())
+                .ok_or_else(|| {
+                    CombineFixtureError::Precondition(
+                        "run_combine_fixture: no inputs provided and no primary_override set"
+                            .to_string(),
+                    )
+                })?,
+        };
+
+        let mut readers: HashMap<String, Box<dyn Read + Send>> = HashMap::new();
+        for (name, data) in inputs {
+            readers.insert(
+                (*name).to_string(),
+                Box::new(std::io::Cursor::new(data.as_bytes().to_vec())) as Box<dyn Read + Send>,
+            );
+        }
+
+        // Register a SharedBuffer for EVERY declared output — multi-output
+        // pipelines (Route downstream of combine) would lose data otherwise.
+        let output_names: Vec<String> = plan
+            .config()
+            .output_configs()
+            .map(|cfg| cfg.name.clone())
+            .collect();
+        if output_names.is_empty() {
+            return Err(CombineFixtureError::Precondition(
+                "run_combine_fixture: pipeline declares no output nodes".to_string(),
+            ));
+        }
+        let output_buffers: HashMap<String, SharedBuffer> = output_names
+            .iter()
+            .map(|name| (name.clone(), SharedBuffer::new()))
+            .collect();
+        let writers: HashMap<String, Box<dyn Write + Send>> = output_buffers
+            .iter()
+            .map(|(name, buf)| (name.clone(), Box::new(buf.clone()) as Box<dyn Write + Send>))
+            .collect();
+
+        let pipeline_vars = plan
+            .config()
+            .pipeline
+            .vars
+            .as_ref()
+            .map(|v| clinker_core::config::convert_pipeline_vars(v))
+            .unwrap_or_default();
+        let params = PipelineRunParams {
+            execution_id: "combine-test-exec".to_string(),
+            batch_id: "combine-test-batch".to_string(),
+            pipeline_vars,
+            shutdown_token: None,
+        };
+
+        let report = PipelineExecutor::run_plan_with_readers_writers_with_primary(
+            &plan, &primary, readers, writers, &params,
+        )
+        .map_err(CombineFixtureError::Run)?;
+
+        let outputs: HashMap<String, String> = output_buffers
+            .into_iter()
+            .map(|(name, buf)| (name, buf.as_string()))
+            .collect();
+        let primary_output_name = output_names.into_iter().next();
+        Ok(CombineFixtureResult {
+            report,
+            outputs,
+            primary_output_name,
+        })
+    }
+
+    /// Canonicalize a CSV string via the `csv` crate: parse into
+    /// `(headers, Vec<record>)`, sort records by lexicographic tuple
+    /// order, re-serialize. Robust against quoted fields, embedded
+    /// newlines, and escaped delimiters — unlike a raw line-sort that
+    /// would mis-split multiline fields.
+    ///
+    /// Empty-or-whitespace input → empty string.
+    fn canonicalize_csv(csv: &str) -> String {
+        if csv.trim().is_empty() {
+            return String::new();
+        }
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv.as_bytes());
+        let headers: Vec<String> = match rdr.headers() {
+            Ok(h) => h.iter().map(String::from).collect(),
+            Err(e) => panic!("canonicalize_csv: failed to read headers: {e}\ninput:\n{csv}"),
+        };
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for rec in rdr.records() {
+            let rec = rec.unwrap_or_else(|e| {
+                panic!("canonicalize_csv: failed to read record: {e}\ninput:\n{csv}")
+            });
+            rows.push(rec.iter().map(String::from).collect());
+        }
+        rows.sort();
+
+        let mut wtr = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Vec::new());
+        wtr.write_record(&headers)
+            .expect("canonicalize_csv: writing headers failed");
+        for row in &rows {
+            wtr.write_record(row)
+                .expect("canonicalize_csv: writing row failed");
+        }
+        wtr.flush().expect("canonicalize_csv: flush failed");
+        String::from_utf8(
+            wtr.into_inner()
+                .expect("canonicalize_csv: into_inner failed"),
+        )
+        .expect("canonicalize_csv: output not utf-8")
+    }
+
+    /// Assert two CSV outputs match record-by-record, ignoring row order
+    /// but requiring identical header and identical row content. Uses the
+    /// `csv` crate for proper parsing (quoted fields, multi-line records,
+    /// escaped delimiters) rather than raw line-sorting.
+    ///
+    /// Used by the `combine_baseline_*` migrated tests to assert the
+    /// combine output canonicalizes to the stored baseline snapshot.
+    fn assert_records_match(actual: &str, expected: &str) {
+        let actual_canon = canonicalize_csv(actual);
+        let expected_canon = canonicalize_csv(expected);
+        assert_eq!(
+            actual_canon, expected_canon,
+            "record sets differ\n--- actual (canonicalized) ---\n{actual_canon}\n--- expected (canonicalized) ---\n{expected_canon}"
+        );
+    }
+
+    // ─── C.2.0.1 gate test: scaffold compiles + runs ──────────────────────
+
+    /// C.2.0.1 gate: `run_combine_fixture` compiles, executes a real
+    /// pipeline through the public executor, and returns a non-empty
+    /// `ExecutionReport`. Uses the simplest available 2-input fixture
+    /// (lookup syntax — combine executor lands in C.2.2 — but the helper
+    /// itself is mode-agnostic and exercised here for compilation only).
+    ///
+    /// THIS TEST DOES NOT yet exercise combine execution. Combine
+    /// dispatch returns `PipelineError::Internal` until C.2.2 replaces
+    /// the stub at `executor/mod.rs:3566`. The test that runs combine
+    /// fixtures end-to-end is `test_combine_exec_equi_match_first` in
+    /// C.2.2's gate suite. The C.2.0 gate is "the helper compiles and is
+    /// callable" — equivalent to the existing
+    /// `test_combine_scaffold_compiles` for the C.0 module gate.
+    #[test]
+    fn test_combine_exec_scaffold_compiles() {
+        // The simplest in-tree pipeline that exercises the helper
+        // end-to-end without depending on combine execution: a 1-source,
+        // 1-transform, 1-output pipeline. This proves the helper's
+        // compile + execute + capture path works on the public API.
+        let yaml = r#"
+pipeline:
+  name: scaffold_smoke
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      schema:
+        - { name: id, type: string }
+  - type: transform
+    name: pass_through
+    input: src
+    config:
+      cxl: |
+        emit id = id
+  - type: output
+    name: out
+    input: pass_through
+    config:
+      name: out
+      type: csv
+      path: scaffold_smoke.csv
+"#;
+        let inputs = "id\nA\nB\nC\n";
+        let result = run_combine_fixture(yaml, &[("src", inputs)], None)
+            .expect("run_combine_fixture must compile and execute the scaffold pipeline");
+        assert_eq!(
+            result.report.counters.total_count, 3,
+            "expected 3 records processed, got {}",
+            result.report.counters.total_count
+        );
+        let output = result.primary_output();
+        assert!(
+            output.contains("id\n") && output.contains("A\n"),
+            "expected output to contain header + records; got: {output:?}"
+        );
+
+        // Exercise the secondary getters so they stay reachable from a
+        // #[test] and the `dead_code` lint stays silent.
+        assert!(result.output("out").is_some());
+        assert!(result.output("nonexistent").is_none());
+        assert_eq!(result.outputs.len(), 1);
+
+        // Exercise canonicalize_csv + assert_records_match.
+        let unsorted = "id\nC\nA\nB\n";
+        let sorted = "id\nA\nB\nC\n";
+        assert_records_match(unsorted, sorted);
+
+        // Exercise CombineFixtureError::Display: a minimal Precondition
+        // case exercises the enum's fmt impl so clippy's dead_code
+        // heuristic doesn't flag variants as unused. No runtime assertion
+        // beyond non-empty Display output.
+        let err = CombineFixtureError::Precondition("demo".to_string());
+        assert!(!format!("{err}").is_empty());
+    }
+
+    // ─── combine migrations against stored baseline snapshots ───────────
+    //
+    // Each test below runs a `type: combine` pipeline through the
+    // executor and asserts that its canonicalized CSV output matches the
+    // stored `.snap` file at
+    // `tests/snapshots/combine_test__tests__lookup_baseline_<name>.snap`.
+    // The snapshot files are pre-captured oracles (2-input equi/range
+    // joins, fan-out, multi-output route split). They are read raw via
+    // `std::fs`, the insta header is stripped, and the body is compared
+    // via `assert_records_match` (order-independent record equality).
+    //
+    // The snapshot filenames still carry the `lookup_baseline_` prefix
+    // — renaming them would add diff noise with zero semantic value.
+    // They encode "regression baseline for 2-input equi/range combine
+    // enrichment patterns" regardless of the legacy name.
+
+    /// Load a baseline `.snap` file and return its body (the captured
+    /// CSV payload), with the insta YAML header stripped. Panics if the
+    /// file is missing or malformed.
+    fn load_baseline_snapshot(name: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/snapshots")
+            .join(format!("combine_test__tests__{name}.snap"));
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        // An insta snapshot file is:
+        //   ---
+        //   <yaml metadata>
+        //   ---
+        //   <body>
+        // Find the second `---\n` separator; everything after is the body.
+        let first = content
+            .find("---\n")
+            .unwrap_or_else(|| panic!("snapshot {} missing first `---` separator", path.display()));
+        let after_first = &content[first + 4..];
+        let second = after_first.find("---\n").unwrap_or_else(|| {
+            panic!("snapshot {} missing second `---` separator", path.display())
+        });
+        content[first + 4 + second + 4..].trim().to_string()
+    }
+
+    fn combine_yaml_equality() -> &'static str {
+        r#"
+pipeline:
+  name: combine_eq_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+  - type: combine
+    name: enrich
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.product_name
+        emit quantity = orders.quantity
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: combine_eq_baseline.csv
+"#
+    }
+
+    fn combine_yaml_range() -> &'static str {
+        r#"
+pipeline:
+  name: combine_range_baseline
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: ee_group, type: string }
+        - { name: pay, type: int }
+  - type: source
+    name: rate_bands
+    config:
+      name: rate_bands
+      type: csv
+      path: rate_bands.csv
+      schema:
+        - { name: ee_group, type: string }
+        - { name: min_pay, type: int }
+        - { name: max_pay, type: int }
+        - { name: rate_class, type: string }
+  - type: combine
+    name: classify
+    input:
+      employees: employees
+      rate_bands: rate_bands
+    config:
+      where: "employees.ee_group == rate_bands.ee_group and employees.pay >= rate_bands.min_pay and employees.pay <= rate_bands.max_pay"
+      cxl: |
+        emit employee_id = employees.employee_id
+        emit rate_class = rate_bands.rate_class
+  - type: output
+    name: result
+    input: classify
+    config:
+      name: result
+      type: csv
+      path: combine_range_baseline.csv
+"#
+    }
+
+    fn combine_yaml_on_miss_skip() -> &'static str {
+        r#"
+pipeline:
+  name: combine_skip_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+  - type: combine
+    name: enrich
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.product_name
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: combine_skip_baseline.csv
+"#
+    }
+
+    fn combine_yaml_match_all() -> &'static str {
+        r#"
+pipeline:
+  name: combine_match_all_baseline
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+  - type: source
+    name: assignments
+    config:
+      name: assignments
+      type: csv
+      path: assignments.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: project, type: string }
+  - type: combine
+    name: enrich
+    input:
+      employees: employees
+      assignments: assignments
+    config:
+      where: "employees.employee_id == assignments.employee_id"
+      match: all
+      cxl: |
+        emit employee_id = employees.employee_id
+        emit department = employees.department
+        emit project = assignments.project
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: combine_match_all_baseline.csv
+"#
+    }
+
+    fn combine_yaml_match_all_skip() -> &'static str {
+        r#"
+pipeline:
+  name: combine_match_all_skip_baseline
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+  - type: source
+    name: assignments
+    config:
+      name: assignments
+      type: csv
+      path: assignments.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: project, type: string }
+  - type: combine
+    name: enrich
+    input:
+      employees: employees
+      assignments: assignments
+    config:
+      where: "employees.employee_id == assignments.employee_id"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit employee_id = employees.employee_id
+        emit department = employees.department
+        emit project = assignments.project
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: combine_match_all_skip_baseline.csv
+"#
+    }
+
+    /// Equality enrichment: 1:1 match, NullFields on miss (default).
+    /// Asserts byte-identical output (modulo row order) against the
+    /// stored `lookup_baseline_equality` snapshot.
+    #[test]
+    fn test_combine_baseline_equality() {
+        let orders =
+            "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\nORD-3,PROD-X,7\n";
+        let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
+        let result = run_combine_fixture(
+            combine_yaml_equality(),
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("combine equality baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_equality");
+        assert_records_match(result.primary_output(), &expected);
+    }
+
+    /// Range enrichment: compound `and` across equi + range predicates.
+    /// Asserts against the stored `lookup_baseline_range` snapshot.
+    #[test]
+    fn test_combine_baseline_range() {
+        let employees =
+            "employee_id,ee_group,pay\nE001,exempt,75000\nE002,hourly,35000\nE003,exempt,120000\n";
+        let rate_bands = "ee_group,min_pay,max_pay,rate_class\nexempt,50000,80000,tier_1\nexempt,80001,150000,tier_2\nhourly,20000,50000,tier_3\n";
+        let result = run_combine_fixture(
+            combine_yaml_range(),
+            &[("employees", employees), ("rate_bands", rate_bands)],
+            Some("employees"),
+        )
+        .expect("combine range baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_range");
+        assert_records_match(result.primary_output(), &expected);
+    }
+
+    /// on_miss: skip — unmatched driver rows are dropped. Asserts
+    /// against `lookup_baseline_on_miss_skip`.
+    #[test]
+    fn test_combine_baseline_on_miss_skip() {
+        let orders = "order_id,product_id\nORD-1,PROD-A\nORD-2,PROD-X\nORD-3,PROD-B\n";
+        let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
+        let result = run_combine_fixture(
+            combine_yaml_on_miss_skip(),
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("combine on_miss:skip baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_on_miss_skip");
+        assert_records_match(result.primary_output(), &expected);
+    }
+
+    /// match: all — one driver row fans out to N output rows, one per
+    /// matching build-side row. Asserts against
+    /// `lookup_baseline_match_all`.
+    #[test]
+    fn test_combine_baseline_match_all() {
+        let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\n";
+        let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE002,Borealis\nE003,Phoenix\nE003,Atlas\nE003,Vega\n";
+        let result = run_combine_fixture(
+            combine_yaml_match_all(),
+            &[("employees", employees), ("assignments", assignments)],
+            Some("employees"),
+        )
+        .expect("combine match:all baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_match_all");
+        assert_records_match(result.primary_output(), &expected);
+    }
+
+    /// match: all + on_miss: skip — unmatched driver rows dropped;
+    /// matched ones fan out. Asserts against
+    /// `lookup_baseline_match_all_skip`.
+    #[test]
+    fn test_combine_baseline_match_all_skip() {
+        let employees = "employee_id,department\nE001,Engineering\nE002,Sales\nE003,Engineering\nE004,Marketing\n";
+        let assignments = "employee_id,project\nE001,Phoenix\nE001,Atlas\nE003,Vega\n";
+        let result = run_combine_fixture(
+            combine_yaml_match_all_skip(),
+            &[("employees", employees), ("assignments", assignments)],
+            Some("employees"),
+        )
+        .expect("combine match:all+skip baseline must execute");
+        let expected = load_baseline_snapshot("lookup_baseline_match_all_skip");
+        assert_records_match(result.primary_output(), &expected);
+    }
+
+    // ─── Multi-output baselines: route fan-out downstream of combine ─────
+    //
+    // These fixtures have a `type: route` node downstream of the
+    // combine, producing two output streams each. The captured
+    // baselines assert equivalence across every output.
+
+    /// Inline variant of the `examples/pipelines/order_fulfillment.yaml`
+    /// pattern, normalized to use `type: route` for deterministic split.
+    fn combine_yaml_order_fulfillment_baseline() -> &'static str {
+        r#"
+pipeline:
+  name: combine_order_fulfillment_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: order_date, type: string }
+        - { name: quantity, type: string }
+        - { name: unit_price, type: string }
+        - { name: product_code, type: string }
+        - { name: priority_level, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      options:
+        has_header: true
+      schema:
+        - { name: product_code, type: string }
+        - { name: product_name, type: string }
+        - { name: category, type: string }
+        - { name: weight_kg, type: string }
+  - type: combine
+    name: product_lookup
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_code == products.product_code"
+      cxl: |
+        emit order_id = orders.order_id
+        emit priority_level = orders.priority_level
+        emit product_code = orders.product_code
+        emit product_name = products.product_name
+        emit category = products.category
+        emit weight_kg = products.weight_kg
+  - type: route
+    name: priority_split
+    input: product_lookup
+    config:
+      mode: exclusive
+      conditions:
+        priority_report: 'priority_level == "urgent" or priority_level == "high"'
+      default: fulfilled_orders
+  - type: output
+    name: fulfilled_orders
+    input: priority_split
+    config:
+      name: fulfilled_orders
+      type: csv
+      path: fulfilled_orders.csv
+      include_unmapped: true
+  - type: output
+    name: priority_report
+    input: priority_split
+    config:
+      name: priority_report
+      type: csv
+      path: priority_report.csv
+      include_unmapped: true
+"#
+    }
+
+    /// Inline variant of the `benches/pipelines/combine/equi_2input_e2e.yaml`
+    /// pattern with route splitting on whether a match was found.
+    /// Path scheme changed from `bench://` to plain relative paths
+    /// (the test harness injects in-memory readers by source name).
+    fn combine_yaml_enrichment_baseline() -> &'static str {
+        r#"
+pipeline:
+  name: combine_enrichment_baseline
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+        - { name: f2, type: int }
+        - { name: f3, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: string }
+        - { name: f1, type: string }
+  - type: combine
+    name: enrich
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.f1 == products.f0"
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.f0
+        emit product_code = orders.f1
+        emit quantity = orders.f2
+        emit product_name = products.f1 ?? "UNKNOWN"
+        emit priority = orders.f3
+  - type: route
+    name: priority_split
+    input: enrich
+    config:
+      mode: exclusive
+      conditions:
+        high_priority_out: 'not product_name.is_null() and product_name != "UNKNOWN"'
+      default: standard_out
+  - type: output
+    name: high_priority_out
+    input: priority_split
+    config:
+      name: high_priority_out
+      type: csv
+      path: high_priority_out.csv
+      include_unmapped: true
+  - type: output
+    name: standard_out
+    input: priority_split
+    config:
+      name: standard_out
+      type: csv
+      path: standard_out.csv
+      include_unmapped: true
+"#
+    }
+
+    /// Multi-output order_fulfillment pattern — combine output split
+    /// by route into fulfilled + priority buckets. Asserts both
+    /// outputs against the stored baselines.
+    #[test]
+    fn test_combine_baseline_order_fulfillment() {
+        let orders = concat!(
+            "order_id,order_date,quantity,unit_price,product_code,priority_level\n",
+            "1,2024-01-15,5,29.99,PROD-A,urgent\n",
+            "2,2024-01-16,10,15.50,PROD-B,normal\n",
+            "3,2024-01-17,2,99.99,PROD-X,high\n",
+            "4,2024-01-18,1,49.99,PROD-A,low\n",
+        );
+        let products = concat!(
+            "product_code,product_name,category,weight_kg\n",
+            "PROD-A,Widget,tools,1.5\n",
+            "PROD-B,Gadget,electronics,0.3\n",
+        );
+        let result = run_combine_fixture(
+            combine_yaml_order_fulfillment_baseline(),
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("combine order_fulfillment baseline must execute");
+        let fulfilled = result
+            .output("fulfilled_orders")
+            .expect("fulfilled_orders output must be present");
+        let priority = result
+            .output("priority_report")
+            .expect("priority_report output must be present");
+        let expected_fulfilled =
+            load_baseline_snapshot("lookup_baseline_order_fulfillment_fulfilled_orders");
+        let expected_priority =
+            load_baseline_snapshot("lookup_baseline_order_fulfillment_priority_report");
+        assert_records_match(fulfilled, &expected_fulfilled);
+        assert_records_match(priority, &expected_priority);
+    }
+
+    /// Multi-output equi-2-input combine enrichment bench pattern —
+    /// combine output split by route on whether the match produced a
+    /// non-UNKNOWN product_name. Asserts both outputs against the
+    /// stored baselines.
+    #[test]
+    fn test_combine_baseline_enrichment() {
+        let orders = concat!(
+            "f0,f1,f2,f3\n",
+            "1,PROD-A,10,priority\n",
+            "2,PROD-B,5,normal\n",
+            "3,PROD-X,1,urgent\n",
+            "4,PROD-A,3,low\n",
+        );
+        let products = concat!("f0,f1\n", "PROD-A,Widget\n", "PROD-B,Gadget\n");
+        let result = run_combine_fixture(
+            combine_yaml_enrichment_baseline(),
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("combine enrichment baseline must execute");
+        assert_eq!(
+            result.report.counters.total_count, 4,
+            "expected 4 input records processed; counters: {:?}",
+            result.report.counters
+        );
+        let high = result
+            .output("high_priority_out")
+            .expect("high_priority_out output must be present");
+        let standard = result
+            .output("standard_out")
+            .expect("standard_out output must be present");
+        assert!(
+            !(high.trim().is_empty() && standard.trim().is_empty()),
+            "both enrichment outputs empty — route dispatch is not firing. report={:?}\nhigh={high:?}\nstandard={standard:?}",
+            result.report
+        );
+        let expected_high = load_baseline_snapshot("lookup_baseline_enrichment_high_priority");
+        let expected_standard = load_baseline_snapshot("lookup_baseline_enrichment_standard");
+        assert_records_match(high, &expected_high);
+        assert_records_match(standard, &expected_standard);
+    }
+
+    /// Gate test: verify every baseline `.snap` file exists on disk
+    /// with a non-degenerate body (header + at least one data row).
+    /// These snapshots are the regression oracle for the migrated
+    /// combine tests above — they ship as committed fixtures; their
+    /// absence turns every migrated test into a vacuous assertion.
+    #[test]
+    fn test_combine_baseline_snapshots_present() {
+        let snapshots_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots");
+        let expected = [
+            "combine_test__tests__lookup_baseline_equality.snap",
+            "combine_test__tests__lookup_baseline_range.snap",
+            "combine_test__tests__lookup_baseline_on_miss_skip.snap",
+            "combine_test__tests__lookup_baseline_match_all.snap",
+            "combine_test__tests__lookup_baseline_match_all_skip.snap",
+            "combine_test__tests__lookup_baseline_order_fulfillment_fulfilled_orders.snap",
+            "combine_test__tests__lookup_baseline_order_fulfillment_priority_report.snap",
+            "combine_test__tests__lookup_baseline_enrichment_high_priority.snap",
+            "combine_test__tests__lookup_baseline_enrichment_standard.snap",
+        ];
+        for name in expected {
+            let path = snapshots_dir.join(name);
+            assert!(
+                path.exists(),
+                "missing baseline snapshot: {}",
+                path.display()
+            );
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            // An insta snapshot body starts after the second `---`.
+            let body_start = content.find("---\n").and_then(|i| {
+                let after = &content[i + 4..];
+                after.find("---\n").map(|j| i + 4 + j + 4)
+            });
+            let body_start = body_start.unwrap_or_else(|| {
+                panic!(
+                    "snapshot {} has no body section (malformed insta file?):\n{content}",
+                    path.display()
+                )
+            });
+            let body = content[body_start..].trim();
+            assert!(
+                !body.is_empty(),
+                "snapshot {} has empty body — regression baseline is degenerate",
+                path.display()
+            );
+            assert!(
+                body.lines().count() >= 1,
+                "snapshot {} body has zero rows — header-only baseline is degenerate",
+                path.display()
+            );
+        }
+    }
+
+    /// Verify the lookup runtime is fully ripped from the codebase.
+    /// Every Rust source file under `crates/` must be free of the
+    /// lookup type names and functions that used to live in the
+    /// deleted `crates/clinker-core/src/pipeline/lookup.rs` and its
+    /// dispatch sites in the executor.
+    ///
+    /// Tokens are assembled at runtime from two halves so this test
+    /// source file itself does not trip the check.
+    #[test]
+    fn test_no_lookup_references_in_codebase() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has parent")
+            .parent()
+            .expect("crates dir has parent")
+            .to_path_buf();
+        let crates_dir = workspace_root.join("crates");
+        assert!(
+            crates_dir.is_dir(),
+            "crates/ not found under workspace root: {}",
+            workspace_root.display()
+        );
+        // Tokens are built from two halves at runtime so this file
+        // itself does not match its own check.
+        let banned: [String; 5] = [
+            format!("{}{}", "Lookup", "Config"),
+            format!("{}{}", "Runtime", "Lookup"),
+            format!("{}{}", "Lookup", "Table"),
+            format!("{}{}", "Equality", "Index"),
+            format!("{}{}", "build_lookup", "_tables"),
+        ];
+        let mut hits: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+        for entry in walkdir::WalkDir::new(&crates_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            // Skip target/ — cargo artifacts aren't source.
+            if path.components().any(|c| c.as_os_str() == "target") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for token in &banned {
+                if content.contains(token.as_str()) {
+                    // Find the first hit line for a useful failure message.
+                    for line in content.lines() {
+                        if line.contains(token.as_str()) {
+                            hits.push((path.to_path_buf(), line.trim().to_string(), token.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "lookup runtime token survived in {} place(s):\n{}",
+            hits.len(),
+            hits.iter()
+                .map(|(p, line, token)| format!("  {} [{token}]: {line}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ─── End migrated combine baselines ──────────────────────────────────
+
+    /// Gate (C.1.4): a compiled Combine node carries
+    /// `OrderingProvenance::DestroyedByCombine { confidence: Proven }` in
+    /// its `NodeProperties`. Hash-build/probe (and IEJoin, grace hash) do
+    /// not preserve driving-input order; the property-derivation pass
+    /// must mark the combine as destructive so downstream streaming-agg
+    /// eligibility, `--explain`, and Kiln canvas overlays can chain
+    /// through. Resolves Phase Combine §OQ-6 and drill D12.
+    ///
+    /// Uses `two_input_equi.yaml` (combine 'enriched' over sources
+    /// 'orders' and 'products'). The combine lands through full
+    /// `ExecutionPlanDag::compile`, which invokes
+    /// `compute_node_properties` internally.
+    #[test]
+    fn test_combine_destroys_ordering() {
+        use clinker_core::plan::properties::{Confidence, OrderingProvenance};
+
+        let yaml = load_fixture("two_input_equi.yaml");
+        let config = parse_fixture(&yaml);
+        let plan = compile_plan(&config);
+
+        let combine_idx = find_combine_node(&plan, "enriched");
+        let props = plan
+            .node_properties
+            .get(&combine_idx)
+            .expect("combine node must have NodeProperties populated by compile()");
+
+        // No sort_order — combine output is unordered.
+        assert!(
+            props.ordering.sort_order.is_none(),
+            "combine output sort_order must be None, got {:?}",
+            props.ordering.sort_order
+        );
+
+        match &props.ordering.provenance {
+            OrderingProvenance::DestroyedByCombine {
+                at_node,
+                confidence,
+            } => {
+                assert_eq!(
+                    at_node, "enriched",
+                    "DestroyedByCombine.at_node must identify the combine node"
+                );
+                assert_eq!(
+                    *confidence,
+                    Confidence::Proven,
+                    "Combine destruction is structural — confidence must be Proven"
+                );
+            }
+            other => panic!(
+                "combine 'enriched' must produce DestroyedByCombine provenance; got {other:?}"
+            ),
+        }
+    }
+
+    // ─── Combine executor gate tests ─────────────────────────────────────
+    //
+    // These tests exercise the `PlanNode::Combine` dispatch arm end-to-end
+    // through the public executor. They use small inline CSV inputs so the
+    // test surface is readable and the oracle outputs are auditable without
+    // reading a 1000-line fixture file.
+
+    const EXEC_ORDERS: &str = "\
+order_id,product_id,amount
+ORD-1,PROD-A,10
+ORD-2,PROD-B,20
+ORD-3,PROD-X,30
+";
+    const EXEC_PRODUCTS: &str = "\
+product_id,name,category
+PROD-A,Widget,cat-1
+PROD-B,Gadget,cat-2
+";
+
+    fn combine_exec_yaml(match_mode: &str, on_miss: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: combine_exec
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - {{ name: order_id, type: string }}
+        - {{ name: product_id, type: string }}
+        - {{ name: amount, type: int }}
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - {{ name: product_id, type: string }}
+        - {{ name: name, type: string }}
+        - {{ name: category, type: string }}
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: {match_mode}
+      on_miss: {on_miss}
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit amount = orders.amount
+  - type: output
+    name: enriched_out
+    input: enriched
+    config:
+      name: enriched_out
+      type: csv
+      path: enriched.csv
+"#,
+        )
+    }
+
+    /// match: first, on_miss: null_fields — a matched order enriches
+    /// with product fields; an unmatched order emits with null product
+    /// fields.
+    #[test]
+    fn test_combine_exec_equi_match_first() {
+        let yaml = combine_exec_yaml("first", "null_fields");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("combine executor must run a pure-equi 2-input fixture");
+        let canon = canonicalize_csv(result.primary_output());
+        // Post-rip: combine output_schema follows emit-statement order
+        // exactly (body emits order_id, product_id, product_name, amount
+        // in that sequence), not the upstream-then-emit pre-rip ordering.
+        let expected = canonicalize_csv(
+            "order_id,product_id,product_name,amount\n\
+             ORD-1,PROD-A,Widget,10\n\
+             ORD-2,PROD-B,Gadget,20\n\
+             ORD-3,PROD-X,,30\n",
+        );
+        assert_eq!(canon, expected, "combine match:first output mismatch");
+    }
+
+    /// match: all — verifies fan-out: every matching build record
+    /// produces an independent output row.
+    #[test]
+    fn test_combine_exec_equi_match_all() {
+        // Two products for the same product_id so match:all fans out.
+        let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
+        let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
+        let yaml = combine_exec_yaml("all", "null_fields");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("match:all fan-out must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // Two matching build rows → two output rows with the same
+        // probe fields but different product_name values. Column
+        // order follows the combine output_schema (emit-statement
+        // order: order_id, product_id, product_name, amount).
+        assert!(canon.contains("ORD-1,PROD-A,Widget,10"), "got: {canon}");
+        assert!(canon.contains("ORD-1,PROD-A,WidgetV2,10"), "got: {canon}");
+        let mut rows = 0usize;
+        for line in canon.lines().skip(1) {
+            if !line.is_empty() {
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 2, "match:all must produce 2 output rows");
+    }
+
+    /// match: collect — synthesized output record carries a
+    /// `<build_qualifier>: Value::Array(Value::Map)` field per driver;
+    /// the `cxl:` body is required-empty (E311). Verify the output
+    /// contains a serialized array per order including nested maps.
+    #[test]
+    fn test_combine_exec_equi_match_collect() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_collect
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      name: collected_out
+      type: csv
+      path: collected.csv
+      include_unmapped: true
+"#;
+        let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
+        let products = "product_id,name,category\nPROD-A,Widget,cat-1\nPROD-A,WidgetV2,cat-1b\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("match:collect must run");
+        let out = result.primary_output();
+        // The array serializes as bracketed content in CSV; each
+        // matched build record appears as a nested map representation.
+        assert!(
+            out.contains("Widget"),
+            "collect array should carry Widget; got: {out:?}"
+        );
+        assert!(
+            out.contains("WidgetV2"),
+            "collect array should carry WidgetV2; got: {out:?}"
+        );
+        // Exactly one output row per driver record under Collect.
+        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 1, "match:collect emits one row per driver");
+    }
+
+    /// match: collect on a driver with zero matches — the array field
+    /// is an empty array, not Value::Null. Verify the driver row is
+    /// emitted (no on_miss skip).
+    #[test]
+    fn test_combine_exec_collect_empty_array_on_miss() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_collect_empty
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      name: collected_out
+      type: csv
+      path: collected_empty.csv
+      include_unmapped: true
+"#;
+        // ORD-1's product_id is PROD-X — no matching build row.
+        let orders = "order_id,product_id,amount\nORD-1,PROD-X,10\n";
+        let products = "product_id,name,category\nPROD-A,Widget,cat-1\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("collect empty-array must run");
+        let out = result.primary_output();
+        // Exactly one data row (the driver row, with an empty array).
+        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 1, "collect emits the driver row even on miss");
+        // The `products` column carries the array serialization. Empty
+        // array stringifies as `[]` in Value::Display; verify we see
+        // `[]` and not `null` in the row.
+        let data = out.lines().nth(1).unwrap_or("");
+        assert!(
+            data.contains("[]"),
+            "empty-match collect must emit `[]`, not null; got row: {data:?}",
+        );
+    }
+
+    /// match: collect with 10K+1 matches on one driver record truncates
+    /// at COLLECT_PER_GROUP_CAP = 10_000. Build the build-side with
+    /// 10_001 rows that all share the same key so every one collides.
+    #[test]
+    fn test_combine_exec_collect_per_group_cap() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_collect_cap
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: collected
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: collect
+      on_miss: null_fields
+      cxl: ""
+  - type: output
+    name: collected_out
+    input: collected
+    config:
+      name: collected_out
+      type: csv
+      path: collected_cap.csv
+      include_unmapped: true
+"#;
+        let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
+        let mut products = String::from("product_id,name,category\n");
+        for i in 0..10_001 {
+            products.push_str(&format!("PROD-A,Widget-{i},cat-1\n"));
+        }
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", &products)],
+            Some("orders"),
+        )
+        .expect("collect cap must run");
+        let out = result.primary_output();
+        // The driver row is emitted.
+        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 1, "collect emits one row per driver");
+        // Expect exactly 10_000 occurrences of the substring `Widget-`
+        // in the serialized array — the 10_001st match was truncated.
+        let widget_count = out.matches("Widget-").count();
+        assert_eq!(
+            widget_count, 10_000,
+            "collect must truncate at 10_000 matches per group"
+        );
+    }
+
+    /// on_miss: null_fields — unmatched driver row emits with
+    /// build-qualifier fields filled with Null. The `product_name`
+    /// field in the CSV output is empty for ORD-X.
+    #[test]
+    fn test_combine_exec_on_miss_null_fields() {
+        let yaml = combine_exec_yaml("first", "null_fields");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("null_fields must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // ORD-3 has PROD-X which has no matching product — emit row
+        // with blank product_name (Null → empty CSV cell). Column
+        // order is the combine output_schema (emit order: order_id,
+        // product_id, product_name, amount), so the empty cell sits
+        // between product_id and amount.
+        assert!(
+            canon.contains("ORD-3,PROD-X,,30"),
+            "null_fields must leave build-qualified fields blank; got: {canon}"
+        );
+    }
+
+    /// on_miss: skip — unmatched driver rows are silently dropped.
+    #[test]
+    fn test_combine_exec_on_miss_skip() {
+        let yaml = combine_exec_yaml("first", "skip");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("skip must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // Two matches (ORD-1, ORD-2). Unmatched ORD-3 is dropped.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(data_rows, 2, "on_miss:skip drops unmatched rows");
+        assert!(!canon.contains("ORD-3"), "ORD-3 must be dropped");
+    }
+
+    /// on_miss: error — the pipeline fails on the first unmatched row.
+    /// Verify an E310-coded error surfaces.
+    #[test]
+    fn test_combine_exec_on_miss_error() {
+        let yaml = combine_exec_yaml("first", "error");
+        let err = run_combine_fixture(
+            &yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect_err("on_miss:error must fail the pipeline on first unmatched row");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("E310"),
+            "on_miss:error must surface E310; got: {msg}",
+        );
+    }
+
+    /// MemoryBudget abort — a 1-byte hard limit forces
+    /// `MemoryBudget::should_abort` to return true on the first poll
+    /// inside `CombineHashTable::build` (process RSS trivially exceeds
+    /// 1 byte). The build's safety-net final check fires for the small
+    /// build set, the executor wraps `CombineError::MemoryLimitExceeded`
+    /// as `PipelineError::Compilation` with an `E310 combine build:
+    /// ...` message, and that surfaces in the run error string.
+    ///
+    /// Mirrors the build-side regression test in
+    /// `pipeline/combine.rs::test_combine_hash_table_oom_aborts_during_build`,
+    /// but exercised end-to-end through the combine executor arm so a
+    /// regression in the arm's error mapping (E310 → generic message)
+    /// is caught here.
+    ///
+    /// Skipped silently when `rss_bytes()` is unavailable on the host
+    /// platform — the same gate the unit test uses, applied via
+    /// `clinker_core::pipeline::memory::rss_bytes()`.
+    #[test]
+    fn test_combine_exec_e310_memory_abort() {
+        if clinker_core::pipeline::memory::rss_bytes().is_none() {
+            return;
+        }
+        let yaml = r#"
+pipeline:
+  name: combine_exec_e310
+  memory_limit: "1"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+  - type: output
+    name: enriched_out
+    input: enriched
+    config:
+      name: enriched_out
+      type: csv
+      path: enriched.csv
+"#;
+        let err = run_combine_fixture(
+            yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect_err("1-byte memory_limit must abort combine with E310");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("E310"),
+            "memory abort must surface E310; got: {msg}",
+        );
+        assert!(
+            msg.contains("memory limit exceeded") || msg.contains("combine build"),
+            "E310 message must mention the combine memory abort; got: {msg}",
+        );
+    }
+
+    /// Residual predicate — equi predicate + a range residual. The
+    /// range is a cross-input comparison so it lands as a RangeConjunct
+    /// (not residual in the strict sense); build a pipeline where the
+    /// residual is same-input to force the residual path.
+    ///
+    /// Fixture: order's `amount >= 20` AND orders.product_id ==
+    /// products.product_id. The `amount >= 20` conjunct is a
+    /// single-input comparison against a literal → residual.
+    #[test]
+    fn test_combine_exec_residual_predicate() {
+        let yaml = r#"
+pipeline:
+  name: combine_exec_residual
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: filtered
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id and orders.amount >= 20"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit amount = orders.amount
+        emit product_name = products.name
+  - type: output
+    name: filtered_out
+    input: filtered
+    config:
+      name: filtered_out
+      type: csv
+      path: filtered.csv
+"#;
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", EXEC_ORDERS), ("products", EXEC_PRODUCTS)],
+            Some("orders"),
+        )
+        .expect("residual predicate must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // ORD-1 amount=10 is rejected by residual; ORD-2 amount=20 is
+        // accepted; ORD-3 PROD-X doesn't match the equi and on_miss:skip.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 1,
+            "residual rejects ORD-1 (amount<20); ORD-3 unmatched; only ORD-2 survives. got: {canon}"
+        );
+        assert!(canon.contains("ORD-2"), "ORD-2 must survive; got: {canon}");
+    }
+
+    /// Null key on the probe side — CXL ternary rules dictate no match.
+    /// Verify an order with NULL product_id produces no join match.
+    #[test]
+    fn test_combine_exec_null_key_no_match() {
+        // Empty product_id field on ORD-2 triggers Null after schema
+        // coercion (string type preserves it as empty string, not
+        // Null). To generate a true Null probe key, use a compare-to-
+        // nonexistent column or rely on runtime Null propagation via
+        // a residual equality that always resolves to Null. The
+        // simplest way: orders schema carries product_id as int with a
+        // blank field which coerces to Null.
+        let orders = "order_id,product_id,amount\nORD-1,1,10\nORD-2,,20\n";
+        let products = "product_id,name,category\n1,Widget,cat-1\n";
+        let yaml = r#"
+pipeline:
+  name: combine_null_key
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: int }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: int }
+        - { name: name, type: string }
+        - { name: category, type: string }
+  - type: combine
+    name: joined
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+  - type: output
+    name: joined_out
+    input: joined
+    config:
+      name: joined_out
+      type: csv
+      path: joined.csv
+"#;
+        let result = run_combine_fixture(
+            yaml,
+            &[("orders", orders), ("products", products)],
+            Some("orders"),
+        )
+        .expect("null-key fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // ORD-1 matches; ORD-2 has a Null probe key and never matches
+        // under SQL 3VL, so on_miss:skip drops it.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 1,
+            "null key must not match; only ORD-1 survives. got: {canon}"
+        );
+        assert!(canon.contains("ORD-1"), "ORD-1 must survive");
+        assert!(!canon.contains("ORD-2"), "ORD-2 null-key must be dropped");
+    }
+
+    // ─── IEJoin integration tests ──────────────────────────────────
+    //
+    // These fixtures live under `tests/fixtures/combine/iejoin_*.yaml`
+    // and reference CSV data files in `tests/fixtures/combine/data/`.
+    // The runner sources data from `inputs` (in-memory) so the YAML's
+    // `path:` is treated as a logical handle the executor's CSV
+    // reader binds against. Per-test inline data keeps the assertions
+    // readable; the fixture YAML is authoritative for the predicate
+    // and pipeline shape.
+
+    /// Load a fixture YAML file by stem from
+    /// `tests/fixtures/combine/`. Used by the IEJoin integration
+    /// suite below.
+    fn load_iejoin_fixture(stem: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/combine")
+            .join(format!("{stem}.yaml"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()))
+    }
+
+    const IEJOIN_EMPLOYEES_CSV: &str = "entity_id,employee_id,income\n\
+        ent-A,emp-001,42000\n\
+        ent-A,emp-002,87500\n\
+        ent-B,emp-003,15000\n\
+        ent-B,emp-004,210000\n";
+
+    const IEJOIN_BRACKETS_CSV: &str = "entity_id,bracket_id,bracket_lo,bracket_hi,rate\n\
+        ent-A,bkt-A1,0,40000,0.1\n\
+        ent-A,bkt-A2,40000,80000,0.2\n\
+        ent-A,bkt-A3,80000,150000,0.3\n\
+        ent-A,bkt-A4,150000,500000,0.4\n\
+        ent-B,bkt-B1,0,40000,0.05\n\
+        ent-B,bkt-B2,40000,80000,0.15\n\
+        ent-B,bkt-B3,80000,150000,0.25\n\
+        ent-B,bkt-B4,150000,500000,0.35\n";
+
+    /// Tax-bracket assignment via mixed equi+range predicate.
+    /// emp-001 (entity_id=ent-A, income=42000) → bkt-A2 (40000..80000).
+    /// emp-002 (ent-A, 87500) → bkt-A3 (80000..150000).
+    /// emp-003 (ent-B, 15000) → bkt-B1 (0..40000).
+    /// emp-004 (ent-B, 210000) → bkt-B4 (150000..500000).
+    #[test]
+    fn test_iejoin_tax_bracket_correct() {
+        let yaml = load_iejoin_fixture("iejoin_tax_bracket");
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("employees", IEJOIN_EMPLOYEES_CSV),
+                ("brackets", IEJOIN_BRACKETS_CSV),
+            ],
+            Some("employees"),
+        )
+        .expect("tax bracket fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            4,
+            "4 employees, each with one matching bracket; got: {canon}"
+        );
+        // Each employee gets the correct rate per their income.
+        assert!(canon.contains("ent-A,42000,0.2"), "emp-001 → 0.2 rate");
+        assert!(canon.contains("ent-A,87500,0.3"), "emp-002 → 0.3 rate");
+        assert!(canon.contains("ent-B,15000,0.05"), "emp-003 → 0.05 rate");
+        assert!(canon.contains("ent-B,210000,0.35"), "emp-004 → 0.35 rate");
+    }
+
+    /// Temporal overlap: events match overlapping sessions in the
+    /// same group via mixed equi+range. `match: all` so multiple
+    /// overlaps all surface.
+    #[test]
+    fn test_iejoin_temporal_overlap_correct() {
+        let events_csv = "group_id,event_id,start,end\n\
+            grp-1,evt-001,10,20\n\
+            grp-1,evt-002,15,25\n\
+            grp-1,evt-003,40,50\n\
+            grp-2,evt-004,5,12\n\
+            grp-2,evt-005,30,35\n";
+        let sessions_csv = "group_id,session_id,start_ts,end_ts\n\
+            grp-1,sess-A,8,18\n\
+            grp-1,sess-B,22,28\n\
+            grp-1,sess-C,45,55\n\
+            grp-2,sess-D,1,10\n\
+            grp-2,sess-E,28,38\n";
+        let yaml = load_iejoin_fixture("iejoin_temporal_overlap");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("events", events_csv), ("sessions", sessions_csv)],
+            Some("events"),
+        )
+        .expect("temporal overlap fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // Hand-computed expected matches:
+        //   evt-001 (10..20) overlaps sess-A (8..18) — start<=end_ts (10<=18), end>=start_ts (20>=8) ✓
+        //   evt-002 (15..25) overlaps sess-A (8..18)  — 15<=18, 25>=8 ✓
+        //   evt-002 (15..25) overlaps sess-B (22..28) — 15<=28, 25>=22 ✓
+        //   evt-003 (40..50) overlaps sess-C (45..55) — 40<=55, 50>=45 ✓
+        //   evt-004 (5..12)  overlaps sess-D (1..10)  — 5<=10, 12>=1 ✓
+        //   evt-005 (30..35) overlaps sess-E (28..38) — 30<=38, 35>=28 ✓
+        // Total: 6 matched pairs.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 6,
+            "expected 6 overlapping event/session pairs; got: {canon}"
+        );
+    }
+
+    /// NULL income → no bracket match. With `on_miss: null_fields`,
+    /// those employees emit one row with build-side fields null-filled.
+    #[test]
+    fn test_iejoin_null_range_never_matches() {
+        let null_employees = "entity_id,employee_id,income\n\
+            ent-A,emp-001,42000\n\
+            ent-A,emp-002,\n\
+            ent-A,emp-003,87500\n\
+            ent-B,emp-004,\n\
+            ent-B,emp-005,15000\n";
+        let yaml = load_iejoin_fixture("iejoin_null_ranges");
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("employees", null_employees),
+                ("brackets", IEJOIN_BRACKETS_CSV),
+            ],
+            Some("employees"),
+        )
+        .expect("null-range fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        // 5 employees, all 5 emit (3 with matched bracket, 2 with
+        // null bracket fields). `match: first` means each driver
+        // emits at most once.
+        assert_eq!(data_rows.len(), 5, "5 employees emit; got: {canon}");
+        // The two null-income employees emit with null bracket
+        // fields. Canonicalized CSV represents Null as an empty
+        // field — check that emp-002 and emp-004 land on rows with
+        // empty bracket_id and rate slots.
+        assert!(
+            data_rows
+                .iter()
+                .any(|r| r.contains("emp-002") && r.contains(",,")),
+            "emp-002 must emit with null bracket fields; got: {canon}"
+        );
+        assert!(
+            data_rows
+                .iter()
+                .any(|r| r.contains("emp-004") && r.contains(",,")),
+            "emp-004 must emit with null bracket fields; got: {canon}"
+        );
+    }
+
+    /// Inclusive vs exclusive boundary: a value equal to a boundary
+    /// matches `>=` (inclusive) but not `>` (strict).
+    #[test]
+    fn test_iejoin_boundary_inclusive_exclusive() {
+        // Inclusive: build.lo = 50, driver.x = 50, predicate `>=`
+        // → match.
+        let inclusive_yaml = r#"
+pipeline:
+  name: inclusive_boundary
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: id, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: id, type: string }
+        - { name: lo, type: int }
+  - type: combine
+    name: bnd
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.id == builds.id and drivers.x >= builds.lo"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = drivers.id
+        emit x = drivers.x
+        emit lo = builds.lo
+  - type: output
+    name: bnd_out
+    input: bnd
+    config:
+      name: bnd_out
+      type: csv
+      path: bnd.csv
+"#;
+        let drivers = "id,x\nA,50\n";
+        let builds = "id,lo\nA,50\n";
+        let result = run_combine_fixture(
+            inclusive_yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("inclusive boundary fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(data_rows, 1, "inclusive `>=` matches equal boundary");
+
+        // Strict: same data, predicate `>` → no match.
+        let strict_yaml = inclusive_yaml.replace("drivers.x >= builds.lo", "drivers.x > builds.lo");
+        let result_strict = run_combine_fixture(
+            &strict_yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("strict boundary fixture must run");
+        let data_rows_strict = canonicalize_csv(result_strict.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(data_rows_strict, 0, "strict `>` rejects equal boundary");
+    }
+
+    /// Empty build → all drivers unmatched. `on_miss: skip` drops
+    /// them; output is empty (header only).
+    #[test]
+    fn test_iejoin_empty_build_side() {
+        let empty_brackets = "entity_id,bracket_id,bracket_lo,bracket_hi,rate\n";
+        let yaml = load_iejoin_fixture("iejoin_empty_build");
+        let result = run_combine_fixture(
+            &yaml,
+            &[
+                ("employees", IEJOIN_EMPLOYEES_CSV),
+                ("brackets", empty_brackets),
+            ],
+            Some("employees"),
+        )
+        .expect("empty-build fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(data_rows, 0, "empty build + on_miss:skip drops all drivers");
+    }
+
+    /// All build records identical (errata point 4 territory):
+    /// every driver should match every build under inclusive ops.
+    /// 10 drivers × 10 builds with `match: all` → 100 output rows.
+    #[test]
+    fn test_iejoin_all_duplicates() {
+        let drivers = "entity_id,driver_id,lo,hi\n\
+            ent-A,drv-01,50,100\nent-A,drv-02,50,100\n\
+            ent-A,drv-03,50,100\nent-A,drv-04,50,100\n\
+            ent-A,drv-05,50,100\nent-A,drv-06,50,100\n\
+            ent-A,drv-07,50,100\nent-A,drv-08,50,100\n\
+            ent-A,drv-09,50,100\nent-A,drv-10,50,100\n";
+        let builds = "entity_id,build_id,lo,hi,tag\n\
+            ent-A,bld-01,0,200,t01\nent-A,bld-02,0,200,t02\n\
+            ent-A,bld-03,0,200,t03\nent-A,bld-04,0,200,t04\n\
+            ent-A,bld-05,0,200,t05\nent-A,bld-06,0,200,t06\n\
+            ent-A,bld-07,0,200,t07\nent-A,bld-08,0,200,t08\n\
+            ent-A,bld-09,0,200,t09\nent-A,bld-10,0,200,t10\n";
+        let yaml = load_iejoin_fixture("iejoin_all_duplicates");
+        let result = run_combine_fixture(
+            &yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("all-duplicates fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(
+            data_rows, 100,
+            "10 drivers × 10 builds with both ranges inclusive → full Cartesian"
+        );
+    }
+
+    /// Single-inequality predicate (no equality, one range conjunct)
+    /// routes to the IEJoin strategy (PWMJ kernel under the hood).
+    /// Asserts correctness end-to-end without observing the kernel
+    /// directly.
+    #[test]
+    fn test_single_inequality_uses_pwmj() {
+        let yaml = r#"
+pipeline:
+  name: pure_range_single
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: id, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: bid, type: string }
+        - { name: y, type: int }
+  - type: combine
+    name: pure_range
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.x < builds.y"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit id = drivers.id
+        emit bid = builds.bid
+        emit x = drivers.x
+        emit y = builds.y
+  - type: output
+    name: pure_range_out
+    input: pure_range
+    config:
+      name: pure_range_out
+      type: csv
+      path: pure_range.csv
+"#;
+        let drivers = "id,x\nD1,1\nD2,5\nD3,10\n";
+        let builds = "bid,y\nB1,3\nB2,7\nB3,12\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("single-inequality fixture must run");
+        let canon = canonicalize_csv(result.primary_output());
+        // D1 (x=1) < B1 (y=3), B2 (7), B3 (12) → 3 rows.
+        // D2 (x=5) < B2 (7), B3 (12) → 2 rows.
+        // D3 (x=10) < B3 (12) → 1 row.
+        // Total = 6.
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            data_rows, 6,
+            "single-inequality cross-product matches expected; got: {canon}"
+        );
+    }
+
+    /// `match: first` short-circuits to one row per matching driver
+    /// even when multiple builds satisfy the predicate.
+    #[test]
+    fn test_iejoin_match_first_short_circuits() {
+        let yaml = r#"
+pipeline:
+  name: first_short_circuit
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: id, type: string }
+        - { name: x, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: gid, type: string }
+        - { name: bid, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: combine
+    name: first_only
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.id == builds.gid and drivers.x >= builds.lo and drivers.x <= builds.hi"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit id = drivers.id
+        emit x = drivers.x
+        emit bid = builds.bid
+  - type: output
+    name: first_only_out
+    input: first_only
+    config:
+      name: first_only_out
+      type: csv
+      path: first_only.csv
+"#;
+        let drivers = "id,x\nA,50\n";
+        // 3 builds all match A's x=50 within range.
+        let builds = "gid,bid,lo,hi\nA,B1,0,100\nA,B2,40,60\nA,B3,49,51\n";
+        let result = run_combine_fixture(
+            yaml,
+            &[("drivers", drivers), ("builds", builds)],
+            Some("drivers"),
+        )
+        .expect("match-first fixture must run");
+        let data_rows = canonicalize_csv(result.primary_output())
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(
+            data_rows, 1,
+            "match: first emits exactly one row per driver even with multiple matches"
+        );
+    }
+
+    /// SortMerge end-to-end: a pure-range combine on pre-sorted inputs
+    /// runs through the SortMerge executor and produces the same
+    /// matches a hand-computed cross-product would. With `products`
+    /// sorted on `price` and `brackets` sorted on `max`, the planner
+    /// selects [`CombineStrategy::SortMerge`] and the kernel walks the
+    /// inputs in place via the two-cursor merge.
+    ///
+    /// Predicate: `product.price < bracket.max`, `match: first`.
+    /// - P1 (10) → first matching bracket where 10 < max: B25 (max=25).
+    /// - P2 (20) → B25 (20 < 25).
+    /// - P3 (30) → B40 (30 < 40).
+    /// - P4 (42) → B100 (42 < 100).
+    #[test]
+    fn test_sort_merge_price_range_exec_correct() {
+        let yaml = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/combine/sort_merge_price_range.yaml"),
+        )
+        .expect("must read sort_merge_price_range fixture");
+        let products = "sku,price\nP1,10\nP2,20\nP3,30\nP4,42\n";
+        let brackets = "bracket_id,max,rate\nB25,25,0.10\nB40,40,0.20\nB100,100,0.30\n";
+        let result = run_combine_fixture(
+            &yaml,
+            &[("products", products), ("brackets", brackets)],
+            Some("products"),
+        )
+        .expect("sort-merge fixture must run end-to-end");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            4,
+            "4 products, each with one matching bracket; got: {canon}"
+        );
+        assert!(
+            canon.contains("P1,10,B25,0.1"),
+            "P1 (price=10) → B25 (max=25); got: {canon}"
+        );
+        assert!(
+            canon.contains("P2,20,B25,0.1"),
+            "P2 (price=20) → B25 (max=25); got: {canon}"
+        );
+        assert!(
+            canon.contains("P3,30,B40,0.2"),
+            "P3 (price=30) → B40 (max=40); got: {canon}"
+        );
+        assert!(
+            canon.contains("P4,42,B100,0.3"),
+            "P4 (price=42) → B100 (max=100); got: {canon}"
+        );
+    }
+
+    /// Strategy-selection: an estimated build cardinality whose product
+    /// with the per-record byte estimate clears the default soft-limit
+    /// must yield `CombineStrategy::GraceHash` instead of
+    /// `HashBuildProbe`.
+    #[test]
+    fn test_grace_hash_strategy_selected_for_large_build() {
+        use clinker_core::plan::bind_schema::CompileArtifacts;
+        use clinker_core::plan::combine::{
+            CombineInput, CombinePredicateSummary, CombineStrategy, DecomposedPredicate,
+            EqualityConjunct, select_combine_strategies,
+        };
+        use clinker_core::plan::execution::{ExecutionPlanDag, PlanNode};
+        use clinker_core::plan::row_type::{QualifiedField, Row};
+        use clinker_core::span::Span;
+        use cxl::ast::{Expr, LiteralValue, NodeId, Program};
+        use cxl::lexer::Span as CxlSpan;
+        use cxl::typecheck::Type;
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        let mut artifacts = CompileArtifacts::default();
+        let mut graph = petgraph::graph::DiGraph::new();
+
+        for q in ["orders", "products"] {
+            graph.add_node(PlanNode::Source {
+                name: q.to_string(),
+                span: Span::SYNTHETIC,
+                resolved: None,
+                output_schema: clinker_record::SchemaBuilder::new().build(),
+            });
+        }
+
+        // Build estimate huge enough that estimated_bytes >= 80% of
+        // 512 MiB: 600_000 rows * 1024 bytes = ~586 MB > 410 MB soft
+        // limit.
+        let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
+        for (q, card) in [("orders", 1_000_000u64), ("products", 600_000u64)] {
+            let mut row_fields: IndexMap<QualifiedField, Type> = IndexMap::new();
+            row_fields.insert(QualifiedField::bare("id"), Type::String);
+            inputs_map.insert(
+                q.to_string(),
+                CombineInput {
+                    upstream_name: Arc::from(q),
+                    row: Row::closed(row_fields, CxlSpan::new(0, 0)),
+                    estimated_cardinality: Some(card),
+                },
+            );
+        }
+        artifacts
+            .combine_inputs
+            .insert("test_combine".to_string(), inputs_map.clone());
+        artifacts
+            .combine_driving
+            .insert("test_combine".to_string(), "orders".to_string());
+
+        let dummy_lit = || Expr::Literal {
+            node_id: NodeId(0),
+            value: LiteralValue::Int(0),
+            span: CxlSpan::new(0, 0),
+        };
+        let dummy_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: Program {
+                statements: Vec::new(),
+                span: CxlSpan::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+            output_row: cxl::typecheck::row::Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
+        });
+        let predicate = DecomposedPredicate {
+            equalities: vec![EqualityConjunct {
+                left_expr: dummy_lit(),
+                left_input: Arc::from("orders"),
+                left_program: Arc::clone(&dummy_program),
+                right_expr: dummy_lit(),
+                right_input: Arc::from("products"),
+                right_program: Arc::clone(&dummy_program),
+            }],
+            ranges: Vec::new(),
+            residual: None,
+        };
+        artifacts
+            .combine_predicates
+            .insert("test_combine".to_string(), predicate);
+
+        let combine_idx = graph.add_node(PlanNode::Combine {
+            name: "test_combine".to_string(),
+            span: Span::SYNTHETIC,
+            strategy: CombineStrategy::HashBuildProbe,
+            driving_input: String::new(),
+            build_inputs: Vec::new(),
+            predicate_summary: CombinePredicateSummary::default(),
+            match_mode: clinker_core::config::pipeline_node::MatchMode::First,
+            on_miss: clinker_core::config::pipeline_node::OnMiss::NullFields,
+            decomposed_from: None,
+            output_schema: clinker_record::SchemaBuilder::new().build(),
+            resolved_column_map: Arc::new(std::collections::HashMap::new()),
+        });
+
+        let mut plan = ExecutionPlanDag {
+            graph,
+            topo_order: Vec::new(),
+            source_dag: Vec::new(),
+            indices_to_build: Vec::new(),
+            output_projections: Vec::new(),
+            parallelism: clinker_core::plan::execution::ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+            node_properties: std::collections::HashMap::new(),
+        };
+        let mut diags = Vec::new();
+        select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
+        if let PlanNode::Combine { strategy, .. } = &plan.graph[combine_idx] {
+            assert!(
+                matches!(strategy, CombineStrategy::GraceHash { .. }),
+                "expected GraceHash for large pure-equi build; got {strategy:?}"
+            );
+        } else {
+            panic!("combine_idx no longer points to a Combine node");
+        }
+    }
+
+    // --- Bench correctness regression guards -----------------------------
+    //
+    // The two performance-gated benches (`combine_nary_3input.rs`,
+    // `combine_grace_hash.rs`) include inline correctness checks at
+    // small scale before measurement begins. Those gates run at
+    // `cargo bench` time, not `cargo test`. The two tests below
+    // mirror those checks at a smaller scale that fits inside a
+    // `cargo test` budget so a regression in the underlying executor
+    // strategy is caught even when CI does not run benches.
+
+    /// CI-visible mirror of the `combine_nary_3input` correctness gate.
+    /// Runs a 3-input chained equi-join at 100 × 100 × 100 with 10
+    /// equality groups (~10 rows per group per input) and asserts the
+    /// emitted row count matches the closed-form `groups *
+    /// rows_per_group^3`. A regression where the chain decomposition
+    /// drops or duplicates rows would surface here long before the
+    /// bench's perf gate at full scale flags it.
+    #[test]
+    fn test_nary_three_input_correctness_at_scale() {
+        use clinker_bench_support::CombineDataGen;
+
+        const ROWS_PER_INPUT: usize = 100;
+        const GROUPS: usize = 10;
+
+        let mk = |rows: usize, card: usize| -> String {
+            let workload = CombineDataGen {
+                build_rows: rows,
+                probe_rows: 0,
+                overlap_ratio: 0.0,
+                key_cardinality: card,
+                extra_columns: 1,
+            };
+            String::from_utf8(workload.build_csv()).expect("CombineDataGen emits utf8 CSV")
+        };
+        let a_csv = mk(ROWS_PER_INPUT, GROUPS);
+        let b_csv = mk(ROWS_PER_INPUT, GROUPS);
+        let c_csv = mk(ROWS_PER_INPUT, GROUPS);
+
+        let yaml = r#"
+pipeline:
+  name: test_nary_three_input_correctness
+nodes:
+- type: source
+  name: a
+  config:
+    name: a
+    type: csv
+    path: a.csv
+    options:
+      has_header: true
+    schema:
+      - { name: key, type: int }
+      - { name: c0, type: string }
+- type: source
+  name: b
+  config:
+    name: b
+    type: csv
+    path: b.csv
+    options:
+      has_header: true
+    schema:
+      - { name: key, type: int }
+      - { name: c0, type: string }
+- type: source
+  name: c
+  config:
+    name: c
+    type: csv
+    path: c.csv
+    options:
+      has_header: true
+    schema:
+      - { name: key, type: int }
+      - { name: c0, type: string }
+- type: combine
+  name: joined3
+  input:
+    a: a
+    b: b
+    c: c
+  config:
+    where: "a.key == b.key and b.key == c.key"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit key = a.key
+      emit a_c0 = a.c0
+      emit b_c0 = b.c0
+      emit c_c0 = c.c0
+- type: output
+  name: out
+  input: joined3
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+        let result = run_combine_fixture(
+            yaml,
+            &[("a", &a_csv), ("b", &b_csv), ("c", &c_csv)],
+            Some("a"),
+        )
+        .expect("3-input chain pipeline must execute");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+
+        let rows_per_group = ROWS_PER_INPUT / GROUPS;
+        let expected = rows_per_group.pow(3) * GROUPS;
+        assert_eq!(
+            data_rows, expected,
+            "3-input chain produced {data_rows} rows; expected {expected} \
+             ({GROUPS} groups × {rows_per_group}^3 per group)",
+        );
+    }
+
+    /// CI-visible mirror of the `combine_grace_hash` correctness gate.
+    /// Runs the same pure-equi combine through both `memory_limit: "1G"`
+    /// and `memory_limit: "16G"` at 1K × 10K and asserts the
+    /// canonicalized outputs are byte-identical. The small workload
+    /// here keeps process RSS under both soft limits so neither path
+    /// actually spills — the gate is (a) the strategy hint routes to
+    /// `CombineStrategy::GraceHash`, and (b) the two budgets produce
+    /// identical output row sets. The full bench at 100K × 1M scale is
+    /// what exercises the spill-vs-no-spill timing comparison.
+    #[test]
+    fn test_grace_hash_correctness_at_scale() {
+        use clinker_bench_support::CombineDataGen;
+
+        let workload = CombineDataGen {
+            build_rows: 1_000,
+            probe_rows: 10_000,
+            overlap_ratio: 0.95,
+            key_cardinality: 1_000,
+            extra_columns: 2,
+        };
+        let build_csv = String::from_utf8(workload.build_csv()).expect("CombineDataGen emits utf8");
+        let probe_csv = String::from_utf8(workload.probe_csv()).expect("CombineDataGen emits utf8");
+
+        let mk_yaml = |memory_limit: &str| -> String {
+            format!(
+                r#"
+pipeline:
+  name: test_grace_hash_correctness
+  memory_limit: "{memory_limit}"
+nodes:
+- type: source
+  name: build
+  config:
+    name: build
+    type: csv
+    path: build.csv
+    options:
+      has_header: true
+    schema:
+      - {{ name: key, type: int }}
+      - {{ name: c0, type: string }}
+      - {{ name: c1, type: string }}
+- type: source
+  name: probe
+  config:
+    name: probe
+    type: csv
+    path: probe.csv
+    options:
+      has_header: true
+    schema:
+      - {{ name: key, type: int }}
+      - {{ name: c0, type: string }}
+      - {{ name: c1, type: string }}
+- type: combine
+  name: joined
+  input:
+    probe: probe
+    build: build
+  config:
+    where: "probe.key == build.key"
+    match: first
+    on_miss: skip
+    strategy: grace_hash
+    cxl: |
+      emit key = probe.key
+      emit probe_c0 = probe.c0
+      emit build_c0 = build.c0
+- type: output
+  name: out
+  input: joined
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#,
+            )
+        };
+
+        let yaml_inmem = mk_yaml("16G");
+        let yaml_spill = mk_yaml("256M");
+        let inmem = run_combine_fixture(
+            &yaml_inmem,
+            &[("build", &build_csv), ("probe", &probe_csv)],
+            Some("probe"),
+        )
+        .expect("in-memory grace hash must run");
+        let spill = run_combine_fixture(
+            &yaml_spill,
+            &[("build", &build_csv), ("probe", &probe_csv)],
+            Some("probe"),
+        )
+        .expect("spilled grace hash must run");
+
+        let canon_inmem = canonicalize_csv(inmem.primary_output());
+        let canon_spill = canonicalize_csv(spill.primary_output());
+        assert_eq!(
+            canon_inmem, canon_spill,
+            "in-memory and spilled grace hash produced different output multisets",
+        );
+
+        // Also verify the strategy hint actually triggered grace hash
+        // selection — a regression where the planner falls back to
+        // HashBuildProbe would silently invalidate the bench's
+        // throughput comparison.
+        let cfg = clinker_core::yaml::from_str::<PipelineConfig>(&yaml_spill)
+            .expect("spill YAML must parse");
+        let plan = cfg
+            .compile(&clinker_core::config::CompileContext::default())
+            .expect("spill YAML must compile");
+        let combine_node = plan
+            .dag()
+            .graph
+            .node_indices()
+            .find(|i| matches!(plan.dag().graph[*i], PlanNode::Combine { .. }))
+            .expect("combine node must exist post-compile");
+        if let PlanNode::Combine { strategy, .. } = &plan.dag().graph[combine_node] {
+            assert!(
+                matches!(
+                    strategy,
+                    clinker_core::plan::combine::CombineStrategy::GraceHash { .. }
+                ),
+                "strategy: grace_hash hint must select CombineStrategy::GraceHash; got {strategy:?}",
+            );
+        } else {
+            panic!("combine node index no longer points at a Combine variant");
+        }
+    }
+}

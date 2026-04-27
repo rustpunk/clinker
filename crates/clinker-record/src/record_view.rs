@@ -27,11 +27,11 @@ impl<'a, S: RecordStorage + ?Sized> RecordView<'a, S> {
 }
 
 impl<S: RecordStorage + ?Sized> FieldResolver for RecordView<'_, S> {
-    fn resolve(&self, name: &str) -> Option<Value> {
+    fn resolve(&self, name: &str) -> Option<&Value> {
         self.storage.resolve_field(self.index, name)
     }
 
-    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
+    fn resolve_qualified(&self, source: &str, field: &str) -> Option<&Value> {
         self.storage.resolve_qualified(self.index, source, field)
     }
 
@@ -39,14 +39,14 @@ impl<S: RecordStorage + ?Sized> FieldResolver for RecordView<'_, S> {
         self.storage.available_fields(self.index)
     }
 
-    fn iter_fields(&self) -> Vec<(String, Value)> {
+    fn iter_fields(&self) -> Vec<(&str, &Value)> {
         let names = self.storage.available_fields(self.index);
         names
             .into_iter()
             .filter_map(|name| {
                 self.storage
                     .resolve_field(self.index, name)
-                    .map(|val| (name.to_string(), val))
+                    .map(|val| (name, val))
             })
             .collect()
     }

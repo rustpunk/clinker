@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
+use clinker_record::RecordStorage;
 use clinker_record::schema_def::FieldDef;
-use clinker_record::{RecordStorage, Value};
 
 // Re-export from clinker-record for backwards compatibility
 pub use clinker_record::{GroupByKey, GroupKeyError, value_to_group_key};
@@ -44,10 +44,10 @@ impl SecondaryIndex {
             for field_name in group_by {
                 let value = storage
                     .resolve_field(pos, field_name)
-                    .unwrap_or(Value::Null);
+                    .unwrap_or(&clinker_record::NULL);
 
                 let pin = schema_pins.get(field_name.as_str());
-                match value_to_group_key(&value, field_name, pin, pos)? {
+                match value_to_group_key(value, field_name, pin, pos)? {
                     Some(gk) => key.push(gk),
                     None => {
                         // Null value — exclude this record from all groups
@@ -103,11 +103,11 @@ mod tests {
     }
 
     impl RecordStorage for TestStorage {
-        fn resolve_field(&self, index: u32, name: &str) -> Option<Value> {
+        fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
             let col = self.schema.index(name)?;
-            self.records.get(index as usize)?.get(col).cloned()
+            self.records.get(index as usize)?.get(col)
         }
-        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<Value> {
+        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
             None
         }
         fn available_fields(&self, _: u32) -> Vec<&str> {

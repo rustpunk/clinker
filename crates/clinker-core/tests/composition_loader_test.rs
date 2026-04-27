@@ -1,5 +1,4 @@
-//! Integration tests for the Phase 1 composition workspace scanner
-//! (Task 16c.1.3).
+//! Integration tests for the composition workspace scanner.
 //!
 //! Uses on-disk fixture files to drive [`scan_workspace_signatures`] through
 //! its complete code path: filesystem walk, YAML parse, signature
@@ -14,28 +13,33 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Path to the committed 5-fixture corpus rewritten in Task 16c.1.3 to
-/// match the drill-canonical composition signature shape.
+/// Path to the committed 5-fixture corpus.
 fn fixture_workspace_root() -> PathBuf {
     manifest_dir().join("tests").join("fixtures")
 }
 
 // ---------------------------------------------------------------------
-// Task 16c.1.3 hard-gate tests
+// Scanner tests
 // ---------------------------------------------------------------------
 
 /// Gate 1: loading the committed `tests/fixtures/compositions/` dir
-/// returns `Ok` with exactly 5 entries, one per on-disk `.comp.yaml`.
+/// returns `Ok` with one entry per on-disk `.comp.yaml`. The corpus
+/// includes the five W101/structural fixtures, four body-executor
+/// fixtures (transform / nested / route+merge / runtime-error), and
+/// five combine-in-composition fixtures (combine_enrich,
+/// nested_combine, combine_after_transform, combine_collect,
+/// combine_bad_predicate) wired against the body executor's combine
+/// path.
 #[test]
 fn test_phase1_scanner_loads_all_fixtures() {
     let root = fixture_workspace_root();
-    let table =
-        scan_workspace_signatures(&root).expect("5-fixture corpus must load without errors");
+    let table = scan_workspace_signatures(&root)
+        .expect("composition fixture corpus must load without errors");
 
     assert_eq!(
         table.len(),
-        5,
-        "expected 5 composition signatures, got {}: {:?}",
+        16,
+        "expected 16 composition signatures, got {}: {:?}",
         table.len(),
         table.keys().collect::<Vec<_>>()
     );
@@ -48,6 +52,11 @@ fn test_phase1_scanner_loads_all_fixtures() {
         "dlq_shape",
         "nested_caller",
         "passthrough_check",
+        "combine_enrich",
+        "nested_combine",
+        "combine_after_transform",
+        "combine_collect",
+        "combine_bad_predicate",
     ] {
         assert!(
             names.contains(&expected),
@@ -79,7 +88,7 @@ fn test_phase1_scanner_emits_e101_on_malformed() {
 }
 
 /// Gate 3: exceeding the [`WORKSPACE_COMPOSITION_BUDGET`] returns an
-/// `Err` — budget enforced DURING the walk per LD-16c-17, not after.
+/// `Err` — budget enforced DURING the walk, not after.
 #[test]
 fn test_phase1_scanner_enforces_50_file_budget() {
     let tmp = tempfile::tempdir().expect("tempdir");

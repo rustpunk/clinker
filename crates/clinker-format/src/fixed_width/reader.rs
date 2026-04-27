@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::NaiveDate;
 use clinker_record::schema_def::{FieldDef, FieldType, Justify, LineSeparator};
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::error::FormatError;
 use crate::traits::FormatReader;
@@ -107,8 +107,11 @@ impl<R: Read> FixedWidthReader<R> {
             .map(ResolvedField::from_field_def)
             .collect::<Result<_, _>>()?;
 
-        let columns: Vec<Box<str>> = fields.iter().map(|f| f.name.as_str().into()).collect();
-        let schema = Arc::new(Schema::new(columns));
+        let schema = fields
+            .iter()
+            .map(|f| Box::<str>::from(f.name.as_str()))
+            .collect::<SchemaBuilder>()
+            .build();
         let record_length = resolved
             .iter()
             .map(|f| f.start + f.width)

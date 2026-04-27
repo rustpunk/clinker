@@ -1,0 +1,61 @@
+# 2-input combine, equi + range predicate combined.
+# Pattern: match orders to products on product_id AND require order amount
+# to clear a minimum product threshold (products.min_order exposed via schema).
+# Here we join orders to tax_brackets to keep the CSV surface small while
+# still exercising equi+range: equality on order_id (always true for the
+# per-row self-reference trick isn't useful), so use a synthetic pattern —
+# equi on a coarse bucket (product_id first digit) and range on amount.
+# For scaffold purposes the shape matters more than semantic realism.
+pipeline:
+  name: two_input_mixed
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: category, type: string }
+        - { name: min_order, type: int }
+        - { name: max_order, type: int }
+  - type: combine
+    name: qualified
+    input:
+      orders: orders
+      products: products
+    config:
+      # 1 equi + 2 range — exercises the full DecomposedPredicate shape
+      # called out in phase-c1 §RESOLUTION T-8. The strengthened
+      # `test_combine_decompose_mixed` asserts `ranges[0].op ==
+      # RangeOp::Ge` and `ranges[0].left_input == "orders"`
+      # (source-order-preserving split_conjunction).
+      where: "orders.product_id == products.product_id and orders.amount >= products.min_order and orders.amount < products.max_order"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_id = orders.product_id
+        emit product_name = products.name
+        emit amount = orders.amount
+        emit min_order = products.min_order
+        emit max_order = products.max_order
+  - type: output
+    name: qualified_out
+    input: qualified
+    config:
+      name: qualified_out
+      type: csv
+      path: /tmp/qualified_two_input_mixed.csv

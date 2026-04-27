@@ -16,8 +16,10 @@
 - [Aggregate Nodes](pipeline/aggregate.md)
 - [Route Nodes](pipeline/route.md)
 - [Merge Nodes](pipeline/merge.md)
+- [Combine Nodes](pipeline/combine.md)
 - [Output Nodes](pipeline/output.md)
 - [Error Handling & DLQ](pipeline/error-handling.md)
+- [Correlation Keys](pipeline/correlation-keys.md)
 - [Pipeline Variables](pipeline/variables.md)
 - [Channels](pipeline/channels.md)
 - [Compositions](pipeline/compositions.md)
@@ -56,7 +58,7 @@
 # Cookbook
 
 - [CSV-to-CSV Transform](cookbook/csv-transform.md)
-- [Multi-Source Lookup](cookbook/lookup.md)
+- [Multi-Input Combine](cookbook/combine.md)
 - [Routing to Multiple Outputs](cookbook/routing.md)
 - [Aggregation & Rollups](cookbook/aggregation.md)
 - [File Splitting](cookbook/file-splitting.md)

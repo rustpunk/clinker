@@ -4,8 +4,8 @@
 //! and stored on [`ExecutionPlanDag`](crate::plan::execution::ExecutionPlanDag).
 //! It is consumed by:
 //!
-//! - streaming aggregation qualification (Phase 16)
-//! - Phase 14 correlated DLQ sort-order lookup
+//! - streaming aggregation qualification
+//! - correlated DLQ sort-order lookup
 //! - `--explain` text and JSON rendering
 //! - Kiln canvas edge overlays
 //!
@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Computed once after transform compilation, stored on
 /// [`ExecutionPlanDag`](crate::plan::execution::ExecutionPlanDag), consumed
-/// by streaming-agg selection, Phase 14 correlated DLQ, `--explain`
-/// rendering, and Kiln canvas edge overlays.
+/// by streaming-agg selection, correlated DLQ, `--explain` rendering,
+/// and Kiln canvas edge overlays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeProperties {
     pub ordering: Ordering,
@@ -89,12 +89,22 @@ pub enum OrderingProvenance {
         parent_orderings: Vec<Option<Vec<SortField>>>,
         confidence: Confidence,
     },
+    /// Destroyed by a combine node: hash-build/probe (and IEJoin, grace
+    /// hash, etc.) does not preserve driving-input order. Combine always
+    /// emits unordered output at `at_node`; if a downstream consumer
+    /// requires sorted input, a sort must be inserted between the
+    /// combine and the consumer.
+    ///
+    /// Resolves Phase Combine §OQ-6.
+    DestroyedByCombine {
+        at_node: String,
+        confidence: Confidence,
+    },
     /// Source has no declared sort order.
     NoOrdering,
     /// Ordering asserted by a streaming aggregate's group-by prefix at
     /// `at_node`, enabled by an upstream `Ordering` provenance chain
-    /// (`enabled_by`). Phase 16 Task 16.4.0 introduces the variant; the
-    /// property-pass walker that produces it lands in Task 16.4.9a.
+    /// (`enabled_by`).
     IntroducedByStreamingAggregate {
         at_node: String,
         enabled_by: Box<OrderingProvenance>,
@@ -161,13 +171,13 @@ impl NodeProperties {
 /// `OrderingProvenance` chain hop-by-hop and emit one `note:` per
 /// destruction site, plus a primary `help:` selected on the terminal hop.
 ///
-/// The walker is also reused (Task 16.4.9) to populate
+/// The walker is also reused to populate
 /// `PlanNode::Aggregation::fallback_reason` when `Auto` resolves to `Hash`
 /// because eligibility was `HashFallback`, so Kiln canvas hover tooltips
 /// share a single source of truth with compile errors.
 ///
 /// Pure formatting — no I/O. Confidence-aware caret style is a
-/// Clinker-original UX (no prior-art precedent; see drill-pass-10 Q4).
+/// Clinker-original UX.
 pub fn render_unordered_streaming_error(
     parent_props: &NodeProperties,
     group_by: &[String],
@@ -256,6 +266,16 @@ pub fn render_unordered_streaming_error(
                 ));
                 break;
             }
+            OrderingProvenance::DestroyedByCombine {
+                at_node,
+                confidence,
+            } => {
+                let (caret, hedge) = caret_and_hedge(*confidence);
+                out.push_str(&format!(
+                    "  note: ordering {hedge}destroyed by combine `{at_node}`\n        {caret}\n"
+                ));
+                break;
+            }
         }
         hops += 1;
         if hops > 32 {
@@ -305,6 +325,12 @@ pub fn render_unordered_streaming_error(
             out.push_str(&format!(
                 "  help: parent orderings disagree at merge `{at_node}`; \
                  align them upstream or sort below the merge\n"
+            ));
+        }
+        OrderingProvenance::DestroyedByCombine { at_node, .. } => {
+            out.push_str(&format!(
+                "  help: combine `{at_node}` produces unordered output; \
+                 add a sort step between `{at_node}` and `{agg_name}`\n"
             ));
         }
         OrderingProvenance::Preserved { .. }
@@ -417,6 +443,27 @@ mod render_tests {
         );
         assert!(s.contains("destroyed by hash aggregate `ha`"));
         assert!(s.contains("add a sort step between `ha` and `agg`"));
+    }
+
+    /// C.1.4 gate (V-5-5): combine destruction renders as a
+    /// `DestroyedBy*`-shaped note + primary help, matching the other
+    /// `DestroyedBy*` render tests.
+    #[test]
+    fn test_render_destroyed_by_combine() {
+        let s = render_unordered_streaming_error(
+            &props(OrderingProvenance::DestroyedByCombine {
+                at_node: "enriched".to_string(),
+                confidence: Confidence::Proven,
+            }),
+            &["k".to_string()],
+            "agg",
+        );
+        assert!(s.contains("CXL0419"));
+        assert!(s.contains("destroyed by combine `enriched`"));
+        assert!(s.contains("^^^"));
+        assert!(s.contains("add a sort step between `enriched` and `agg`"));
+        assert!(s.contains("insert a sort step upstream of `agg`"));
+        assert!(s.contains("relax to `strategy: auto`"));
     }
 
     #[test]

@@ -7,11 +7,14 @@
 }
 
 html {
-    font-family: "Share Tech Mono", monospace;
+    font-family: "Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
     color: var(--fg);
     background-color: var(--bg);
     text-size-adjust: none;
     -webkit-text-size-adjust: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
 }
 
 body {
@@ -167,7 +170,7 @@ h1, h2, h3, h4, h5, h6 {
 
 .blueprint h1, .blueprint h2, .blueprint h3,
 .blueprint h4, .blueprint h5, .blueprint h6 {
-    font-family: "Share Tech Mono", monospace;
+    font-family: "Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
     font-weight: 400;
 }
 .blueprint h1, .blueprint h2, .blueprint h3 {
@@ -271,7 +274,7 @@ table thead th {
 
 .blueprint table thead td,
 .blueprint table thead th {
-    font-family: "Share Tech Mono", monospace;
+    font-family: "Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
     font-weight: 400;
     letter-spacing: 0.15em;
     color: #5A8A83;

@@ -1,0 +1,22 @@
+# Single-transform body. The body executor doubles inp.a into a
+# `computed` field; a pass-through stub would not produce that field,
+# so this fixture is the regression gate against re-introducing the
+# old pass-through arm.
+_compose:
+  name: exec_transform_check
+  inputs:
+    inp:
+      schema:
+        - { name: a, type: int }
+  outputs:
+    out: doubler
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: doubler
+    input: inp
+    config:
+      cxl: |
+        emit a = a
+        emit computed = a.to_int() * 2

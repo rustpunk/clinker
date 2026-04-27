@@ -1,0 +1,40 @@
+# Error fixture: reserved `$`-prefixed qualifier collides with CXL
+# system namespaces ($pipeline, $window, $meta) → E301.
+# C.1.1 gate test `test_combine_e301_reserved_namespace`.
+pipeline:
+  name: error_reserved_namespace
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: tests/fixtures/combine/data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: tests/fixtures/combine/data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+  - type: combine
+    name: reserved
+    input:
+      $pipeline: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+  - type: output
+    name: reserved_out
+    input: reserved
+    config:
+      name: reserved_out
+      type: csv
+      path: /tmp/error_reserved_namespace.csv

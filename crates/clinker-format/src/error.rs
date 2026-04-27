@@ -12,8 +12,21 @@ pub enum FormatError {
     Json(String),
     Xml(String),
     FixedWidth(String),
-    InvalidRecord { row: u64, message: String },
+    InvalidRecord {
+        row: u64,
+        message: String,
+    },
     SchemaInference(String),
+    /// Reader saw >64 off-schema keys on a single input record. The
+    /// partial record (first 64 off-schema keys captured into
+    /// `$meta.*`) travels with the error so the executor can route it
+    /// to DLQ. The 65th key (the one that triggered the cap) is
+    /// returned verbatim alongside.
+    MetadataCapExceeded {
+        record: clinker_record::Record,
+        key: String,
+        count: usize,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -28,6 +41,10 @@ impl fmt::Display for FormatError {
                 write!(f, "invalid record at row {row}: {message}")
             }
             Self::SchemaInference(msg) => write!(f, "schema inference failed: {msg}"),
+            Self::MetadataCapExceeded { key, count, .. } => write!(
+                f,
+                "per-record metadata cap exceeded at key {key:?} (captured {count} keys before the cap)"
+            ),
         }
     }
 }

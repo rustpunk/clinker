@@ -1,0 +1,6 @@
+order_id,order_date,quantity,unit_price,product_code,priority_level
+1,2024-01-15,5,29.99,PROD-A,urgent
+2,2024-01-16,10,15.50,PROD-B,normal
+3,2024-01-17,2,99.99,PROD-X,high
+4,2024-01-18,1,49.99,PROD-A,low
+5,2024-01-19,8,12.00,PROD-B,normal

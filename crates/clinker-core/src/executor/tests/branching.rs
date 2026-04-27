@@ -1,4 +1,4 @@
-//! Branch execution tests for Phase 15.
+//! Branch execution tests.
 //!
 //! Tests in this module exercise the DAG executor's branch dispatch,
 //! merge semantics, record conservation, and per-node execution strategy.
@@ -11,10 +11,11 @@ fn run_branch_test(
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
     let config = crate::config::parse_config(yaml).unwrap();
-    let output_buf = crate::test_helpers::SharedBuffer::new();
+    let output_buf = clinker_bench_support::io::SharedBuffer::new();
 
+    let primary = config.source_configs().next().unwrap().name.clone();
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.source_configs().next().unwrap().name.clone(),
+        primary.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
@@ -36,7 +37,8 @@ fn run_branch_test(
         shutdown_token: None,
     };
 
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
 
     let output = output_buf.as_string();
     Ok((report.counters, report.dlq_entries, output))
@@ -57,6 +59,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -140,6 +143,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -217,6 +221,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -281,13 +286,19 @@ nodes:
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
     let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
 
-    // id=1 (200): matches over_50 AND over_100 -> 2 records
-    // id=2 (50): matches nothing -> default (low) -> 1 record
-    // id=3 (75): matches over_50 only -> 1 record
-    // Total: 4 records output from 3 input records
+    // id=1 (200): matches over_50 AND over_100 -> 2 writes
+    // id=2 (50): matches nothing -> default (low) -> 1 write
+    // id=3 (75): matches over_50 only -> 1 write
+    // Dual counters:
+    //   ok_count = 3 (3 distinct input records all reached at least one Output)
+    //   records_written = 4 (id=1 fans out to 2 sinks, others to 1 each)
     assert_eq!(
-        counters.ok_count, 4,
-        "inclusive mode should duplicate records: {output}"
+        counters.ok_count, 3,
+        "ok_count should equal distinct successful inputs: {output}"
+    );
+    assert_eq!(
+        counters.records_written, 4,
+        "records_written should equal total writes (inclusive fan-out duplicates id=1): {output}"
     );
 }
 
@@ -306,6 +317,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -399,6 +411,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -484,6 +497,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -560,6 +574,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -629,15 +644,6 @@ nodes:
     assert!(output.contains("LOW"));
 }
 
-/// Route within a branch -> two levels of branching.
-#[test]
-#[ignore = "Task 15.4: nested routes require multiple CompiledRoute instances"]
-fn test_branch_nested_routes() {
-    // Nested routes require multiple compiled route instances which
-    // is not yet supported. The current implementation uses a single
-    // compiled_route. This test is deferred.
-}
-
 /// Branch A: enrichment, Branch B: filtering -- different transforms per branch.
 #[test]
 fn test_branch_different_transforms_per_branch() {
@@ -653,6 +659,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -672,14 +679,14 @@ nodes:
   name: enrich_high
   input: classify.high
   config:
-    cxl: 'emit enriched = id + "_premium"
+    cxl: 'emit enriched = id.concat("_premium")
 
       '
 - type: transform
   name: enrich_low
   input: classify.low
   config:
-    cxl: 'emit enriched = id + "_standard"
+    cxl: 'emit enriched = id.concat("_standard")
 
       '
 - type: merge
@@ -738,13 +745,14 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: string }
 
 - type: transform
   name: calc
   input: src
   config:
-    cxl: 'emit doubled = name + "_doubled"
+    cxl: 'emit doubled = name.concat("_doubled")
 
       '
 - type: output
@@ -785,13 +793,14 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: dept, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: stateless_calc
   input: src
   config:
-    cxl: 'emit label = dept + "_label"
+    cxl: 'emit label = dept.concat("_label")
 
       '
 - type: transform
@@ -844,6 +853,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -930,6 +940,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -951,14 +962,14 @@ nodes:
   name: mutate_a
   input: classify.branch_a
   config:
-    cxl: 'emit marker = "A_" + id
+    cxl: 'emit marker = "A_".concat(id)
 
       '
 - type: transform
   name: mutate_b
   input: classify.branch_b
   config:
-    cxl: 'emit marker = "B_" + id
+    cxl: 'emit marker = "B_".concat(id)
 
       '
 - type: merge
@@ -986,8 +997,18 @@ nodes:
     let csv = "id,amount\n1,100\n";
     let (counters, _, output) = run_branch_test(yaml, csv).unwrap();
 
-    // id=1 matches both branches (inclusive) -> 2 output records
-    assert_eq!(counters.ok_count, 2);
+    // id=1 matches both branches (inclusive) -> 2 writes from 1 input record.
+    // Dual counters:
+    //   ok_count = 1 (one distinct input reached at least one Output)
+    //   records_written = 2 (one write per branch reached)
+    assert_eq!(
+        counters.ok_count, 1,
+        "ok_count = distinct successful inputs"
+    );
+    assert_eq!(
+        counters.records_written, 2,
+        "records_written = total writes"
+    );
     // Branch A should have "A_1", Branch B should have "B_1"
     // They're independent — mutations in one don't affect the other
     assert!(output.contains("A_1"), "branch A marker: {output}");

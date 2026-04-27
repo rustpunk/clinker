@@ -6,24 +6,35 @@ use crate::storage::RecordStorage;
 
 /// Resolve a field name to a value from the current record.
 ///
-/// Object-safe: usable as `dyn FieldResolver`. All methods take `&self` —
-/// resolvers are shared references during evaluation. Returns owned `Value`
-/// (not borrowed) to avoid lifetime entanglement through the evaluator call
-/// chain — see spec SS11.4 for the rationale.
+/// Object-safe: usable as `dyn FieldResolver`. All methods take `&self`
+/// — resolvers are shared references during evaluation. Returns
+/// borrowed `&Value` (lifetime tied to `&self`) so the combine /
+/// transform body-evaluator hot path can short-circuit through
+/// coalesce, filter, and let-binding without cloning the underlying
+/// `Value::String(Box<str>)`. The clone happens at most once per
+/// field reference, at the eval-site that needs to keep the value
+/// past the next `resolve` call.
+///
+/// Resolvers that want to hand out a `&Value` for a logically-absent
+/// field (e.g. `CombineResolver` under `on_miss: null_fields`) can
+/// return `Some(&clinker_record::NULL)` — the module-level sentinel
+/// that exists solely to give these impls a stable address to borrow
+/// from.
 pub trait FieldResolver {
-    /// Unqualified field lookup: `field_name` → Value.
-    fn resolve(&self, name: &str) -> Option<Value>;
+    /// Unqualified field lookup: `field_name` → `&Value`.
+    fn resolve(&self, name: &str) -> Option<&Value>;
 
-    /// Qualified field lookup: `source.field` → Value.
-    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value>;
+    /// Qualified field lookup: `source.field` → `&Value`.
+    fn resolve_qualified(&self, source: &str, field: &str) -> Option<&Value>;
 
-    /// All available field names. Used for fuzzy-match diagnostics in Phase B.
+    /// All available field names. Used for fuzzy-match diagnostics.
     /// Lifetime tied to `&self` — zero-copy borrows from internal storage.
     fn available_fields(&self) -> Vec<&str>;
 
-    /// All fields as owned (name, value) pairs. Used for bare `distinct` (all-fields hash).
-    /// Returns owned Values to avoid lifetime entanglement through the evaluator.
-    fn iter_fields(&self) -> Vec<(String, Value)>;
+    /// All fields as borrowed `(&str, &Value)` pairs. Used for bare
+    /// `distinct` (all-fields hash) and the evaluator's record-level
+    /// iteration.
+    fn iter_fields(&self) -> Vec<(&str, &Value)>;
 }
 
 /// Access window partition data (Arena + Secondary Index).
@@ -115,25 +126,20 @@ impl HashMapResolver {
 }
 
 impl FieldResolver for HashMapResolver {
-    fn resolve(&self, name: &str) -> Option<Value> {
-        self.fields.get(name).cloned()
+    fn resolve(&self, name: &str) -> Option<&Value> {
+        self.fields.get(name)
     }
 
-    fn resolve_qualified(&self, source: &str, field: &str) -> Option<Value> {
-        self.qualified
-            .get(&(source.to_owned(), field.to_owned()))
-            .cloned()
+    fn resolve_qualified(&self, source: &str, field: &str) -> Option<&Value> {
+        self.qualified.get(&(source.to_owned(), field.to_owned()))
     }
 
     fn available_fields(&self) -> Vec<&str> {
         self.fields.keys().map(|s| s.as_str()).collect()
     }
 
-    fn iter_fields(&self) -> Vec<(String, Value)> {
-        self.fields
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+    fn iter_fields(&self) -> Vec<(&str, &Value)> {
+        self.fields.iter().map(|(k, v)| (k.as_str(), v)).collect()
     }
 }
 
@@ -145,10 +151,10 @@ mod tests {
     struct DummyStorage;
 
     impl RecordStorage for DummyStorage {
-        fn resolve_field(&self, _index: u32, _name: &str) -> Option<Value> {
+        fn resolve_field(&self, _index: u32, _name: &str) -> Option<&Value> {
             None
         }
-        fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<Value> {
+        fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<&Value> {
             None
         }
         fn available_fields(&self, _index: u32) -> Vec<&str> {

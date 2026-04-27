@@ -1,11 +1,10 @@
 /// Derives canvas-renderable stage data from a `PipelineConfig`.
 ///
-/// Phase 16b Task 16b.5: the canvas dispatches on `PipelineNode` variants
-/// directly. Every variant — Source, Transform, Aggregate, Route, Merge,
-/// Output, Composition — maps 1:1 to a [`StageKind`] via an exhaustive
-/// `match` in [`stage_kind_for_node`], so adding a new variant to
-/// `PipelineNode` is a compile-time break. Composition renders as a
-/// placeholder badge until Phase 16c supplies real rendering.
+/// The canvas dispatches on `PipelineNode` variants directly. Every variant —
+/// Source, Transform, Aggregate, Route, Merge, Output, Composition — maps 1:1
+/// to a [`StageKind`] via an exhaustive `match` in [`stage_kind_for_node`], so
+/// adding a new variant to `PipelineNode` is a compile-time break. Composition
+/// currently renders as a placeholder badge pending full sub-canvas rendering.
 use clinker_core::config::node_header::NodeInput;
 use clinker_core::config::{PipelineConfig, PipelineNode};
 
@@ -19,6 +18,7 @@ pub enum StageKind {
     Aggregate,
     Route,
     Merge,
+    Combine,
     Output,
     Composition,
     Error,
@@ -32,6 +32,7 @@ impl StageKind {
             StageKind::Aggregate => "aggregate",
             StageKind::Route => "route",
             StageKind::Merge => "merge",
+            StageKind::Combine => "combine",
             StageKind::Output => "output",
             StageKind::Composition => "composition",
             StageKind::Error => "error",
@@ -45,6 +46,7 @@ impl StageKind {
             StageKind::Aggregate => "AGGREGATE",
             StageKind::Route => "ROUTE",
             StageKind::Merge => "MERGE",
+            StageKind::Combine => "COMBINE",
             StageKind::Output => "OUTPUT",
             StageKind::Composition => "COMPOSITION",
             StageKind::Error => "ERROR",
@@ -62,6 +64,7 @@ pub fn stage_kind_for_node(node: &PipelineNode) -> StageKind {
         PipelineNode::Aggregate { .. } => StageKind::Aggregate,
         PipelineNode::Route { .. } => StageKind::Route,
         PipelineNode::Merge { .. } => StageKind::Merge,
+        PipelineNode::Combine { .. } => StageKind::Combine,
         PipelineNode::Output { .. } => StageKind::Output,
         PipelineNode::Composition { .. } => StageKind::Composition,
     }
@@ -113,12 +116,11 @@ pub struct PipelineView {
     pub connections: Vec<(usize, usize)>,
 }
 
-/// Phase 16b Task 16b.5: walk `config.nodes` in declaration order and
-/// dispatch on `PipelineNode` variant to produce a [`StageView`] for every
-/// node. Connections are derived from each consumer's `input:` / `inputs:`
-/// header field. The match arms here mirror [`stage_kind_for_node`]; both
-/// are compile-time exhaustive, so adding a new `PipelineNode` variant is
-/// a build error.
+/// Walk `config.nodes` in declaration order and dispatch on `PipelineNode`
+/// variant to produce a [`StageView`] for every node. Connections are derived
+/// from each consumer's `input:` / `inputs:` header field. The match arms
+/// here mirror [`stage_kind_for_node`]; both are compile-time exhaustive, so
+/// adding a new `PipelineNode` variant is a build error.
 pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
     use std::collections::HashMap;
 
@@ -133,7 +135,14 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             PipelineNode::Merge { header, .. } => header
                 .inputs
                 .iter()
-                .filter_map(|ni| name_to_idx.get(node_input_name(ni)).copied())
+                .filter_map(|ni| name_to_idx.get(node_input_name(&ni.value)).copied())
+                .map(|i| cols[i] + 1)
+                .max()
+                .unwrap_or(1),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|ni| name_to_idx.get(node_input_name(&ni.value)).copied())
                 .map(|i| cols[i] + 1)
                 .max()
                 .unwrap_or(1),
@@ -142,7 +151,7 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Composition { header, .. } => name_to_idx
-                .get(node_input_name(&header.input))
+                .get(node_input_name(&header.input.value))
                 .copied()
                 .map(|i| cols[i] + 1)
                 .unwrap_or(1),
@@ -177,7 +186,14 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             PipelineNode::Source { .. } => {}
             PipelineNode::Merge { header, .. } => {
                 for ni in &header.inputs {
-                    if let Some(&from) = name_to_idx.get(node_input_name(ni)) {
+                    if let Some(&from) = name_to_idx.get(node_input_name(&ni.value)) {
+                        connections.push((from, idx));
+                    }
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for ni in header.input.values() {
+                    if let Some(&from) = name_to_idx.get(node_input_name(&ni.value)) {
                         connections.push((from, idx));
                     }
                 }
@@ -187,7 +203,7 @@ pub fn derive_pipeline_view(config: &PipelineConfig) -> PipelineView {
             | PipelineNode::Route { header, .. }
             | PipelineNode::Output { header, .. }
             | PipelineNode::Composition { header, .. } => {
-                if let Some(&from) = name_to_idx.get(node_input_name(&header.input)) {
+                if let Some(&from) = name_to_idx.get(node_input_name(&header.input.value)) {
                     connections.push((from, idx));
                 }
             }
@@ -291,6 +307,23 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             description: header.description.clone(),
             error_message: None,
         },
+        PipelineNode::Combine {
+            header,
+            config: body,
+        } => {
+            let cxl_src: &str = body.cxl.as_ref();
+            StageView {
+                id: header.name.clone(),
+                label: header.name.clone(),
+                kind,
+                subtitle: format!("{} inputs", header.input.len()),
+                canvas_x: x,
+                canvas_y: y,
+                cxl_source: Some(cxl_src.to_string()),
+                description: header.description.clone(),
+                error_message: None,
+            }
+        }
         PipelineNode::Output {
             header,
             config: body,
@@ -309,7 +342,7 @@ fn build_stage_view(node: &PipelineNode, x: f32, y: f32) -> StageView {
             id: header.name.clone(),
             label: header.name.clone(),
             kind,
-            subtitle: format!("use: {} (Phase 16c)", r#use.display()),
+            subtitle: format!("use: {}", r#use.display()),
             canvas_x: x,
             canvas_y: y,
             cxl_source: None,
@@ -537,18 +570,57 @@ fn cxl_subtitle(cxl: &str) -> String {
         .collect()
 }
 
-/// Derive canvas nodes from a `BoundBody`'s `PlanNode` list.
+/// Derive canvas nodes from a `BoundBody`'s mini-DAG.
 ///
 /// Used when drilled into a composition: the sub-canvas renders the
-/// composition's internal nodes. Layout is a simple left-to-right chain.
+/// composition's internal nodes. Layout walks `body.topo_order` and
+/// places each node at column = 1 + max(predecessor columns), then
+/// stacks per-column rows with the same `STAGGER_Y` / `STACK_GAP`
+/// constants as `derive_pipeline_view`. Edges come from
+/// `body.graph.edge_references()` so route, merge, and combine
+/// branches all render as the real DAG instead of a synthetic chain.
 pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) -> PipelineView {
     use clinker_core::plan::execution::PlanNode;
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+    use petgraph::visit::EdgeRef;
+    use std::collections::HashMap;
 
-    let mut stages = Vec::with_capacity(body.nodes.len());
+    // Column = 1 + max column of incoming neighbors; nodes with no
+    // incoming edges (sources, port-seed nodes) sit at column 0.
+    let mut cols: HashMap<NodeIndex, usize> = HashMap::with_capacity(body.topo_order.len());
+    for &idx in &body.topo_order {
+        let col = body
+            .graph
+            .neighbors_directed(idx, Direction::Incoming)
+            .filter_map(|p| cols.get(&p).copied())
+            .map(|c| c + 1)
+            .max()
+            .unwrap_or(0);
+        cols.insert(idx, col);
+    }
 
-    for (idx, plan_node) in body.nodes.iter().enumerate() {
-        let x = LEFT_MARGIN + idx as f32 * (NODE_WIDTH + NODE_GAP);
-        let y = BASE_Y;
+    // Per-column row counter for vertical stacking; matches the
+    // top-level layout's stagger pattern so a body view feels visually
+    // consistent with the parent canvas.
+    let mut col_rows: HashMap<usize, usize> = HashMap::new();
+    let mut idx_to_slot: HashMap<NodeIndex, usize> = HashMap::with_capacity(body.topo_order.len());
+    let mut stages: Vec<StageView> = Vec::with_capacity(body.topo_order.len());
+
+    for &node_idx in &body.topo_order {
+        let plan_node = &body.graph[node_idx];
+        let col = cols.get(&node_idx).copied().unwrap_or(0);
+        let row = *col_rows
+            .entry(col)
+            .and_modify(|r| *r += 1)
+            .or_insert(0_usize);
+        let x = LEFT_MARGIN + (col as f32) * (NODE_WIDTH + NODE_GAP);
+        let stagger = if col.is_multiple_of(2) {
+            0.0
+        } else {
+            STAGGER_Y
+        };
+        let y = BASE_Y + (row as f32) * (NODE_HEIGHT + STACK_GAP) + stagger;
 
         let (id, kind, subtitle) = match plan_node {
             PlanNode::Source { name, .. } => (name.clone(), StageKind::Source, String::new()),
@@ -565,8 +637,18 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
             PlanNode::Composition { name, .. } => {
                 (name.clone(), StageKind::Composition, String::new())
             }
+            PlanNode::Combine { name, strategy, .. } => {
+                (name.clone(), StageKind::Combine, format!("{strategy:?}"))
+            }
+            PlanNode::CorrelationCommit { name, .. } => (
+                name.clone(),
+                StageKind::Transform,
+                "correlation_commit".into(),
+            ),
         };
 
+        let slot = stages.len();
+        idx_to_slot.insert(node_idx, slot);
         stages.push(StageView {
             id,
             label: plan_node.name().to_string(),
@@ -580,9 +662,17 @@ pub fn derive_body_view(body: &clinker_core::plan::composition_body::BoundBody) 
         });
     }
 
-    // Simple sequential connections for body nodes
-    let connections: Vec<(usize, usize)> = (0..stages.len().saturating_sub(1))
-        .map(|i| (i, i + 1))
+    // Walk every edge in the mini-DAG and translate it to a slot
+    // pair. Stages were pushed in topo order, so every edge's source
+    // and target are already in `idx_to_slot`.
+    let connections: Vec<(usize, usize)> = body
+        .graph
+        .edge_references()
+        .filter_map(|e| {
+            let from = idx_to_slot.get(&e.source()).copied()?;
+            let to = idx_to_slot.get(&e.target()).copied()?;
+            Some((from, to))
+        })
         .collect();
 
     PipelineView {
@@ -596,10 +686,10 @@ mod task_16b_5_tests {
     use super::*;
     use clinker_core::config::parse_config;
 
-    /// Phase 16b Task 16b.5 gate test: compile-time exhaustiveness of the
-    /// variant dispatch. This function returns a distinct `StageKind` for
-    /// every `PipelineNode` variant; adding a new variant without updating
-    /// [`stage_kind_for_node`] is a build error.
+    /// Compile-time exhaustiveness of the variant dispatch: this function
+    /// returns a distinct `StageKind` for every `PipelineNode` variant;
+    /// adding a new variant without updating [`stage_kind_for_node`] is a
+    /// build error.
     #[test]
     fn test_canvas_node_dispatches_on_variant() {
         // Use a minimal unified-shape YAML exercising every variant so the
@@ -664,9 +754,9 @@ nodes:
         assert!(has(&StageKind::Output));
     }
 
-    /// Phase 16b Task 16b.5 gate test: a legacy-shape fixture lifted into
-    /// the unified `nodes:` topology still renders via the variant-dispatch
-    /// code path and produces the expected stage count.
+    /// A legacy-shape fixture lifted into the unified `nodes:` topology
+    /// still renders via the variant-dispatch code path and produces the
+    /// expected stage count.
     #[test]
     fn test_kiln_loads_migrated_fixture() {
         let yaml = r#"
@@ -737,9 +827,8 @@ nodes:
         assert!(!view.connections.is_empty());
     }
 
-    /// Phase 16b Task 16b.5 gate test: a pipeline containing a
-    /// `PipelineNode::Composition` stub renders it as a placeholder stage
-    /// (Phase 16c badge subtitle) without panic.
+    /// A pipeline containing a `PipelineNode::Composition` stub renders it
+    /// as a placeholder stage (badge subtitle) without panic.
     #[test]
     fn test_kiln_composition_placeholder_renders() {
         let yaml = r#"
@@ -770,8 +859,8 @@ nodes:
             .expect("composition stage present");
         assert_eq!(comp.label, "sub");
         assert!(
-            comp.subtitle.contains("Phase 16c"),
-            "placeholder subtitle should mention Phase 16c, got: {}",
+            comp.subtitle.starts_with("use: "),
+            "composition subtitle should show the `use:` path, got: {}",
             comp.subtitle
         );
         // Badge text is the authoritative kind label.

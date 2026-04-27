@@ -1,10 +1,10 @@
-//! Multi-output routing tests for Phase 13.
+//! Multi-output routing tests.
 //!
 //! Tests in this module exercise the multi-writer registry, route condition
 //! evaluation, per-output channels, and DLQ stage/route extensions.
 
 use super::*;
-use crate::test_helpers::SharedBuffer;
+use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
 /// Build a multi-output test fixture with the given YAML config.
@@ -58,6 +58,26 @@ fn test_eval_context() -> cxl::eval::EvalContext<'static> {
     }
 }
 
+/// Helper: assemble a Record from an `(emitted, metadata)` field pair
+/// for the post-rip `CompiledRoute::evaluate(&Record, ...)` shape.
+/// Schema columns take insertion order of `emitted`; metadata writes
+/// route through `Record::set_meta` so the resolver's `$meta.*`
+/// prefix-strip sees them.
+fn test_record(
+    emitted: &indexmap::IndexMap<String, Value>,
+    metadata: &indexmap::IndexMap<String, Value>,
+) -> clinker_record::Record {
+    use std::sync::Arc;
+    let columns: Vec<Box<str>> = emitted.keys().map(|k| k.as_str().into()).collect();
+    let schema = Arc::new(clinker_record::Schema::new(columns));
+    let values: Vec<Value> = emitted.values().cloned().collect();
+    let mut record = clinker_record::Record::new(schema, values);
+    for (key, value) in metadata {
+        let _ = record.set_meta(key, value.clone());
+    }
+    record
+}
+
 // --- Route evaluation unit tests ---
 
 #[test]
@@ -78,7 +98,7 @@ default: low
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(50000))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["high"]);
 }
@@ -101,7 +121,7 @@ default: low
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["medium"]);
 }
@@ -124,7 +144,7 @@ default: low
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(500))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["low"]);
 }
@@ -147,7 +167,7 @@ default: standard
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["audit", "report"]);
 }
@@ -172,7 +192,7 @@ default: standard
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(5000))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["report"]);
 }
@@ -195,7 +215,7 @@ default: standard
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Integer(100))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["standard"]);
 }
@@ -220,7 +240,7 @@ default: standard
         ("country".to_string(), Value::String("UK".into())),
     ]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["intl_high"]);
 
@@ -230,7 +250,7 @@ default: standard
         ("country".to_string(), Value::String("US".into())),
     ]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["standard"]);
 }
@@ -250,7 +270,7 @@ default: standard
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("amount".to_string(), Value::Null)]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     // Null > 10000 is not true → default
     assert_eq!(targets, vec!["standard"]);
@@ -272,7 +292,7 @@ default: standard
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("computed_score".to_string(), Value::Integer(95))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["high"]);
 }
@@ -295,7 +315,7 @@ default: regular
     let ctx = test_eval_context();
     let emitted = indexmap::IndexMap::from([("tier".to_string(), Value::String("gold".into()))]);
     let targets = route
-        .evaluate(&emitted, &indexmap::IndexMap::new(), &ctx)
+        .evaluate(&test_record(&emitted, &indexmap::IndexMap::new()), &ctx)
         .unwrap();
     assert_eq!(targets, vec!["vip"]);
 }
@@ -310,8 +330,9 @@ fn run_multi_output(
     let (config, buffers) = multi_output_fixture(yaml);
     let params = test_params(&config);
 
+    let primary = config.source_configs().next().unwrap().name.clone();
     let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        config.source_configs().next().unwrap().name.clone(),
+        primary.clone(),
         Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
             as Box<dyn std::io::Read + Send>,
     )]);
@@ -325,7 +346,8 @@ fn run_multi_output(
         })
         .collect();
 
-    let report = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)?;
+    let report =
+        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
@@ -349,6 +371,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -417,6 +440,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -482,6 +506,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -543,6 +568,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -642,6 +668,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -696,7 +723,8 @@ nodes:
         ),
     ]);
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     assert!(result.is_err(), "should propagate writer error");
 }
 
@@ -714,6 +742,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -761,7 +790,18 @@ nodes:
     let csv = "id,amount\n1,500\n2,30\n";
     let (counters, _, outputs) = run_multi_output(yaml, csv).unwrap();
 
-    assert_eq!(counters.ok_count, 2);
+    // Dual counters:
+    //   ok_count = 2 (both input records reached at least one Output)
+    //   records_written = 3 (record 1 fans out to {audit, report},
+    //                        record 2 routes to {standard})
+    assert_eq!(
+        counters.ok_count, 2,
+        "ok_count should be 2 distinct successful inputs"
+    );
+    assert_eq!(
+        counters.records_written, 3,
+        "records_written should be 3 — record 1 written to 2 sinks + record 2 to 1 sink"
+    );
 
     // Record 1 should appear in both audit and report
     assert!(outputs["audit"].contains("1,500"));
@@ -826,6 +866,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -918,6 +959,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -974,7 +1016,7 @@ nodes:
 
     // Panic should be caught and propagated, not hang or abort
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params)
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params)
     }));
 
     // The panic is re-raised via resume_unwind, so catch_unwind catches it
@@ -1004,6 +1046,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1087,6 +1130,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1144,7 +1188,8 @@ nodes:
     ]);
 
     // Should not deadlock — producer handles SendError::Disconnected
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     // Either error (from the dying writer) or success if the writer survived long enough
     // The key assertion: no deadlock, no hang — the test completes
     let _ = result;
@@ -1178,6 +1223,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1231,19 +1277,25 @@ nodes:
         ),
     ]);
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+    // The DAG-walk Output arm collects every Output's write/flush
+    // failure across the topo walk before aggregating into
+    // PipelineError::Multiple. With both writers failing on flush, the
+    // result MUST be Multiple with both errors — strictly tighter than
+    // the old matcher that accepted `Multiple | Io | Format(Io)` to
+    // tolerate a first-fail short-circuit.
     match result {
         Err(PipelineError::Multiple(errors)) => {
             assert_eq!(errors.len(), 2, "should collect both flush errors");
         }
-        Err(PipelineError::Io(_)) => {
-            // If only one error collected (order-dependent), that's also acceptable
+        other => {
+            panic!("expected PipelineError::Multiple with 2 collected flush errors, got: {other:?}")
         }
-        other => panic!("expected Multiple or Io error, got: {other:?}"),
     }
 }
 
-// --- DLQ stage/route extension tests (Task 13.6) ---
+// --- DLQ stage/route extension tests ---
 
 #[test]
 fn test_dlq_stage_source() {
@@ -1282,6 +1334,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1323,8 +1376,8 @@ nodes:
     assert_eq!(dlq.len(), 1);
     assert_eq!(
         dlq[0].stage,
-        Some("transform:classify".to_string()),
-        "stage should be transform:classify"
+        Some("transform:classify_emit".to_string()),
+        "stage should be transform:classify_emit"
     );
     assert_eq!(
         dlq[0].route, None,
@@ -1349,6 +1402,8 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
+      - { name: zero, type: string }
 
 - type: transform
   name: calc_emit
@@ -1436,6 +1491,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: classify_emit
@@ -1539,6 +1595,7 @@ nodes:
     type: csv
     schema:
       - { name: id, type: string }
+      - { name: amount, type: string }
 
 - type: transform
   name: calc
@@ -1584,7 +1641,7 @@ nodes:
     assert!(header.contains("_cxl_dlq_route"));
 }
 
-// --- HashMap registry backward compat tests (Task 13.2) ---
+// --- HashMap registry backward compat tests ---
 
 #[test]
 fn test_single_writer_hashmap_backward_compat() {
@@ -1600,6 +1657,7 @@ nodes:
     path: input.csv
     schema:
       - { name: id, type: string }
+      - { name: name, type: string }
 
 - type: transform
   name: identity
@@ -1638,7 +1696,8 @@ nodes:
         })
         .collect();
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     assert!(
         result.is_ok(),
         "single-writer HashMap should work: {result:?}"
@@ -1662,7 +1721,7 @@ nodes:
     type: csv
     path: input.csv
     schema:
-      - { name: id, type: string }
+      - { name: x, type: string }
 
 - type: transform
   name: identity
@@ -1701,7 +1760,8 @@ nodes:
         })
         .collect();
 
-    let result = PipelineExecutor::run_with_readers_writers(&config, readers, writers, &params);
+    let result =
+        PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
     assert!(
         result.is_ok(),
         "single-reader HashMap should work: {result:?}"
@@ -1714,7 +1774,7 @@ nodes:
     );
 }
 
-// --- Route condition typecheck tests (Task 13.3) ---
+// --- Route condition typecheck tests ---
 
 #[test]
 fn test_route_config_non_boolean_condition_typecheck_error() {

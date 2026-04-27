@@ -31,7 +31,7 @@ fn compile_fixture(rel_pipeline_path: &str) -> clinker_core::plan::CompiledPlan 
     clinker_core::config::PipelineConfig::compile(&config, &ctx).expect("compile fixture")
 }
 
-// ── Gate tests for Task 16c.4.3 ─────────────────────────────────────────
+// ── Channel overlay merge tests ─────────────────────────────────────────
 
 #[test]
 fn test_channel_overlay_applies_fixed_binding_wins() {

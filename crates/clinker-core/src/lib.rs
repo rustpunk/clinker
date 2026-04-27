@@ -22,9 +22,6 @@ pub mod span;
 pub mod validation;
 pub mod yaml;
 
-#[cfg(test)]
-pub mod test_helpers;
-
 pub use config::{
     CompileContext, CompositionFile, CompositionSignature, CompositionSymbolTable, NodeRef,
     OutputAlias, ParamDecl, ParamName, ParamType, PortDecl, PortName, ResourceDecl, ResourceKind,
@@ -32,7 +29,9 @@ pub use config::{
     scan_workspace_signatures, validate_signatures,
 };
 pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
-pub use plan::{BoundBody, ColumnLookup, CompositionBodyId, Row, RowTail, TailVarId};
+pub use plan::{
+    BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
+};
 
 #[allow(unused_imports)]
 use clinker_record::{PipelineCounters, Record, RecordProvenance, Schema, Value};

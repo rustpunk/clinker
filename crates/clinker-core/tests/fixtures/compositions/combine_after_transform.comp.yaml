@@ -1,0 +1,49 @@
+# Body has a transform that preprocesses the orders port (adding a
+# normalized field), then a combine that joins the transformed
+# stream against the products port on product_id. Verifies that a
+# combine's `input:` map can reference a body-scope NODE name
+# (`normalize_orders`) rather than a port name — schema-by-name
+# lookup resolves both shapes uniformly.
+_compose:
+  name: combine_after_transform
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+    discount_table:
+      schema:
+        - { name: product_id, type: string }
+        - { name: discount_pct, type: float }
+  outputs:
+    enriched: join_products
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: normalize_orders
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+        emit quantity = quantity
+        emit doubled_quantity = quantity * 2
+  - type: combine
+    name: join_products
+    input:
+      orders: normalize_orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+        emit doubled_quantity = orders.doubled_quantity

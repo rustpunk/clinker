@@ -1,4 +1,4 @@
-//! YAML parser chokepoint (Phase 16b Task 16b.0.5).
+//! YAML parser chokepoint.
 //!
 //! This module is the **single** entry point for YAML parsing in clinker.
 //! No other code path is permitted to call `serde_saphyr::from_str*` or
@@ -8,14 +8,13 @@
 //!    upstream maintainer. If we ever need to fork or replace it, this
 //!    file is the only thing that has to change.
 //! 2. **DoS-defense chokepoint.** A single [`Budget`] keeps depth /
-//!    size / alias-expansion / include limits aligned with the Phase 11
-//!    threat model (assumption #66). Tightening the limits is a one-file
-//!    edit.
+//!    size / alias-expansion / include limits aligned with the
+//!    documented threat model. Tightening the limits is a one-file edit.
 //!
 //! ## Span support
 //!
 //! Re-exports [`serde_saphyr::Spanned`], [`serde_saphyr::Location`], and
-//! [`serde_saphyr::Span`]. The Phase 16b lift carries
+//! [`serde_saphyr::Span`]. Pipeline configs carry
 //! `Vec<Spanned<PipelineNode>>` at the top level — wrapping the **whole**
 //! enum (not the inner fields) is the documented workaround for
 //! `Spanned<T>` losing location info inside `#[serde(tag = "...")]`
@@ -124,7 +123,7 @@ fn make_oversize_error(actual: usize) -> serde_saphyr::Error {
 
 /// A CXL expression source string carrying its YAML origin span.
 ///
-/// `CxlSource` is the per-CXL-string span vehicle for Phase 16b. It
+/// `CxlSource` is the per-CXL-string span vehicle. It
 /// piggybacks on [`Spanned<String>`]'s deserializer so the field captures
 /// non-zero span information whenever it appears in a normal struct
 /// context. When buried inside a `#[serde(tag = "...")]` enum variant
@@ -204,7 +203,7 @@ impl PartialEq for CxlSource {
 impl Eq for CxlSource {}
 
 // ---------------------------------------------------------------------
-// Spike + budget tests (Task 16b.0.5 hard gate)
+// Spike + budget tests
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -312,6 +311,123 @@ nodes:
         );
     }
 
+    // ---- Spike 3a: Spanned<T> at IndexMap<String, _> value position -
+    //
+    // Verifies that serde-saphyr's `Spanned<T>` captures real source
+    // locations when positioned as the value of an IndexMap. This is
+    // the shape `CombineHeader.input: IndexMap<String, Spanned<NodeInput>>`
+    // relies on for field-level span accuracy on combine input references.
+
+    #[derive(Deserialize)]
+    struct MapHolder {
+        input: indexmap::IndexMap<String, Spanned<String>>,
+    }
+
+    // ---- Spike 3b: Spanned<T> survives a custom-Visitor dispatch -----
+    //
+    // Verifies that when a custom `Visitor::visit_map` handler delegates
+    // to an inner struct's deserialization via `MapAccessDeserializer`,
+    // `Spanned<T>` fields inside that struct still capture real spans.
+    // This is the exact mechanism the pre-C.1 `PipelineNode` custom-
+    // Deserialize impl relies on — if this fails, no amount of visitor
+    // gymnastics saves the refactor.
+
+    #[derive(Deserialize)]
+    struct InnerWithSpan {
+        #[allow(dead_code)]
+        name: String,
+        input: indexmap::IndexMap<String, Spanned<String>>,
+    }
+
+    struct DispatchHolder(InnerWithSpan);
+
+    impl<'de> Deserialize<'de> for DispatchHolder {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = DispatchHolder;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a map")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let inner = InnerWithSpan::deserialize(
+                        serde::de::value::MapAccessDeserializer::new(map),
+                    )?;
+                    Ok(DispatchHolder(inner))
+                }
+            }
+            deserializer.deserialize_map(V)
+        }
+    }
+
+    #[test]
+    fn test_spanned_survives_mapaccess_deserializer_dispatch() {
+        let yaml = "# line 1 comment\nname: dispatch_test\ninput:\n  orders: raw_orders\n  products: product_source\n";
+        let parsed: DispatchHolder = from_str(yaml).expect("parse DispatchHolder");
+        let orders = parsed.0.input.get("orders").expect("orders key present");
+        let products = parsed
+            .0
+            .input
+            .get("products")
+            .expect("products key present");
+        assert_ne!(
+            orders.referenced,
+            Location::UNKNOWN,
+            "orders value must carry a real location even through MapAccessDeserializer dispatch"
+        );
+        assert_ne!(
+            products.referenced,
+            Location::UNKNOWN,
+            "products value must carry a real location even through MapAccessDeserializer dispatch"
+        );
+        assert!(
+            orders.referenced.line() >= 1,
+            "orders value line must be >= 1, got {}",
+            orders.referenced.line()
+        );
+        assert!(
+            products.referenced.line() > orders.referenced.line(),
+            "products line must be after orders; got products={} orders={}",
+            products.referenced.line(),
+            orders.referenced.line()
+        );
+    }
+
+    #[test]
+    fn test_spanned_at_indexmap_value_position_captures_real_spans() {
+        let yaml = "# line 1 comment\ninput:\n  orders: raw_orders\n  products: product_source\n";
+        let parsed: MapHolder = from_str(yaml).expect("parse MapHolder");
+        let orders = parsed.input.get("orders").expect("orders key present");
+        let products = parsed.input.get("products").expect("products key present");
+        assert_ne!(
+            orders.referenced,
+            Location::UNKNOWN,
+            "orders value must carry a real location (got UNKNOWN — the IndexMap<String, Spanned<T>> path needs a newtype fallback)"
+        );
+        assert_ne!(
+            products.referenced,
+            Location::UNKNOWN,
+            "products value must carry a real location (got UNKNOWN — the IndexMap<String, Spanned<T>> path needs a newtype fallback)"
+        );
+        assert!(
+            orders.referenced.line() >= 1,
+            "orders value line must be >= 1, got {}",
+            orders.referenced.line()
+        );
+        assert!(
+            products.referenced.line() > orders.referenced.line(),
+            "products value line must be after orders (insertion-order preservation + different lines); got products={} orders={}",
+            products.referenced.line(),
+            orders.referenced.line()
+        );
+    }
+
     // ---- Spike 3: alias / anchor span resolution ---------------------
 
     #[test]
@@ -379,7 +495,7 @@ nodes:
                 };
                 // Use the raw saphyr value type to confirm the bytes
                 // parse without imposing a schema (fixture shape changes
-                // are validated by Phase 16b downstream tests).
+                // are validated by downstream tests).
                 let parsed: Result<serde_json::Value, _> = from_str(&text);
                 // Either it parses, or it fails on a *schema* mismatch
                 // (which is fine here — we only care that the parser

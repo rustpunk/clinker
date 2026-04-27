@@ -294,7 +294,7 @@ pub fn CanvasPanel() -> Element {
                             disabled: count < 2,
                             title: if count < 2 { "Select 2+ nodes to extract as composition" } else { "Extract selected nodes as a composition" },
                             onclick: move |_| {
-                                // TODO: open extraction modal (Phase 16c.6.4)
+                                // TODO: open extraction modal.
                             },
                             span { class: "kiln-view-toggle-label", "EXTRACT" }
                         }

@@ -19,7 +19,7 @@ fn parse_pipeline(yaml: &str) -> clinker_core::config::PipelineConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Existing scaffold tests (from 16c.2.0 + 16c.2.1)
+// Scaffold tests for composition binding.
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -47,9 +47,15 @@ fn test_compile_artifacts_insert_body_and_lookup() {
 
     let body = BoundBody {
         signature_path: "compositions/test.comp.yaml".into(),
-        nodes: vec![],
-        bound_schemas: Default::default(),
+        graph: petgraph::graph::DiGraph::new(),
+        topo_order: Vec::new(),
+        name_to_idx: std::collections::HashMap::new(),
+        port_name_to_node_idx: std::collections::HashMap::new(),
+        body_rows: std::collections::HashMap::new(),
+        node_input_refs: std::collections::HashMap::new(),
+        route_bodies: std::collections::HashMap::new(),
         output_port_rows: IndexMap::new(),
+        output_port_to_node_idx: IndexMap::new(),
         input_port_rows: IndexMap::new(),
         nested_body_ids: vec![],
     };
@@ -89,7 +95,7 @@ fn test_pipeline_node_composition_serde_skips_body_field() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Task 16c.2.2 hard-gate tests
+// Composition-binding gate tests
 // ─────────────────────────────────────────────────────────────────────
 
 /// Gate 1: A pipeline with one composition call site, after compile(ctx),
@@ -145,6 +151,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     // Verify: composition_body_assignments has an entry for "enrich".
@@ -226,6 +233,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let body_id = artifacts.composition_body_assignments["enrich"];
@@ -243,13 +251,10 @@ nodes:
         input_row.tail
     );
     assert!(
-        input_row.declared.contains_key("customer_id"),
+        input_row.has_field("customer_id"),
         "input row should declare customer_id"
     );
-    assert!(
-        input_row.declared.contains_key("name"),
-        "input row should declare name"
-    );
+    assert!(input_row.has_field("name"), "input row should declare name");
 }
 
 /// Gate 3: Given upstream row with extra columns beyond port schema,
@@ -309,6 +314,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     // Binding should succeed with no E102 errors.
@@ -374,6 +380,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     // Should have 2 body assignments: nested_process (outer) + inner_normalize (inner).
@@ -439,6 +446,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e103: Vec<_> = diags.iter().filter(|d| d.code == "E103").collect();
@@ -525,6 +533,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e104: Vec<_> = diags.iter().filter(|d| d.code == "E104").collect();
@@ -595,6 +604,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e102: Vec<_> = diags.iter().filter(|d| d.code == "E102").collect();
@@ -692,6 +702,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e107: Vec<_> = diags.iter().filter(|d| d.code == "E107").collect();
@@ -772,6 +783,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e108: Vec<_> = diags.iter().filter(|d| d.code == "E108").collect();
@@ -840,6 +852,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let w101: Vec<_> = diags.iter().filter(|d| d.code == "W101").collect();
@@ -946,6 +959,7 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
+        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e107: Vec<_> = diags.iter().filter(|d| d.code == "E107").collect();
@@ -962,7 +976,7 @@ nodes:
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Task 16c.2.3 hard-gate tests
+// E100 eradication gate tests
 // ─────────────────────────────────────────────────────────────────────
 
 /// Gate 1: No "E100" string literal anywhere in crates/.
@@ -1030,13 +1044,14 @@ fn test_pipeline_compile_with_workspace_root_binds_compositions() {
                 &ctx,
                 &symbol_table,
                 &ctx.pipeline_dir,
+                cfg.error_handling.correlation_key.as_ref(),
             );
             let bound_body = artifacts
                 .body_of(*body)
                 .expect("body_of should return the BoundBody");
             assert!(
-                !bound_body.nodes.is_empty(),
-                "BoundBody.nodes should be populated for {name:?}"
+                !bound_body.topo_order.is_empty(),
+                "BoundBody.topo_order should be populated for {name:?}"
             );
         }
     }

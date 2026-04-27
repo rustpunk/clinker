@@ -1,4 +1,4 @@
-//! Extract-as-composition modal for the Kiln canvas (Phase 16c.6.4).
+//! Extract-as-composition modal for the Kiln canvas.
 //!
 //! Displayed when the user clicks the "Extract" button with 2+ nodes selected.
 //! Shows the detected ports, config candidates, and output path.

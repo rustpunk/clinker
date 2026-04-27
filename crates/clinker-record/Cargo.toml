@@ -15,6 +15,7 @@ indexmap = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true }
+postcard = { workspace = true }
 
 [[bench]]
 name = "record_ops"

@@ -1,4 +1,4 @@
-//! Path-security chokepoint (Phase 11 assumption #51, Phase 16b Task 16b.1.5).
+//! Path-security chokepoint.
 //!
 //! The only way to obtain a [`ValidatedPath`] is by calling [`validate_path`].
 //! The newtype's inner field is private, so downstream code that consumes a
@@ -79,7 +79,7 @@ impl AsRef<Path> for ValidatedPath {
 /// synthetic primary span. Callers that know the source location of the
 /// offending `path:` field should replace the primary span before surfacing
 /// the diagnostic to the user.
-#[allow(clippy::result_large_err)] // Diagnostic is the agreed error type (Phase 16b).
+#[allow(clippy::result_large_err)] // Diagnostic is the agreed error type.
 pub fn validate_path(
     raw: &Path,
     base_dir: &Path,
@@ -149,7 +149,7 @@ fn sec_diag(message: String) -> Diagnostic {
 }
 
 /// Check if output file exists (overwrite protection).
-#[allow(clippy::result_large_err)] // Diagnostic is the agreed error type (Phase 16b).
+#[allow(clippy::result_large_err)] // Diagnostic is the agreed error type.
 pub fn check_overwrite(path: &Path, force: bool, config_overwrite: bool) -> Result<(), Diagnostic> {
     if path.exists() && !force && !config_overwrite {
         return Err(sec_diag(format!(
@@ -162,9 +162,8 @@ pub fn check_overwrite(path: &Path, force: bool, config_overwrite: bool) -> Resu
 /// Walk every path-bearing field of `config` and validate it. Collects all
 /// failures rather than short-circuiting.
 ///
-/// This is the Task 16b.1.5 scaffold of the `compile()` path pre-pass. It runs
-/// against the current (pre-lift) [`PipelineConfig`] shape; Task 16b.2 will
-/// rewrite it to walk `PipelineConfig.nodes` variants.
+/// Runs as a `compile()` path pre-pass over the unified `PipelineConfig.nodes`
+/// variants.
 pub fn validate_all_config_paths(
     config: &PipelineConfig,
     base_dir: &Path,

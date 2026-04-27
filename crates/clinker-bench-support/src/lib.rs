@@ -1,14 +1,21 @@
-//! Shared deterministic data generators for Clinker benchmarks.
+//! Shared test and benchmark utilities for Clinker.
 //!
-//! All generators use explicit seeds for reproducibility across runs.
+//! This crate consolidates cross-crate utilities used by both the
+//! integration-test suite and the Criterion benchmark harness:
+//! deterministic data generators (seeded, reproducible across runs),
+//! workspace-root discovery, pipeline-config discovery, and I/O
+//! capture helpers. Depended on via `[dev-dependencies]` — not shipped
+//! in release builds.
 
 #[cfg(feature = "bench-alloc")]
 pub mod alloc;
 
 pub mod cache;
+pub mod combine;
 pub mod generators;
+pub mod io;
 
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +91,7 @@ pub fn discover_pipeline_configs(base: &Path) -> Vec<ConfigEntry> {
 
 // Explicit re-exports for backward compatibility (D-9: no glob re-exports)
 pub use cache::DataSpec;
+pub use combine::CombineDataGen;
 pub use generators::csv::CsvPayload;
 pub use generators::fixed_width::{
     BenchFieldSpec, BenchFieldType, BenchJustify, field_specs_for, generate_fixed_width,
@@ -235,11 +243,12 @@ impl RecordFactory {
     /// Even-indexed fields are integers, odd-indexed are strings.
     /// `null_ratio` in [0.0, 1.0] controls the fraction of null values.
     pub fn new(field_count: usize, string_len: usize, null_ratio: f64, seed: u64) -> Self {
-        let columns: Vec<Box<str>> = (0..field_count)
-            .map(|i| format!("f{i}").into_boxed_str())
-            .collect();
+        let schema = (0..field_count)
+            .map(|i| format!("f{i}"))
+            .collect::<SchemaBuilder>()
+            .build();
         Self {
-            schema: Arc::new(Schema::new(columns)),
+            schema,
             rng: fastrand::Rng::with_seed(seed),
             string_len,
             null_ratio,
