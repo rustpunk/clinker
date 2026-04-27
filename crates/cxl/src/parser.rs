@@ -347,6 +347,14 @@ impl Parser {
         let (name, is_meta) = if *self.peek() == Token::Dollar {
             self.advance(); // consume '$'
             let ns = self.expect_ident("system namespace after '$'")?;
+            if ns == "ck" {
+                return Err(self.error(
+                    "the `$ck` namespace is reserved for engine-stamped \
+                     correlation snapshots and cannot be assigned by `emit`",
+                    "$ck.* is read-only — the value is captured at Source ingest",
+                    "To override the user-visible value, write `emit <field_name> = ...` instead",
+                ));
+            }
             if ns != "meta" {
                 return Err(self.error(
                     &format!(
@@ -1278,6 +1286,35 @@ mod tests {
             }
             _ => panic!("expected Emit"),
         }
+    }
+
+    #[test]
+    fn test_parse_emit_ck_namespace_rejected_with_specialized_message() {
+        let result = Parser::parse("emit $ck.employee_id = 1");
+        assert!(
+            !result.errors.is_empty(),
+            "expected parse error for `emit $ck.* = ...`",
+        );
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("$ck"),
+            "diagnostic should name the $ck namespace; got: {msg}",
+        );
+        assert!(
+            msg.contains("reserved") || msg.contains("read-only") || msg.contains("snapshot"),
+            "diagnostic should explain why $ck.* is unwritable; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_parse_emit_other_dollar_namespace_keeps_generic_message() {
+        let result = Parser::parse("emit $pipeline.x = 1");
+        assert!(!result.errors.is_empty());
+        let msg = &result.errors[0].message;
+        assert!(
+            msg.contains("$pipeline") && msg.contains("only emit $meta"),
+            "non-$ck namespaces still hit the generic gate; got: {msg}",
+        );
     }
 
     #[test]
