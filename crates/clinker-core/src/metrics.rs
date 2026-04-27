@@ -76,6 +76,55 @@ pub struct ExecutionMetrics {
     /// Top-level error message if the pipeline exited with code 1, 3, or 4.
     /// `null` on clean success (exit 0) or partial success (exit 2).
     pub error: Option<String>,
+    /// Counters surfaced by the relaxed correlation-key retraction
+    /// orchestrator. Strict pipelines emit the default (all zero) shape
+    /// because the orchestrator short-circuits before any retraction
+    /// phase runs. `#[serde(default)]` keeps the spool collector
+    /// forward-compatible with files written before the retraction
+    /// counters landed; old files round-trip with every field zero.
+    #[serde(default)]
+    pub retraction: RetractionMetrics,
+}
+
+/// Cross-pipeline shape of the retraction-phase counters surfaced via
+/// the `clinker metrics collect` spool.
+///
+/// Mirrors `clinker_record::RetractionCounters` field-for-field. Lives
+/// here rather than re-using the runtime struct directly because the
+/// spool format must stay serde-stable independently of any future
+/// runtime-side counter additions; the runtime crate's struct may grow
+/// fields without changing the on-disk metrics shape until a coordinated
+/// `schema_version` bump.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetractionMetrics {
+    /// Aggregate groups whose accumulator state was rerun.
+    #[serde(default)]
+    pub groups_recomputed: u64,
+    /// Window partitions whose stored row buffer was wholesale-rerun.
+    #[serde(default)]
+    pub partitions_recomputed: u64,
+    /// Total record-deltas the replay phase pushed downstream.
+    #[serde(default)]
+    pub subdag_replay_rows: u64,
+    /// Output rows the post-replay flush retracted.
+    #[serde(default)]
+    pub output_rows_retracted_total: u64,
+    /// Aggregate-or-partition retract paths that took the documented
+    /// degrade fallback at runtime.
+    #[serde(default)]
+    pub degrade_fallback_count: u64,
+}
+
+impl From<&clinker_record::RetractionCounters> for RetractionMetrics {
+    fn from(c: &clinker_record::RetractionCounters) -> Self {
+        Self {
+            groups_recomputed: c.groups_recomputed,
+            partitions_recomputed: c.partitions_recomputed,
+            subdag_replay_rows: c.subdag_replay_rows,
+            output_rows_retracted_total: c.output_rows_retracted_total,
+            degrade_fallback_count: c.degrade_fallback_count,
+        }
+    }
 }
 
 /// Atomically write `metrics` to `<spool_dir>/<execution_id>.json`.
@@ -231,6 +280,7 @@ mod tests {
             output_files: vec!["output.csv".into()],
             dlq_path: Some("dlq.csv".into()),
             error: None,
+            retraction: RetractionMetrics::default(),
         }
     }
 

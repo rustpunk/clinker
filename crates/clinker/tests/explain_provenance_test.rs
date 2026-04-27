@@ -132,3 +132,51 @@ fn test_explain_error_code_e105_outputs_doc_content() {
         "output must contain meaningful doc content.\nstdout: {stdout}"
     );
 }
+
+#[test]
+fn test_explain_error_code_e15w_relaxed_correlation_key_help() {
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg("--code")
+        .arg("E15W")
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "clinker explain --code E15W must succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("E15W"),
+        "E15W doc must reference its own code.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("relaxed_correlation_key"),
+        "E15W doc must mention the relaxed_correlation_key opt-in.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_explain_error_code_e15y_streaming_help() {
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg("--code")
+        .arg("E15Y")
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "clinker explain --code E15Y must succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("E15Y"),
+        "E15Y doc must reference its own code.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("streaming") || stdout.contains("Streaming"),
+        "E15Y doc must mention the streaming strategy interaction.\nstdout: {stdout}"
+    );
+}

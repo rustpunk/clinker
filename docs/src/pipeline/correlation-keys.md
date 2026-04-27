@@ -273,6 +273,27 @@ The `drive:` field on a combine selects which input is the driver. Choose the si
 
 A composition's body operates on records flowing in from the parent pipeline. The correlation-key shadow columns flow into composition inputs and back out the named ports unchanged. Compositions cannot define their own correlation key -- it is a pipeline-level concern.
 
+## Operator-by-operator retraction cost reference
+
+The `relaxed_correlation_key: true` opt-in pulls the per-Aggregate retraction protocol into play. Each operator on the post-source DAG carries a different cost profile under retraction; the table below summarizes the per-operator footprint so you can size memory and pick `propagate_ck` settings before pipelines hit production.
+
+| Operator | Retraction cost |
+|---|---|
+| Source | None at retraction time. The CK shadow columns are stamped at ingest; replay never re-reads the source file. |
+| Transform | Re-evaluated against substituted upstream rows during sub-DAG replay. Cost = O(rows_substituted) per layer, no extra state held. Non-deterministic builtins (e.g. `now`) are rejected at compile time with E15W. |
+| Aggregate (strict) | None. Strict aggregates short-circuit to today's two-phase commit body and pay zero retraction overhead. |
+| Aggregate (relaxed, Reversible bindings) | Per-row lineage map `(input_row_id → group_index)` carried alongside accumulator state — ~8 bytes/row plus the per-group `input_rows` Vec inline cost. Retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. Reversible accumulators: `sum`, `count`, `collect`, `any`. |
+| Aggregate (relaxed, BufferRequired bindings) | Per-group raw contributions held until commit. Memory cost = O(input_rows × Σ binding_value_size). Retract recomputes affected groups from `contributions − retracted_rows`. BufferRequired accumulators: `min`, `max`, `avg`, `weighted_avg`. |
+| Combine (driver propagation) | One propagated `$ck.<field>` slot from the driver record. No retraction state held by the combine itself; replay carries upstream deltas through. |
+| Combine (`propagate_ck: all` / `named: [...]`) | Same per-row cost as driver propagation, plus the widened output schema's `$ck.<field>` columns must be re-populated on replay. Cost scales with the output schema width, not retraction frequency. |
+| Window (streaming) | None — streaming windows are forbidden downstream of relaxed-CK aggregates whose dropped CK fields overlap `partition_by`. The plan-time derivation switches such windows into buffer mode. |
+| Window (buffer-mode) | Per-partition raw row buffers held until commit. Memory cost = O(largest partition × per-row-size). Retract reruns the configured `$window.*` evaluation over `partition − retracted_rows`. Covers all 13 `$window.*` builtins uniformly via wholesale recompute. |
+| Output | Holds retracted rows in `correlation_buffers` until commit. Replay substitutes the post-retract row in place; clean records flush to the writer, dirty records DLQ per the resolved `correlation_fanout_policy`. |
+
+The `--explain` output's `=== Retraction ===` section reports the live per-aggregate / per-window detail derived from the current pipeline. The `clinker metrics collect` spool reports the runtime counterpart: `correlation.retract.groups_recomputed`, `.partitions_recomputed`, `.subdag_replay_rows`, `.output_rows_retracted_total`, `.degrade_fallback_count`. Use the explain block for plan-time capacity sizing, the metrics spool for post-run confirmation.
+
+When retraction's preconditions break at runtime (an aggregate spilled before retract reached it, or a window partition exceeded the memory budget), the orchestrator degrades to "DLQ entire affected group/partition" — today's strict E151 collateral semantics. Each degrade increments `correlation.retract.degrade_fallback_count`; persistent non-zero values point at a tighter memory budget or a smaller correlation key cardinality.
+
 ## Debugging
 
 To see correlation-key shadow columns in writer output:

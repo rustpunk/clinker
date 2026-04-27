@@ -1524,11 +1524,17 @@ impl PipelineConfig {
                     &source,
                     &wc.sort_by,
                 );
+                // Sort arena_fields for deterministic order — the source
+                // collection is a HashSet whose iteration order randomizes
+                // run-to-run, which leaks into `--explain` output and into
+                // any snapshot test that captures the explain block.
+                let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
+                arena_fields_vec.sort();
                 raw_index_requests.push(crate::plan::index::RawIndexRequest {
                     source,
                     group_by: wc.group_by.clone(),
                     sort_by: wc.sort_by.clone(),
-                    arena_fields: arena_fields.into_iter().collect(),
+                    arena_fields: arena_fields_vec,
                     already_sorted,
                     transform_index: i,
                     // Default false here; the buffer-recompute derivation

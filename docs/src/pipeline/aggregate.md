@@ -110,6 +110,8 @@ error_handling:
 
 This is purely additive: pipelines without the field keep today's strict semantics. The opt-in is incompatible with `strategy: streaming` -- the combination is rejected with `E15Y` because streaming aggregates emit at group-boundary close, before the terminal correlation commit, and that defeats the rollback window the relaxed path needs. See [Correlation Keys](correlation-keys.md#aggregate-interaction) for the full lattice rules.
 
+The retraction protocol carries a per-aggregate cost — Reversible accumulators use a per-row lineage map, BufferRequired accumulators hold raw contributions until commit. The [operator-by-operator retraction cost reference](correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator breakdown; `clinker run --explain` reports the live per-aggregate detail.
+
 ## Complete example
 
 ```yaml

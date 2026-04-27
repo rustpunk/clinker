@@ -17,7 +17,7 @@ pub use coercion::{
     CoercionError, DEFAULT_DATE_FORMATS, DEFAULT_DATETIME_FORMATS, coerce_to_bool, coerce_to_date,
     coerce_to_datetime, coerce_to_float, coerce_to_int, coerce_to_string,
 };
-pub use counters::PipelineCounters;
+pub use counters::{PipelineCounters, RetractionCounters};
 pub use group_key::{GroupByKey, GroupKeyError, value_to_group_key};
 pub use minimal::MinimalRecord;
 pub use provenance::RecordProvenance;

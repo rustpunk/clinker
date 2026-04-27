@@ -1,0 +1,107 @@
+---
+source: crates/clinker-core/tests/retraction_explain_snapshot.rs
+assertion_line: 87
+expression: text
+---
+=== Execution Plan ===
+
+Mode: TwoPass
+Indices to build: 1
+Transforms: 1
+Output projections: 1
+DAG nodes: 6
+
+Source DAG:
+  Tier 0: orders
+
+Index [0]:
+  Source: orders
+  Group by: ["department"]
+  Sort by: []
+  Arena fields: ["amount", "department", "order_id"]
+  Already sorted: false
+  Buffer recompute on commit: yes (worst-case memory = O(largest partition × per-row-size))
+
+Transform 'windowed':
+  Parallelism: IndexReading
+  Window index: Some(0)
+  Partition lookup: Some(SameSource)
+
+[sort] __correlation_sort_orders
+  sort_fields:
+    - order_id Asc (nulls None)
+
+=== Physical Properties ===
+
+source.orders:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+sort.__correlation_sort_orders:
+  ordering: order_id
+  ordering_provenance: Preserved { from_node: "__correlation_sort_orders" }
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+transform.windowed:
+  ordering: <none>
+  ordering_provenance: DestroyedByTransformWriteSet { at_node: "windowed", fields_written: ["amount", "department", "order_id", "running_total"], sort_fields_lost: ["order_id"], confidence: Proven }
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+aggregation.dept_totals:
+  ordering: <none>
+  ordering_provenance: DestroyedByHashAggregate { at_node: "dept_totals", confidence: Proven }
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+output.out:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+
+=== Retraction ===
+
+retraction enabled — 1 relaxed aggregates, 1 buffer-mode windows, fanout policy: any.
+
+Aggregate 'dept_totals':
+  retraction: relaxed-CK enabled, BufferRequired accumulator path, lineage memory n/a (buffer-mode holds raw contributions) (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.
+
+Window index [0] (source 'orders', partition_by ["department"]):
+  retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~3× sizeof(Value).
+  worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.
+
+=== CXL Expressions ===
+
+Transform 'windowed':
+  emit order_id = order_id
+  emit department = department
+  emit amount = amount
+  emit running_total = $window.sum(amount)
+
+Transform 'dept_totals':
+  emit department = department
+  emit total = sum(amount)
+  emit lo = min(amount)
+  emit n = count(*)
+
+=== Type Annotations ===
+
+Transform 'windowed': (types inferred at compile time)
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [source] orders (line:9)
+  │ [sort] __correlation_sort_orders
+  │ [transform] windowed (line:19)
+  ◇ [aggregation:hash] dept_totals (line:34)
+  │ [output] out (line:49)
+  │ [correlation_commit] __correlation_commit_terminal key=[order_id]

@@ -626,6 +626,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 .collect(),
             dlq_path,
             error: None,
+            retraction: clinker_core::metrics::RetractionMetrics::from(&counters.retraction),
         };
 
         if let Err(e) = metrics::write_spool(&execution_metrics, dir) {

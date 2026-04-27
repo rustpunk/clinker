@@ -47,6 +47,7 @@ pub(crate) fn recompute_aggregates(
 
         match recompute_one_aggregate(ctx, agg_idx, retained, &retract_ids) {
             Ok(mut local_deltas) => {
+                ctx.counters.retraction.groups_recomputed += local_deltas.len() as u64;
                 deltas.append(&mut local_deltas);
             }
             Err(_) => {
@@ -55,6 +56,7 @@ pub(crate) fn recompute_aggregates(
         }
     }
 
+    ctx.counters.retraction.degrade_fallback_count += degraded.len() as u64;
     ctx.relaxed_aggregator_degrade.extend(degraded);
     Ok(deltas)
 }

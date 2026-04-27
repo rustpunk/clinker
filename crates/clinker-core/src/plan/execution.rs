@@ -1161,7 +1161,123 @@ impl ExecutionPlanDag {
         // default to avoid a config-coupling cycle here.
         self.render_combine_section(&mut out, None, 0);
 
+        self.render_retraction_section(&mut out, None);
+
         out
+    }
+
+    /// Render the retraction-cost block for relaxed-CK aggregates and
+    /// buffer-mode windows.
+    ///
+    /// `config` is `Some` when the caller went through one of the
+    /// artifacts-aware entry points and can read the pipeline-level
+    /// `correlation_fanout_policy` default. Without it the block still
+    /// emits per-aggregate / per-window detail; only the policy line
+    /// degrades to "unknown at this rendering".
+    ///
+    /// The block is silent on pipelines with no relaxed-CK aggregate so
+    /// strict-correlation and non-correlated `--explain` output stays
+    /// identical to today's text.
+    fn render_retraction_section(&self, out: &mut String, config: Option<&PipelineConfig>) {
+        let mut relaxed_aggregates: Vec<(&str, &PlanNode)> = Vec::new();
+        for &idx in &self.topo_order {
+            if let PlanNode::Aggregation {
+                name,
+                relaxed_correlation_key: true,
+                ..
+            } = &self.graph[idx]
+            {
+                relaxed_aggregates.push((name.as_str(), &self.graph[idx]));
+            }
+        }
+        let buffer_mode_index_count = self
+            .indices_to_build
+            .iter()
+            .filter(|s| s.requires_buffer_recompute)
+            .count();
+
+        if relaxed_aggregates.is_empty() && buffer_mode_index_count == 0 {
+            return;
+        }
+
+        out.push_str("=== Retraction ===\n\n");
+
+        let policy_line = match config.and_then(|c| c.error_handling.correlation_fanout_policy) {
+            Some(p) => format!("{p:?}").to_lowercase(),
+            None => {
+                if config.is_some() {
+                    "any (default)".to_string()
+                } else {
+                    "unknown at this rendering (config not threaded)".to_string()
+                }
+            }
+        };
+        out.push_str(&format!(
+            "retraction enabled — {} relaxed aggregates, {} buffer-mode windows, fanout policy: {}.\n\n",
+            relaxed_aggregates.len(),
+            buffer_mode_index_count,
+            policy_line,
+        ));
+
+        for (name, node) in &relaxed_aggregates {
+            let PlanNode::Aggregation { compiled, .. } = node else {
+                continue;
+            };
+            let path_label = if compiled.requires_buffer_mode {
+                "BufferRequired"
+            } else if compiled.requires_lineage {
+                "Reversible"
+            } else {
+                // Unreachable on relaxed aggregates because the planner
+                // sets exactly one of the two flags; surface the
+                // inconsistency rather than fall back silently.
+                "unclassified"
+            };
+            // Cardinality estimate is honest: today's planner has no
+            // group-cardinality side-table to consult before the run,
+            // so the lineage memory ceiling is expressed as a per-row
+            // cost rather than a total. The `(input_row_id → group_index)`
+            // pair is `(u32, u32)` = 8 bytes; per-group `input_rows` Vec
+            // overhead is tracked alongside but its sum scales with the
+            // unknown group cardinality.
+            let lineage_per_row_bytes = if compiled.requires_lineage {
+                "~8 bytes/row"
+            } else {
+                "n/a (buffer-mode holds raw contributions)"
+            };
+            out.push_str(&format!("Aggregate '{name}':\n"));
+            out.push_str(&format!(
+                "  retraction: relaxed-CK enabled, {path_label} accumulator path, lineage memory {lineage_per_row_bytes} (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.\n",
+            ));
+            out.push('\n');
+        }
+
+        for (i, spec) in self.indices_to_build.iter().enumerate() {
+            if !spec.requires_buffer_recompute {
+                continue;
+            }
+            // Per-row buffer cost = sum of arena-field value sizes; the
+            // arena uses `Value` so worst case is the per-row union of
+            // `arena_fields` sizes. Surface the field count and the
+            // `Value`-size order without a fake byte total because
+            // partition cardinality is also unknown at plan time. The
+            // arena field set itself appears in the upstream `Index`
+            // block above; not duplicated here because its ordering is
+            // deduplication-pass dependent and would be a noisy
+            // snapshot diff target.
+            let row_field_count = spec.arena_fields.len();
+            out.push_str(&format!(
+                "Window index [{i}] (source '{}', partition_by {:?}):\n",
+                spec.source, spec.group_by,
+            ));
+            out.push_str(&format!(
+                "  retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~{row_field_count}× sizeof(Value).\n",
+            ));
+            out.push_str(
+                "  worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.\n",
+            );
+            out.push('\n');
+        }
     }
 
     /// `--explain` text with combine multi-line blocks. Identical to
@@ -1408,6 +1524,15 @@ impl ExecutionPlanDag {
             config.pipeline.memory_limit.as_deref(),
         );
         let mut out = self.explain_with_artifacts(artifacts, total_limit);
+        // Re-render the retraction section with the pipeline config in
+        // scope so the fanout-policy line resolves to the user-visible
+        // setting. `explain()` (called inside `explain_with_artifacts`)
+        // already emitted a config-less variant; strip it before
+        // re-rendering to avoid duplicate blocks.
+        if let Some(start) = out.find("=== Retraction ===\n") {
+            out.truncate(start);
+        }
+        self.render_retraction_section(&mut out, Some(config));
         self.append_full_sections(&mut out, config);
         out
     }
@@ -1536,6 +1661,10 @@ impl ExecutionPlanDag {
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let mut out = self.explain();
+        if let Some(start) = out.find("=== Retraction ===\n") {
+            out.truncate(start);
+        }
+        self.render_retraction_section(&mut out, Some(config));
 
         // CXL AST (reformatted expressions from config)
         out.push_str("=== CXL Expressions ===\n\n");

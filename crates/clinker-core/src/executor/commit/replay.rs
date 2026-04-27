@@ -64,6 +64,13 @@ pub(crate) fn replay_subdag(
         }
         iterations += 1;
 
+        // Each frontier entry crosses one DAG hop on this iteration.
+        // Charging the counter at iteration entry rather than at the
+        // per-step hop captures the breadth of replay work so the
+        // metric matches the cost model `--explain` advertises (one
+        // unit per row-delta visited per replay layer).
+        ctx.counters.retraction.subdag_replay_rows += frontier.len() as u64;
+
         let mut next_frontier: Vec<Delta> = Vec::new();
         for delta in frontier.iter() {
             let new_deltas = step_delta_downstream(ctx, current_dag, delta)?;
@@ -95,7 +102,8 @@ fn step_delta_downstream(
     for ds in downstream {
         match &current_dag.graph[ds] {
             PlanNode::Output { .. } => {
-                substitute_in_correlation_buffers(ctx, delta);
+                let retracted = substitute_in_correlation_buffers(ctx, delta);
+                ctx.counters.retraction.output_rows_retracted_total += retracted;
             }
             PlanNode::Transform { .. }
             | PlanNode::Route { .. }
@@ -145,18 +153,24 @@ fn step_delta_downstream(
 /// not appear in any buffered slot is a no-op (means the retracted
 /// aggregate output never reached an Output, e.g. it was filtered by
 /// a Route predicate downstream).
-fn substitute_in_correlation_buffers(ctx: &mut ExecutorContext<'_>, delta: &Delta) {
+///
+/// Returns the number of buffered output rows that were retracted —
+/// either replaced with a fresh post-retract row or removed outright
+/// when the recompute step produced no replacement.
+fn substitute_in_correlation_buffers(ctx: &mut ExecutorContext<'_>, delta: &Delta) -> u64 {
     let Some(buffers) = ctx.correlation_buffers.as_mut() else {
-        return;
+        return 0;
     };
     let Some(old_row) = delta.retract_old_row.as_ref() else {
-        return;
+        return 0;
     };
 
+    let mut retracted: u64 = 0;
     for group in buffers.values_mut() {
         let mut i = 0;
         while i < group.records.len() {
             if records_equal(&group.records[i].original_record, old_row) {
+                retracted += 1;
                 if let Some(new_row) = delta.add_new_row.as_ref() {
                     group.records[i].original_record = new_row.clone();
                     group.records[i].projected = new_row.clone();
@@ -169,6 +183,7 @@ fn substitute_in_correlation_buffers(ctx: &mut ExecutorContext<'_>, delta: &Delt
             }
         }
     }
+    retracted
 }
 
 /// Structural equality for `Record`s: same schema pointer + element-wise

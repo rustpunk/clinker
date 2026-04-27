@@ -104,6 +104,13 @@ pub(crate) fn recompute_window_partitions(
             let Some(rows) = retained.partition_outputs.get(partition_key) else {
                 continue;
             };
+
+            // Count this partition once, before walking its rows. The
+            // aggregator counter increments per delta; the partition
+            // counter increments per (window_node, partition_key) pair
+            // touched, mirroring the wholesale-recompute granularity
+            // that `--explain` advertises.
+            ctx.counters.retraction.partitions_recomputed += 1;
             for (arena_pos, rn, pre_retract) in rows {
                 if retracted_positions.contains(arena_pos) {
                     // The retracted row itself: emit a retract-only
