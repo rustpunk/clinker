@@ -296,6 +296,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// pipelines.
     pub(crate) relaxed_aggregator_degrade: Vec<NodeIndex>,
 
+    /// Per-window-node retained state for buffer-recompute mode. The
+    /// dispatcher's Transform arm populates this when the upstream
+    /// IndexSpec has `requires_buffer_recompute = true`; the
+    /// orchestrator's recompute-window phase reads it to rerun window
+    /// evaluation against `partition − retracted_rows` and emit
+    /// per-output Deltas. Strict pipelines and pipelines without a
+    /// relaxed-CK aggregate never instantiate the inner map, so the
+    /// streaming-emit path observes zero overhead.
+    pub(crate) relaxed_window_states: HashMap<NodeIndex, RetainedWindowState>,
+
     /// Tracks which commit-step path the orchestrator selected. Read by
     /// the zero-overhead-on-strict-pipeline test so the assertion
     /// proves the short-circuit is taken on every strict workload.
@@ -339,6 +349,41 @@ pub(crate) struct RetainedAggregatorState {
     /// each entry against the post-retract finalize output to build
     /// per-row deltas.
     pub(crate) pre_retract_output_rows: Vec<crate::aggregation::SortRow>,
+}
+
+/// Per-window-node state retained for buffer-recompute mode. Captured
+/// during the windowed Transform arm's per-record evaluation when the
+/// IndexSpec has `requires_buffer_recompute = true`; the orchestrator's
+/// recompute-window phase consumes it to rerun window evaluation over
+/// `partition − retracted_rows`.
+///
+/// `partition_outputs` keys by the partition tuple (the window's
+/// `group_by` values, encoded as `Vec<GroupByKey>`); each value is the
+/// ordered list of `(arena_position, source_row, pre_retract_record)`
+/// triples emitted on the original walk. The arena positions point
+/// into the per-source `Arena` materialized at Phase-0 setup; combined
+/// with the SecondaryIndex partition slice (also keyed by the same
+/// tuple), they let the recompute phase reconstruct the surviving
+/// position list per partition without re-buffering record bodies.
+///
+/// `transform_idx` is the index into `compiled_transforms` for the
+/// owning Transform; the recompute phase uses it to instantiate a
+/// fresh `ProgramEvaluator` mirroring the dispatcher's setup. Strict
+/// pipelines and pipelines without a relaxed-CK aggregate never
+/// populate this struct.
+pub(crate) struct RetainedWindowState {
+    pub(crate) transform_idx: usize,
+    pub(crate) window_index: usize,
+    /// Per-partition emit log. Each entry's first field is the arena
+    /// position; the second is the original source-row number for
+    /// downstream replay; the third is the pre-retract output Record
+    /// the executor surfaced into `node_buffers` on the original walk
+    /// (needed as the retract-old half of the per-output Delta).
+    pub(crate) partition_outputs: HashMap<Vec<GroupByKey>, Vec<(u32, u64, Record)>>,
+    /// Per-record bytes accounted into the memory budget at
+    /// admission time. Held so the recompute phase can release the
+    /// charge after emitting Deltas.
+    pub(crate) charged_bytes: usize,
 }
 
 impl ExecutorContext<'_> {
@@ -560,6 +605,34 @@ pub(crate) fn dispatch_plan_node(
 
             let mut output_records = Vec::with_capacity(input_records.len());
 
+            // Buffer-recompute mode opt-in. When the IndexSpec backing
+            // this Transform's window flags `requires_buffer_recompute`,
+            // capture per-record (arena_position, source_row, output)
+            // triples per partition. The orchestrator's commit phase
+            // reads them to recompute affected partitions over
+            // `partition − retracted_rows` and emit per-output Deltas.
+            let buffered_window: Option<(usize, Vec<String>, Arc<crate::pipeline::arena::Arena>)> =
+                window_index.and_then(|idx_num| {
+                    let spec = current_dag.indices_to_build.get(idx_num)?;
+                    if !spec.requires_buffer_recompute {
+                        return None;
+                    }
+                    let arena = ctx.arena.as_ref()?.clone();
+                    Some((idx_num, spec.group_by.clone(), arena))
+                });
+            // RSS budget guard for buffer-mode admission. Polled every
+            // 10K admitted rows so a runaway partition cannot blow the
+            // hard limit before the recompute phase fires. Mirrors the
+            // combine-probe and hash-build guards already in this file.
+            let mut buffered_budget = if buffered_window.is_some() {
+                Some(MemoryBudget::from_config(
+                    ctx.config.pipeline.memory_limit.as_deref(),
+                ))
+            } else {
+                None
+            };
+            let mut buffered_admitted_since_check: u64 = 0;
+
             for (record, rn) in input_records {
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
@@ -607,6 +680,78 @@ pub(crate) fn dispatch_plan_node(
                 };
                 match eval_result {
                     Ok((modified_record, Ok(()))) => {
+                        if let Some((idx_num, partition_fields, _arena)) = &buffered_window {
+                            // Read partition_by values off the input record so
+                            // partition assignment is keyed by the same fields
+                            // the windowed evaluator partitioned on. Mirror the
+                            // null-coalesce semantics of
+                            // `evaluate_single_transform_windowed`: a null
+                            // component lands the row in a "no-partition" slot
+                            // that the recompute phase treats as out-of-scope.
+                            let mut partition_key: Vec<GroupByKey> =
+                                Vec::with_capacity(partition_fields.len());
+                            let mut all_resolved = true;
+                            for field in partition_fields {
+                                let val = record.get(field).cloned().unwrap_or(Value::Null);
+                                match clinker_record::value_to_group_key(
+                                    &val,
+                                    field,
+                                    None,
+                                    (rn - 1) as u32,
+                                ) {
+                                    Ok(Some(k)) => partition_key.push(k),
+                                    _ => {
+                                        all_resolved = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if all_resolved {
+                                let arena_pos = (rn - 1) as u32;
+                                // Memory accounting: charge an upper-bound
+                                // estimate per buffered triple. The Record
+                                // body shares its `Arc<Schema>`; the
+                                // dominant cost is per-field Value
+                                // payload, so estimate as
+                                // `sizeof::<Value>() * column_count` plus
+                                // a conservative entry overhead.
+                                let row_bytes = std::mem::size_of::<Value>()
+                                    * modified_record.schema().column_count()
+                                    + std::mem::size_of::<(u32, u64, Record)>();
+                                let entry = ctx
+                                    .relaxed_window_states
+                                    .entry(node_idx)
+                                    .or_insert_with(|| RetainedWindowState {
+                                        transform_idx,
+                                        window_index: *idx_num,
+                                        partition_outputs: HashMap::new(),
+                                        charged_bytes: 0,
+                                    });
+                                entry
+                                    .partition_outputs
+                                    .entry(partition_key)
+                                    .or_default()
+                                    .push((arena_pos, rn, modified_record.clone()));
+                                entry.charged_bytes = entry.charged_bytes.saturating_add(row_bytes);
+                                buffered_admitted_since_check += 1;
+                                if buffered_admitted_since_check >= 10_000
+                                    && let Some(budget) = buffered_budget.as_mut()
+                                    && budget.should_abort()
+                                {
+                                    return Err(PipelineError::Compilation {
+                                        transform_name: name.clone(),
+                                        messages: vec![format!(
+                                            "E310 window buffer-recompute memory limit exceeded: \
+                                             hard limit {}",
+                                            budget.hard_limit()
+                                        )],
+                                    });
+                                }
+                                if buffered_admitted_since_check >= 10_000 {
+                                    buffered_admitted_since_check = 0;
+                                }
+                            }
+                        }
                         output_records.push((modified_record, rn));
                     }
                     Ok((_record, Err(SkipReason::Filtered))) => {

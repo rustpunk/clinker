@@ -281,7 +281,7 @@ pub struct CompiledTransform {
 }
 
 impl CompiledTransform {
-    fn has_distinct(&self) -> bool {
+    pub(crate) fn has_distinct(&self) -> bool {
         self.typed
             .program
             .statements
@@ -1359,6 +1359,7 @@ impl PipelineExecutor {
             correlation_max_group_buffer,
             relaxed_aggregator_states: HashMap::new(),
             relaxed_aggregator_degrade: Vec::new(),
+            relaxed_window_states: HashMap::new(),
             commit_step_path: dispatch::CommitStepPath::NotSelected,
         };
 
@@ -2266,8 +2267,10 @@ pub(crate) fn copy_build_ck_columns(
 /// that is not already declared. Allocates a fresh `Arc<Schema>` only
 /// when new names appear; otherwise clones `input`. Used by the legacy
 /// linear pipeline path where the emit set is determined at eval time
-/// rather than via a plan-time `output_schema`.
-fn record_with_emitted_fields(
+/// rather than via a plan-time `output_schema`, and by the
+/// commit-phase window recompute which materializes new output rows
+/// against the same emit shape the dispatcher's window arm produced.
+pub(crate) fn record_with_emitted_fields(
     input: &Record,
     emitted: &IndexMap<String, clinker_record::Value>,
 ) -> Record {
@@ -2408,6 +2411,7 @@ mod tests {
     mod branching;
     mod correlated_dlq;
     mod correlated_dlq_retract;
+    mod correlated_window_retract;
     mod format_dispatch;
     mod multi_output;
 }

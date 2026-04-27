@@ -1049,7 +1049,13 @@ impl ExecutionPlanDag {
                 spec.sort_by.iter().map(|s| &s.field).collect::<Vec<_>>()
             ));
             out.push_str(&format!("  Arena fields: {:?}\n", spec.arena_fields));
-            out.push_str(&format!("  Already sorted: {}\n\n", spec.already_sorted));
+            out.push_str(&format!("  Already sorted: {}\n", spec.already_sorted));
+            if spec.requires_buffer_recompute {
+                out.push_str(
+                    "  Buffer recompute on commit: yes (worst-case memory = O(largest partition × per-row-size))\n",
+                );
+            }
+            out.push('\n');
         }
 
         for node in self.graph.node_weights() {
@@ -2727,6 +2733,81 @@ impl ExecutionPlanDag {
         }
 
         Ok(())
+    }
+
+    /// Mark every [`IndexSpec`] whose owning window-bearing Transform
+    /// participates in a relaxed-CK retraction pipeline AND whose
+    /// `partition_by` does not cover the source-side correlation-key
+    /// set. The flag flips the executor's window arm into buffered emit
+    /// mode so the orchestrator's commit-time recompute can rerun the
+    /// window over `partition − retracted_rows` and emit per-output
+    /// Deltas.
+    ///
+    /// The trigger captures both directions of the geometry:
+    ///
+    /// * Window upstream of a relaxed-CK aggregate. The window operates
+    ///   on source-side arena positions; a CK group can span multiple
+    ///   partitions when `partition_by` is not a CK superset; the
+    ///   relaxed aggregate downstream provides the retraction protocol
+    ///   that needs the per-partition rollback.
+    ///
+    /// * Window downstream of a relaxed-CK aggregate. The aggregate's
+    ///   dropped CK fields no longer appear in the partition's
+    ///   downstream `ck_set`; if the window's `partition_by` references
+    ///   one of those fields, partitions can span what would have been
+    ///   strict CK boundaries.
+    ///
+    /// The unified rule: at the window's node, the visible `ck_set` has
+    /// at least one field that is not part of the window's
+    /// `partition_by` slice. Reads `node_properties.ck_set`, so callers
+    /// must invoke `compute_node_properties` first. Idempotent.
+    pub(crate) fn derive_window_buffer_recompute_flags(&mut self) {
+        // Pipeline-level enabler: at least one relaxed-CK aggregate
+        // anywhere in the DAG. Without one, the retraction protocol
+        // does not fire and no window needs buffer mode.
+        let has_relaxed_aggregate = self.graph.node_weights().any(|n| {
+            matches!(
+                n,
+                PlanNode::Aggregation {
+                    relaxed_correlation_key: true,
+                    ..
+                }
+            )
+        });
+        if !has_relaxed_aggregate {
+            return;
+        }
+
+        let mut to_flag: Vec<usize> = Vec::new();
+        for idx in self.graph.node_indices() {
+            if let PlanNode::Transform {
+                window_index: Some(idx_num),
+                ..
+            } = &self.graph[idx]
+            {
+                let idx_num = *idx_num;
+                let Some(props) = self.node_properties.get(&idx) else {
+                    continue;
+                };
+                let Some(spec) = self.indices_to_build.get(idx_num) else {
+                    continue;
+                };
+                let partition_set: BTreeSet<&str> =
+                    spec.group_by.iter().map(String::as_str).collect();
+                let ck_outside_partition = props
+                    .ck_set
+                    .iter()
+                    .any(|f| !partition_set.contains(f.as_str()));
+                if ck_outside_partition {
+                    to_flag.push(idx_num);
+                }
+            }
+        }
+        for idx_num in to_flag {
+            if let Some(spec) = self.indices_to_build.get_mut(idx_num) {
+                spec.requires_buffer_recompute = true;
+            }
+        }
     }
 
     /// Resolve `AggregateStrategyHint` on every `PlanNode::Aggregation`

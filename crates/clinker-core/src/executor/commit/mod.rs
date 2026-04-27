@@ -14,9 +14,10 @@
 //!    `HashAggregator::retract_row` against the retained per-aggregate
 //!    state and refinalizes; emits [`Delta`] entries describing the
 //!    retracted-old/added-new aggregate output rows.
-//! 3. [`recompute_window`] — no-op stub for the universe of pipelines
-//!    Phase 6 accepts (no relaxed-window aggregates downstream of a
-//!    relaxed-CK aggregate). Returns `Ok(Vec::new())`.
+//! 3. [`recompute_window`] — for each window-bearing Transform whose
+//!    IndexSpec was flagged for buffer-recompute, reruns the window
+//!    evaluation over `partition − retracted_rows` and emits per-output
+//!    Deltas. Empty `scope.windows` short-circuits to `Ok(vec![])`.
 //! 4. [`replay`] — re-executes the deterministic downstream sub-DAG for
 //!    the row deltas. Bounded by a defensive iteration cap; any overflow
 //!    panics with the documented message because the protocol's
@@ -108,11 +109,12 @@ pub(crate) fn orchestrate(
     // finalize_in_place against the retained per-aggregate state.
     let mut deltas = recompute_agg::recompute_aggregates(ctx, &scope)?;
 
-    // Phase 3: recompute affected window partitions. No-op for the
-    // current Phase-6-accepted universe — pipelines without relaxed
-    // window aggregates downstream of a relaxed-CK aggregate produce
-    // zero window deltas. Wired so the orchestrator shape is stable
-    // when the analytic-window retraction path lands.
+    // Phase 3: recompute affected window partitions. For each window
+    // node flagged for buffer-recompute by the planner, rerun the
+    // window evaluation over `partition − retracted_rows` and emit a
+    // per-record Delta. An empty `scope.windows` (no windows downstream
+    // of the relaxed aggregate, or no retracted row landed in any
+    // captured partition) short-circuits with zero deltas.
     let window_deltas = recompute_window::recompute_window_partitions(ctx, &scope)?;
     deltas.extend(window_deltas);
 

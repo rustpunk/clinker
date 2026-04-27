@@ -1531,6 +1531,12 @@ impl PipelineConfig {
                     arena_fields: arena_fields.into_iter().collect(),
                     already_sorted,
                     transform_index: i,
+                    // Default false here; the buffer-recompute derivation
+                    // walks the DAG after lowering and overwrites the
+                    // flag on the resulting IndexSpec when a relaxed-CK
+                    // upstream aggregate's dropped CK fields overlap
+                    // this window's partition_by.
+                    requires_buffer_recompute: false,
                 });
             }
         }
@@ -1766,6 +1772,16 @@ impl PipelineConfig {
             return Err(diags);
         }
 
+        // Window buffer-recompute derivation. Reads `node_properties.ck_set`
+        // populated above and the relaxed-CK aggregate's `group_by`; flags
+        // every IndexSpec whose downstream window-bearing Transform sits
+        // under a relaxed-CK aggregate that dropped CK fields the window's
+        // `partition_by` references. The executor's window arm reads the
+        // flag at runtime to choose between streaming-emit and buffered
+        // emit; pipelines without a relaxed-CK aggregate keep every flag
+        // false and the executor stays on its existing path.
+        dag.derive_window_buffer_recompute_flags();
+
         // E15Y: relaxed_correlation_key + streaming aggregator strategy
         // is rejected at compile time. Streaming aggregates emit at
         // group-boundary close, before the terminal CorrelationCommit,
@@ -1901,10 +1917,24 @@ impl PipelineConfig {
             for node in dag.graph.node_weights() {
                 if let crate::plan::execution::PlanNode::Transform {
                     name,
-                    window_index: Some(_),
+                    window_index: Some(idx_num),
                     ..
                 } = node
                 {
+                    // Buffer-recompute mode lifts the E150 restriction:
+                    // the orchestrator's commit phase reruns the window
+                    // over surviving partition rows and emits per-output
+                    // Deltas, so a window downstream of a relaxed-CK
+                    // aggregate is safe to materialize even when
+                    // partitions span correlation-key boundaries.
+                    let buffered = dag
+                        .indices_to_build
+                        .get(*idx_num)
+                        .map(|s| s.requires_buffer_recompute)
+                        .unwrap_or(false);
+                    if buffered {
+                        continue;
+                    }
                     let err = crate::plan::execution::PlanError::CorrelationKeyWithArena {
                         transform: name.clone(),
                     };
