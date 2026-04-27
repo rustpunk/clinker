@@ -117,10 +117,12 @@ pub fn extract_aggregates(
         group_by_fields: group_by_fields.to_vec(),
         pre_agg_filter,
         emits,
-        // Defaults to `false`; the planner flips this on via
-        // `set_requires_lineage_for_relaxed` when the owning aggregate
+        // Both retraction-strategy flags default to `false`; the planner
+        // flips at most one of them on via
+        // `set_retraction_flags_for_relaxed` when the owning aggregate
         // opts into relaxed correlation-key semantics.
         requires_lineage: false,
+        requires_buffer_mode: false,
     })
 }
 
@@ -885,17 +887,20 @@ mod tests {
         assert!(err.iter().any(|d| d.message.contains("nope")));
     }
 
-    // ----- requires_lineage truth table -----
+    // ----- retraction-strategy truth table -----
     //
-    // The lineage map is the Reversible-path optimization for retraction:
-    // it lets an O(1) sub() on Sum/Count/Collect/Any target only the rows
-    // a downstream rollback names. A BufferRequired binding (Min/Max/Avg/
-    // WeightedAvg) replays contributions from a separate per-group buffer,
-    // so a single such binding flips the whole aggregate off the lineage
-    // path — splitting strategies per slot would defeat the point.
+    // The two flags are exact complements under relaxed-CK. Lineage is the
+    // Reversible-path optimization for retraction: it lets an O(1) sub()
+    // on Sum/Count/Collect/Any target only the rows a downstream rollback
+    // names. Buffer-mode replays contributions from a separate per-group
+    // buffer for BufferRequired bindings (Min/Max/Avg/WeightedAvg) where
+    // an inverse op would either drift (Avg, WeightedAvg) or be impossible
+    // without the surviving multiset (Min, Max). A single BufferRequired
+    // binding flips the whole aggregate to buffer-mode — splitting
+    // strategies per slot would defeat the point.
 
     #[test]
-    fn test_requires_lineage_relaxed_with_all_reversible() {
+    fn test_retraction_flags_relaxed_with_all_reversible() {
         let fields = &[("dept", Type::String), ("salary", Type::Int)];
         let typed = typed_for_agg(
             "emit total = sum(salary)\nemit n = count(*)",
@@ -904,21 +909,26 @@ mod tests {
         );
         let mut compiled =
             extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
-        // Default after extraction is always `false`.
+        // Default after extraction is always `false` for both.
         assert!(!compiled.requires_lineage);
-        compiled.set_requires_lineage_for_relaxed(true);
+        assert!(!compiled.requires_buffer_mode);
+        compiled.set_retraction_flags_for_relaxed(true);
         assert!(
             compiled.requires_lineage,
             "all-Reversible bindings under relaxed_correlation_key must enable lineage"
         );
+        assert!(
+            !compiled.requires_buffer_mode,
+            "all-Reversible bindings must not select buffer-mode"
+        );
     }
 
     #[test]
-    fn test_requires_lineage_relaxed_with_any_buffer_required() {
+    fn test_retraction_flags_relaxed_with_any_buffer_required() {
         let fields = &[("dept", Type::String), ("salary", Type::Int)];
         // `min(salary)` is BufferRequired — its presence forces the
-        // whole aggregate off the lineage path even though `sum` is
-        // Reversible.
+        // whole aggregate off the lineage path and onto buffer-mode
+        // even though `sum` is Reversible.
         let typed = typed_for_agg(
             "emit total = sum(salary)\nemit lo = min(salary)",
             fields,
@@ -926,23 +936,45 @@ mod tests {
         );
         let mut compiled =
             extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
-        compiled.set_requires_lineage_for_relaxed(true);
+        compiled.set_retraction_flags_for_relaxed(true);
         assert!(
             !compiled.requires_lineage,
             "a single BufferRequired binding short-circuits requires_lineage to false"
         );
+        assert!(
+            compiled.requires_buffer_mode,
+            "a single BufferRequired binding must select buffer-mode"
+        );
     }
 
     #[test]
-    fn test_requires_lineage_strict_always_false() {
+    fn test_retraction_flags_relaxed_with_only_buffer_required() {
+        // Pure BufferRequired bindings — exercise the path with no
+        // Reversible accumulator at all.
+        let fields = &[("dept", Type::String), ("salary", Type::Int)];
+        let typed = typed_for_agg(
+            "emit lo = min(salary)\nemit hi = max(salary)\nemit mean = avg(salary)",
+            fields,
+            &["dept"],
+        );
+        let mut compiled =
+            extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
+        compiled.set_retraction_flags_for_relaxed(true);
+        assert!(!compiled.requires_lineage);
+        assert!(compiled.requires_buffer_mode);
+    }
+
+    #[test]
+    fn test_retraction_flags_strict_always_false() {
         let fields = &[("dept", Type::String), ("salary", Type::Int)];
         let typed = typed_for_agg("emit total = sum(salary)", fields, &["dept"]);
         let mut compiled =
             extract_aggregates(&typed, &["dept".to_string()], &schema_names(fields)).unwrap();
-        // Strict mode (relaxed_correlation_key=false) suppresses lineage
-        // regardless of binding shape.
-        compiled.set_requires_lineage_for_relaxed(false);
+        // Strict mode (relaxed_correlation_key=false) suppresses both
+        // flags regardless of binding shape.
+        compiled.set_retraction_flags_for_relaxed(false);
         assert!(!compiled.requires_lineage);
+        assert!(!compiled.requires_buffer_mode);
 
         // And the same call with a BufferRequired binding mix still
         // resolves to false — strict short-circuits before the binding
@@ -954,7 +986,8 @@ mod tests {
         );
         let mut compiled2 =
             extract_aggregates(&typed2, &["dept".to_string()], &schema_names(fields)).unwrap();
-        compiled2.set_requires_lineage_for_relaxed(false);
+        compiled2.set_retraction_flags_for_relaxed(false);
         assert!(!compiled2.requires_lineage);
+        assert!(!compiled2.requires_buffer_mode);
     }
 }

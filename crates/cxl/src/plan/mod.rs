@@ -106,21 +106,39 @@ pub struct CompiledAggregate {
     /// per-group buffer instead of running the lineage-driven retract.
     /// Strict (non-relaxed) aggregates always set this `false`.
     pub requires_lineage: bool,
+    /// Whether the runtime aggregator must hold raw per-row contributions
+    /// instead of folded accumulator state. Derived from the aggregate's
+    /// relaxed-correlation-key opt-in plus the reversibility of every
+    /// binding's accumulator — exactly the complement of the lineage
+    /// gate: at least one `BufferRequired` binding (`Min`, `Max`, `Avg`,
+    /// `WeightedAvg`) flips this on so the rollback step can recompute
+    /// affected groups from `contributions − retracted_rows` rather than
+    /// rely on an O(1) inverse op the accumulator does not admit.
+    /// Strict (non-relaxed) aggregates always set this `false`.
+    pub requires_buffer_mode: bool,
 }
 
 impl CompiledAggregate {
-    /// Derive `requires_lineage` from the relaxed-correlation-key opt-in.
+    /// Derive both retraction-strategy flags from the relaxed-correlation-key
+    /// opt-in.
     ///
-    /// `requires_lineage` flips on iff the aggregate has opted into
-    /// relaxed correlation-key semantics AND every binding's accumulator
-    /// is reversible. A single `BufferRequired` binding (`Min`, `Max`,
-    /// `Avg`, `WeightedAvg`) short-circuits the result to `false` so the
-    /// runtime takes the buffered-contributions path for the whole
-    /// aggregate rather than splitting the rollback strategy per slot.
-    pub fn set_requires_lineage_for_relaxed(&mut self, relaxed_correlation_key: bool) {
-        self.requires_lineage = relaxed_correlation_key
-            && self.bindings.iter().all(|b| {
-                AccumulatorEnum::for_type(&b.acc_type).reversibility() == Reversibility::Reversible
-            });
+    /// `requires_lineage` and `requires_buffer_mode` are exact complements
+    /// under relaxed-CK: every binding being `Reversible` selects lineage,
+    /// any `BufferRequired` binding selects buffer-mode. Strict aggregates
+    /// short-circuit both to `false` so non-opted pipelines pay zero
+    /// retraction overhead. Setting them in one call keeps the dispatch
+    /// invariant — exactly one of the two flags is `true` under relaxed
+    /// opt-in — visible at every call site.
+    pub fn set_retraction_flags_for_relaxed(&mut self, relaxed_correlation_key: bool) {
+        if !relaxed_correlation_key {
+            self.requires_lineage = false;
+            self.requires_buffer_mode = false;
+            return;
+        }
+        let any_buffer_required = self.bindings.iter().any(|b| {
+            AccumulatorEnum::for_type(&b.acc_type).reversibility() == Reversibility::BufferRequired
+        });
+        self.requires_lineage = !any_buffer_required;
+        self.requires_buffer_mode = any_buffer_required;
     }
 }

@@ -2365,12 +2365,12 @@ pub(crate) fn lower_node_to_plan_node(
                         return None;
                     }
                 };
-            // Plan-time derivation of the runtime lineage gate. Strict
-            // aggregates leave it `false`; relaxed aggregates flip it on
-            // only when every binding is reversible — a single
-            // BufferRequired accumulator routes the whole aggregate to
-            // the buffered-contributions path that lineage cannot help.
-            compiled_agg.set_requires_lineage_for_relaxed(agg_body.relaxed_correlation_key);
+            // Plan-time derivation of the two retraction-strategy flags.
+            // Strict aggregates leave both `false`; relaxed aggregates
+            // pick exactly one — lineage when every binding is
+            // Reversible (O(1) inverse-op retract), buffer-mode when any
+            // binding is BufferRequired (recompute from raw contributions).
+            compiled_agg.set_retraction_flags_for_relaxed(agg_body.relaxed_correlation_key);
             // `schema_from_bound` reads the typed `output_row` produced
             // by `propagate_aggregate` (group-by columns first, then
             // emits) and stamps engine-stamp metadata on the
