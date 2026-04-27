@@ -46,6 +46,7 @@ use indexmap::IndexMap;
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::KeyExtractor;
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
 use crate::pipeline::memory::MemoryBudget;
@@ -638,7 +639,7 @@ fn execute_combine_sort_merge_with_stats(
         // walk; unmatched drivers emit here with an empty array.
         for (driver_record, driver_order) in all_unmatched {
             let mut rec = match output_schema {
-                Some(s) => widen(&driver_record, s),
+                Some(s) => widen_record_to_schema(&driver_record, s),
                 None => driver_record.clone(),
             };
             rec.set(build_qualifier, Value::Array(Vec::new()));
@@ -669,7 +670,7 @@ fn execute_combine_sort_merge_with_stats(
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit { fields, metadata }) => {
                             let mut rec = match output_schema {
-                                Some(s) => widen(&driver_record, s),
+                                Some(s) => widen_record_to_schema(&driver_record, s),
                                 None => driver_record.clone(),
                             };
                             for (n, v) in fields {
@@ -1109,7 +1110,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                 args.matched_driver_orders.insert(driver_order);
             }
             let mut rec = match output_schema {
-                Some(s) => widen(driver_record, s),
+                Some(s) => widen_record_to_schema(driver_record, s),
                 None => driver_record.clone(),
             };
             rec.set(build_qualifier, Value::Array(arr));
@@ -1145,7 +1146,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit { fields, metadata }) => {
                             let mut rec = match output_schema {
-                                Some(s) => widen(driver_record, s),
+                                Some(s) => widen_record_to_schema(driver_record, s),
                                 None => driver_record.clone(),
                             };
                             for (n, v) in fields {
@@ -1238,25 +1239,6 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
         }
     }
     Ok(())
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Schema helpers
-// ──────────────────────────────────────────────────────────────────────
-
-fn widen(input: &Record, target: &Arc<Schema>) -> Record {
-    if Arc::ptr_eq(input.schema(), target) {
-        return input.clone();
-    }
-    let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
-    for col in target.columns() {
-        values.push(input.get(col).cloned().unwrap_or(Value::Null));
-    }
-    let mut out = Record::new(Arc::clone(target), values);
-    for (k, v) in input.iter_meta() {
-        let _ = out.set_meta(k, v.clone());
-    }
-    out
 }
 
 fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineError {

@@ -60,6 +60,7 @@ use cxl::typecheck::TypedProgram;
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
 use crate::pipeline::grace_spill::{GraceSpillReader, GraceSpillWriter, SpillFilePath};
 use crate::pipeline::memory::MemoryBudget;
@@ -1683,7 +1684,7 @@ fn emit_for_probe<'a>(
                 );
             }
             let mut rec = match output_schema {
-                Some(s) => widen(probe_record, s),
+                Some(s) => widen_record_to_schema(probe_record, s),
                 None => probe_record.clone(),
             };
             rec.set(build_qualifier, Value::Array(arr));
@@ -1735,7 +1736,7 @@ fn emit_for_probe<'a>(
                                 metadata,
                             }) => {
                                 let mut rec = match output_schema {
-                                    Some(s) => widen(probe_record, s),
+                                    Some(s) => widen_record_to_schema(probe_record, s),
                                     None => probe_record.clone(),
                                 };
                                 for (n, v) in emitted {
@@ -1761,7 +1762,7 @@ fn emit_for_probe<'a>(
                             metadata,
                         }) => {
                             let mut rec = match output_schema {
-                                Some(s) => widen(probe_record, s),
+                                Some(s) => widen_record_to_schema(probe_record, s),
                                 None => probe_record.clone(),
                             };
                             for (n, v) in emitted {
@@ -1816,47 +1817,6 @@ fn emit_for_probe<'a>(
         }
     }
     Ok(())
-}
-
-fn widen(input: &Record, target: &Arc<Schema>) -> Record {
-    if Arc::ptr_eq(input.schema(), target) {
-        return input.clone();
-    }
-    let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
-    for (i, col) in target.columns().iter().enumerate() {
-        let v = match input.get(col.as_ref()) {
-            Some(v) => v.clone(),
-            None => {
-                // Recover an engine-stamped column from a chain-encoded
-                // intermediate driver: column `$ck.<field>` arrives as
-                // `__<driver_qualifier>__$ck.<field>` in the final
-                // step's driver record. See
-                // `executor::widen_record_to_schema` for the canonical
-                // version of this logic.
-                let is_engine_stamped = target
-                    .field_metadata(i)
-                    .is_some_and(|m| m.is_engine_stamped());
-                if is_engine_stamped {
-                    let suffix = format!("__{}", col.as_ref());
-                    input
-                        .schema()
-                        .columns()
-                        .iter()
-                        .position(|n| n.as_ref().ends_with(&suffix))
-                        .map(|j| input.values()[j].clone())
-                        .unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                }
-            }
-        };
-        values.push(v);
-    }
-    let mut out = Record::new(Arc::clone(target), values);
-    for (k, v) in input.iter_meta() {
-        let _ = out.set_meta(k, v.clone());
-    }
-    out
 }
 
 /// Placeholder `RecordStorage` for windowless expression evaluation.

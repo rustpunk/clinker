@@ -50,6 +50,7 @@ use indexmap::IndexMap;
 use crate::config::pipeline_node::{MatchMode, OnMiss};
 use crate::error::PipelineError;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{KeyExtractor, hash_composite_key, keys_equal_canonicalized};
 use crate::pipeline::memory::MemoryBudget;
 use crate::plan::combine::{DecomposedPredicate, RangeOp};
@@ -1032,47 +1033,6 @@ fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineErr
         transform_name: name.to_string(),
         messages: vec![format!("combine {side}-side range/key eval error: {err}")],
     }
-}
-
-fn widen_record_to_schema(input: &Record, target: &Arc<Schema>) -> Record {
-    if Arc::ptr_eq(input.schema(), target) {
-        return input.clone();
-    }
-    let mut values: Vec<Value> = Vec::with_capacity(target.column_count());
-    for (i, col) in target.columns().iter().enumerate() {
-        let v = match input.get(col.as_ref()) {
-            Some(v) => v.clone(),
-            None => {
-                // Recover an engine-stamped column from a chain-encoded
-                // intermediate driver: column `$ck.<field>` arrives as
-                // `__<driver_qualifier>__$ck.<field>` in the final
-                // step's driver record. See
-                // `executor::widen_record_to_schema` for the canonical
-                // version of this logic.
-                let is_engine_stamped = target
-                    .field_metadata(i)
-                    .is_some_and(|m| m.is_engine_stamped());
-                if is_engine_stamped {
-                    let suffix = format!("__{}", col.as_ref());
-                    input
-                        .schema()
-                        .columns()
-                        .iter()
-                        .position(|n| n.as_ref().ends_with(&suffix))
-                        .map(|j| input.values()[j].clone())
-                        .unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                }
-            }
-        };
-        values.push(v);
-    }
-    let mut out = Record::new(Arc::clone(target), values);
-    for (k, v) in input.iter_meta() {
-        let _ = out.set_meta(k, v.clone());
-    }
-    out
 }
 
 /// Placeholder `RecordStorage` for windowless body / residual
