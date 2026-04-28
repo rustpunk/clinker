@@ -191,6 +191,12 @@ Aggregate output rows on the strict path inherit the correlation meta of the rec
 
 On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. The retraction protocol's compile-time and runtime constraints (`E15W` for non-deterministic builtins downstream, `E15Y` for `strategy: streaming` on a retraction-mode aggregate) are enforced automatically once the engine has classified the aggregate.
 
+#### Where retraction triggers are sourced
+
+Retraction is fine-grained for failures **upstream** of a retraction-mode aggregate (Source ingest, Transform evaluation, Combine probe, Validation): the failing record carries `$ck.<field>` shadow columns, the engine identifies its correlation group from those columns, and `retract_row` removes that record's specific contribution from every affected aggregate group while leaving every other contributing record intact.
+
+Failures **downstream** of a retraction-mode aggregate (a Transform that fails on an aggregate output row, an Output writer that rejects an aggregate row) are routed differently. Aggregate output rows do not carry the `$ck.<field>` shadow columns of their contributing source records — the retraction lattice intentionally drops those fields when `group_by` omits them, because one aggregate row's identity is the group, not any one source record. A downstream failure therefore lacks the per-source-record correlation key it would need to fan out to upstream peers, and the engine treats the failure as a single-record DLQ event tied to the earliest contributing source row. This is a known limitation: pipelines that need DLQ rollback for downstream-of-aggregate failures should keep `group_by ⊇ correlation_key` (the strict-collateral path) where each aggregate output row inherits a single correlation identity unambiguously.
+
 ### Combine interaction
 
 Every combine declares `propagate_ck:` to select which correlation-key fields its output rows carry:

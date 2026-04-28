@@ -14,14 +14,10 @@ nodes:
     type: transform
     input: raw_sales
     analytic_window:
-      partition_by: [region]
-      order_by:
+      group_by: [region]
+      sort_by:
         - field: amount
-          direction: desc
-      frame:
-        type: rows
-        start: unbounded_preceding
-        end: current_row
+          order: desc
     cxl: |
       emit region = region
       emit amount = amount
@@ -33,11 +29,12 @@ nodes:
 
 | Field | Description |
 |-------|-------------|
-| `partition_by` | List of fields to partition the window by (like SQL `PARTITION BY`) |
-| `order_by` | List of ordering specifications (`field` + `direction`) |
-| `frame.type` | Frame type: `rows` or `range` |
-| `frame.start` | Frame start: `unbounded_preceding`, `current_row`, or `preceding(n)` |
-| `frame.end` | Frame end: `unbounded_following`, `current_row`, or `following(n)` |
+| `group_by` | List of fields to partition the window by (the SQL `PARTITION BY` axis). |
+| `sort_by` | List of `{ field, order }` ordering specifications (`order` is `asc` or `desc`). |
+| `source` | Optional explicit source-name reference for cross-source windows. |
+| `on` | Optional cross-source partition-lookup field. |
+
+Frame specification (`frame: { rows: ... }` / `frame: { range: ... }`) is not yet plumbed through the YAML parser; today every window evaluates with a `rows: unbounded_preceding..current_row` semantic, which matches the SQL default for the listed window functions. See [the deferred-work tracker](https://github.com/rustpunk/clinker/issues) for status of explicit frame syntax.
 
 ## Aggregate window functions
 
@@ -164,14 +161,10 @@ nodes:
     type: transform
     input: daily_sales
     analytic_window:
-      partition_by: [store_id]
-      order_by:
+      group_by: [store_id]
+      sort_by:
         - field: sale_date
-          direction: asc
-      frame:
-        type: rows
-        start: preceding(6)
-        end: current_row
+          order: asc
     cxl: |
       emit store_id = store_id
       emit sale_date = sale_date
@@ -182,10 +175,10 @@ nodes:
       emit day_over_day = revenue - ($window.lag(1) ?? revenue)
 ```
 
-This computes a 7-day rolling average and total per store, along with day-over-day revenue change.
+This computes per-store running averages and totals over the partition's history-up-to-and-including the current row.
 
 ## Retraction interaction
 
-When a window sits downstream of a relaxed-CK aggregate whose dropped correlation-key fields overlap the window's `partition_by`, the planner switches the window from streaming-emit to buffer-mode. The window operator stores per-partition raw row buffers until commit; on retraction, it reruns the configured `$window.*` evaluation over `partition − retracted_rows` and emits per-output deltas through the replay phase.
+When a window sits downstream of a relaxed-CK aggregate whose dropped correlation-key fields overlap the window's `group_by`, the planner switches the window from streaming-emit to buffer-mode. The window operator stores per-partition raw row buffers until commit; on retraction, it reruns the configured `$window.*` evaluation over `partition − retracted_rows` and emits per-output deltas through the replay phase.
 
 All 13 window functions are covered uniformly by wholesale recompute. The [operator-by-operator retraction cost reference](../pipeline/correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator memory ceilings; `clinker run --explain` reports the live per-window detail.
