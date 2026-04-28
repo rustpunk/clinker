@@ -2499,6 +2499,41 @@ pub(crate) fn build_source_dag(
     Ok(tiers)
 }
 
+/// Tier index of `source_name` in a `Vec<SourceTier>` (output of
+/// [`build_source_dag`]), or `None` if the name is not present in any
+/// tier. Used by E150c diagnostic emission to compare two sources'
+/// ingestion ordering: lower index = earlier tier.
+pub fn source_tier_index(tiers: &[SourceTier], source_name: &str) -> Option<usize> {
+    tiers
+        .iter()
+        .position(|t| t.sources.iter().any(|s| s == source_name))
+}
+
+/// Walk back from a window-bearing Transform through the DAG and return
+/// the name of the [`PlanNode::Source`] feeding its primary input chain.
+///
+/// Pass-through operators ([`PlanNode::Sort`], [`PlanNode::Route`]) and
+/// schema-changing operators (Aggregation, Combine, Transform, Merge,
+/// Composition) are walked through by following the first incoming
+/// edge. Returns `None` if the walk reaches a node with no incoming
+/// edges that is not a `Source` (disconnected node), or hits a
+/// [`PlanNode::Merge`] whose inputs come from multiple distinct
+/// source roots (no single primary source).
+pub fn primary_input_source_for_transform(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> Option<String> {
+    let mut cursor = start;
+    loop {
+        if let PlanNode::Source { name, .. } = &graph[cursor] {
+            return Some(name.clone());
+        }
+        let mut incoming = graph.neighbors_directed(cursor, petgraph::Direction::Incoming);
+        let parent = incoming.next()?;
+        cursor = parent;
+    }
+}
+
 /// Walk one incoming edge per step from `start` past pass-through nodes
 /// ([`PlanNode::Sort`], [`PlanNode::Route`]) and return the first ancestor
 /// that actually changes the row stream's schema or row count.
@@ -2667,19 +2702,20 @@ pub(crate) fn resolve_composition_body_windows(
             for sf in &wc.sort_by {
                 arena_fields.insert(sf.field.clone());
             }
-            // Body Transforms do not carry an analyzer-pass
-            // `accessed_fields` map at this stage — body type
-            // analysis happens during bind_composition but its
-            // accessed-field surface is not propagated to a side
-            // table the post-pass can consult. Falling back to
-            // `group_by ∪ sort_by` covers every field the windowed
-            // builtin partitions / orders by; window builtins that
-            // reference additional payload columns (e.g.
-            // `$window.sum(other_col)` over a `partition_by:
-            // [department]`) project through the runtime arena's
-            // resolve path and require those columns in the arena
-            // schema. Phase 3 owns the analyzer-side hook that
-            // surfaces body-Transform accessed-fields here.
+            // Pull every field a body Transform references through
+            // window builtins or bare FieldRefs — e.g.
+            // `$window.sum(amount)` adds `amount`, and `emit x = y` adds
+            // `y`. The analyzer is the same one consumed at top-level
+            // lowering (`config/mod.rs`); body Transforms register their
+            // typed programs in `artifacts.typed` keyed by the body
+            // node's name, so the analyzer call here mirrors the
+            // top-level shape exactly.
+            if let Some(typed) = artifacts.typed.get(*transform_name) {
+                let analysis = cxl::analyzer::analyze_transform(transform_name, typed);
+                for f in &analysis.accessed_fields {
+                    arena_fields.insert(f.clone());
+                }
+            }
             let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
             arena_fields_vec.sort();
 
@@ -2748,6 +2784,33 @@ pub(crate) fn resolve_composition_body_windows(
                     let Some(anchor_schema) = other.stored_output_schema().cloned() else {
                         continue;
                     };
+                    // E150b — every arena field must be present in the
+                    // upstream operator's output schema. The top-level
+                    // lowering enforces this at `config/mod.rs`; body
+                    // windows enforce it here so body-internal
+                    // post-aggregate windows that reference a column
+                    // the aggregate did not emit fail at compile rather
+                    // than silently reading Null at runtime.
+                    let mut e150b_fired = false;
+                    for f in &arena_fields_vec {
+                        if !anchor_schema.contains(f.as_str()) {
+                            diags.push(Diagnostic::error(
+                                "E150b",
+                                format!(
+                                    "composition body windowed transform {transform_name:?} \
+                                     references field {f:?} that the upstream operator {:?} \
+                                     does not emit; a node-rooted window can only see \
+                                     columns produced by its rooted operator",
+                                    other.name()
+                                ),
+                                LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                            ));
+                            e150b_fired = true;
+                        }
+                    }
+                    if e150b_fired {
+                        continue;
+                    }
                     PlanIndexRoot::Node {
                         upstream: rooted_idx,
                         anchor_schema,
@@ -3248,57 +3311,17 @@ impl ExecutionPlanDag {
     /// `partition_by` slice. Reads `node_properties.ck_set`, so callers
     /// must invoke `compute_node_properties` first. Idempotent.
     pub(crate) fn derive_window_buffer_recompute_flags(&mut self) {
-        // Lattice-driven enabler: at least one aggregate whose parent's
-        // `ck_set` is NOT a subset of `group_by`. Without one, the
-        // retraction protocol does not fire and no window needs buffer
-        // mode.
-        let has_relaxed_aggregate = self.graph.node_indices().any(|idx| {
-            let PlanNode::Aggregation { config, .. } = &self.graph[idx] else {
-                return false;
-            };
-            let parent_ck = self
-                .graph
-                .neighbors_directed(idx, petgraph::Direction::Incoming)
-                .next()
-                .and_then(|p| self.node_properties.get(&p))
+        let ck_at = |idx: NodeIndex| -> BTreeSet<String> {
+            self.node_properties
+                .get(&idx)
                 .map(|p| p.ck_set.clone())
-                .unwrap_or_default();
-            group_by_omits_any_ck_field(&config.group_by, &parent_ck)
-        });
-        if !has_relaxed_aggregate {
-            return;
-        }
-
-        let mut to_flag: Vec<usize> = Vec::new();
-        for idx in self.graph.node_indices() {
-            if let PlanNode::Transform {
-                window_index: Some(idx_num),
-                ..
-            } = &self.graph[idx]
-            {
-                let idx_num = *idx_num;
-                let Some(props) = self.node_properties.get(&idx) else {
-                    continue;
-                };
-                let Some(spec) = self.indices_to_build.get(idx_num) else {
-                    continue;
-                };
-                let partition_set: BTreeSet<&str> =
-                    spec.group_by.iter().map(String::as_str).collect();
-                let ck_outside_partition = props
-                    .ck_set
-                    .iter()
-                    .any(|f| !partition_set.contains(f.as_str()));
-                if ck_outside_partition {
-                    to_flag.push(idx_num);
-                }
-            }
-        }
-        for idx_num in to_flag {
-            if let Some(spec) = self.indices_to_build.get_mut(idx_num) {
-                spec.requires_buffer_recompute = true;
-            }
-        }
+                .unwrap_or_default()
+        };
+        derive_window_buffer_recompute_flags_for_graph(
+            &self.graph,
+            &mut self.indices_to_build,
+            ck_at,
+        );
     }
 
     /// Resolve `AggregateStrategyHint` on every `PlanNode::Aggregation`
@@ -4153,6 +4176,122 @@ pub(crate) fn apply_retraction_flags_in_body(body: &mut crate::plan::composition
             Arc::make_mut(compiled).set_retraction_flags(is_relaxed);
         }
     }
+}
+
+/// Shared core for the buffer-recompute auto-flip walk over any
+/// `(graph, indices_to_build)` pair.
+///
+/// `ck_at` returns the CK set visible at a given node — the top-level
+/// dispatch reads `node_properties.ck_set`; the body dispatch derives it
+/// inline by walking the nearest upstream `output_schema` for
+/// `FieldMetadata::SourceCorrelation` columns.
+///
+/// The walk is the unified rule from
+/// [`ExecutionPlanDag::derive_window_buffer_recompute_flags`]: when at
+/// least one aggregate's `group_by` omits a parent-CK field (relaxed
+/// retraction protocol fires), every windowed Transform whose
+/// `partition_by` does not cover the visible CK set flips to
+/// `requires_buffer_recompute = true`.
+fn derive_window_buffer_recompute_flags_for_graph<F>(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    indices_to_build: &mut [crate::plan::index::IndexSpec],
+    mut ck_at: F,
+) where
+    F: FnMut(NodeIndex) -> BTreeSet<String>,
+{
+    // Lattice-driven enabler: at least one aggregate whose parent's
+    // `ck_set` is NOT a subset of `group_by`. Without one, the
+    // retraction protocol does not fire and no window needs buffer
+    // mode.
+    let has_relaxed_aggregate = graph.node_indices().any(|idx| {
+        let PlanNode::Aggregation { config, .. } = &graph[idx] else {
+            return false;
+        };
+        let parent_ck = graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .next()
+            .map(&mut ck_at)
+            .unwrap_or_default();
+        group_by_omits_any_ck_field(&config.group_by, &parent_ck)
+    });
+    if !has_relaxed_aggregate {
+        return;
+    }
+
+    let mut to_flag: Vec<usize> = Vec::new();
+    for idx in graph.node_indices() {
+        if let PlanNode::Transform {
+            window_index: Some(idx_num),
+            ..
+        } = &graph[idx]
+        {
+            let idx_num = *idx_num;
+            let Some(spec) = indices_to_build.get(idx_num) else {
+                continue;
+            };
+            let partition_set: BTreeSet<&str> = spec.group_by.iter().map(String::as_str).collect();
+            let ck_set = ck_at(idx);
+            let ck_outside_partition = ck_set.iter().any(|f| !partition_set.contains(f.as_str()));
+            if ck_outside_partition {
+                to_flag.push(idx_num);
+            }
+        }
+    }
+    for idx_num in to_flag {
+        if let Some(spec) = indices_to_build.get_mut(idx_num) {
+            spec.requires_buffer_recompute = true;
+        }
+    }
+}
+
+/// Body-graph variant of `derive_window_buffer_recompute_flags`.
+///
+/// Body mini-DAGs do not carry a `node_properties` side table, so the
+/// CK set visible at any body node is derived inline by walking the
+/// nearest upstream `output_schema` for `FieldMetadata::SourceCorrelation`
+/// columns — the same shape `apply_retraction_flags_in_body` uses to
+/// derive the relaxed-aggregate trigger. Composition-body windows
+/// downstream of a body-internal relaxed-CK aggregate flip into
+/// buffer-recompute mode the same way top-level windows do, so the
+/// commit-phase recompute path can rerun the window over
+/// `partition − retracted_rows`.
+pub(crate) fn derive_window_buffer_recompute_flags_in_body(
+    body: &mut crate::plan::composition_body::BoundBody,
+) {
+    use clinker_record::FieldMetadata;
+
+    let ck_at = |start: NodeIndex| -> BTreeSet<String> {
+        let mut ck: BTreeSet<String> = BTreeSet::new();
+        let mut cursor = start;
+        loop {
+            if let Some(schema) = body.graph[cursor].stored_output_schema() {
+                for (i, col) in schema.columns().iter().enumerate() {
+                    if matches!(
+                        schema.field_metadata(i),
+                        Some(FieldMetadata::SourceCorrelation { .. }),
+                    ) && let Some(field) = col.strip_prefix("$ck.")
+                    {
+                        ck.insert(field.to_string());
+                    }
+                }
+                return ck;
+            }
+            match body
+                .graph
+                .neighbors_directed(cursor, petgraph::Direction::Incoming)
+                .next()
+            {
+                Some(upstream) => cursor = upstream,
+                None => return ck,
+            }
+        }
+    };
+
+    derive_window_buffer_recompute_flags_for_graph(
+        &body.graph,
+        &mut body.body_indices_to_build,
+        ck_at,
+    );
 }
 
 /// Detect whether a CXL transform contains any `distinct` statement.

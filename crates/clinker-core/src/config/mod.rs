@@ -1722,6 +1722,45 @@ impl PipelineConfig {
                 .filter(|s| s.as_str() != primary_source_str)
                 .cloned();
 
+            // E150c — when a window declares a cross-source reference
+            // (`wc.source: <other>`), the referenced source's ingestion
+            // tier MUST be earlier than (or equal to) the tier of the
+            // window-bearing transform's primary input source.
+            // `build_source_dag` orders cross-source-referenced sources
+            // into earlier tiers so their indices are populated before
+            // any consumer reads them; an inverted-tier reference means
+            // the engine would attempt to project against a not-yet-
+            // ingested source.
+            if let Some(other) = cross_source.as_deref() {
+                let primary_for_transform =
+                    crate::plan::execution::primary_input_source_for_transform(
+                        &graph,
+                        transform_idx,
+                    )
+                    .unwrap_or_else(|| primary_source_str.to_string());
+                let other_tier = crate::plan::execution::source_tier_index(&source_dag, other);
+                let primary_tier = crate::plan::execution::source_tier_index(
+                    &source_dag,
+                    primary_for_transform.as_str(),
+                );
+                if let (Some(other_tier), Some(primary_tier)) = (other_tier, primary_tier)
+                    && other_tier > primary_tier
+                {
+                    diags.push(Diagnostic::error(
+                        "E150c",
+                        format!(
+                            "cross-source window references source '{other}' whose \
+                             ingestion tier is downstream of the window-bearing \
+                             transform '{transform_name}' primary input source \
+                             '{primary_for_transform}'; promote '{other}' to an \
+                             earlier tier or remove the cross-source reference"
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+            }
+
             let root = if let Some(other) = cross_source {
                 crate::plan::index::PlanIndexRoot::Source(other)
             } else {
@@ -1803,6 +1842,50 @@ impl PipelineConfig {
                                     LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                                 ));
                                 return Err(diags);
+                            }
+                        }
+                        // E150e — windows over Combine emit columns
+                        // cannot reference an array-typed field. The
+                        // typed `output_row` lives in `artifacts.typed`
+                        // keyed by the combine's name and carries the
+                        // CXL `Type` per emitted column; a
+                        // `match: collect` body emits `Type::Array` for
+                        // every collected build-row column. Window
+                        // builtins (sum/avg/min/max/lag/lead/...) do
+                        // not handle `Value::Array`, so they would
+                        // silently see Null at runtime.
+                        if let crate::plan::execution::PlanNode::Combine { .. } = other {
+                            let combine_name = other.name();
+                            if let Some(typed) = artifacts.typed.get(combine_name) {
+                                for f in &report.transforms[i].accessed_fields {
+                                    let is_array = typed
+                                        .output_row
+                                        .fields()
+                                        .find(|(qf, _)| qf.name.as_ref() == f.as_str())
+                                        .map(|(_, ty)| {
+                                            matches!(
+                                                ty.unwrap_nullable(),
+                                                cxl::typecheck::Type::Array
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if is_array {
+                                        diags.push(Diagnostic::error(
+                                            "E150e",
+                                            format!(
+                                                "windowed transform '{transform_name}' \
+                                                 references field '{f}' typed as Array; \
+                                                 window builtin does not support \
+                                                 array-typed field '{f}' from \
+                                                 `match: collect` combine '{combine_name}'; \
+                                                 flatten the array upstream or use \
+                                                 `match: first | all`"
+                                            ),
+                                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                                        ));
+                                        return Err(diags);
+                                    }
+                                }
                             }
                         }
                         crate::plan::index::PlanIndexRoot::Node {
@@ -2065,6 +2148,18 @@ impl PipelineConfig {
             .any(|d| matches!(d.severity, crate::error::Severity::Error))
         {
             return Err(diags);
+        }
+
+        // Per-body buffer-recompute flag derivation. Mirrors the top-
+        // level `derive_window_buffer_recompute_flags` walk above —
+        // body-internal relaxed-CK aggregates engage the retraction
+        // protocol the same way top-level relaxed-CK aggregates do, so
+        // any body window whose `partition_by` does not cover the
+        // visible CK set must flip to buffered emit. Without this
+        // pass, body-window retraction would silently bypass the
+        // commit-phase recompute path.
+        for body in artifacts.composition_bodies.values_mut() {
+            crate::plan::execution::derive_window_buffer_recompute_flags_in_body(body);
         }
 
         // E15Y: an aggregate whose `group_by` omits any correlation-key
