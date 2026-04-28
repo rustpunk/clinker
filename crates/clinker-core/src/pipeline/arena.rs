@@ -556,4 +556,83 @@ mod tests {
             other => panic!("expected SchemaMismatch, got: {other:?}"),
         }
     }
+
+    /// Shared `MemoryBudget` across a source-stream `Arena::build` and
+    /// a downstream `Arena::from_records`: when their combined byte
+    /// charge crosses the cumulative limit, the second build raises
+    /// `MemoryBudgetExceeded` even though its own per-call
+    /// `memory_limit` is unbounded. This pins the cross-arena
+    /// accounting that makes node-rooted post-aggregate windows fit
+    /// under the user-declared pipeline budget.
+    #[test]
+    fn shared_memory_budget_aggregates_across_source_and_node_arenas() {
+        use clinker_record::Record;
+
+        // Source arena: 100 records, each ~80 bytes after projection.
+        let mut src_csv = String::from("dept,amount\n");
+        for i in 0..100 {
+            src_csv.push_str(&format!("dept_{i:03},{}\n", i * 10));
+        }
+        let mut reader = make_csv_reader(&src_csv);
+        // Cumulative budget sized just above the source arena so the
+        // first build admits 100 records and the second build's
+        // node-rooted projection trips on the cumulative ceiling.
+        let cumulative_limit = 12_000u64;
+        let mut shared_budget = MemoryBudget::new(cumulative_limit, 0.80);
+        let src_arena = Arena::build(
+            &mut reader,
+            &["dept".into(), "amount".into()],
+            usize::MAX,
+            None,
+            &mut shared_budget,
+        )
+        .expect("source arena fits under the shared budget");
+        assert_eq!(src_arena.record_count(), 100);
+        let after_source_charge = shared_budget.arena_bytes_charged();
+        assert!(
+            after_source_charge > 0,
+            "source arena must charge bytes against the shared budget; \
+             got 0 — budget plumbing regressed"
+        );
+        assert!(
+            after_source_charge <= cumulative_limit,
+            "source arena alone must fit under the shared budget"
+        );
+
+        // Build a second wave of materialized records and project them
+        // through `from_records`. Each record is small but their
+        // cumulative charge plus the source arena's already-charged
+        // bytes pushes past `cumulative_limit`. The error MUST come
+        // from the shared budget, not from the per-call cap.
+        let anchor_schema = Arc::new(Schema::new(vec!["dept".into(), "amount".into()]));
+        let mut rows: Vec<(Record, u64)> = Vec::with_capacity(200);
+        for i in 0..200 {
+            rows.push((
+                Record::new(
+                    Arc::clone(&anchor_schema),
+                    vec![
+                        Value::String(format!("dept_{i:03}").into()),
+                        Value::String(format!("{}", i * 10).into()),
+                    ],
+                ),
+                i as u64,
+            ));
+        }
+        let result = Arena::from_records(
+            &rows,
+            &["dept".into(), "amount".into()],
+            &anchor_schema,
+            &mut shared_budget,
+        );
+        match result {
+            Err(ArenaError::MemoryBudgetExceeded { used, limit }) => {
+                assert!(
+                    used as u64 > cumulative_limit,
+                    "shared budget overflow must report cumulative bytes \
+                     above the limit; used={used} limit={limit}"
+                );
+            }
+            other => panic!("expected MemoryBudgetExceeded from shared budget; got: {other:?}"),
+        }
+    }
 }

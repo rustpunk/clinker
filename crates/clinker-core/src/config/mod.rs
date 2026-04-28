@@ -2310,18 +2310,28 @@ impl PipelineConfig {
                     ..
                 } = node
                 {
-                    // Buffer-recompute mode lifts the E150 restriction:
-                    // the orchestrator's commit phase reruns the window
-                    // over surviving partition rows and emits per-output
-                    // Deltas, so a window inside a retraction-active
-                    // pipeline is safe to materialize even when
-                    // partitions span correlation-key boundaries.
-                    let buffered = dag
+                    // Two disjoint reasons E150 lifts:
+                    //
+                    // 1. Node-rooted / ParentNode-rooted spec: the
+                    //    arena materializes from the upstream operator's
+                    //    emit buffer, not from per-CK-group source rows,
+                    //    so the original "per-group arena construction"
+                    //    concern does not apply. CK-aligned partitions
+                    //    fall under this case.
+                    // 2. Source-rooted spec in buffer-recompute mode:
+                    //    the orchestrator's commit phase reruns the
+                    //    window over surviving partition rows after a
+                    //    CK group is retracted, so the source-rooted
+                    //    arena is safe to materialize.
+                    let safe = dag
                         .indices_to_build
                         .get(*idx_num)
-                        .map(|s| s.requires_buffer_recompute)
+                        .map(|s| {
+                            !matches!(s.root, crate::plan::index::PlanIndexRoot::Source(_))
+                                || s.requires_buffer_recompute
+                        })
                         .unwrap_or(false);
-                    if buffered {
+                    if safe {
                         continue;
                     }
                     let err = crate::plan::execution::PlanError::CorrelationKeyWithArena {

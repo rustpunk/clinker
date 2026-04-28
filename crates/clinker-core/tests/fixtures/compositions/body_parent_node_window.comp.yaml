@@ -1,0 +1,26 @@
+# Composition body whose windowed Transform's first non-pass-through
+# ancestor IS the body's `inp` port, which resolves to a parent-DAG
+# operator. Body lowering must emit `PlanIndexRoot::ParentNode` for the
+# resulting IndexSpec.
+_compose:
+  name: body_parent_node_window
+  inputs:
+    inp:
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: running
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: running
+    input: inp
+    config:
+      analytic_window:
+        group_by: [department]
+      cxl: |
+        emit department = department
+        emit amount = amount
+        emit running_total = $window.sum(amount)

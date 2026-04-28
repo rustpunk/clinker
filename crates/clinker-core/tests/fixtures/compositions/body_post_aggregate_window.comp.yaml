@@ -1,0 +1,35 @@
+# Composition body containing Aggregate → Transform(window over
+# aggregate emit) → emit. The body's analytic-window references the
+# aggregate's emitted `total` column; lowering must root the body's
+# IndexSpec at the body's Aggregate node, not at the body's input port.
+_compose:
+  name: body_post_aggregate_window
+  inputs:
+    inp:
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: running
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+
+  - type: transform
+    name: running
+    input: dept_totals
+    config:
+      analytic_window:
+        group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = total
+        emit running_total = $window.sum(total)

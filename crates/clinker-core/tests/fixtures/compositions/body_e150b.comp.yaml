@@ -1,0 +1,35 @@
+# Body Aggregate emits {department, total}; the windowed Transform's
+# `partition_by` references a `region` column the aggregate did not
+# emit. Body lowering must reject with E150b — the analogue of the
+# top-level E150b at config/mod.rs.
+_compose:
+  name: body_e150b
+  inputs:
+    inp:
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: bad_window
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+
+  - type: transform
+    name: bad_window
+    input: dept_totals
+    config:
+      analytic_window:
+        group_by: [region]
+      cxl: |
+        emit department = department
+        emit total = total
+        emit running_total = $window.sum(total)
