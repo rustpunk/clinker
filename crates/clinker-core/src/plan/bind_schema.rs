@@ -1918,12 +1918,27 @@ fn bind_combine(
             output_decl.insert(qf.clone(), ty.clone());
         }
         output_decl.insert(QualifiedField::bare(build_qualifier.as_str()), Type::Array);
-        // Build-side `$ck.<field>` propagation under collect mode.
-        // The matched-array column carries every per-build payload,
-        // but the propagation slot itself is single-valued — the
-        // first match contributes its $ck value; later matches keep
-        // their own $ck inside the array's per-row Map. Mirrors the
-        // first-match-wins discipline for hashable scalar slots while
+        // Synthetic CK rides through collect-mode combines regardless
+        // of `propagate_ck`. See `combine_output_row` rustdoc for why
+        // the engine-managed `$ck.aggregate.*` lineage is exempt from
+        // the user-facing knob.
+        for (qualifier, input) in inputs {
+            if qualifier == &driving {
+                continue;
+            }
+            for (qf, ty) in input.row.fields() {
+                if qf.name.starts_with("$ck.aggregate.") {
+                    let bare = QualifiedField::bare(qf.name.clone());
+                    output_decl.entry(bare).or_insert_with(|| ty.clone());
+                }
+            }
+        }
+        // Build-side source-CK propagation under collect mode. The
+        // matched-array column carries every per-build payload, but
+        // the propagation slot itself is single-valued — the first
+        // match contributes its $ck value; later matches keep their
+        // own $ck inside the array's per-row Map. Mirrors the first-
+        // match-wins discipline for hashable scalar slots while
         // letting the array preserve full lineage.
         if !matches!(config.propagate_ck, PropagateCkSpec::Driver) {
             for (qualifier, input) in inputs {
@@ -1931,6 +1946,9 @@ fn bind_combine(
                     continue;
                 }
                 for (qf, ty) in input.row.fields() {
+                    if qf.name.starts_with("$ck.aggregate.") {
+                        continue;
+                    }
                     let Some(field_name) = qf.name.strip_prefix("$ck.") else {
                         continue;
                     };
@@ -2563,7 +2581,7 @@ fn walk_statement_exprs(
 /// The driver's `$ck.<field>` shadow columns always land on the output
 /// row so the combined record carries the driver's frozen-identity
 /// snapshot through the join boundary. `propagate_ck` selects whether
-/// build-side `$ck.*` columns also land:
+/// build-side source-CK (`$ck.<field>`) columns also land:
 ///
 /// - `Driver` — only the driver's set propagates.
 /// - `All` — every non-driver input's `$ck.*` columns also land.
@@ -2575,6 +2593,15 @@ fn walk_statement_exprs(
 /// schema and the runtime CK-copy step preserves the driver's value
 /// (the build record's value is not written when a non-null driver
 /// value is already in place).
+///
+/// Synthetic CK (`$ck.aggregate.<aggregate_name>`) is engine-managed
+/// lineage from a relaxed aggregate to its source rows; the user did
+/// not declare it, so `propagate_ck` does not gate it. Build-side
+/// synthetic CK rides through every combine regardless of the spec.
+/// Without this exemption, the detect-phase fan-out from a downstream
+/// failure to the aggregator's per-group source-row table would lose
+/// its bridge whenever a Combine sat between the relaxed aggregate
+/// and the failing node.
 fn combine_output_row(
     typed: &TypedProgram,
     driver_row: Option<&Row>,
@@ -2613,10 +2640,30 @@ fn combine_output_row(
             }
         }
     }
-    // Build-side propagation. Without these slots, the runtime CK
-    // copy has nowhere to write; downstream collateral DLQ traversal
-    // would lose the build inputs' contribution to the joined row's
-    // identity.
+    // Synthetic CK from the build side rides through every combine
+    // unconditionally. `$ck.aggregate.<name>` carries the engine
+    // lineage from a relaxed aggregate to its source rows; the user
+    // did not declare it, so `propagate_ck` (a user-facing knob over
+    // source CK) has no semantic meaning over it. Dropping it would
+    // sever the detect-phase fan-out bridge for any
+    // `Aggregate (relaxed) → Combine → …` shape.
+    if let Some(inputs) = inputs {
+        for (qualifier, input) in inputs {
+            if Some(qualifier.as_str()) == driver_qualifier {
+                continue;
+            }
+            for (qf, ty) in input.row.fields() {
+                if qf.name.starts_with("$ck.aggregate.") {
+                    let bare = QualifiedField::bare(qf.name.clone());
+                    out.entry(bare).or_insert_with(|| ty.clone());
+                }
+            }
+        }
+    }
+    // Build-side source-CK propagation. Without these slots, the
+    // runtime CK copy has nowhere to write; downstream collateral DLQ
+    // traversal would lose the build inputs' contribution to the
+    // joined row's identity.
     if let Some(inputs) = inputs
         && !matches!(propagate_ck, PropagateCkSpec::Driver)
     {
@@ -2625,6 +2672,11 @@ fn combine_output_row(
                 continue;
             }
             for (qf, ty) in input.row.fields() {
+                // Synthetic CK was already covered by the unconditional
+                // loop above; skip to avoid double-insert.
+                if qf.name.starts_with("$ck.aggregate.") {
+                    continue;
+                }
                 let Some(field_name) = qf.name.strip_prefix("$ck.") else {
                     continue;
                 };

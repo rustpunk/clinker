@@ -2217,29 +2217,41 @@ fn recover_engine_stamped_value(
 /// keeping the policy here means a strategy never has to encode the
 /// `$ck` semantics itself.
 ///
-/// `Driver` is the no-op — keeps today's behavior so existing combines
-/// migrated to `propagate_ck: driver` produce identical output. `All`
-/// copies every `$ck.*` column the build record carries. `Named(set)`
-/// copies only the listed CK fields.
+/// `Driver` copies only the engine-managed synthetic CK
+/// (`$ck.aggregate.<name>`, stamped
+/// [`clinker_record::FieldMetadata::AggregateGroupIndex`]) — the user-
+/// declared source CK is suppressed. `All` copies every `$ck.*` column
+/// the build record carries. `Named(set)` copies only the listed
+/// source-CK fields plus every synthetic-CK column unconditionally.
+///
+/// Synthetic CK is engine-managed lineage from a relaxed aggregate to
+/// its source rows; the user did not declare it, so `propagate_ck`
+/// (a knob over user-declared source CK) has no semantic meaning over
+/// it. Without this exemption, the detect-phase fan-out from a
+/// downstream failure to the aggregator's per-group source-row table
+/// would lose its bridge whenever a Combine sat between the relaxed
+/// aggregate and the failing node.
 pub(crate) fn copy_build_ck_columns(
     out: &mut Record,
     build: &Record,
     spec: &crate::config::pipeline_node::PropagateCkSpec,
 ) {
     use crate::config::pipeline_node::PropagateCkSpec;
-    if matches!(spec, PropagateCkSpec::Driver) {
-        return;
-    }
     let build_schema = Arc::clone(build.schema());
     for (idx, col) in build_schema.columns().iter().enumerate() {
         let Some(field_name) = col.strip_prefix("$ck.") else {
             continue;
         };
-        let allowed = match spec {
-            PropagateCkSpec::Driver => false,
-            PropagateCkSpec::All => true,
-            PropagateCkSpec::Named(names) => names.contains(field_name),
-        };
+        let is_synthetic = matches!(
+            build_schema.field_metadata(idx),
+            Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. }),
+        );
+        let allowed = is_synthetic
+            || match spec {
+                PropagateCkSpec::Driver => false,
+                PropagateCkSpec::All => true,
+                PropagateCkSpec::Named(names) => names.contains(field_name),
+            };
         if !allowed {
             continue;
         }
@@ -2251,7 +2263,11 @@ pub(crate) fn copy_build_ck_columns(
         }
         // Driver wins on collision: a non-null value at this slot
         // came from the driver via `widen_record_to_schema`. Only
-        // fill when the slot is still null.
+        // fill when the slot is still null. Synthetic-CK names are
+        // unique per aggregate (`$ck.aggregate.<name>`), so a driver
+        // and build pairing can collide only when both descend from
+        // the same relaxed aggregate, in which case the slot is
+        // already populated with the correct lineage.
         match out.get(col.as_ref()) {
             Some(clinker_record::Value::Null) | None => {
                 let v = &build.values()[idx];

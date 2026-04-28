@@ -677,6 +677,268 @@ nodes:
     }
 }
 
+/// Synthetic CK from a relaxed aggregate rides through a downstream
+/// `propagate_ck: driver` Combine even when the user-source CK gating
+/// would otherwise drop the build-side set. `propagate_ck` is a knob
+/// over user-declared source CK; engine-managed
+/// `$ck.aggregate.<name>` is not the user's concern, so the lattice
+/// unions it from every parent regardless of the spec.
+///
+/// Topology: the build side's source has no `correlation_key:`, so
+/// the only synthetic CK on the upstream lattice comes from the
+/// relaxed aggregate. Whatever petgraph parent ordering turns up,
+/// synthetic CK MUST appear on the combine and output ck_set.
+#[test]
+fn ck_lattice_combine_driver_keeps_synthetic_from_aggregate_parent() {
+    let yaml = r#"
+pipeline:
+  name: ck_combine_driver_keeps_synthetic
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: lookup.csv
+      schema:
+        - { name: department, type: string }
+        - { name: budget, type: int }
+  - type: combine
+    name: enriched
+    input:
+      a: dept_totals
+      l: lookup
+    config:
+      where: "a.department == l.department"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit department = a.department
+        emit total = a.total
+        emit budget = l.budget
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile(yaml);
+    // Synthetic CK rides through regardless of `propagate_ck: driver`.
+    // The build source declares no correlation_key, so its ck_set is
+    // empty — the only way `$ck.aggregate.dept_totals` reaches the
+    // combine output is via the unconditional synthetic-CK union.
+    let combine_set = ck_set_for(&plan, "enriched");
+    assert!(
+        combine_set.contains("$ck.aggregate.dept_totals"),
+        "synthetic CK must survive `propagate_ck: driver`; got {combine_set:?}"
+    );
+    let out_set = ck_set_for(&plan, "out");
+    assert!(
+        out_set.contains("$ck.aggregate.dept_totals"),
+        "output downstream must inherit synthetic CK; got {out_set:?}"
+    );
+}
+
+/// Two independent relaxed aggregates feeding a Combine: each
+/// contributes its own synthetic CK, distinguished by aggregate name.
+/// Both columns carry through the Combine regardless of
+/// `propagate_ck` because synthetic CK is engine-managed lineage —
+/// the user-facing knob does not gate it.
+///
+/// Stacked relaxed aggregates are forbidden by E15W (the outer
+/// aggregator has no lineage entry for the inner aggregate's output
+/// rows), so each synthetic CK lives on a separate branch and the
+/// Combine is the meeting point.
+#[test]
+fn ck_lattice_combine_unions_synthetic_from_independent_aggregate_branches() {
+    let yaml = r#"
+pipeline:
+  name: ck_combine_unions_synthetic
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: tickets
+    config:
+      name: tickets
+      type: csv
+      path: tickets.csv
+      correlation_key: ticket_id
+      schema:
+        - { name: ticket_id, type: string }
+        - { name: department, type: string }
+        - { name: priority, type: int }
+  - type: aggregate
+    name: dept_priorities
+    input: tickets
+    config:
+      group_by: [department]
+      cxl: |
+        emit avg_priority = avg(priority)
+  - type: combine
+    name: enriched
+    input:
+      a: dept_totals
+      b: dept_priorities
+    config:
+      where: "a.department == b.department"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit department = a.department
+        emit total = a.total
+        emit avg_priority = b.avg_priority
+      propagate_ck: all
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile(yaml);
+    let combine_set = ck_set_for(&plan, "enriched");
+    assert!(
+        combine_set.contains("$ck.aggregate.dept_totals"),
+        "combine must carry dept_totals' synthetic CK; got {combine_set:?}"
+    );
+    assert!(
+        combine_set.contains("$ck.aggregate.dept_priorities"),
+        "combine must carry dept_priorities' synthetic CK; got {combine_set:?}"
+    );
+    let out_set = ck_set_for(&plan, "out");
+    assert!(
+        out_set.contains("$ck.aggregate.dept_totals")
+            && out_set.contains("$ck.aggregate.dept_priorities"),
+        "output must carry both synthetic CKs; got {out_set:?}"
+    );
+}
+
+/// Same fixture as the test above, but with `propagate_ck: driver`.
+/// User-source CK is suppressed (build's `ticket_id` does not survive),
+/// but the engine-managed synthetic CK from BOTH branches still rides
+/// through unconditionally.
+#[test]
+fn ck_lattice_combine_driver_unions_synthetic_drops_build_source_ck() {
+    let yaml = r#"
+pipeline:
+  name: ck_combine_driver_unions_synthetic
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: tickets
+    config:
+      name: tickets
+      type: csv
+      path: tickets.csv
+      correlation_key: ticket_id
+      schema:
+        - { name: ticket_id, type: string }
+        - { name: department, type: string }
+        - { name: priority, type: int }
+  - type: aggregate
+    name: dept_priorities
+    input: tickets
+    config:
+      group_by: [department]
+      cxl: |
+        emit avg_priority = avg(priority)
+  - type: combine
+    name: enriched
+    input:
+      a: dept_totals
+      b: dept_priorities
+    config:
+      where: "a.department == b.department"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit department = a.department
+        emit total = a.total
+        emit avg_priority = b.avg_priority
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile(yaml);
+    let combine_set = ck_set_for(&plan, "enriched");
+    // Both synthetic CK names must appear regardless of `driver` mode.
+    assert!(
+        combine_set.contains("$ck.aggregate.dept_totals"),
+        "combine must carry dept_totals' synthetic CK under driver; got {combine_set:?}"
+    );
+    assert!(
+        combine_set.contains("$ck.aggregate.dept_priorities"),
+        "combine must carry dept_priorities' synthetic CK under driver; got {combine_set:?}"
+    );
+}
+
 // Defensive coverage: make sure every node in every fixture above
 // actually has a NodeProperties entry. A missing entry would silently
 // short-circuit `ck_set_for` to an empty set and hide a regression.

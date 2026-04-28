@@ -3510,7 +3510,7 @@ fn compute_one(
             // fallback, which matches today's runtime driver-resolution
             // behavior at dispatch.
             use crate::config::pipeline_node::PropagateCkSpec;
-            let ck_set: BTreeSet<String> = match propagate_ck {
+            let mut ck_set: BTreeSet<String> = match propagate_ck {
                 PropagateCkSpec::Driver => parents
                     .first()
                     .map(|p| p.ck_set.clone())
@@ -3527,6 +3527,23 @@ fn compute_one(
                     names.intersection(&upstream_union).cloned().collect()
                 }
             };
+            // Synthetic CK (`$ck.aggregate.<name>`) is engine-managed
+            // lineage from a relaxed aggregate to its source rows; the
+            // user did not declare it, so `propagate_ck` has no
+            // semantic meaning over it. Union it from every parent so
+            // detect-phase fan-out keeps its bridge across the combine
+            // boundary regardless of how user-declared source CK is
+            // routed.
+            let synthetic: BTreeSet<String> = parents
+                .iter()
+                .flat_map(|p| {
+                    p.ck_set
+                        .iter()
+                        .filter(|f| f.starts_with("$ck.aggregate."))
+                        .cloned()
+                })
+                .collect();
+            ck_set.extend(synthetic);
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
