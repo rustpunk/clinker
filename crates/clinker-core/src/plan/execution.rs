@@ -880,7 +880,7 @@ impl ExecutionPlanDag {
             graph: body.graph.clone(),
             topo_order: body.topo_order.clone(),
             source_dag: Vec::new(),
-            indices_to_build: Vec::new(),
+            indices_to_build: body.body_indices_to_build.clone(),
             output_projections: Vec::new(),
             parallelism: ParallelismProfile {
                 per_transform: Vec::new(),
@@ -2539,6 +2539,276 @@ pub fn first_non_passthrough_ancestor(
             return current;
         }
         current = parent;
+    }
+}
+
+/// Resolve composition-body analytic-window IndexSpecs against the
+/// fully-built parent DAG.
+///
+/// Body lowering (`bind_composition`) runs before the parent DAG's
+/// NodeIndex space is allocated, so it cannot stamp `window_index`
+/// onto body Transform nodes whose first non-pass-through ancestor
+/// reaches the body's `input:` port — that port resolves to a
+/// parent-DAG operator only after Stage 5 has built the parent's
+/// `name_to_idx`. This pass closes that gap: per body, per Transform
+/// carrying a captured `body_window_configs` entry, walk
+/// `first_non_passthrough_ancestor` through the body graph, classify
+/// the rooting (`Source` / `Node` / `ParentNode`), construct the
+/// `RawIndexRequest` set, deduplicate it, and backfill `window_index`
+/// onto the body Transform.
+///
+/// Cross-body recursion (composition-of-composition) is handled by
+/// running the pass per-body; nested bodies' parent context is the
+/// enclosing body's mini-DAG plus any ancestor port resolutions
+/// already baked into the encoding scope's index list.
+pub(crate) fn resolve_composition_body_windows(
+    parent_dag: &ExecutionPlanDag,
+    artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<crate::error::Diagnostic>,
+) {
+    use crate::error::{Diagnostic, LabeledSpan};
+    use crate::plan::index::{
+        IndexSpec, PlanIndexRoot, RawIndexRequest, deduplicate_indices, find_index_for,
+    };
+    use crate::span::Span as PlanSpan;
+
+    // Two-step ownership shuffle: (1) compute every body's
+    // (idx_specs, window_index_assignments) without holding a mutable
+    // borrow on `artifacts`, then (2) write the results back.
+    // `artifacts.composition_bodies` holds `BoundBody` values keyed
+    // by `CompositionBodyId`; the immutable borrow during compute
+    // also covers parent_dag access.
+    let body_ids: Vec<crate::plan::composition_body::CompositionBodyId> =
+        artifacts.composition_bodies.keys().copied().collect();
+
+    for body_id in body_ids {
+        let Some(body) = artifacts.composition_bodies.get(&body_id) else {
+            continue;
+        };
+
+        // Build a parent-DAG name → NodeIndex map once per body so
+        // later port resolutions don't re-walk the parent graph for
+        // every window. Top-level lookups walk parent_dag; nested-
+        // body lookups would need the enclosing body's mini-DAG, but
+        // for this pass the parent context is always the top-level
+        // DAG — nested ParentNode rooting through multiple body
+        // layers is an extension that the dispatcher's
+        // `current_body_node_input_refs` plumbing already handles via
+        // active_stack walks; the spec list emitted here points at the
+        // most-immediate parent-DAG operator. Top-level pipelines
+        // dominate the production geometry so this is the load-
+        // bearing case.
+        let mut parent_name_to_idx: std::collections::HashMap<&str, NodeIndex> =
+            std::collections::HashMap::new();
+        for idx in parent_dag.graph.node_indices() {
+            parent_name_to_idx.insert(parent_dag.graph[idx].name(), idx);
+        }
+
+        // Find this body's call-site composition node in the parent
+        // DAG. Multi-call-site signatures (the same .comp.yaml
+        // referenced by N composition nodes) bind to N distinct
+        // `CompositionBodyId`s — `composition_body_assignments` keys
+        // by composition node name, not body file path, so each
+        // body has exactly one composition node.
+        let mut composition_idx: Option<NodeIndex> = None;
+        for (comp_name, &assigned_id) in &artifacts.composition_body_assignments {
+            if assigned_id == body_id
+                && let Some(&idx) = parent_name_to_idx.get(comp_name.as_str())
+            {
+                composition_idx = Some(idx);
+                break;
+            }
+        }
+        let Some(composition_idx) = composition_idx else {
+            // No call site — body is dead code. Skip.
+            continue;
+        };
+
+        // Per-port → parent-DAG NodeIndex via the composition's
+        // incoming port-tagged edges.
+        let mut port_to_parent_idx: std::collections::HashMap<&str, NodeIndex> =
+            std::collections::HashMap::new();
+        use petgraph::visit::EdgeRef;
+        for edge in parent_dag
+            .graph
+            .edges_directed(composition_idx, petgraph::Direction::Incoming)
+        {
+            if let Some(port_name) = edge.weight().port.as_deref() {
+                port_to_parent_idx.insert(port_name, edge.source());
+            }
+        }
+
+        // Per-Transform spec construction. Walk in declaration order
+        // (HashMap iteration order is undefined but stable per
+        // process; we collect names sorted for determinism into the
+        // explain output downstream).
+        let mut window_names: Vec<&str> = body
+            .body_window_configs
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        window_names.sort_unstable();
+
+        let mut raw_requests: Vec<(RawIndexRequest, NodeIndex)> = Vec::new();
+
+        for transform_name in &window_names {
+            let Some(wc) = body.body_window_configs.get(*transform_name) else {
+                continue;
+            };
+            let Some(&transform_idx) = body.name_to_idx.get(*transform_name) else {
+                continue;
+            };
+
+            let mut arena_fields: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for gb in &wc.group_by {
+                arena_fields.insert(gb.clone());
+            }
+            for sf in &wc.sort_by {
+                arena_fields.insert(sf.field.clone());
+            }
+            // Body Transforms do not carry an analyzer-pass
+            // `accessed_fields` map at this stage — body type
+            // analysis happens during bind_composition but its
+            // accessed-field surface is not propagated to a side
+            // table the post-pass can consult. Falling back to
+            // `group_by ∪ sort_by` covers every field the windowed
+            // builtin partitions / orders by; window builtins that
+            // reference additional payload columns (e.g.
+            // `$window.sum(other_col)` over a `partition_by:
+            // [department]`) project through the runtime arena's
+            // resolve path and require those columns in the arena
+            // schema. Phase 3 owns the analyzer-side hook that
+            // surfaces body-Transform accessed-fields here.
+            let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
+            arena_fields_vec.sort();
+
+            // Body-internal first non-pass-through ancestor.
+            let pred_idx = match body
+                .graph
+                .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
+                .next()
+            {
+                Some(p) => p,
+                None => continue,
+            };
+            let rooted_idx = first_non_passthrough_ancestor(&body.graph, pred_idx);
+            let rooted_node = &body.graph[rooted_idx];
+
+            // Classify the rooting:
+            // - Body Source whose name matches a port → ParentNode.
+            // - Body Source not a port (declared inside body) →
+            //   Source(name).
+            // - Other body operator → Node{ body_upstream, .. }.
+            let root: PlanIndexRoot = match rooted_node {
+                PlanNode::Source { name, .. } => {
+                    if let Some(&parent_upstream) = port_to_parent_idx.get(name.as_str()) {
+                        let anchor_schema = match parent_dag.graph[parent_upstream]
+                            .stored_output_schema()
+                            .cloned()
+                        {
+                            Some(s) => s,
+                            None => {
+                                diags.push(Diagnostic::error(
+                                    "E003",
+                                    format!(
+                                        "composition body windowed transform {transform_name:?} \
+                                         resolves through input port {name:?} to parent operator {:?} \
+                                         which has no output schema",
+                                        parent_dag.graph[parent_upstream].name()
+                                    ),
+                                    LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                                ));
+                                continue;
+                            }
+                        };
+                        PlanIndexRoot::ParentNode {
+                            upstream: parent_upstream,
+                            anchor_schema,
+                        }
+                    } else {
+                        // Body-declared Source — rare but legal.
+                        PlanIndexRoot::Source(name.clone())
+                    }
+                }
+                PlanNode::Merge { .. } => {
+                    diags.push(Diagnostic::error(
+                        "E150d",
+                        format!(
+                            "composition body windowed transform {transform_name:?} \
+                             is rooted at a Merge node; Merge concatenates streams \
+                             without a single producer identity, so a window cannot \
+                             anchor to it"
+                        ),
+                        LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                    ));
+                    continue;
+                }
+                other => {
+                    let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                        continue;
+                    };
+                    PlanIndexRoot::Node {
+                        upstream: rooted_idx,
+                        anchor_schema,
+                    }
+                }
+            };
+
+            // Body Sources do not declare top-level sort_order today;
+            // node-rooted / parent-node-rooted arenas sort partitions
+            // post-build at the upstream-arm exit anyway. Treat body
+            // windows as `already_sorted = false` uniformly.
+            let already_sorted = false;
+
+            let req = RawIndexRequest {
+                root,
+                group_by: wc.group_by.clone(),
+                sort_by: wc.sort_by.clone(),
+                arena_fields: arena_fields_vec,
+                already_sorted,
+                // `transform_index` indexes into a per-body Vec; the
+                // body has no top-level "transform list" alongside it,
+                // so we record the body NodeIndex's underlying integer
+                // for traceability. The dedup pass uses (root,
+                // group_by, sort_by) regardless.
+                transform_index: transform_idx.index(),
+                requires_buffer_recompute: false,
+            };
+            raw_requests.push((req, transform_idx));
+        }
+
+        let request_only: Vec<RawIndexRequest> =
+            raw_requests.iter().map(|(r, _)| r.clone()).collect();
+        let body_indices: Vec<IndexSpec> = deduplicate_indices(request_only);
+
+        // Backfill `window_index` onto each body Transform node. Re-
+        // borrow `body` mutably now that we've finished consulting it
+        // immutably. Only mutate `body.graph`, `body.body_indices_to_build`.
+        let Some(body_mut) = artifacts.composition_bodies.get_mut(&body_id) else {
+            continue;
+        };
+        for (req, transform_idx) in &raw_requests {
+            let new_window_index =
+                find_index_for(&body_indices, &req.root, &req.group_by, &req.sort_by);
+            if let PlanNode::Transform {
+                window_index,
+                partition_lookup,
+                ..
+            } = &mut body_mut.graph[*transform_idx]
+            {
+                *window_index = new_window_index;
+                // Body-internal partition lookup: cross-source
+                // (`wc.source: <other>`) is not a body-level surface
+                // today, so every body window resolves through the
+                // same-source path. Stamping `SameSource` keeps
+                // downstream consumers that branch on
+                // `partition_lookup` uniform with the top-level
+                // lowering arm in `lower_node_to_plan_node`.
+                *partition_lookup = Some(PartitionLookupKind::SameSource);
+            }
+        }
+        body_mut.body_indices_to_build = body_indices;
     }
 }
 
@@ -4202,6 +4472,8 @@ mod port_tag_guard_tests {
             output_port_to_node_idx: indexmap::IndexMap::new(),
             input_port_rows: indexmap::IndexMap::new(),
             nested_body_ids: Vec::new(),
+            body_indices_to_build: Vec::new(),
+            body_window_configs: HashMap::new(),
         };
         artifacts.insert_body(body_id, body);
         let diags = diagnose_untagged_composition_edges(&dag, &artifacts);

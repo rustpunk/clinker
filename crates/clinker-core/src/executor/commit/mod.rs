@@ -115,7 +115,7 @@ pub(crate) fn orchestrate(
     // per-record Delta. An empty `scope.windows` (no windows downstream
     // of the relaxed aggregate, or no retracted row landed in any
     // captured partition) short-circuits with zero deltas.
-    let window_deltas = recompute_window::recompute_window_partitions(ctx, &scope)?;
+    let window_deltas = recompute_window::recompute_window_partitions(ctx, current_dag, &scope)?;
     deltas.extend(window_deltas);
 
     // Phase 4: replay the deterministic downstream sub-DAG. Walks

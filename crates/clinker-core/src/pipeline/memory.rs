@@ -119,6 +119,15 @@ pub struct MemoryBudget {
     /// pipeline run. Updated by callers via `record_spill_bytes()`.
     /// Stays at zero until the first spill writer commits a file.
     pub cumulative_spill_bytes: u64,
+    /// Cumulative bytes charged across every Arena build site sharing
+    /// this budget — the source-rooted Phase-0 arena plus every
+    /// node-rooted arena materialized at an upstream operator's
+    /// dispatch-arm exit. Source arena + N node-rooted arenas share
+    /// one cumulative budget so a pipeline declaring a 512MB limit
+    /// cannot multiply that limit across N operators by accident.
+    /// Updated by `Arena::from_records` and `Arena::build` via
+    /// `charge_arena_bytes`.
+    pub arena_bytes_charged: u64,
 }
 
 impl MemoryBudget {
@@ -129,6 +138,7 @@ impl MemoryBudget {
             peak_rss: None,
             max_spill_bytes: u64::MAX,
             cumulative_spill_bytes: 0,
+            arena_bytes_charged: 0,
         }
     }
 
@@ -208,6 +218,28 @@ impl MemoryBudget {
     pub fn record_spill_bytes(&mut self, n: u64) -> bool {
         self.cumulative_spill_bytes = self.cumulative_spill_bytes.saturating_add(n);
         self.cumulative_spill_bytes > self.max_spill_bytes
+    }
+
+    /// Add `n` bytes to the cumulative arena-byte counter. Returns
+    /// `true` when the running total has exceeded the hard memory
+    /// limit — the build site's signal to surface E310 instead of
+    /// admitting the next record. Saturating-add ensures an
+    /// overflowing accumulation cannot wrap below the limit and
+    /// silently disable the gate.
+    ///
+    /// One shared counter across the source-rooted Phase-0 arena and
+    /// every node-rooted arena built at an upstream operator's
+    /// dispatch-arm exit: the pipeline's declared memory limit is a
+    /// pipeline-wide envelope, not a per-arena one.
+    pub fn charge_arena_bytes(&mut self, n: u64) -> bool {
+        self.arena_bytes_charged = self.arena_bytes_charged.saturating_add(n);
+        self.arena_bytes_charged > self.limit
+    }
+
+    /// Cumulative arena bytes charged so far across every Arena build
+    /// site polling this budget.
+    pub fn arena_bytes_charged(&self) -> u64 {
+        self.arena_bytes_charged
     }
 }
 

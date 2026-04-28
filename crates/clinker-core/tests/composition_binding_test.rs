@@ -58,6 +58,8 @@ fn test_compile_artifacts_insert_body_and_lookup() {
         output_port_to_node_idx: IndexMap::new(),
         input_port_rows: IndexMap::new(),
         nested_body_ids: vec![],
+        body_indices_to_build: Vec::new(),
+        body_window_configs: std::collections::HashMap::new(),
     };
 
     artifacts.insert_body(id, body.clone());

@@ -900,7 +900,46 @@ fn bind_composition(
         }
     }
 
-    // 15. Build and insert BoundBody.
+    // Capture analytic-window configs from body Transform nodes so
+    // the post-parent-DAG-build pass can build `body_indices_to_build`
+    // without re-reading the body file. Body lowering does not stamp
+    // `window_index` on the PlanNode::Transform — that backfill is
+    // owned by the body-window pass once parent NodeIndex space is
+    // allocated.
+    let mut body_window_configs: HashMap<String, crate::plan::index::LocalWindowConfig> =
+        HashMap::new();
+    for spanned in &body_file.nodes {
+        if let PipelineNode::Transform { header, config } = &spanned.value
+            && let Some(raw) = config.analytic_window.as_ref()
+        {
+            match crate::plan::index::parse_analytic_window_value(&Some(raw.clone()), &header.name)
+            {
+                Ok(Some(wc)) => {
+                    body_window_configs.insert(header.name.clone(), wc);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "composition body for {node_name:?} carries an \
+                             invalid analytic_window on transform {:?}: {e}",
+                            header.name
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    // 15. Build and insert BoundBody. `body_indices_to_build` is
+    // empty here — the post-parent-DAG-build pass populates it once
+    // the parent's NodeIndex space exists, threading the parent's
+    // `name_to_idx` so body-internal port-input references can resolve
+    // to a parent-DAG `NodeIndex` and emit
+    // `PlanIndexRoot::ParentNode { upstream, .. }`.
     let bound_body = BoundBody {
         signature_path: resolved_path,
         graph: body_graph,
@@ -914,6 +953,8 @@ fn bind_composition(
         output_port_to_node_idx,
         input_port_rows,
         nested_body_ids,
+        body_indices_to_build: Vec::new(),
+        body_window_configs,
     };
     artifacts.insert_body(body_id, bound_body);
     artifacts

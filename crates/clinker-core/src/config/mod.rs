@@ -2042,6 +2042,31 @@ impl PipelineConfig {
         // false and the executor stays on its existing path.
         dag.derive_window_buffer_recompute_flags();
 
+        // Composition body windows. `bind_composition` cannot stamp
+        // `window_index` on body Transforms because body lowering
+        // runs before the parent DAG's NodeIndex space is allocated.
+        // This post-pass walks each body's mini-DAG, classifies each
+        // window's rooting (Source / Node / ParentNode), constructs
+        // the body's IndexSpec list, and backfills `window_index` on
+        // each body Transform. Bodies whose windows resolve through
+        // an `input:` port emit `PlanIndexRoot::ParentNode` pointing
+        // at the parent-DAG operator feeding the port — the body
+        // executor inherits the parent's WindowRuntime via
+        // `Arc::clone` at recursion entry. The pass only short-
+        // circuits on errors it itself emits (E003 / E150d at body
+        // root); existing E102-E109 from bind_composition stay
+        // non-fatal here, mirroring the post-bind-schema gate above
+        // that lets composition-binding errors land as soft
+        // diagnostics while CXL errors hard-stop.
+        let pre_pass_diag_count = diags.len();
+        crate::plan::execution::resolve_composition_body_windows(&dag, &mut artifacts, &mut diags);
+        if diags[pre_pass_diag_count..]
+            .iter()
+            .any(|d| matches!(d.severity, crate::error::Severity::Error))
+        {
+            return Err(diags);
+        }
+
         // E15Y: an aggregate whose `group_by` omits any correlation-key
         // field cannot also use `strategy: streaming`. Streaming
         // aggregates emit at group-boundary close, before the terminal
