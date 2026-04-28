@@ -592,8 +592,8 @@ impl<'a> TypeChecker<'a> {
                     self.check_expr(arg, is_predicate_fn);
                 }
 
-                // Check numeric requirement for sum/avg
-                if matches!(&**function, "sum" | "avg") {
+                // Check numeric requirement for sum/cumulative_sum/avg
+                if matches!(&**function, "sum" | "cumulative_sum" | "avg") {
                     for arg in args {
                         let arg_ty = self.get_type(arg.node_id());
                         let inner = arg_ty.unwrap_nullable();

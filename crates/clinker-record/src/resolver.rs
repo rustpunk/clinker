@@ -68,6 +68,11 @@ pub trait WindowContext<'a, S: RecordStorage> {
     /// Non-numeric fields → Value::Null.
     fn sum(&self, field: &str) -> Value;
 
+    /// Running total of a named field over the prefix of the partition
+    /// up to and including the current record. Returns the same shape
+    /// as `sum` for the prefix slice; non-numeric fields → Value::Null.
+    fn cumulative_sum(&self, field: &str) -> Value;
+
     /// Average of a named field across all records in the partition.
     /// Non-numeric fields → Value::Null.
     fn avg(&self, field: &str) -> Value;

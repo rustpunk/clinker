@@ -220,7 +220,7 @@ nodes:
 /// `partition_by: [department]`. Every row in HR sees the HR sum;
 /// every row in ENG sees the ENG sum.
 #[test]
-fn post_aggregate_window_sum_across_multiple_emit_rows_per_partition() {
+fn post_aggregate_full_partition_sum() {
     // HR/east: 10+20=30, HR/west: 5  → HR partition total = 35
     // ENG/east: 100+200=300, ENG/west: 50, ENG/north: 7+3=10 → ENG = 360
     let csv = "\
@@ -302,6 +302,124 @@ ENG,north,3
         by_key[&("ENG".into(), "west".into())].get("total").unwrap(),
         "50"
     );
+}
+
+// ── #2b: cumulative_sum running total within partition ────────────
+
+const CUMSUM_PIPELINE: &str = r#"
+pipeline:
+  name: post_agg_cumsum
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: department, type: string }
+      - { name: region, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_region
+  input: src
+  config:
+    group_by: [department, region]
+    cxl: |
+      emit department = department
+      emit region = region
+      emit total = sum(amount)
+- type: transform
+  name: dept_running
+  input: dept_region
+  config:
+    cxl: |
+      emit department = department
+      emit region = region
+      emit total = total
+      emit cumsum_by_region = $window.cumulative_sum(total)
+    analytic_window:
+      group_by: [department]
+      sort_by:
+        - field: region
+          order: asc
+- type: output
+  name: out
+  input: dept_running
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+/// `$window.cumulative_sum(total)` produces a running total over the
+/// `sort_by` order within each `partition_by` group. Each row sees the
+/// sum of its own `total` plus every prior row's `total` in the same
+/// partition, ordered by `region asc`.
+///
+/// HR partition `[east(30), west(5)]` → cumsum `[30, 35]`.
+/// ENG partition `[east(300), north(10), west(50)]` → cumsum
+/// `[300, 310, 360]`. The previous source-rooted geometry would have
+/// returned `Null` for the `total` reference; node-rooted resolution
+/// against the upstream Aggregate's emit buffer is what makes the
+/// running total well-defined here.
+#[test]
+fn post_aggregate_window_cumulative_sum_within_partition() {
+    // HR/east: 10+20=30, HR/west: 5. ENG/east: 100+200=300, ENG/west: 50,
+    // ENG/north: 7+3=10. Identical fixture to the full-partition sum test
+    // so a single ground-truth set covers both arithmetic shapes.
+    let csv = "\
+department,region,amount
+HR,east,10
+HR,east,20
+HR,west,5
+ENG,east,100
+ENG,east,200
+ENG,west,50
+ENG,north,7
+ENG,north,3
+";
+    let (counters, dlq, output) =
+        run_pipeline(CUMSUM_PIPELINE, csv).expect("pipeline must execute");
+    assert_eq!(counters.dlq_count, 0);
+    assert!(dlq.is_empty());
+
+    // Map (department, region) → row.
+    let mut by_key: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
+    let mut lines = output.lines();
+    let header_line = lines.next().expect("header");
+    let headers: Vec<&str> = header_line.split(',').collect();
+    let dept_idx = headers.iter().position(|h| *h == "department").unwrap();
+    let region_idx = headers.iter().position(|h| *h == "region").unwrap();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let values: Vec<&str> = line.split(',').collect();
+        let row: HashMap<String, String> = headers
+            .iter()
+            .zip(values.iter())
+            .map(|(h, v)| ((*h).to_string(), (*v).to_string()))
+            .collect();
+        by_key.insert(
+            (values[dept_idx].to_string(), values[region_idx].to_string()),
+            row,
+        );
+    }
+
+    // Strict per-row cumulative-sum assertions in `region asc` order
+    // within each partition.
+    let cumsum = |dept: &str, region: &str| {
+        by_key[&(dept.into(), region.into())]["cumsum_by_region"].clone()
+    };
+    assert_eq!(cumsum("HR", "east"), "30", "HR/east: cumsum = 30");
+    assert_eq!(cumsum("HR", "west"), "35", "HR/west: cumsum = 30+5");
+    assert_eq!(cumsum("ENG", "east"), "300", "ENG/east: cumsum = 300");
+    assert_eq!(cumsum("ENG", "north"), "310", "ENG/north: cumsum = 300+10");
+    assert_eq!(cumsum("ENG", "west"), "360", "ENG/west: cumsum = 300+10+50");
 }
 
 // ── #3: divide-by-zero on a post-aggregate predicate ───────────────

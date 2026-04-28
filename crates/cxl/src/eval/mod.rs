@@ -593,6 +593,13 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                         Ok(Value::Null)
                     }
                 }
+                "cumulative_sum" => {
+                    if let Some(Expr::FieldRef { name, .. }) = args.first() {
+                        Ok(w.cumulative_sum(name))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
                 "avg" => {
                     if let Some(Expr::FieldRef { name, .. }) = args.first() {
                         Ok(w.avg(name))
