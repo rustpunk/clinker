@@ -260,17 +260,28 @@ pub(crate) fn detect_retract_scope(
     // Windows: every Transform whose IndexSpec is flagged for
     // buffer-recompute. Walk the captured per-partition admission
     // state and drop each retract row id into its origin partition.
-    // The window operator admitted records using `record_pos = rn - 1`
-    // as the arena position, mirroring the Aggregate path's row-id
-    // lineage; `affected_row_ids` therefore directly maps onto the
-    // arena positions stored on `RetainedWindowState.partition_outputs`.
+    //
+    // The buffered triple is `(arena_pos, rn, record)`. `rn` is the
+    // source row number — the source's row id for source-rooted
+    // windows, and the contributing group's `min_row_num` (still a
+    // real source row id) for windows rooted on a relaxed-CK
+    // aggregate's emit. `arena_pos` is a position in the upstream's
+    // arena: equal to `rn - 1` for source-rooted windows, but a
+    // dispatcher iteration index (in the upstream emit's hash-map
+    // order) for node-rooted windows. `affected_row_ids` carries
+    // source row ids; comparing against `arena_pos` only happens to
+    // collide with source row ids in the source-rooted case, and
+    // even there only by chance off-by-one. Filter on `rn` so the
+    // two id spaces align across both rooting flavors and partition
+    // membership in the retract scope is deterministic regardless
+    // of upstream emit-order non-determinism.
     for (&window_node, retained) in &ctx.relaxed_window_states {
         let mut partition_retracts: Vec<(Vec<GroupByKey>, Vec<u32>)> = Vec::new();
         for (partition_key, rows) in &retained.partition_outputs {
             let drops: Vec<u32> = rows
                 .iter()
-                .filter_map(|(arena_pos, _, _)| {
-                    if affected_row_ids.contains(arena_pos) {
+                .filter_map(|(arena_pos, rn, _)| {
+                    if affected_row_ids.contains(&(*rn as u32)) {
                         Some(*arena_pos)
                     } else {
                         None

@@ -353,4 +353,22 @@ O6,ENG,300
              no surviving rows after retraction); got line: {line:?}"
         );
     }
+
+    // The synthetic-CK fan-out drives the aggregate's recompute path
+    // (HR's contribution is retracted from `dept_totals`); HR is
+    // dropped from the writer through the aggregate's delta, NOT
+    // through a window-partition recompute. The HR aggregate-emit row
+    // never reached `running.partition_outputs` because its evaluator
+    // failed on `1/(60-60)` before the window arm could admit it, so
+    // the buffer-recompute scope sees zero partitions for the window.
+    // ENG's row succeeds and is unaffected. The deterministic counter
+    // value across runs is therefore 0; the determinism guarantee
+    // itself is exercised by `post_aggregate_recompute_determinism`.
+    assert_eq!(
+        counters.retraction.partitions_recomputed, 0,
+        "HR's aggregate-emit row was rejected by `running` before \
+         window admission, so the buffer-recompute scope is empty; \
+         HR's exclusion from output flows through the aggregate's \
+         retract path, not the window's recompute path"
+    );
 }

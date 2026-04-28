@@ -2434,6 +2434,7 @@ mod tests {
     mod format_dispatch;
     mod multi_output;
     mod post_aggregate_lag_lead;
+    mod post_aggregate_recompute_determinism;
     mod post_aggregate_window;
     mod post_aggregate_window_spilled;
     mod post_combine_array_field;
