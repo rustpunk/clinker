@@ -337,7 +337,7 @@ mod tests {
     fn test_record_iter_user_fields_skips_engine_stamped() {
         use crate::schema::FieldMetadata;
         let cols: Vec<Box<str>> = vec!["employee_id".into(), "$ck.employee_id".into()];
-        let meta = vec![None, Some(FieldMetadata::snapshot_of("employee_id"))];
+        let meta = vec![None, Some(FieldMetadata::source_correlation("employee_id"))];
         let schema = Arc::new(Schema::with_metadata(cols, meta));
         let record = Record::new(schema, vec![Value::Integer(7), Value::Integer(7)]);
 

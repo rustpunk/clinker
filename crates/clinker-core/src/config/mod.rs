@@ -2262,23 +2262,35 @@ pub(crate) fn lower_node_to_plan_node(
     // reaches the executor.
     //
     // Columns whose name has the `$ck.` prefix carry engine-stamp
-    // metadata pointing at the user-declared source field (the shadow
-    // is named `$ck.<field>` and stamps `snapshot_of: <field>`). The
-    // marker travels with the column through the DAG: when a Transform
-    // / Aggregate / Combine output row inherits a `$ck.*` column, its
-    // own `Arc<Schema>` recovers the same metadata here. LD-005's
-    // reserved-`$` prefix guarantees no user-declared column collides.
+    // metadata. Two prefix shapes are recognized in priority order:
+    //
+    // - `$ck.aggregate.<aggregate_name>` — synthetic column emitted by
+    //   a relaxed aggregate, stamped `AggregateGroupIndex`.
+    // - `$ck.<field>` — source-CK shadow column, stamped
+    //   `SourceCorrelation`.
+    //
+    // The aggregate prefix is checked first because `$ck.aggregate.x`
+    // also matches the generic `$ck.` prefix; misordering would mis-
+    // classify aggregate columns as source-CK shadows. The marker
+    // travels with the column through the DAG: when a Transform /
+    // Aggregate / Combine output row inherits a `$ck.*` column, its
+    // own `Arc<Schema>` recovers the same metadata here. The reserved
+    // `$` prefix guarantees no user-declared column collides.
     let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
         match artifacts.typed.get(node_name) {
             Some(tp) => {
                 let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
                 for (qf, _) in tp.output_row.fields() {
                     let col = qf.name.as_ref();
-                    builder = match col.strip_prefix("$ck.") {
-                        Some(field) => {
-                            builder.with_field_meta(col, FieldMetadata::snapshot_of(field))
-                        }
-                        None => builder.with_field(col),
+                    builder = if let Some(aggregate_name) = col.strip_prefix("$ck.aggregate.") {
+                        builder.with_field_meta(
+                            col,
+                            FieldMetadata::aggregate_group_index(aggregate_name),
+                        )
+                    } else if let Some(field) = col.strip_prefix("$ck.") {
+                        builder.with_field_meta(col, FieldMetadata::source_correlation(field))
+                    } else {
+                        builder.with_field(col)
                     };
                 }
                 builder.build()
@@ -3105,7 +3117,7 @@ fn extend_aggregate_group_by_with_shadow(
         for entry in &to_append {
             builder = builder.with_field_meta(
                 entry.shadow_name.clone(),
-                FieldMetadata::snapshot_of(entry.source_field.as_str()),
+                FieldMetadata::source_correlation(entry.source_field.as_str()),
             );
         }
         *output_schema = builder.build();

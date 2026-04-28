@@ -8,6 +8,17 @@
 //! - The module rename from cxl_compile is complete
 
 use clinker_core::config::{CompileContext, PipelineConfig};
+use clinker_record::FieldMetadata;
+
+/// Returns `Some(source_field)` if `meta` is a [`FieldMetadata::SourceCorrelation`],
+/// `None` for any other variant or `None` input. Used by tests that
+/// assert the source-CK shadow column points back at a specific field.
+fn source_correlation_field(meta: Option<&FieldMetadata>) -> Option<&str> {
+    match meta {
+        Some(FieldMetadata::SourceCorrelation { source_field }) => Some(source_field.as_ref()),
+        _ => None,
+    }
+}
 
 fn compile_yaml(yaml: &str) -> clinker_core::plan::CompiledPlan {
     let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
@@ -275,7 +286,7 @@ nodes:
     let stamp = schema
         .field_metadata_by_name("$ck.employee_id")
         .expect("shadow column must carry engine-stamp metadata");
-    assert_eq!(stamp.snapshot_of.as_deref(), Some("employee_id"));
+    assert_eq!(source_correlation_field(Some(stamp)), Some("employee_id"));
     assert!(stamp.is_engine_stamped());
 
     // User-declared columns remain unannotated.
@@ -326,15 +337,11 @@ nodes:
     assert_eq!(&*schema.columns()[4], "$ck.employee_id");
 
     assert_eq!(
-        schema
-            .field_metadata_by_name("$ck.tenant")
-            .and_then(|m| m.snapshot_of.as_deref()),
+        source_correlation_field(schema.field_metadata_by_name("$ck.tenant")),
         Some("tenant"),
     );
     assert_eq!(
-        schema
-            .field_metadata_by_name("$ck.employee_id")
-            .and_then(|m| m.snapshot_of.as_deref()),
+        source_correlation_field(schema.field_metadata_by_name("$ck.employee_id")),
         Some("employee_id"),
     );
 }
@@ -392,9 +399,7 @@ nodes:
         _ => unreachable!(),
     };
     assert_eq!(
-        tx_schema
-            .field_metadata_by_name("$ck.id")
-            .and_then(|m| m.snapshot_of.as_deref()),
+        source_correlation_field(tx_schema.field_metadata_by_name("$ck.id")),
         Some("id"),
         "engine-stamp metadata must travel with the column through the DAG"
     );
@@ -515,9 +520,7 @@ nodes:
         "composition body port-synthetic Source must inherit `$ck.<field>` from parent"
     );
     assert_eq!(
-        port_schema
-            .field_metadata_by_name("$ck.id")
-            .and_then(|m| m.snapshot_of.as_deref()),
+        source_correlation_field(port_schema.field_metadata_by_name("$ck.id")),
         Some("id"),
         "port-synthetic Source must carry the same engine-stamp metadata"
     );

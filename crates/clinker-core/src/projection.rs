@@ -367,7 +367,7 @@ mod tests {
         let schema = SchemaBuilder::new()
             .with_field("id")
             .with_field("name")
-            .with_field_meta("$ck.id", FieldMetadata::snapshot_of("id"))
+            .with_field_meta("$ck.id", FieldMetadata::source_correlation("id"))
             .build();
         Record::new(
             schema,

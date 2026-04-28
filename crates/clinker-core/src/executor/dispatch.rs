@@ -71,7 +71,7 @@ fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
     for i in 0..schema.column_count() {
         if schema
             .field_metadata(i)
-            .is_some_and(|m| m.snapshot_of.is_some())
+            .is_some_and(|m| m.is_engine_stamped())
         {
             let idx = key.len();
             key.push(value_to_correlation_key(&record.values()[i], idx));
@@ -451,10 +451,15 @@ pub(crate) fn dispatch_plan_node(
                 .as_ref()
                 .map(|target| {
                     (0..target.column_count())
-                        .filter_map(|i| {
-                            target
-                                .field_metadata(i)
-                                .and_then(|m| m.snapshot_of.as_ref().map(|name| (i, name.clone())))
+                        .filter_map(|i| match target.field_metadata(i) {
+                            Some(clinker_record::FieldMetadata::SourceCorrelation {
+                                source_field,
+                            }) => Some((i, source_field.clone())),
+                            // Aggregate-emitted synthetic CK columns are
+                            // stamped at aggregate finalize, not at source
+                            // ingest, so they are not part of this mapping.
+                            Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
+                            | None => None,
                         })
                         .collect()
                 })

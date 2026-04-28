@@ -1301,9 +1301,9 @@ impl PipelineExecutor {
         // dispatcher walks the buffers at end-of-DAG. Group identity
         // travels through the schema as `$ck.<field>` shadow columns
         // stamped at Source ingest; the dispatcher reads them via the
-        // `FieldMetadata.snapshot_of` annotation, so the executor
-        // context only needs to know whether buffering is active and
-        // the per-group cap.
+        // engine-stamp annotation on each shadow column's
+        // `FieldMetadata`, so the executor context only needs to know
+        // whether buffering is active and the per-group cap.
         let (correlation_buffers, correlation_max_group_buffer) =
             match config.error_handling.correlation_key.as_ref() {
                 Some(_) => {

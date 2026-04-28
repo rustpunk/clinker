@@ -1411,10 +1411,21 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Build a runtime `Arc<Schema>` from an iterator of column names,
 /// stamping engine-stamp metadata on every column whose name begins
-/// with the `$ck.` prefix. The metadata's `snapshot_of` records the
-/// suffix (the user-declared source field). Mirrors the deduction in
-/// `lower_node_to_plan_node`'s `schema_from_bound` closure so a
-/// composition body's port-synthetic Source carries the same marker.
+/// with the `$ck.` prefix. Two prefix shapes are recognized:
+///
+/// - `$ck.aggregate.<aggregate_name>` — synthetic group-index column
+///   emitted by a relaxed aggregate. Stamped
+///   [`FieldMetadata::AggregateGroupIndex`].
+/// - `$ck.<source_field>` — source-CK shadow column. Stamped
+///   [`FieldMetadata::SourceCorrelation`].
+///
+/// The aggregate prefix is checked first because `$ck.aggregate.x`
+/// also matches the generic `$ck.` prefix; misordering would mis-
+/// classify aggregate columns as source-CK shadows.
+///
+/// Mirrors the deduction in `lower_node_to_plan_node`'s
+/// `schema_from_bound` closure so a composition body's port-synthetic
+/// Source carries the same marker.
 pub(crate) fn schema_from_field_names<'a, I>(names: I) -> Arc<clinker_record::Schema>
 where
     I: IntoIterator<Item = &'a str>,
@@ -1422,9 +1433,12 @@ where
     use clinker_record::{FieldMetadata, SchemaBuilder};
     let mut builder = SchemaBuilder::new();
     for name in names {
-        builder = match name.strip_prefix("$ck.") {
-            Some(field) => builder.with_field_meta(name, FieldMetadata::snapshot_of(field)),
-            None => builder.with_field(name),
+        builder = if let Some(aggregate_name) = name.strip_prefix("$ck.aggregate.") {
+            builder.with_field_meta(name, FieldMetadata::aggregate_group_index(aggregate_name))
+        } else if let Some(field) = name.strip_prefix("$ck.") {
+            builder.with_field_meta(name, FieldMetadata::source_correlation(field))
+        } else {
+            builder.with_field(name)
         };
     }
     builder.build()
@@ -2704,4 +2718,55 @@ pub fn e201_missing_schema(source_name: &str, span: Span) -> Diagnostic {
     .with_help(
         "declare the source columns inline:\n  schema:\n    - { name: col1, type: string }\n    - { name: col2, type: int }",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clinker_record::FieldMetadata;
+
+    /// `$ck.<field>` columns resolve to source-CK metadata; the
+    /// suffix is the user-declared field name.
+    #[test]
+    fn schema_from_field_names_classifies_source_ck() {
+        let schema = schema_from_field_names(["id", "$ck.id"]);
+        assert!(schema.field_metadata_by_name("id").is_none());
+        match schema.field_metadata_by_name("$ck.id") {
+            Some(FieldMetadata::SourceCorrelation { source_field }) => {
+                assert_eq!(source_field.as_ref(), "id");
+            }
+            other => panic!("expected SourceCorrelation, got {other:?}"),
+        }
+    }
+
+    /// `$ck.aggregate.<aggregate_name>` columns resolve to the
+    /// aggregate-group-index variant; the suffix is the aggregate node
+    /// name. The aggregate prefix wins over the bare `$ck.` prefix.
+    #[test]
+    fn schema_from_field_names_classifies_aggregate_group_index() {
+        let schema = schema_from_field_names(["region", "$ck.aggregate.dept_totals"]);
+        match schema.field_metadata_by_name("$ck.aggregate.dept_totals") {
+            Some(FieldMetadata::AggregateGroupIndex { aggregate_name }) => {
+                assert_eq!(aggregate_name.as_ref(), "dept_totals");
+            }
+            other => panic!("expected AggregateGroupIndex, got {other:?}"),
+        }
+    }
+
+    /// Both shadow shapes coexist in one schema without cross-talk:
+    /// the `$ck.aggregate.x` column and a sibling `$ck.y` column
+    /// classify independently.
+    #[test]
+    fn schema_from_field_names_distinguishes_both_shapes() {
+        let schema =
+            schema_from_field_names(["user_id", "$ck.user_id", "$ck.aggregate.daily_totals"]);
+        assert!(matches!(
+            schema.field_metadata_by_name("$ck.user_id"),
+            Some(FieldMetadata::SourceCorrelation { .. }),
+        ));
+        assert!(matches!(
+            schema.field_metadata_by_name("$ck.aggregate.daily_totals"),
+            Some(FieldMetadata::AggregateGroupIndex { .. }),
+        ));
+    }
 }
