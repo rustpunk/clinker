@@ -3039,7 +3039,7 @@ pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError
     load_config_with_vars(path, &[])
 }
 
-/// Auto-extend every `PlanNode::Aggregation.group_by` with the
+/// Auto-extend every strict `PlanNode::Aggregation.group_by` with the
 /// `$ck.<field>` shadow column when the user-declared correlation-key
 /// field is already listed AND the parent's lattice carries that CK
 /// field. Engine-internal namespace stays out of user YAML; the
@@ -3053,6 +3053,14 @@ pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError
 /// - `output_schema` is rebuilt to carry the shadow column with
 ///   engine-stamp metadata so writers, projection, and downstream
 ///   consumers can identify it as engine-stamped.
+///
+/// Relaxed aggregates (whose `group_by` omits a parent CK field) get
+/// their synthetic `$ck.aggregate.<name>` column added by
+/// `propagate_aggregate` at bind-schema time and lowered onto the
+/// `PlanNode::Aggregation.output_schema` via `schema_from_bound`. This
+/// pass therefore only handles the strict source-CK shadow shape;
+/// touching the relaxed path here would double-append the synthetic
+/// column.
 ///
 /// Body mini-DAGs go through
 /// [`extend_aggregate_group_by_with_shadow_in_body`] which derives
@@ -3121,8 +3129,14 @@ fn extend_aggregate_group_by_with_shadow_for_graph(
         }
     }
 
-    // Collect work first so the upstream-schema borrow doesn't alias the
-    // mutable graph borrow used for in-place mutation below.
+    // The relaxed aggregate's synthetic `$ck.aggregate.<name>` column
+    // is added by `propagate_aggregate` at bind_schema time, then
+    // travels into the lowered `output_schema` through
+    // `lower_node_to_plan_node`'s `schema_from_bound`. This pass only
+    // needs to handle the strict source-CK shadow shape — appending
+    // `$ck.<field>` to `output_schema`, `config.group_by`, and the
+    // compiled group-key projection so the runtime stamps each row
+    // with the upstream source's CK field at the aggregator hot loop.
     let mut work: Vec<(NodeIndex, Vec<ShadowAppend>)> = Vec::new();
     for idx in graph.node_indices() {
         let group_by = match &graph[idx] {

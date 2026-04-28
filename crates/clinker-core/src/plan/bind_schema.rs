@@ -343,7 +343,7 @@ fn bind_schema_inner(
                 };
                 match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
                     Ok(mut typed) => {
-                        let out = propagate_aggregate(&config.group_by, &upstream, &typed);
+                        let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
                         artifacts.typed.insert(name, Arc::new(typed));
@@ -1610,7 +1610,21 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
 /// Propagate an upstream row through an Aggregate node: start with the
 /// `group_by` fields (typed against upstream), then append one entry
 /// per `emit` statement. All output fields are bare.
-fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram) -> Row {
+///
+/// When the aggregate's `group_by` omits any source-CK field visible
+/// upstream (relaxed mode), the row gains one synthetic
+/// `$ck.aggregate.<aggregate_name>` column carrying the aggregator's
+/// in-memory group index. The schema-widening pass at the planner
+/// stage stamps the same column on the lowered `output_schema`; this
+/// addition keeps bind_schema's typed output row in sync so
+/// downstream Transform / Combine bind passes see the synthetic
+/// column and propagate it forward.
+fn propagate_aggregate(
+    aggregate_name: &str,
+    group_by: &[String],
+    upstream: &Row,
+    typed: &TypedProgram,
+) -> Row {
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for gb in group_by {
         let t = match upstream.lookup(gb) {
@@ -1637,6 +1651,29 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
                 .unwrap_or(Type::Any);
             out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
+    }
+    // Detect relaxed mode by walking the upstream row for `$ck.<field>`
+    // shadow columns whose source field is missing from `group_by`.
+    // Mirror the lattice rule the planner applies post-bind in
+    // `compute_one`'s Aggregate arm — both must agree on which
+    // aggregates are relaxed so the typed output row, the lowered
+    // `output_schema`, and the runtime stamp stay coherent.
+    let mut omits_any_source_ck = false;
+    for (qf, _) in upstream.fields() {
+        let col = qf.name.as_ref();
+        if let Some(field) = col.strip_prefix("$ck.")
+            && !field.starts_with("aggregate.")
+            && !group_by.iter().any(|gb| gb == field)
+        {
+            omits_any_source_ck = true;
+            break;
+        }
+    }
+    if omits_any_source_ck {
+        out.insert(
+            QualifiedField::bare(format!("$ck.aggregate.{aggregate_name}").as_str()),
+            Type::Int,
+        );
     }
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
 }

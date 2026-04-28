@@ -95,10 +95,14 @@ nodes:
 }
 
 /// Relaxed mode: aggregate omits the CK field from `group_by`, so the
-/// engine routes it through the retraction protocol and that field
-/// disappears from the downstream CK set.
+/// engine routes it through the retraction protocol. The user CK
+/// disappears from the downstream lattice (the aggregator no longer
+/// projects it onto its output rows), but a synthetic
+/// `$ck.aggregate.<name>` entry takes its place so detect-phase
+/// fan-out can resolve a downstream-failure key back to the
+/// contributing source rows via the aggregator's per-group lineage.
 #[test]
-fn ck_lattice_relaxed_aggregate_drops_omitted_ck_field() {
+fn ck_lattice_relaxed_aggregate_emits_synthetic_ck() {
     let yaml = r#"
 pipeline:
   name: ck_lattice_relaxed
@@ -142,9 +146,190 @@ nodes:
     let plan = compile(yaml);
     assert_eq!(ck_set_for(&plan, "orders"), set_of(&["order_id"]));
     assert_eq!(ck_set_for(&plan, "identity"), set_of(&["order_id"]));
-    // Relaxed aggregate omitted `order_id` from group_by — CK set drops it.
-    assert_eq!(ck_set_for(&plan, "dept_totals"), BTreeSet::new());
-    assert_eq!(ck_set_for(&plan, "out"), BTreeSet::new());
+    // Relaxed aggregate omitted `order_id` from group_by — the user CK
+    // drops out and the synthetic aggregate-group-index column takes
+    // its place. Output preserves the synthetic CK because the Output
+    // arm inherits its parent's ck_set.
+    let synthetic = set_of(&["$ck.aggregate.dept_totals"]);
+    assert_eq!(ck_set_for(&plan, "dept_totals"), synthetic);
+    assert_eq!(ck_set_for(&plan, "out"), synthetic);
+
+    // The aggregate's `output_schema` must carry the synthetic column,
+    // tagged so downstream consumers (writer-strip, detect-phase) can
+    // distinguish it from a source-CK shadow column.
+    use clinker_record::FieldMetadata;
+    let mut found = false;
+    for idx in plan.graph.node_indices() {
+        if plan.graph[idx].name() != "dept_totals" {
+            continue;
+        }
+        let crate::plan::execution::PlanNode::Aggregation { output_schema, .. } = &plan.graph[idx]
+        else {
+            panic!("dept_totals must lower to an Aggregation node");
+        };
+        let col_idx = output_schema
+            .index("$ck.aggregate.dept_totals")
+            .expect("synthetic column on aggregate output schema");
+        match output_schema.field_metadata(col_idx) {
+            Some(FieldMetadata::AggregateGroupIndex { aggregate_name }) => {
+                assert_eq!(aggregate_name.as_ref(), "dept_totals");
+                found = true;
+            }
+            other => panic!("synthetic column metadata must be AggregateGroupIndex, got {other:?}"),
+        }
+    }
+    assert!(found, "dept_totals aggregate node not found");
+}
+
+/// Strict regression mirror: an aggregate whose `group_by` covers the
+/// upstream CK set never gets a synthetic column. Confirms the
+/// schema-widening pass and the lattice rule both short-circuit on
+/// the strict path.
+#[test]
+fn ck_lattice_strict_aggregate_has_no_synthetic_column() {
+    let yaml = r#"
+pipeline:
+  name: ck_lattice_strict_no_synthetic
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: per_order
+    input: orders
+    config:
+      group_by: [order_id]
+      cxl: |
+        emit total = sum(amount)
+  - type: output
+    name: out
+    input: per_order
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile(yaml);
+    let ck = ck_set_for(&plan, "per_order");
+    assert!(
+        !ck.iter().any(|f| f.starts_with("$ck.aggregate.")),
+        "strict aggregate must not introduce synthetic CK; got {ck:?}"
+    );
+    assert!(
+        !ck_set_for(&plan, "out")
+            .iter()
+            .any(|f| f.starts_with("$ck.aggregate.")),
+        "strict aggregate's downstream Output must not carry synthetic CK"
+    );
+
+    // Schema check: no `$ck.aggregate.*` column on the strict
+    // aggregate's output schema.
+    for idx in plan.graph.node_indices() {
+        if plan.graph[idx].name() != "per_order" {
+            continue;
+        }
+        let crate::plan::execution::PlanNode::Aggregation { output_schema, .. } = &plan.graph[idx]
+        else {
+            panic!("per_order must lower to an Aggregation node");
+        };
+        for col in output_schema.columns() {
+            assert!(
+                !col.starts_with("$ck.aggregate."),
+                "strict aggregate output schema must not carry a $ck.aggregate.* column; saw {col}"
+            );
+        }
+    }
+}
+
+/// Multi-source CK regression: a relaxed aggregate downstream of a
+/// `propagate_ck: all` Combine carries its synthetic CK alongside the
+/// preserved subset of the upstream union. With `group_by: [bucket]`
+/// (covering neither parent's CK), the lattice loses both source CK
+/// fields but gains the synthetic entry.
+#[test]
+fn ck_lattice_relaxed_aggregate_downstream_of_combine_keeps_synthetic() {
+    let yaml = r#"
+pipeline:
+  name: ck_relaxed_after_combine
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: customers.csv
+      correlation_key: customer_id
+      schema:
+        - { name: customer_id, type: string }
+        - { name: bucket, type: string }
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: int }
+  - type: combine
+    name: enriched
+    input:
+      o: orders
+      c: customers
+    config:
+      where: "o.customer_id == c.customer_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = o.order_id
+        emit customer_id = o.customer_id
+        emit bucket = c.bucket
+        emit amount = o.amount
+      propagate_ck: all
+  - type: aggregate
+    name: bucket_totals
+    input: enriched
+    config:
+      group_by: [bucket]
+      cxl: |
+        emit total = sum(amount)
+  - type: output
+    name: out
+    input: bucket_totals
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile(yaml);
+    // Both source CKs survive the `propagate_ck: all` combine.
+    assert_eq!(
+        ck_set_for(&plan, "enriched"),
+        set_of(&["customer_id", "order_id"])
+    );
+    // Relaxed aggregate downstream: `bucket` covers neither source CK,
+    // so both drop out and the synthetic CK takes their place.
+    assert_eq!(
+        ck_set_for(&plan, "bucket_totals"),
+        set_of(&["$ck.aggregate.bucket_totals"])
+    );
+    assert_eq!(
+        ck_set_for(&plan, "out"),
+        set_of(&["$ck.aggregate.bucket_totals"])
+    );
 }
 
 /// `propagate_ck: driver` keeps only the driver input's CK set on the

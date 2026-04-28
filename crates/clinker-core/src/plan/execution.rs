@@ -3389,7 +3389,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Aggregation { config, .. } => {
+        PlanNode::Aggregation { name, config, .. } => {
             // Aggregation node ordering is the sole responsibility of
             // the `select_aggregation_strategies` post-pass, which runs
             // immediately after `compute_node_properties` and overwrites
@@ -3404,13 +3404,18 @@ fn compute_one(
             //     CK set unchanged.
             //   - relaxed (`group_by` omits any CK field visible in
             //     the parent lattice): intersects parent CK set with
-            //     `group_by`. Any CK column the user dropped from
-            //     `group_by` stops being visible to downstream
-            //     consumers because the aggregator no longer projects
-            //     it onto its output rows.
+            //     `group_by`, then injects a synthetic
+            //     `$ck.aggregate.<name>` entry that the schema-widening
+            //     pass already appended to the aggregate's
+            //     `output_schema`. The synthetic entry keeps a relaxed
+            //     aggregate's downstream consumers correlation-aware
+            //     even when the original source CK field has dropped
+            //     out of the lattice — detect-phase fan-out resolves
+            //     it back to source rows via the aggregator's
+            //     `input_rows` lineage.
             let parent_ck = preserve_parent_ck_set();
             let omits_ck = group_by_omits_any_ck_field(&config.group_by, &parent_ck);
-            let ck_set: BTreeSet<String> = if omits_ck {
+            let mut ck_set: BTreeSet<String> = if omits_ck {
                 let group_by_set: BTreeSet<&str> =
                     config.group_by.iter().map(String::as_str).collect();
                 parent_ck
@@ -3420,6 +3425,9 @@ fn compute_one(
             } else {
                 parent_ck
             };
+            if omits_ck {
+                ck_set.insert(format!("$ck.aggregate.{name}"));
+            }
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,

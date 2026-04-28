@@ -2175,6 +2175,18 @@ pub(crate) fn finalize_group_inner(
             values[idx] = v;
         }
     }
+    // Stamp the synthetic aggregate-group-index column for relaxed
+    // aggregates. Strict aggregates have no such column on their
+    // `output_schema` (the schema-widening pass only appends one for
+    // relaxed aggregates), so the lookup short-circuits and the strict
+    // path pays zero overhead. The CXL parser blocks `emit $ck.* = ...`
+    // so no user-emit collides for the slot; the write order is still
+    // chosen so any future engine emit cannot overwrite the synthetic
+    // value silently.
+    let synthetic_ck = format!("$ck.aggregate.{transform_name}");
+    if let Some(idx) = output_schema.index(&synthetic_ck) {
+        values[idx] = Value::Integer(state.group_index as i64);
+    }
 
     let auto_pairs = state.meta_tracker.clone().finalize();
     for (k, v) in auto_pairs {
@@ -4580,5 +4592,266 @@ mod spill_trigger_tests {
             record_set_eq(&after, &baseline),
             "WeightedAvg retract: {after:?} != {baseline:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Synthetic aggregate-CK column emission
+    //
+    // Mirrors the planner's schema-widening pass: a relaxed aggregate's
+    // output schema gains one trailing `$ck.aggregate.<name>` column
+    // tagged `FieldMetadata::AggregateGroupIndex`. The runtime stamps
+    // each finalized record's slot with the in-memory group index so
+    // downstream detect-phase fan-out can resolve a buffer-cell key
+    // back to the contributing source rows via `input_rows`.
+    // ----------------------------------------------------------------
+
+    /// Like `build_test_aggregator_relaxed` but appends an explicit
+    /// `$ck.aggregate.<transform_name>` column to the output schema,
+    /// mimicking what the schema-widening pass does at compile time
+    /// for relaxed aggregates.
+    fn build_test_aggregator_with_synthetic_ck(
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+        memory_budget: usize,
+        spill_dir: Option<std::path::PathBuf>,
+    ) -> HashAggregator {
+        let parsed = Parser::parse(cxl_src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
+        let resolved =
+            resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
+            .iter()
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
+            .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
+        let schema_names: Vec<String> =
+            input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
+        let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
+        let mut compiled =
+            extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates");
+        compiled.set_retraction_flags(true);
+
+        let transform_name = "test_agg";
+        // Build the output schema mirroring the widening pass: user
+        // emits first, then the synthetic CK column at the tail.
+        let mut builder = clinker_record::SchemaBuilder::new();
+        for emit in compiled.emits.iter().filter(|e| !e.is_meta) {
+            builder = builder.with_field(emit.output_name.clone());
+        }
+        let synthetic_name = format!("$ck.aggregate.{transform_name}");
+        builder = builder.with_field_meta(
+            synthetic_name,
+            clinker_record::FieldMetadata::aggregate_group_index(transform_name),
+        );
+        let output_schema = builder.build();
+
+        let mut spill_cols: Vec<Box<str>> = group_by_owned
+            .iter()
+            .map(|s| Box::<str>::from(s.as_str()))
+            .collect();
+        spill_cols.push("__acc_state".into());
+        spill_cols.push("__meta_tracker".into());
+        let spill_schema = Arc::new(Schema::new(spill_cols));
+
+        let evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+
+        HashAggregator::new(
+            Arc::new(compiled),
+            evaluator,
+            output_schema,
+            spill_schema,
+            memory_budget,
+            spill_dir,
+            transform_name,
+        )
+    }
+
+    #[test]
+    fn test_synthetic_ck_lineage_mode_finalize_stamps_group_index() {
+        // Lineage path (Reversible-only bindings): finalize must stamp
+        // the synthetic column from each group's in-memory group_index.
+        let input = make_schema(&["k", "v"]);
+        let mut agg = build_test_aggregator_with_synthetic_ck(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit total = sum(v)",
+            10_000_000,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // Two groups; the first inserted gets group_index 0, the
+        // second gets 1.
+        for (i, (k, v)) in [("a", 1i64), ("b", 10), ("a", 2), ("b", 20)]
+            .iter()
+            .enumerate()
+        {
+            let r = make_record(&input, vec![Value::String((*k).into()), Value::Integer(*v)]);
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let mut out = Vec::new();
+        agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize_in_place");
+        let synthetic_idx = out[0]
+            .0
+            .schema()
+            .index("$ck.aggregate.test_agg")
+            .expect("synthetic column on output schema");
+        // Each emitted record's synthetic slot must carry an Integer
+        // value matching its in-memory group index. With two groups
+        // the set of indices is exactly {0, 1}.
+        let mut indices: Vec<i64> = Vec::new();
+        for (record, _) in &out {
+            match record.values().get(synthetic_idx).expect("synthetic slot") {
+                Value::Integer(n) => indices.push(*n),
+                other => panic!("synthetic CK must be Integer, got {other:?}"),
+            }
+        }
+        indices.sort();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_synthetic_ck_buffer_mode_finalize_stamps_group_index() {
+        // Buffer-mode path (any BufferRequired binding): the same
+        // stamp must apply after `fold_buffered_state` reconstructs
+        // the AggregatorGroupState. Confirms `fold_buffered_state`
+        // preserves `group_index` and the runtime stamp fires for
+        // both retraction strategies.
+        let input = make_schema(&["k", "v"]);
+        let mut agg = build_test_aggregator_with_synthetic_ck(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit lo = min(v)",
+            10_000_000,
+            None,
+        );
+        assert!(
+            agg.buffer_mode,
+            "min(v) under relaxed must select buffer-mode"
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for (i, (k, v)) in [("a", 5i64), ("b", 50), ("a", 1), ("b", 10)]
+            .iter()
+            .enumerate()
+        {
+            let r = make_record(&input, vec![Value::String((*k).into()), Value::Integer(*v)]);
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let mut out = Vec::new();
+        agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize_in_place");
+        let synthetic_idx = out[0]
+            .0
+            .schema()
+            .index("$ck.aggregate.test_agg")
+            .expect("synthetic column on output schema");
+        let mut indices: Vec<i64> = Vec::new();
+        for (record, _) in &out {
+            match record.values().get(synthetic_idx).expect("synthetic slot") {
+                Value::Integer(n) => indices.push(*n),
+                other => panic!("synthetic CK must be Integer, got {other:?}"),
+            }
+        }
+        indices.sort();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_synthetic_ck_strict_aggregator_pays_zero_overhead() {
+        // Strict (non-relaxed) aggregator's output schema does not
+        // carry the synthetic column; the finalize lookup short-circuits
+        // and the emitted record has no synthetic slot.
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            10_000_000,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..4u64 {
+            let r = make_record(&input, vec![Value::String("a".into())]);
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+        }
+        let mut out = Vec::new();
+        agg.finalize(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize");
+        for (record, _) in &out {
+            assert!(
+                record.schema().index("$ck.aggregate.test_agg").is_none(),
+                "strict aggregator's output schema must not carry the synthetic column"
+            );
+        }
+    }
+
+    #[test]
+    fn test_synthetic_ck_survives_spill_round_trip_via_finalize() {
+        // Force at least one spill, then finalize through the
+        // spill-recovery path. The synthetic column must survive: each
+        // emitted record's synthetic slot is set from the merged
+        // `AggregatorGroupState.group_index` reconstructed by the
+        // spill-merge loop. `group_index` itself is derive-Serialize on
+        // both `AggregatorGroupState` and `BufferedGroupState`, so the
+        // postcard round trip preserves the value end-to-end.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator_with_synthetic_ck(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            1024,
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let keys = ["a", "b", "c", "d"];
+        for i in 0..32u64 {
+            let k = keys[(i as usize) % keys.len()];
+            let r = make_record(&input, vec![Value::String(k.into())]);
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "tiny budget must trigger at least one spill"
+        );
+
+        let mut out = Vec::new();
+        agg.finalize(&ctx_for(&stable, &file, 0), &mut out)
+            .expect("finalize after spill");
+        let synthetic_idx = out[0]
+            .0
+            .schema()
+            .index("$ck.aggregate.test_agg")
+            .expect("synthetic column on output schema");
+        // Four distinct keys → four distinct group indices reassigned
+        // by the spill-recovery loop. Exact ordering is not contracted,
+        // but each row must carry a non-negative Integer.
+        let mut indices: Vec<i64> = Vec::new();
+        for (record, _) in &out {
+            match record.values().get(synthetic_idx).expect("synthetic slot") {
+                Value::Integer(n) => {
+                    assert!(*n >= 0, "synthetic CK must be a non-negative group index");
+                    indices.push(*n);
+                }
+                other => panic!("synthetic CK must be Integer, got {other:?}"),
+            }
+        }
+        assert_eq!(indices.len(), 4, "one row per distinct key");
     }
 }
