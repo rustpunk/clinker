@@ -1,0 +1,20 @@
+_schema:
+  name: audit_events
+  format: csv
+  description: |
+    Per-order audit trail. Joins to `orders` on `order_id`. Carries an
+    independent `event_id` field — under a multi-CK pipeline this would
+    appear alongside `order_id` in the propagated correlation set, but
+    today's demo runs with a single-field correlation key.
+  version: "1.0"
+
+fields:
+  - name: event_id
+    type: string
+  - name: order_id
+    type: string
+    description: Foreign key into `orders.order_id`; the CK join axis.
+  - name: actor
+    type: string
+  - name: event_type
+    type: string

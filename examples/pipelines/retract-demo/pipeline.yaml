@@ -1,0 +1,161 @@
+pipeline:
+  name: retract_demo
+
+# Pipeline-level correlation key. Both Sources stamp `order_id` as
+# `$ck.order_id` at ingest. The downstream aggregate's `group_by`
+# omits `order_id`, so the engine routes this pipeline through the
+# five-phase retraction-aware commit instead of the strict
+# two-phase fast path. `correlation_fanout_policy: any` keeps the
+# default — a triggering record fans collateral DLQ across every
+# row sharing its CK group.
+error_handling:
+  strategy: continue
+  correlation_key: order_id
+  correlation_fanout_policy: any
+  dlq:
+    path: ./output/dlq.csv
+    include_reason: true
+    include_source_row: true
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer_id, type: string }
+        - { name: department, type: string }
+        - { name: day, type: string }
+        - { name: amount, type: int }
+        - { name: quality_score, type: string }
+
+  - type: source
+    name: audit_events
+    config:
+      name: audit_events
+      type: csv
+      path: ./data/audit_events.csv
+      options:
+        has_header: true
+      schema:
+        - { name: event_id, type: string }
+        - { name: order_id, type: string }
+        - { name: actor, type: string }
+        - { name: event_type, type: string }
+
+  # Combine joins each order with its first matching audit event.
+  # `propagate_ck: all` widens the joined output schema with every
+  # input's `$ck.<field>` columns. Today's single-field CK surfaces
+  # `$ck.order_id` (driver wins on shared field names); under a
+  # compound CK both sides' columns would land.
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      audit_events: audit_events
+    config:
+      where: "orders.order_id == audit_events.order_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit customer_id = orders.customer_id
+        emit department = orders.department
+        emit day = orders.day
+        emit amount = orders.amount
+        emit quality_score = orders.quality_score
+        emit event_id = audit_events.event_id
+        emit actor = audit_events.actor
+        emit event_type = audit_events.event_type
+      propagate_ck: all
+
+  # Validation gate. `to_int(quality_score)` succeeds for normal
+  # rows (numeric strings like "92") and fails on the `"BAD"`
+  # sentinel; the failure surfaces as a DLQ trigger. The aggregate
+  # downstream is relaxed-CK (its `group_by` omits `order_id`), so
+  # the orchestrator's recompute phase retracts the failing row's
+  # contribution from `dept_totals` before any output buffer commits.
+  # The integer `quality_score_int` projection keeps every column
+  # strongly typed downstream so the window emit and aggregate emit
+  # can name them without `<unmapped>` casts.
+  - type: transform
+    name: validate
+    input: enriched
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit customer_id = customer_id
+        emit department = department
+        emit day = day
+        emit amount = amount
+        emit event_id = event_id
+        emit actor = actor
+        emit event_type = event_type
+        emit quality_score_int = quality_score.to_int()
+
+  # Per-order analytic window over (department, day). The window's
+  # `partition_by` is `department`; the partition spans multiple CK
+  # groups (one CK group per `order_id`), so the planner flips this
+  # window into buffer-recompute mode under the relaxed-CK
+  # downstream aggregate. `$window.sum`, `$window.lag(1)`, and
+  # `$window.first()` produce per-record running, prior, and
+  # opening totals. When a CK group's order is retracted upstream,
+  # the window's commit phase reruns the partition over surviving
+  # rows.
+  - type: transform
+    name: running_totals
+    input: validate
+    config:
+      analytic_window:
+        group_by: [department]
+        sort_by:
+          - field: day
+            order: asc
+      cxl: |
+        emit order_id = order_id
+        emit department = department
+        emit day = day
+        emit amount = amount
+        emit event_id = event_id
+        emit actor = actor
+        emit running_total = $window.sum(amount)
+        emit prev_amount = $window.lag(1).amount
+        emit first_amount = $window.first().amount
+
+  # Per-(department, day) aggregate. `group_by` omits `order_id`,
+  # so this aggregate triggers the relaxed-CK lattice. `sum`,
+  # `min`, and `count` are reversible (the accumulator's retract
+  # path recomputes finalize cheaply); `collect(order_id)` is a
+  # buffer-required binding (the aggregator retains every
+  # contribution and rebuilds the array post-retract).
+  - type: aggregate
+    name: dept_totals
+    input: running_totals
+    config:
+      group_by: [department, day]
+      cxl: |
+        emit department = department
+        emit day = day
+        emit total = sum(amount)
+        emit min_amount = min(amount)
+        emit n = count(*)
+        emit order_ids = collect(order_id)
+
+  # Sink. `include_correlation_keys: true` surfaces the `$ck.*`
+  # columns the Combine widened. `correlation_fanout_policy: any`
+  # is also set on the pipeline-level `error_handling` block; the
+  # explicit per-Output value teaches authors the override surface.
+  - type: output
+    name: report
+    input: dept_totals
+    config:
+      name: report
+      type: csv
+      path: ./output/report.csv
+      include_correlation_keys: true
+      correlation_fanout_policy: any

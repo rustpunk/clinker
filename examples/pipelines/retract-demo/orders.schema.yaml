@@ -1,0 +1,32 @@
+_schema:
+  name: orders
+  format: csv
+  description: |
+    Order events with department, day, amount, and a free-text notes column.
+    The notes column carries a "BAD" sentinel that the demo's validation
+    transform rejects so the engine's relaxed-CK retraction machinery has
+    a real failing row to retract.
+  version: "1.0"
+
+fields:
+  - name: order_id
+    type: string
+    description: Frozen identity column. Stamped at ingest as `$ck.order_id`.
+  - name: customer_id
+    type: string
+  - name: department
+    type: string
+    description: Group-by axis for the downstream aggregate.
+  - name: day
+    type: string
+    description: Sort axis for the downstream analytic window.
+  - name: amount
+    type: int
+  - name: quality_score
+    type: string
+    description: |
+      Numeric quality score serialized as a string so the source reader
+      does not pre-reject sentinel values. The demo's validation transform
+      calls `to_int(quality_score)`; the `"BAD"` sentinel fails the cast
+      and surfaces a DLQ trigger that the relaxed-CK orchestrator retracts
+      from the aggregate's contributions.
