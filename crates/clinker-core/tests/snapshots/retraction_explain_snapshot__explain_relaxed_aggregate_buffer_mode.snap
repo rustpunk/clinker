@@ -69,6 +69,7 @@ retraction enabled — 1 relaxed aggregates, 1 buffer-mode windows, fanout polic
 
 Aggregate 'dept_totals':
   retraction: relaxed-CK enabled, BufferRequired accumulator path, lineage memory n/a (buffer-mode holds raw contributions) (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.
+  synthetic CK: $ck.aggregate.dept_totals (engine-stamped, +16 B/output-row, hidden from default writers)
 
 Window index [0] (source 'orders', partition_by ["department"]):
   retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~3× sizeof(Value).

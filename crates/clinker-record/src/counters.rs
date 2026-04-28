@@ -92,6 +92,25 @@ pub struct RetractionCounters {
     /// group_key) or (window_node, partition_key) that took the
     /// fallback.
     pub degrade_fallback_count: u64,
+    /// Synthetic `$ck.aggregate.<name>` column writes performed by the
+    /// relaxed aggregator's finalize step. One increment per output
+    /// row whose synthetic-CK slot was populated with the group index.
+    /// Stays zero on strict aggregates (the slot is absent from the
+    /// output schema, so the lookup short-circuits without a write).
+    pub synthetic_ck_columns_emitted_total: u64,
+    /// Detect-phase observations of an `AggregateGroupIndex` column on
+    /// a triggered correlation buffer cell. Each increment corresponds
+    /// to one resolution attempt — the orchestrator tried to decode the
+    /// synthetic group index back into contributing source row ids.
+    /// Increments even when the retained aggregator state is missing
+    /// (degrade-fallback path).
+    pub synthetic_ck_fanout_lookups_total: u64,
+    /// Source-row ids unioned into the affected set as a result of
+    /// successful synthetic-CK fan-out. Equal to the sum of
+    /// `input_rows.len()` across every successful resolution; pairs
+    /// with `synthetic_ck_fanout_lookups_total` to characterize
+    /// per-failure expansion factor.
+    pub synthetic_ck_fanout_rows_expanded_total: u64,
 }
 
 impl PipelineCounters {
@@ -150,6 +169,9 @@ mod tests {
         assert_eq!(c.retraction.subdag_replay_rows, 0);
         assert_eq!(c.retraction.output_rows_retracted_total, 0);
         assert_eq!(c.retraction.degrade_fallback_count, 0);
+        assert_eq!(c.retraction.synthetic_ck_columns_emitted_total, 0);
+        assert_eq!(c.retraction.synthetic_ck_fanout_lookups_total, 0);
+        assert_eq!(c.retraction.synthetic_ck_fanout_rows_expanded_total, 0);
     }
 
     #[test]
@@ -160,12 +182,18 @@ mod tests {
         c.retraction.subdag_replay_rows = 13;
         c.retraction.output_rows_retracted_total = 6;
         c.retraction.degrade_fallback_count = 1;
+        c.retraction.synthetic_ck_columns_emitted_total = 4;
+        c.retraction.synthetic_ck_fanout_lookups_total = 3;
+        c.retraction.synthetic_ck_fanout_rows_expanded_total = 19;
         let snap = c.snapshot();
         assert_eq!(snap.retraction.groups_recomputed, 7);
         assert_eq!(snap.retraction.partitions_recomputed, 2);
         assert_eq!(snap.retraction.subdag_replay_rows, 13);
         assert_eq!(snap.retraction.output_rows_retracted_total, 6);
         assert_eq!(snap.retraction.degrade_fallback_count, 1);
+        assert_eq!(snap.retraction.synthetic_ck_columns_emitted_total, 4);
+        assert_eq!(snap.retraction.synthetic_ck_fanout_lookups_total, 3);
+        assert_eq!(snap.retraction.synthetic_ck_fanout_rows_expanded_total, 19);
     }
 
     #[test]

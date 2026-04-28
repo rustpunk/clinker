@@ -1256,6 +1256,15 @@ impl ExecutionPlanDag {
             out.push_str(&format!(
                 "  retraction: relaxed-CK enabled, {path_label} accumulator path, lineage memory {lineage_per_row_bytes} (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.\n",
             ));
+            // Per-output-row cost of the synthetic shadow column the
+            // relaxed aggregate emits. ~16 B is the Value::Integer
+            // discriminant + the 8-byte i64 payload + the Vec slot
+            // overhead per row; the column lives at the tail of every
+            // emitted record and lifts the post-aggregate retract
+            // fan-out path for downstream failures.
+            out.push_str(&format!(
+                "  synthetic CK: $ck.aggregate.{name} (engine-stamped, +16 B/output-row, hidden from default writers)\n",
+            ));
             out.push('\n');
         }
 

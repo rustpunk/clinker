@@ -5,24 +5,37 @@
 //!
 //! 1. Bit-for-bit equivalence between the retract-corrected writer
 //!    payload and a baseline rerun of the same pipeline with the
-//!    sentinel row removed from the input. Anything that breaks the
-//!    five-phase correlation-commit chain (lineage drop, retract
-//!    mis-attribution, replay overshoot, window buffer-recompute leak)
-//!    surfaces here as a value mismatch.
+//!    upstream sentinel row removed from the input. Anything that
+//!    breaks the five-phase correlation-commit chain (lineage drop,
+//!    retract mis-attribution, replay overshoot, window
+//!    buffer-recompute leak) surfaces here as a value mismatch. Both
+//!    runs hit the same post-aggregate `dept_validate` failures
+//!    because the predicate fires on the surviving aggregate totals,
+//!    not on the sentinel; the retract run's DLQ is the baseline's
+//!    DLQ plus the upstream sentinel entry.
 //!
-//! 2. The DLQ contains exactly the trigger row, with its `trigger`
-//!    flag set. Single-source pipelines under the `Any` fan-out
-//!    policy with one bad CK group emit one DLQ entry; collateral
-//!    fan-out is not exercised by this fixture (one row per CK
-//!    group, so a CK group's only contributor is its own trigger).
+//! 2. The DLQ carries the upstream `transform:validate` trigger for
+//!    the BAD-quality sentinel row plus one `transform:dept_validate`
+//!    trigger per HR `(department, day)` whose surviving total falls
+//!    below the predicate threshold. The synthetic
+//!    `$ck.aggregate.dept_totals` lineage routes each post-aggregate
+//!    failure back through the contributing source rows so the final
+//!    aggregate output excludes them (the bit-for-bit assertion
+//!    above pins the resulting writer payload against a baseline
+//!    rerun).
 //!
 //! 3. The retraction counters surfaced by the orchestrator
 //!    (`PipelineCounters.retraction.*`) increment in the expected
 //!    direction. The demo's geometry (relaxed-CK aggregate plus a
-//!    buffer-mode window upstream) exercises three counter paths:
-//!    `groups_recomputed` for the aggregator's recompute step,
-//!    `partitions_recomputed` for the window's wholesale-recompute
-//!    step, and `subdag_replay_rows` for the deltas pushed downstream.
+//!    buffer-mode window upstream and a post-aggregate validation
+//!    Transform) exercises every counter path: `groups_recomputed`
+//!    for the aggregator's recompute step, `partitions_recomputed`
+//!    for the window's wholesale-recompute step,
+//!    `subdag_replay_rows` for the deltas pushed downstream,
+//!    `synthetic_ck_columns_emitted_total` for the per-output-row
+//!    shadow column writes at finalize, and the
+//!    `synthetic_ck_fanout_*` pair for the detect-phase resolution
+//!    of post-aggregate failures back to source row ids.
 //!    `degrade_fallback_count` stays at zero because the demo's
 //!    per-group memory budget never breaches the orchestrator's
 //!    degrade threshold.
@@ -192,7 +205,11 @@ fn demo_files_present() {
 /// rerun output (header + sorted body). The plan-level comparison
 /// proves the orchestrator's recompute, replay, and flush phases
 /// produce the same CSV the user would have gotten if they had
-/// pre-filtered the bad row out of the input.
+/// pre-filtered the upstream-bad row out of the input. Both runs
+/// also encounter the same post-aggregate `dept_validate` failures,
+/// so DLQ entries shrink to a strict subset between baseline and
+/// retract: baseline emits only the post-aggregate triggers; the
+/// retract run additionally emits the upstream sentinel entry.
 #[test]
 fn demo_retract_output_matches_baseline_rerun() {
     let orders = read_demo_csv("orders.csv");
@@ -200,16 +217,21 @@ fn demo_retract_output_matches_baseline_rerun() {
 
     let baseline_orders = drop_orders(&orders, &["O08"]);
 
-    let (_retract_report, retract_output) = run_demo(&orders, &audit_events);
+    let (retract_report, retract_output) = run_demo(&orders, &audit_events);
     let (baseline_report, baseline_output) = run_demo(&baseline_orders, &audit_events);
 
-    assert_eq!(
-        baseline_report.dlq_entries.len(),
-        0,
-        "baseline rerun has no failing rows; got DLQ entries: {:?}",
-        baseline_report.dlq_entries
+    // Baseline still surfaces the post-aggregate dept_validate
+    // triggers because their predicate fires on every HR group whose
+    // total is below 500 — a property of the surviving orders, not
+    // the retracted sentinel. The relevant invariant is that the
+    // retract run's DLQ is the baseline's plus the upstream sentinel.
+    assert!(
+        retract_report.counters.dlq_count > baseline_report.counters.dlq_count,
+        "retract run must DLQ at least the upstream sentinel beyond the baseline's count; \
+         retract={}, baseline={}",
+        retract_report.counters.dlq_count,
+        baseline_report.counters.dlq_count,
     );
-    assert_eq!(baseline_report.counters.dlq_count, 0);
 
     assert_eq!(
         sort_body(&retract_output),
@@ -219,35 +241,60 @@ fn demo_retract_output_matches_baseline_rerun() {
     );
 }
 
-/// DLQ shape: exactly one entry, the trigger, whose source row carries
-/// the `BAD` quality_score. The single-source-per-CK-group geometry
-/// of the demo's input makes collateral fan-out a no-op (each CK
-/// group has only one contributor — itself).
+/// DLQ shape: the upstream `BAD`-quality sentinel arrives as a
+/// `transform:validate` trigger; the post-aggregate `dept_validate`
+/// predicate fires once per HR `(department, day)` whose surviving
+/// total is below 500, and each failing aggregate output row enters
+/// the DLQ as its own trigger. The synthetic CK fan-out path
+/// retracts the contributing source rows from the aggregator state
+/// (verified bit-for-bit against the baseline rerun by the sibling
+/// test) — those source rows do not need to land as separate
+/// collateral entries because the post-retract aggregate output
+/// already excludes them.
 #[test]
-fn demo_dlq_contains_only_the_sentinel_trigger() {
+fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
     let orders = read_demo_csv("orders.csv");
     let audit_events = read_demo_csv("audit_events.csv");
 
     let (report, _output) = run_demo(&orders, &audit_events);
 
-    assert_eq!(
-        report.dlq_entries.len(),
-        1,
-        "expected exactly one DLQ entry — the BAD-quality sentinel row, got: {:?}",
+    let upstream_trigger = report.dlq_entries.iter().find(|e| {
+        e.trigger
+            && e.stage.as_deref() == Some("transform:validate")
+            && e.original_record
+                .values()
+                .iter()
+                .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "O08"))
+    });
+    assert!(
+        upstream_trigger.is_some(),
+        "expected one upstream sentinel trigger from transform:validate carrying order_id O08, \
+         got: {:?}",
         report.dlq_entries
     );
-    assert_eq!(report.counters.dlq_count, 1);
-    let entry = &report.dlq_entries[0];
-    assert!(entry.trigger, "the only DLQ entry is the trigger");
-    let bad_carries_o08 = entry
-        .original_record
-        .values()
+
+    let post_aggregate_triggers: Vec<_> = report
+        .dlq_entries
         .iter()
-        .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "O08"));
-    assert!(
-        bad_carries_o08,
-        "trigger row must carry the sentinel order_id O08; got: {entry:?}"
+        .filter(|e| e.trigger && e.stage.as_deref() == Some("transform:dept_validate"))
+        .collect();
+    assert_eq!(
+        post_aggregate_triggers.len(),
+        3,
+        "expected three dept_validate triggers (one per HR (department, day) whose surviving \
+         total is below the predicate threshold); got: {post_aggregate_triggers:?}",
     );
+    for entry in &post_aggregate_triggers {
+        let department_is_hr = entry
+            .original_record
+            .values()
+            .iter()
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR"));
+        assert!(
+            department_is_hr,
+            "every post-aggregate trigger row belongs to the HR department; got: {entry:?}",
+        );
+    }
 }
 
 /// Retraction metrics counters fire under the demo workload. The
@@ -304,5 +351,37 @@ fn demo_retraction_counters_fire_in_the_expected_direction() {
         r.degrade_fallback_count, 0,
         "demo workload must not trip degrade fallback, got {}",
         r.degrade_fallback_count
+    );
+
+    // Synthetic CK emission: the relaxed dept_totals aggregate stamps
+    // one $ck.aggregate.dept_totals slot per emitted output row.
+    // Initial finalize yields six (department, day) groups; the
+    // upstream-sentinel retract drives a re-finalize over the
+    // surviving HR/2024-01-03 contributors, so the counter reads
+    // strictly above the initial six.
+    assert!(
+        r.synthetic_ck_columns_emitted_total >= 6,
+        "synthetic_ck_columns_emitted_total must cover every relaxed-aggregate \
+         finalized group (initial pass + post-retract refinalize), got {}",
+        r.synthetic_ck_columns_emitted_total
+    );
+
+    // Synthetic CK fan-out: the post-aggregate dept_validate Transform
+    // fails on three HR aggregate output rows. Each failure carries
+    // the synthetic CK column on the trigger record, so the detect
+    // phase sees three lookups and expands to the contributing
+    // source row ids of each HR group.
+    assert!(
+        r.synthetic_ck_fanout_lookups_total >= 3,
+        "synthetic_ck_fanout_lookups_total must register one observation per failing \
+         post-aggregate trigger, got {}",
+        r.synthetic_ck_fanout_lookups_total
+    );
+    assert!(
+        r.synthetic_ck_fanout_rows_expanded_total >= r.synthetic_ck_fanout_lookups_total,
+        "every successful synthetic-CK lookup must expand to at least one source row, \
+         lookups={}, rows_expanded={}",
+        r.synthetic_ck_fanout_lookups_total,
+        r.synthetic_ck_fanout_rows_expanded_total
     );
 }

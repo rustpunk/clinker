@@ -1362,8 +1362,14 @@ pub(crate) fn dispatch_plan_node(
                         });
                     }
                 };
+                let emits_synthetic = hash_box.emits_synthetic_ck();
+                let pre_finalize_len = emitted_rows.len();
                 match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
                     Ok(()) => {
+                        if emits_synthetic {
+                            ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
+                                (emitted_rows.len() - pre_finalize_len) as u64;
+                        }
                         let group_by_indices = hash_box.group_by_indices().to_vec();
                         let pre_retract_output_rows = emitted_rows.clone();
                         ctx.relaxed_aggregator_states.insert(

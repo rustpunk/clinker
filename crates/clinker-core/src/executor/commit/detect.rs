@@ -55,7 +55,7 @@ pub(crate) struct WindowRetractEntry {
 /// Compute the retract scope from `ctx.correlation_buffers` plus the
 /// per-node `ck_set` lattice on `current_dag.node_properties`.
 pub(crate) fn detect_retract_scope(
-    ctx: &ExecutorContext<'_>,
+    ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> RetractScope {
     let mut scope = RetractScope::default();
@@ -105,6 +105,13 @@ pub(crate) fn detect_retract_scope(
     // degrade-fallback in `recompute_agg.rs` routes the affected group
     // through strict-collateral DLQ.
     let mut affected_row_ids: BTreeSet<u32> = BTreeSet::new();
+    // Accumulate counter deltas locally so the immutable borrow of
+    // `ctx.correlation_buffers` (and the immutable hand to
+    // `ctx.relaxed_aggregator_states`) does not collide with the
+    // mutable counter writes; we apply them below in one shot once the
+    // buffer borrow ends.
+    let mut synthetic_ck_lookups: u64 = 0;
+    let mut synthetic_ck_rows_expanded: u64 = 0;
     for key in &trigger_keys {
         let Some(group) = buffers.get(key) else {
             continue;
@@ -129,20 +136,46 @@ pub(crate) fn detect_retract_scope(
                         let Some(key_pos) = buffer_key_position_for_column(schema, col_idx) else {
                             continue;
                         };
-                        let Some(&GroupByKey::Int(raw)) = key.get(key_pos) else {
-                            // Synthetic CK should always encode as
-                            // GroupByKey::Int (the aggregator stamps the
-                            // u32 group_index as Value::Integer); a
-                            // non-Int key here means the cell predates
-                            // the synthetic-CK landing or the aggregator
-                            // failed to populate the slot. Nothing to
-                            // resolve back to source rows.
-                            continue;
-                        };
-                        let Ok(group_idx) = u32::try_from(raw) else {
-                            continue;
+                        // The aggregator stamps `state.group_index` as
+                        // `Value::Integer`, but `value_to_group_key`
+                        // widens unpinned `Value::Integer` to
+                        // `GroupByKey::Float` (the canonical numeric
+                        // group-key shape used so int/float groups
+                        // collide deterministically). Decode either
+                        // shape back to a `u32` group index. A
+                        // non-numeric key here means the cell predates
+                        // the synthetic-CK landing or the aggregator
+                        // failed to populate the slot.
+                        let group_idx = match key.get(key_pos) {
+                            Some(GroupByKey::Int(raw)) => match u32::try_from(*raw) {
+                                Ok(idx) => idx,
+                                Err(_) => continue,
+                            },
+                            Some(GroupByKey::Float(bits)) => {
+                                let f = f64::from_bits(*bits);
+                                if !f.is_finite() || f < 0.0 || f > u32::MAX as f64 {
+                                    continue;
+                                }
+                                let rounded = f as u32;
+                                if rounded as f64 != f {
+                                    // Float carrying a non-integral
+                                    // value; the aggregator never emits
+                                    // such a key for the synthetic CK
+                                    // slot, so skip rather than mask a
+                                    // contract violation.
+                                    continue;
+                                }
+                                rounded
+                            }
+                            _ => continue,
                         };
                         had_synthetic_lookup = true;
+                        // One observation of the synthetic-CK column on
+                        // a triggered cell — count regardless of whether
+                        // the retained aggregator state is available, so
+                        // a persistent gap between lookup and expansion
+                        // counters surfaces a degrade-fallback pattern.
+                        synthetic_ck_lookups += 1;
                         let Some(&node_idx) = aggregate_idx_by_name.get(aggregate_name.as_ref())
                         else {
                             continue;
@@ -161,6 +194,7 @@ pub(crate) fn detect_retract_scope(
                         };
                         if let Some(rows) = retained.aggregator.input_rows_by_group_index(group_idx)
                         {
+                            synthetic_ck_rows_expanded += rows.len() as u64;
                             for &r in rows {
                                 affected_row_ids.insert(r);
                             }
@@ -185,6 +219,13 @@ pub(crate) fn detect_retract_scope(
             }
         }
     }
+    // The immutable borrow of `ctx.correlation_buffers` ends at the
+    // last use above (NLL), so the mutable counter writes below
+    // compile against fresh borrows.
+    ctx.counters.retraction.synthetic_ck_fanout_lookups_total += synthetic_ck_lookups;
+    ctx.counters
+        .retraction
+        .synthetic_ck_fanout_rows_expanded_total += synthetic_ck_rows_expanded;
 
     if affected_row_ids.is_empty() {
         return scope;

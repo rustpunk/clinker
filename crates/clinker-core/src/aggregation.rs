@@ -1247,6 +1247,18 @@ impl HashAggregator {
         &self.spill_files
     }
 
+    /// True when the aggregator's output schema carries a synthetic
+    /// `$ck.aggregate.<transform_name>` column — the relaxed-aggregate
+    /// shadow lineage finalize stamps with the per-group index. Strict
+    /// aggregates have no such column and the predicate is constant
+    /// `false` for them, so the runtime counter increment short-circuits
+    /// at the call site without paying the per-record schema lookup.
+    pub(crate) fn emits_synthetic_ck(&self) -> bool {
+        self.output_schema
+            .index(&format!("$ck.aggregate.{}", self.transform_name))
+            .is_some()
+    }
+
     /// Drive one input record through the aggregator (D1, D9, D10, D11
     /// revised, D44). Order:
     ///
