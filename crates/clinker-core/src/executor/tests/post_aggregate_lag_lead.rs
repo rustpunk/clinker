@@ -5,16 +5,9 @@
 //! applied. Hash aggregation emits group rows in a hash-bucket order
 //! that varies run-to-run — but the windowed Transform's `sort_by`
 //! normalizes that. Three runs of the same pipeline against identical
-//! input must produce byte-identical writer output.
-//!
-//! Today's CXL evaluator returns `Value::Null` for `$window.lag(N).<field>`
-//! / `$window.lead(N).<field>` chains (the WindowCall arm at
-//! `cxl/src/eval/mod.rs` discards the RecordView). Determinism still
-//! holds — three runs all emit identical Null cells in the lag/lead
-//! columns — and the test gates that determinism. The richer
-//! "lag(1).total returns a non-null prior row" assertion blocks until
-//! the CXL evaluator implements the postfix-field chain; this test is
-//! the pin against re-introducing run-to-run drift in the meantime.
+//! input must produce byte-identical writer output, and the
+//! `prev_total` column populated via `$window.lag(1).total` must
+//! reference the prior row in the partition's `sort_by` order.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -146,8 +139,12 @@ ENG,south,400
         "post-aggregate window must emit one row per aggregate output row"
     );
 
-    // Verify the sort_by puts HR's three regions in lex-asc order
-    // within partition.
+    // Pin per-row totals AND `prev_total` against the partition's
+    // `sort_by: region asc` order. Sort_by within partition is:
+    //   HR  → [east(10), north(30), west(20)]
+    //   ENG → [east(100), north(300), south(400), west(200)]
+    // So `lag(1).total` chains as the prior row's `total` per partition,
+    // with the first row in each partition emitting Null (empty CSV cell).
     let mut hr_regions: Vec<String> = Vec::new();
     let mut lines = run1.lines();
     let header_line = lines.next().expect("header");
@@ -155,6 +152,7 @@ ENG,south,400
     let dept_idx = headers.iter().position(|h| *h == "department").unwrap();
     let region_idx = headers.iter().position(|h| *h == "region").unwrap();
     let total_idx = headers.iter().position(|h| *h == "total").unwrap();
+    let prev_idx = headers.iter().position(|h| *h == "prev_total").unwrap();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -163,25 +161,45 @@ ENG,south,400
         if v[dept_idx] == "HR" {
             hr_regions.push(v[region_idx].to_string());
         }
-        // Pin the per-row aggregate `total` is correct regardless of
-        // emit order — guards against re-introducing the source-rooted
-        // geometry's Null bug at the post-aggregate boundary.
         let total: i64 = v[total_idx].parse().expect("total parses");
+        let prev = v[prev_idx];
         match (v[dept_idx], v[region_idx]) {
-            ("HR", "east") => assert_eq!(total, 10),
-            ("HR", "west") => assert_eq!(total, 20),
-            ("HR", "north") => assert_eq!(total, 30),
-            ("ENG", "east") => assert_eq!(total, 100),
-            ("ENG", "west") => assert_eq!(total, 200),
-            ("ENG", "north") => assert_eq!(total, 300),
-            ("ENG", "south") => assert_eq!(total, 400),
+            ("HR", "east") => {
+                assert_eq!(total, 10);
+                assert_eq!(
+                    prev, "",
+                    "HR/east is first in partition; prev_total is Null"
+                );
+            }
+            ("HR", "north") => {
+                assert_eq!(total, 30);
+                assert_eq!(prev, "10", "HR/north's prev is HR/east's total (10)");
+            }
+            ("HR", "west") => {
+                assert_eq!(total, 20);
+                assert_eq!(prev, "30", "HR/west's prev is HR/north's total (30)");
+            }
+            ("ENG", "east") => {
+                assert_eq!(total, 100);
+                assert_eq!(
+                    prev, "",
+                    "ENG/east is first in partition; prev_total is Null"
+                );
+            }
+            ("ENG", "north") => {
+                assert_eq!(total, 300);
+                assert_eq!(prev, "100", "ENG/north's prev is ENG/east's total (100)");
+            }
+            ("ENG", "south") => {
+                assert_eq!(total, 400);
+                assert_eq!(prev, "300", "ENG/south's prev is ENG/north's total (300)");
+            }
+            ("ENG", "west") => {
+                assert_eq!(total, 200);
+                assert_eq!(prev, "400", "ENG/west's prev is ENG/south's total (400)");
+            }
             other => panic!("unexpected (dept, region) {other:?}"),
         }
     }
-    // hr_regions is the writer-ordered sequence. Determinism plus
-    // sort_by means this sequence is fixed across runs (already proven
-    // by canon1 == canon2 == canon3 above) — but we don't pin a specific
-    // sequence here because the dispatcher's per-record loop iterates
-    // upstream emit order, not partition-sorted order.
     assert_eq!(hr_regions.len(), 3, "HR partition has three rows");
 }
