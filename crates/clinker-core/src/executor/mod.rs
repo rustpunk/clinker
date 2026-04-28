@@ -2410,6 +2410,7 @@ mod tests {
     mod branching;
     mod correlated_dlq;
     mod correlated_dlq_retract;
+    mod correlated_post_aggregate_retract;
     mod correlated_window_retract;
     mod format_dispatch;
     mod multi_output;

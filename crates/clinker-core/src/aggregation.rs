@@ -1181,6 +1181,41 @@ impl HashAggregator {
         &self.groups
     }
 
+    /// Resolve a group's `input_rows` slice from its stable in-memory
+    /// `group_index`, walking whichever map (`groups` for the lineage
+    /// path, `buffered_groups` for the buffer path) is populated for
+    /// this aggregator. The two maps are mutually exclusive at runtime
+    /// because `buffer_mode` is fixed by `compiled.requires_buffer_mode`
+    /// at construction.
+    ///
+    /// Returns `None` when no group with `group_index` exists in the
+    /// in-memory state — typically because the aggregate has spilled
+    /// (post-merge index space is reassigned by the recovery loop) or
+    /// because the index pre-dates a merge step that compacted the
+    /// table. The retraction orchestrator's detect phase treats `None`
+    /// as a degrade-fallback signal: the wide-net union over each
+    /// trigger cell's `error_rows` continues to cover the affected
+    /// aggregate group through the strict-collateral path.
+    ///
+    /// O(groups) — typical aggregate workloads carry hundreds of
+    /// groups in memory at most. A cached `HashMap<u32, &Vec<u32>>`
+    /// is an obvious future optimization but not warranted at current
+    /// call frequencies (one walk per detect-phase synthetic-CK
+    /// trigger column).
+    pub(crate) fn input_rows_by_group_index(&self, group_index: u32) -> Option<&[u32]> {
+        if self.buffer_mode {
+            self.buffered_groups
+                .values()
+                .find(|s| s.group_index == group_index)
+                .map(|s| s.input_rows.as_slice())
+        } else {
+            self.groups
+                .values()
+                .find(|s| s.group_index == group_index)
+                .map(|s| s.input_rows.as_slice())
+        }
+    }
+
     /// Group-by column indices in the input record schema. Mirrors the
     /// `CompiledAggregate.group_by_indices` projection the orchestrator's
     /// recompute phase needs to align pre-/post-retract output rows by

@@ -8,9 +8,9 @@
 //! every Transform with a buffer-recompute IndexSpec, mapping retract
 //! row IDs to the partitions they originally landed in.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
-use clinker_record::GroupByKey;
+use clinker_record::{FieldMetadata, GroupByKey, Schema};
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::ExecutorContext;
@@ -74,18 +74,112 @@ pub(crate) fn detect_retract_scope(
     trigger_keys.sort_by_key(|k| format_group_key(k));
     scope.trigger_group_keys = trigger_keys.clone();
 
-    // For each triggered group, walk every relaxed-CK Aggregate in the
-    // DAG and add its node index to the scope. Today's Aggregate state
-    // retention does not key per-row IDs by trigger-group identity (the
-    // retained `HashAggregator` holds the entire input set), so the
-    // affected per-aggregate row id list is the union of every error
-    // row across every trigger group. The `recompute_agg` phase calls
-    // `retract_row` for each id; the orchestrator's flush phase honors
-    // the per-output fan-out policy when deciding which collateral
-    // records to spare.
+    // Aggregate-name → DAG NodeIndex map, built once per detect call so
+    // synthetic-CK column lookups below do not re-scan node weights for
+    // every trigger key.
+    let aggregate_idx_by_name: HashMap<&str, NodeIndex> = current_dag
+        .graph
+        .node_indices()
+        .filter_map(|idx| match &current_dag.graph[idx] {
+            PlanNode::Aggregation { name, .. } => Some((name.as_str(), idx)),
+            _ => None,
+        })
+        .collect();
+
+    // For each triggered group, classify its key columns by their
+    // `FieldMetadata` to decide which row IDs feed `affected_row_ids`.
+    //
+    // - Source-CK column: the cell's `error_rows` are post-source row
+    //   numbers and feed `retract_row` directly through the lineage path
+    //   the aggregator built at ingest. Union them in.
+    // - Synthetic-CK column (`AggregateGroupIndex`): the cell's
+    //   `error_rows` are aggregate-output row numbers — NOT source row
+    //   IDs — so they cannot drive `retract_row`. Resolve the encoded
+    //   `group_index` back to the contributing source rows via the
+    //   retained aggregator's `input_rows` table and union those.
+    // - Mixed cell: both are processed independently; their row IDs
+    //   union additively into `affected_row_ids`.
+    //
+    // When the aggregator is degraded (state spilled or never
+    // instantiated), the synthetic-CK lookup misses and the existing
+    // degrade-fallback in `recompute_agg.rs` routes the affected group
+    // through strict-collateral DLQ.
     let mut affected_row_ids: BTreeSet<u32> = BTreeSet::new();
     for key in &trigger_keys {
-        if let Some(group) = buffers.get(key) {
+        let Some(group) = buffers.get(key) else {
+            continue;
+        };
+        // Probe the cell's schema for engine-stamped column lineage.
+        // Every CorrelationErrorRecord in a given cell shares the same
+        // schema (cells are keyed by the engine-stamped tuple), so the
+        // first error_message is representative.
+        let schema = group
+            .error_messages
+            .first()
+            .map(|err| err.original_record.schema().clone());
+        let mut has_source_ck = false;
+        let mut had_synthetic_lookup = false;
+        if let Some(schema) = schema.as_ref() {
+            for col_idx in 0..schema.column_count() {
+                match schema.field_metadata(col_idx) {
+                    Some(FieldMetadata::SourceCorrelation { .. }) => {
+                        has_source_ck = true;
+                    }
+                    Some(FieldMetadata::AggregateGroupIndex { aggregate_name }) => {
+                        let Some(key_pos) = buffer_key_position_for_column(schema, col_idx) else {
+                            continue;
+                        };
+                        let Some(&GroupByKey::Int(raw)) = key.get(key_pos) else {
+                            // Synthetic CK should always encode as
+                            // GroupByKey::Int (the aggregator stamps the
+                            // u32 group_index as Value::Integer); a
+                            // non-Int key here means the cell predates
+                            // the synthetic-CK landing or the aggregator
+                            // failed to populate the slot. Nothing to
+                            // resolve back to source rows.
+                            continue;
+                        };
+                        let Ok(group_idx) = u32::try_from(raw) else {
+                            continue;
+                        };
+                        had_synthetic_lookup = true;
+                        let Some(&node_idx) = aggregate_idx_by_name.get(aggregate_name.as_ref())
+                        else {
+                            continue;
+                        };
+                        let Some(retained) = ctx.relaxed_aggregator_states.get(&node_idx) else {
+                            // Degrade-fallback: the aggregator's state
+                            // is gone (spilled mid-run, or the relaxed
+                            // dispatch arm never retained it because the
+                            // node ran the strict path). The
+                            // recompute-aggregates phase's
+                            // degrade-fallback (`recompute_agg.rs`)
+                            // routes the affected group through
+                            // strict-collateral DLQ — no synthetic-CK
+                            // expansion needed here.
+                            continue;
+                        };
+                        if let Some(rows) = retained.aggregator.input_rows_by_group_index(group_idx)
+                        {
+                            for &r in rows {
+                                affected_row_ids.insert(r);
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        // Source-CK or no-CK cells: the cell's `error_rows` ARE source
+        // row numbers (modulo the row-number-disambiguator path for
+        // null-keyed cells), so they feed `retract_row` directly. A
+        // pure-AggregateGroupIndex cell whose synthetic lookup landed
+        // already covered its contributing source rows; including the
+        // raw `error_rows` here would feed aggregate-output row numbers
+        // into `retract_row` and exercise the not-found tolerance,
+        // silently no-opping. Skip the raw union in that case.
+        if has_source_ck || !had_synthetic_lookup {
             for &row in &group.error_rows {
                 affected_row_ids.insert(row as u32);
             }
@@ -155,6 +249,32 @@ pub(crate) fn detect_retract_scope(
     }
 
     scope
+}
+
+/// Position of `target_col_idx` within the buffer-key tuple emitted by
+/// `buffer_key_for_record`. The buffer-key builder walks the schema in
+/// column order and pushes one component per engine-stamped column, so
+/// the position of any given engine-stamped column is the count of
+/// engine-stamped columns that precede it. Returns `None` when
+/// `target_col_idx` is itself not engine-stamped (a caller-side
+/// invariant violation; the production callers all gate on
+/// `field_metadata(idx)` first).
+fn buffer_key_position_for_column(schema: &Schema, target_col_idx: usize) -> Option<usize> {
+    if !schema
+        .field_metadata(target_col_idx)
+        .is_some_and(|m| m.is_engine_stamped())
+    {
+        return None;
+    }
+    Some(
+        (0..target_col_idx)
+            .filter(|&i| {
+                schema
+                    .field_metadata(i)
+                    .is_some_and(|m| m.is_engine_stamped())
+            })
+            .count(),
+    )
 }
 
 fn format_group_key(key: &[GroupByKey]) -> String {
