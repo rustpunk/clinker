@@ -1434,7 +1434,7 @@ impl PipelineConfig {
         // Transform/Aggregate/Route nodes in declaration order. The
         // resulting `entries` array is parallel to `window_configs`;
         // its index is reused as the `transform_index` in raw index
-        // requests and the `spec_idx` lookup below feeds `LoweringCtx`.
+        // requests built after the graph topology is known.
         // Source/Output/Merge/Composition/Combine variants do not
         // contribute (they don't carry `analytic_window` or CXL
         // programs the analyzer pass would consume).
@@ -1521,8 +1521,12 @@ impl PipelineConfig {
                 }
             }
         }
-        // Build raw index requests + deduplicate.
-        let mut raw_index_requests: Vec<crate::plan::index::RawIndexRequest> = Vec::new();
+        // E003 — every cross-source `wc.source: <name>` must name a
+        // declared source. The full `RawIndexRequest` set is built later
+        // (after the DAG topology is known so node-rooted windows can
+        // pin their `PlanIndexRoot::Node { upstream, .. }` to a real
+        // NodeIndex), but the unknown-source diagnostic does not depend
+        // on graph topology and runs first.
         for (i, wc_opt) in window_configs.iter().enumerate() {
             if let Some(wc) = wc_opt {
                 let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
@@ -1537,45 +1541,8 @@ impl PipelineConfig {
                     ));
                     return Err(diags);
                 }
-                let mut arena_fields: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for gb in &wc.group_by {
-                    arena_fields.insert(gb.clone());
-                }
-                for sf in &wc.sort_by {
-                    arena_fields.insert(sf.field.clone());
-                }
-                for f in &report.transforms[i].accessed_fields {
-                    arena_fields.insert(f.clone());
-                }
-                let already_sorted = crate::plan::execution::check_already_sorted(
-                    &source_configs,
-                    &source,
-                    &wc.sort_by,
-                );
-                // Sort arena_fields for deterministic order — the source
-                // collection is a HashSet whose iteration order randomizes
-                // run-to-run, which leaks into `--explain` output and into
-                // any snapshot test that captures the explain block.
-                let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
-                arena_fields_vec.sort();
-                raw_index_requests.push(crate::plan::index::RawIndexRequest {
-                    source,
-                    group_by: wc.group_by.clone(),
-                    sort_by: wc.sort_by.clone(),
-                    arena_fields: arena_fields_vec,
-                    already_sorted,
-                    transform_index: i,
-                    // Default false here; the buffer-recompute derivation
-                    // walks the DAG after lowering and overwrites the
-                    // flag on the resulting IndexSpec when a relaxed-CK
-                    // upstream aggregate's dropped CK fields overlap
-                    // this window's partition_by.
-                    requires_buffer_recompute: false,
-                });
             }
         }
-        let indices = crate::plan::index::deduplicate_indices(raw_index_requests);
         // Build source DAG + output projections.
         let source_dag = crate::plan::execution::build_source_dag(
             &source_configs,
@@ -1604,8 +1571,11 @@ impl PipelineConfig {
 
         // Phase 1: insert one PlanNode per spanned-PipelineNode.
         // Transform + Aggregate variants draw their enrichment from
-        // the analyzer report / window configs / indices built above;
-        // other variants ignore the LoweringCtx fields.
+        // the analyzer report / window configs; other variants ignore
+        // the LoweringCtx fields. Window-bearing Transforms are
+        // emitted with `window_index = None`; a post-edge-wiring pass
+        // populates the deduplicated index list and backfills the
+        // field once the upstream `NodeIndex` is known.
         for spanned in &self.nodes {
             // Thread the real source line number off the saphyr
             // `Spanned<PipelineNode>::referenced` Location.
@@ -1624,7 +1594,6 @@ impl PipelineConfig {
             let lowering_ctx = LoweringCtx {
                 analysis: analysis_by_name.get(name.as_str()).copied(),
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
-                indices: &indices,
                 primary_source: primary_source.as_str(),
             };
             let plan_node =
@@ -1699,6 +1668,252 @@ impl PipelineConfig {
                         wire(&input_full_reference(&node_input.value), None);
                     }
                 }
+            }
+        }
+
+        // Build index requests with full graph context. A window-bearing
+        // transform's `IndexSpec.root` resolves to a real `NodeIndex`
+        // for the upstream operator (after walking past pass-through
+        // Sort/Route nodes), or to a declared source name for the
+        // degenerate source-rooted case. Source-rooted is only
+        // selected when the immediate predecessor is a `PlanNode::Source`
+        // AND the user did not request a different source via
+        // `wc.source: <other>`; the cross-source `wc.source` form
+        // continues to lower to `PlanIndexRoot::Source(<name>)`.
+        let mut raw_index_requests: Vec<crate::plan::index::RawIndexRequest> = Vec::new();
+        let primary_source_str = primary_source.as_str();
+        for (i, wc_opt) in window_configs.iter().enumerate() {
+            let Some(wc) = wc_opt else { continue };
+            let transform_name = entries[i].name.as_str();
+            let Some(&transform_idx) = name_to_idx.get(transform_name) else {
+                // Lowering produced no node for this transform (e.g. a
+                // typecheck failure already surfaced its diagnostic);
+                // skip — the missing-program diagnostic has already fired.
+                continue;
+            };
+
+            let mut arena_fields: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for gb in &wc.group_by {
+                arena_fields.insert(gb.clone());
+            }
+            for sf in &wc.sort_by {
+                arena_fields.insert(sf.field.clone());
+            }
+            for f in &report.transforms[i].accessed_fields {
+                arena_fields.insert(f.clone());
+            }
+            // Sort arena_fields for deterministic order — the source
+            // collection is a HashSet whose iteration order randomizes
+            // run-to-run, which leaks into `--explain` output and into
+            // any snapshot test that captures the explain block.
+            let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
+            arena_fields_vec.sort();
+
+            // Cross-source `wc.source: <other>` always roots at that
+            // declared source. `wc.source: None` (or matching the
+            // primary) defers to predecessor inspection: if the
+            // immediate non-pass-through ancestor is a `PlanNode::Source`,
+            // it is source-rooted; otherwise it is node-rooted on the
+            // ancestor.
+            let cross_source = wc
+                .source
+                .as_ref()
+                .filter(|s| s.as_str() != primary_source_str)
+                .cloned();
+
+            let root = if let Some(other) = cross_source {
+                crate::plan::index::PlanIndexRoot::Source(other)
+            } else {
+                let pred_idx = match graph
+                    .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
+                    .next()
+                {
+                    Some(p) => p,
+                    None => {
+                        diags.push(Diagnostic::error(
+                            "E003",
+                            format!(
+                                "windowed transform '{}' has no upstream input; \
+                                 local_window requires a predecessor in the DAG",
+                                transform_name
+                            ),
+                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                        ));
+                        return Err(diags);
+                    }
+                };
+                let rooted_idx =
+                    crate::plan::execution::first_non_passthrough_ancestor(&graph, pred_idx);
+                match &graph[rooted_idx] {
+                    crate::plan::execution::PlanNode::Merge { .. } => {
+                        diags.push(Diagnostic::error(
+                            "E150d",
+                            format!(
+                                "windowed transform '{}' is rooted at a Merge node; \
+                                 Merge concatenates streams without a single producer \
+                                 identity, so a window cannot anchor to it",
+                                transform_name
+                            ),
+                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                        ));
+                        return Err(diags);
+                    }
+                    crate::plan::execution::PlanNode::Source { name, .. } => {
+                        // Source-rooted: `wc.source` is `None` (or matches
+                        // the primary) and the immediate non-pass-through
+                        // ancestor is a `Source`. The arena builds at
+                        // Phase-0 from that source's stream — source-rooted
+                        // lookups go through the source name in
+                        // `pipeline/ingestion.rs`.
+                        crate::plan::index::PlanIndexRoot::Source(name.clone())
+                    }
+                    other => {
+                        let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                            diags.push(Diagnostic::error(
+                                "E003",
+                                format!(
+                                    "windowed transform '{}' rooted at upstream node \
+                                     '{}' which has no output schema",
+                                    transform_name,
+                                    other.name()
+                                ),
+                                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                            ));
+                            return Err(diags);
+                        };
+                        // E150b — every arena field must be present in
+                        // the upstream's output schema (group_by,
+                        // sort_by, and any field the window builtins
+                        // accessed). Schema membership is checked by
+                        // name only at this stage.
+                        for f in &arena_fields_vec {
+                            if !anchor_schema.contains(f.as_str()) {
+                                diags.push(Diagnostic::error(
+                                    "E150b",
+                                    format!(
+                                        "windowed transform '{}' references field '{}' \
+                                         that the upstream operator '{}' does not emit; \
+                                         a node-rooted window can only see columns \
+                                         produced by its rooted operator",
+                                        transform_name,
+                                        f,
+                                        other.name()
+                                    ),
+                                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                                ));
+                                return Err(diags);
+                            }
+                        }
+                        crate::plan::index::PlanIndexRoot::Node {
+                            upstream: rooted_idx,
+                            anchor_schema,
+                        }
+                    }
+                }
+            };
+
+            let already_sorted = match &root {
+                crate::plan::index::PlanIndexRoot::Source(name) => {
+                    crate::plan::execution::check_already_sorted(&source_configs, name, &wc.sort_by)
+                }
+                // Node-rooted / parent-node-rooted arenas have no
+                // declared source ordering — partitions are sorted
+                // post-build at the upstream-arm exit. Treat as
+                // unsorted; the executor's per-partition `sort_partition`
+                // call normalizes the slice before window evaluation.
+                crate::plan::index::PlanIndexRoot::Node { .. }
+                | crate::plan::index::PlanIndexRoot::ParentNode { .. } => false,
+            };
+
+            raw_index_requests.push(crate::plan::index::RawIndexRequest {
+                root,
+                group_by: wc.group_by.clone(),
+                sort_by: wc.sort_by.clone(),
+                arena_fields: arena_fields_vec,
+                already_sorted,
+                transform_index: i,
+                // Default false here; the buffer-recompute derivation
+                // walks the DAG after lowering and overwrites the
+                // flag on the resulting IndexSpec when a relaxed-CK
+                // upstream aggregate's dropped CK fields overlap
+                // this window's partition_by.
+                requires_buffer_recompute: false,
+            });
+        }
+        let indices = crate::plan::index::deduplicate_indices(raw_index_requests);
+
+        // Backfill `window_index` and `partition_lookup` on each
+        // window-bearing Transform node now that `indices` exists. The
+        // initial lowering pass deferred these because `PlanIndexRoot`
+        // for node-rooted windows requires the post-graph NodeIndex.
+        for (i, wc_opt) in window_configs.iter().enumerate() {
+            let Some(wc) = wc_opt else { continue };
+            let transform_name = entries[i].name.as_str();
+            let Some(&transform_idx) = name_to_idx.get(transform_name) else {
+                continue;
+            };
+            // Recompute the same root used above. The duplicated walk is
+            // intentional — sharing a side table would couple the
+            // diagnostic-emitting and update passes via a structure
+            // that adds no clarity over re-walking a small graph.
+            let cross_source = wc
+                .source
+                .as_ref()
+                .filter(|s| s.as_str() != primary_source_str)
+                .cloned();
+            let root = if let Some(other) = cross_source {
+                crate::plan::index::PlanIndexRoot::Source(other)
+            } else {
+                let pred_idx = match graph
+                    .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
+                    .next()
+                {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let rooted_idx =
+                    crate::plan::execution::first_non_passthrough_ancestor(&graph, pred_idx);
+                match &graph[rooted_idx] {
+                    crate::plan::execution::PlanNode::Source { name, .. } => {
+                        crate::plan::index::PlanIndexRoot::Source(name.clone())
+                    }
+                    other => {
+                        let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                            continue;
+                        };
+                        crate::plan::index::PlanIndexRoot::Node {
+                            upstream: rooted_idx,
+                            anchor_schema,
+                        }
+                    }
+                }
+            };
+            let new_window_index =
+                crate::plan::index::find_index_for(&indices, &root, &wc.group_by, &wc.sort_by);
+            if let crate::plan::execution::PlanNode::Transform {
+                window_index,
+                partition_lookup,
+                ..
+            } = &mut graph[transform_idx]
+            {
+                *window_index = new_window_index;
+                // `partition_lookup` mirrors the cross-source vs
+                // same-source distinction. Re-derive from `wc.source`
+                // and `primary_source`, matching the lowering arm in
+                // `lower_node_to_plan_node`.
+                use crate::plan::execution::PartitionLookupKind;
+                let source = wc
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| primary_source_str.to_string());
+                *partition_lookup = if source == primary_source_str && wc.on.is_none() {
+                    Some(PartitionLookupKind::SameSource)
+                } else {
+                    Some(PartitionLookupKind::CrossSource {
+                        on_expr: wc.on.clone(),
+                    })
+                };
             }
         }
 
@@ -2252,18 +2467,22 @@ fn resolve_all_input_references(
 /// variants that need derived fields (Transform, Aggregate).
 ///
 /// Top-level callers in `compile_with_diagnostics` populate every field
-/// from the already-computed analyzer report / window configs / index
-/// specs; body-node callers in `bind_composition` use
+/// from the already-computed analyzer report / window configs;
+/// body-node callers in `bind_composition` use
 /// [`LoweringCtx::default`] (all fields `None`/empty), which falls back
 /// to minimal placeholder lowering suitable for Kiln drill-in
 /// inspection. Body nodes are not executed directly — the top-level
 /// DAG produced by `compile_with_diagnostics` is the single source of
 /// truth for runtime planning.
+///
+/// `window_index` on Transform nodes is intentionally NOT derived here —
+/// it requires the post-graph upstream `NodeIndex` for node-rooted
+/// windows. The Stage-5 lowering pass mutates the field in place
+/// after edges are wired and indices are deduplicated.
 #[derive(Default)]
 pub(crate) struct LoweringCtx<'a> {
     pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
     pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
-    pub indices: &'a [crate::plan::index::IndexSpec],
     pub primary_source: &'a str,
 }
 
@@ -2291,7 +2510,6 @@ pub(crate) fn lower_node_to_plan_node(
         PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
         extract_write_set,
     };
-    use crate::plan::index::find_index_for;
     use clinker_record::{FieldMetadata, SchemaBuilder};
     use std::sync::Arc;
 
@@ -2374,13 +2592,18 @@ pub(crate) fn lower_node_to_plan_node(
                     } else {
                         NodeExecutionReqs::Streaming
                     };
-                    let wi = ctx.window_config.and_then(|wc| {
-                        let source = wc
-                            .source
-                            .clone()
-                            .unwrap_or_else(|| ctx.primary_source.to_string());
-                        find_index_for(ctx.indices, &source, &wc.group_by, &wc.sort_by)
-                    });
+                    // `window_index` is computed after the graph topology
+                    // is known — `PlanIndexRoot::Node` for post-aggregate
+                    // / post-combine windows requires the upstream
+                    // operator's `NodeIndex`, which only exists once the
+                    // graph is built. The Stage-5 lowering pass in
+                    // `compile_with_diagnostics` mutates this field in
+                    // place after edges are wired and indices are
+                    // deduplicated. Lowering callers from
+                    // `bind_composition` always pass `LoweringCtx::default()`
+                    // (so `ctx.window_config` is `None`); body-internal
+                    // windows are not yet rooted through this path.
+                    let wi = None;
                     let pl = ctx.window_config.map(|wc| {
                         let source = wc
                             .source

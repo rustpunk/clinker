@@ -1036,7 +1036,7 @@ impl ExecutionPlanDag {
 
         for (i, spec) in self.indices_to_build.iter().enumerate() {
             out.push_str(&format!("Index [{}]:\n", i));
-            out.push_str(&format!("  Source: {}\n", spec.source));
+            out.push_str(&format!("  Root: {}\n", format_index_root(&spec.root)));
             out.push_str(&format!("  Group by: {:?}\n", spec.group_by));
             out.push_str(&format!(
                 "  Sort by: {:?}\n",
@@ -1283,8 +1283,9 @@ impl ExecutionPlanDag {
             // snapshot diff target.
             let row_field_count = spec.arena_fields.len();
             out.push_str(&format!(
-                "Window index [{i}] (source '{}', partition_by {:?}):\n",
-                spec.source, spec.group_by,
+                "Window index [{i}] (root {}, partition_by {:?}):\n",
+                format_index_root(&spec.root),
+                spec.group_by,
             ));
             out.push_str(&format!(
                 "  retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~{row_field_count}× sizeof(Value).\n",
@@ -1837,6 +1838,21 @@ impl ExecutionPlanDag {
                 &|_, (_, node)| { format!(r#"label="{}""#, dot_escape(&node.display_name())) },
             )
         )
+    }
+}
+
+/// Render a [`PlanIndexRoot`] for `--explain` output. Source-rooted
+/// indices show as `source(<name>)`, node-rooted as `node(<idx>)`,
+/// parent-node-rooted as `parent_node(<idx>)`.
+fn format_index_root(root: &crate::plan::index::PlanIndexRoot) -> String {
+    match root {
+        crate::plan::index::PlanIndexRoot::Source(name) => format!("source({name})"),
+        crate::plan::index::PlanIndexRoot::Node { upstream, .. } => {
+            format!("node({})", upstream.index())
+        }
+        crate::plan::index::PlanIndexRoot::ParentNode { upstream, .. } => {
+            format!("parent_node({})", upstream.index())
+        }
     }
 }
 
@@ -2481,6 +2497,49 @@ pub(crate) fn build_source_dag(
     }
 
     Ok(tiers)
+}
+
+/// Walk one incoming edge per step from `start` past pass-through nodes
+/// ([`PlanNode::Sort`], [`PlanNode::Route`]) and return the first ancestor
+/// that actually changes the row stream's schema or row count.
+///
+/// Sort and Route are pass-through with respect to a windowed Transform's
+/// rooting decision: a Sort merely reorders, a Route merely partitions a
+/// shared row stream. The window's arena+index pair must root at whatever
+/// upstream operator is actually producing the rows the window will see —
+/// the Sort/Route is just an in-flight transform of those same rows.
+///
+/// Returns `start` itself if `start` has zero incoming edges (a Source
+/// with no upstream, or a disconnected node). Returns the first
+/// non-pass-through ancestor otherwise. If the walk encounters a
+/// pass-through with multiple incoming edges (in-pipeline branching),
+/// returns that pass-through node — the caller must treat that as a
+/// rooting boundary because the row stream loses single-producer
+/// identity past that point.
+pub fn first_non_passthrough_ancestor(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> NodeIndex {
+    let mut current = start;
+    loop {
+        let is_passthrough = matches!(
+            graph[current],
+            PlanNode::Sort { .. } | PlanNode::Route { .. }
+        );
+        if !is_passthrough {
+            return current;
+        }
+        let mut incoming = graph.neighbors_directed(current, petgraph::Direction::Incoming);
+        let Some(parent) = incoming.next() else {
+            return current;
+        };
+        if incoming.next().is_some() {
+            // Multiple incoming edges into a pass-through — rooting
+            // boundary. The window must root here, not past it.
+            return current;
+        }
+        current = parent;
+    }
 }
 
 /// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes

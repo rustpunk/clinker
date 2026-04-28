@@ -4,10 +4,113 @@
 //! `AnalysisReport` field sets, deduplicates into `Vec<IndexSpec>`.
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
+use clinker_record::Schema;
+use petgraph::graph::NodeIndex;
 use serde::Deserialize;
 
 use crate::config::SortField;
+
+/// Where a window's secondary index is rooted in the execution plan.
+///
+/// A windowed transform's arena+index pair is materialized from the rows
+/// of some upstream operator. Today's source-rooted geometry is one
+/// degenerate case; post-aggregate / post-combine / post-transform
+/// windows are rooted at the upstream operator's emit buffer instead.
+///
+/// The `Arc<Schema>` carried by the `Node` and `ParentNode` variants is
+/// the upstream operator's `output_schema` at lowering time. It is
+/// **not** part of equality / hashing — only `upstream: NodeIndex` is.
+/// Two `IndexSpec`s with the same `upstream` always carry the same
+/// `Arc<Schema>` instance from that upstream node, so dedup keyed on
+/// `upstream` alone is correct.
+pub enum PlanIndexRoot {
+    /// Source-rooted: arena built from the named source's record stream
+    /// at Phase-0 setup.
+    Source(String),
+    /// Node-rooted in the current DAG: arena built at the upstream
+    /// operator's dispatch-arm exit from `node_buffers[upstream]`.
+    Node {
+        upstream: NodeIndex,
+        anchor_schema: Arc<Schema>,
+    },
+    /// Body-rooted at a parent-DAG node: a composition body's window
+    /// references rows produced by the body's `input:` port, which in
+    /// turn resolves to a parent-DAG operator. Lookup walks the body's
+    /// runtime overlay first, then falls back to the parent's runtime.
+    ParentNode {
+        upstream: NodeIndex,
+        anchor_schema: Arc<Schema>,
+    },
+}
+
+impl Clone for PlanIndexRoot {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Source(s) => Self::Source(s.clone()),
+            Self::Node {
+                upstream,
+                anchor_schema,
+            } => Self::Node {
+                upstream: *upstream,
+                anchor_schema: Arc::clone(anchor_schema),
+            },
+            Self::ParentNode {
+                upstream,
+                anchor_schema,
+            } => Self::ParentNode {
+                upstream: *upstream,
+                anchor_schema: Arc::clone(anchor_schema),
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for PlanIndexRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source(name) => f.debug_tuple("Source").field(name).finish(),
+            Self::Node { upstream, .. } => f
+                .debug_struct("Node")
+                .field("upstream", upstream)
+                .finish_non_exhaustive(),
+            Self::ParentNode { upstream, .. } => f
+                .debug_struct("ParentNode")
+                .field("upstream", upstream)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl PartialEq for PlanIndexRoot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Source(a), Self::Source(b)) => a == b,
+            (Self::Node { upstream: a, .. }, Self::Node { upstream: b, .. }) => a == b,
+            (Self::ParentNode { upstream: a, .. }, Self::ParentNode { upstream: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PlanIndexRoot {}
+
+impl Hash for PlanIndexRoot {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Discriminant + payload: Source by string, Node/ParentNode by
+        // upstream NodeIndex. The Arc<Schema> is a side-channel — every
+        // IndexSpec sharing an `upstream` carries the same Arc instance
+        // (it's the upstream operator's output_schema), so excluding it
+        // from the hash key keeps dedup correct.
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Source(name) => name.hash(state),
+            Self::Node { upstream, .. } | Self::ParentNode { upstream, .. } => upstream.hash(state),
+        }
+    }
+}
 
 /// Typed representation of the `analytic_window` YAML block on a transform.
 #[derive(Debug, Clone, Deserialize)]
@@ -58,8 +161,8 @@ pub(crate) fn parse_analytic_window_value(
 /// Specification for one secondary index to build during Phase 1.
 #[derive(Debug, Clone)]
 pub struct IndexSpec {
-    /// Source input name this index is built from.
-    pub source: String,
+    /// Where the arena+index for this window is rooted. See [`PlanIndexRoot`].
+    pub root: PlanIndexRoot,
     /// Fields to group partition keys by.
     pub group_by: Vec<String>,
     /// Fields to sort within each partition.
@@ -77,14 +180,14 @@ pub struct IndexSpec {
     pub requires_buffer_recompute: bool,
 }
 
-/// Deduplicate index specs: two transforms with the same (source, group_by, sort_by)
+/// Deduplicate index specs: two transforms with the same (root, group_by, sort_by)
 /// share one IndexSpec. Arena fields are unioned.
 pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
     let mut deduped: Vec<IndexSpec> = Vec::new();
 
     for req in raw_specs {
         let existing = deduped.iter_mut().find(|spec| {
-            spec.source == req.source
+            spec.root == req.root
                 && spec.group_by == req.group_by
                 && sort_fields_equal(&spec.sort_by, &req.sort_by)
         });
@@ -107,7 +210,7 @@ pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
             }
             None => {
                 deduped.push(IndexSpec {
-                    source: req.source,
+                    root: req.root,
                     group_by: req.group_by,
                     sort_by: req.sort_by,
                     arena_fields: req.arena_fields,
@@ -124,7 +227,7 @@ pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
 /// Raw index request before deduplication. One per (transform, local_window) pair.
 #[derive(Debug, Clone)]
 pub struct RawIndexRequest {
-    pub source: String,
+    pub root: PlanIndexRoot,
     pub group_by: Vec<String>,
     pub sort_by: Vec<SortField>,
     pub arena_fields: Vec<String>,
@@ -137,11 +240,15 @@ pub struct RawIndexRequest {
     pub requires_buffer_recompute: bool,
 }
 
-/// Collect the union of arena_fields across all IndexSpecs for a given source.
-pub fn collect_arena_fields(indices: &[IndexSpec], source: &str) -> Vec<String> {
+/// Collect the union of arena_fields across all IndexSpecs rooted at a
+/// given source. Used by source-arena materialization paths
+/// (`pipeline/ingestion.rs`, `executor/mod.rs`'s Phase-0 build).
+pub fn collect_arena_fields_for_source(indices: &[IndexSpec], source: &str) -> Vec<String> {
     let mut fields = HashSet::new();
     for spec in indices {
-        if spec.source == source {
+        if let PlanIndexRoot::Source(name) = &spec.root
+            && name == source
+        {
             for f in &spec.arena_fields {
                 fields.insert(f.clone());
             }
@@ -152,15 +259,37 @@ pub fn collect_arena_fields(indices: &[IndexSpec], source: &str) -> Vec<String> 
     result
 }
 
-/// Find the index in `indices` that matches the given (source, group_by, sort_by).
+/// Collect the union of arena_fields across all IndexSpecs rooted at a
+/// given upstream node. Used by node-rooted arena materialization at
+/// the upstream operator's dispatch-arm exit.
+pub fn collect_arena_fields_for_node(indices: &[IndexSpec], upstream: NodeIndex) -> Vec<String> {
+    let mut fields = HashSet::new();
+    for spec in indices {
+        let matches = match &spec.root {
+            PlanIndexRoot::Node { upstream: u, .. } => *u == upstream,
+            PlanIndexRoot::ParentNode { upstream: u, .. } => *u == upstream,
+            PlanIndexRoot::Source(_) => false,
+        };
+        if matches {
+            for f in &spec.arena_fields {
+                fields.insert(f.clone());
+            }
+        }
+    }
+    let mut result: Vec<String> = fields.into_iter().collect();
+    result.sort();
+    result
+}
+
+/// Find the index in `indices` that matches the given (root, group_by, sort_by).
 pub fn find_index_for(
     indices: &[IndexSpec],
-    source: &str,
+    root: &PlanIndexRoot,
     group_by: &[String],
     sort_by: &[SortField],
 ) -> Option<usize> {
     indices.iter().position(|spec| {
-        spec.source == source
+        &spec.root == root
             && spec.group_by == *group_by
             && sort_fields_equal(&spec.sort_by, sort_by)
     })
