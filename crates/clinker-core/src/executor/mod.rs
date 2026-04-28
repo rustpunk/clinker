@@ -2440,4 +2440,5 @@ mod tests {
     mod post_combine_array_field;
     mod post_combine_synthetic_ck;
     mod post_combine_window_strategies;
+    mod window_recompute_correctness;
 }
