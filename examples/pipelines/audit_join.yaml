@@ -1,0 +1,80 @@
+pipeline:
+  name: audit_join
+
+# Pipeline-level correlation key. Both Sources observe `order_id` as
+# a frozen-identity column shadow-stamped at ingest as `$ck.order_id`.
+# Downstream Output rejection fans out across the whole correlation
+# group; Phase 5's `propagate_ck` field selects which inputs'
+# correlation columns flow onto the joined output rows so
+# collateral-DLQ traversal can route through every source that
+# contributed to the joined row.
+error_handling:
+  strategy: continue
+  correlation_key: order_id
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/audit_orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: float }
+        - { name: status, type: string }
+
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: ./data/audit_events.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: event_id, type: string }
+        - { name: actor, type: string }
+        - { name: event_type, type: string }
+
+  - type: combine
+    name: enriched
+    description: |
+      Join orders with their audit events. `propagate_ck: all` widens
+      the output schema with every input's `$ck.<field>` columns; under
+      a single-key correlation that's just `$ck.order_id` (driver wins
+      over the build's same-named column). With multi-key correlation
+      (e.g., add event_id to error_handling.correlation_key) both
+      `$ck.order_id` and `$ck.event_id` would land.
+    input:
+      orders: orders
+      events: events
+    config:
+      where: "orders.order_id == events.order_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit customer_id = orders.customer_id
+        emit amount = orders.amount
+        emit status = orders.status
+        emit event_id = events.event_id
+        emit actor = events.actor
+        emit event_type = events.event_type
+      propagate_ck: all
+
+  - type: output
+    name: report
+    input: enriched
+    config:
+      name: report
+      type: csv
+      path: ./output/audit_report.csv
+      # Engine-stamped `$ck.<field>` columns are stripped from the
+      # default writer output. Opt in here so the audit trail keeps
+      # the correlation snapshot alongside the user-declared columns.
+      include_correlation_keys: true

@@ -52,6 +52,7 @@ nodes:
         emit amount = orders.amount
         emit min_order = products.min_order
         emit max_order = products.max_order
+      propagate_ck: driver
   - type: output
     name: qualified_out
     input: qualified

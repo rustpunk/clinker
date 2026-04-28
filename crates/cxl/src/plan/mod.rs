@@ -25,7 +25,7 @@
 //!   `clinker-record`. Keeping `Expr` serde-free matches DataFusion's
 //!   architectural decision (see apache/arrow-datafusion#1832).
 
-use clinker_record::accumulator::AggregateType;
+use clinker_record::accumulator::{AccumulatorEnum, AggregateType, Reversibility};
 
 use crate::ast::Expr;
 
@@ -96,4 +96,58 @@ pub struct CompiledAggregate {
     pub pre_agg_filter: Option<Expr>,
     /// One per `Statement::Emit` in the CXL (post-extraction residuals).
     pub emits: Vec<CompiledEmit>,
+    /// Whether the runtime aggregator must record per-input-row lineage
+    /// `(input_row_id → group_index)` so a downstream rollback step can
+    /// retract individual contributions without rerunning the whole
+    /// stream. Derived from whether the aggregate's `group_by` omits
+    /// any correlation-key field plus the reversibility of every
+    /// binding's accumulator — any `BufferRequired` binding
+    /// short-circuits this back to `false` because that path will
+    /// replay surviving rows from a separate per-group buffer instead
+    /// of running the lineage-driven retract. Strict aggregates
+    /// (`group_by ⊇ correlation_key`, or no correlation key) always set
+    /// this `false`.
+    pub requires_lineage: bool,
+    /// Whether the runtime aggregator must hold raw per-row contributions
+    /// instead of folded accumulator state. Derived from whether the
+    /// aggregate's `group_by` omits any correlation-key field plus the
+    /// reversibility of every binding's accumulator — exactly the
+    /// complement of the lineage gate: at least one `BufferRequired`
+    /// binding (`Min`, `Max`, `Avg`, `WeightedAvg`) flips this on so the
+    /// rollback step can recompute affected groups from
+    /// `contributions − retracted_rows` rather than rely on an O(1)
+    /// inverse op the accumulator does not admit. Strict aggregates
+    /// (`group_by ⊇ correlation_key`, or no correlation key) always set
+    /// this `false`.
+    pub requires_buffer_mode: bool,
+}
+
+impl CompiledAggregate {
+    /// Derive both retraction-strategy flags from whether this aggregate
+    /// is in retraction mode.
+    ///
+    /// `is_relaxed` is the planner's content-derived classification:
+    /// `true` when `group_by` omits any pipeline correlation-key field,
+    /// `false` for strict-collateral aggregates (and pipelines without a
+    /// correlation key at all).
+    ///
+    /// Under retraction mode, `requires_lineage` and `requires_buffer_mode`
+    /// are exact complements: every binding being `Reversible` selects
+    /// lineage, any `BufferRequired` binding selects buffer-mode. Strict
+    /// aggregates short-circuit both to `false` so they pay zero
+    /// retraction overhead. Setting them in one call keeps the dispatch
+    /// invariant — exactly one of the two flags is `true` under
+    /// retraction — visible at every call site.
+    pub fn set_retraction_flags(&mut self, is_relaxed: bool) {
+        if !is_relaxed {
+            self.requires_lineage = false;
+            self.requires_buffer_mode = false;
+            return;
+        }
+        let any_buffer_required = self.bindings.iter().any(|b| {
+            AccumulatorEnum::for_type(&b.acc_type).reversibility() == Reversibility::BufferRequired
+        });
+        self.requires_lineage = !any_buffer_required;
+        self.requires_buffer_mode = any_buffer_required;
+    }
 }

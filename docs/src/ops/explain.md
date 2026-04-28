@@ -97,3 +97,34 @@ Explain runs instantly because it only parses the YAML and builds the plan -- no
 clinker run pipeline.yaml --explain       # inspect plan
 clinker run pipeline.yaml --dry-run       # validate config
 ```
+
+## Retraction section
+
+Pipelines whose at least one Aggregate has a `group_by` that omits a correlation-key field get a `=== Retraction ===` block in the text output. The engine selects the retraction-mode path automatically based on `group_by` content; the block is silent on every other pipeline, so strict-correlation and non-correlated `--explain` output stays identical to today's text.
+
+The block opens with a one-line summary -- `retraction enabled — N relaxed aggregates, M buffer-mode windows, fanout policy: <policy>.` -- followed by one block per retraction-mode Aggregate and one per buffer-mode window index.
+
+Per retraction-mode Aggregate the block reports:
+
+- the resolved accumulator path (`Reversible` or `BufferRequired`),
+- the per-row lineage memory cost (`~8 bytes/row` for Reversible, `n/a` for BufferRequired which holds raw contributions instead),
+- the worst-case degrade fallback when retraction's preconditions break at runtime.
+
+Per buffer-mode window index the block reports:
+
+- the source name and `partition_by` fields,
+- the per-row buffer cost in `Value` slots over the index's arena fields,
+- the worst-case partition memory ceiling under degrade.
+
+Group cardinality is honestly surfaced as "unknown at plan time" -- the planner has no group-cardinality side-table to consult before the run. Use the [operator-by-operator retraction cost reference](../pipeline/correlation-keys.md#operator-by-operator-retraction-cost-reference) and the per-row figures the explain block prints for capacity planning, then confirm the live shape via `clinker metrics collect` after the first production run.
+
+## Looking up diagnostic codes
+
+`clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:
+
+```bash
+clinker explain --code E15W   # non-deterministic CXL builtin downstream of a retraction-mode aggregate
+clinker explain --code E15Y   # retraction-mode aggregate incompatible with strategy: streaming
+```
+
+The full set of codes is enumerated in the error returned when an unknown code is passed.

@@ -31,6 +31,7 @@ nodes:
     config:
       where: "orders.product_id == products.product_id"
       cxl: ""
+      propagate_ck: driver
   - type: output
     name: bad_out
     input: bad

@@ -90,6 +90,19 @@ If your source declares a `sort_order:` that covers the group-by fields, the opt
 
 Hash aggregation works on unsorted input and is the safe default. It uses more memory but handles any data ordering. Memory-aware disk spill kicks in when RSS approaches the pipeline's `memory_limit`.
 
+## Correlation-key interaction
+
+In a pipeline with `error_handling.correlation_key`, the engine inspects each aggregate's `group_by` against the correlation key:
+
+- `group_by ⊇ correlation_key.fields()` — strict-collateral path. The aggregate emits one row per group, the row inherits the correlation identity of its inputs, and a DLQ trigger anywhere in the group rolls back the whole group including the aggregate output. Zero retraction overhead.
+- `group_by` omits any correlation-key field — retraction protocol path. A single correlation group may span multiple aggregate groups; correlation-key fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output. The engine retracts only the failing records and refinalizes affected groups.
+
+Authors do not configure this — the engine selects the path automatically based on `group_by` content. A retraction-mode aggregate is incompatible with `strategy: streaming` (rejected with `E15Y`, because streaming aggregates emit at group-boundary close before the terminal correlation commit and that defeats the rollback window). Non-deterministic CXL builtins (e.g. `now`) downstream of a retraction-mode aggregate are rejected with `E15W`. See [Correlation Keys](correlation-keys.md#aggregate-interaction) for the full lattice rules.
+
+The retraction-mode aggregate's output schema is `[group_by_columns] ++ [emitted_binding_columns]` — it does not carry the `$ck.<field>` shadow columns of contributing source records. This means a failure downstream of a retraction-mode aggregate (a post-aggregate Transform that rejects a row, or an Output writer that fails) cannot fan out to upstream source-record peers via the correlation lattice. Pipelines that need fine-grained retraction for downstream-of-aggregate failures should keep `group_by ⊇ correlation_key` so that every aggregate output row inherits an unambiguous correlation identity. See [Correlation Keys → Where retraction triggers are sourced](correlation-keys.md#where-retraction-triggers-are-sourced).
+
+The retraction protocol carries a per-aggregate cost — Reversible accumulators use a per-row lineage map, BufferRequired accumulators hold raw contributions until commit. The [operator-by-operator retraction cost reference](correlation-keys.md#operator-by-operator-retraction-cost-reference) has the per-operator breakdown; `clinker run --explain` reports the live per-aggregate detail.
+
 ## Complete example
 
 ```yaml

@@ -135,6 +135,43 @@ impl SumState {
     }
 }
 
+/// Subtract one previously-added value from a `SumState`.
+///
+/// Symmetric inverse of `SumState::add`: integer path subtracts from the
+/// i128 accumulator; float path runs Kahan compensated subtraction (negate
+/// the value, feed through `kahan_add` so the residual updates the same
+/// way an add would). `has_value` is left at `true` once set — the empty-
+/// group sentinel for retraction is "every row retracted" which the caller
+/// detects via the surrounding `retract_row` count, not by clearing the
+/// flag; finalize on a fully-retracted Sum returns `Integer(0)` /
+/// `Float(0.0)`, byte-identical to a feed-from-scratch on the surviving
+/// (empty) row set after the per-group state was built.
+fn sum_state_sub(s: &mut SumState, value: &Value) {
+    match value {
+        Value::Null => {}
+        Value::Integer(n) => {
+            s.int_sum -= *n as i128;
+            if !s.is_integer {
+                s.kahan_add(-(*n as f64));
+            }
+        }
+        Value::Float(f) => {
+            if s.is_integer {
+                // First sub on a still-integer state with a float value
+                // promotes the same way `add` does — seed the Kahan path
+                // from the running int sum so the subtraction's drift is
+                // bounded by what an equivalent add-then-add(-x) would
+                // produce.
+                s.is_integer = false;
+                s.float_sum = s.int_sum as f64;
+                s.compensation = 0.0;
+            }
+            s.kahan_add(-(*f));
+        }
+        _ => {}
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 /// Count accumulator state. Two modes: count-all (includes NULLs) vs
@@ -174,6 +211,19 @@ impl CountState {
 
     fn finalize(&self) -> Value {
         Value::Integer(self.count as i64)
+    }
+}
+
+/// Decrement a `CountState` by one observation.
+///
+/// `count_all` mode mirrors SQL `COUNT(*)` and decrements unconditionally;
+/// `count_field` mode skips nulls so a retracted null contributes nothing
+/// (symmetric with `add`). Saturates at zero — over-retraction is a
+/// programmer bug but does not panic; finalize returns `Integer(0)` on an
+/// empty group.
+fn count_state_sub(s: &mut CountState, value: &Value) {
+    if s.count_all || !value.is_null() {
+        s.count = s.count.saturating_sub(1);
     }
 }
 
@@ -341,6 +391,25 @@ impl CollectState {
     }
 }
 
+/// Remove the first occurrence of `value` from a `CollectState`'s array.
+///
+/// Returns the negative heap delta (one `Value` slot plus the removed
+/// value's own heap footprint, symmetric with `CollectState::add`).
+/// "First occurrence" rather than "every occurrence" preserves multiset
+/// semantics: feed `[a, a, b]` then retract `a` produces `[a, b]`,
+/// byte-identical to feed-from-scratch of `[a, b]`. Missing values are
+/// no-ops returning zero — over-retraction is a programmer bug surfaced
+/// by mismatched per-group `input_rows` lineage rather than a panic here.
+fn collect_state_sub(s: &mut CollectState, value: &Value) -> isize {
+    if let Some(idx) = s.values.iter().position(|v| values_equal(v, value)) {
+        let removed = s.values.remove(idx);
+        let delta = std::mem::size_of::<Value>() + removed.heap_size();
+        -(delta as isize)
+    } else {
+        0
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 /// Weighted average state. Two-argument: value + weight. i128 weighted sum
@@ -478,35 +547,158 @@ impl WeightedAvgState {
 // AccumulatorEnum
 // ============================================================================
 
-/// Enum-dispatched accumulator with 7 built-in variants.
+/// SQL `ANY_VALUE` / `arbitrary()` accumulator state.
 ///
-/// SQL `ANY_VALUE` / `arbitrary()` accumulator: first-wins semantics.
+/// Two parallel pieces of state:
 ///
-/// Used as the explicit escape hatch for metadata propagation when the user
-/// knows the value is constant within a group and wants to skip the
-/// `MetadataCommonTracker` conflict-detection overhead (D11 revised).
-/// Merge is first-wins stable: if `self.value` is already `Some`, it is
-/// preserved; otherwise `other.value` is taken.
+/// * `value` — the first non-null value observed. Locks at the first add and
+///   moves only when retraction empties its refcount entry; preserves the
+///   first-wins guarantee that drove this variant into the catalogue
+///   (explicit escape hatch for metadata propagation when the user knows
+///   the value is constant within a group and wants to skip the
+///   `MetadataCommonTracker` conflict-detection overhead).
+/// * `refcounts` — multiset cardinality stored as `(Value, count)` pairs.
+///   `Vec` rather than `HashMap`/`BTreeMap` because [`Value`] does not impl
+///   `Hash`/`Eq`/`Ord` (`Value::Float` carries `f64`, NaN-comparisons are
+///   undefined). Linear search is O(distinct values per group), which is
+///   O(1) for the canonical "constant within a group" case and bounded by
+///   group cardinality otherwise.
+///
+/// The refcount vec exists for retraction support: an `add` increments the
+/// observed value's count; a `sub` decrements it. When the locked `value`'s
+/// count drops to zero, finalize falls back to any other still-positive
+/// entry in iteration order. When every entry has been retracted, finalize
+/// returns `Null`. Strict (non-relaxed) aggregation paths never call `sub`,
+/// so the refcount stays a write-only scoreboard there.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AnyState {
+    /// First non-null value observed, locked once set. `None` until the
+    /// first non-null `add` and after every observation has been retracted
+    /// via `sub`.
     pub value: Option<Value>,
+    /// `(Value, count)` pairs keyed by observed value. `Vec` rather than
+    /// `HashMap` because `Value` is not `Hash`/`Eq`. An entry with count
+    /// zero is removed eagerly so `is_empty()` mirrors "no surviving
+    /// contributions". Empty by default to preserve the no-allocation
+    /// fast path on the strict aggregation path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refcounts: Vec<(Value, u32)>,
 }
 
 impl AnyState {
+    fn refcount_index(&self, value: &Value) -> Option<usize> {
+        self.refcounts
+            .iter()
+            .position(|(v, _)| values_equal(v, value))
+    }
+
     fn add(&mut self, value: &Value) {
-        if self.value.is_none() && !value.is_null() {
+        if value.is_null() {
+            return;
+        }
+        if self.value.is_none() {
             self.value = Some(value.clone());
+        }
+        match self.refcount_index(value) {
+            Some(i) => self.refcounts[i].1 += 1,
+            None => self.refcounts.push((value.clone(), 1)),
         }
     }
 
     fn merge(&mut self, other: &AnyState) {
+        // First-wins on the locked `value`.
         if self.value.is_none() {
             self.value.clone_from(&other.value);
+        }
+        for (k, v) in other.refcounts.iter() {
+            match self.refcount_index(k) {
+                Some(i) => self.refcounts[i].1 += *v,
+                None => self.refcounts.push((k.clone(), *v)),
+            }
         }
     }
 
     fn finalize(&self) -> Value {
-        self.value.clone().unwrap_or(Value::Null)
+        if self.refcounts.is_empty() {
+            return Value::Null;
+        }
+        // Prefer the locked `value` when its refcount entry is still alive.
+        if let Some(v) = &self.value
+            && self
+                .refcount_index(v)
+                .map(|i| self.refcounts[i].1 > 0)
+                .unwrap_or(false)
+        {
+            return v.clone();
+        }
+        // Otherwise return the first surviving entry in iteration order.
+        // Only reached when the originally locked value was retracted to
+        // zero, in which case the caller's add order continues to drive
+        // determinism (the vec is push-ordered).
+        self.refcounts
+            .iter()
+            .find(|(_, c)| *c > 0)
+            .map(|(k, _)| k.clone())
+            .unwrap_or(Value::Null)
+    }
+
+    /// Decrement the refcount of `value`; when it drops to zero the entry is
+    /// removed. Null values are ignored (mirrors `add`). When the vec empties,
+    /// the locked `value` is cleared so subsequent `add` calls re-lock to the
+    /// next observed value, restoring the "feed-from-scratch over surviving
+    /// rows" equivalence the retract path is built around.
+    fn sub(&mut self, value: &Value) {
+        if value.is_null() {
+            return;
+        }
+        if let Some(i) = self.refcount_index(value) {
+            if self.refcounts[i].1 > 1 {
+                self.refcounts[i].1 -= 1;
+            } else {
+                self.refcounts.swap_remove(i);
+            }
+        }
+        if self.refcounts.is_empty() {
+            self.value = None;
+        }
+    }
+
+    /// Reported heap footprint: per-entry (Value heap + tag bytes + u32) plus
+    /// vec capacity overhead.
+    fn heap_size(&self) -> usize {
+        let entry_overhead = std::mem::size_of::<(Value, u32)>();
+        let vec_overhead = self.refcounts.capacity() * entry_overhead;
+        let entry_heap: usize = self.refcounts.iter().map(|(k, _)| k.heap_size()).sum();
+        let value_heap = self.value.as_ref().map(Value::heap_size).unwrap_or(0);
+        vec_overhead + entry_heap + value_heap
+    }
+}
+
+/// Equality predicate for refcount lookup. `Value` does not derive `Eq`
+/// because `Value::Float` carries `f64` (NaN ≠ NaN). The retract path treats
+/// floats by bit pattern so `add(NaN); sub(NaN)` round-trips; downstream
+/// finalize then re-emits whichever surviving entry the locked `value`
+/// originally pointed at.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Null, Null) => true,
+        (Bool(x), Bool(y)) => x == y,
+        (Integer(x), Integer(y)) => x == y,
+        (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
+        (String(x), String(y)) => x == y,
+        (Date(x), Date(y)) => x == y,
+        (DateTime(x), DateTime(y)) => x == y,
+        (Array(x), Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Map(x), Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((kx, vx), (ky, vy))| kx == ky && values_equal(vx, vy))
+        }
+        _ => false,
     }
 }
 
@@ -523,6 +715,20 @@ pub enum AggregateType {
     Collect,
     WeightedAvg,
     Any,
+}
+
+/// Whether an accumulator can subtract a value to undo a prior contribution.
+///
+/// `Reversible` variants admit an `O(1)` retract step that walks back a
+/// single contribution and recovers a state byte-equivalent to never having
+/// observed it. `BufferRequired` variants must replay surviving inputs from
+/// scratch — either because the operation is positional (`Min`, `Max`) or
+/// because incremental retract under floating-point arithmetic accumulates
+/// drift that diverges from a re-fold (`Avg`, `WeightedAvg`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reversibility {
+    Reversible,
+    BufferRequired,
 }
 
 /// Per-group heap allocation cost: one `AccumulatorEnum` in the group's row.
@@ -596,12 +802,66 @@ impl AccumulatorEnum {
         }
     }
 
+    /// Whether this accumulator admits an O(1) retract step.
+    ///
+    /// `Sum`, `Count`, `Collect`, `Any` are reversible: an inverse operation
+    /// recovers a state equivalent to never having observed the retracted
+    /// value. `Min` and `Max` are positional and need the full surviving
+    /// multiset to recompute. `Avg` and `WeightedAvg` are mathematically
+    /// reversible but classified `BufferRequired` because incremental
+    /// retract on the Kahan-compensated f64 paths accumulates drift that
+    /// diverges from a re-fold over surviving rows; the buffered path
+    /// trades memory for byte-exact equivalence to a baseline rerun.
+    pub const fn reversibility(&self) -> Reversibility {
+        match self {
+            Self::Sum(_) | Self::Count(_) | Self::Collect(_) | Self::Any(_) => {
+                Reversibility::Reversible
+            }
+            Self::Min(_) | Self::Max(_) | Self::Avg(_) | Self::WeightedAvg(_) => {
+                Reversibility::BufferRequired
+            }
+        }
+    }
+
     /// Two-argument add for `WeightedAvg`. No-op on other variants
     /// (debug-asserts to catch programmer errors).
     pub fn add_weighted(&mut self, value: &Value, weight: &Value) {
         match self {
             Self::WeightedAvg(s) => s.add_weighted(value, weight),
             _ => debug_assert!(false, "add_weighted only valid for WeightedAvg"),
+        }
+    }
+
+    /// Retract one previously-added value's contribution.
+    ///
+    /// Defined only on `Reversibility::Reversible` variants (`Sum`, `Count`,
+    /// `Collect`, `Any`). Returns the heap-bytes delta for memory tracking
+    /// — negative for shrink (`Collect` removing one slot, `Any` decrementing
+    /// a refcount entry to zero) and zero for fixed-size variants.
+    /// `BufferRequired` variants (`Min`, `Max`, `Avg`, `WeightedAvg`)
+    /// debug-assert: their retraction path replays surviving rows from a
+    /// per-group buffer rather than walking back state in place.
+    pub fn sub(&mut self, value: &Value) -> isize {
+        match self {
+            Self::Sum(s) => {
+                sum_state_sub(s, value);
+                0
+            }
+            Self::Count(s) => {
+                count_state_sub(s, value);
+                0
+            }
+            Self::Collect(s) => collect_state_sub(s, value),
+            Self::Any(s) => {
+                let before = s.heap_size();
+                s.sub(value);
+                let after = s.heap_size();
+                after as isize - before as isize
+            }
+            Self::Avg(_) | Self::Min(_) | Self::Max(_) | Self::WeightedAvg(_) => {
+                debug_assert!(false, "sub only valid on Reversible accumulators");
+                0
+            }
         }
     }
 
@@ -647,9 +907,7 @@ impl AccumulatorEnum {
     pub fn heap_size(&self) -> usize {
         match self {
             Self::Collect(s) => s.heap_size(),
-            Self::Any(s) => {
-                std::mem::size_of::<Self>() + s.value.as_ref().map(Value::heap_size).unwrap_or(0)
-            }
+            Self::Any(s) => std::mem::size_of::<Self>() + s.heap_size(),
             _ => std::mem::size_of::<Self>(),
         }
     }

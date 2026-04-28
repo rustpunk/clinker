@@ -38,6 +38,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit product_name = products.name
+      propagate_ck: driver
   - type: output
     name: combine_or_out
     input: combine_or

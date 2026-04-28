@@ -41,6 +41,7 @@ nodes:
         emit category = products.category
         emit sample_order_id = orders.order_id
         emit sample_amount = orders.amount
+      propagate_ck: driver
   - type: output
     name: product_driven_out
     input: product_driven

@@ -331,6 +331,10 @@ pub(crate) struct SortMergeExec<'a> {
     /// arrive sorted on the range key prefix. Phase A external sort is
     /// skipped in that case and the inputs are walked in place.
     pub presorted: bool,
+    /// Build-side `$ck.<field>` propagation policy. Threaded uniformly
+    /// across every combine strategy and consumed by
+    /// `copy_build_ck_columns` at each emit site.
+    pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a mut MemoryBudget,
     /// Pipeline-scoped spill directory borrowed from
@@ -397,6 +401,7 @@ fn execute_combine_sort_merge_with_stats(
         match_mode,
         on_miss,
         presorted,
+        propagate_ck,
         ctx,
         budget,
         spill_dir,
@@ -604,6 +609,7 @@ fn execute_combine_sort_merge_with_stats(
         output_schema,
         match_mode,
         build_qualifier,
+        propagate_ck,
         ctx,
         byte_limit,
         spill_dir,
@@ -910,6 +916,7 @@ struct WalkArgs<'a, 'b, 'c> {
     output_schema: Option<&'a Arc<Schema>>,
     match_mode: MatchMode,
     build_qualifier: &'a str,
+    propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     ctx: &'a EvalContext<'a>,
     byte_limit: usize,
     spill_dir: &'a std::path::Path,
@@ -945,6 +952,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
         output_schema,
         match_mode,
         build_qualifier,
+        propagate_ck,
         ctx,
         byte_limit,
         spill_dir,
@@ -1021,6 +1029,7 @@ fn walk_two_cursors(args: WalkArgs<'_, '_, '_>) -> Result<(), PipelineError> {
             output_schema,
             match_mode,
             build_qualifier,
+            propagate_ck,
             ctx,
             output,
             matched_driver_orders,
@@ -1044,6 +1053,7 @@ struct EmitForRunArgs<'a, 'b> {
     output_schema: Option<&'a Arc<Schema>>,
     match_mode: MatchMode,
     build_qualifier: &'a str,
+    propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     ctx: &'a EvalContext<'a>,
     output: &'b mut Vec<(Record, RecordOrder)>,
     matched_driver_orders: &'b mut std::collections::HashSet<RecordOrder>,
@@ -1069,6 +1079,7 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
     match match_mode {
         MatchMode::Collect => {
             let mut arr: Vec<Value> = Vec::new();
+            let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for inner in iter_run(run).map_err(|e| PipelineError::Internal {
                 op: "combine",
@@ -1094,6 +1105,9 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                     truncated = true;
                     break;
                 }
+                if first_build.is_none() {
+                    first_build = Some(inner.clone());
+                }
                 let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
                 for (fname, val) in inner.iter_all_fields() {
                     m.insert(fname.into(), val.clone());
@@ -1113,6 +1127,9 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                 Some(s) => widen_record_to_schema(driver_record, s),
                 None => driver_record.clone(),
             };
+            if let Some(b) = first_build.as_ref() {
+                crate::executor::copy_build_ck_columns(&mut rec, b, args.propagate_ck);
+            }
             rec.set(build_qualifier, Value::Array(arr));
             args.output.push((rec, driver_order));
         }
@@ -1155,6 +1172,11 @@ fn emit_for_run(args: &mut EmitForRunArgs<'_, '_>) -> Result<(), PipelineError> 
                             for (k, v) in metadata {
                                 let _ = rec.set_meta(&k, v);
                             }
+                            crate::executor::copy_build_ck_columns(
+                                &mut rec,
+                                &inner,
+                                args.propagate_ck,
+                            );
                             args.output.push((rec, driver_order));
                             args.matched_driver_orders.insert(driver_order);
                             *args.emitted_since_check = args.emitted_since_check.saturating_add(1);
@@ -1502,6 +1524,7 @@ mod tests {
             match_mode: rk.match_mode,
             on_miss: rk.on_miss,
             presorted: rk.presorted,
+            propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),

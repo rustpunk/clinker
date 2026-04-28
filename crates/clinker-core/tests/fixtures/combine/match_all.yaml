@@ -39,6 +39,7 @@ nodes:
         emit product_id = orders.product_id
         emit product_name = products.name
         emit amount = orders.amount
+      propagate_ck: driver
   - type: output
     name: fanned_out
     input: fanned

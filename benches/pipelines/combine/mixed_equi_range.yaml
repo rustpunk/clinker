@@ -49,6 +49,7 @@ nodes:
         emit entity_id = employees.f0
         emit income = employees.f2
         emit bracket = brackets.f1 ?? "UNASSIGNED"
+      propagate_ck: driver
 
   - type: output
     name: assigned_out

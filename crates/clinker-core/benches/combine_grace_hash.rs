@@ -117,6 +117,7 @@ nodes:
       emit key = probe.key
       emit probe_c0 = probe.c0
       emit build_c0 = build.c0
+    propagate_ck: driver
 - type: output
   name: out
   input: joined
@@ -169,6 +170,7 @@ nodes:
       emit key = probe.key
       emit probe_c0 = probe.c0
       emit build_c0 = build.c0
+    propagate_ck: driver
 - type: output
   name: out
   input: joined

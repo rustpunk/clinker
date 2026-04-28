@@ -15,6 +15,7 @@
 
 use crate::config::SortField;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Physical properties of a node's output stream.
 ///
@@ -26,6 +27,18 @@ use serde::{Deserialize, Serialize};
 pub struct NodeProperties {
     pub ordering: Ordering,
     pub partitioning: Partitioning,
+    /// Closed-schema set of pipeline-level correlation-key field names
+    /// visible at this node's output. Computed at compile time by
+    /// walking the DAG topologically. Empty when the pipeline has no
+    /// `error_handling.correlation_key` declared, or when an upstream
+    /// relaxed Aggregate / driver-only Combine dropped every CK field
+    /// before reaching this node.
+    ///
+    /// The set tracks which `$ck.<field>` shadow columns reach a
+    /// downstream consumer, not the per-record runtime correlation
+    /// buffer key (which remains keyed by the full pipeline-level
+    /// correlation_key tuple).
+    pub ck_set: BTreeSet<String>,
 }
 
 /// Effective output ordering of a node, together with a provenance chain
@@ -162,6 +175,7 @@ impl NodeProperties {
                 kind: PartitioningKind::Single,
                 provenance: PartitioningProvenance::SingleStream,
             },
+            ck_set: BTreeSet::new(),
         }
     }
 }
@@ -382,6 +396,7 @@ mod render_tests {
                 kind: PartitioningKind::Single,
                 provenance: PartitioningProvenance::SingleStream,
             },
+            ck_set: BTreeSet::new(),
         }
     }
 

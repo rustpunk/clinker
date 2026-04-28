@@ -88,6 +88,7 @@ nodes:
       emit entity_id = employees.entity_id
       emit income = employees.income
       emit rate = brackets.rate
+    propagate_ck: driver
 - type: output
   name: out
   input: assign_bracket

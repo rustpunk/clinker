@@ -37,6 +37,7 @@ nodes:
         emit product_id = orders.product_id
         emit product_name = products.name
         emit amount = orders.amount
+      propagate_ck: driver
   - type: output
     name: matched_only_out
     input: matched_only

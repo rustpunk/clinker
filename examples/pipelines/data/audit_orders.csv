@@ -1,0 +1,5 @@
+order_id,customer_id,amount,status
+ORD-001,CUST-A,150.00,placed
+ORD-002,CUST-B,89.50,placed
+ORD-003,CUST-A,42.00,placed
+ORD-004,CUST-C,310.75,cancelled

@@ -1,0 +1,13 @@
+event_id,order_id,actor,event_type
+E1001,O01,alice,placed
+E1002,O02,alice,placed
+E1003,O03,bob,placed
+E1004,O04,carol,placed
+E1005,O05,alice,placed
+E1006,O06,bob,placed
+E1007,O07,carol,placed
+E1008,O08,alice,placed
+E1009,O09,bob,placed
+E1010,O10,carol,placed
+E1011,O11,alice,placed
+E1012,O12,bob,placed

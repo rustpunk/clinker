@@ -52,6 +52,7 @@ nodes:
         emit order_region = orders.f3
         emit carrier = shipments.f1 ?? "PENDING"
         emit tracking_region = shipments.f3 ?? "unknown"
+      propagate_ck: driver
 
   - type: output
     name: matched_out

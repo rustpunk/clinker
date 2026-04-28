@@ -38,3 +38,4 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit product_name = products.name
+      propagate_ck: driver

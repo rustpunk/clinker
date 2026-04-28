@@ -987,6 +987,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.product_name
         emit quantity = orders.quantity
+      propagate_ck: driver
 
   - type: output
     name: result

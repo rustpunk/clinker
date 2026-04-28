@@ -35,3 +35,4 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.name
         emit total = products.price * orders.quantity
+      propagate_ck: driver

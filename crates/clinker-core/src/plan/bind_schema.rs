@@ -32,7 +32,9 @@ use crate::config::composition::{
     PortDecl, ProvenanceDb, ResolvedValue,
 };
 use crate::config::node_header::CombineHeader;
-use crate::config::pipeline_node::{CombineBody, MatchMode, PipelineNode, SchemaDecl};
+use crate::config::pipeline_node::{
+    CombineBody, MatchMode, PipelineNode, PropagateCkSpec, SchemaDecl,
+};
 use crate::error::{Diagnostic, LabeledSpan};
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
@@ -692,12 +694,17 @@ fn bind_composition(
         };
         let n = &spanned.value;
         let n_name = n.name().to_string();
-        // Body nodes are lowered with a default `LoweringCtx` — they
-        // run inside the body executor's mini-DAG and don't need the
-        // top-level parallelism/index/aggregate enrichment. The
-        // top-level `compile_with_diagnostics` path supplies a
-        // populated ctx for runtime-executed top-level nodes.
-        let lower_ctx = crate::config::LoweringCtx::default();
+        // Body nodes are lowered without the top-level
+        // parallelism/index enrichment — those live on the
+        // top-level mini-DAG. The pipeline-level correlation_key still
+        // threads in: body aggregates inside a correlated pipeline must
+        // pick the same retraction-mode flags the top-level lowering
+        // would, since their `group_by` shape is what determines the
+        // commit-time behavior.
+        let lower_ctx = crate::config::LoweringCtx {
+            correlation_key: bind_ctx.correlation_key,
+            ..crate::config::LoweringCtx::default()
+        };
         if let Some(plan_node) = crate::config::lower_node_to_plan_node(
             n, &n_name, body_span, artifacts, &lower_ctx, diags,
         ) {
@@ -1857,6 +1864,35 @@ fn bind_combine(
             output_decl.insert(qf.clone(), ty.clone());
         }
         output_decl.insert(QualifiedField::bare(build_qualifier.as_str()), Type::Array);
+        // Build-side `$ck.<field>` propagation under collect mode.
+        // The matched-array column carries every per-build payload,
+        // but the propagation slot itself is single-valued — the
+        // first match contributes its $ck value; later matches keep
+        // their own $ck inside the array's per-row Map. Mirrors the
+        // first-match-wins discipline for hashable scalar slots while
+        // letting the array preserve full lineage.
+        if !matches!(config.propagate_ck, PropagateCkSpec::Driver) {
+            for (qualifier, input) in inputs {
+                if qualifier == &driving {
+                    continue;
+                }
+                for (qf, ty) in input.row.fields() {
+                    let Some(field_name) = qf.name.strip_prefix("$ck.") else {
+                        continue;
+                    };
+                    let allowed = match &config.propagate_ck {
+                        PropagateCkSpec::Driver => false,
+                        PropagateCkSpec::All => true,
+                        PropagateCkSpec::Named(names) => names.contains(field_name),
+                    };
+                    if !allowed {
+                        continue;
+                    }
+                    let bare = QualifiedField::bare(qf.name.clone());
+                    output_decl.entry(bare).or_insert_with(|| ty.clone());
+                }
+            }
+        }
         let output_row = Row::closed(output_decl, cxl_span);
         schema_by_name.insert(name.to_string(), output_row.clone());
         artifacts.typed.insert(
@@ -1904,7 +1940,16 @@ fn bind_combine(
         .get(name)
         .and_then(|q| artifacts.combine_inputs.get(name).and_then(|m| m.get(q)))
         .map(|input| input.row.clone());
-    let output_row = combine_output_row(&body_typed, driver_row.as_ref(), cxl_span);
+    let driver_qualifier_for_row = artifacts.combine_driving.get(name).cloned();
+    let inputs_for_row = artifacts.combine_inputs.get(name);
+    let output_row = combine_output_row(
+        &body_typed,
+        driver_row.as_ref(),
+        inputs_for_row,
+        driver_qualifier_for_row.as_deref(),
+        &config.propagate_ck,
+        cxl_span,
+    );
     schema_by_name.insert(name.to_string(), output_row.clone());
     let mut body_typed = body_typed;
     body_typed.output_row = output_row;
@@ -2460,9 +2505,28 @@ fn walk_statement_exprs(
 /// Meta emits (`emit $meta.x = ...`) don't contribute to the output
 /// row schema; they write to per-record metadata, not the record
 /// itself.
+///
+/// The driver's `$ck.<field>` shadow columns always land on the output
+/// row so the combined record carries the driver's frozen-identity
+/// snapshot through the join boundary. `propagate_ck` selects whether
+/// build-side `$ck.*` columns also land:
+///
+/// - `Driver` — only the driver's set propagates.
+/// - `All` — every non-driver input's `$ck.*` columns also land.
+/// - `Named(set)` — only the listed CK fields propagate (intersected
+///   with what's actually present on the upstream rows).
+///
+/// Driver wins on a name collision: if both the driver and a build
+/// input declare `$ck.<field>`, the column appears once on the output
+/// schema and the runtime CK-copy step preserves the driver's value
+/// (the build record's value is not written when a non-null driver
+/// value is already in place).
 fn combine_output_row(
     typed: &TypedProgram,
     driver_row: Option<&Row>,
+    inputs: Option<&IndexMap<String, CombineInput>>,
+    driver_qualifier: Option<&str>,
+    propagate_ck: &PropagateCkSpec,
     span: cxl::lexer::Span,
 ) -> Row {
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
@@ -2485,21 +2549,41 @@ fn combine_output_row(
             out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
     }
-    // Auto-append the driver's engine-stamped tail (`$ck.<field>`
-    // shadow columns) so the combined record's schema carries the
-    // driver's frozen-identity snapshot through the join boundary.
-    // The runtime `widen_record_to_schema` picks up the values from
-    // the driver record by name; without these slots the combined
-    // record would silently drop the snapshot and lose its
-    // correlation-group identity. Mirrors how the dispatch arm
-    // forwards `iter_meta()` from the driver, but for schema columns.
+    // Driver's engine-stamped tail always rides through. `widen_record_to_schema`
+    // picks up the values from the driver record by name at runtime.
     if let Some(driver) = driver_row {
         for (qf, ty) in driver.fields() {
             if qf.name.starts_with("$ck.") {
                 let bare = QualifiedField::bare(qf.name.clone());
-                if !out.contains_key(&bare) {
-                    out.insert(bare, ty.clone());
+                out.entry(bare).or_insert_with(|| ty.clone());
+            }
+        }
+    }
+    // Build-side propagation. Without these slots, the runtime CK
+    // copy has nowhere to write; downstream collateral DLQ traversal
+    // would lose the build inputs' contribution to the joined row's
+    // identity.
+    if let Some(inputs) = inputs
+        && !matches!(propagate_ck, PropagateCkSpec::Driver)
+    {
+        for (qualifier, input) in inputs {
+            if Some(qualifier.as_str()) == driver_qualifier {
+                continue;
+            }
+            for (qf, ty) in input.row.fields() {
+                let Some(field_name) = qf.name.strip_prefix("$ck.") else {
+                    continue;
+                };
+                let allowed = match propagate_ck {
+                    PropagateCkSpec::Driver => false,
+                    PropagateCkSpec::All => true,
+                    PropagateCkSpec::Named(names) => names.contains(field_name),
+                };
+                if !allowed {
+                    continue;
                 }
+                let bare = QualifiedField::bare(qf.name.clone());
+                out.entry(bare).or_insert_with(|| ty.clone());
             }
         }
     }

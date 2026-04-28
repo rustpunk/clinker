@@ -449,6 +449,11 @@ pub enum PlanNode {
         predicate_summary: crate::plan::combine::CombinePredicateSummary,
         match_mode: crate::config::pipeline_node::MatchMode,
         on_miss: crate::config::pipeline_node::OnMiss,
+        /// Mirrors `CombineBody.propagate_ck`. Selects which correlation-key
+        /// fields the combine's output rows carry — driver-only, union of
+        /// all inputs, or an explicit named subset. Read by the per-node
+        /// CK-set lattice in `compute_one`.
+        propagate_ck: crate::config::pipeline_node::PropagateCkSpec,
         /// For synthetic binary combine nodes created by N-ary
         /// decomposition: name of the original N-ary combine node this
         /// was decomposed from. `None` for user-authored combine nodes.
@@ -1037,7 +1042,13 @@ impl ExecutionPlanDag {
                 spec.sort_by.iter().map(|s| &s.field).collect::<Vec<_>>()
             ));
             out.push_str(&format!("  Arena fields: {:?}\n", spec.arena_fields));
-            out.push_str(&format!("  Already sorted: {}\n\n", spec.already_sorted));
+            out.push_str(&format!("  Already sorted: {}\n", spec.already_sorted));
+            if spec.requires_buffer_recompute {
+                out.push_str(
+                    "  Buffer recompute on commit: yes (worst-case memory = O(largest partition × per-row-size))\n",
+                );
+            }
+            out.push('\n');
         }
 
         for node in self.graph.node_weights() {
@@ -1143,7 +1154,125 @@ impl ExecutionPlanDag {
         // default to avoid a config-coupling cycle here.
         self.render_combine_section(&mut out, None, 0);
 
+        self.render_retraction_section(&mut out, None);
+
         out
+    }
+
+    /// Render the retraction-cost block for content-relaxed aggregates
+    /// and buffer-mode windows.
+    ///
+    /// `config` is `Some` when the caller went through one of the
+    /// artifacts-aware entry points and can read the pipeline-level
+    /// `correlation_fanout_policy` default plus the `correlation_key`
+    /// used to classify aggregates. Without it the block still emits
+    /// per-window detail; aggregate detection requires the correlation
+    /// key, so the per-aggregate section is silent on the no-config
+    /// rendering and the policy line degrades to "unknown at this
+    /// rendering".
+    ///
+    /// The block is silent on pipelines whose every aggregate has
+    /// `group_by ⊇ correlation_key` so strict-correlation and
+    /// non-correlated `--explain` output stays identical to today's
+    /// text.
+    fn render_retraction_section(&self, out: &mut String, config: Option<&PipelineConfig>) {
+        let correlation_key = config.and_then(|c| c.error_handling.correlation_key.as_ref());
+        let mut relaxed_aggregates: Vec<(&str, &PlanNode)> = Vec::new();
+        for &idx in &self.topo_order {
+            if let PlanNode::Aggregation { name, config, .. } = &self.graph[idx]
+                && group_by_omits_any_ck_field(&config.group_by, correlation_key)
+            {
+                relaxed_aggregates.push((name.as_str(), &self.graph[idx]));
+            }
+        }
+        let buffer_mode_index_count = self
+            .indices_to_build
+            .iter()
+            .filter(|s| s.requires_buffer_recompute)
+            .count();
+
+        if relaxed_aggregates.is_empty() && buffer_mode_index_count == 0 {
+            return;
+        }
+
+        out.push_str("=== Retraction ===\n\n");
+
+        let policy_line = match config.and_then(|c| c.error_handling.correlation_fanout_policy) {
+            Some(p) => format!("{p:?}").to_lowercase(),
+            None => {
+                if config.is_some() {
+                    "any (default)".to_string()
+                } else {
+                    "unknown at this rendering (config not threaded)".to_string()
+                }
+            }
+        };
+        out.push_str(&format!(
+            "retraction enabled — {} relaxed aggregates, {} buffer-mode windows, fanout policy: {}.\n\n",
+            relaxed_aggregates.len(),
+            buffer_mode_index_count,
+            policy_line,
+        ));
+
+        for (name, node) in &relaxed_aggregates {
+            let PlanNode::Aggregation { compiled, .. } = node else {
+                continue;
+            };
+            let path_label = if compiled.requires_buffer_mode {
+                "BufferRequired"
+            } else if compiled.requires_lineage {
+                "Reversible"
+            } else {
+                // Unreachable on relaxed aggregates because the planner
+                // sets exactly one of the two flags; surface the
+                // inconsistency rather than fall back silently.
+                "unclassified"
+            };
+            // Cardinality estimate is honest: today's planner has no
+            // group-cardinality side-table to consult before the run,
+            // so the lineage memory ceiling is expressed as a per-row
+            // cost rather than a total. The `(input_row_id → group_index)`
+            // pair is `(u32, u32)` = 8 bytes; per-group `input_rows` Vec
+            // overhead is tracked alongside but its sum scales with the
+            // unknown group cardinality.
+            let lineage_per_row_bytes = if compiled.requires_lineage {
+                "~8 bytes/row"
+            } else {
+                "n/a (buffer-mode holds raw contributions)"
+            };
+            out.push_str(&format!("Aggregate '{name}':\n"));
+            out.push_str(&format!(
+                "  retraction: relaxed-CK enabled, {path_label} accumulator path, lineage memory {lineage_per_row_bytes} (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.\n",
+            ));
+            out.push('\n');
+        }
+
+        for (i, spec) in self.indices_to_build.iter().enumerate() {
+            if !spec.requires_buffer_recompute {
+                continue;
+            }
+            // Per-row buffer cost = sum of arena-field value sizes; the
+            // arena uses `Value` so worst case is the per-row union of
+            // `arena_fields` sizes. Surface the field count and the
+            // `Value`-size order without a fake byte total because
+            // partition cardinality is also unknown at plan time. The
+            // arena field set itself appears in the upstream `Index`
+            // block above; not duplicated here because its ordering is
+            // deduplication-pass dependent and would be a noisy
+            // snapshot diff target.
+            let row_field_count = spec.arena_fields.len();
+            out.push_str(&format!(
+                "Window index [{i}] (source '{}', partition_by {:?}):\n",
+                spec.source, spec.group_by,
+            ));
+            out.push_str(&format!(
+                "  retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~{row_field_count}× sizeof(Value).\n",
+            ));
+            out.push_str(
+                "  worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.\n",
+            );
+            out.push('\n');
+        }
     }
 
     /// `--explain` text with combine multi-line blocks. Identical to
@@ -1390,6 +1519,15 @@ impl ExecutionPlanDag {
             config.pipeline.memory_limit.as_deref(),
         );
         let mut out = self.explain_with_artifacts(artifacts, total_limit);
+        // Re-render the retraction section with the pipeline config in
+        // scope so the fanout-policy line resolves to the user-visible
+        // setting. `explain()` (called inside `explain_with_artifacts`)
+        // already emitted a config-less variant; strip it before
+        // re-rendering to avoid duplicate blocks.
+        if let Some(start) = out.find("=== Retraction ===\n") {
+            out.truncate(start);
+        }
+        self.render_retraction_section(&mut out, Some(config));
         self.append_full_sections(&mut out, config);
         out
     }
@@ -1518,6 +1656,10 @@ impl ExecutionPlanDag {
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let mut out = self.explain();
+        if let Some(start) = out.find("=== Retraction ===\n") {
+            out.truncate(start);
+        }
+        self.render_retraction_section(&mut out, Some(config));
 
         // CXL AST (reformatted expressions from config)
         out.push_str("=== CXL Expressions ===\n\n");
@@ -2694,6 +2836,7 @@ impl ExecutionPlanDag {
     pub fn compute_node_properties(
         &mut self,
         inputs: &HashMap<String, SourceConfig>,
+        correlation_key_fields: &[String],
     ) -> Result<(), PipelineError> {
         assert!(
             self.node_properties.is_empty(),
@@ -2708,12 +2851,88 @@ impl ExecutionPlanDag {
                     .neighbors_directed(idx, petgraph::Direction::Incoming)
                     .filter_map(|p| self.node_properties.get(&p))
                     .collect();
-                compute_one(&self.graph[idx], &parents, inputs)
+                compute_one(&self.graph[idx], &parents, inputs, correlation_key_fields)
             };
             self.node_properties.insert(idx, props);
         }
 
         Ok(())
+    }
+
+    /// Mark every [`IndexSpec`] whose owning window-bearing Transform
+    /// participates in a relaxed-CK retraction pipeline AND whose
+    /// `partition_by` does not cover the source-side correlation-key
+    /// set. The flag flips the executor's window arm into buffered emit
+    /// mode so the orchestrator's commit-time recompute can rerun the
+    /// window over `partition − retracted_rows` and emit per-output
+    /// Deltas.
+    ///
+    /// The trigger captures both directions of the geometry:
+    ///
+    /// * Window upstream of a relaxed-CK aggregate. The window operates
+    ///   on source-side arena positions; a CK group can span multiple
+    ///   partitions when `partition_by` is not a CK superset; the
+    ///   relaxed aggregate downstream provides the retraction protocol
+    ///   that needs the per-partition rollback.
+    ///
+    /// * Window downstream of a relaxed-CK aggregate. The aggregate's
+    ///   dropped CK fields no longer appear in the partition's
+    ///   downstream `ck_set`; if the window's `partition_by` references
+    ///   one of those fields, partitions can span what would have been
+    ///   strict CK boundaries.
+    ///
+    /// The unified rule: at the window's node, the visible `ck_set` has
+    /// at least one field that is not part of the window's
+    /// `partition_by` slice. Reads `node_properties.ck_set`, so callers
+    /// must invoke `compute_node_properties` first. Idempotent.
+    pub(crate) fn derive_window_buffer_recompute_flags(
+        &mut self,
+        correlation_key: Option<&crate::config::CorrelationKey>,
+    ) {
+        // Pipeline-level enabler: at least one aggregate whose `group_by`
+        // omits a correlation-key field. Without one, the retraction
+        // protocol does not fire and no window needs buffer mode.
+        let has_relaxed_aggregate = self.graph.node_weights().any(|n| {
+            matches!(
+                n,
+                PlanNode::Aggregation { config, .. }
+                    if group_by_omits_any_ck_field(&config.group_by, correlation_key)
+            )
+        });
+        if !has_relaxed_aggregate {
+            return;
+        }
+
+        let mut to_flag: Vec<usize> = Vec::new();
+        for idx in self.graph.node_indices() {
+            if let PlanNode::Transform {
+                window_index: Some(idx_num),
+                ..
+            } = &self.graph[idx]
+            {
+                let idx_num = *idx_num;
+                let Some(props) = self.node_properties.get(&idx) else {
+                    continue;
+                };
+                let Some(spec) = self.indices_to_build.get(idx_num) else {
+                    continue;
+                };
+                let partition_set: BTreeSet<&str> =
+                    spec.group_by.iter().map(String::as_str).collect();
+                let ck_outside_partition = props
+                    .ck_set
+                    .iter()
+                    .any(|f| !partition_set.contains(f.as_str()));
+                if ck_outside_partition {
+                    to_flag.push(idx_num);
+                }
+            }
+        }
+        for idx_num in to_flag {
+            if let Some(spec) = self.indices_to_build.get_mut(idx_num) {
+                spec.requires_buffer_recompute = true;
+            }
+        }
     }
 
     /// Resolve `AggregateStrategyHint` on every `PlanNode::Aggregation`
@@ -2833,6 +3052,18 @@ impl ExecutionPlanDag {
                 *qualified_sort_order = resolved.qualified_sort_order.clone();
             }
 
+            // Preserve the CK set computed by `compute_one`. The post-pass
+            // overwrites ordering/partitioning to reflect the resolved
+            // strategy, but the CK lattice has already been computed and
+            // must survive the rewrite — the resolved strategy does not
+            // change which `$ck.<field>` columns this aggregate's output
+            // carries.
+            let preserved_ck_set = self
+                .node_properties
+                .get(&idx)
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+
             // Overwrite the side-table ordering for this aggregation node
             // (D77 — single source of truth for aggregation ordering).
             let new_props = match resolved.strategy {
@@ -2848,6 +3079,7 @@ impl ExecutionPlanDag {
                         kind: PartitioningKind::Single,
                         provenance: PartitioningProvenance::SingleStream,
                     },
+                    ck_set: preserved_ck_set.clone(),
                 },
                 AggregateStrategy::Hash => NodeProperties {
                     ordering: Ordering {
@@ -2861,6 +3093,7 @@ impl ExecutionPlanDag {
                         kind: PartitioningKind::Single,
                         provenance: PartitioningProvenance::SingleStream,
                     },
+                    ck_set: preserved_ck_set,
                 },
             };
             self.node_properties.insert(idx, new_props);
@@ -2891,6 +3124,7 @@ fn compute_one(
     node: &PlanNode,
     parents: &[&NodeProperties],
     inputs: &HashMap<String, SourceConfig>,
+    correlation_key_fields: &[String],
 ) -> NodeProperties {
     let single_stream_partitioning = || Partitioning {
         kind: PartitioningKind::Single,
@@ -2901,6 +3135,15 @@ fn compute_one(
             .first()
             .map(|p| p.partitioning.clone())
             .unwrap_or_else(single_stream_partitioning)
+    };
+    // Default lattice rule for nodes that do not transform CK visibility
+    // (Transform, Sort, Route, Output, Composition): preserve the first
+    // parent's CK set, or empty when there is no parent.
+    let preserve_parent_ck_set = || {
+        parents
+            .first()
+            .map(|p| p.ck_set.clone())
+            .unwrap_or_default()
     };
 
     match node {
@@ -2916,12 +3159,17 @@ fn compute_one(
             } else {
                 OrderingProvenance::NoOrdering
             };
+            // Source observes every pipeline-level CK field — they are
+            // shadow-stamped at ingest, so the column set is uniform
+            // across all sources.
+            let ck_set: BTreeSet<String> = correlation_key_fields.iter().cloned().collect();
             NodeProperties {
                 ordering: Ordering {
                     sort_order,
                     provenance,
                 },
                 partitioning: single_stream_partitioning(),
+                ck_set,
             }
         }
 
@@ -2935,6 +3183,7 @@ fn compute_one(
                 },
             },
             partitioning: parent_partitioning(),
+            ck_set: preserve_parent_ck_set(),
         },
 
         PlanNode::Transform {
@@ -2944,6 +3193,7 @@ fn compute_one(
             ..
         } => {
             let partitioning = parent_partitioning();
+            let ck_set = preserve_parent_ck_set();
 
             // Distinct destroys ordering unconditionally.
             if *has_distinct {
@@ -2956,6 +3206,7 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 };
             }
 
@@ -2971,6 +3222,7 @@ fn compute_one(
                             .unwrap_or(OrderingProvenance::NoOrdering),
                     },
                     partitioning,
+                    ck_set,
                 };
             };
 
@@ -2991,6 +3243,7 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 }
             } else {
                 NodeProperties {
@@ -3004,6 +3257,7 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 }
             }
         }
@@ -3029,6 +3283,7 @@ fn compute_one(
                     provenance,
                 },
                 partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
             }
         }
 
@@ -3048,6 +3303,20 @@ fn compute_one(
             } else {
                 parents[0].partitioning.clone()
             };
+            // Intersect CK sets across all parents: a CK column is visible
+            // post-merge only when every parent stream still carries it.
+            // If a sibling branch has already passed through a relaxed
+            // Aggregate that dropped a CK field, the smaller visible set
+            // wins downstream.
+            let ck_set: BTreeSet<String> = {
+                let mut iter = parents.iter().map(|p| p.ck_set.clone());
+                match iter.next() {
+                    Some(first) => iter.fold(first, |acc, next| {
+                        acc.intersection(&next).cloned().collect()
+                    }),
+                    None => BTreeSet::new(),
+                }
+            };
             if all_match {
                 let provenance = if first_so.is_some() {
                     OrderingProvenance::Preserved {
@@ -3062,6 +3331,7 @@ fn compute_one(
                         provenance,
                     },
                     partitioning,
+                    ck_set,
                 }
             } else {
                 NodeProperties {
@@ -3077,11 +3347,12 @@ fn compute_one(
                         },
                     },
                     partitioning,
+                    ck_set,
                 }
             }
         }
 
-        PlanNode::Aggregation { .. } => {
+        PlanNode::Aggregation { config, .. } => {
             // Aggregation node ordering is the sole responsibility of
             // the `select_aggregation_strategies` post-pass, which runs
             // immediately after `compute_node_properties` and overwrites
@@ -3090,19 +3361,46 @@ fn compute_one(
             // bypasses the post-pass produces conservative
             // (correct-but-suboptimal) downstream eligibility decisions
             // rather than silently asserting a false ordering.
+            //
+            // CK lattice rule:
+            //   - strict (`group_by ⊇ correlation_key`): preserves parent
+            //     CK set unchanged.
+            //   - relaxed (`group_by` omits any CK field): intersects
+            //     parent CK set with `group_by`. Any CK column the user
+            //     dropped from `group_by` stops being visible to
+            //     downstream consumers because the aggregator no longer
+            //     projects it onto its output rows.
+            let parent_ck = preserve_parent_ck_set();
+            let omits_ck = correlation_key_fields
+                .iter()
+                .any(|f| !config.group_by.iter().any(|g| g == f));
+            let ck_set: BTreeSet<String> = if omits_ck {
+                let group_by_set: BTreeSet<&str> =
+                    config.group_by.iter().map(String::as_str).collect();
+                parent_ck
+                    .into_iter()
+                    .filter(|f| group_by_set.contains(f.as_str()))
+                    .collect()
+            } else {
+                parent_ck
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
                     provenance: OrderingProvenance::NoOrdering,
                 },
                 partitioning: single_stream_partitioning(),
+                ck_set,
             }
         }
 
         PlanNode::Output { name, .. } => {
             // Terminal — properties still computed for debugging. Inherit
             // parent, rewrite provenance to point at this node when ordering
-            // is non-None so explain chains through.
+            // is non-None so explain chains through. CK set is preserved at
+            // Output so the inclusion-flag interaction (writer-default
+            // strip vs `include_correlation_keys: true`) can consult the
+            // surviving CK columns.
             let parent = match parents.first() {
                 Some(p) => p,
                 None => return NodeProperties::unordered_single(),
@@ -3120,6 +3418,7 @@ fn compute_one(
                     provenance,
                 },
                 partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
             }
         }
 
@@ -3145,10 +3444,13 @@ fn compute_one(
                     provenance,
                 },
                 partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
             }
         }
 
-        PlanNode::Combine { name, .. } => {
+        PlanNode::Combine {
+            name, propagate_ck, ..
+        } => {
             // Combine always destroys parent ordering: hash-build/probe
             // (and IEJoin, grace hash) do not preserve driving-input
             // order. Emit `DestroyedByCombine { Proven }` so downstream
@@ -3156,6 +3458,31 @@ fn compute_one(
             // can chain through and suggest "add a sort step between
             // `{combine}` and `{consumer}`". Resolves Phase Combine
             // §OQ-6 and drill D12.
+            //
+            // CK lattice rule reads `propagate_ck`. The Combine
+            // post-pass `select_combine_strategies` runs AFTER
+            // `compute_node_properties`, so `driving_input` is empty
+            // here — declaration order (first parent = driver) is the
+            // fallback, which matches today's runtime driver-resolution
+            // behavior at dispatch.
+            use crate::config::pipeline_node::PropagateCkSpec;
+            let ck_set: BTreeSet<String> = match propagate_ck {
+                PropagateCkSpec::Driver => parents
+                    .first()
+                    .map(|p| p.ck_set.clone())
+                    .unwrap_or_default(),
+                PropagateCkSpec::All => parents
+                    .iter()
+                    .flat_map(|p| p.ck_set.iter().cloned())
+                    .collect(),
+                PropagateCkSpec::Named(names) => {
+                    let upstream_union: BTreeSet<String> = parents
+                        .iter()
+                        .flat_map(|p| p.ck_set.iter().cloned())
+                        .collect();
+                    names.intersection(&upstream_union).cloned().collect()
+                }
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
@@ -3165,6 +3492,7 @@ fn compute_one(
                     },
                 },
                 partitioning: single_stream_partitioning(),
+                ck_set,
             }
         }
 
@@ -3181,6 +3509,7 @@ fn compute_one(
                         provenance: OrderingProvenance::NoOrdering,
                     }),
                 partitioning: parent_partitioning(),
+                ck_set: preserve_parent_ck_set(),
             }
         }
     }
@@ -3247,6 +3576,102 @@ fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> 
         }
         _ => false,
     }
+}
+
+/// Detect whether a CXL `TypedProgram` calls any non-deterministic builtin.
+///
+/// Today's CXL surface has one non-deterministic builtin: `now` (the
+/// `now` keyword reads wall-clock time at evaluation). The walker
+/// returns `true` if any `Expr::Now` appears anywhere in the program's
+/// statements; the result drives the E15W diagnostic, which rejects a
+/// relaxed-CK aggregate feeding a Transform that calls a non-deterministic
+/// operator (replay would not produce the same row twice, breaking the
+/// post-retract substitution proof). New non-deterministic builtins
+/// added later in CXL must extend this walker — the central check
+/// keeps the planner consistent with whatever the language admits.
+pub(crate) fn cxl_has_nondeterministic_call(typed: &TypedProgram) -> bool {
+    use cxl::ast::Expr;
+
+    fn walk(e: &Expr) -> bool {
+        match e {
+            Expr::Now { .. } => true,
+            Expr::Binary { lhs, rhs, .. } => walk(lhs) || walk(rhs),
+            Expr::Unary { operand, .. } => walk(operand),
+            Expr::MethodCall { receiver, args, .. } => walk(receiver) || args.iter().any(walk),
+            Expr::Match { subject, arms, .. } => {
+                subject.as_deref().map(walk).unwrap_or(false)
+                    || arms.iter().any(|a| walk(&a.pattern) || walk(&a.body))
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                walk(condition)
+                    || walk(then_branch)
+                    || else_branch.as_deref().map(walk).unwrap_or(false)
+            }
+            Expr::Coalesce { lhs, rhs, .. } => walk(lhs) || walk(rhs),
+            Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => args.iter().any(walk),
+            Expr::Literal { .. }
+            | Expr::FieldRef { .. }
+            | Expr::QualifiedFieldRef { .. }
+            | Expr::PipelineAccess { .. }
+            | Expr::MetaAccess { .. }
+            | Expr::Wildcard { .. }
+            | Expr::AggSlot { .. }
+            | Expr::GroupKey { .. } => false,
+        }
+    }
+
+    for stmt in &typed.program.statements {
+        let mut exprs: Vec<&Expr> = Vec::new();
+        match stmt {
+            Statement::Emit { expr, .. } | Statement::Let { expr, .. } => exprs.push(expr),
+            Statement::Filter { predicate, .. } => exprs.push(predicate),
+            Statement::Trace { guard, message, .. } => {
+                if let Some(g) = guard.as_deref() {
+                    exprs.push(g);
+                }
+                exprs.push(message);
+            }
+            Statement::ExprStmt { expr, .. } => exprs.push(expr),
+            Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+        }
+        if exprs.iter().any(|e| walk(e)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when an aggregate's `group_by` omits at least one field of the
+/// pipeline-level correlation key.
+///
+/// Selects between the strict-collateral two-phase commit (returns
+/// `false`) and the relaxed lattice + five-phase retraction protocol
+/// (returns `true`). Pipelines without a correlation key always return
+/// `false` — there is no key to test against, so retraction is not in
+/// play.
+///
+/// `correlation_key` is the comma-split [`crate::config::CorrelationKey`]
+/// fields. `group_by` is the aggregate's user-declared (or
+/// auto-extension-rewritten) group-by list. Field-name comparison is
+/// strict equality; the auto-extension pass appends `$ck.<field>` shadow
+/// columns whenever the user already lists the corresponding bare field,
+/// so the bare-name check below sees the post-extension shape and stays
+/// stable across the rewrite.
+pub(crate) fn group_by_omits_any_ck_field(
+    group_by: &[String],
+    correlation_key: Option<&crate::config::CorrelationKey>,
+) -> bool {
+    let Some(ck) = correlation_key else {
+        return false;
+    };
+    ck.fields()
+        .iter()
+        .any(|f| !group_by.iter().any(|g| g.as_str() == *f))
 }
 
 /// Detect whether a CXL transform contains any `distinct` statement.
@@ -3326,14 +3751,6 @@ pub enum PlanError {
     /// limitation up front instead of a confusing runtime path.
     CorrelationKeyWithArena {
         transform: String,
-    },
-    /// E151 — an Aggregate node's `group_by` does not include every
-    /// `correlation_key` field. Without this superset relation an
-    /// aggregate row could mix records from multiple correlation
-    /// groups into a single output row, breaking per-group rollback.
-    CorrelationKeyWithMixedAggregate {
-        aggregate: String,
-        missing_fields: Vec<String>,
     },
     /// E152 — a `PlanNode::Composition` has an incoming edge with no
     /// `PlanEdge.port` tag. Compile-time guard for the dispatcher's
@@ -3428,17 +3845,6 @@ impl std::fmt::Display for PlanError {
                     "E150 transform '{transform}' uses analytic windows but the \
                      pipeline has `error_handling.correlation_key` set; per-group \
                      arena construction is not supported",
-                )
-            }
-            PlanError::CorrelationKeyWithMixedAggregate {
-                aggregate,
-                missing_fields,
-            } => {
-                write!(
-                    f,
-                    "E151 aggregate '{aggregate}' group_by must include every \
-                     correlation_key field — missing: [{}]",
-                    missing_fields.join(", ")
                 )
             }
             PlanError::CompositionUntaggedIncomingEdge {

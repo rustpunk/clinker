@@ -21,6 +21,16 @@ pub struct LocalWindowConfig {
     pub sort_by: Vec<SortField>,
     /// Expression to evaluate against the primary record for cross-source lookup.
     pub on: Option<String>,
+    /// Window sits downstream of a relaxed-CK aggregate whose dropped CK
+    /// fields overlap this window's `partition_by`. Set to `true` by the
+    /// plan-time derivation walk in
+    /// `derive_window_buffer_recompute_flags`; the executor's window arm
+    /// switches from streaming-emit to per-partition buffered output so
+    /// the orchestrator's commit phase can recompute affected partitions
+    /// over `partition − retracted_rows`. `#[serde(default)]` is required
+    /// because YAML never sets this — it is a derived plan-time property.
+    #[serde(default)]
+    pub requires_buffer_recompute: bool,
 }
 
 /// Parse a transform's `analytic_window` JSON value into a typed
@@ -58,6 +68,13 @@ pub struct IndexSpec {
     pub arena_fields: Vec<String>,
     /// True if the source config declares a sort_order matching this index's sort_by.
     pub already_sorted: bool,
+    /// Mirror of `LocalWindowConfig.requires_buffer_recompute`. Set during
+    /// `deduplicate_indices` from the input `RawIndexRequest`s; the
+    /// executor's window arm consults this to decide between streaming
+    /// emit and buffered emit. When two transforms share a deduplicated
+    /// IndexSpec and any one of them needs buffer-recompute, the merged
+    /// spec inherits the flag.
+    pub requires_buffer_recompute: bool,
 }
 
 /// Deduplicate index specs: two transforms with the same (source, group_by, sort_by)
@@ -80,6 +97,13 @@ pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
                         spec.arena_fields.push(field.clone());
                     }
                 }
+                // Lift the buffer-recompute flag if any contributing
+                // transform requires it: a shared index that one
+                // transform reads in buffered mode and another reads in
+                // streaming mode collapses to buffered mode (the buffered
+                // path's per-record output is a superset of the streaming
+                // path's).
+                spec.requires_buffer_recompute |= req.requires_buffer_recompute;
             }
             None => {
                 deduped.push(IndexSpec {
@@ -88,6 +112,7 @@ pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
                     sort_by: req.sort_by,
                     arena_fields: req.arena_fields,
                     already_sorted: req.already_sorted,
+                    requires_buffer_recompute: req.requires_buffer_recompute,
                 });
             }
         }
@@ -106,6 +131,10 @@ pub struct RawIndexRequest {
     pub already_sorted: bool,
     /// Index of the transform that requested this index.
     pub transform_index: usize,
+    /// Mirror of `LocalWindowConfig.requires_buffer_recompute` for this
+    /// transform. Carried through dedup so the merged `IndexSpec` lifts
+    /// the flag when any contributing transform needs buffer recompute.
+    pub requires_buffer_recompute: bool,
 }
 
 /// Collect the union of arena_fields across all IndexSpecs for a given source.

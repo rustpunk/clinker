@@ -68,10 +68,11 @@ Groups that exceed the cap are DLQ'd entirely with a `group_size_exceeded` trigg
 
 ## Compile-time constraints
 
-Two compile-time invariants are enforced:
+One compile-time invariant is enforced:
 
-- **Aggregate group-by superset**: every correlation-key field must appear in `group_by` of every aggregate downstream of the source. The engine extends `group_by` automatically when it can; an explicit `group_by` that omits a correlation-key field produces an `E151` compile error. See [Aggregate interaction](#aggregate-interaction) below.
 - **Arena execution incompatible**: the arena-evaluated execution path is incompatible with correlation grouping. Combinations are rejected at compile time.
+
+Aggregates whose `group_by` includes every correlation-key field stay on the strict-collateral path; aggregates that omit any correlation-key field activate the retraction protocol automatically. Authors do not configure this — the engine inspects the configuration and picks the correct path. See [Aggregate interaction](#aggregate-interaction) below.
 
 ## Per-operator interactions
 
@@ -156,7 +157,7 @@ If `east_orders` and `west_orders` both contain rows for `order_id = ORD-42`, al
 
 ### Aggregate interaction
 
-Every correlation-key field must be in `group_by`. The engine auto-extends `group_by` to include the correlation-key fields when you omit them; if you specify a `group_by` that explicitly excludes a correlation-key field, the pipeline fails to compile with `E151`.
+When an aggregate's `group_by` lists every correlation-key field, the aggregate stays on the strict-collateral path: each emitted row inherits the correlation identity of its inputs and any DLQ trigger in the group rolls back every record in the group, including the aggregate output row. This is the zero-overhead default.
 
 ```yaml
 error_handling:
@@ -166,10 +167,12 @@ error_handling:
   name: order_totals
   input: validate
   config:
-    group_by: [order_id]               # OK -- includes correlation key
+    group_by: [order_id]               # strict -- includes the correlation key
     cxl: |
       emit total = sum(amount)
 ```
+
+When an aggregate's `group_by` omits any correlation-key field, the engine routes the aggregate through the retraction protocol automatically. A single correlation group may span multiple aggregate groups; correlation-key fields omitted from `group_by` stop being visible to downstream consumers of this aggregate's output. Authors do not configure this — the engine inspects the configuration and picks the correct path.
 
 ```yaml
 error_handling:
@@ -179,18 +182,28 @@ error_handling:
   name: dept_totals
   input: validate
   config:
-    group_by: [department]             # E151 -- omits order_id
+    group_by: [department]             # retraction protocol is active
     cxl: |
       emit total = sum(amount)
 ```
 
-The reason is structural: aggregates emit one row per group, and the emitted row must inherit the correlation identity of its inputs so that downstream DLQ logic can route it correctly. If a single aggregate group spanned multiple correlation groups, the emitted row would have ambiguous identity and could not participate in correlation rollback.
+Aggregate output rows on the strict path inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row -- but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
 
-Aggregate output rows inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row -- but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
+On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. The retraction protocol's compile-time and runtime constraints (`E15W` for non-deterministic builtins downstream, `E15Y` for `strategy: streaming` on a retraction-mode aggregate) are enforced automatically once the engine has classified the aggregate.
+
+#### Where retraction triggers are sourced
+
+Retraction is fine-grained for failures **upstream** of a retraction-mode aggregate (Source ingest, Transform evaluation, Combine probe, Validation): the failing record carries `$ck.<field>` shadow columns, the engine identifies its correlation group from those columns, and `retract_row` removes that record's specific contribution from every affected aggregate group while leaving every other contributing record intact.
+
+Failures **downstream** of a retraction-mode aggregate (a Transform that fails on an aggregate output row, an Output writer that rejects an aggregate row) are routed differently. Aggregate output rows do not carry the `$ck.<field>` shadow columns of their contributing source records — the retraction lattice intentionally drops those fields when `group_by` omits them, because one aggregate row's identity is the group, not any one source record. A downstream failure therefore lacks the per-source-record correlation key it would need to fan out to upstream peers, and the engine treats the failure as a single-record DLQ event tied to the earliest contributing source row. This is a known limitation: pipelines that need DLQ rollback for downstream-of-aggregate failures should keep `group_by ⊇ correlation_key` (the strict-collateral path) where each aggregate output row inherits a single correlation identity unambiguously.
 
 ### Combine interaction
 
-A combine's output rows inherit the **driver** input's correlation identity. Build-side records contribute fields to the output but their group identity is consumed by the hash or sort-merge match -- they do not reach the writer directly.
+Every combine declares `propagate_ck:` to select which correlation-key fields its output rows carry:
+
+- `propagate_ck: driver` -- output inherits only the driver input's correlation identity. Build-side records contribute fields to the output but their group identity is consumed by the match. Default-equivalent behavior; today's strict-correlation pipelines stay on this setting.
+- `propagate_ck: all` -- output carries the union of correlation-key fields across every input. Use when the build side carries CK fields that downstream operators need to read (for example, a build-side stream is also subject to correlation-driven DLQ on its own keys).
+- `propagate_ck: { named: [<field>, ...] }` -- output carries exactly the named subset, intersected with what is actually present upstream. Use to project a multi-field correlation key down to a single field after a join.
 
 ```yaml
 error_handling:
@@ -209,17 +222,66 @@ error_handling:
       emit employee_id = o.employee_id
       emit amount = o.amount
       emit dept = d.dept
+    propagate_ck: driver
 ```
 
-Output rows from `enriched` carry the `$ck.employee_id` value from the driver record, regardless of which department record matched. A trigger error on a driver record DLQ's that driver's whole correlation group, including any combine output rows that were already produced for that group.
+```yaml
+error_handling:
+  correlation_key: employee_id
 
-This rule holds across all combine execution paths: the hash-join path, the IEJoin range-predicate path, and chained combines (combine consuming the output of another combine).
+- type: combine
+  name: enriched_all
+  input:
+    o: orders
+    d: departments
+  config:
+    where: "o.employee_id == d.employee_id"
+    cxl: |
+      emit employee_id = o.employee_id
+      emit dept = d.dept
+    propagate_ck: all                  # union of every input's CK columns
+```
+
+Under `propagate_ck: driver`, output rows from `enriched` carry the `$ck.employee_id` value from the driver record, regardless of which department record matched. A trigger error on a driver record DLQ's that driver's whole correlation group, including any combine output rows that were already produced for that group.
+
+Under `propagate_ck: all` (or `{ named: [...] }`), the combine widens its output schema with the build-side `$ck.<field>` columns it propagates, and the runtime copies the matched build record's values into those columns. **Driver wins on a name collision**: if both the driver and a build input declare `$ck.<field>`, the column appears once on the output schema and the runtime keeps the driver's value -- the build's value would only land if the driver's slot was null, which never happens for a same-named CK field that the driver itself observes.
+
+Match-mode interaction:
+
+- `match: first` -- one matched build per driver row; that build's `$ck.<field>` fills the propagated slot.
+- `match: all` -- one output row per matched build; each row carries its own matched build's `$ck.<field>`.
+- `match: collect` -- one synthesized output row per driver. The propagated `$ck.<field>` slot is single-valued: the **first matched build's** CK fills it. Every matched build's full payload still rides inside the array column via `Value::Map`, so per-build lineage is preserved at the cost of single-valued addressing on the propagated slot.
+
+This rule holds across all combine execution paths: the hash-join path, the IEJoin range-predicate path, the grace-hash spill path, the sort-merge path, and chained combines (combine consuming the output of another combine).
 
 The `drive:` field on a combine selects which input is the driver. Choose the side that carries the authoritative group identity for downstream DLQ routing -- typically the larger or more transactional stream.
+
+`propagate_ck` is a required field with no default value -- every combine must spell out which propagation mode it uses. Existing pipelines migrate by adding `propagate_ck: driver` to keep today's behavior.
 
 ### Composition interaction
 
 A composition's body operates on records flowing in from the parent pipeline. The correlation-key shadow columns flow into composition inputs and back out the named ports unchanged. Compositions cannot define their own correlation key -- it is a pipeline-level concern.
+
+## Operator-by-operator retraction cost reference
+
+An aggregate whose `group_by` omits a correlation-key field activates the retraction protocol automatically. Each operator on the post-source DAG carries a different cost profile under retraction; the table below summarizes the per-operator footprint so you can size memory and pick `propagate_ck` settings before pipelines hit production.
+
+| Operator | Retraction cost |
+|---|---|
+| Source | None at retraction time. The CK shadow columns are stamped at ingest; replay never re-reads the source file. |
+| Transform | Re-evaluated against substituted upstream rows during sub-DAG replay. Cost = O(rows_substituted) per layer, no extra state held. Non-deterministic builtins (e.g. `now`) are rejected at compile time with E15W. |
+| Aggregate (strict, `group_by ⊇ correlation_key`) | None. Strict aggregates short-circuit to today's two-phase commit body and pay zero retraction overhead. |
+| Aggregate (retraction-mode, Reversible bindings) | Per-row lineage map `(input_row_id → group_index)` carried alongside accumulator state — ~8 bytes/row plus the per-group `input_rows` Vec inline cost. Retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. Reversible accumulators: `sum`, `count`, `collect`, `any`. |
+| Aggregate (retraction-mode, BufferRequired bindings) | Per-group raw contributions held until commit. Memory cost = O(input_rows × Σ binding_value_size). Retract recomputes affected groups from `contributions − retracted_rows`. BufferRequired accumulators: `min`, `max`, `avg`, `weighted_avg`. |
+| Combine (driver propagation) | One propagated `$ck.<field>` slot from the driver record. No retraction state held by the combine itself; replay carries upstream deltas through. |
+| Combine (`propagate_ck: all` / `named: [...]`) | Same per-row cost as driver propagation, plus the widened output schema's `$ck.<field>` columns must be re-populated on replay. Cost scales with the output schema width, not retraction frequency. |
+| Window (streaming) | None — streaming windows are incompatible with a retraction-mode aggregate whose dropped CK fields overlap `partition_by`. The plan-time derivation switches such windows into buffer mode. |
+| Window (buffer-mode) | Per-partition raw row buffers held until commit. Memory cost = O(largest partition × per-row-size). Retract reruns the configured `$window.*` evaluation over `partition − retracted_rows`. Covers all 13 `$window.*` builtins uniformly via wholesale recompute. |
+| Output | Holds retracted rows in `correlation_buffers` until commit. Replay substitutes the post-retract row in place; clean records flush to the writer, dirty records DLQ per the resolved `correlation_fanout_policy`. |
+
+The `--explain` output's `=== Retraction ===` section reports the live per-aggregate / per-window detail derived from the current pipeline. The `clinker metrics collect` spool reports the runtime counterpart: `correlation.retract.groups_recomputed`, `.partitions_recomputed`, `.subdag_replay_rows`, `.output_rows_retracted_total`, `.degrade_fallback_count`. Use the explain block for plan-time capacity sizing, the metrics spool for post-run confirmation.
+
+When retraction's preconditions break at runtime (an aggregate spilled before retract reached it, or a window partition exceeded the memory budget), the orchestrator degrades to "DLQ entire affected group/partition" — the same strict-collateral DLQ shape every aggregate uses on the strict path. Each degrade increments `correlation.retract.degrade_fallback_count`; persistent non-zero values point at a tighter memory budget or a smaller correlation key cardinality.
 
 ## Debugging
 

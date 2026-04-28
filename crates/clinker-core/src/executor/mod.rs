@@ -1,7 +1,8 @@
 pub mod stage_metrics;
 
 pub mod combine;
-mod dispatch;
+pub(crate) mod commit;
+pub(crate) mod dispatch;
 mod schema_check;
 
 use std::collections::{HashMap, HashSet};
@@ -280,7 +281,7 @@ pub struct CompiledTransform {
 }
 
 impl CompiledTransform {
-    fn has_distinct(&self) -> bool {
+    pub(crate) fn has_distinct(&self) -> bool {
         self.typed
             .program
             .statements
@@ -1356,6 +1357,10 @@ impl PipelineExecutor {
             indices,
             correlation_buffers,
             correlation_max_group_buffer,
+            relaxed_aggregator_states: HashMap::new(),
+            relaxed_aggregator_degrade: Vec::new(),
+            relaxed_window_states: HashMap::new(),
+            commit_step_path: dispatch::CommitStepPath::NotSelected,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2204,12 +2209,68 @@ fn recover_engine_stamped_value(
     clinker_record::Value::Null
 }
 
+/// Copy build-side `$ck.<field>` columns from `build` into `out` per
+/// the combine's `propagate_ck` spec. Driver wins on collision: if
+/// `out` already carries a non-null value for the column (because
+/// `widen_record_to_schema(driver, …)` filled it), the build value is
+/// not written. This is the single runtime CK-copy path used by every
+/// combine strategy (HashBuildProbe, IEJoin, GraceHash, SortMerge);
+/// keeping the policy here means a strategy never has to encode the
+/// `$ck` semantics itself.
+///
+/// `Driver` is the no-op — keeps today's behavior so existing combines
+/// migrated to `propagate_ck: driver` produce identical output. `All`
+/// copies every `$ck.*` column the build record carries. `Named(set)`
+/// copies only the listed CK fields.
+pub(crate) fn copy_build_ck_columns(
+    out: &mut Record,
+    build: &Record,
+    spec: &crate::config::pipeline_node::PropagateCkSpec,
+) {
+    use crate::config::pipeline_node::PropagateCkSpec;
+    if matches!(spec, PropagateCkSpec::Driver) {
+        return;
+    }
+    let build_schema = Arc::clone(build.schema());
+    for (idx, col) in build_schema.columns().iter().enumerate() {
+        let Some(field_name) = col.strip_prefix("$ck.") else {
+            continue;
+        };
+        let allowed = match spec {
+            PropagateCkSpec::Driver => false,
+            PropagateCkSpec::All => true,
+            PropagateCkSpec::Named(names) => names.contains(field_name),
+        };
+        if !allowed {
+            continue;
+        }
+        if out.schema().index(col.as_ref()).is_none() {
+            // Output schema didn't widen for this column — the
+            // plan-time `combine_output_row` filtered it out
+            // already. Skip rather than silently lose data.
+            continue;
+        }
+        // Driver wins on collision: a non-null value at this slot
+        // came from the driver via `widen_record_to_schema`. Only
+        // fill when the slot is still null.
+        match out.get(col.as_ref()) {
+            Some(clinker_record::Value::Null) | None => {
+                let v = &build.values()[idx];
+                out.set(col.as_ref(), v.clone());
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 /// Widen `input`'s schema in place to include every key in `emitted`
 /// that is not already declared. Allocates a fresh `Arc<Schema>` only
 /// when new names appear; otherwise clones `input`. Used by the legacy
 /// linear pipeline path where the emit set is determined at eval time
-/// rather than via a plan-time `output_schema`.
-fn record_with_emitted_fields(
+/// rather than via a plan-time `output_schema`, and by the
+/// commit-phase window recompute which materializes new output rows
+/// against the same emit shape the dispatcher's window arm produced.
+pub(crate) fn record_with_emitted_fields(
     input: &Record,
     emitted: &IndexMap<String, clinker_record::Value>,
 ) -> Record {
@@ -2349,6 +2410,8 @@ mod tests {
     mod aggregation;
     mod branching;
     mod correlated_dlq;
+    mod correlated_dlq_retract;
+    mod correlated_window_retract;
     mod format_dispatch;
     mod multi_output;
 }

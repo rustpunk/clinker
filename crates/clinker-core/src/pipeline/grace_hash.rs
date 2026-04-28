@@ -349,6 +349,10 @@ pub(crate) struct GraceHashExec<'a> {
     pub on_miss: OnMiss,
     /// Initial partition bit width supplied by the planner.
     pub partition_bits: u8,
+    /// Build-side `$ck.<field>` propagation policy. Threaded uniformly
+    /// across every combine strategy and consumed by
+    /// `copy_build_ck_columns` at each emit site.
+    pub propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a mut MemoryBudget,
     /// Pipeline-scoped spill directory. Owned by the executor's
@@ -774,6 +778,7 @@ pub(crate) fn execute_combine_grace_hash(
         match_mode,
         on_miss,
         partition_bits,
+        propagate_ck,
         ctx,
         budget,
         spill_dir,
@@ -893,6 +898,7 @@ pub(crate) fn execute_combine_grace_hash(
         match_mode,
         on_miss,
         build_qualifier,
+        propagate_ck,
     };
 
     for (probe_record, rn) in driver_records {
@@ -1627,6 +1633,7 @@ struct EmitArgs<'a> {
     match_mode: MatchMode,
     on_miss: OnMiss,
     build_qualifier: &'a str,
+    propagate_ck: &'a crate::config::pipeline_node::PropagateCkSpec,
 }
 
 /// Per-probe emission. Walks the probe iterator, applies the residual
@@ -1650,10 +1657,12 @@ fn emit_for_probe<'a>(
         match_mode,
         on_miss,
         build_qualifier,
+        propagate_ck,
     } = *args;
     match match_mode {
         MatchMode::Collect => {
             let mut arr: Vec<Value> = Vec::new();
+            let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for cand in probe_iter {
                 if let Some(residual) = decomposed.residual.as_ref() {
@@ -1669,6 +1678,9 @@ fn emit_for_probe<'a>(
                 if arr.len() >= COLLECT_PER_GROUP_CAP {
                     truncated = true;
                     break;
+                }
+                if first_build.is_none() {
+                    first_build = Some(cand.record.clone());
                 }
                 let mut m: indexmap::IndexMap<Box<str>, Value> = indexmap::IndexMap::new();
                 for (fname, val) in cand.record.iter_all_fields() {
@@ -1687,6 +1699,9 @@ fn emit_for_probe<'a>(
                 Some(s) => widen_record_to_schema(probe_record, s),
                 None => probe_record.clone(),
             };
+            if let Some(b) = first_build.as_ref() {
+                crate::executor::copy_build_ck_columns(&mut rec, b, propagate_ck);
+            }
             rec.set(build_qualifier, Value::Array(arr));
             output.push((rec, rn));
         }
@@ -1771,6 +1786,7 @@ fn emit_for_probe<'a>(
                             for (k, v) in metadata {
                                 let _ = rec.set_meta(&k, v);
                             }
+                            crate::executor::copy_build_ck_columns(&mut rec, m, propagate_ck);
                             output.push((rec, rn));
                         }
                         Ok(EvalResult::Skip(_)) => {}
@@ -2238,6 +2254,7 @@ mod tests {
             match_mode: crate::config::pipeline_node::MatchMode::All,
             on_miss: crate::config::pipeline_node::OnMiss::Skip,
             partition_bits: 4,
+            propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
@@ -2426,6 +2443,7 @@ mod tests {
             match_mode: crate::config::pipeline_node::MatchMode::All,
             on_miss: crate::config::pipeline_node::OnMiss::Skip,
             partition_bits: 4,
+            propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
@@ -2607,6 +2625,7 @@ mod tests {
             match_mode: crate::config::pipeline_node::MatchMode::All,
             on_miss: crate::config::pipeline_node::OnMiss::Skip,
             partition_bits: 4,
+            propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
             budget: &mut budget,
             spill_dir: dir.path(),
@@ -2865,6 +2884,7 @@ mod tests {
             match_mode: h.emit.match_mode,
             on_miss: h.emit.on_miss,
             build_qualifier: &h.emit.build_qualifier,
+            propagate_ck: &crate::config::pipeline_node::PropagateCkSpec::Driver,
         };
         let eval_ctx = EvalContext {
             stable: &h.stable,

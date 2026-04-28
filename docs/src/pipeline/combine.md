@@ -20,6 +20,7 @@ Combine is distinct from merge: merge concatenates upstream branches that share 
       emit order_id = orders.order_id
       emit product_name = products.product_name
       emit amount = orders.amount
+    propagate_ck: driver
 ```
 
 Note the differences from other node types:
@@ -53,6 +54,7 @@ Iteration order in the `input:` map is preserved and used as the default driver-
 | `cxl` | Yes (except under `match: collect`) | -- | Emit statements defining the output row. Empty under `match: collect`. |
 | `drive` | No | first input | Explicit driver-input qualifier. Overrides the iteration-order default. |
 | `strategy` | No | `auto` | Execution strategy hint: `auto` or `grace_hash`. |
+| `propagate_ck` | Yes | -- | Selects which correlation-key columns ride onto the output. `driver` keeps the driver's CK only; `all` unions every input's CK columns; `{ named: [<field>, ...] }` carries an explicit subset. See [Correlation-key propagation](#correlation-key-propagation) below. |
 
 ## The `where:` predicate
 
@@ -180,6 +182,7 @@ Combine accepts any number of inputs. Each pair of inputs that should be related
       emit product_name = products.product_name
       emit category_name = categories.name
       emit amount = orders.amount
+    propagate_ck: driver
 ```
 
 The planner builds a join tree by walking equalities pairwise and ordering the joins by selectivity.
@@ -210,6 +213,41 @@ With `drive: products`, the pipeline emits one row per product enriched with a m
 | `grace_hash` | Force grace hash join (disk-spilling partitioned hash). Applies only to pure-equi predicates; ignored on predicates with range conjuncts. |
 
 `grace_hash` is the right hint when build-side inputs are larger than the memory budget but fit on disk after partitioning. The planner falls back automatically to grace-hash spill when an in-memory hash table approaches the RSS soft limit, so `strategy: grace_hash` is mostly an explicit assertion for performance reasoning.
+
+## Correlation-key propagation
+
+Combine declares which correlation-key columns its output rows carry via the required `propagate_ck` field. The choice shapes both the combine's compile-time output schema and the runtime record builder.
+
+```yaml
+- type: combine
+  name: enriched
+  input:
+    orders: orders
+    products: products
+  config:
+    where: "orders.product_id == products.product_id"
+    cxl: |
+      emit order_id = orders.order_id
+      emit product_name = products.name
+    propagate_ck: driver        # driver-only (today's behavior)
+```
+
+```yaml
+    propagate_ck: all           # union of every input's $ck.* columns
+```
+
+```yaml
+    propagate_ck:
+      named: [order_id]         # explicit subset (intersected with upstream)
+```
+
+- `driver` -- output schema carries only the driver input's `$ck.<field>` columns. Build-side records contribute body fields; their CK identity is consumed by the match.
+- `all` -- output schema carries every input's `$ck.<field>` columns; the runtime copies build-side values onto each output row alongside the body's `emit` columns. Use when the build side carries CK fields downstream operators need to read.
+- `named: [<field>, ...]` -- explicit subset, intersected with what's actually present upstream. Use to project a multi-field CK down to a single field after a join.
+
+Driver wins on a name collision: if both the driver and a build input declare `$ck.<field>`, the column appears once on the output schema and the runtime keeps the driver's value. See the [Correlation-key combine interaction](correlation-keys.md#combine-interaction) reference for match-mode interaction details (especially `match: collect`, where the propagated slot is single-valued and the array column preserves full lineage).
+
+`propagate_ck` is required on every combine; pipelines without an explicit value fail to compile. Existing pipelines migrate by adding `propagate_ck: driver`, which is bit-for-bit equivalent to today's behavior.
 
 ## Memory considerations
 
@@ -259,6 +297,7 @@ nodes:
         emit product_name = products.product_name
         emit category = products.category
         emit amount = orders.amount
+      propagate_ck: driver
 
   - type: output
     name: result

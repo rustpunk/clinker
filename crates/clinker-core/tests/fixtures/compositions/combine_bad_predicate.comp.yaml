@@ -31,3 +31,4 @@ nodes:
       on_miss: null_fields
       cxl: |
         emit x = a.x
+      propagate_ck: driver

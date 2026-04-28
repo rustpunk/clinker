@@ -52,6 +52,7 @@ nodes:
         emit customer_id = customers.f0
         emit customer_name = customers.f1 ?? "UNKNOWN"
         emit customer_tier = customers.f3 ?? "standard"
+      propagate_ck: driver
 
   - type: output
     name: enriched_out

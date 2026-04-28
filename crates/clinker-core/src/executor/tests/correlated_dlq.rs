@@ -472,9 +472,14 @@ nodes:
 }
 
 #[test]
-fn correlation_key_aggregate_group_by_must_be_superset() {
-    // P.2: E151 — Aggregate group_by must include every
-    // correlation_key field.
+fn correlation_key_aggregate_group_by_subset_compiles_into_retraction_mode() {
+    // Aggregate `group_by` that omits a correlation-key field is no
+    // longer a compile-time error — it routes the aggregate through
+    // the retraction protocol automatically. The pipeline must compile
+    // cleanly and the planner must flip the per-aggregate
+    // retraction-strategy flag (`requires_lineage` for the all-Reversible
+    // bindings here) so the executor's retain-finalize-into-state path
+    // takes over from the strict consume-and-discard finalize.
     let yaml = r#"
 pipeline:
   name: corr_with_agg
@@ -514,36 +519,48 @@ nodes:
     include_unmapped: true
 "#;
     let config = crate::config::parse_config(yaml).unwrap();
-    let result = config.compile(&crate::config::CompileContext::default());
-    let diags = result.expect_err("E151 should reject correlation_key not in group_by");
+    let plan = config
+        .compile(&crate::config::CompileContext::default())
+        .expect("retraction-mode aggregate must compile, not error");
+    let agg_node = plan
+        .dag()
+        .graph
+        .node_weights()
+        .find_map(|n| match n {
+            crate::plan::execution::PlanNode::Aggregation { name, compiled, .. }
+                if name == "agg" =>
+            {
+                Some(compiled.clone())
+            }
+            _ => None,
+        })
+        .expect("agg node present after compile");
     assert!(
-        diags.iter().any(|d| d.code == "E151"),
-        "expected an E151 diagnostic, got: {:?}",
-        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        agg_node.requires_lineage,
+        "all-Reversible bindings (sum) under retraction mode must enable lineage"
     );
+    assert!(!agg_node.requires_buffer_mode);
 }
 
 #[test]
 fn aggregate_output_inherits_correlation_meta() {
-    // An aggregate that satisfies E151's group_by-superset invariant
-    // must have its emitted rows participate in correlation rollback.
-    // When a transform error fails one record in group A, the
-    // surviving A records still flow into the aggregator and produce
-    // one (A, total) output row — that aggregate row is the ONLY
-    // thing the Output arm sees for group A, so it must inherit the
-    // correlation meta and route into cell [A] alongside the trigger
-    // error. The whole group then DLQs uniformly: one trigger for
-    // the bad source row plus one collateral for the aggregate
-    // output row. Group B is clean and its aggregate row flushes to
-    // the writer.
+    // A strict aggregate (`group_by ⊇ correlation_key`) must have its
+    // emitted rows participate in correlation rollback. When a transform
+    // error fails one record in group A, the surviving A records still
+    // flow into the aggregator and produce one (A, total) output row —
+    // that aggregate row is the ONLY thing the Output arm sees for
+    // group A, so it must inherit the correlation meta and route into
+    // cell [A] alongside the trigger error. The whole group then DLQs
+    // uniformly: one trigger for the bad source row plus one collateral
+    // for the aggregate output row. Group B is clean and its aggregate
+    // row flushes to the writer.
     //
     // Mechanism: every record in a group carries the same
-    // `$ck.employee_id` snapshot column stamped at Source ingest. The
-    // E151 group_by ⊇ correlation_key.fields() invariant requires the
-    // user to list every correlation-key field in the Aggregate's
-    // group_by, so the snapshot column propagates positionally onto
-    // the aggregate output row and the buffer-key extractor finds
-    // the same group identity on the emitted row.
+    // `$ck.employee_id` snapshot column stamped at Source ingest. With
+    // `group_by ⊇ correlation_key.fields()`, the snapshot column
+    // propagates positionally onto the aggregate output row and the
+    // buffer-key extractor finds the same group identity on the
+    // emitted row.
     //
     // Without that propagation the aggregate row for A would land in
     // a distinct null-keyed buffer cell, group A's writer-side buffer
@@ -843,6 +860,7 @@ nodes:
       emit employee_id = o.employee_id
       emit amount_int = o.amount_int
       emit dept = d.dept
+    propagate_ck: driver
 
 - type: output
   name: out
@@ -1018,6 +1036,7 @@ nodes:
       emit product_name = p.name
       emit category_name = c.category_name
       emit amount_int = o.amount_int
+    propagate_ck: driver
 
 - type: output
   name: out
@@ -1237,6 +1256,7 @@ nodes:
       emit amount_int = o.amount_int
       emit event_time = o.event_time
       emit session_start = s.session_start
+    propagate_ck: driver
 
 - type: output
   name: out

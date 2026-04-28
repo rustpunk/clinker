@@ -31,6 +31,7 @@ nodes:
       where: "orders.product_id == products.product_id"
       cxl: |
         emit order_id = orders.order_id
+      propagate_ck: driver
   - type: output
     name: reserved_out
     input: reserved

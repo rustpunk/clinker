@@ -626,6 +626,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 .collect(),
             dlq_path,
             error: None,
+            retraction: clinker_core::metrics::RetractionMetrics::from(&counters.retraction),
         };
 
         if let Err(e) = metrics::write_spool(&execution_metrics, dir) {
@@ -718,7 +719,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 return Err(format!(
-                    "unknown diagnostic code '{code}'. Valid codes: E101-E108, E110, W101"
+                    "unknown diagnostic code '{code}'. Valid codes: E101-E108, E110, E15W, E15Y, W101"
                 )
                 .into());
             }

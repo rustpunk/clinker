@@ -1441,6 +1441,7 @@ mod tests {
         for c in 'a'..='h' {
             yaml.push_str(&format!("        emit {c}_val = {c}.{c}_val\n", c = c));
         }
+        yaml.push_str("      propagate_ck: driver\n");
         yaml.push_str("  - type: output\n    name: joined8_out\n    input: joined8\n    config:\n");
         yaml.push_str("      name: joined8_out\n      type: csv\n      path: /tmp/joined8.csv\n");
 
@@ -1657,6 +1658,7 @@ nodes:
       where: "orders.order_id == products.order_id"
       cxl: |
         emit order_id = orders.order_id
+      propagate_ck: driver
 "#;
         let config = parse_fixture(yaml);
         let diags = config
@@ -1742,6 +1744,7 @@ nodes:
       where: "orders.order_id == products.order_id"
       cxl: |
         emit order_id = orders.order_id
+      propagate_ck: driver
 "#;
         let config = parse_fixture(yaml);
         let diags = config
@@ -2331,6 +2334,7 @@ nodes:
         emit order_id = orders.order_id
         emit product_name = products.product_name
         emit quantity = orders.quantity
+      propagate_ck: driver
   - type: output
     name: result
     input: enrich
@@ -2377,6 +2381,7 @@ nodes:
       cxl: |
         emit employee_id = employees.employee_id
         emit rate_class = rate_bands.rate_class
+      propagate_ck: driver
   - type: output
     name: result
     input: classify
@@ -2421,6 +2426,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit product_name = products.product_name
+      propagate_ck: driver
   - type: output
     name: result
     input: enrich
@@ -2466,6 +2472,7 @@ nodes:
         emit employee_id = employees.employee_id
         emit department = employees.department
         emit project = assignments.project
+      propagate_ck: driver
   - type: output
     name: result
     input: enrich
@@ -2512,6 +2519,7 @@ nodes:
         emit employee_id = employees.employee_id
         emit department = employees.department
         emit project = assignments.project
+      propagate_ck: driver
   - type: output
     name: result
     input: enrich
@@ -2662,6 +2670,7 @@ nodes:
         emit product_name = products.product_name
         emit category = products.category
         emit weight_kg = products.weight_kg
+      propagate_ck: driver
   - type: route
     name: priority_split
     input: product_lookup
@@ -2736,6 +2745,7 @@ nodes:
         emit quantity = orders.f2
         emit product_name = products.f1 ?? "UNKNOWN"
         emit priority = orders.f3
+      propagate_ck: driver
   - type: route
     name: priority_split
     input: enrich
@@ -3085,6 +3095,7 @@ nodes:
         emit product_id = orders.product_id
         emit product_name = products.name
         emit amount = orders.amount
+      propagate_ck: driver
   - type: output
     name: enriched_out
     input: enriched
@@ -3191,6 +3202,7 @@ nodes:
       match: collect
       on_miss: null_fields
       cxl: ""
+      propagate_ck: driver
   - type: output
     name: collected_out
     input: collected
@@ -3263,6 +3275,7 @@ nodes:
       match: collect
       on_miss: null_fields
       cxl: ""
+      propagate_ck: driver
   - type: output
     name: collected_out
     input: collected
@@ -3334,6 +3347,7 @@ nodes:
       match: collect
       on_miss: null_fields
       cxl: ""
+      propagate_ck: driver
   - type: output
     name: collected_out
     input: collected
@@ -3485,6 +3499,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit product_name = products.name
+      propagate_ck: driver
   - type: output
     name: enriched_out
     input: enriched
@@ -3557,6 +3572,7 @@ nodes:
         emit order_id = orders.order_id
         emit amount = orders.amount
         emit product_name = products.name
+      propagate_ck: driver
   - type: output
     name: filtered_out
     input: filtered
@@ -3631,6 +3647,7 @@ nodes:
       cxl: |
         emit order_id = orders.order_id
         emit product_name = products.name
+      propagate_ck: driver
   - type: output
     name: joined_out
     input: joined
@@ -3850,6 +3867,7 @@ nodes:
         emit id = drivers.id
         emit x = drivers.x
         emit lo = builds.lo
+      propagate_ck: driver
   - type: output
     name: bnd_out
     input: bnd
@@ -3989,6 +4007,7 @@ nodes:
         emit bid = builds.bid
         emit x = drivers.x
         emit y = builds.y
+      propagate_ck: driver
   - type: output
     name: pure_range_out
     input: pure_range
@@ -4058,6 +4077,7 @@ nodes:
         emit id = drivers.id
         emit x = drivers.x
         emit bid = builds.bid
+      propagate_ck: driver
   - type: output
     name: first_only_out
     input: first_only
@@ -4235,6 +4255,7 @@ nodes:
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: clinker_core::config::pipeline_node::MatchMode::First,
             on_miss: clinker_core::config::pipeline_node::OnMiss::NullFields,
+            propagate_ck: clinker_core::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
@@ -4354,6 +4375,7 @@ nodes:
       emit a_c0 = a.c0
       emit b_c0 = b.c0
       emit c_c0 = c.c0
+    propagate_ck: driver
 - type: output
   name: out
   input: joined3
@@ -4448,6 +4470,7 @@ nodes:
       emit key = probe.key
       emit probe_c0 = probe.c0
       emit build_c0 = build.c0
+    propagate_ck: driver
 - type: output
   name: out
   input: joined

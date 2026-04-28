@@ -45,6 +45,7 @@ nodes:
         emit event_end = events.end
         emit session_start = sessions.start_ts
         emit session_end = sessions.end_ts
+      propagate_ck: driver
   - type: output
     name: overlapping_out
     input: overlapping
