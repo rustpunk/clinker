@@ -473,12 +473,10 @@ pub(crate) fn dispatch_plan_node(
                             // The reader's `Arc<Schema>` covers the user-declared
                             // columns; the plan-time target may extend that with
                             // engine-stamped tail columns (`$ck.<field>` shadow
-                            // columns from `error_handling.correlation_key`
+                            // columns from each source's own `correlation_key:`
                             // widening). Reader columns must equal the user-
                             // declared prefix of the target; tail slots are
-                            // filled by the snapshot stamp below. Build sources
-                            // missing a correlation-key field stamp `Value::Null`
-                            // — the Combine arm later inherits the driver's tag.
+                            // filled by the snapshot stamp below.
                             debug_assert!(
                                 target
                                     .columns()

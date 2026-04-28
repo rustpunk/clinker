@@ -99,16 +99,17 @@ pipeline:
   name: ck_driver_schema
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: lookup
     config: { name: lookup, type: csv, path: lookup.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: tier, type: string } ] }
   - type: combine
@@ -153,17 +154,18 @@ pipeline:
   name: ck_all_schema
 error_handling:
   strategy: continue
-  correlation_key: [order_id, customer_id]
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: ledger_ref, type: string } ] }
@@ -207,17 +209,18 @@ pipeline:
   name: ck_named_schema
 error_handling:
   strategy: continue
-  correlation_key: [order_id, customer_id]
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: ledger_ref, type: string } ] }
@@ -272,16 +275,17 @@ pipeline:
   name: ck_all_runtime
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: ledger_ref, type: string } ] }
   - type: combine
@@ -347,16 +351,17 @@ pipeline:
   name: ck_driver_runtime
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: ledger_ref, type: string } ] }
   - type: combine
@@ -415,16 +420,17 @@ pipeline:
   name: ck_collision
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: side
     config: { name: side, type: csv, path: side.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: tag, type: string } ] }
   - type: combine
@@ -471,16 +477,17 @@ pipeline:
   name: ck_collect_all
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: events
     config: { name: events, type: csv, path: events.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: kind, type: string } ] }
   - type: combine
@@ -525,21 +532,23 @@ pipeline:
   name: ck_chain
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: a_src
     config: { name: a_src, type: csv, path: a.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: a_val, type: string } ] }
   - type: source
     name: b_src
     config: { name: b_src, type: csv, path: b.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: b_val, type: string } ] }
   - type: source
     name: c_src
     config: { name: c_src, type: csv, path: c.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: c_val, type: string } ] }
   - type: combine
@@ -605,16 +614,17 @@ pipeline:
   name: ck_parity_{strategy}
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: {{ name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ {{ name: order_id, type: string }},
                         {{ name: amount, type: int }} ] }}
   - type: source
     name: ledger
     config: {{ name: ledger, type: csv, path: ledger.csv,
+              correlation_key: order_id,
               schema: [ {{ name: order_id, type: string }},
                         {{ name: ledger_ref, type: string }} ] }}
   - type: combine

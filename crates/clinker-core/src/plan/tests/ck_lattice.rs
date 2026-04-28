@@ -53,7 +53,6 @@ pipeline:
   name: ck_lattice_strict
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
@@ -61,6 +60,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: amount, type: int }
@@ -104,7 +104,6 @@ pipeline:
   name: ck_lattice_relaxed
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
@@ -112,6 +111,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: department, type: string }
@@ -157,7 +157,6 @@ pipeline:
   name: ck_lattice_combine_driver
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
@@ -165,6 +164,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: product_id, type: string }
@@ -204,14 +204,17 @@ nodes:
     let plan = compile(yaml);
     let expected = set_of(&["order_id"]);
     assert_eq!(ck_set_for(&plan, "orders"), expected);
-    assert_eq!(ck_set_for(&plan, "products"), expected);
+    // Per-source CK: `products` declares no `correlation_key:`, so its
+    // lattice set is empty.
+    assert_eq!(ck_set_for(&plan, "products"), BTreeSet::new());
     assert_eq!(ck_set_for(&plan, "enriched"), expected);
     assert_eq!(ck_set_for(&plan, "out"), expected);
 }
 
 /// `propagate_ck: all` unions every parent's CK set on the combine
-/// output. Both inputs see the same pipeline-level `correlation_key`,
-/// so the union equals each parent's set.
+/// output. With per-source CK, each source declares its own key
+/// independently — `orders` carries `order_id` and `products` carries
+/// `product_id`, so the combine's union is `{order_id, product_id}`.
 #[test]
 fn ck_lattice_combine_all() {
     let yaml = r#"
@@ -219,7 +222,6 @@ pipeline:
   name: ck_lattice_combine_all
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
@@ -227,6 +229,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: product_id, type: string }
@@ -236,6 +239,7 @@ nodes:
       name: products
       type: csv
       path: products.csv
+      correlation_key: product_id
       schema:
         - { name: product_id, type: string }
         - { name: name, type: string }
@@ -250,6 +254,7 @@ nodes:
       on_miss: skip
       cxl: |
         emit order_id = o.order_id
+        emit product_id = o.product_id
         emit name = p.name
       propagate_ck: all
   - type: output
@@ -261,8 +266,14 @@ nodes:
       path: out.csv
 "#;
     let plan = compile(yaml);
-    assert_eq!(ck_set_for(&plan, "enriched"), set_of(&["order_id"]));
-    assert_eq!(ck_set_for(&plan, "out"), set_of(&["order_id"]));
+    assert_eq!(
+        ck_set_for(&plan, "enriched"),
+        set_of(&["order_id", "product_id"])
+    );
+    assert_eq!(
+        ck_set_for(&plan, "out"),
+        set_of(&["order_id", "product_id"])
+    );
 }
 
 /// `propagate_ck: { named: [...] }` selects an explicit subset
@@ -277,7 +288,6 @@ pipeline:
   name: ck_lattice_combine_named
 error_handling:
   strategy: continue
-  correlation_key: [order_id, customer_id]
 nodes:
   - type: source
     name: orders
@@ -285,6 +295,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: [order_id, customer_id]
       schema:
         - { name: order_id, type: string }
         - { name: customer_id, type: string }
@@ -295,6 +306,7 @@ nodes:
       name: products
       type: csv
       path: products.csv
+      correlation_key: [order_id, customer_id]
       schema:
         - { name: order_id, type: string }
         - { name: customer_id, type: string }
@@ -339,7 +351,6 @@ pipeline:
   name: ck_lattice_merge
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: east
@@ -347,6 +358,7 @@ nodes:
       name: east
       type: csv
       path: east.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: amount, type: int }
@@ -356,6 +368,7 @@ nodes:
       name: west
       type: csv
       path: west.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: amount, type: int }
@@ -390,7 +403,6 @@ pipeline:
   name: e15y_gate
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
@@ -398,6 +410,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: order_id
       sort_order: [department]
       schema:
         - { name: order_id, type: string }
@@ -520,7 +533,6 @@ pipeline:
   name: properties_coverage
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
@@ -528,6 +540,7 @@ nodes:
       name: orders
       type: csv
       path: orders.csv
+      correlation_key: order_id
       schema:
         - { name: order_id, type: string }
         - { name: amount, type: int }

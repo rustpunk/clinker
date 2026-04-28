@@ -52,13 +52,13 @@ pipeline:
   name: retract_metrics_test
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -102,13 +102,13 @@ pipeline:
   name: strict_metrics_test
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }

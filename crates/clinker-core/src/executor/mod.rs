@@ -1294,8 +1294,8 @@ impl PipelineExecutor {
         );
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
-        // Correlation grouping context. `Some(...)` iff
-        // `error_handling.correlation_key` is set; the planner's
+        // Correlation grouping context. `Some(...)` iff at least one
+        // source declares a `correlation_key:`; the planner's
         // `inject_correlation_commit` pass guarantees a terminal
         // `PlanNode::CorrelationCommit` is also present so the
         // dispatcher walks the buffers at end-of-DAG. Group identity
@@ -1305,12 +1305,11 @@ impl PipelineExecutor {
         // `FieldMetadata`, so the executor context only needs to know
         // whether buffering is active and the per-group cap.
         let (correlation_buffers, correlation_max_group_buffer) =
-            match config.error_handling.correlation_key.as_ref() {
-                Some(_) => {
-                    let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
-                    (Some(HashMap::new()), cap)
-                }
-                None => (None, 0),
+            if config.any_source_has_correlation_key() {
+                let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
+                (Some(HashMap::new()), cap)
+            } else {
+                (None, 0)
             };
 
         // Construct the dispatcher context. Mutable per-walk state

@@ -111,8 +111,8 @@ The orchestrator routes the failing row through four phases:
 ## Reference
 
 - [`docs/src/pipeline/correlation-keys.md`](../../../docs/src/pipeline/correlation-keys.md) — the
-  `error_handling.correlation_key` field, `$ck.<field>` shadow
-  columns, and the strict-vs-relaxed routing rule.
+  per-source `correlation_key:` field, `$ck.<field>` shadow columns,
+  and the strict-vs-relaxed routing rule.
 - [`docs/src/pipeline/aggregate.md`](../../../docs/src/pipeline/aggregate.md) — Aggregate node
   `group_by` and binding semantics.
 - [`docs/src/pipeline/combine.md`](../../../docs/src/pipeline/combine.md) — Combine node

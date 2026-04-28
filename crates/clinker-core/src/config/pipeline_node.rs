@@ -662,6 +662,14 @@ pub struct SourceBody {
     /// missing this field is a serde parse error routed to E201 via
     /// the diagnostic layer.
     pub schema: SchemaDecl,
+    /// Per-source correlation key. When set, widens this source's
+    /// schema with one `$ck.<field>` shadow column per listed field
+    /// and triggers grouped DLQ for records sharing the key value.
+    /// Independent per source — multi-source pipelines declare CK on
+    /// each source separately (a missing field declaration means that
+    /// source has no CK and DLQs per-record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_key: Option<crate::config::CorrelationKey>,
     #[serde(flatten)]
     pub source: crate::config::SourceConfig,
 }
@@ -749,10 +757,10 @@ pub type AnalyticWindowSpec = serde_json::Value;
 /// Aggregate variant body. Peer to Transform (no longer nested).
 ///
 /// Whether the engine routes this aggregate through retraction-aware
-/// machinery is content-derived from `group_by` against the pipeline-level
-/// `error_handling.correlation_key`: aggregates whose `group_by` lists
-/// every correlation-key field stay on the strict-collateral two-phase
-/// commit; aggregates that omit any correlation-key field activate the
+/// machinery is content-derived from `group_by` against the visible
+/// upstream correlation-key set: aggregates whose `group_by` covers
+/// every CK field flowing in stay on the strict-collateral two-phase
+/// commit; aggregates that omit any visible CK field activate the
 /// relaxed lattice and the five-phase commit. Authors do not configure
 /// this — the engine inspects the configuration and selects the path.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -123,7 +123,6 @@ pipeline:
   name: correlation_composition_validate
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
   - type: source
     name: src
@@ -131,6 +130,7 @@ nodes:
       name: src
       type: csv
       path: in.csv
+      correlation_key: employee_id
       schema:
         - { name: employee_id, type: string }
         - { name: value, type: string }
@@ -211,7 +211,6 @@ pipeline:
   name: correlation_composition_rewrite
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
   - type: source
     name: src
@@ -219,6 +218,7 @@ nodes:
       name: src
       type: csv
       path: in.csv
+      correlation_key: employee_id
       schema:
         - { name: employee_id, type: string }
         - { name: value, type: string }

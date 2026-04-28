@@ -27,17 +27,18 @@ use std::collections::BTreeSet;
 pub struct NodeProperties {
     pub ordering: Ordering,
     pub partitioning: Partitioning,
-    /// Closed-schema set of pipeline-level correlation-key field names
-    /// visible at this node's output. Computed at compile time by
-    /// walking the DAG topologically. Empty when the pipeline has no
-    /// `error_handling.correlation_key` declared, or when an upstream
-    /// relaxed Aggregate / driver-only Combine dropped every CK field
-    /// before reaching this node.
+    /// Closed-schema set of correlation-key field names visible at this
+    /// node's output, computed at compile time by walking the DAG
+    /// topologically. Each entry is a bare CK field name (e.g.
+    /// `order_id`); the corresponding shadow column on the runtime
+    /// schema is `$ck.<field>`. Empty when no upstream source declared
+    /// a `correlation_key:`, or when an upstream relaxed Aggregate /
+    /// driver-only Combine dropped every CK field before reaching this
+    /// node.
     ///
-    /// The set tracks which `$ck.<field>` shadow columns reach a
-    /// downstream consumer, not the per-record runtime correlation
-    /// buffer key (which remains keyed by the full pipeline-level
-    /// correlation_key tuple).
+    /// Multi-source pipelines union per-source CK fields at every Merge
+    /// / Combine that propagates them; the lattice value here is the
+    /// post-union view at this specific node.
     pub ck_set: BTreeSet<String>,
 }
 

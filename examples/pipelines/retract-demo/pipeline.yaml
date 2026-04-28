@@ -1,16 +1,15 @@
 pipeline:
   name: retract_demo
 
-# Pipeline-level correlation key. Both Sources stamp `order_id` as
-# `$ck.order_id` at ingest. The downstream aggregate's `group_by`
-# omits `order_id`, so the engine routes this pipeline through the
-# five-phase retraction-aware commit instead of the strict
-# two-phase fast path. `correlation_fanout_policy: any` keeps the
-# default — a triggering record fans collateral DLQ across every
+# Both Sources declare `correlation_key: order_id`, stamping
+# `order_id` as `$ck.order_id` at ingest. The downstream aggregate's
+# `group_by` omits `order_id`, so the engine routes this pipeline
+# through the five-phase retraction-aware commit instead of the
+# strict two-phase fast path. `correlation_fanout_policy: any` keeps
+# the default — a triggering record fans collateral DLQ across every
 # row sharing its CK group.
 error_handling:
   strategy: continue
-  correlation_key: order_id
   correlation_fanout_policy: any
   dlq:
     path: ./output/dlq.csv
@@ -24,6 +23,7 @@ nodes:
       name: orders
       type: csv
       path: ./data/orders.csv
+      correlation_key: order_id
       options:
         has_header: true
       schema:
@@ -40,6 +40,7 @@ nodes:
       name: audit_events
       type: csv
       path: ./data/audit_events.csv
+      correlation_key: order_id
       options:
         has_header: true
       schema:

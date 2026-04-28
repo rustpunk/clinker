@@ -99,7 +99,7 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [source] orders (line:9)
+  ● [source] orders (line:8)
   │ [sort] __correlation_sort_orders
   │ [transform] windowed (line:19)
   ◇ [aggregation:hash] dept_totals (line:34)

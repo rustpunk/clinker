@@ -1,0 +1,5 @@
+customer_id,region,tier
+C-001,west,gold
+C-002,east,silver
+C-003,west,bronze
+C-004,east,gold

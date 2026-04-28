@@ -247,7 +247,6 @@ fn test_source_widening_single_correlation_key_appends_one_shadow() {
 pipeline:
   name: ck-single
 error_handling:
-  correlation_key: employee_id
 nodes:
   - type: source
     name: src
@@ -255,6 +254,7 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      correlation_key: employee_id
       schema:
         - { name: employee_id, type: string }
         - { name: salary, type: int }
@@ -308,7 +308,6 @@ fn test_source_widening_compound_correlation_key_appends_in_order() {
 pipeline:
   name: ck-compound
 error_handling:
-  correlation_key: [tenant, employee_id]
 nodes:
   - type: source
     name: src
@@ -316,6 +315,7 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      correlation_key: [tenant, employee_id]
       schema:
         - { name: employee_id, type: string }
         - { name: tenant, type: int }
@@ -356,7 +356,6 @@ fn test_source_widening_propagates_through_transform() {
 pipeline:
   name: ck-propagate
 error_handling:
-  correlation_key: id
 nodes:
   - type: source
     name: src
@@ -364,6 +363,7 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      correlation_key: id
       schema:
         - { name: id, type: string }
         - { name: amount, type: int }
@@ -405,21 +405,16 @@ nodes:
     );
 }
 
-/// A `correlation_key` listing a field absent from the source schema
-/// is silently skipped by the widening pass. The widening only
-/// synthesizes shadow columns it can type unambiguously; the missing-
-/// field case is the responsibility of a future validation pass (no
-/// such pass exists today; the runtime stamping path that depends on
-/// the shadow column lands in a later wave). This test pins
-/// bind_schema's local invariant: the pass does not over-promise on
-/// fields it can't see in the source's `schema:` block.
+/// A `correlation_key` listing a field absent from the source's own
+/// `schema:` block fails compile with E153. Every CK field declared
+/// on a source MUST appear in that source's schema — silently
+/// skipping a phantom shadow column hides the misconfigured
+/// declaration and disables grouped DLQ for the source.
 #[test]
-fn test_source_widening_skips_undeclared_correlation_field() {
+fn test_source_correlation_field_missing_emits_e153() {
     let yaml = r#"
 pipeline:
   name: ck-missing
-error_handling:
-  correlation_key: nonexistent
 nodes:
   - type: source
     name: src
@@ -427,6 +422,7 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      correlation_key: nonexistent
       schema:
         - { name: employee_id, type: string }
   - type: output
@@ -437,13 +433,23 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let plan = compile_yaml(yaml);
-    let schema = source_output_schema(&plan, "src");
-    assert_eq!(schema.column_count(), 1);
-    assert_eq!(&*schema.columns()[0], "employee_id");
+    let config: PipelineConfig = clinker_core::yaml::from_str(yaml).expect("fixture must parse");
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("E153 must reject CK field absent from source schema");
+    let e153 = diags
+        .iter()
+        .find(|d| d.code == "E153")
+        .expect("E153 diagnostic must be present");
     assert!(
-        !schema.contains("$ck.nonexistent"),
-        "undeclared correlation-key field must not produce a phantom shadow column"
+        e153.message.contains("nonexistent"),
+        "E153 must name the missing field, got: {}",
+        e153.message
+    );
+    assert!(
+        e153.message.contains("src"),
+        "E153 must name the source, got: {}",
+        e153.message
     );
 }
 
@@ -460,7 +466,6 @@ fn test_source_widening_recurses_into_composition_port() {
 pipeline:
   name: ck-comp
 error_handling:
-  correlation_key: id
 nodes:
   - type: source
     name: src
@@ -468,6 +473,7 @@ nodes:
       name: src
       type: csv
       path: data/a.csv
+      correlation_key: id
       schema:
         - { name: id, type: string }
   - type: composition
@@ -523,5 +529,118 @@ nodes:
         source_correlation_field(port_schema.field_metadata_by_name("$ck.id")),
         Some("id"),
         "port-synthetic Source must carry the same engine-stamp metadata"
+    );
+}
+
+/// Multi-source pipeline with per-source CK declarations: each source
+/// gets its own `$ck.<field>` shadow column on its output schema, and
+/// a downstream Combine that propagates all CK fields surfaces both
+/// sources' shadows on its joined output.
+#[test]
+fn test_multi_source_per_source_correlation_keys() {
+    let yaml = r#"
+pipeline:
+  name: multi-ck
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: customers.csv
+      correlation_key: customer_id
+      schema:
+        - { name: customer_id, type: string }
+        - { name: region, type: string }
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: int }
+  - type: combine
+    name: enriched
+    input:
+      o: orders
+      c: customers
+    config:
+      where: "o.customer_id == c.customer_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = o.order_id
+        emit customer_id = o.customer_id
+        emit region = c.region
+        emit amount = o.amount
+      propagate_ck: all
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let plan = compile_yaml(yaml);
+    let customers_schema = source_output_schema(&plan, "customers");
+    assert!(
+        customers_schema.contains("$ck.customer_id"),
+        "customers source must carry $ck.customer_id"
+    );
+    assert!(
+        !customers_schema.contains("$ck.order_id"),
+        "customers source must NOT carry the orders source's CK"
+    );
+    let orders_schema = source_output_schema(&plan, "orders");
+    assert!(
+        orders_schema.contains("$ck.order_id"),
+        "orders source must carry $ck.order_id"
+    );
+    assert!(
+        !orders_schema.contains("$ck.customer_id"),
+        "orders source must NOT carry the customers source's CK"
+    );
+}
+
+/// Pipeline-level `error_handling.correlation_key:` is removed; a
+/// fixture that still declares it must produce a clear
+/// `deny_unknown_fields` parse error pointing at the field. This
+/// test pins the migration: a YAML author who copied an old fixture
+/// gets a useful diagnostic instead of silent acceptance.
+#[test]
+fn test_pipeline_level_correlation_key_is_unknown_field() {
+    let yaml = r#"
+pipeline:
+  name: legacy-pipeline-ck
+error_handling:
+  correlation_key: order_id
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = clinker_core::yaml::from_str::<PipelineConfig>(yaml)
+        .expect_err("legacy pipeline-level correlation_key must fail parse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("correlation_key"),
+        "parse error must mention `correlation_key`, got: {msg}"
     );
 }

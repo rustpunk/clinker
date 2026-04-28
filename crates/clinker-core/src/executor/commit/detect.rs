@@ -96,23 +96,29 @@ pub(crate) fn detect_retract_scope(
         return scope;
     }
 
-    // Aggregates: every aggregate node whose `group_by` omits a
-    // correlation-key field — those activate the retraction protocol.
+    // Aggregates: every aggregate node whose `group_by` omits a CK
+    // field visible upstream — those activate the retraction protocol.
+    // The lattice on `node_properties` already encodes the per-source
+    // CK identity per node, so the classification below stays
+    // consistent with the planner's assignment of relaxed-mode flags.
     // We don't pre-filter against the trigger's CK set here because
     // `retract_row` is idempotent on row IDs that don't appear in the
     // aggregator's lineage — the lookup either succeeds or returns an
     // error which the recompute phase routes to the degrade-fallback.
-    let correlation_key = ctx.config.error_handling.correlation_key.as_ref();
     for idx in current_dag.graph.node_indices() {
-        if let PlanNode::Aggregation { config, .. } = &current_dag.graph[idx]
-            && crate::plan::execution::group_by_omits_any_ck_field(
-                &config.group_by,
-                correlation_key,
-            )
-        {
-            scope
-                .aggregates
-                .push((idx, affected_row_ids.iter().copied().collect()));
+        if let PlanNode::Aggregation { config, .. } = &current_dag.graph[idx] {
+            let parent_ck = current_dag
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .next()
+                .and_then(|p| current_dag.node_properties.get(&p))
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+            if crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
+                scope
+                    .aggregates
+                    .push((idx, affected_row_ids.iter().copied().collect()));
+            }
         }
     }
 

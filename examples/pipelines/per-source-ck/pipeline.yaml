@@ -1,0 +1,75 @@
+pipeline:
+  name: per_source_ck
+
+# Demonstrates per-source correlation keys: each source declares its
+# own `correlation_key:` field independently. `customers` carries
+# `customer_id` as its CK; `orders` carries `order_id`. The Combine
+# joins them on `customer_id`; `propagate_ck: all` widens the joined
+# output schema with both sources' `$ck.*` columns. The downstream
+# aggregate's `group_by` covers `region` only — both CK fields drop
+# from the lattice and the engine routes the pipeline through the
+# five-phase retraction-aware commit.
+error_handling:
+  strategy: continue
+  correlation_fanout_policy: any
+
+nodes:
+  - type: source
+    name: customers
+    config:
+      name: customers
+      type: csv
+      path: ./data/customers.csv
+      correlation_key: customer_id
+      schema:
+        - { name: customer_id, type: string }
+        - { name: region, type: string }
+        - { name: tier, type: string }
+
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer_id, type: string }
+        - { name: amount, type: int }
+
+  - type: combine
+    name: enriched
+    input:
+      o: orders
+      c: customers
+    config:
+      where: "o.customer_id == c.customer_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = o.order_id
+        emit customer_id = o.customer_id
+        emit region = c.region
+        emit tier = c.tier
+        emit amount = o.amount
+      propagate_ck: all
+
+  - type: aggregate
+    name: regional_totals
+    input: enriched
+    config:
+      group_by: [region]
+      cxl: |
+        emit region = region
+        emit total = sum(amount)
+        emit n = count(*)
+
+  - type: output
+    name: report
+    input: regional_totals
+    config:
+      name: report
+      type: csv
+      path: ./output/regional_totals.csv
+      include_correlation_keys: true
