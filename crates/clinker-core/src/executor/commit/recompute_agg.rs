@@ -97,9 +97,13 @@ fn recompute_one_aggregate(
         source_file: ctx.source_file_arc,
         source_row: 0,
     };
+    let emits_synthetic = retained.aggregator.emits_synthetic_ck();
     retained
         .aggregator
         .finalize_in_place(&finalize_ctx, &mut new_rows)?;
+    if emits_synthetic {
+        ctx.counters.retraction.synthetic_ck_columns_emitted_total += new_rows.len() as u64;
+    }
 
     // Pair pre-retract and post-retract rows by group-key prefix.
     // Aggregator output preserves the group_by columns at the head of

@@ -14,8 +14,9 @@ use crate::config::{PipelineConfig, PipelineNode, SourceConfig};
 use crate::error::PipelineError;
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::SecondaryIndex;
+use crate::pipeline::memory::MemoryBudget;
 use crate::plan::execution::ExecutionPlanDag;
-use crate::plan::index;
+use crate::plan::index::{self, PlanIndexRoot};
 use clinker_format::traits::FormatReader;
 
 /// Data products of Phase 1 ingestion, per source.
@@ -119,8 +120,11 @@ where
             messages: vec![format!("source '{}' not found in config", source_name)],
         })?;
 
-    // Determine which fields this source needs in its Arena
-    let arena_fields = index::collect_arena_fields(&plan.indices_to_build, source_name);
+    // Determine which fields this source needs in its Arena —
+    // only `PlanIndexRoot::Source(name)` slots whose name matches.
+    // Node-rooted slots populate at upstream-arm exit during the DAG
+    // walk, not at source ingestion.
+    let arena_fields = index::collect_arena_fields_for_source(&plan.indices_to_build, source_name);
 
     if arena_fields.is_empty() {
         // This source has no indices — return empty Arena
@@ -132,15 +136,28 @@ where
     // Open reader for this source
     let mut reader = open_reader(&input.path)?;
 
-    // Build Arena
-    let arena = Arena::build(reader.as_mut(), &arena_fields, memory_limit, None).map_err(|e| {
-        PipelineError::Compilation {
-            transform_name: String::new(),
-            messages: vec![e.to_string()],
-        }
+    // Build Arena. The standalone path holds a fresh `MemoryBudget`
+    // — multi-source ingestion runs before the executor's ctx-owned
+    // budget exists, and it builds at most one arena per source. The
+    // shared-budget invariant enforced by the dispatcher applies to
+    // arenas materialized AFTER ingestion, not during it.
+    let mut budget = MemoryBudget::new(memory_limit as u64, 0.80);
+    let arena = Arena::build(
+        reader.as_mut(),
+        &arena_fields,
+        memory_limit,
+        None,
+        &mut budget,
+    )
+    .map_err(|e| PipelineError::Compilation {
+        transform_name: String::new(),
+        messages: vec![e.to_string()],
     })?;
 
-    // Build SecondaryIndices for this source
+    // Build SecondaryIndices for this source — one per IndexSpec
+    // whose root is this source. Other roots are owned by their
+    // respective upstream operators and populate at dispatch-arm
+    // exit.
     let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
         .schema_overrides
         .as_ref()
@@ -154,7 +171,7 @@ where
 
     let mut source_indices = Vec::new();
     for spec in &plan.indices_to_build {
-        if spec.source == source_name {
+        if matches!(&spec.root, PlanIndexRoot::Source(name) if name == source_name) {
             let idx = SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
                 PipelineError::Compilation {
                     transform_name: String::new(),

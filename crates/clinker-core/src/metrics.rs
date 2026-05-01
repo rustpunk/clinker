@@ -113,6 +113,18 @@ pub struct RetractionMetrics {
     /// degrade fallback at runtime.
     #[serde(default)]
     pub degrade_fallback_count: u64,
+    /// Synthetic `$ck.aggregate.<name>` column writes performed at
+    /// relaxed-aggregate finalize.
+    #[serde(default)]
+    pub synthetic_ck_columns_emitted_total: u64,
+    /// Detect-phase synthetic-CK lookups against triggered buffer
+    /// cells (one per `AggregateGroupIndex` column observation).
+    #[serde(default)]
+    pub synthetic_ck_fanout_lookups_total: u64,
+    /// Source-row ids unioned into the affected set via successful
+    /// synthetic-CK fan-out (sum of `input_rows.len()` per resolution).
+    #[serde(default)]
+    pub synthetic_ck_fanout_rows_expanded_total: u64,
 }
 
 impl From<&clinker_record::RetractionCounters> for RetractionMetrics {
@@ -123,6 +135,9 @@ impl From<&clinker_record::RetractionCounters> for RetractionMetrics {
             subdag_replay_rows: c.subdag_replay_rows,
             output_rows_retracted_total: c.output_rows_retracted_total,
             degrade_fallback_count: c.degrade_fallback_count,
+            synthetic_ck_columns_emitted_total: c.synthetic_ck_columns_emitted_total,
+            synthetic_ck_fanout_lookups_total: c.synthetic_ck_fanout_lookups_total,
+            synthetic_ck_fanout_rows_expanded_total: c.synthetic_ck_fanout_rows_expanded_total,
         }
     }
 }

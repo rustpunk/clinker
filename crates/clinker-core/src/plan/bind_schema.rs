@@ -159,12 +159,6 @@ pub(crate) struct BindContext<'a> {
     /// pipeline this is typically `"pipelines/"` or similar; for nested
     /// compositions it's the directory of the `.comp.yaml` file.
     pub origin_dir: PathBuf,
-    /// Pipeline-level `error_handling.correlation_key`, threaded so the
-    /// Source-arm widening pass can synthesize one `$ck.<field>` shadow
-    /// column per declared correlation field. `None` when the pipeline
-    /// has no correlation key. Composition bodies inherit the parent
-    /// pipeline's key — they have no `error_handling` of their own.
-    pub correlation_key: Option<&'a crate::config::CorrelationKey>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -176,20 +170,20 @@ pub(crate) struct BindContext<'a> {
 /// file being compiled. Used to resolve relative `use:` paths on
 /// `PipelineNode::Composition` nodes. Pass `""` if unknown.
 ///
-/// `correlation_key` is the pipeline-level
-/// `error_handling.correlation_key`. When `Some`, every `Source` node's
-/// declared schema is widened with one `$ck.<field>` shadow column per
-/// listed field, tail-appended in declaration order. The shadow columns
-/// preserve correlation-group identity through downstream Transforms
-/// that may rewrite the user-declared field. Composition body Sources
-/// inherit the same widening through the recursive walk.
+/// Each `Source` node's declared schema is widened with one
+/// `$ck.<field>` shadow column per field listed on that source's own
+/// `correlation_key:`, tail-appended in declaration order. The shadow
+/// columns preserve correlation-group identity through downstream
+/// Transforms that may rewrite the user-declared field. Composition
+/// body Sources inherit the parent caller's widening transparently —
+/// the body's port-synthetic Source carries every column flowing in,
+/// including any `$ck.*` shadows.
 pub fn bind_schema(
     nodes: &[Spanned<PipelineNode>],
     diags: &mut Vec<Diagnostic>,
     ctx: &CompileContext,
     symbol_table: &CompositionSymbolTable,
     pipeline_dir: &Path,
-    correlation_key: Option<&crate::config::CorrelationKey>,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
@@ -200,7 +194,6 @@ pub fn bind_schema(
         depth: 0,
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
-        correlation_key,
     };
     bind_schema_inner(
         nodes,
@@ -259,7 +252,20 @@ fn bind_schema_inner(
         match node {
             PipelineNode::Source { config, .. } => {
                 let schema_decl: &SchemaDecl = &config.schema;
-                let columns = columns_from_decl(schema_decl, bind_ctx.correlation_key);
+                let (columns, missing) =
+                    columns_from_decl(schema_decl, config.correlation_key.as_ref());
+                for missing_field in &missing {
+                    diags.push(Diagnostic::error(
+                        "E153",
+                        format!(
+                            "source {name:?} declares correlation_key field {missing_field:?} \
+                             but the field is not present in this source's `schema:` block. \
+                             Add the column to the source's schema, or remove the field from \
+                             `correlation_key`."
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                }
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
                 let row = Row::closed(columns, cxl_span);
                 schema_by_name.insert(name.clone(), row.clone());
@@ -337,7 +343,7 @@ fn bind_schema_inner(
                 };
                 match typecheck_cxl(&name, &config.cxl.source, &upstream, agg_mode, span) {
                     Ok(mut typed) => {
-                        let out = propagate_aggregate(&config.group_by, &upstream, &typed);
+                        let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
                         artifacts.typed.insert(name, Arc::new(typed));
@@ -696,15 +702,11 @@ fn bind_composition(
         let n_name = n.name().to_string();
         // Body nodes are lowered without the top-level
         // parallelism/index enrichment — those live on the
-        // top-level mini-DAG. The pipeline-level correlation_key still
-        // threads in: body aggregates inside a correlated pipeline must
-        // pick the same retraction-mode flags the top-level lowering
-        // would, since their `group_by` shape is what determines the
-        // commit-time behavior.
-        let lower_ctx = crate::config::LoweringCtx {
-            correlation_key: bind_ctx.correlation_key,
-            ..crate::config::LoweringCtx::default()
-        };
+        // top-level mini-DAG. Body aggregate retraction-mode flags are
+        // re-derived after the body's mini-DAG is built, alongside the
+        // top-level pass that walks the lattice. Lowering only stamps
+        // the strict default; `apply_retraction_flags` rewrites it.
+        let lower_ctx = crate::config::LoweringCtx::default();
         if let Some(plan_node) = crate::config::lower_node_to_plan_node(
             n, &n_name, body_span, artifacts, &lower_ctx, diags,
         ) {
@@ -898,7 +900,46 @@ fn bind_composition(
         }
     }
 
-    // 15. Build and insert BoundBody.
+    // Capture analytic-window configs from body Transform nodes so
+    // the post-parent-DAG-build pass can build `body_indices_to_build`
+    // without re-reading the body file. Body lowering does not stamp
+    // `window_index` on the PlanNode::Transform — that backfill is
+    // owned by the body-window pass once parent NodeIndex space is
+    // allocated.
+    let mut body_window_configs: HashMap<String, crate::plan::index::LocalWindowConfig> =
+        HashMap::new();
+    for spanned in &body_file.nodes {
+        if let PipelineNode::Transform { header, config } = &spanned.value
+            && let Some(raw) = config.analytic_window.as_ref()
+        {
+            match crate::plan::index::parse_analytic_window_value(&Some(raw.clone()), &header.name)
+            {
+                Ok(Some(wc)) => {
+                    body_window_configs.insert(header.name.clone(), wc);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    diags.push(Diagnostic::error(
+                        "E003",
+                        format!(
+                            "composition body for {node_name:?} carries an \
+                             invalid analytic_window on transform {:?}: {e}",
+                            header.name
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    // 15. Build and insert BoundBody. `body_indices_to_build` is
+    // empty here — the post-parent-DAG-build pass populates it once
+    // the parent's NodeIndex space exists, threading the parent's
+    // `name_to_idx` so body-internal port-input references can resolve
+    // to a parent-DAG `NodeIndex` and emit
+    // `PlanIndexRoot::ParentNode { upstream, .. }`.
     let bound_body = BoundBody {
         signature_path: resolved_path,
         graph: body_graph,
@@ -912,6 +953,8 @@ fn bind_composition(
         output_port_to_node_idx,
         input_port_rows,
         nested_body_ids,
+        body_indices_to_build: Vec::new(),
+        body_window_configs,
     };
     artifacts.insert_body(body_id, bound_body);
     artifacts
@@ -1178,16 +1221,16 @@ fn build_input_port_rows(
         }
 
         // Append the parent's engine-stamped tail columns ($ck.<field>
-        // shadow columns from `error_handling.correlation_key` widening)
-        // to the body's port declared set. The runtime port-synthetic
-        // Source built at body entry adopts every parent column, so the
-        // body sees these at runtime; declaring them here keeps the
-        // compile-time Row aligned with that runtime shape — without
-        // this step the open-tail mechanism would silently drop
-        // engine-stamped columns from the body's compile-time view and
-        // surface as a schema mismatch when records flow back to the
-        // parent (the composition's `output_schema` is derived from the
-        // body's terminal Row).
+        // shadow columns from each parent source's `correlation_key:`
+        // widening) to the body's port declared set. The runtime port-
+        // synthetic Source built at body entry adopts every parent
+        // column, so the body sees these at runtime; declaring them
+        // here keeps the compile-time Row aligned with that runtime
+        // shape — without this step the open-tail mechanism would
+        // silently drop engine-stamped columns from the body's
+        // compile-time view and surface as a schema mismatch when
+        // records flow back to the parent (the composition's
+        // `output_schema` is derived from the body's terminal Row).
         let mut declared_columns = declared_columns;
         for (qf, ty) in upstream_row.fields() {
             if qf.name.starts_with("$ck.") && !declared_columns.contains_key(qf) {
@@ -1411,10 +1454,21 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Build a runtime `Arc<Schema>` from an iterator of column names,
 /// stamping engine-stamp metadata on every column whose name begins
-/// with the `$ck.` prefix. The metadata's `snapshot_of` records the
-/// suffix (the user-declared source field). Mirrors the deduction in
-/// `lower_node_to_plan_node`'s `schema_from_bound` closure so a
-/// composition body's port-synthetic Source carries the same marker.
+/// with the `$ck.` prefix. Two prefix shapes are recognized:
+///
+/// - `$ck.aggregate.<aggregate_name>` — synthetic group-index column
+///   emitted by a relaxed aggregate. Stamped
+///   [`FieldMetadata::AggregateGroupIndex`].
+/// - `$ck.<source_field>` — source-CK shadow column. Stamped
+///   [`FieldMetadata::SourceCorrelation`].
+///
+/// The aggregate prefix is checked first because `$ck.aggregate.x`
+/// also matches the generic `$ck.` prefix; misordering would mis-
+/// classify aggregate columns as source-CK shadows.
+///
+/// Mirrors the deduction in `lower_node_to_plan_node`'s
+/// `schema_from_bound` closure so a composition body's port-synthetic
+/// Source carries the same marker.
 pub(crate) fn schema_from_field_names<'a, I>(names: I) -> Arc<clinker_record::Schema>
 where
     I: IntoIterator<Item = &'a str>,
@@ -1422,52 +1476,56 @@ where
     use clinker_record::{FieldMetadata, SchemaBuilder};
     let mut builder = SchemaBuilder::new();
     for name in names {
-        builder = match name.strip_prefix("$ck.") {
-            Some(field) => builder.with_field_meta(name, FieldMetadata::snapshot_of(field)),
-            None => builder.with_field(name),
+        builder = if let Some(aggregate_name) = name.strip_prefix("$ck.aggregate.") {
+            builder.with_field_meta(name, FieldMetadata::aggregate_group_index(aggregate_name))
+        } else if let Some(field) = name.strip_prefix("$ck.") {
+            builder.with_field_meta(name, FieldMetadata::source_correlation(field))
+        } else {
+            builder.with_field(name)
         };
     }
     builder.build()
 }
 
 /// Build the `Row.declared` map for a Source from its author-declared
-/// `schema:` block, optionally tail-appending one `$ck.<field>` shadow
-/// column per `correlation_key` field.
+/// `schema:` block, tail-appending one `$ck.<field>` shadow column per
+/// field listed in the source's own `correlation_key:`.
 ///
 /// Each shadow column is typed identically to the user-declared field
-/// of the same name; if a listed correlation field is not declared on
-/// the source schema, that shadow column is skipped (E15X surfaces the
-/// missing-field case elsewhere — this function only widens the rows
-/// it can type unambiguously). Tail-append preserves user-declared
-/// positional indices, mirroring Spark `_metadata`.
+/// of the same name. Tail-append preserves user-declared positional
+/// indices, mirroring Spark `_metadata`.
+///
+/// Returns the column map paired with a list of `correlation_key`
+/// field names that did NOT appear in `decl.columns`. The caller emits
+/// E153 for each such name — every CK field a source declares MUST be
+/// in that source's own schema.
 fn columns_from_decl(
     decl: &SchemaDecl,
     correlation_key: Option<&crate::config::CorrelationKey>,
-) -> IndexMap<QualifiedField, Type> {
+) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
     let mut cols: IndexMap<QualifiedField, Type> = decl
         .columns
         .iter()
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect();
+    let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
-            // Type the shadow column identically to the user-declared
-            // field. When the source schema does not declare `field`,
-            // skip — a missing correlation-key field is surfaced by
-            // the validation pass (config/mod.rs:1818-) and would only
-            // produce a phantom $ck. column with no source value.
-            if let Some(ty) = decl
+            match decl
                 .columns
                 .iter()
                 .find(|c| c.name.as_str() == field)
                 .map(|c| c.ty.clone())
             {
-                let shadow_name = format!("$ck.{field}");
-                cols.insert(QualifiedField::bare(shadow_name), ty);
+                Some(ty) => {
+                    let shadow_name = format!("$ck.{field}");
+                    cols.insert(QualifiedField::bare(shadow_name), ty);
+                }
+                None => missing.push(field.to_string()),
             }
         }
     }
-    cols
+    (cols, missing)
 }
 
 fn upstream_schema<'a>(
@@ -1593,7 +1651,21 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
 /// Propagate an upstream row through an Aggregate node: start with the
 /// `group_by` fields (typed against upstream), then append one entry
 /// per `emit` statement. All output fields are bare.
-fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram) -> Row {
+///
+/// When the aggregate's `group_by` omits any source-CK field visible
+/// upstream (relaxed mode), the row gains one synthetic
+/// `$ck.aggregate.<aggregate_name>` column carrying the aggregator's
+/// in-memory group index. The schema-widening pass at the planner
+/// stage stamps the same column on the lowered `output_schema`; this
+/// addition keeps bind_schema's typed output row in sync so
+/// downstream Transform / Combine bind passes see the synthetic
+/// column and propagate it forward.
+fn propagate_aggregate(
+    aggregate_name: &str,
+    group_by: &[String],
+    upstream: &Row,
+    typed: &TypedProgram,
+) -> Row {
     let mut out: IndexMap<QualifiedField, Type> = IndexMap::new();
     for gb in group_by {
         let t = match upstream.lookup(gb) {
@@ -1620,6 +1692,29 @@ fn propagate_aggregate(group_by: &[String], upstream: &Row, typed: &TypedProgram
                 .unwrap_or(Type::Any);
             out.insert(QualifiedField::bare(name.as_ref()), emit_type);
         }
+    }
+    // Detect relaxed mode by walking the upstream row for `$ck.<field>`
+    // shadow columns whose source field is missing from `group_by`.
+    // Mirror the lattice rule the planner applies post-bind in
+    // `compute_one`'s Aggregate arm — both must agree on which
+    // aggregates are relaxed so the typed output row, the lowered
+    // `output_schema`, and the runtime stamp stay coherent.
+    let mut omits_any_source_ck = false;
+    for (qf, _) in upstream.fields() {
+        let col = qf.name.as_ref();
+        if let Some(field) = col.strip_prefix("$ck.")
+            && !field.starts_with("aggregate.")
+            && !group_by.iter().any(|gb| gb == field)
+        {
+            omits_any_source_ck = true;
+            break;
+        }
+    }
+    if omits_any_source_ck {
+        out.insert(
+            QualifiedField::bare(format!("$ck.aggregate.{aggregate_name}").as_str()),
+            Type::Int,
+        );
     }
     Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
 }
@@ -1864,12 +1959,27 @@ fn bind_combine(
             output_decl.insert(qf.clone(), ty.clone());
         }
         output_decl.insert(QualifiedField::bare(build_qualifier.as_str()), Type::Array);
-        // Build-side `$ck.<field>` propagation under collect mode.
-        // The matched-array column carries every per-build payload,
-        // but the propagation slot itself is single-valued — the
-        // first match contributes its $ck value; later matches keep
-        // their own $ck inside the array's per-row Map. Mirrors the
-        // first-match-wins discipline for hashable scalar slots while
+        // Synthetic CK rides through collect-mode combines regardless
+        // of `propagate_ck`. See `combine_output_row` rustdoc for why
+        // the engine-managed `$ck.aggregate.*` lineage is exempt from
+        // the user-facing knob.
+        for (qualifier, input) in inputs {
+            if qualifier == &driving {
+                continue;
+            }
+            for (qf, ty) in input.row.fields() {
+                if qf.name.starts_with("$ck.aggregate.") {
+                    let bare = QualifiedField::bare(qf.name.clone());
+                    output_decl.entry(bare).or_insert_with(|| ty.clone());
+                }
+            }
+        }
+        // Build-side source-CK propagation under collect mode. The
+        // matched-array column carries every per-build payload, but
+        // the propagation slot itself is single-valued — the first
+        // match contributes its $ck value; later matches keep their
+        // own $ck inside the array's per-row Map. Mirrors the first-
+        // match-wins discipline for hashable scalar slots while
         // letting the array preserve full lineage.
         if !matches!(config.propagate_ck, PropagateCkSpec::Driver) {
             for (qualifier, input) in inputs {
@@ -1877,6 +1987,9 @@ fn bind_combine(
                     continue;
                 }
                 for (qf, ty) in input.row.fields() {
+                    if qf.name.starts_with("$ck.aggregate.") {
+                        continue;
+                    }
                     let Some(field_name) = qf.name.strip_prefix("$ck.") else {
                         continue;
                     };
@@ -2509,7 +2622,7 @@ fn walk_statement_exprs(
 /// The driver's `$ck.<field>` shadow columns always land on the output
 /// row so the combined record carries the driver's frozen-identity
 /// snapshot through the join boundary. `propagate_ck` selects whether
-/// build-side `$ck.*` columns also land:
+/// build-side source-CK (`$ck.<field>`) columns also land:
 ///
 /// - `Driver` — only the driver's set propagates.
 /// - `All` — every non-driver input's `$ck.*` columns also land.
@@ -2521,6 +2634,15 @@ fn walk_statement_exprs(
 /// schema and the runtime CK-copy step preserves the driver's value
 /// (the build record's value is not written when a non-null driver
 /// value is already in place).
+///
+/// Synthetic CK (`$ck.aggregate.<aggregate_name>`) is engine-managed
+/// lineage from a relaxed aggregate to its source rows; the user did
+/// not declare it, so `propagate_ck` does not gate it. Build-side
+/// synthetic CK rides through every combine regardless of the spec.
+/// Without this exemption, the detect-phase fan-out from a downstream
+/// failure to the aggregator's per-group source-row table would lose
+/// its bridge whenever a Combine sat between the relaxed aggregate
+/// and the failing node.
 fn combine_output_row(
     typed: &TypedProgram,
     driver_row: Option<&Row>,
@@ -2559,10 +2681,30 @@ fn combine_output_row(
             }
         }
     }
-    // Build-side propagation. Without these slots, the runtime CK
-    // copy has nowhere to write; downstream collateral DLQ traversal
-    // would lose the build inputs' contribution to the joined row's
-    // identity.
+    // Synthetic CK from the build side rides through every combine
+    // unconditionally. `$ck.aggregate.<name>` carries the engine
+    // lineage from a relaxed aggregate to its source rows; the user
+    // did not declare it, so `propagate_ck` (a user-facing knob over
+    // source CK) has no semantic meaning over it. Dropping it would
+    // sever the detect-phase fan-out bridge for any
+    // `Aggregate (relaxed) → Combine → …` shape.
+    if let Some(inputs) = inputs {
+        for (qualifier, input) in inputs {
+            if Some(qualifier.as_str()) == driver_qualifier {
+                continue;
+            }
+            for (qf, ty) in input.row.fields() {
+                if qf.name.starts_with("$ck.aggregate.") {
+                    let bare = QualifiedField::bare(qf.name.clone());
+                    out.entry(bare).or_insert_with(|| ty.clone());
+                }
+            }
+        }
+    }
+    // Build-side source-CK propagation. Without these slots, the
+    // runtime CK copy has nowhere to write; downstream collateral DLQ
+    // traversal would lose the build inputs' contribution to the
+    // joined row's identity.
     if let Some(inputs) = inputs
         && !matches!(propagate_ck, PropagateCkSpec::Driver)
     {
@@ -2571,6 +2713,11 @@ fn combine_output_row(
                 continue;
             }
             for (qf, ty) in input.row.fields() {
+                // Synthetic CK was already covered by the unconditional
+                // loop above; skip to avoid double-insert.
+                if qf.name.starts_with("$ck.aggregate.") {
+                    continue;
+                }
                 let Some(field_name) = qf.name.strip_prefix("$ck.") else {
                     continue;
                 };
@@ -2704,4 +2851,55 @@ pub fn e201_missing_schema(source_name: &str, span: Span) -> Diagnostic {
     .with_help(
         "declare the source columns inline:\n  schema:\n    - { name: col1, type: string }\n    - { name: col2, type: int }",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clinker_record::FieldMetadata;
+
+    /// `$ck.<field>` columns resolve to source-CK metadata; the
+    /// suffix is the user-declared field name.
+    #[test]
+    fn schema_from_field_names_classifies_source_ck() {
+        let schema = schema_from_field_names(["id", "$ck.id"]);
+        assert!(schema.field_metadata_by_name("id").is_none());
+        match schema.field_metadata_by_name("$ck.id") {
+            Some(FieldMetadata::SourceCorrelation { source_field }) => {
+                assert_eq!(source_field.as_ref(), "id");
+            }
+            other => panic!("expected SourceCorrelation, got {other:?}"),
+        }
+    }
+
+    /// `$ck.aggregate.<aggregate_name>` columns resolve to the
+    /// aggregate-group-index variant; the suffix is the aggregate node
+    /// name. The aggregate prefix wins over the bare `$ck.` prefix.
+    #[test]
+    fn schema_from_field_names_classifies_aggregate_group_index() {
+        let schema = schema_from_field_names(["region", "$ck.aggregate.dept_totals"]);
+        match schema.field_metadata_by_name("$ck.aggregate.dept_totals") {
+            Some(FieldMetadata::AggregateGroupIndex { aggregate_name }) => {
+                assert_eq!(aggregate_name.as_ref(), "dept_totals");
+            }
+            other => panic!("expected AggregateGroupIndex, got {other:?}"),
+        }
+    }
+
+    /// Both shadow shapes coexist in one schema without cross-talk:
+    /// the `$ck.aggregate.x` column and a sibling `$ck.y` column
+    /// classify independently.
+    #[test]
+    fn schema_from_field_names_distinguishes_both_shapes() {
+        let schema =
+            schema_from_field_names(["user_id", "$ck.user_id", "$ck.aggregate.daily_totals"]);
+        assert!(matches!(
+            schema.field_metadata_by_name("$ck.user_id"),
+            Some(FieldMetadata::SourceCorrelation { .. }),
+        ));
+        assert!(matches!(
+            schema.field_metadata_by_name("$ck.aggregate.daily_totals"),
+            Some(FieldMetadata::AggregateGroupIndex { .. }),
+        ));
+    }
 }

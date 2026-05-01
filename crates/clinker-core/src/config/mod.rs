@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// Top-level pipeline configuration, deserialized from YAML.
@@ -905,6 +906,25 @@ impl PipelineConfig {
         })
     }
 
+    /// Public iterator over source bodies. Each item carries the inline
+    /// `schema:` declaration and the per-source `correlation_key:` (when
+    /// declared) alongside the format-layer [`SourceConfig`].
+    pub fn source_bodies(
+        &self,
+    ) -> impl Iterator<Item = &crate::config::pipeline_node::SourceBody> + '_ {
+        self.nodes.iter().filter_map(|n| match &n.value {
+            PipelineNode::Source { config: body, .. } => Some(body),
+            _ => None,
+        })
+    }
+
+    /// Whether any source declares a `correlation_key:`. Surfaces the
+    /// "is grouped DLQ active anywhere in this pipeline" bit consumed
+    /// by planner gates and the runtime correlation-buffer setup.
+    pub fn any_source_has_correlation_key(&self) -> bool {
+        self.source_bodies().any(|b| b.correlation_key.is_some())
+    }
+
     /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {
@@ -1369,14 +1389,14 @@ impl PipelineConfig {
             ctx,
             &symbol_table,
             &ctx.pipeline_dir,
-            self.error_handling.correlation_key.as_ref(),
         );
-        // Only abort on non-composition CXL errors (E200/E201). Composition
-        // binding errors (E102–E109) are non-fatal for the rest of the
-        // pipeline — the composition node is omitted from the DAG.
+        // Only abort on non-composition CXL errors (E200/E201) and
+        // source-CK validation errors (E153). Composition binding
+        // errors (E102–E109) are non-fatal for the rest of the pipeline
+        // — the composition node is omitted from the DAG.
         let has_cxl_errors = diags.iter().any(|d| {
             matches!(d.severity, crate::error::Severity::Error)
-                && (d.code == "E200" || d.code == "E201")
+                && (d.code == "E200" || d.code == "E201" || d.code == "E153")
         });
         if has_cxl_errors {
             return Err(diags);
@@ -1405,7 +1425,7 @@ impl PipelineConfig {
         // Transform/Aggregate/Route nodes in declaration order. The
         // resulting `entries` array is parallel to `window_configs`;
         // its index is reused as the `transform_index` in raw index
-        // requests and the `spec_idx` lookup below feeds `LoweringCtx`.
+        // requests built after the graph topology is known.
         // Source/Output/Merge/Composition/Combine variants do not
         // contribute (they don't carry `analytic_window` or CXL
         // programs the analyzer pass would consume).
@@ -1492,8 +1512,12 @@ impl PipelineConfig {
                 }
             }
         }
-        // Build raw index requests + deduplicate.
-        let mut raw_index_requests: Vec<crate::plan::index::RawIndexRequest> = Vec::new();
+        // E003 — every cross-source `wc.source: <name>` must name a
+        // declared source. The full `RawIndexRequest` set is built later
+        // (after the DAG topology is known so node-rooted windows can
+        // pin their `PlanIndexRoot::Node { upstream, .. }` to a real
+        // NodeIndex), but the unknown-source diagnostic does not depend
+        // on graph topology and runs first.
         for (i, wc_opt) in window_configs.iter().enumerate() {
             if let Some(wc) = wc_opt {
                 let source = wc.source.clone().unwrap_or_else(|| primary_source.clone());
@@ -1508,45 +1532,8 @@ impl PipelineConfig {
                     ));
                     return Err(diags);
                 }
-                let mut arena_fields: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for gb in &wc.group_by {
-                    arena_fields.insert(gb.clone());
-                }
-                for sf in &wc.sort_by {
-                    arena_fields.insert(sf.field.clone());
-                }
-                for f in &report.transforms[i].accessed_fields {
-                    arena_fields.insert(f.clone());
-                }
-                let already_sorted = crate::plan::execution::check_already_sorted(
-                    &source_configs,
-                    &source,
-                    &wc.sort_by,
-                );
-                // Sort arena_fields for deterministic order — the source
-                // collection is a HashSet whose iteration order randomizes
-                // run-to-run, which leaks into `--explain` output and into
-                // any snapshot test that captures the explain block.
-                let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
-                arena_fields_vec.sort();
-                raw_index_requests.push(crate::plan::index::RawIndexRequest {
-                    source,
-                    group_by: wc.group_by.clone(),
-                    sort_by: wc.sort_by.clone(),
-                    arena_fields: arena_fields_vec,
-                    already_sorted,
-                    transform_index: i,
-                    // Default false here; the buffer-recompute derivation
-                    // walks the DAG after lowering and overwrites the
-                    // flag on the resulting IndexSpec when a relaxed-CK
-                    // upstream aggregate's dropped CK fields overlap
-                    // this window's partition_by.
-                    requires_buffer_recompute: false,
-                });
             }
         }
-        let indices = crate::plan::index::deduplicate_indices(raw_index_requests);
         // Build source DAG + output projections.
         let source_dag = crate::plan::execution::build_source_dag(
             &source_configs,
@@ -1575,8 +1562,11 @@ impl PipelineConfig {
 
         // Phase 1: insert one PlanNode per spanned-PipelineNode.
         // Transform + Aggregate variants draw their enrichment from
-        // the analyzer report / window configs / indices built above;
-        // other variants ignore the LoweringCtx fields.
+        // the analyzer report / window configs; other variants ignore
+        // the LoweringCtx fields. Window-bearing Transforms are
+        // emitted with `window_index = None`; a post-edge-wiring pass
+        // populates the deduplicated index list and backfills the
+        // field once the upstream `NodeIndex` is known.
         for spanned in &self.nodes {
             // Thread the real source line number off the saphyr
             // `Spanned<PipelineNode>::referenced` Location.
@@ -1595,9 +1585,7 @@ impl PipelineConfig {
             let lowering_ctx = LoweringCtx {
                 analysis: analysis_by_name.get(name.as_str()).copied(),
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
-                indices: &indices,
                 primary_source: primary_source.as_str(),
-                correlation_key: self.error_handling.correlation_key.as_ref(),
             };
             let plan_node =
                 lower_node_to_plan_node(node, &name, span, &artifacts, &lowering_ctx, &mut diags);
@@ -1674,6 +1662,335 @@ impl PipelineConfig {
             }
         }
 
+        // Build index requests with full graph context. A window-bearing
+        // transform's `IndexSpec.root` resolves to a real `NodeIndex`
+        // for the upstream operator (after walking past pass-through
+        // Sort/Route nodes), or to a declared source name for the
+        // degenerate source-rooted case. Source-rooted is only
+        // selected when the immediate predecessor is a `PlanNode::Source`
+        // AND the user did not request a different source via
+        // `wc.source: <other>`; the cross-source `wc.source` form
+        // continues to lower to `PlanIndexRoot::Source(<name>)`.
+        let mut raw_index_requests: Vec<crate::plan::index::RawIndexRequest> = Vec::new();
+        let primary_source_str = primary_source.as_str();
+        for (i, wc_opt) in window_configs.iter().enumerate() {
+            let Some(wc) = wc_opt else { continue };
+            let transform_name = entries[i].name.as_str();
+            let Some(&transform_idx) = name_to_idx.get(transform_name) else {
+                // Lowering produced no node for this transform (e.g. a
+                // typecheck failure already surfaced its diagnostic);
+                // skip — the missing-program diagnostic has already fired.
+                continue;
+            };
+
+            let mut arena_fields: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for gb in &wc.group_by {
+                arena_fields.insert(gb.clone());
+            }
+            for sf in &wc.sort_by {
+                arena_fields.insert(sf.field.clone());
+            }
+            for f in &report.transforms[i].accessed_fields {
+                arena_fields.insert(f.clone());
+            }
+            // Sort arena_fields for deterministic order — the source
+            // collection is a HashSet whose iteration order randomizes
+            // run-to-run, which leaks into `--explain` output and into
+            // any snapshot test that captures the explain block.
+            let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
+            arena_fields_vec.sort();
+
+            // Cross-source `wc.source: <other>` always roots at that
+            // declared source. `wc.source: None` (or matching the
+            // primary) defers to predecessor inspection: if the
+            // immediate non-pass-through ancestor is a `PlanNode::Source`,
+            // it is source-rooted; otherwise it is node-rooted on the
+            // ancestor.
+            let cross_source = wc
+                .source
+                .as_ref()
+                .filter(|s| s.as_str() != primary_source_str)
+                .cloned();
+
+            // E150c — when a window declares a cross-source reference
+            // (`wc.source: <other>`), the referenced source's ingestion
+            // tier MUST be earlier than (or equal to) the tier of the
+            // window-bearing transform's primary input source.
+            // `build_source_dag` orders cross-source-referenced sources
+            // into earlier tiers so their indices are populated before
+            // any consumer reads them; an inverted-tier reference means
+            // the engine would attempt to project against a not-yet-
+            // ingested source.
+            if let Some(other) = cross_source.as_deref() {
+                let primary_for_transform =
+                    crate::plan::execution::primary_input_source_for_transform(
+                        &graph,
+                        transform_idx,
+                    )
+                    .unwrap_or_else(|| primary_source_str.to_string());
+                let other_tier = crate::plan::execution::source_tier_index(&source_dag, other);
+                let primary_tier = crate::plan::execution::source_tier_index(
+                    &source_dag,
+                    primary_for_transform.as_str(),
+                );
+                if let (Some(other_tier), Some(primary_tier)) = (other_tier, primary_tier)
+                    && other_tier > primary_tier
+                {
+                    diags.push(Diagnostic::error(
+                        "E150c",
+                        format!(
+                            "cross-source window references source '{other}' whose \
+                             ingestion tier is downstream of the window-bearing \
+                             transform '{transform_name}' primary input source \
+                             '{primary_for_transform}'; promote '{other}' to an \
+                             earlier tier or remove the cross-source reference"
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+            }
+
+            let root = if let Some(other) = cross_source {
+                crate::plan::index::PlanIndexRoot::Source(other)
+            } else {
+                let pred_idx = match graph
+                    .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
+                    .next()
+                {
+                    Some(p) => p,
+                    None => {
+                        diags.push(Diagnostic::error(
+                            "E003",
+                            format!(
+                                "windowed transform '{}' has no upstream input; \
+                                 local_window requires a predecessor in the DAG",
+                                transform_name
+                            ),
+                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                        ));
+                        return Err(diags);
+                    }
+                };
+                let rooted_idx =
+                    crate::plan::execution::first_non_passthrough_ancestor(&graph, pred_idx);
+                match &graph[rooted_idx] {
+                    crate::plan::execution::PlanNode::Merge { .. } => {
+                        diags.push(Diagnostic::error(
+                            "E150d",
+                            format!(
+                                "windowed transform '{}' is rooted at a Merge node; \
+                                 Merge concatenates streams without a single producer \
+                                 identity, so a window cannot anchor to it",
+                                transform_name
+                            ),
+                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                        ));
+                        return Err(diags);
+                    }
+                    crate::plan::execution::PlanNode::Source { name, .. } => {
+                        // Source-rooted: `wc.source` is `None` (or matches
+                        // the primary) and the immediate non-pass-through
+                        // ancestor is a `Source`. The arena builds at
+                        // Phase-0 from that source's stream — source-rooted
+                        // lookups go through the source name in
+                        // `pipeline/ingestion.rs`.
+                        crate::plan::index::PlanIndexRoot::Source(name.clone())
+                    }
+                    other => {
+                        let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                            diags.push(Diagnostic::error(
+                                "E003",
+                                format!(
+                                    "windowed transform '{}' rooted at upstream node \
+                                     '{}' which has no output schema",
+                                    transform_name,
+                                    other.name()
+                                ),
+                                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                            ));
+                            return Err(diags);
+                        };
+                        // E150b — every arena field must be present in
+                        // the upstream's output schema (group_by,
+                        // sort_by, and any field the window builtins
+                        // accessed). Schema membership is checked by
+                        // name only at this stage.
+                        for f in &arena_fields_vec {
+                            if !anchor_schema.contains(f.as_str()) {
+                                diags.push(Diagnostic::error(
+                                    "E150b",
+                                    format!(
+                                        "windowed transform '{}' references field '{}' \
+                                         that the upstream operator '{}' does not emit; \
+                                         a node-rooted window can only see columns \
+                                         produced by its rooted operator",
+                                        transform_name,
+                                        f,
+                                        other.name()
+                                    ),
+                                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                                ));
+                                return Err(diags);
+                            }
+                        }
+                        // E150e — windows over Combine emit columns
+                        // cannot reference an array-typed field. The
+                        // typed `output_row` lives in `artifacts.typed`
+                        // keyed by the combine's name and carries the
+                        // CXL `Type` per emitted column; a
+                        // `match: collect` body emits `Type::Array` for
+                        // every collected build-row column. Window
+                        // builtins (sum/avg/min/max/lag/lead/...) do
+                        // not handle `Value::Array`, so they would
+                        // silently see Null at runtime.
+                        if let crate::plan::execution::PlanNode::Combine { .. } = other {
+                            let combine_name = other.name();
+                            if let Some(typed) = artifacts.typed.get(combine_name) {
+                                for f in &report.transforms[i].accessed_fields {
+                                    let is_array = typed
+                                        .output_row
+                                        .fields()
+                                        .find(|(qf, _)| qf.name.as_ref() == f.as_str())
+                                        .map(|(_, ty)| {
+                                            matches!(
+                                                ty.unwrap_nullable(),
+                                                cxl::typecheck::Type::Array
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if is_array {
+                                        diags.push(Diagnostic::error(
+                                            "E150e",
+                                            format!(
+                                                "windowed transform '{transform_name}' \
+                                                 references field '{f}' typed as Array; \
+                                                 window builtin does not support \
+                                                 array-typed field '{f}' from \
+                                                 `match: collect` combine '{combine_name}'; \
+                                                 flatten the array upstream or use \
+                                                 `match: first | all`"
+                                            ),
+                                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                                        ));
+                                        return Err(diags);
+                                    }
+                                }
+                            }
+                        }
+                        crate::plan::index::PlanIndexRoot::Node {
+                            upstream: rooted_idx,
+                            anchor_schema,
+                        }
+                    }
+                }
+            };
+
+            let already_sorted = match &root {
+                crate::plan::index::PlanIndexRoot::Source(name) => {
+                    crate::plan::execution::check_already_sorted(&source_configs, name, &wc.sort_by)
+                }
+                // Node-rooted / parent-node-rooted arenas have no
+                // declared source ordering — partitions are sorted
+                // post-build at the upstream-arm exit. Treat as
+                // unsorted; the executor's per-partition `sort_partition`
+                // call normalizes the slice before window evaluation.
+                crate::plan::index::PlanIndexRoot::Node { .. }
+                | crate::plan::index::PlanIndexRoot::ParentNode { .. } => false,
+            };
+
+            raw_index_requests.push(crate::plan::index::RawIndexRequest {
+                root,
+                group_by: wc.group_by.clone(),
+                sort_by: wc.sort_by.clone(),
+                arena_fields: arena_fields_vec,
+                already_sorted,
+                transform_index: i,
+                // Default false here; the buffer-recompute derivation
+                // walks the DAG after lowering and overwrites the
+                // flag on the resulting IndexSpec when a relaxed-CK
+                // upstream aggregate's dropped CK fields overlap
+                // this window's partition_by.
+                requires_buffer_recompute: false,
+            });
+        }
+        let indices = crate::plan::index::deduplicate_indices(raw_index_requests);
+
+        // Backfill `window_index` and `partition_lookup` on each
+        // window-bearing Transform node now that `indices` exists. The
+        // initial lowering pass deferred these because `PlanIndexRoot`
+        // for node-rooted windows requires the post-graph NodeIndex.
+        for (i, wc_opt) in window_configs.iter().enumerate() {
+            let Some(wc) = wc_opt else { continue };
+            let transform_name = entries[i].name.as_str();
+            let Some(&transform_idx) = name_to_idx.get(transform_name) else {
+                continue;
+            };
+            // Recompute the same root used above. The duplicated walk is
+            // intentional — sharing a side table would couple the
+            // diagnostic-emitting and update passes via a structure
+            // that adds no clarity over re-walking a small graph.
+            let cross_source = wc
+                .source
+                .as_ref()
+                .filter(|s| s.as_str() != primary_source_str)
+                .cloned();
+            let root = if let Some(other) = cross_source {
+                crate::plan::index::PlanIndexRoot::Source(other)
+            } else {
+                let pred_idx = match graph
+                    .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
+                    .next()
+                {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let rooted_idx =
+                    crate::plan::execution::first_non_passthrough_ancestor(&graph, pred_idx);
+                match &graph[rooted_idx] {
+                    crate::plan::execution::PlanNode::Source { name, .. } => {
+                        crate::plan::index::PlanIndexRoot::Source(name.clone())
+                    }
+                    other => {
+                        let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                            continue;
+                        };
+                        crate::plan::index::PlanIndexRoot::Node {
+                            upstream: rooted_idx,
+                            anchor_schema,
+                        }
+                    }
+                }
+            };
+            let new_window_index =
+                crate::plan::index::find_index_for(&indices, &root, &wc.group_by, &wc.sort_by);
+            if let crate::plan::execution::PlanNode::Transform {
+                window_index,
+                partition_lookup,
+                ..
+            } = &mut graph[transform_idx]
+            {
+                *window_index = new_window_index;
+                // `partition_lookup` mirrors the cross-source vs
+                // same-source distinction. Re-derive from `wc.source`
+                // and `primary_source`, matching the lowering arm in
+                // `lower_node_to_plan_node`.
+                use crate::plan::execution::PartitionLookupKind;
+                let source = wc
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| primary_source_str.to_string());
+                *partition_lookup = if source == primary_source_str && wc.on.is_none() {
+                    Some(PartitionLookupKind::SameSource)
+                } else {
+                    Some(PartitionLookupKind::CrossSource {
+                        on_expr: wc.on.clone(),
+                    })
+                };
+            }
+        }
+
         // Topo sort. Cycles were already caught by stage 3 (E003) so
         // toposort here is expected to succeed; if it doesn't, surface
         // a generic E003 fallback.
@@ -1724,15 +2041,21 @@ impl PipelineConfig {
         };
 
         // ── Enrichment pipeline ─────────────────────────────────────
-        let inputs_map: HashMap<String, crate::config::SourceConfig> = source_configs
+        let source_bodies: Vec<&crate::config::pipeline_node::SourceBody> =
+            self.source_bodies().collect();
+        let inputs_map: HashMap<String, &crate::config::pipeline_node::SourceBody> = source_bodies
+            .iter()
+            .map(|b| (b.source.name.clone(), *b))
+            .collect();
+        let format_inputs_map: HashMap<String, crate::config::SourceConfig> = source_configs
             .iter()
             .map(|i| (i.name.clone(), i.clone()))
             .collect();
-        // Pipeline-level correlation-sort injection runs before the
-        // operator-level enforcer pass so the latter sees the
-        // correlation sort already in place. The correlation pass is
-        // a no-op when `error_handling.correlation_key` is unset.
-        if let Err(e) = dag.inject_correlation_sort(&self.error_handling, &source_configs) {
+        // Per-source correlation-sort injection runs before the
+        // operator-level enforcer pass so the latter sees every
+        // CK-driven sort already in place. No-op for sources that
+        // declared no `correlation_key:`.
+        if let Err(e) = dag.inject_correlation_sort(&source_bodies) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("correlation-sort injection failed: {e}"),
@@ -1740,7 +2063,7 @@ impl PipelineConfig {
             ));
             return Err(diags);
         }
-        if let Err(e) = dag.insert_enforcer_sorts(&inputs_map) {
+        if let Err(e) = dag.insert_enforcer_sorts(&format_inputs_map) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("enforcer-sort insertion failed: {e}"),
@@ -1764,13 +2087,7 @@ impl PipelineConfig {
             }
         };
         crate::plan::execution::assign_tiers(&mut dag.graph, &dag.topo_order);
-        let correlation_key_fields: Vec<String> = self
-            .error_handling
-            .correlation_key
-            .as_ref()
-            .map(|ck| ck.fields().into_iter().map(String::from).collect())
-            .unwrap_or_default();
-        if let Err(e) = dag.compute_node_properties(&inputs_map, &correlation_key_fields) {
+        if let Err(e) = dag.compute_node_properties(&inputs_map) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("node property derivation failed: {e}"),
@@ -1779,15 +2096,62 @@ impl PipelineConfig {
             return Err(diags);
         }
 
+        // Aggregate retraction-mode flags are derived once
+        // `compute_node_properties` has stamped the per-node `ck_set`.
+        // Walks every aggregate (top-level + body mini-DAG) and flips
+        // the strict default to relaxed when its parent ck_set carries
+        // a field the aggregate's `group_by` does not cover.
+        crate::plan::execution::apply_retraction_flags(&mut dag);
+        for body in artifacts.composition_bodies.values_mut() {
+            crate::plan::execution::apply_retraction_flags_in_body(body);
+        }
+
         // Window buffer-recompute derivation. Reads `node_properties.ck_set`
-        // populated above and the relaxed-CK aggregate's `group_by`; flags
-        // every IndexSpec whose downstream window-bearing Transform sits
-        // under a relaxed-CK aggregate that dropped CK fields the window's
-        // `partition_by` references. The executor's window arm reads the
-        // flag at runtime to choose between streaming-emit and buffered
-        // emit; pipelines without a relaxed-CK aggregate keep every flag
+        // populated above; flags every IndexSpec whose downstream
+        // window-bearing Transform sits under a relaxed-CK aggregate
+        // that dropped CK fields the window's `partition_by`
+        // references. The executor's window arm reads the flag at
+        // runtime to choose between streaming-emit and buffered emit;
+        // pipelines without a relaxed-CK aggregate keep every flag
         // false and the executor stays on its existing path.
-        dag.derive_window_buffer_recompute_flags(self.error_handling.correlation_key.as_ref());
+        dag.derive_window_buffer_recompute_flags();
+
+        // Composition body windows. `bind_composition` cannot stamp
+        // `window_index` on body Transforms because body lowering
+        // runs before the parent DAG's NodeIndex space is allocated.
+        // This post-pass walks each body's mini-DAG, classifies each
+        // window's rooting (Source / Node / ParentNode), constructs
+        // the body's IndexSpec list, and backfills `window_index` on
+        // each body Transform. Bodies whose windows resolve through
+        // an `input:` port emit `PlanIndexRoot::ParentNode` pointing
+        // at the parent-DAG operator feeding the port — the body
+        // executor inherits the parent's WindowRuntime via
+        // `Arc::clone` at recursion entry. The pass only short-
+        // circuits on errors it itself emits (E003 / E150d at body
+        // root); existing E102-E109 from bind_composition stay
+        // non-fatal here, mirroring the post-bind-schema gate above
+        // that lets composition-binding errors land as soft
+        // diagnostics while CXL errors hard-stop.
+        let pre_pass_diag_count = diags.len();
+        crate::plan::execution::resolve_composition_body_windows(&dag, &mut artifacts, &mut diags);
+        if diags[pre_pass_diag_count..]
+            .iter()
+            .any(|d| matches!(d.severity, crate::error::Severity::Error))
+        {
+            return Err(diags);
+        }
+
+        // Per-body buffer-recompute flag derivation. Mirrors the top-
+        // level `derive_window_buffer_recompute_flags` walk above —
+        // body-internal relaxed-CK aggregates engage the retraction
+        // protocol the same way top-level relaxed-CK aggregates do, so
+        // any body window whose `partition_by` does not cover the
+        // visible CK set must flip to buffered emit. Without this
+        // pass, body-window retraction would silently bypass the
+        // commit-phase recompute path.
+        for body in artifacts.composition_bodies.values_mut() {
+            crate::plan::execution::derive_window_buffer_recompute_flags_in_body(body);
+        }
 
         // E15Y: an aggregate whose `group_by` omits any correlation-key
         // field cannot also use `strategy: streaming`. Streaming
@@ -1798,36 +2162,44 @@ impl PipelineConfig {
         // "explicit Streaming on ineligible input" diagnostic does not
         // preempt the more specific E15Y message.
         let mut e15y_present = false;
-        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
-            for node in dag.graph.node_weights() {
-                if let crate::plan::execution::PlanNode::Aggregation { name, config, .. } = node
-                    && matches!(
-                        config.strategy,
-                        crate::config::AggregateStrategyHint::Streaming
-                    )
-                    && crate::plan::execution::group_by_omits_any_ck_field(
-                        &config.group_by,
-                        Some(ck),
-                    )
-                {
-                    diags.push(Diagnostic::error(
-                        "E15Y",
-                        format!(
-                            "E15Y aggregate '{}' has `strategy: streaming` but its \
-                             `group_by` omits at least one correlation-key field, \
-                             which routes it through the retraction protocol. \
-                             Streaming aggregates emit per group-boundary close, \
-                             before correlation-commit, which defeats the rollback \
-                             window. Use `strategy: hash` (the default), or include \
-                             every correlation-key field in `group_by` so the \
-                             aggregate stays on the strict-collateral path.",
-                            name
-                        ),
-                        LabeledSpan::primary(node.span(), String::new()),
-                    ));
-                    e15y_present = true;
-                }
+        for idx in dag.graph.node_indices() {
+            let crate::plan::execution::PlanNode::Aggregation { name, config, .. } =
+                &dag.graph[idx]
+            else {
+                continue;
+            };
+            if !matches!(
+                config.strategy,
+                crate::config::AggregateStrategyHint::Streaming
+            ) {
+                continue;
             }
+            let parent_ck = dag
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .next()
+                .and_then(|p| dag.node_properties.get(&p))
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+            if !crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
+                continue;
+            }
+            diags.push(Diagnostic::error(
+                "E15Y",
+                format!(
+                    "E15Y aggregate '{}' has `strategy: streaming` but its \
+                     `group_by` omits at least one correlation-key field \
+                     visible upstream, which routes it through the retraction \
+                     protocol. Streaming aggregates emit per group-boundary \
+                     close, before correlation-commit, which defeats the \
+                     rollback window. Use `strategy: hash` (the default), or \
+                     include every correlation-key field in `group_by` so the \
+                     aggregate stays on the strict-collateral path.",
+                    name
+                ),
+                LabeledSpan::primary(dag.graph[idx].span(), String::new()),
+            ));
+            e15y_present = true;
         }
         if e15y_present {
             return Err(diags);
@@ -1907,23 +2279,21 @@ impl PipelineConfig {
         // enriched so we see every Transform's `window_index` and every
         // Aggregate's resolved `group_by`.
         //
-        // Auto-extension: for every Aggregate downstream of a pipeline
-        // with `error_handling.correlation_key`, transparently append
+        // Auto-extension: for every Aggregate, transparently append
         // `$ck.<field>` shadow columns to the runtime `group_by`
-        // whenever the user-declared field is already listed. The user
-        // never types the engine-internal namespace in YAML; the engine
+        // whenever the user-declared CK field is already listed AND
+        // the parent's `ck_set` carries that CK field. The user never
+        // types the engine-internal namespace in YAML; the engine
         // routes frozen identity through the aggregation key by
-        // construction. An aggregate whose `group_by` omits a
-        // correlation-key field activates the retraction protocol at
-        // runtime — it is not a compile-time error.
-        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
-            let key_fields: Vec<String> = ck.fields().into_iter().map(String::from).collect();
-            extend_aggregate_group_by_with_shadow(&mut dag.graph, &key_fields);
-            for body in artifacts.composition_bodies.values_mut() {
-                extend_aggregate_group_by_with_shadow(&mut body.graph, &key_fields);
-            }
+        // construction. An aggregate whose `group_by` omits a CK field
+        // activates the retraction protocol at runtime — it is not a
+        // compile-time error.
+        extend_aggregate_group_by_with_shadow(&mut dag);
+        for body in artifacts.composition_bodies.values_mut() {
+            extend_aggregate_group_by_with_shadow_in_body(body);
         }
-        if self.error_handling.correlation_key.is_some() {
+        let pipeline_has_any_ck = self.any_source_has_correlation_key();
+        if pipeline_has_any_ck {
             for node in dag.graph.node_weights() {
                 if let crate::plan::execution::PlanNode::Transform {
                     name,
@@ -1931,18 +2301,28 @@ impl PipelineConfig {
                     ..
                 } = node
                 {
-                    // Buffer-recompute mode lifts the E150 restriction:
-                    // the orchestrator's commit phase reruns the window
-                    // over surviving partition rows and emits per-output
-                    // Deltas, so a window inside a retraction-active
-                    // pipeline is safe to materialize even when
-                    // partitions span correlation-key boundaries.
-                    let buffered = dag
+                    // Two disjoint reasons E150 lifts:
+                    //
+                    // 1. Node-rooted / ParentNode-rooted spec: the
+                    //    arena materializes from the upstream operator's
+                    //    emit buffer, not from per-CK-group source rows,
+                    //    so the original "per-group arena construction"
+                    //    concern does not apply. CK-aligned partitions
+                    //    fall under this case.
+                    // 2. Source-rooted spec in buffer-recompute mode:
+                    //    the orchestrator's commit phase reruns the
+                    //    window over surviving partition rows after a
+                    //    CK group is retracted, so the source-rooted
+                    //    arena is safe to materialize.
+                    let safe = dag
                         .indices_to_build
                         .get(*idx_num)
-                        .map(|s| s.requires_buffer_recompute)
+                        .map(|s| {
+                            !matches!(s.root, crate::plan::index::PlanIndexRoot::Source(_))
+                                || s.requires_buffer_recompute
+                        })
                         .unwrap_or(false);
-                    if buffered {
+                    if safe {
                         continue;
                     }
                     let err = crate::plan::execution::PlanError::CorrelationKeyWithArena {
@@ -1965,87 +2345,90 @@ impl PipelineConfig {
         // a different value on replay than at first execution, breaking
         // the post-retract substitution proof. Reject at compile time
         // so users see the limitation before they hit a silent diverge
-        // at runtime. Pipelines whose every aggregate has
-        // `group_by ⊇ correlation_key` (or no correlation key at all)
-        // are unaffected.
-        if let Some(ck) = self.error_handling.correlation_key.as_ref() {
-            let relaxed_aggs_present = dag.graph.node_weights().any(|n| {
-                matches!(
-                    n,
-                    crate::plan::execution::PlanNode::Aggregation { config, .. }
-                        if crate::plan::execution::group_by_omits_any_ck_field(
-                            &config.group_by, Some(ck))
-                )
-            });
-            if relaxed_aggs_present {
-                for node in dag.graph.node_weights() {
-                    if let crate::plan::execution::PlanNode::Transform {
-                        name,
-                        resolved: Some(payload),
-                        ..
-                    } = node
-                        && crate::plan::execution::cxl_has_nondeterministic_call(&payload.typed)
-                    {
-                        diags.push(Diagnostic::error(
-                            "E15W",
-                            format!(
-                                "E15W transform '{}' calls a non-deterministic CXL builtin \
-                                 (e.g. `now`) downstream of an aggregate that activates the \
-                                 retraction protocol. Replay during correlation-commit would \
-                                 not produce the same row twice, breaking the post-retract \
-                                 substitution proof. Remove the non-deterministic call, or \
-                                 include every correlation-key field in the aggregate's \
-                                 `group_by` so the aggregate stays on the strict-collateral \
-                                 path.",
-                                name
-                            ),
-                            LabeledSpan::primary(node.span(), String::new()),
-                        ));
-                    }
-                }
-
-                // Chained-aggregate stack guard. When a content-relaxed
-                // aggregate feeds another aggregate whose `group_by` does
-                // NOT include every correlation-key field, the runtime
-                // cannot prove correct retraction propagation: the inner
-                // retract delta would have to thread through the outer
-                // aggregator's accumulator state, which has no lineage
-                // entry for the inner-aggregate output rows. Reject at
-                // plan time so the user sees the limit before they hit
-                // silent corruption at runtime. The outer aggregate is
-                // safe iff its `group_by` is a superset of the pipeline
-                // CK — then the outer aggregate stays on the strict-
-                // collateral path and observes inner retract effects only
-                // through the wholesale group rebuild.
-                let chained_violations = collect_chained_aggregate_e15w_violations(&dag, ck);
-                for (downstream_node_idx, upstream_name) in chained_violations {
-                    let node = &dag.graph[downstream_node_idx];
-                    let downstream_name = node.name();
+        // at runtime.
+        let relaxed_aggs_present = dag.graph.node_indices().any(|idx| {
+            let crate::plan::execution::PlanNode::Aggregation { config, .. } = &dag.graph[idx]
+            else {
+                return false;
+            };
+            let parent_ck = dag
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .next()
+                .and_then(|p| dag.node_properties.get(&p))
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+            crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck)
+        });
+        if relaxed_aggs_present {
+            for node in dag.graph.node_weights() {
+                if let crate::plan::execution::PlanNode::Transform {
+                    name,
+                    resolved: Some(payload),
+                    ..
+                } = node
+                    && crate::plan::execution::cxl_has_nondeterministic_call(&payload.typed)
+                {
                     diags.push(Diagnostic::error(
                         "E15W",
                         format!(
-                            "E15W aggregate '{}' is downstream of relaxed aggregate '{}' but \
-                             its `group_by` omits at least one correlation-key field. The \
-                             runtime cannot prove correct retraction propagation through \
-                             chained aggregates with narrower group_by than the pipeline \
-                             correlation key — the outer aggregate's accumulator state holds \
-                             no lineage entry for the inner aggregate's output rows. \
-                             Either widen the downstream `group_by` to include every \
-                             correlation-key field, or restructure the pipeline so the \
-                             relaxed aggregate is terminal.",
-                            downstream_name, upstream_name
+                            "E15W transform '{}' calls a non-deterministic CXL builtin \
+                             (e.g. `now`) downstream of an aggregate that activates the \
+                             retraction protocol. Replay during correlation-commit would \
+                             not produce the same row twice, breaking the post-retract \
+                             substitution proof. Remove the non-deterministic call, or \
+                             include every correlation-key field in the aggregate's \
+                             `group_by` so the aggregate stays on the strict-collateral \
+                             path.",
+                            name
                         ),
                         LabeledSpan::primary(node.span(), String::new()),
                     ));
                 }
+            }
+
+            // Chained-aggregate stack guard. When a content-relaxed
+            // aggregate feeds another aggregate whose `group_by` does
+            // NOT cover the parent's visible CK set, the runtime
+            // cannot prove correct retraction propagation: the inner
+            // retract delta would have to thread through the outer
+            // aggregator's accumulator state, which has no lineage
+            // entry for the inner-aggregate output rows. Reject at
+            // plan time so the user sees the limit before they hit
+            // silent corruption at runtime. The outer aggregate is
+            // safe iff its `group_by` covers every CK field its
+            // upstream lattice carries — then it stays on the strict-
+            // collateral path and observes inner retract effects only
+            // through the wholesale group rebuild.
+            let chained_violations = collect_chained_aggregate_e15w_violations(&dag);
+            for (downstream_node_idx, upstream_name) in chained_violations {
+                let node = &dag.graph[downstream_node_idx];
+                let downstream_name = node.name();
+                diags.push(Diagnostic::error(
+                    "E15W",
+                    format!(
+                        "E15W aggregate '{}' is downstream of relaxed aggregate '{}' but \
+                         its `group_by` omits at least one correlation-key field visible \
+                         upstream. The runtime cannot prove correct retraction propagation \
+                         through chained aggregates with narrower group_by than the upstream \
+                         CK lattice — the outer aggregate's accumulator state holds no \
+                         lineage entry for the inner aggregate's output rows. \
+                         Either widen the downstream `group_by` to include every \
+                         correlation-key field flowing in, or restructure the pipeline so \
+                         the relaxed aggregate is terminal.",
+                        downstream_name, upstream_name
+                    ),
+                    LabeledSpan::primary(node.span(), String::new()),
+                ));
             }
         }
 
         // Inject the terminal correlation-commit node once the DAG is
         // otherwise frozen. Re-derive topo afterward because the
         // commit node and its incoming edges change the order. No-op
-        // when `error_handling.correlation_key` is unset.
-        if let Err(e) = dag.inject_correlation_commit(&self.error_handling) {
+        // when no source declares a correlation key.
+        let max_group_buffer = self.error_handling.max_group_buffer.unwrap_or(100_000);
+        if let Err(e) = dag.inject_correlation_commit(&source_bodies, max_group_buffer) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("correlation-commit injection failed: {e}"),
@@ -2205,27 +2588,23 @@ fn resolve_all_input_references(
 /// variants that need derived fields (Transform, Aggregate).
 ///
 /// Top-level callers in `compile_with_diagnostics` populate every field
-/// from the already-computed analyzer report / window configs / index
-/// specs; body-node callers in `bind_composition` use
+/// from the already-computed analyzer report / window configs;
+/// body-node callers in `bind_composition` use
 /// [`LoweringCtx::default`] (all fields `None`/empty), which falls back
 /// to minimal placeholder lowering suitable for Kiln drill-in
 /// inspection. Body nodes are not executed directly — the top-level
 /// DAG produced by `compile_with_diagnostics` is the single source of
 /// truth for runtime planning.
+///
+/// `window_index` on Transform nodes is intentionally NOT derived here —
+/// it requires the post-graph upstream `NodeIndex` for node-rooted
+/// windows. The Stage-5 lowering pass mutates the field in place
+/// after edges are wired and indices are deduplicated.
 #[derive(Default)]
 pub(crate) struct LoweringCtx<'a> {
     pub analysis: Option<&'a cxl::analyzer::TransformAnalysis>,
     pub window_config: Option<&'a crate::plan::index::LocalWindowConfig>,
-    pub indices: &'a [crate::plan::index::IndexSpec],
     pub primary_source: &'a str,
-    /// Pipeline-level `error_handling.correlation_key`, threaded so
-    /// the Aggregate-lowering site can derive each aggregate's
-    /// retraction-mode flags from `group_by` content. `None` for
-    /// pipelines without a correlation key (every aggregate is strict
-    /// in that case) and for body-node lowering, where the body's
-    /// containing pipeline's correlation key is consulted at the
-    /// top-level lowering pass instead.
-    pub correlation_key: Option<&'a CorrelationKey>,
 }
 
 /// Lower a single `PipelineNode` into its `PlanNode` counterpart.
@@ -2252,7 +2631,6 @@ pub(crate) fn lower_node_to_plan_node(
         PlanSourcePayload, PlanTransformPayload, derive_parallelism_class, extract_has_distinct,
         extract_write_set,
     };
-    use crate::plan::index::find_index_for;
     use clinker_record::{FieldMetadata, SchemaBuilder};
     use std::sync::Arc;
 
@@ -2262,23 +2640,35 @@ pub(crate) fn lower_node_to_plan_node(
     // reaches the executor.
     //
     // Columns whose name has the `$ck.` prefix carry engine-stamp
-    // metadata pointing at the user-declared source field (the shadow
-    // is named `$ck.<field>` and stamps `snapshot_of: <field>`). The
-    // marker travels with the column through the DAG: when a Transform
-    // / Aggregate / Combine output row inherits a `$ck.*` column, its
-    // own `Arc<Schema>` recovers the same metadata here. LD-005's
-    // reserved-`$` prefix guarantees no user-declared column collides.
+    // metadata. Two prefix shapes are recognized in priority order:
+    //
+    // - `$ck.aggregate.<aggregate_name>` — synthetic column emitted by
+    //   a relaxed aggregate, stamped `AggregateGroupIndex`.
+    // - `$ck.<field>` — source-CK shadow column, stamped
+    //   `SourceCorrelation`.
+    //
+    // The aggregate prefix is checked first because `$ck.aggregate.x`
+    // also matches the generic `$ck.` prefix; misordering would mis-
+    // classify aggregate columns as source-CK shadows. The marker
+    // travels with the column through the DAG: when a Transform /
+    // Aggregate / Combine output row inherits a `$ck.*` column, its
+    // own `Arc<Schema>` recovers the same metadata here. The reserved
+    // `$` prefix guarantees no user-declared column collides.
     let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
         match artifacts.typed.get(node_name) {
             Some(tp) => {
                 let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
                 for (qf, _) in tp.output_row.fields() {
                     let col = qf.name.as_ref();
-                    builder = match col.strip_prefix("$ck.") {
-                        Some(field) => {
-                            builder.with_field_meta(col, FieldMetadata::snapshot_of(field))
-                        }
-                        None => builder.with_field(col),
+                    builder = if let Some(aggregate_name) = col.strip_prefix("$ck.aggregate.") {
+                        builder.with_field_meta(
+                            col,
+                            FieldMetadata::aggregate_group_index(aggregate_name),
+                        )
+                    } else if let Some(field) = col.strip_prefix("$ck.") {
+                        builder.with_field_meta(col, FieldMetadata::source_correlation(field))
+                    } else {
+                        builder.with_field(col)
                     };
                 }
                 builder.build()
@@ -2323,13 +2713,18 @@ pub(crate) fn lower_node_to_plan_node(
                     } else {
                         NodeExecutionReqs::Streaming
                     };
-                    let wi = ctx.window_config.and_then(|wc| {
-                        let source = wc
-                            .source
-                            .clone()
-                            .unwrap_or_else(|| ctx.primary_source.to_string());
-                        find_index_for(ctx.indices, &source, &wc.group_by, &wc.sort_by)
-                    });
+                    // `window_index` is computed after the graph topology
+                    // is known — `PlanIndexRoot::Node` for post-aggregate
+                    // / post-combine windows requires the upstream
+                    // operator's `NodeIndex`, which only exists once the
+                    // graph is built. The Stage-5 lowering pass in
+                    // `compile_with_diagnostics` mutates this field in
+                    // place after edges are wired and indices are
+                    // deduplicated. Lowering callers from
+                    // `bind_composition` always pass `LoweringCtx::default()`
+                    // (so `ctx.window_config` is `None`); body-internal
+                    // windows are not yet rooted through this path.
+                    let wi = None;
                     let pl = ctx.window_config.map(|wc| {
                         let source = wc
                             .source
@@ -2466,18 +2861,16 @@ pub(crate) fn lower_node_to_plan_node(
                         return None;
                     }
                 };
-            // Plan-time derivation of the two retraction-strategy flags.
-            // Aggregates whose `group_by` includes every correlation-key
-            // field stay on the strict-collateral path with both flags
-            // `false`; aggregates that omit any correlation-key field
-            // pick exactly one — lineage when every binding is
-            // Reversible (O(1) inverse-op retract), buffer-mode when any
-            // binding is BufferRequired (recompute from raw contributions).
-            let is_relaxed = crate::plan::execution::group_by_omits_any_ck_field(
-                &agg_cfg.group_by,
-                ctx.correlation_key,
-            );
-            compiled_agg.set_retraction_flags(is_relaxed);
+            // Default to strict-collateral. The actual retraction-mode
+            // flags are derived after `compute_node_properties` runs on
+            // the full DAG: a downstream post-pass walks every
+            // aggregate, compares its `group_by` against the parent's
+            // `ck_set` lattice, and rewrites the flags via
+            // `set_retraction_flags(true)` when the aggregate omits
+            // any visible CK field. The strict default below is the
+            // identity for `set_retraction_flags(false)` so a body
+            // mini-DAG that the post-pass also walks stays consistent.
+            compiled_agg.set_retraction_flags(false);
             // `schema_from_bound` reads the typed `output_row` produced
             // by `propagate_aggregate` (group-by columns first, then
             // emits) and stamps engine-stamp metadata on the
@@ -2630,7 +3023,7 @@ fn default_max_group_buffer() -> Option<u64> {
 ///   trigger are collateral-DLQ'd. Records that derived only some CK
 ///   columns from a failing source pass through to the writer.
 /// * `Primary` — only records on the primary correlation-key field
-///   (first-listed in `error_handling.correlation_key`) face collateral
+///   (first-listed in the source's `correlation_key`) face collateral
 ///   rollback. Audit-dump opt-out for sinks that retain enough provenance
 ///   to accept partial-rollback semantics.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2652,11 +3045,6 @@ pub struct ErrorHandlingConfig {
     pub dlq: Option<DlqConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
-    /// Correlation key for grouped DLQ rejection. When set, records sharing
-    /// this key value are DLQ'd as a unit if ANY record in the group fails
-    /// Transform / Route eval / Output write.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub correlation_key: Option<CorrelationKey>,
     /// Maximum buffered records per correlation group. Once a group reaches
     /// this cap, the group is DLQ'd with a `group_size_exceeded` root-cause
     /// entry plus collateral entries for every other buffered record of the
@@ -2667,9 +3055,9 @@ pub struct ErrorHandlingConfig {
     )]
     pub max_group_buffer: Option<u64>,
     /// Pipeline-level default for collateral fan-out at correlation commit.
-    /// Defaults to `Any` when `correlation_key` is set; pipelines without a
-    /// correlation key never observe this field. Per-Combine / per-Output
-    /// overrides win against this default.
+    /// Defaults to `Any` when any source has a correlation key; pipelines
+    /// without any correlation key never observe this field. Per-Combine
+    /// / per-Output overrides win against this default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
 }
@@ -2680,7 +3068,6 @@ impl Default for ErrorHandlingConfig {
             strategy: default_strategy(),
             dlq: None,
             type_error_threshold: None,
-            correlation_key: None,
             max_group_buffer: None,
             correlation_fanout_policy: None,
         }
@@ -2996,25 +3383,68 @@ pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError
     load_config_with_vars(path, &[])
 }
 
-/// Auto-extend every `PlanNode::Aggregation.group_by` with the
+/// Auto-extend every strict `PlanNode::Aggregation.group_by` with the
 /// `$ck.<field>` shadow column when the user-declared correlation-key
-/// field is already listed. Engine-internal namespace stays out of
-/// user YAML; the engine routes frozen identity through the
-/// aggregation key by construction.
+/// field is already listed AND the parent's lattice carries that CK
+/// field. Engine-internal namespace stays out of user YAML; the
+/// engine routes frozen identity through the aggregation key by
+/// construction.
 ///
-/// Walks `graph` once, mutating each Aggregation in place:
+/// Walks the top-level DAG once, mutating each Aggregation in place:
 /// - `config.group_by` gains the shadow column at the tail.
 /// - `compiled.group_by_fields` and `compiled.group_by_indices`
 ///   gain the corresponding upstream-schema position.
 /// - `output_schema` is rebuilt to carry the shadow column with
 ///   engine-stamp metadata so writers, projection, and downstream
 ///   consumers can identify it as engine-stamped.
-fn extend_aggregate_group_by_with_shadow(
+///
+/// Relaxed aggregates (whose `group_by` omits a parent CK field) get
+/// their synthetic `$ck.aggregate.<name>` column added by
+/// `propagate_aggregate` at bind-schema time and lowered onto the
+/// `PlanNode::Aggregation.output_schema` via `schema_from_bound`. This
+/// pass therefore only handles the strict source-CK shadow shape;
+/// touching the relaxed path here would double-append the synthetic
+/// column.
+///
+/// Body mini-DAGs go through
+/// [`extend_aggregate_group_by_with_shadow_in_body`] which derives
+/// each aggregate's parent CK set inline because composition bodies
+/// don't carry a `node_properties` side table.
+fn extend_aggregate_group_by_with_shadow(dag: &mut crate::plan::execution::ExecutionPlanDag) {
+    use petgraph::graph::NodeIndex;
+
+    // Precompute parent ck_set per aggregate so the in-place mutation
+    // below does not need to peek into `node_properties` while holding
+    // a mutable borrow on `graph`.
+    let parent_ck_set: HashMap<NodeIndex, std::collections::BTreeSet<String>> = dag
+        .graph
+        .node_indices()
+        .filter_map(|idx| {
+            if !matches!(
+                &dag.graph[idx],
+                crate::plan::execution::PlanNode::Aggregation { .. }
+            ) {
+                return None;
+            }
+            let ck_set = dag
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .next()
+                .and_then(|p| dag.node_properties.get(&p))
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+            Some((idx, ck_set))
+        })
+        .collect();
+    extend_aggregate_group_by_with_shadow_for_graph(&mut dag.graph, &parent_ck_set);
+}
+
+fn extend_aggregate_group_by_with_shadow_for_graph(
     graph: &mut petgraph::graph::DiGraph<
         crate::plan::execution::PlanNode,
         crate::plan::execution::PlanEdge,
     >,
-    key_fields: &[String],
+    parent_ck_set: &HashMap<petgraph::graph::NodeIndex, std::collections::BTreeSet<String>>,
 ) {
     use clinker_record::{FieldMetadata, Schema, SchemaBuilder};
     use petgraph::Direction;
@@ -3043,16 +3473,25 @@ fn extend_aggregate_group_by_with_shadow(
         }
     }
 
-    // Collect work first so the upstream-schema borrow doesn't alias the
-    // mutable graph borrow used for in-place mutation below.
+    // The relaxed aggregate's synthetic `$ck.aggregate.<name>` column
+    // is added by `propagate_aggregate` at bind_schema time, then
+    // travels into the lowered `output_schema` through
+    // `lower_node_to_plan_node`'s `schema_from_bound`. This pass only
+    // needs to handle the strict source-CK shadow shape — appending
+    // `$ck.<field>` to `output_schema`, `config.group_by`, and the
+    // compiled group-key projection so the runtime stamps each row
+    // with the upstream source's CK field at the aggregator hot loop.
     let mut work: Vec<(NodeIndex, Vec<ShadowAppend>)> = Vec::new();
     for idx in graph.node_indices() {
         let group_by = match &graph[idx] {
             crate::plan::execution::PlanNode::Aggregation { config, .. } => config.group_by.clone(),
             _ => continue,
         };
+        let Some(ck_fields) = parent_ck_set.get(&idx) else {
+            continue;
+        };
         let mut to_append: Vec<ShadowAppend> = Vec::new();
-        for ck_field in key_fields {
+        for ck_field in ck_fields {
             let shadow = format!("$ck.{ck_field}");
             let user_present = group_by.iter().any(|f| f == ck_field);
             let shadow_present = group_by.iter().any(|f| f == &shadow);
@@ -3105,11 +3544,56 @@ fn extend_aggregate_group_by_with_shadow(
         for entry in &to_append {
             builder = builder.with_field_meta(
                 entry.shadow_name.clone(),
-                FieldMetadata::snapshot_of(entry.source_field.as_str()),
+                FieldMetadata::source_correlation(entry.source_field.as_str()),
             );
         }
         *output_schema = builder.build();
     }
+}
+
+/// Body-graph variant. Walks the body mini-DAG and derives each
+/// aggregate's parent ck_set by inspecting the upstream node's
+/// `output_schema` for `$ck.<field>` columns, since body mini-DAGs do
+/// not maintain a `node_properties` side table.
+fn extend_aggregate_group_by_with_shadow_in_body(
+    body: &mut crate::plan::composition_body::BoundBody,
+) {
+    use clinker_record::FieldMetadata;
+    use petgraph::Direction;
+    use petgraph::graph::NodeIndex;
+
+    let mut parent_ck_set: HashMap<NodeIndex, std::collections::BTreeSet<String>> = HashMap::new();
+    for idx in body.graph.node_indices() {
+        if !matches!(
+            &body.graph[idx],
+            crate::plan::execution::PlanNode::Aggregation { .. }
+        ) {
+            continue;
+        }
+        let mut ck: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut cursor = idx;
+        while let Some(upstream) = body
+            .graph
+            .neighbors_directed(cursor, Direction::Incoming)
+            .next()
+        {
+            if let Some(schema) = body.graph[upstream].stored_output_schema() {
+                for (i, col) in schema.columns().iter().enumerate() {
+                    if matches!(
+                        schema.field_metadata(i),
+                        Some(FieldMetadata::SourceCorrelation { .. }),
+                    ) && let Some(field) = col.strip_prefix("$ck.")
+                    {
+                        ck.insert(field.to_string());
+                    }
+                }
+                break;
+            }
+            cursor = upstream;
+        }
+        parent_ck_set.insert(idx, ck);
+    }
+    extend_aggregate_group_by_with_shadow_for_graph(&mut body.graph, &parent_ck_set);
 }
 
 /// Find every (downstream-aggregate, upstream-aggregate-name) pair that
@@ -3134,13 +3618,49 @@ fn extend_aggregate_group_by_with_shadow(
 /// same regardless of which upstream they look at first.
 fn collect_chained_aggregate_e15w_violations(
     dag: &crate::plan::execution::ExecutionPlanDag,
-    ck: &CorrelationKey,
 ) -> Vec<(petgraph::graph::NodeIndex, String)> {
     use crate::plan::execution::{PlanNode, group_by_omits_any_ck_field};
     use petgraph::Direction;
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{BTreeSet, HashSet, VecDeque};
+
+    let aggregate_parent_ck = |idx: NodeIndex| -> BTreeSet<String> {
+        dag.graph
+            .neighbors_directed(idx, Direction::Incoming)
+            .next()
+            .and_then(|p| dag.node_properties.get(&p))
+            .map(|p| p.ck_set.clone())
+            .unwrap_or_default()
+    };
+
+    // Collect the union of source-level CK fields reachable upstream
+    // of `start`. Used to compute the originally-contributing CK set
+    // for the chained-aggregate violation test below; once a relaxed
+    // aggregate has run, the lattice value at the downstream
+    // aggregate's parent has dropped the CK fields the inner aggregate
+    // omitted, so the lattice alone cannot tell whether the downstream
+    // group_by would cover the original source identity.
+    let upstream_source_ck = |start: NodeIndex| -> BTreeSet<String> {
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
+        queue.push_back(start);
+        let mut acc: BTreeSet<String> = BTreeSet::new();
+        while let Some(idx) = queue.pop_front() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            if matches!(dag.graph[idx], PlanNode::Source { .. })
+                && let Some(props) = dag.node_properties.get(&idx)
+            {
+                acc.extend(props.ck_set.iter().cloned());
+            }
+            for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
+                queue.push_back(edge.source());
+            }
+        }
+        acc
+    };
 
     let mut findings: Vec<(NodeIndex, String)> = Vec::new();
 
@@ -3148,12 +3668,6 @@ fn collect_chained_aggregate_e15w_violations(
         let PlanNode::Aggregation { config, .. } = &dag.graph[downstream_idx] else {
             continue;
         };
-        if !group_by_omits_any_ck_field(&config.group_by, Some(ck)) {
-            // Downstream's group_by ⊇ correlation_key. The downstream
-            // aggregate stays on the strict-collateral path and absorbs
-            // any inner retract via wholesale group rebuild — safe.
-            continue;
-        }
 
         // BFS upstream from the downstream aggregate, looking for the
         // first relaxed aggregate ancestor. `seen` prevents revisits in
@@ -3176,10 +3690,12 @@ fn collect_chained_aggregate_e15w_violations(
                 config: upstream_cfg,
                 ..
             } = &dag.graph[idx]
-                && group_by_omits_any_ck_field(&upstream_cfg.group_by, Some(ck))
             {
-                upstream_relaxed_name = Some(name.clone());
-                break;
+                let upstream_parent_ck = aggregate_parent_ck(idx);
+                if group_by_omits_any_ck_field(&upstream_cfg.group_by, &upstream_parent_ck) {
+                    upstream_relaxed_name = Some(name.clone());
+                    break;
+                }
             }
             for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
                 let pred = edge.source();
@@ -3188,9 +3704,20 @@ fn collect_chained_aggregate_e15w_violations(
                 }
             }
         }
-        if let Some(upstream_name) = upstream_relaxed_name {
-            findings.push((downstream_idx, upstream_name));
+        let Some(upstream_name) = upstream_relaxed_name else {
+            continue;
+        };
+
+        // The downstream aggregate is safe iff its `group_by` covers
+        // every source-level CK field flowing in. The lattice at the
+        // downstream parent has been narrowed by the inner relaxed
+        // aggregate, so we walk to the source roots to recover the
+        // original CK identity that needs to be preserved.
+        let source_ck = upstream_source_ck(downstream_idx);
+        if !group_by_omits_any_ck_field(&config.group_by, &source_ck) {
+            continue;
         }
+        findings.push((downstream_idx, upstream_name));
     }
 
     findings

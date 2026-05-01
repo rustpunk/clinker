@@ -334,8 +334,8 @@ nodes:
 
     #[derive(Deserialize)]
     struct InnerWithSpan {
-        #[allow(dead_code)]
-        name: String,
+        #[serde(rename = "name")]
+        _name: String,
         input: indexmap::IndexMap<String, Spanned<String>>,
     }
 

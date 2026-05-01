@@ -307,7 +307,7 @@ mod tests {
         use clinker_record::SchemaBuilder;
         SchemaBuilder::new()
             .with_field(user_col)
-            .with_field_meta(stamp_col, FieldMetadata::snapshot_of(user_col))
+            .with_field_meta(stamp_col, FieldMetadata::source_correlation(user_col))
             .build()
     }
 

@@ -1935,23 +1935,37 @@ pub(crate) fn decompose_nary_combines(
 
         // Wire edges. Step 0 ← driver source + first build source.
         // Step i ≥ 1 ← step (i-1) + step's build source.
+        //
+        // When a source carries a `__correlation_sort_<src>` Sort node
+        // downstream (injected by `inject_correlation_sort`), the chain
+        // step consumes from the Sort instead of the source directly.
+        // This avoids the dispatch race where the Sort and the chain
+        // step would both want the source's `node_buffers` entry — only
+        // one consumer can take it.
+        let resolve_chain_input = |upstream_name: &str| -> Option<NodeIndex> {
+            let sort_name = format!(
+                "{}{}",
+                crate::plan::execution::CORRELATION_SORT_PREFIX,
+                upstream_name
+            );
+            if let Some(idx) = node_by_name.get(sort_name.as_str()).copied() {
+                return Some(idx);
+            }
+            node_by_name.get(upstream_name).copied()
+        };
         for (i, step) in steps.iter().enumerate() {
             let driver_idx = if i == 0 {
                 let original_driver_input = inputs
                     .get(&driving)
                     .expect("driver qualifier present in combine_inputs");
-                node_by_name
-                    .get(original_driver_input.upstream_name.as_ref())
-                    .copied()
+                resolve_chain_input(original_driver_input.upstream_name.as_ref())
             } else {
                 Some(step_indices[i - 1])
             };
             let build_input_meta = inputs
                 .get(&step.build_input)
                 .expect("step.build_input was selected from inputs.keys()");
-            let build_idx = node_by_name
-                .get(build_input_meta.upstream_name.as_ref())
-                .copied();
+            let build_idx = resolve_chain_input(build_input_meta.upstream_name.as_ref());
             let target = step_indices[i];
             if let Some(d) = driver_idx {
                 plan.graph.add_edge(

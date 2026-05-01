@@ -52,13 +52,13 @@ pipeline:
   name: retract_metrics_test
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -102,13 +102,13 @@ pipeline:
   name: strict_metrics_test
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -218,6 +218,9 @@ fn retraction_metrics_serializes_via_spool_payload() {
         subdag_replay_rows: 17,
         output_rows_retracted_total: 4,
         degrade_fallback_count: 2,
+        synthetic_ck_columns_emitted_total: 11,
+        synthetic_ck_fanout_lookups_total: 5,
+        synthetic_ck_fanout_rows_expanded_total: 23,
     };
 
     let payload = RetractionMetrics::from(&runtime);
@@ -226,6 +229,9 @@ fn retraction_metrics_serializes_via_spool_payload() {
     assert_eq!(payload.subdag_replay_rows, 17);
     assert_eq!(payload.output_rows_retracted_total, 4);
     assert_eq!(payload.degrade_fallback_count, 2);
+    assert_eq!(payload.synthetic_ck_columns_emitted_total, 11);
+    assert_eq!(payload.synthetic_ck_fanout_lookups_total, 5);
+    assert_eq!(payload.synthetic_ck_fanout_rows_expanded_total, 23);
 
     // JSON round-trip — the spool format keeps these as bare u64
     // fields under a `retraction` object.
@@ -235,6 +241,9 @@ fn retraction_metrics_serializes_via_spool_payload() {
     assert!(json.contains("\"subdag_replay_rows\":17"));
     assert!(json.contains("\"output_rows_retracted_total\":4"));
     assert!(json.contains("\"degrade_fallback_count\":2"));
+    assert!(json.contains("\"synthetic_ck_columns_emitted_total\":11"));
+    assert!(json.contains("\"synthetic_ck_fanout_lookups_total\":5"));
+    assert!(json.contains("\"synthetic_ck_fanout_rows_expanded_total\":23"));
 
     // Old-spool forward-compat: parsing JSON without the retraction
     // object yields a default (all zero) struct rather than a parse

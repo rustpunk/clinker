@@ -99,16 +99,17 @@ pipeline:
   name: ck_driver_schema
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: lookup
     config: { name: lookup, type: csv, path: lookup.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: tier, type: string } ] }
   - type: combine
@@ -153,17 +154,18 @@ pipeline:
   name: ck_all_schema
 error_handling:
   strategy: continue
-  correlation_key: [order_id, customer_id]
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: ledger_ref, type: string } ] }
@@ -207,17 +209,18 @@ pipeline:
   name: ck_named_schema
 error_handling:
   strategy: continue
-  correlation_key: [order_id, customer_id]
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: [order_id, customer_id],
               schema: [ { name: order_id, type: string },
                         { name: customer_id, type: string },
                         { name: ledger_ref, type: string } ] }
@@ -272,16 +275,17 @@ pipeline:
   name: ck_all_runtime
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: ledger_ref, type: string } ] }
   - type: combine
@@ -347,16 +351,17 @@ pipeline:
   name: ck_driver_runtime
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: ledger
     config: { name: ledger, type: csv, path: ledger.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: ledger_ref, type: string } ] }
   - type: combine
@@ -415,16 +420,17 @@ pipeline:
   name: ck_collision
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: side
     config: { name: side, type: csv, path: side.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: tag, type: string } ] }
   - type: combine
@@ -471,16 +477,17 @@ pipeline:
   name: ck_collect_all
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: { name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: amount, type: int } ] }
   - type: source
     name: events
     config: { name: events, type: csv, path: events.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: kind, type: string } ] }
   - type: combine
@@ -525,21 +532,23 @@ pipeline:
   name: ck_chain
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: a_src
     config: { name: a_src, type: csv, path: a.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: a_val, type: string } ] }
   - type: source
     name: b_src
     config: { name: b_src, type: csv, path: b.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: b_val, type: string } ] }
   - type: source
     name: c_src
     config: { name: c_src, type: csv, path: c.csv,
+              correlation_key: order_id,
               schema: [ { name: order_id, type: string },
                         { name: c_val, type: string } ] }
   - type: combine
@@ -605,16 +614,17 @@ pipeline:
   name: ck_parity_{strategy}
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
   - type: source
     name: orders
     config: {{ name: orders, type: csv, path: orders.csv,
+              correlation_key: order_id,
               schema: [ {{ name: order_id, type: string }},
                         {{ name: amount, type: int }} ] }}
   - type: source
     name: ledger
     config: {{ name: ledger, type: csv, path: ledger.csv,
+              correlation_key: order_id,
               schema: [ {{ name: order_id, type: string }},
                         {{ name: ledger_ref, type: string }} ] }}
   - type: combine
@@ -674,4 +684,361 @@ nodes:
         auto_body, grace_body,
         "body rows must match across strategies (sorted)"
     );
+}
+
+// ─── Synthetic CK auto-survival across combines ─────────────────────
+//
+// `propagate_ck` is a user-facing knob over user-declared source CK.
+// Synthetic CK (`$ck.aggregate.<name>`) is engine-managed lineage from
+// a relaxed aggregate to its source rows; the user did not declare it,
+// so `propagate_ck` does not gate it. The plan-time output schema and
+// the runtime CK-copy step both let synthetic CK ride through every
+// combine regardless of the spec.
+
+/// Driver-side relaxed aggregate, plain build source. The combine's
+/// output schema must carry the driver's synthetic CK column even
+/// under `propagate_ck: driver`. The aggregate-side path has been
+/// covered for several commits — this test pins the output_schema
+/// shape.
+#[test]
+fn synthetic_ck_on_driver_appears_on_combine_output_schema() {
+    let yaml = r#"
+pipeline:
+  name: synthetic_driver
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: lookup.csv
+      schema:
+        - { name: department, type: string }
+        - { name: budget, type: int }
+  - type: combine
+    name: enriched
+    input:
+      a: dept_totals
+      l: lookup
+    config:
+      where: "a.department == l.department"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit department = a.department
+        emit total = a.total
+        emit budget = l.budget
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config: { name: out, type: csv, path: out.csv }
+"#;
+    let cols = combine_output_columns(yaml, "enriched");
+    assert!(
+        cols.iter().any(|c| c == "$ck.aggregate.dept_totals"),
+        "synthetic CK from upstream relaxed aggregate must appear on combine \
+         output schema regardless of propagate_ck=driver; got {cols:?}"
+    );
+}
+
+/// Build-side relaxed aggregate, plain driver source. The combine's
+/// output schema must carry the build's synthetic CK column under
+/// `propagate_ck: driver` because synthetic CK is engine-managed.
+/// User-declared source CK on the build side stays gated by the spec
+/// (covered by `runtime_propagate_ck_driver_drops_source_ck_keeps_synthetic`
+/// below); this test isolates the schema-widening half of the change.
+#[test]
+fn synthetic_ck_on_build_appears_on_combine_output_under_driver_spec() {
+    let yaml = r#"
+pipeline:
+  name: synthetic_build
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: department, type: string }
+        - { name: lead, type: string }
+  - type: combine
+    name: enriched
+    input:
+      d: drivers
+      a: dept_totals
+    config:
+      where: "d.department == a.department"
+      match: first
+      on_miss: skip
+      drive: d
+      cxl: |
+        emit department = d.department
+        emit lead = d.lead
+        emit total = a.total
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config: { name: out, type: csv, path: out.csv }
+"#;
+    let cols = combine_output_columns(yaml, "enriched");
+    assert!(
+        cols.iter().any(|c| c == "$ck.aggregate.dept_totals"),
+        "synthetic CK from build-side relaxed aggregate must appear on \
+         combine output schema regardless of propagate_ck=driver; got {cols:?}"
+    );
+}
+
+/// Runtime end-to-end: `propagate_ck: driver` drops the build-side
+/// user-source CK column from the output (regression behavior), but
+/// the synthetic CK column from the build-side relaxed aggregate
+/// survives because it is engine-managed lineage.
+#[test]
+fn runtime_propagate_ck_driver_drops_source_ck_keeps_synthetic() {
+    let yaml = r#"
+pipeline:
+  name: synthetic_runtime
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      correlation_key: lead_id
+      schema:
+        - { name: lead_id, type: string }
+        - { name: department, type: string }
+        - { name: lead, type: string }
+  - type: combine
+    name: enriched
+    input:
+      d: drivers
+      a: dept_totals
+    config:
+      where: "d.department == a.department"
+      match: first
+      on_miss: skip
+      drive: d
+      cxl: |
+        emit department = d.department
+        emit lead = d.lead
+        emit total = a.total
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_correlation_keys: true
+"#;
+    let cols = combine_output_columns(yaml, "enriched");
+    assert!(
+        cols.iter().any(|c| c == "$ck.aggregate.dept_totals"),
+        "synthetic CK must appear on combine output schema; got {cols:?}"
+    );
+    // `propagate_ck: driver` keeps the driver's source CK
+    // (`$ck.lead_id`) and drops the build's source CK column.
+    // Synthetic CK from the build-side aggregate is exempt and rides
+    // through.
+    assert!(
+        cols.iter().any(|c| c == "$ck.lead_id"),
+        "driver's source CK must survive; got {cols:?}"
+    );
+
+    let orders_csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\nO3,ENG,100\n";
+    let drivers_csv = "lead_id,department,lead\nL1,HR,Alice\nL2,ENG,Bob\n";
+    let (_report, csv_out) = run_with_output(
+        yaml,
+        &[("orders", orders_csv), ("drivers", drivers_csv)],
+        "orders",
+        "out",
+    );
+    let header = csv_out.lines().next().expect("header line");
+    assert!(
+        header.contains("$ck.aggregate.dept_totals"),
+        "writer must include synthetic CK header; got {header:?}"
+    );
+    assert!(
+        header.contains("$ck.lead_id"),
+        "writer must include driver's source CK header; got {header:?}"
+    );
+    let body: Vec<&str> = csv_out.lines().skip(1).collect();
+    assert!(!body.is_empty(), "expected at least one output row");
+    // Locate the synthetic-CK column in the header by its index, then
+    // check every body row has a non-empty value at that index. The
+    // group index from a relaxed aggregator is u64; CSV serializes it
+    // as a non-empty integer string.
+    let header_cols: Vec<&str> = header.split(',').collect();
+    let synth_idx = header_cols
+        .iter()
+        .position(|c| *c == "$ck.aggregate.dept_totals")
+        .expect("header has synthetic CK column");
+    for line in &body {
+        let cells: Vec<&str> = line.split(',').collect();
+        let cell = cells.get(synth_idx).copied().unwrap_or("");
+        assert!(
+            !cell.is_empty() && cell != "null",
+            "synthetic CK must be populated on every output row; \
+             header={header:?} line={line:?} cell={cell:?}"
+        );
+    }
+}
+
+/// `Source → Aggregate (relaxed) → Combine (driver) → Output` final
+/// integration: synthetic CK lands on the writer with the right
+/// `AggregateGroupIndex` metadata and a non-empty value per output
+/// row. Driver here is the relaxed aggregate itself; combines over a
+/// driver-side aggregate parent are the most common shape post-D-7
+/// and the most common detect-phase fan-out source.
+#[test]
+fn runtime_synthetic_ck_carries_through_driver_side_combine() {
+    let yaml = r#"
+pipeline:
+  name: synthetic_driver_runtime
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit total = sum(amount)
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: lookup.csv
+      schema:
+        - { name: department, type: string }
+        - { name: budget, type: int }
+  - type: combine
+    name: enriched
+    input:
+      a: dept_totals
+      l: lookup
+    config:
+      where: "a.department == l.department"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit department = a.department
+        emit total = a.total
+        emit budget = l.budget
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_correlation_keys: true
+"#;
+    let orders_csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\nO3,ENG,100\n";
+    let lookup_csv = "department,budget\nHR,500\nENG,2000\n";
+    let (_report, csv_out) = run_with_output(
+        yaml,
+        &[("orders", orders_csv), ("lookup", lookup_csv)],
+        "orders",
+        "out",
+    );
+    let header = csv_out.lines().next().expect("header line");
+    assert!(
+        header.contains("$ck.aggregate.dept_totals"),
+        "writer must include driver's synthetic CK header; got {header:?}"
+    );
+    let body: Vec<&str> = csv_out.lines().skip(1).collect();
+    assert_eq!(body.len(), 2, "two finalized groups produce two rows");
+    let header_cols: Vec<&str> = header.split(',').collect();
+    let synth_idx = header_cols
+        .iter()
+        .position(|c| *c == "$ck.aggregate.dept_totals")
+        .expect("header has synthetic CK column");
+    for line in &body {
+        let cells: Vec<&str> = line.split(',').collect();
+        let cell = cells.get(synth_idx).copied().unwrap_or("");
+        assert!(
+            !cell.is_empty() && cell != "null",
+            "synthetic CK populated on every output row; line={line:?}"
+        );
+    }
 }

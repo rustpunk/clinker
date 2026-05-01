@@ -52,13 +52,13 @@ pipeline:
   name: correlated_test
 error_handling:
   strategy: continue
-  correlation_key: {0}
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: {0}
     type: csv
     schema:
       - {{ name: employee_id, type: string }}
@@ -185,9 +185,6 @@ pipeline:
   name: compound_key_test
 error_handling:
   strategy: continue
-  correlation_key:
-  - employee_id
-  - dept
 nodes:
 - type: source
   name: src
@@ -195,6 +192,9 @@ nodes:
     name: src
     path: input.csv
     type: csv
+    correlation_key:
+    - employee_id
+    - dept
     schema:
       - { name: employee_id, type: string }
       - { name: dept, type: string }
@@ -251,7 +251,6 @@ pipeline:
   name: buffer_overflow_test
 error_handling:
   strategy: continue
-  correlation_key: employee_id
   max_group_buffer: 3
 nodes:
 - type: source
@@ -259,6 +258,7 @@ nodes:
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -322,13 +322,13 @@ pipeline:
   name: multi_output_correlation
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -429,13 +429,13 @@ pipeline:
   name: corr_with_arena
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     sort_order:
     - employee_id
@@ -485,13 +485,13 @@ pipeline:
   name: corr_with_agg
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     sort_order:
     - employee_id
@@ -572,13 +572,13 @@ pipeline:
   name: aggregate_correlation_meta
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -661,13 +661,13 @@ pipeline:
   name: rewrite_key_test
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -723,13 +723,13 @@ pipeline:
   name: rewrite_then_agg
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -816,13 +816,13 @@ pipeline:
   name: combine_correlation_meta
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: orders
   config:
     name: orders
     path: orders.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -833,6 +833,7 @@ nodes:
   config:
     name: departments
     path: departments.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -975,13 +976,13 @@ pipeline:
   name: combine_chain_correlation_meta
 error_handling:
   strategy: continue
-  correlation_key: department_id
 nodes:
 - type: source
   name: orders
   config:
     name: orders
     path: orders.csv
+    correlation_key: department_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1140,13 +1141,13 @@ pipeline:
   name: route_eval_error_test
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -1209,13 +1210,13 @@ pipeline:
   name: combine_iejoin_correlation_meta
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: orders
   config:
     name: orders
     path: orders.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -1227,6 +1228,7 @@ nodes:
   config:
     name: sessions
     path: sessions.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }

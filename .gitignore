@@ -6,6 +6,7 @@ target/
 bench-data/
 examples/pipelines/output/
 examples/pipelines/retract-demo/output/
+examples/pipelines/per-source-ck/output/
 tests/e2e/
 .playwright-mcp/
 notes/

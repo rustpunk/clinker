@@ -29,7 +29,6 @@ pipeline:
   name: retract_explain_demo
 error_handling:
   strategy: continue
-  correlation_key: order_id
   correlation_fanout_policy: any
 nodes:
 - type: source
@@ -38,6 +37,7 @@ nodes:
     name: orders
     path: orders.csv
     type: csv
+    correlation_key: order_id
     schema:
       - { name: order_id, type: string }
       - { name: department, type: string }
@@ -94,7 +94,6 @@ pipeline:
   name: strict_explain
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: orders
@@ -102,6 +101,7 @@ nodes:
     name: orders
     path: orders.csv
     type: csv
+    correlation_key: order_id
     schema:
       - { name: order_id, type: string }
       - { name: department, type: string }

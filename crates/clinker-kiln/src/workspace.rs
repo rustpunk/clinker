@@ -130,8 +130,6 @@ pub struct WorkspaceState {
     #[serde(default)]
     pub window: Option<WindowGeometry>,
     #[serde(default)]
-    pub layout: Option<LayoutState>,
-    #[serde(default)]
     pub navigation: Option<NavigationPersistence>,
     #[serde(default)]
     pub tabs: Option<TabsState>,
@@ -180,15 +178,6 @@ pub struct SearchState {
     /// User-saved queries with labels.
     #[serde(default)]
     pub saved: Vec<crate::search::SearchHistoryEntry>,
-}
-
-/// Legacy layout state — kept for backwards compatibility with old state files.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LayoutState {
-    pub preset: String,
-    pub inspector_width: Option<f32>,
-    pub yaml_sidebar_width: Option<f32>,
-    pub run_log_expanded: Option<bool>,
 }
 
 fn default_version() -> u32 {
@@ -512,7 +501,6 @@ pub fn save_full_session(
     active_tab_id: Option<crate::tab::TabId>,
     context: NavigationContext,
     pipeline_layout: PipelineLayoutMode,
-    run_log_expanded: bool,
     activity_bar_visible: bool,
     channel_state: &Option<ChannelState>,
     theme: KilnTheme,
@@ -531,7 +519,6 @@ pub fn save_full_session(
         active_file.as_deref(),
         context,
         pipeline_layout,
-        run_log_expanded,
         activity_bar_visible,
         channel_state,
         theme,
@@ -568,7 +555,6 @@ pub fn build_state_snapshot(
     active_file: Option<&str>,
     context: NavigationContext,
     pipeline_layout: PipelineLayoutMode,
-    run_log_expanded: bool,
     activity_bar_visible: bool,
     channel_state: &Option<ChannelState>,
     theme: KilnTheme,
@@ -587,12 +573,6 @@ pub fn build_state_snapshot(
     WorkspaceState {
         version: 1,
         window: None, // TODO: save window geometry
-        layout: Some(LayoutState {
-            preset: pipeline_layout.as_data_attr().to_string(),
-            inspector_width: None,
-            yaml_sidebar_width: None,
-            run_log_expanded: Some(run_log_expanded),
-        }),
         navigation: Some(NavigationPersistence {
             active_context: context.as_data_attr().to_string(),
             pipeline_layout_mode: pipeline_layout.as_data_attr().to_string(),
@@ -650,18 +630,6 @@ pub fn parse_navigation_state(state: &WorkspaceState) -> (NavigationContext, Pip
             _ => PipelineLayoutMode::Hybrid,
         };
         return (context, layout);
-    }
-
-    // Legacy format: map old LayoutPreset strings to (context, layout) pairs
-    if let Some(ref layout_state) = state.layout {
-        return match layout_state.preset.as_str() {
-            "canvas-focus" | "canvas" => (NavigationContext::Pipeline, PipelineLayoutMode::Canvas),
-            "hybrid" => (NavigationContext::Pipeline, PipelineLayoutMode::Hybrid),
-            "editor-focus" | "editor" => (NavigationContext::Pipeline, PipelineLayoutMode::Editor),
-            "schematics" => (NavigationContext::Docs, PipelineLayoutMode::Hybrid),
-            "version" => (NavigationContext::Git, PipelineLayoutMode::Hybrid),
-            _ => (NavigationContext::Pipeline, PipelineLayoutMode::Hybrid),
-        };
     }
 
     (NavigationContext::Pipeline, PipelineLayoutMode::Hybrid)

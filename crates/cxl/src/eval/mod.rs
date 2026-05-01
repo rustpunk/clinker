@@ -542,6 +542,60 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             args,
             span,
         } => {
+            // `$window.lag(n).<field>` style chains: parser emits this as
+            // `MethodCall { receiver: WindowCall(lag/lead/first/last), method: <field>, args: [] }`.
+            // Resolve the field directly off the positional record without
+            // round-tripping through `Value` — `RecordView` carries a
+            // borrow into the arena that would not survive the lifetime of
+            // a `Value` round-trip without inventing a lifetime-carrying
+            // variant on the `Value` enum (which the postcard/serde wire
+            // format cannot accommodate).
+            if args.is_empty()
+                && let Expr::WindowCall {
+                    function,
+                    args: window_args,
+                    ..
+                } = &**receiver
+                && matches!(&**function, "first" | "last" | "lag" | "lead")
+            {
+                let w = window.ok_or_else(|| {
+                    EvalError::new(
+                        EvalErrorKind::TypeMismatch {
+                            expected: "window context",
+                            got: "none",
+                        },
+                        *span,
+                    )
+                })?;
+                let view = match &**function {
+                    "first" => w.first(),
+                    "last" => w.last(),
+                    "lag" | "lead" => {
+                        let offset = match window_args.first() {
+                            Some(arg) => {
+                                let v =
+                                    eval_expr(arg, typed, ctx, resolver, window, env, meta_state)?;
+                                if let Value::Integer(n) = v {
+                                    n.max(0) as usize
+                                } else {
+                                    1
+                                }
+                            }
+                            None => 1,
+                        };
+                        if &**function == "lag" {
+                            w.lag(offset)
+                        } else {
+                            w.lead(offset)
+                        }
+                    }
+                    _ => unreachable!("matches! pre-filtered the function name"),
+                };
+                return Ok(view
+                    .and_then(|row| row.resolve(method).cloned())
+                    .unwrap_or(Value::Null));
+            }
+
             let recv_val = eval_expr(receiver, typed, ctx, resolver, window, env, meta_state)?;
             let mut arg_vals = Vec::with_capacity(args.len());
             for arg in args {
@@ -593,6 +647,13 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                         Ok(Value::Null)
                     }
                 }
+                "cumulative_sum" => {
+                    if let Some(Expr::FieldRef { name, .. }) = args.first() {
+                        Ok(w.cumulative_sum(name))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
                 "avg" => {
                     if let Some(Expr::FieldRef { name, .. }) = args.first() {
                         Ok(w.avg(name))
@@ -614,43 +675,17 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                         Ok(Value::Null)
                     }
                 }
-                "first" => {
-                    // Positional: returns RecordView. Field access via postfix chain
-                    // is handled by the MethodCall evaluator on the receiver.
-                    // For now, return Null — full field chain resolution in Task 5.4.
-                    Ok(w.first().map(|_r| Value::Null).unwrap_or(Value::Null))
-                }
-                "last" => Ok(w.last().map(|_r| Value::Null).unwrap_or(Value::Null)),
-                "lag" => {
-                    let offset = args
-                        .first()
-                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env, meta_state))
-                        .transpose()?
-                        .and_then(|v| {
-                            if let Value::Integer(n) = v {
-                                Some(n as usize)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(1);
-                    Ok(w.lag(offset).map(|_r| Value::Null).unwrap_or(Value::Null))
-                }
-                "lead" => {
-                    let offset = args
-                        .first()
-                        .map(|a| eval_expr(a, typed, ctx, resolver, window, env, meta_state))
-                        .transpose()?
-                        .and_then(|v| {
-                            if let Value::Integer(n) = v {
-                                Some(n as usize)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(1);
-                    Ok(w.lead(offset).map(|_r| Value::Null).unwrap_or(Value::Null))
-                }
+                // Positional builtins return `RecordView` per the trait;
+                // a bare `$window.first()` (without `.field`) is semantically
+                // a row reference, which `Value` cannot carry — `Value`
+                // is `'static` and `RecordView<'a, S>` borrows the arena.
+                // The meaningful surface is the postfix chain
+                // `$window.first().<field>`, which the `MethodCall` arm
+                // intercepts upstream. Reaching this arm means the user
+                // wrote a positional builtin without a field accessor —
+                // return Null so downstream coalesce / filter sees a
+                // well-typed nullable.
+                "first" | "last" | "lag" | "lead" => Ok(Value::Null),
                 "collect" => {
                     if let Some(Expr::FieldRef { name, .. }) = args.first() {
                         Ok(w.collect(name))

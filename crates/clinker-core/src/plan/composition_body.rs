@@ -127,4 +127,25 @@ pub struct BoundBody {
     /// by CompositionBodyId assigned from the parent
     /// CompileArtifacts counter.
     pub nested_body_ids: Vec<CompositionBodyId>,
+
+    /// Body-scope analytic-window IndexSpecs. Populated by the post-
+    /// parent-DAG-build pass that runs after `bind_composition` —
+    /// body lowering happens before the parent DAG's NodeIndex space
+    /// is allocated, so a body window whose first non-pass-through
+    /// ancestor is the body's `input:` port (which resolves through to
+    /// a parent-DAG operator) needs the parent's `name_to_idx` map
+    /// to emit the right `PlanIndexRoot::ParentNode { upstream, .. }`.
+    /// The body executor sizes its `window_runtime.bodies[body_id]`
+    /// vec to this list at recursion entry. Empty for bodies whose
+    /// transforms declare no `analytic_window:` config.
+    pub body_indices_to_build: Vec<crate::plan::index::IndexSpec>,
+
+    /// Per-Transform analytic-window configs captured at
+    /// `bind_composition` time. Keyed by the body Transform's name;
+    /// values are the typed `LocalWindowConfig` parsed from the
+    /// body file's `analytic_window:` block. Empty entries are
+    /// omitted. Consumed by the post-parent-DAG-build body-window
+    /// pass to construct `body_indices_to_build` and backfill
+    /// `window_index` onto each body Transform.
+    pub body_window_configs: HashMap<String, crate::plan::index::LocalWindowConfig>,
 }

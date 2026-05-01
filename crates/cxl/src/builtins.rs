@@ -403,6 +403,7 @@ impl BuiltinRegistry {
         };
         for (n, d) in [
             wa("sum", vec![TypeTag::Any], 1, TypeTag::Numeric),
+            wa("cumulative_sum", vec![TypeTag::Any], 1, TypeTag::Numeric),
             wa("avg", vec![TypeTag::Any], 1, TypeTag::Float),
             wa("min", vec![TypeTag::Any], 1, TypeTag::Any),
             wa("max", vec![TypeTag::Any], 1, TypeTag::Any),

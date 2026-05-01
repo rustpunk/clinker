@@ -1,16 +1,15 @@
 pipeline:
   name: retract_demo
 
-# Pipeline-level correlation key. Both Sources stamp `order_id` as
-# `$ck.order_id` at ingest. The downstream aggregate's `group_by`
-# omits `order_id`, so the engine routes this pipeline through the
-# five-phase retraction-aware commit instead of the strict
-# two-phase fast path. `correlation_fanout_policy: any` keeps the
-# default — a triggering record fans collateral DLQ across every
+# Both Sources declare `correlation_key: order_id`, stamping
+# `order_id` as `$ck.order_id` at ingest. The downstream aggregate's
+# `group_by` omits `order_id`, so the engine routes this pipeline
+# through the five-phase retraction-aware commit instead of the
+# strict two-phase fast path. `correlation_fanout_policy: any` keeps
+# the default — a triggering record fans collateral DLQ across every
 # row sharing its CK group.
 error_handling:
   strategy: continue
-  correlation_key: order_id
   correlation_fanout_policy: any
   dlq:
     path: ./output/dlq.csv
@@ -24,6 +23,7 @@ nodes:
       name: orders
       type: csv
       path: ./data/orders.csv
+      correlation_key: order_id
       options:
         has_header: true
       schema:
@@ -40,6 +40,7 @@ nodes:
       name: audit_events
       type: csv
       path: ./data/audit_events.csv
+      correlation_key: order_id
       options:
         has_header: true
       schema:
@@ -146,13 +147,37 @@ nodes:
         emit n = count(*)
         emit order_ids = collect(order_id)
 
+  # Post-aggregate validation. The CXL emits a derived `anomaly_check`
+  # column; for any (department, day) whose surviving total is below
+  # 500 the projection evaluates `to_int` against a non-numeric literal
+  # and raises a type-conversion error. Because this Transform sits
+  # downstream of a relaxed-CK aggregate, the failure carries the
+  # synthetic `$ck.aggregate.dept_totals` lineage that the engine
+  # stamped at finalize. The orchestrator's detect phase decodes it
+  # into the contributing source row ids and fans the failure back
+  # to the original orders rows — every row that fed the failing
+  # group lands in the DLQ alongside the aggregate output row,
+  # matching the upstream-failure DLQ-fan-out semantic.
+  - type: transform
+    name: dept_validate
+    input: dept_totals
+    config:
+      cxl: |
+        emit department = department
+        emit day = day
+        emit total = total
+        emit min_amount = min_amount
+        emit n = n
+        emit order_ids = order_ids
+        emit anomaly_check = if total < 500 then "x".to_int() else 0
+
   # Sink. `include_correlation_keys: true` surfaces the `$ck.*`
   # columns the Combine widened. `correlation_fanout_policy: any`
   # is also set on the pipeline-level `error_handling` block; the
   # explicit per-Output value teaches authors the override surface.
   - type: output
     name: report
-    input: dept_totals
+    input: dept_validate
     config:
       name: report
       type: csv

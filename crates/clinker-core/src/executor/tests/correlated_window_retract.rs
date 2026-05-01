@@ -173,13 +173,13 @@ pipeline:
   name: window_retract
 error_handling:
   strategy: continue
-  correlation_key: emp_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: emp_id
     type: csv
     schema:
       - {{ name: emp_id, type: string }}

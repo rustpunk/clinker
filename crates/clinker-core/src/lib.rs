@@ -32,6 +32,3 @@ pub use executor::stage_metrics::{StageCollector, StageMetrics, StageName};
 pub use plan::{
     BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
 };
-
-#[allow(unused_imports)]
-use clinker_record::{PipelineCounters, Record, RecordProvenance, Schema, Value};

@@ -390,8 +390,8 @@ pub enum PlanNode {
     /// Planner-synthesized terminal commit node for `correlation_key` pipelines.
     ///
     /// Inserted by [`ExecutionPlanDag::inject_correlation_commit`] downstream
-    /// of every [`PlanNode::Output`] when `error_handling.correlation_key`
-    /// is set. The Output arm redirects projected records into
+    /// of every [`PlanNode::Output`] when at least one source declares a
+    /// `correlation_key:`. The Output arm redirects projected records into
     /// `ExecutorContext.correlation_buffers` instead of writing to the
     /// FormatWriter; this arm walks the buffer at end-of-DAG and, per
     /// correlation group, either flushes records to the appropriate writer
@@ -404,9 +404,10 @@ pub enum PlanNode {
         name: String,
         #[serde(skip)]
         span: Span,
-        /// Correlation key fields, copied from `error_handling.correlation_key`
-        /// at planner-synthesis time. Used by the dispatcher arm to format
-        /// the group key in DLQ trigger messages.
+        /// Correlation key fields. The union of every source's
+        /// declared `correlation_key:` field names, in declaration
+        /// order. Used by the dispatcher arm to format the group key
+        /// in DLQ trigger messages.
         commit_group_by: Vec<String>,
         /// Per-group buffer cap. Mirrors
         /// `error_handling.max_group_buffer`; the dispatcher arm checks
@@ -879,7 +880,7 @@ impl ExecutionPlanDag {
             graph: body.graph.clone(),
             topo_order: body.topo_order.clone(),
             source_dag: Vec::new(),
-            indices_to_build: Vec::new(),
+            indices_to_build: body.body_indices_to_build.clone(),
             output_projections: Vec::new(),
             parallelism: ParallelismProfile {
                 per_transform: Vec::new(),
@@ -1035,7 +1036,7 @@ impl ExecutionPlanDag {
 
         for (i, spec) in self.indices_to_build.iter().enumerate() {
             out.push_str(&format!("Index [{}]:\n", i));
-            out.push_str(&format!("  Source: {}\n", spec.source));
+            out.push_str(&format!("  Root: {}\n", format_index_root(&spec.root)));
             out.push_str(&format!("  Group by: {:?}\n", spec.group_by));
             out.push_str(&format!(
                 "  Sort by: {:?}\n",
@@ -1176,13 +1177,24 @@ impl ExecutionPlanDag {
     /// non-correlated `--explain` output stays identical to today's
     /// text.
     fn render_retraction_section(&self, out: &mut String, config: Option<&PipelineConfig>) {
-        let correlation_key = config.and_then(|c| c.error_handling.correlation_key.as_ref());
         let mut relaxed_aggregates: Vec<(&str, &PlanNode)> = Vec::new();
         for &idx in &self.topo_order {
-            if let PlanNode::Aggregation { name, config, .. } = &self.graph[idx]
-                && group_by_omits_any_ck_field(&config.group_by, correlation_key)
+            if let PlanNode::Aggregation {
+                name,
+                config: agg_cfg,
+                ..
+            } = &self.graph[idx]
             {
-                relaxed_aggregates.push((name.as_str(), &self.graph[idx]));
+                let parent_ck = self
+                    .graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .next()
+                    .and_then(|p| self.node_properties.get(&p))
+                    .map(|p| p.ck_set.clone())
+                    .unwrap_or_default();
+                if group_by_omits_any_ck_field(&agg_cfg.group_by, &parent_ck) {
+                    relaxed_aggregates.push((name.as_str(), &self.graph[idx]));
+                }
             }
         }
         let buffer_mode_index_count = self
@@ -1244,6 +1256,15 @@ impl ExecutionPlanDag {
             out.push_str(&format!(
                 "  retraction: relaxed-CK enabled, {path_label} accumulator path, lineage memory {lineage_per_row_bytes} (cardinality unknown at plan time), worst-case degrade-fallback: DLQ entire affected group when retract precondition breaks at runtime.\n",
             ));
+            // Per-output-row cost of the synthetic shadow column the
+            // relaxed aggregate emits. ~16 B is the Value::Integer
+            // discriminant + the 8-byte i64 payload + the Vec slot
+            // overhead per row; the column lives at the tail of every
+            // emitted record and lifts the post-aggregate retract
+            // fan-out path for downstream failures.
+            out.push_str(&format!(
+                "  synthetic CK: $ck.aggregate.{name} (engine-stamped, +16 B/output-row, hidden from default writers)\n",
+            ));
             out.push('\n');
         }
 
@@ -1262,8 +1283,9 @@ impl ExecutionPlanDag {
             // snapshot diff target.
             let row_field_count = spec.arena_fields.len();
             out.push_str(&format!(
-                "Window index [{i}] (source '{}', partition_by {:?}):\n",
-                spec.source, spec.group_by,
+                "Window index [{i}] (root {}, partition_by {:?}):\n",
+                format_index_root(&spec.root),
+                spec.group_by,
             ));
             out.push_str(&format!(
                 "  retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~{row_field_count}× sizeof(Value).\n",
@@ -1816,6 +1838,21 @@ impl ExecutionPlanDag {
                 &|_, (_, node)| { format!(r#"label="{}""#, dot_escape(&node.display_name())) },
             )
         )
+    }
+}
+
+/// Render a [`PlanIndexRoot`] for `--explain` output. Source-rooted
+/// indices show as `source(<name>)`, node-rooted as `node(<idx>)`,
+/// parent-node-rooted as `parent_node(<idx>)`.
+fn format_index_root(root: &crate::plan::index::PlanIndexRoot) -> String {
+    match root {
+        crate::plan::index::PlanIndexRoot::Source(name) => format!("source({name})"),
+        crate::plan::index::PlanIndexRoot::Node { upstream, .. } => {
+            format!("node({})", upstream.index())
+        }
+        crate::plan::index::PlanIndexRoot::ParentNode { upstream, .. } => {
+            format!("parent_node({})", upstream.index())
+        }
     }
 }
 
@@ -2462,6 +2499,382 @@ pub(crate) fn build_source_dag(
     Ok(tiers)
 }
 
+/// Tier index of `source_name` in a `Vec<SourceTier>` (output of
+/// [`build_source_dag`]), or `None` if the name is not present in any
+/// tier. Used by E150c diagnostic emission to compare two sources'
+/// ingestion ordering: lower index = earlier tier.
+pub fn source_tier_index(tiers: &[SourceTier], source_name: &str) -> Option<usize> {
+    tiers
+        .iter()
+        .position(|t| t.sources.iter().any(|s| s == source_name))
+}
+
+/// Walk back from a window-bearing Transform through the DAG and return
+/// the name of the [`PlanNode::Source`] feeding its primary input chain.
+///
+/// Pass-through operators ([`PlanNode::Sort`], [`PlanNode::Route`]) and
+/// schema-changing operators (Aggregation, Combine, Transform, Merge,
+/// Composition) are walked through by following the first incoming
+/// edge. Returns `None` if the walk reaches a node with no incoming
+/// edges that is not a `Source` (disconnected node), or hits a
+/// [`PlanNode::Merge`] whose inputs come from multiple distinct
+/// source roots (no single primary source).
+pub fn primary_input_source_for_transform(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> Option<String> {
+    let mut cursor = start;
+    loop {
+        if let PlanNode::Source { name, .. } = &graph[cursor] {
+            return Some(name.clone());
+        }
+        let mut incoming = graph.neighbors_directed(cursor, petgraph::Direction::Incoming);
+        let parent = incoming.next()?;
+        cursor = parent;
+    }
+}
+
+/// Walk one incoming edge per step from `start` past pass-through nodes
+/// ([`PlanNode::Sort`], [`PlanNode::Route`]) and return the first ancestor
+/// that actually changes the row stream's schema or row count.
+///
+/// Sort and Route are pass-through with respect to a windowed Transform's
+/// rooting decision: a Sort merely reorders, a Route merely partitions a
+/// shared row stream. The window's arena+index pair must root at whatever
+/// upstream operator is actually producing the rows the window will see —
+/// the Sort/Route is just an in-flight transform of those same rows.
+///
+/// Returns `start` itself if `start` has zero incoming edges (a Source
+/// with no upstream, or a disconnected node). Returns the first
+/// non-pass-through ancestor otherwise. If the walk encounters a
+/// pass-through with multiple incoming edges (in-pipeline branching),
+/// returns that pass-through node — the caller must treat that as a
+/// rooting boundary because the row stream loses single-producer
+/// identity past that point.
+pub fn first_non_passthrough_ancestor(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> NodeIndex {
+    let mut current = start;
+    loop {
+        let is_passthrough = matches!(
+            graph[current],
+            PlanNode::Sort { .. } | PlanNode::Route { .. }
+        );
+        if !is_passthrough {
+            return current;
+        }
+        let mut incoming = graph.neighbors_directed(current, petgraph::Direction::Incoming);
+        let Some(parent) = incoming.next() else {
+            return current;
+        };
+        if incoming.next().is_some() {
+            // Multiple incoming edges into a pass-through — rooting
+            // boundary. The window must root here, not past it.
+            return current;
+        }
+        current = parent;
+    }
+}
+
+/// Resolve composition-body analytic-window IndexSpecs against the
+/// fully-built parent DAG.
+///
+/// Body lowering (`bind_composition`) runs before the parent DAG's
+/// NodeIndex space is allocated, so it cannot stamp `window_index`
+/// onto body Transform nodes whose first non-pass-through ancestor
+/// reaches the body's `input:` port — that port resolves to a
+/// parent-DAG operator only after Stage 5 has built the parent's
+/// `name_to_idx`. This pass closes that gap: per body, per Transform
+/// carrying a captured `body_window_configs` entry, walk
+/// `first_non_passthrough_ancestor` through the body graph, classify
+/// the rooting (`Source` / `Node` / `ParentNode`), construct the
+/// `RawIndexRequest` set, deduplicate it, and backfill `window_index`
+/// onto the body Transform.
+///
+/// Cross-body recursion (composition-of-composition) is handled by
+/// running the pass per-body; nested bodies' parent context is the
+/// enclosing body's mini-DAG plus any ancestor port resolutions
+/// already baked into the encoding scope's index list.
+pub(crate) fn resolve_composition_body_windows(
+    parent_dag: &ExecutionPlanDag,
+    artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<crate::error::Diagnostic>,
+) {
+    use crate::error::{Diagnostic, LabeledSpan};
+    use crate::plan::index::{
+        IndexSpec, PlanIndexRoot, RawIndexRequest, deduplicate_indices, find_index_for,
+    };
+    use crate::span::Span as PlanSpan;
+
+    // Two-step ownership shuffle: (1) compute every body's
+    // (idx_specs, window_index_assignments) without holding a mutable
+    // borrow on `artifacts`, then (2) write the results back.
+    // `artifacts.composition_bodies` holds `BoundBody` values keyed
+    // by `CompositionBodyId`; the immutable borrow during compute
+    // also covers parent_dag access.
+    let body_ids: Vec<crate::plan::composition_body::CompositionBodyId> =
+        artifacts.composition_bodies.keys().copied().collect();
+
+    for body_id in body_ids {
+        let Some(body) = artifacts.composition_bodies.get(&body_id) else {
+            continue;
+        };
+
+        // Build a parent-DAG name → NodeIndex map once per body so
+        // later port resolutions don't re-walk the parent graph for
+        // every window. Top-level lookups walk parent_dag; nested-
+        // body lookups would need the enclosing body's mini-DAG, but
+        // for this pass the parent context is always the top-level
+        // DAG — nested ParentNode rooting through multiple body
+        // layers is an extension that the dispatcher's
+        // `current_body_node_input_refs` plumbing already handles via
+        // active_stack walks; the spec list emitted here points at the
+        // most-immediate parent-DAG operator. Top-level pipelines
+        // dominate the production geometry so this is the load-
+        // bearing case.
+        let mut parent_name_to_idx: std::collections::HashMap<&str, NodeIndex> =
+            std::collections::HashMap::new();
+        for idx in parent_dag.graph.node_indices() {
+            parent_name_to_idx.insert(parent_dag.graph[idx].name(), idx);
+        }
+
+        // Find this body's call-site composition node in the parent
+        // DAG. Multi-call-site signatures (the same .comp.yaml
+        // referenced by N composition nodes) bind to N distinct
+        // `CompositionBodyId`s — `composition_body_assignments` keys
+        // by composition node name, not body file path, so each
+        // body has exactly one composition node.
+        let mut composition_idx: Option<NodeIndex> = None;
+        for (comp_name, &assigned_id) in &artifacts.composition_body_assignments {
+            if assigned_id == body_id
+                && let Some(&idx) = parent_name_to_idx.get(comp_name.as_str())
+            {
+                composition_idx = Some(idx);
+                break;
+            }
+        }
+        let Some(composition_idx) = composition_idx else {
+            // No call site — body is dead code. Skip.
+            continue;
+        };
+
+        // Per-port → parent-DAG NodeIndex via the composition's
+        // incoming port-tagged edges.
+        let mut port_to_parent_idx: std::collections::HashMap<&str, NodeIndex> =
+            std::collections::HashMap::new();
+        use petgraph::visit::EdgeRef;
+        for edge in parent_dag
+            .graph
+            .edges_directed(composition_idx, petgraph::Direction::Incoming)
+        {
+            if let Some(port_name) = edge.weight().port.as_deref() {
+                port_to_parent_idx.insert(port_name, edge.source());
+            }
+        }
+
+        // Per-Transform spec construction. Walk in declaration order
+        // (HashMap iteration order is undefined but stable per
+        // process; we collect names sorted for determinism into the
+        // explain output downstream).
+        let mut window_names: Vec<&str> = body
+            .body_window_configs
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        window_names.sort_unstable();
+
+        let mut raw_requests: Vec<(RawIndexRequest, NodeIndex)> = Vec::new();
+
+        for transform_name in &window_names {
+            let Some(wc) = body.body_window_configs.get(*transform_name) else {
+                continue;
+            };
+            let Some(&transform_idx) = body.name_to_idx.get(*transform_name) else {
+                continue;
+            };
+
+            let mut arena_fields: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for gb in &wc.group_by {
+                arena_fields.insert(gb.clone());
+            }
+            for sf in &wc.sort_by {
+                arena_fields.insert(sf.field.clone());
+            }
+            // Pull every field a body Transform references through
+            // window builtins or bare FieldRefs — e.g.
+            // `$window.sum(amount)` adds `amount`, and `emit x = y` adds
+            // `y`. The analyzer is the same one consumed at top-level
+            // lowering (`config/mod.rs`); body Transforms register their
+            // typed programs in `artifacts.typed` keyed by the body
+            // node's name, so the analyzer call here mirrors the
+            // top-level shape exactly.
+            if let Some(typed) = artifacts.typed.get(*transform_name) {
+                let analysis = cxl::analyzer::analyze_transform(transform_name, typed);
+                for f in &analysis.accessed_fields {
+                    arena_fields.insert(f.clone());
+                }
+            }
+            let mut arena_fields_vec: Vec<String> = arena_fields.into_iter().collect();
+            arena_fields_vec.sort();
+
+            // Body-internal first non-pass-through ancestor.
+            let pred_idx = match body
+                .graph
+                .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
+                .next()
+            {
+                Some(p) => p,
+                None => continue,
+            };
+            let rooted_idx = first_non_passthrough_ancestor(&body.graph, pred_idx);
+            let rooted_node = &body.graph[rooted_idx];
+
+            // Classify the rooting:
+            // - Body Source whose name matches a port → ParentNode.
+            // - Body Source not a port (declared inside body) →
+            //   Source(name).
+            // - Other body operator → Node{ body_upstream, .. }.
+            let root: PlanIndexRoot = match rooted_node {
+                PlanNode::Source { name, .. } => {
+                    if let Some(&parent_upstream) = port_to_parent_idx.get(name.as_str()) {
+                        let anchor_schema = match parent_dag.graph[parent_upstream]
+                            .stored_output_schema()
+                            .cloned()
+                        {
+                            Some(s) => s,
+                            None => {
+                                diags.push(Diagnostic::error(
+                                    "E003",
+                                    format!(
+                                        "composition body windowed transform {transform_name:?} \
+                                         resolves through input port {name:?} to parent operator {:?} \
+                                         which has no output schema",
+                                        parent_dag.graph[parent_upstream].name()
+                                    ),
+                                    LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                                ));
+                                continue;
+                            }
+                        };
+                        PlanIndexRoot::ParentNode {
+                            upstream: parent_upstream,
+                            anchor_schema,
+                        }
+                    } else {
+                        // Body-declared Source — rare but legal.
+                        PlanIndexRoot::Source(name.clone())
+                    }
+                }
+                PlanNode::Merge { .. } => {
+                    diags.push(Diagnostic::error(
+                        "E150d",
+                        format!(
+                            "composition body windowed transform {transform_name:?} \
+                             is rooted at a Merge node; Merge concatenates streams \
+                             without a single producer identity, so a window cannot \
+                             anchor to it"
+                        ),
+                        LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                    ));
+                    continue;
+                }
+                other => {
+                    let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                        continue;
+                    };
+                    // E150b — every arena field must be present in the
+                    // upstream operator's output schema. The top-level
+                    // lowering enforces this at `config/mod.rs`; body
+                    // windows enforce it here so body-internal
+                    // post-aggregate windows that reference a column
+                    // the aggregate did not emit fail at compile rather
+                    // than silently reading Null at runtime.
+                    let mut e150b_fired = false;
+                    for f in &arena_fields_vec {
+                        if !anchor_schema.contains(f.as_str()) {
+                            diags.push(Diagnostic::error(
+                                "E150b",
+                                format!(
+                                    "composition body windowed transform {transform_name:?} \
+                                     references field {f:?} that the upstream operator {:?} \
+                                     does not emit; a node-rooted window can only see \
+                                     columns produced by its rooted operator",
+                                    other.name()
+                                ),
+                                LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
+                            ));
+                            e150b_fired = true;
+                        }
+                    }
+                    if e150b_fired {
+                        continue;
+                    }
+                    PlanIndexRoot::Node {
+                        upstream: rooted_idx,
+                        anchor_schema,
+                    }
+                }
+            };
+
+            // Body Sources do not declare top-level sort_order today;
+            // node-rooted / parent-node-rooted arenas sort partitions
+            // post-build at the upstream-arm exit anyway. Treat body
+            // windows as `already_sorted = false` uniformly.
+            let already_sorted = false;
+
+            let req = RawIndexRequest {
+                root,
+                group_by: wc.group_by.clone(),
+                sort_by: wc.sort_by.clone(),
+                arena_fields: arena_fields_vec,
+                already_sorted,
+                // `transform_index` indexes into a per-body Vec; the
+                // body has no top-level "transform list" alongside it,
+                // so we record the body NodeIndex's underlying integer
+                // for traceability. The dedup pass uses (root,
+                // group_by, sort_by) regardless.
+                transform_index: transform_idx.index(),
+                requires_buffer_recompute: false,
+            };
+            raw_requests.push((req, transform_idx));
+        }
+
+        let request_only: Vec<RawIndexRequest> =
+            raw_requests.iter().map(|(r, _)| r.clone()).collect();
+        let body_indices: Vec<IndexSpec> = deduplicate_indices(request_only);
+
+        // Backfill `window_index` onto each body Transform node. Re-
+        // borrow `body` mutably now that we've finished consulting it
+        // immutably. Only mutate `body.graph`, `body.body_indices_to_build`.
+        let Some(body_mut) = artifacts.composition_bodies.get_mut(&body_id) else {
+            continue;
+        };
+        for (req, transform_idx) in &raw_requests {
+            let new_window_index =
+                find_index_for(&body_indices, &req.root, &req.group_by, &req.sort_by);
+            if let PlanNode::Transform {
+                window_index,
+                partition_lookup,
+                ..
+            } = &mut body_mut.graph[*transform_idx]
+            {
+                *window_index = new_window_index;
+                // Body-internal partition lookup: cross-source
+                // (`wc.source: <other>`) is not a body-level surface
+                // today, so every body window resolves through the
+                // same-source path. Stamping `SameSource` keeps
+                // downstream consumers that branch on
+                // `partition_lookup` uniform with the top-level
+                // lowering arm in `lower_node_to_plan_node`.
+                *partition_lookup = Some(PartitionLookupKind::SameSource);
+            }
+        }
+        body_mut.body_indices_to_build = body_indices;
+    }
+}
+
 /// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes
 /// inserted by [`ExecutionPlanDag::insert_enforcer_sorts`] to satisfy a
 /// transform's per-operator [`NodeExecutionReqs::RequiresSortedInput`].
@@ -2469,9 +2882,9 @@ pub const ENFORCER_SORT_PREFIX: &str = "__sort_for_";
 
 /// Reserved name prefix for planner-synthesized [`PlanNode::Sort`] nodes
 /// inserted by [`ExecutionPlanDag::inject_correlation_sort`] to materialize
-/// `error_handling.correlation_key` failure-domain grouping. Distinct
+/// each source's `correlation_key:` failure-domain grouping. Distinct
 /// from [`ENFORCER_SORT_PREFIX`] because the two passes encode different
-/// concerns: per-operator algorithm need vs. pipeline-level policy.
+/// concerns: per-operator algorithm need vs. per-source identity.
 pub const CORRELATION_SORT_PREFIX: &str = "__correlation_sort_";
 
 /// Reserved name prefix for planner-synthesized [`PlanNode::CorrelationCommit`]
@@ -2612,139 +3025,139 @@ impl ExecutionPlanDag {
         Ok(())
     }
 
-    /// Inject a [`PlanNode::Sort`] for the pipeline-level
-    /// `error_handling.correlation_key` failure-domain grouping policy.
+    /// Inject one [`PlanNode::Sort`] downstream of every source whose
+    /// `correlation_key:` is declared, so the per-source failure-domain
+    /// grouping has the deterministic ordering the commit phase needs.
     ///
-    /// No-op when `correlation_key` is unset, when there is no primary
-    /// source, or when the source's declared `sort_order` already starts
-    /// with the correlation-key fields. Otherwise inserts one
-    /// [`PlanNode::Sort`] downstream of the primary source and reroutes
-    /// every existing data edge from that source through it.
+    /// No-op for sources without a declared `correlation_key:`, and
+    /// idempotent for sources whose declared `sort_order` already starts
+    /// with the source's correlation-key fields. Each sort node carries
+    /// the source's CK fields (ascending) as a prefix of any declared
+    /// sort, mirroring the per-source identity downstream operators
+    /// commit against.
     pub fn inject_correlation_sort(
         &mut self,
-        error_handling: &crate::config::ErrorHandlingConfig,
-        sources: &[SourceConfig],
+        sources: &[&crate::config::pipeline_node::SourceBody],
     ) -> Result<(), PipelineError> {
-        let Some(correlation_key) = error_handling.correlation_key.as_ref() else {
-            return Ok(());
-        };
-        let Some(primary_input) = sources.first() else {
-            return Ok(());
-        };
+        for body in sources {
+            let Some(correlation_key) = body.correlation_key.as_ref() else {
+                continue;
+            };
+            let source_cfg = &body.source;
 
-        let key_field_names: Vec<String> = correlation_key
-            .fields()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let declared: Vec<SortField> = primary_input
-            .sort_order
-            .as_ref()
-            .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect())
-            .unwrap_or_default();
+            let key_field_names: Vec<String> = correlation_key
+                .fields()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let declared: Vec<SortField> = source_cfg
+                .sort_order
+                .as_ref()
+                .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect())
+                .unwrap_or_default();
 
-        // Idempotent satisfaction: declared sort already starts with the
-        // correlation key fields. Direction-agnostic to mirror the
-        // deleted impl.
-        let already_satisfied = key_field_names.len() <= declared.len()
-            && key_field_names
-                .iter()
-                .zip(declared.iter())
-                .all(|(k, sf)| k == &sf.field);
-        if already_satisfied {
-            return Ok(());
-        }
-
-        let primary_name = &primary_input.name;
-        let source_idx = self.graph.node_indices().find(
-            |&idx| matches!(&self.graph[idx], PlanNode::Source { name, .. } if name == primary_name),
-        );
-        let Some(source_idx) = source_idx else {
-            return Err(PipelineError::Compilation {
-                transform_name: primary_name.clone(),
-                messages: vec![format!(
-                    "inject_correlation_sort: primary source '{primary_name}' not found in DAG"
-                )],
-            });
-        };
-
-        let mut sort_fields: Vec<SortField> = key_field_names
-            .iter()
-            .map(|f| SortField {
-                field: f.clone(),
-                order: crate::config::SortOrder::Asc,
-                null_order: None,
-            })
-            .collect();
-        for sf in declared.into_iter() {
-            if !key_field_names.contains(&sf.field) {
-                sort_fields.push(sf);
-            }
-        }
-
-        // Capture (target, dep_type, port) for every outgoing edge — the
-        // port tag must survive the splice so a downstream
-        // composition's named-input edge keeps its tag on the new
-        // sort→target hop.
-        let outgoing: Vec<(NodeIndex, DependencyType, Option<String>)> = self
-            .graph
-            .edges_directed(source_idx, petgraph::Direction::Outgoing)
-            .map(|e| {
-                (
-                    e.target(),
-                    e.weight().dependency_type,
-                    e.weight().port.clone(),
-                )
-            })
-            .collect();
-        if outgoing.is_empty() {
-            return Ok(());
-        }
-
-        // Idempotent insertion guard: every outgoing edge already
-        // lands on a CORRELATION_SORT_PREFIX Sort node — nothing to do.
-        if outgoing.iter().all(|(t, _, _)| {
-            matches!(&self.graph[*t], PlanNode::Sort { name, .. } if name.starts_with(CORRELATION_SORT_PREFIX))
-        }) {
-            return Ok(());
-        }
-
-        let sort_node = PlanNode::Sort {
-            name: format!("{CORRELATION_SORT_PREFIX}{primary_name}"),
-            span: Span::SYNTHETIC,
-            sort_fields,
-        };
-        let sort_idx = self.graph.add_node(sort_node);
-        for (target, dep_type, port) in outgoing {
-            if target == sort_idx {
+            // Idempotent satisfaction: declared sort already starts with
+            // the correlation key fields. Direction-agnostic.
+            let already_satisfied = key_field_names.len() <= declared.len()
+                && key_field_names
+                    .iter()
+                    .zip(declared.iter())
+                    .all(|(k, sf)| k == &sf.field);
+            if already_satisfied {
                 continue;
             }
-            if let Some(edge_id) = self.graph.find_edge(source_idx, target) {
-                self.graph.remove_edge(edge_id);
+
+            let source_name = &source_cfg.name;
+            let source_idx = self.graph.node_indices().find(
+                |&idx| matches!(&self.graph[idx], PlanNode::Source { name, .. } if name == source_name),
+            );
+            let Some(source_idx) = source_idx else {
+                return Err(PipelineError::Compilation {
+                    transform_name: source_name.clone(),
+                    messages: vec![format!(
+                        "inject_correlation_sort: source '{source_name}' not found in DAG"
+                    )],
+                });
+            };
+
+            let mut sort_fields: Vec<SortField> = key_field_names
+                .iter()
+                .map(|f| SortField {
+                    field: f.clone(),
+                    order: crate::config::SortOrder::Asc,
+                    null_order: None,
+                })
+                .collect();
+            for sf in declared.into_iter() {
+                if !key_field_names.contains(&sf.field) {
+                    sort_fields.push(sf);
+                }
+            }
+
+            // Capture (target, dep_type, port) for every outgoing edge — the
+            // port tag must survive the splice so a downstream
+            // composition's named-input edge keeps its tag on the new
+            // sort→target hop.
+            let outgoing: Vec<(NodeIndex, DependencyType, Option<String>)> = self
+                .graph
+                .edges_directed(source_idx, petgraph::Direction::Outgoing)
+                .map(|e| {
+                    (
+                        e.target(),
+                        e.weight().dependency_type,
+                        e.weight().port.clone(),
+                    )
+                })
+                .collect();
+            if outgoing.is_empty() {
+                continue;
+            }
+
+            // Idempotent insertion guard: every outgoing edge already
+            // lands on a CORRELATION_SORT_PREFIX Sort node — nothing to do.
+            if outgoing.iter().all(|(t, _, _)| {
+                matches!(&self.graph[*t], PlanNode::Sort { name, .. } if name.starts_with(CORRELATION_SORT_PREFIX))
+            }) {
+                continue;
+            }
+
+            let sort_node = PlanNode::Sort {
+                name: format!("{CORRELATION_SORT_PREFIX}{source_name}"),
+                span: Span::SYNTHETIC,
+                sort_fields,
+            };
+            let sort_idx = self.graph.add_node(sort_node);
+            for (target, dep_type, port) in outgoing {
+                if target == sort_idx {
+                    continue;
+                }
+                if let Some(edge_id) = self.graph.find_edge(source_idx, target) {
+                    self.graph.remove_edge(edge_id);
+                }
+                self.graph.add_edge(
+                    sort_idx,
+                    target,
+                    PlanEdge {
+                        dependency_type: dep_type,
+                        port,
+                    },
+                );
             }
             self.graph.add_edge(
+                source_idx,
                 sort_idx,
-                target,
                 PlanEdge {
-                    dependency_type: dep_type,
-                    port,
+                    dependency_type: DependencyType::Data,
+                    port: None,
                 },
             );
         }
-        self.graph.add_edge(
-            source_idx,
-            sort_idx,
-            PlanEdge {
-                dependency_type: DependencyType::Data,
-                port: None,
-            },
-        );
 
         Ok(())
     }
 
-    /// Inject the terminal [`PlanNode::CorrelationCommit`] for
-    /// `error_handling.correlation_key` pipelines.
+    /// Inject the terminal [`PlanNode::CorrelationCommit`] when any
+    /// source declares a `correlation_key:`.
     ///
     /// One commit node is created and every existing [`PlanNode::Output`]
     /// gains an outgoing edge to it. Output writes from the dispatcher
@@ -2752,13 +3165,20 @@ impl ExecutionPlanDag {
     /// keyed by group; the commit arm walks those buffers at end-of-DAG.
     /// Idempotent — calling twice with a commit already present is a
     /// no-op.
+    ///
+    /// `commit_group_by` carries the union of every source's CK field
+    /// names. The runtime's `buffer_key_for_record` keys each record by
+    /// every engine-stamped column it carries, so the commit-side
+    /// `commit_group_by` is informational; the union is the most useful
+    /// shape for `--explain` rendering.
     pub fn inject_correlation_commit(
         &mut self,
-        error_handling: &crate::config::ErrorHandlingConfig,
+        sources: &[&crate::config::pipeline_node::SourceBody],
+        max_group_buffer: u64,
     ) -> Result<(), PipelineError> {
-        let Some(correlation_key) = error_handling.correlation_key.as_ref() else {
+        if sources.iter().all(|b| b.correlation_key.is_none()) {
             return Ok(());
-        };
+        }
 
         // Idempotent: bail if a commit node already exists.
         let already = self
@@ -2769,12 +3189,17 @@ impl ExecutionPlanDag {
             return Ok(());
         }
 
-        let commit_group_by: Vec<String> = correlation_key
-            .fields()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let max_group_buffer = error_handling.max_group_buffer.unwrap_or(100_000);
+        let mut commit_group_by: Vec<String> = Vec::new();
+        for body in sources {
+            if let Some(ck) = body.correlation_key.as_ref() {
+                for field in ck.fields() {
+                    let owned = field.to_string();
+                    if !commit_group_by.contains(&owned) {
+                        commit_group_by.push(owned);
+                    }
+                }
+            }
+        }
 
         let output_indices: Vec<NodeIndex> = self
             .graph
@@ -2809,8 +3234,9 @@ impl ExecutionPlanDag {
 
     /// Whether this DAG carries the correlation-key terminal commit
     /// node. Returns `true` iff [`Self::inject_correlation_commit`]
-    /// has run on a pipeline with `error_handling.correlation_key`
-    /// configured AND at least one [`PlanNode::Output`] was present.
+    /// has run on a pipeline with at least one source declaring a
+    /// `correlation_key:` AND at least one [`PlanNode::Output`] was
+    /// present.
     pub fn required_sorted_input(&self) -> bool {
         self.graph
             .node_weights()
@@ -2835,8 +3261,7 @@ impl ExecutionPlanDag {
     /// rule fails (currently infallible).
     pub fn compute_node_properties(
         &mut self,
-        inputs: &HashMap<String, SourceConfig>,
-        correlation_key_fields: &[String],
+        inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
     ) -> Result<(), PipelineError> {
         assert!(
             self.node_properties.is_empty(),
@@ -2851,7 +3276,7 @@ impl ExecutionPlanDag {
                     .neighbors_directed(idx, petgraph::Direction::Incoming)
                     .filter_map(|p| self.node_properties.get(&p))
                     .collect();
-                compute_one(&self.graph[idx], &parents, inputs, correlation_key_fields)
+                compute_one(&self.graph[idx], &parents, inputs)
             };
             self.node_properties.insert(idx, props);
         }
@@ -2885,54 +3310,18 @@ impl ExecutionPlanDag {
     /// at least one field that is not part of the window's
     /// `partition_by` slice. Reads `node_properties.ck_set`, so callers
     /// must invoke `compute_node_properties` first. Idempotent.
-    pub(crate) fn derive_window_buffer_recompute_flags(
-        &mut self,
-        correlation_key: Option<&crate::config::CorrelationKey>,
-    ) {
-        // Pipeline-level enabler: at least one aggregate whose `group_by`
-        // omits a correlation-key field. Without one, the retraction
-        // protocol does not fire and no window needs buffer mode.
-        let has_relaxed_aggregate = self.graph.node_weights().any(|n| {
-            matches!(
-                n,
-                PlanNode::Aggregation { config, .. }
-                    if group_by_omits_any_ck_field(&config.group_by, correlation_key)
-            )
-        });
-        if !has_relaxed_aggregate {
-            return;
-        }
-
-        let mut to_flag: Vec<usize> = Vec::new();
-        for idx in self.graph.node_indices() {
-            if let PlanNode::Transform {
-                window_index: Some(idx_num),
-                ..
-            } = &self.graph[idx]
-            {
-                let idx_num = *idx_num;
-                let Some(props) = self.node_properties.get(&idx) else {
-                    continue;
-                };
-                let Some(spec) = self.indices_to_build.get(idx_num) else {
-                    continue;
-                };
-                let partition_set: BTreeSet<&str> =
-                    spec.group_by.iter().map(String::as_str).collect();
-                let ck_outside_partition = props
-                    .ck_set
-                    .iter()
-                    .any(|f| !partition_set.contains(f.as_str()));
-                if ck_outside_partition {
-                    to_flag.push(idx_num);
-                }
-            }
-        }
-        for idx_num in to_flag {
-            if let Some(spec) = self.indices_to_build.get_mut(idx_num) {
-                spec.requires_buffer_recompute = true;
-            }
-        }
+    pub(crate) fn derive_window_buffer_recompute_flags(&mut self) {
+        let ck_at = |idx: NodeIndex| -> BTreeSet<String> {
+            self.node_properties
+                .get(&idx)
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default()
+        };
+        derive_window_buffer_recompute_flags_for_graph(
+            &self.graph,
+            &mut self.indices_to_build,
+            ck_at,
+        );
     }
 
     /// Resolve `AggregateStrategyHint` on every `PlanNode::Aggregation`
@@ -3123,8 +3512,7 @@ struct ResolvedStrategy {
 fn compute_one(
     node: &PlanNode,
     parents: &[&NodeProperties],
-    inputs: &HashMap<String, SourceConfig>,
-    correlation_key_fields: &[String],
+    inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
 ) -> NodeProperties {
     let single_stream_partitioning = || Partitioning {
         kind: PartitioningKind::Single,
@@ -3148,9 +3536,9 @@ fn compute_one(
 
     match node {
         PlanNode::Source { name, .. } => {
-            let sort_order: Option<Vec<SortField>> = inputs
-                .get(name)
-                .and_then(|ic| ic.sort_order.as_ref())
+            let body = inputs.get(name).copied();
+            let sort_order: Option<Vec<SortField>> = body
+                .and_then(|b| b.source.sort_order.as_ref())
                 .map(|specs| specs.iter().cloned().map(|s| s.into_sort_field()).collect());
             let provenance = if sort_order.is_some() {
                 OrderingProvenance::DeclaredOnInput {
@@ -3159,10 +3547,20 @@ fn compute_one(
             } else {
                 OrderingProvenance::NoOrdering
             };
-            // Source observes every pipeline-level CK field — they are
-            // shadow-stamped at ingest, so the column set is uniform
-            // across all sources.
-            let ck_set: BTreeSet<String> = correlation_key_fields.iter().cloned().collect();
+            // Source observes every CK field declared on its own
+            // `correlation_key:` — those columns are shadow-stamped at
+            // ingest. Sources without a declared CK contribute an
+            // empty set; multi-source pipelines rely on each source's
+            // local declaration.
+            let ck_set: BTreeSet<String> = body
+                .and_then(|b| b.correlation_key.as_ref())
+                .map(|ck| {
+                    ck.fields()
+                        .into_iter()
+                        .map(String::from)
+                        .collect::<BTreeSet<String>>()
+                })
+                .unwrap_or_default();
             NodeProperties {
                 ordering: Ordering {
                     sort_order,
@@ -3352,7 +3750,7 @@ fn compute_one(
             }
         }
 
-        PlanNode::Aggregation { config, .. } => {
+        PlanNode::Aggregation { name, config, .. } => {
             // Aggregation node ordering is the sole responsibility of
             // the `select_aggregation_strategies` post-pass, which runs
             // immediately after `compute_node_properties` and overwrites
@@ -3363,18 +3761,22 @@ fn compute_one(
             // rather than silently asserting a false ordering.
             //
             // CK lattice rule:
-            //   - strict (`group_by ⊇ correlation_key`): preserves parent
+            //   - strict (`group_by ⊇ parent.ck_set`): preserves parent
             //     CK set unchanged.
-            //   - relaxed (`group_by` omits any CK field): intersects
-            //     parent CK set with `group_by`. Any CK column the user
-            //     dropped from `group_by` stops being visible to
-            //     downstream consumers because the aggregator no longer
-            //     projects it onto its output rows.
+            //   - relaxed (`group_by` omits any CK field visible in
+            //     the parent lattice): intersects parent CK set with
+            //     `group_by`, then injects a synthetic
+            //     `$ck.aggregate.<name>` entry that the schema-widening
+            //     pass already appended to the aggregate's
+            //     `output_schema`. The synthetic entry keeps a relaxed
+            //     aggregate's downstream consumers correlation-aware
+            //     even when the original source CK field has dropped
+            //     out of the lattice — detect-phase fan-out resolves
+            //     it back to source rows via the aggregator's
+            //     `input_rows` lineage.
             let parent_ck = preserve_parent_ck_set();
-            let omits_ck = correlation_key_fields
-                .iter()
-                .any(|f| !config.group_by.iter().any(|g| g == f));
-            let ck_set: BTreeSet<String> = if omits_ck {
+            let omits_ck = group_by_omits_any_ck_field(&config.group_by, &parent_ck);
+            let mut ck_set: BTreeSet<String> = if omits_ck {
                 let group_by_set: BTreeSet<&str> =
                     config.group_by.iter().map(String::as_str).collect();
                 parent_ck
@@ -3384,6 +3786,9 @@ fn compute_one(
             } else {
                 parent_ck
             };
+            if omits_ck {
+                ck_set.insert(format!("$ck.aggregate.{name}"));
+            }
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
@@ -3466,7 +3871,7 @@ fn compute_one(
             // fallback, which matches today's runtime driver-resolution
             // behavior at dispatch.
             use crate::config::pipeline_node::PropagateCkSpec;
-            let ck_set: BTreeSet<String> = match propagate_ck {
+            let mut ck_set: BTreeSet<String> = match propagate_ck {
                 PropagateCkSpec::Driver => parents
                     .first()
                     .map(|p| p.ck_set.clone())
@@ -3483,6 +3888,23 @@ fn compute_one(
                     names.intersection(&upstream_union).cloned().collect()
                 }
             };
+            // Synthetic CK (`$ck.aggregate.<name>`) is engine-managed
+            // lineage from a relaxed aggregate to its source rows; the
+            // user did not declare it, so `propagate_ck` has no
+            // semantic meaning over it. Union it from every parent so
+            // detect-phase fan-out keeps its bridge across the combine
+            // boundary regardless of how user-declared source CK is
+            // routed.
+            let synthetic: BTreeSet<String> = parents
+                .iter()
+                .flat_map(|p| {
+                    p.ck_set
+                        .iter()
+                        .filter(|f| f.starts_with("$ck.aggregate."))
+                        .cloned()
+                })
+                .collect();
+            ck_set.extend(synthetic);
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
@@ -3647,31 +4069,229 @@ pub(crate) fn cxl_has_nondeterministic_call(typed: &TypedProgram) -> bool {
 }
 
 /// True when an aggregate's `group_by` omits at least one field of the
-/// pipeline-level correlation key.
+/// parent's visible CK set.
 ///
 /// Selects between the strict-collateral two-phase commit (returns
 /// `false`) and the relaxed lattice + five-phase retraction protocol
-/// (returns `true`). Pipelines without a correlation key always return
-/// `false` — there is no key to test against, so retraction is not in
-/// play.
+/// (returns `true`). Aggregates whose parent ck_set is empty always
+/// return `false` — there is no CK to test against, so retraction is
+/// not in play.
 ///
-/// `correlation_key` is the comma-split [`crate::config::CorrelationKey`]
-/// fields. `group_by` is the aggregate's user-declared (or
-/// auto-extension-rewritten) group-by list. Field-name comparison is
-/// strict equality; the auto-extension pass appends `$ck.<field>` shadow
-/// columns whenever the user already lists the corresponding bare field,
-/// so the bare-name check below sees the post-extension shape and stays
+/// `parent_ck_set` is the lattice value computed at the aggregate's
+/// upstream node (typed-stable across composition descent). `group_by`
+/// is the aggregate's user-declared (or auto-extension-rewritten)
+/// group-by list. Field-name comparison is strict equality; the
+/// auto-extension pass appends `$ck.<field>` shadow columns whenever
+/// the user already lists the corresponding bare field, so the
+/// bare-name check below sees the post-extension shape and stays
 /// stable across the rewrite.
 pub(crate) fn group_by_omits_any_ck_field(
     group_by: &[String],
-    correlation_key: Option<&crate::config::CorrelationKey>,
+    parent_ck_set: &BTreeSet<String>,
 ) -> bool {
-    let Some(ck) = correlation_key else {
-        return false;
-    };
-    ck.fields()
+    parent_ck_set
         .iter()
-        .any(|f| !group_by.iter().any(|g| g.as_str() == *f))
+        .any(|f| !group_by.iter().any(|g| g.as_str() == f.as_str()))
+}
+
+/// Walk the top-level DAG and re-stamp each aggregate's
+/// `requires_lineage` / `requires_buffer_mode` flags from the lattice.
+///
+/// Lowering stamps the strict default; this pass flips the flags via
+/// `set_retraction_flags(true)` for any aggregate whose `group_by`
+/// does not cover its parent's `ck_set`. Runs after
+/// `compute_node_properties`, so every aggregate's parent has a
+/// populated lattice entry.
+pub(crate) fn apply_retraction_flags(dag: &mut ExecutionPlanDag) {
+    use std::sync::Arc;
+
+    let plan: Vec<(petgraph::graph::NodeIndex, bool)> = dag
+        .graph
+        .node_indices()
+        .filter_map(|idx| {
+            let PlanNode::Aggregation { config, .. } = &dag.graph[idx] else {
+                return None;
+            };
+            let parent_ck = dag
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .next()
+                .and_then(|p| dag.node_properties.get(&p))
+                .map(|p| p.ck_set.clone())
+                .unwrap_or_default();
+            let is_relaxed = group_by_omits_any_ck_field(&config.group_by, &parent_ck);
+            Some((idx, is_relaxed))
+        })
+        .collect();
+
+    for (idx, is_relaxed) in plan {
+        if let PlanNode::Aggregation { compiled, .. } = &mut dag.graph[idx] {
+            Arc::make_mut(compiled).set_retraction_flags(is_relaxed);
+        }
+    }
+}
+
+/// Body-graph variant. Body mini-DAGs don't carry a `node_properties`
+/// side table, so the parent's CK set is derived inline by walking
+/// the upstream node's `output_schema` for `$ck.<field>` columns.
+pub(crate) fn apply_retraction_flags_in_body(body: &mut crate::plan::composition_body::BoundBody) {
+    use clinker_record::FieldMetadata;
+    use std::sync::Arc;
+
+    let plan: Vec<(petgraph::graph::NodeIndex, bool)> = body
+        .graph
+        .node_indices()
+        .filter_map(|idx| {
+            let PlanNode::Aggregation { config, .. } = &body.graph[idx] else {
+                return None;
+            };
+            let mut ck: BTreeSet<String> = BTreeSet::new();
+            let mut cursor = idx;
+            while let Some(upstream) = body
+                .graph
+                .neighbors_directed(cursor, petgraph::Direction::Incoming)
+                .next()
+            {
+                if let Some(schema) = body.graph[upstream].stored_output_schema() {
+                    for (i, col) in schema.columns().iter().enumerate() {
+                        if matches!(
+                            schema.field_metadata(i),
+                            Some(FieldMetadata::SourceCorrelation { .. }),
+                        ) && let Some(field) = col.strip_prefix("$ck.")
+                        {
+                            ck.insert(field.to_string());
+                        }
+                    }
+                    break;
+                }
+                cursor = upstream;
+            }
+            let is_relaxed = group_by_omits_any_ck_field(&config.group_by, &ck);
+            Some((idx, is_relaxed))
+        })
+        .collect();
+
+    for (idx, is_relaxed) in plan {
+        if let PlanNode::Aggregation { compiled, .. } = &mut body.graph[idx] {
+            Arc::make_mut(compiled).set_retraction_flags(is_relaxed);
+        }
+    }
+}
+
+/// Shared core for the buffer-recompute auto-flip walk over any
+/// `(graph, indices_to_build)` pair.
+///
+/// `ck_at` returns the CK set visible at a given node — the top-level
+/// dispatch reads `node_properties.ck_set`; the body dispatch derives it
+/// inline by walking the nearest upstream `output_schema` for
+/// `FieldMetadata::SourceCorrelation` columns.
+///
+/// The walk is the unified rule from
+/// [`ExecutionPlanDag::derive_window_buffer_recompute_flags`]: when at
+/// least one aggregate's `group_by` omits a parent-CK field (relaxed
+/// retraction protocol fires), every windowed Transform whose
+/// `partition_by` does not cover the visible CK set flips to
+/// `requires_buffer_recompute = true`.
+fn derive_window_buffer_recompute_flags_for_graph<F>(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    indices_to_build: &mut [crate::plan::index::IndexSpec],
+    mut ck_at: F,
+) where
+    F: FnMut(NodeIndex) -> BTreeSet<String>,
+{
+    // Lattice-driven enabler: at least one aggregate whose parent's
+    // `ck_set` is NOT a subset of `group_by`. Without one, the
+    // retraction protocol does not fire and no window needs buffer
+    // mode.
+    let has_relaxed_aggregate = graph.node_indices().any(|idx| {
+        let PlanNode::Aggregation { config, .. } = &graph[idx] else {
+            return false;
+        };
+        let parent_ck = graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .next()
+            .map(&mut ck_at)
+            .unwrap_or_default();
+        group_by_omits_any_ck_field(&config.group_by, &parent_ck)
+    });
+    if !has_relaxed_aggregate {
+        return;
+    }
+
+    let mut to_flag: Vec<usize> = Vec::new();
+    for idx in graph.node_indices() {
+        if let PlanNode::Transform {
+            window_index: Some(idx_num),
+            ..
+        } = &graph[idx]
+        {
+            let idx_num = *idx_num;
+            let Some(spec) = indices_to_build.get(idx_num) else {
+                continue;
+            };
+            let partition_set: BTreeSet<&str> = spec.group_by.iter().map(String::as_str).collect();
+            let ck_set = ck_at(idx);
+            let ck_outside_partition = ck_set.iter().any(|f| !partition_set.contains(f.as_str()));
+            if ck_outside_partition {
+                to_flag.push(idx_num);
+            }
+        }
+    }
+    for idx_num in to_flag {
+        if let Some(spec) = indices_to_build.get_mut(idx_num) {
+            spec.requires_buffer_recompute = true;
+        }
+    }
+}
+
+/// Body-graph variant of `derive_window_buffer_recompute_flags`.
+///
+/// Body mini-DAGs do not carry a `node_properties` side table, so the
+/// CK set visible at any body node is derived inline by walking the
+/// nearest upstream `output_schema` for `FieldMetadata::SourceCorrelation`
+/// columns — the same shape `apply_retraction_flags_in_body` uses to
+/// derive the relaxed-aggregate trigger. Composition-body windows
+/// downstream of a body-internal relaxed-CK aggregate flip into
+/// buffer-recompute mode the same way top-level windows do, so the
+/// commit-phase recompute path can rerun the window over
+/// `partition − retracted_rows`.
+pub(crate) fn derive_window_buffer_recompute_flags_in_body(
+    body: &mut crate::plan::composition_body::BoundBody,
+) {
+    use clinker_record::FieldMetadata;
+
+    let ck_at = |start: NodeIndex| -> BTreeSet<String> {
+        let mut ck: BTreeSet<String> = BTreeSet::new();
+        let mut cursor = start;
+        loop {
+            if let Some(schema) = body.graph[cursor].stored_output_schema() {
+                for (i, col) in schema.columns().iter().enumerate() {
+                    if matches!(
+                        schema.field_metadata(i),
+                        Some(FieldMetadata::SourceCorrelation { .. }),
+                    ) && let Some(field) = col.strip_prefix("$ck.")
+                    {
+                        ck.insert(field.to_string());
+                    }
+                }
+                return ck;
+            }
+            match body
+                .graph
+                .neighbors_directed(cursor, petgraph::Direction::Incoming)
+                .next()
+            {
+                Some(upstream) => cursor = upstream,
+                None => return ck,
+            }
+        }
+    };
+
+    derive_window_buffer_recompute_flags_for_graph(
+        &body.graph,
+        &mut body.body_indices_to_build,
+        ck_at,
+    );
 }
 
 /// Detect whether a CXL transform contains any `distinct` statement.
@@ -3744,10 +4364,10 @@ pub enum PlanError {
     AggregateWithMultipleInputs {
         transform: String,
     },
-    /// E150 — `error_handling.correlation_key` is incompatible with any
+    /// E150 — a source's `correlation_key:` is incompatible with any
     /// Transform that uses analytic windows (`window_index: Some(_)`).
-    /// Per-group arena construction across correlation boundaries is a
-    /// separate concern; reject at compile time so users see the
+    /// Per-group arena construction across correlation boundaries is
+    /// a separate concern; reject at compile time so users see the
     /// limitation up front instead of a confusing runtime path.
     CorrelationKeyWithArena {
         transform: String,
@@ -3842,8 +4462,8 @@ impl std::fmt::Display for PlanError {
             PlanError::CorrelationKeyWithArena { transform } => {
                 write!(
                     f,
-                    "E150 transform '{transform}' uses analytic windows but the \
-                     pipeline has `error_handling.correlation_key` set; per-group \
+                    "E150 transform '{transform}' uses analytic windows but at \
+                     least one source declares a `correlation_key:`; per-group \
                      arena construction is not supported",
                 )
             }
@@ -3991,6 +4611,8 @@ mod port_tag_guard_tests {
             output_port_to_node_idx: indexmap::IndexMap::new(),
             input_port_rows: indexmap::IndexMap::new(),
             nested_body_ids: Vec::new(),
+            body_indices_to_build: Vec::new(),
+            body_window_configs: HashMap::new(),
         };
         artifacts.insert_body(body_id, body);
         let diags = diagnose_untagged_composition_edges(&dag, &artifacts);

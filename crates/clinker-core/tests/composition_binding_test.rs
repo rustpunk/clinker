@@ -58,6 +58,8 @@ fn test_compile_artifacts_insert_body_and_lookup() {
         output_port_to_node_idx: IndexMap::new(),
         input_port_rows: IndexMap::new(),
         nested_body_ids: vec![],
+        body_indices_to_build: Vec::new(),
+        body_window_configs: std::collections::HashMap::new(),
     };
 
     artifacts.insert_body(id, body.clone());
@@ -151,7 +153,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     // Verify: composition_body_assignments has an entry for "enrich".
@@ -233,7 +234,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let body_id = artifacts.composition_body_assignments["enrich"];
@@ -314,7 +314,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     // Binding should succeed with no E102 errors.
@@ -380,7 +379,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     // Should have 2 body assignments: nested_process (outer) + inner_normalize (inner).
@@ -446,7 +444,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e103: Vec<_> = diags.iter().filter(|d| d.code == "E103").collect();
@@ -533,7 +530,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e104: Vec<_> = diags.iter().filter(|d| d.code == "E104").collect();
@@ -604,7 +600,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e102: Vec<_> = diags.iter().filter(|d| d.code == "E102").collect();
@@ -702,7 +697,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e107: Vec<_> = diags.iter().filter(|d| d.code == "E107").collect();
@@ -783,7 +777,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e108: Vec<_> = diags.iter().filter(|d| d.code == "E108").collect();
@@ -852,7 +845,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let w101: Vec<_> = diags.iter().filter(|d| d.code == "W101").collect();
@@ -959,7 +951,6 @@ nodes:
         &ctx,
         &symbol_table,
         &ctx.pipeline_dir,
-        cfg.error_handling.correlation_key.as_ref(),
     );
 
     let e107: Vec<_> = diags.iter().filter(|d| d.code == "E107").collect();
@@ -1044,7 +1035,6 @@ fn test_pipeline_compile_with_workspace_root_binds_compositions() {
                 &ctx,
                 &symbol_table,
                 &ctx.pipeline_dir,
-                cfg.error_handling.correlation_key.as_ref(),
             );
             let bound_body = artifacts
                 .body_of(*body)

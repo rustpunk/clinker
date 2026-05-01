@@ -526,6 +526,68 @@ impl<'a> TypeChecker<'a> {
                 args,
                 span,
             } => {
+                // `$window.lag(n).<field>` style postfix-field chain on a
+                // positional window builtin. The result type is the
+                // upstream row's declared type for `field`; an unknown
+                // field name surfaces as a typecheck error here rather
+                // than silently producing Null at runtime.
+                if args.is_empty()
+                    && let Expr::WindowCall { function, .. } = &**receiver
+                    && matches!(&**function, "first" | "last" | "lag" | "lead")
+                {
+                    // Recurse into the WindowCall to typecheck its args
+                    // (e.g. the integer offset on `lag(1)`).
+                    self.check_expr(receiver, in_predicate);
+                    let ty = match self.schema.lookup(method) {
+                        // Out-of-bounds positional (lag past partition
+                        // start, lead past partition end) returns Null at
+                        // runtime, so the chain's result is always
+                        // nullable regardless of the upstream column's
+                        // declared nullability.
+                        ColumnLookup::Declared(declared) => Type::nullable(declared.clone()),
+                        // Open row (composition tail / source-without-
+                        // declared-schema) — we cannot prove the field
+                        // exists upstream at compile time. Type::Any
+                        // mirrors how `FieldRef` handles open rows.
+                        ColumnLookup::PassThrough(_) => Type::Any,
+                        ColumnLookup::Unknown => {
+                            // Closed row, field genuinely absent. Treat
+                            // identically to a bare `FieldRef` typo.
+                            self.error(
+                                *span,
+                                format!(
+                                    "field '{}' is not in the upstream row schema for $window.{}()",
+                                    method, function
+                                ),
+                                Some(
+                                    "ensure the upstream node emits this field, or correct the spelling"
+                                        .into(),
+                                ),
+                            );
+                            Type::Any
+                        }
+                        ColumnLookup::Ambiguous(_) => {
+                            // Bare field reference on a merged-row receiver
+                            // is ambiguous — same shape the FieldRef arm
+                            // handles for combine inputs.
+                            self.error(
+                                *span,
+                                format!(
+                                    "field '{}' on $window.{}() is ambiguous in the upstream row schema",
+                                    method, function
+                                ),
+                                Some(
+                                    "qualify the upstream input or rename the field upstream"
+                                        .into(),
+                                ),
+                            );
+                            Type::Any
+                        }
+                    };
+                    self.set_type(*node_id, ty.clone());
+                    return ty;
+                }
+
                 let recv_ty = self.check_expr(receiver, in_predicate);
                 let mut arg_types = Vec::new();
                 for arg in args {
@@ -592,8 +654,8 @@ impl<'a> TypeChecker<'a> {
                     self.check_expr(arg, is_predicate_fn);
                 }
 
-                // Check numeric requirement for sum/avg
-                if matches!(&**function, "sum" | "avg") {
+                // Check numeric requirement for sum/cumulative_sum/avg
+                if matches!(&**function, "sum" | "cumulative_sum" | "avg") {
                     for arg in args {
                         let arg_ty = self.get_type(arg.node_id());
                         let inner = arg_ty.unwrap_nullable();
@@ -1259,6 +1321,39 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("Numeric")),
             "Expected Numeric requirement diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_window_lag_postfix_field_known() {
+        // `$window.lag(1).total` typechecks against the upstream row's
+        // declared `total: Int`, lifting it to Nullable(Int) because
+        // out-of-bounds positionals return Null.
+        let mut cols = IndexMap::new();
+        cols.insert("total".into(), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let typed = typecheck_ok("emit prev = $window.lag(1).total", &["total"], &schema);
+        assert_eq!(
+            first_emit_expr_type(&typed),
+            Type::Nullable(Box::new(Type::Int))
+        );
+    }
+
+    #[test]
+    fn test_typecheck_window_lag_postfix_field_unknown_rejects() {
+        // `$window.lag(1).typo_field` against a closed schema with no
+        // `typo_field` produces a typecheck error rather than silently
+        // typing as Any.
+        let mut cols = IndexMap::new();
+        cols.insert("total".into(), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit prev = $window.lag(1).typo_field", &["total"], &schema);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("typo_field") && d.message.contains("upstream")),
+            "expected upstream-row-schema diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

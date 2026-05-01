@@ -11,15 +11,16 @@ Before any git commit, run the same checks as GitHub CI (`.github/workflows/ci.y
 3. `cargo test --workspace`
 4. `cargo check --benches --workspace` — `cargo test --workspace` does NOT compile benches; a changed crate API can leave bench call-sites broken and only surface in CI
 5. `cargo check --features bench-alloc -p clinker-benchmarks`
-6. `cargo deny check`
+6. `cargo test --benches -p clinker-benchmarks`
+7. `cargo deny check`
 
-Fix any issues before committing. All six must pass — these are the exact checks CI enforces on every PR.
+Fix any issues before committing. All seven must pass — these are the exact checks CI enforces on every PR. (CI also runs `cargo check` against `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` for `clinker-core`; cross-compile setup is optional locally.)
 
 ## Build & test commands
 
 ```bash
 cargo build --workspace          # Build all crates
-cargo test --workspace           # Run all tests (~1100 tests)
+cargo test --workspace           # Run all tests
 cargo test -p cxl                # Test a single crate
 cargo test -p clinker-core -- node_taxonomy  # Run tests matching a pattern
 cargo bench -p clinker-core      # Run benchmarks (arena, parallel, pipeline, sort, window)
@@ -85,7 +86,7 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
   - `Aggregate` — grouped or windowed reduction
   - `Route` — predicate-based fan-out
   - `Merge` — streamwise concatenation of inputs
-  - `Combine` — N-ary record combining with mixed predicates (equi + range + arbitrary CXL); distinct from Merge and Transform+lookup. Active work on `feat/combine-node` (see `docs/internal/plans/cxl-engine/phase-combine-node/`).
+  - `Combine` — N-ary record combining with mixed predicates (equi + range + arbitrary CXL); distinct from Merge and Transform+lookup.
   - `Output` — sink writer
   - `Composition` — call-site node referencing a `.comp.yaml` reusable sub-pipeline; lowered in compile Stage 5 with body nodes stored in `CompileArtifacts.composition_bodies`.
 
@@ -102,7 +103,7 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
 Architectural rules are tracked in `docs/internal/plans/cxl-engine/LOCKED-DECISIONS.md` (gitignored). The load-bearing ones to know:
 
 - **LD-001 — YAML via `serde-saphyr`.** All YAML deserialization goes through `serde-saphyr` with a budget. `serde_yaml` (archived 2024) and `serde_yml` are forbidden; `serde_yaml_bw` points at `serde-saphyr` as its successor.
-- **LD-011 — Greenfield rip-and-replace.** Clinker has zero users. When two paths exist, pick the one that reaches the correct target architecture, even when it touches more files. Forbidden shapes: `Legacy*` / `Internal*` / `*Block` rename-instead-of-delete, `#[serde(default)]` on mandatory-post-rename fields, `#[ignore]` on tests verifying a cutover, parallel "new + old path" coexistence beyond a single commit, "pragmatic" / "incremental" / "deferred cleanup" / "lower-cascade" / "bottom-up migration" / "prep phase" / "file-by-file" justifications.
+- **LD-011 — Greenfield rip-and-replace.** Clinker has zero users. When two paths exist, pick the one that reaches the correct target architecture, even when it touches more files. Forbidden shapes (measured at sprint close): `Legacy*` / `Internal*` / `*Block` rename-instead-of-delete, `#[serde(default)]` on mandatory-post-rename fields, `#[ignore]` on tests verifying a cutover, parallel "new + old path" coexistence surviving the sprint's closing commit, "pragmatic" / "incremental" / "deferred cleanup" / "lower-cascade" / "bottom-up migration" / "prep phase" / "file-by-file" justifications used to defer work past the sprint.
 
 Deleted symbols are tracked append-only in `docs/internal/plans/cxl-engine/RIP-LOG.md`. Never resurrect a symbol listed there without amending the log.
 
@@ -114,24 +115,37 @@ When a change cascades to N files, touch all N. Library constraints (e.g. `serde
 
 Apply this policy to every refactor in this repo, not just the one currently in flight.
 
-Concrete shortcut signatures — the patterns this policy forbids and the architecturally correct alternative for each — live in `.claude/policies/architectural-rigor.md`. That file is the single source of truth read by the `audit-shortcuts` skill, the `shortcut-auditor` subagent, and the PreToolUse pre-commit hook.
+Concrete shortcut signatures — the patterns this policy forbids and the architecturally correct alternative for each — live in `.claude/policies/architectural-rigor.md`. That file is the single source of truth read by the `audit-shortcuts` skill (sprint-close gate) and the `shortcut-auditor` subagent it invokes. There is no per-commit pre-commit hook anymore — the audit runs at sprint close.
 
-**Commit-boundary principle — atomicity matches architecture.** A new
-`pub` or `pub(crate)` item must land in the same commit as at least
-one non-test intra-crate caller. `#[cfg(test)]` references do not count
+**Sprint-boundary principle — atomicity matches architecture per sprint.**
+A sprint is a contiguous series of commits implementing a single
+architectural unit. Every `pub` or `pub(crate)` item the sprint
+introduces must have a non-test intra-crate caller present in the
+sprint's closing commit. `#[cfg(test)]` references do not count
 because CI runs `cargo clippy --workspace -- -D warnings` without
 `--all-targets`, so test-only references are invisible to the dead-code
-lint. Splitting a type from the code that consumes it manufactures a
-speculative-API state (architectural-rigor policy §6) and tempts three
-shortcuts: widening visibility to silence clippy, adding `#[allow(dead_code)]`,
-or skipping the commit-level build check. The correct response when a
-plan entry reads "add type X, then add caller Y" is to collapse X and
-Y into one commit.
+lint at sprint close.
+
+Intermediate commits within the sprint may legitimately split a type
+from its consumer. CI-failing transitional states (compile errors,
+dead-code warnings, fmt/clippy noise, transient `#[allow]` /
+`#[ignore]`, unused imports, even temporary tombstone comments) are
+acceptable as long as the sprint's closing commit eliminates every such
+signature. The boundary is user-declared (typically
+`<merge-base>..HEAD` for the current branch).
 
 Applies to public enums, structs, traits, trait methods, free functions,
-type aliases, and modules. "The caller lands in the next commit" is a
-forbidden rationalization in this tree — if the next commit is the
-caller, this commit is mis-scoped.
+type aliases, and modules. The audit measures the sprint's final state,
+not any intermediate snapshot. Run `/audit-shortcuts --range
+<base>..HEAD` (or `--working`) to verify a sprint is sealed before
+declaring the work done — the audit runs the full CI gauntlet plus the
+architectural-rigor signature scan against the working-tree state at
+HEAD. Final-commit invariants: no `#[allow(dead_code)]`, no `#[ignore]`,
+no tombstone comments, no dead code, no speculative `pub` APIs without
+intra-crate callers, no shims, no compat layers, no
+`Legacy*`/`Internal*`/`*Block` rename-instead-of-delete patterns. The
+architectural-rigor policy (`.claude/policies/architectural-rigor.md`)
+enumerates the full signature list and is the single source of truth.
 
 ### Comment policy
 
@@ -192,6 +206,7 @@ All user-facing errors use `miette` for rich span-annotated diagnostics. CXL com
 - `bench-data/` — generated CSV inputs for benchmarks (with `.meta.json` sidecars describing schema/seed)
 - `lancedb/` — scratch/working LanceDB store used by integration tests
 - `docs/internal/plans/` — phase plans (e.g. `cxl-engine/phase-combine-node/`); gitignored, never `git add -f`
+- `notes/` — in-tree scratchpad for in-flight reasoning that belongs alongside the code it describes; durable across sessions, distinct from auto-memory
 
 ### Kiln IDE
 

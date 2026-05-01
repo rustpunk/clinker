@@ -4,6 +4,7 @@ pub mod combine;
 pub(crate) mod commit;
 pub(crate) mod dispatch;
 mod schema_check;
+pub(crate) mod window_runtime;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
@@ -803,7 +804,14 @@ impl PipelineExecutor {
         let mut counters = PipelineCounters::default();
         let mut dlq_entries: Vec<DlqEntry> = Vec::new();
 
-        let requires_arena = plan.required_arena();
+        // Pipeline-scoped MemoryBudget. One declared `memory_limit`
+        // envelopes the source-rooted Phase-0 arena AND every node-
+        // rooted arena finalize. Promoted to ctx-owned so a relaxed
+        // pipeline cannot multiply its declared limit across N upstream
+        // operators by accident.
+        let mut memory_budget = crate::pipeline::memory::MemoryBudget::from_config(
+            config.pipeline.memory_limit.as_deref(),
+        );
 
         // ── Phase 0: source materialization ──
         // Drain the primary reader into `all_records` carrying the
@@ -848,56 +856,24 @@ impl PipelineExecutor {
             }
         }
 
-        // Build arena + per-source secondary indices when the plan
-        // declares analytic windows. The arena projects each record
-        // to the windowed transforms' `arena_fields` set; the index
-        // partitions group-key → arena positions for the windowed
-        // Transform arm's partition lookup. Records remain
-        // full-schema in `all_records`; arena/indices are a side
-        // structure consulted only by `$window.*` evaluation.
-        let (arena_for_ctx, indices_for_ctx) = if requires_arena && !all_records.is_empty() {
-            let arena_fields =
-                crate::plan::index::collect_arena_fields(&plan.indices_to_build, &input.name);
-            let memory_limit = parse_memory_limit(config);
-            let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
-
+        // Build per-window arena+index runtimes for every source-rooted
+        // IndexSpec whose declared source matches this primary input.
+        // Other-source `Source(..)` slots are reserved for the multi-
+        // source ingestion path (`pipeline/ingestion.rs`); node-rooted
+        // (`Node`/`ParentNode`) slots populate later at their upstream
+        // operator's dispatch-arm exit through
+        // `finalize_node_rooted_windows`.
+        //
+        // Each IndexSpec gets its own arena projected to that spec's
+        // `arena_fields` set. Per-spec projection (rather than a single
+        // union arena) lets node-rooted slots sit alongside source-
+        // rooted slots without a shared index space — every slot
+        // carries its own anchor schema. Memory accounting is shared
+        // across every build site through `memory_budget`.
+        let mut window_runtime =
+            crate::executor::window_runtime::WindowRuntimeRegistry::new(&plan.indices_to_build);
+        if !all_records.is_empty() {
             let source_schema = Arc::clone(all_records[0].0.schema());
-            let arena_schema: Arc<Schema> = arena_fields
-                .iter()
-                .map(|f| f.clone().into_boxed_str())
-                .collect::<SchemaBuilder>()
-                .build();
-            let field_indices: Vec<Option<usize>> = arena_fields
-                .iter()
-                .map(|f| source_schema.index(f))
-                .collect();
-            let mut bytes_used: usize = 0;
-            let mut minimal_records: Vec<clinker_record::MinimalRecord> =
-                Vec::with_capacity(all_records.len());
-            for (record, _) in &all_records {
-                let projected: Vec<Value> = field_indices
-                    .iter()
-                    .map(|idx| {
-                        idx.and_then(|i| record.values().get(i).cloned())
-                            .unwrap_or(Value::Null)
-                    })
-                    .collect();
-                let minimal = clinker_record::MinimalRecord::new(projected);
-                bytes_used += crate::pipeline::arena::estimated_size(&minimal);
-                if bytes_used > memory_limit {
-                    return Err(PipelineError::Compilation {
-                        transform_name: String::new(),
-                        messages: vec![format!(
-                            "arena memory budget exceeded: {bytes_used} > {memory_limit}"
-                        )],
-                    });
-                }
-                minimal_records.push(minimal);
-            }
-            let arena = Arena::from_parts(arena_schema, minimal_records);
-            let arena_len = arena.record_count() as u64;
-            collector.record(arena_timer.finish(arena_len, arena_len));
-
             let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = input
                 .schema_overrides
                 .as_ref()
@@ -909,14 +885,37 @@ impl PipelineExecutor {
                 })
                 .unwrap_or_default();
 
-            let mut indices: Vec<SecondaryIndex> = Vec::new();
-            for spec in &plan.indices_to_build {
-                let index_name = format!("{}:{}", spec.source, spec.group_by.join(","));
+            for (idx, spec) in plan.indices_to_build.iter().enumerate() {
+                let crate::plan::index::PlanIndexRoot::Source(source_name) = &spec.root else {
+                    continue;
+                };
+                if source_name != &input.name {
+                    // Other-source rooted — owned by the multi-source
+                    // ingestion path or by a future top-level pre-walk
+                    // that materializes referenced sources up front.
+                    continue;
+                }
+                let arena_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
+                let arena = Arena::from_records(
+                    &all_records,
+                    &spec.arena_fields,
+                    &source_schema,
+                    &mut memory_budget,
+                )
+                .map_err(|e| PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: vec![format!("E310 source-arena build: {e}")],
+                })?;
+                let arena_len = arena.record_count() as u64;
+                collector.record(arena_timer.finish(arena_len, arena_len));
+
+                let index_name = format!("{}:{}", source_name, spec.group_by.join(","));
                 let index_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
                         name: index_name,
                     });
-                let idx =
+                let mut secondary_index =
                     SecondaryIndex::build(&arena, &spec.group_by, &schema_pins).map_err(|e| {
                         PipelineError::Compilation {
                             transform_name: String::new(),
@@ -924,26 +923,21 @@ impl PipelineExecutor {
                         }
                     })?;
                 collector.record(index_timer.finish(arena_len, arena_len));
-                indices.push(idx);
-            }
 
-            // Sort partitions whose source is not already in the
-            // required order; the windowed Transform arm assumes
-            // partition slices are sorted by `IndexSpec.sort_by`.
-            for (i, spec) in plan.indices_to_build.iter().enumerate() {
                 if !spec.already_sorted {
-                    for partition in indices[i].groups.values_mut() {
+                    for partition in secondary_index.groups.values_mut() {
                         if !sort::is_sorted(&arena, partition, &spec.sort_by) {
                             sort::sort_partition(&arena, partition, &spec.sort_by);
                         }
                     }
                 }
-            }
 
-            (Some(Arc::new(arena)), Some(Arc::new(indices)))
-        } else {
-            (None, None)
-        };
+                window_runtime.top[idx] = Some(crate::executor::window_runtime::WindowRuntime {
+                    arena: Arc::new(arena),
+                    index: Arc::new(secondary_index),
+                });
+            }
+        }
 
         // D12: a global-fold aggregate (group_by: []) must still emit one
         // row over empty input, so we cannot early-return when the plan
@@ -1212,8 +1206,8 @@ impl PipelineExecutor {
             &mut counters,
             &mut dlq_entries,
             collector,
-            arena_for_ctx,
-            indices_for_ctx,
+            window_runtime,
+            memory_budget,
         )
     }
 
@@ -1245,8 +1239,8 @@ impl PipelineExecutor {
         counters: &mut PipelineCounters,
         dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
-        arena: Option<Arc<crate::pipeline::arena::Arena>>,
-        indices: Option<Arc<Vec<crate::pipeline::index::SecondaryIndex>>>,
+        window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
+        memory_budget: crate::pipeline::memory::MemoryBudget,
     ) -> Result<(PipelineCounters, Vec<DlqEntry>, Option<u64>), PipelineError> {
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
         let pipeline_start_time = chrono::Local::now().naive_local();
@@ -1294,23 +1288,22 @@ impl PipelineExecutor {
         );
         let spill_root_path: Arc<std::path::Path> = Arc::from(spill_root.path());
 
-        // Correlation grouping context. `Some(...)` iff
-        // `error_handling.correlation_key` is set; the planner's
+        // Correlation grouping context. `Some(...)` iff at least one
+        // source declares a `correlation_key:`; the planner's
         // `inject_correlation_commit` pass guarantees a terminal
         // `PlanNode::CorrelationCommit` is also present so the
         // dispatcher walks the buffers at end-of-DAG. Group identity
         // travels through the schema as `$ck.<field>` shadow columns
         // stamped at Source ingest; the dispatcher reads them via the
-        // `FieldMetadata.snapshot_of` annotation, so the executor
-        // context only needs to know whether buffering is active and
-        // the per-group cap.
+        // engine-stamp annotation on each shadow column's
+        // `FieldMetadata`, so the executor context only needs to know
+        // whether buffering is active and the per-group cap.
         let (correlation_buffers, correlation_max_group_buffer) =
-            match config.error_handling.correlation_key.as_ref() {
-                Some(_) => {
-                    let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
-                    (Some(HashMap::new()), cap)
-                }
-                None => (None, 0),
+            if config.any_source_has_correlation_key() {
+                let cap = config.error_handling.max_group_buffer.unwrap_or(100_000);
+                (Some(HashMap::new()), cap)
+            } else {
+                (None, 0)
             };
 
         // Construct the dispatcher context. Mutable per-walk state
@@ -1353,8 +1346,8 @@ impl PipelineExecutor {
             current_body_node_input_refs: None,
             spill_root,
             spill_root_path,
-            arena,
-            indices,
+            window_runtime,
+            memory_budget,
             correlation_buffers,
             correlation_max_group_buffer,
             relaxed_aggregator_states: HashMap::new(),
@@ -2073,22 +2066,28 @@ pub(crate) fn evaluate_single_transform(
 }
 
 /// Same as [`evaluate_single_transform`] but threads a
-/// [`PartitionWindowContext`] derived from the per-source `arena` and
-/// `indices` so `$window.*` expressions resolve against the
-/// transform's analytic window. `window_index` indexes
-/// `plan.indices_to_build`; the matching [`SecondaryIndex`] is looked
-/// up via `indices[window_index]`.
+/// [`PartitionWindowContext`] derived from the resolved
+/// [`crate::executor::window_runtime::WindowRuntime`] so `$window.*`
+/// expressions resolve against the transform's analytic window.
+/// `window_index` indexes `plan.indices_to_build`.
 ///
-/// `record_pos` is the record's arena position (zero-based). The
-/// caller derives it from `EvalContext::source_row - 1`, which holds
-/// because Phase-0 setup materializes records in arena order with
-/// `source_row = pos + 1` and intervening dispatcher arms preserve
-/// the row number through transform/route/merge buffers.
+/// The caller resolves `runtime` via
+/// `ctx.window_runtime.resolve(&spec.root, window_index)` and is
+/// responsible for surfacing `PipelineError::Internal` if `resolve`
+/// returns `None` — at this point in the dispatch arm the upstream
+/// operator has already finalized its emit, so a missing runtime is
+/// always an invariant violation.
 ///
-/// If the record's group-by values do not resolve to a partition
-/// (null in any group key, or no matching partition), the evaluator
-/// runs without a window context — matching the legacy inline arena
-/// path's behavior.
+/// `record_pos` is the record's position in the arena, derived by the
+/// caller from the spec's root: `(rn - 1)` for `Source(_)` roots
+/// (Phase-0 materializes source records in row-number order), or the
+/// per-record enumerate index for `Node{..}` and `ParentNode{..}` roots
+/// (the upstream operator's emit order is the arena's order).
+///
+/// If the record's group-by values do not resolve to a partition (null
+/// in any group key, or no matching partition), the evaluator runs
+/// without a window context — matching the legacy inline arena path's
+/// behavior.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_single_transform_windowed(
     record: &Record,
@@ -2097,12 +2096,12 @@ pub(crate) fn evaluate_single_transform_windowed(
     ctx: &EvalContext,
     plan: &ExecutionPlanDag,
     window_index: usize,
-    arena: &Arena,
-    indices: &[SecondaryIndex],
+    runtime: &crate::executor::window_runtime::WindowRuntime,
     record_pos: u32,
 ) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
     let spec = &plan.indices_to_build[window_index];
-    let index = &indices[window_index];
+    let arena = runtime.arena.as_ref();
+    let index = runtime.index.as_ref();
 
     let key: Option<Vec<GroupByKey>> = spec
         .group_by
@@ -2218,29 +2217,41 @@ fn recover_engine_stamped_value(
 /// keeping the policy here means a strategy never has to encode the
 /// `$ck` semantics itself.
 ///
-/// `Driver` is the no-op — keeps today's behavior so existing combines
-/// migrated to `propagate_ck: driver` produce identical output. `All`
-/// copies every `$ck.*` column the build record carries. `Named(set)`
-/// copies only the listed CK fields.
+/// `Driver` copies only the engine-managed synthetic CK
+/// (`$ck.aggregate.<name>`, stamped
+/// [`clinker_record::FieldMetadata::AggregateGroupIndex`]) — the user-
+/// declared source CK is suppressed. `All` copies every `$ck.*` column
+/// the build record carries. `Named(set)` copies only the listed
+/// source-CK fields plus every synthetic-CK column unconditionally.
+///
+/// Synthetic CK is engine-managed lineage from a relaxed aggregate to
+/// its source rows; the user did not declare it, so `propagate_ck`
+/// (a knob over user-declared source CK) has no semantic meaning over
+/// it. Without this exemption, the detect-phase fan-out from a
+/// downstream failure to the aggregator's per-group source-row table
+/// would lose its bridge whenever a Combine sat between the relaxed
+/// aggregate and the failing node.
 pub(crate) fn copy_build_ck_columns(
     out: &mut Record,
     build: &Record,
     spec: &crate::config::pipeline_node::PropagateCkSpec,
 ) {
     use crate::config::pipeline_node::PropagateCkSpec;
-    if matches!(spec, PropagateCkSpec::Driver) {
-        return;
-    }
     let build_schema = Arc::clone(build.schema());
     for (idx, col) in build_schema.columns().iter().enumerate() {
         let Some(field_name) = col.strip_prefix("$ck.") else {
             continue;
         };
-        let allowed = match spec {
-            PropagateCkSpec::Driver => false,
-            PropagateCkSpec::All => true,
-            PropagateCkSpec::Named(names) => names.contains(field_name),
-        };
+        let is_synthetic = matches!(
+            build_schema.field_metadata(idx),
+            Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. }),
+        );
+        let allowed = is_synthetic
+            || match spec {
+                PropagateCkSpec::Driver => false,
+                PropagateCkSpec::All => true,
+                PropagateCkSpec::Named(names) => names.contains(field_name),
+            };
         if !allowed {
             continue;
         }
@@ -2252,7 +2263,11 @@ pub(crate) fn copy_build_ck_columns(
         }
         // Driver wins on collision: a non-null value at this slot
         // came from the driver via `widen_record_to_schema`. Only
-        // fill when the slot is still null.
+        // fill when the slot is still null. Synthetic-CK names are
+        // unique per aggregate (`$ck.aggregate.<name>`), so a driver
+        // and build pairing can collide only when both descend from
+        // the same relaxed aggregate, in which case the slot is
+        // already populated with the correct lineage.
         match out.get(col.as_ref()) {
             Some(clinker_record::Value::Null) | None => {
                 let v = &build.values()[idx];
@@ -2409,9 +2424,21 @@ mod tests {
 
     mod aggregation;
     mod branching;
+    mod ck_aligned_partition_runtime;
     mod correlated_dlq;
     mod correlated_dlq_retract;
+    mod correlated_post_aggregate_retract;
+    mod correlated_window_after_aggregate_retract;
     mod correlated_window_retract;
+    mod cross_source_window_topology;
     mod format_dispatch;
     mod multi_output;
+    mod post_aggregate_lag_lead;
+    mod post_aggregate_recompute_determinism;
+    mod post_aggregate_window;
+    mod post_aggregate_window_spilled;
+    mod post_combine_array_field;
+    mod post_combine_synthetic_ck;
+    mod post_combine_window_strategies;
+    mod window_recompute_correctness;
 }

@@ -24,6 +24,37 @@ impl<'a> PartitionWindowContext<'a> {
             current_pos,
         }
     }
+
+    /// Sum a named field across the supplied partition positions.
+    ///
+    /// Single arithmetic path shared by `sum` (full partition) and
+    /// `cumulative_sum` (prefix `0..=current_pos`). Mirrors the
+    /// numeric-coercion contract of the trait's `sum`: Integer and
+    /// Float values participate, every other resolved Value (including
+    /// String, Date, Null) is silently skipped, and a slice with no
+    /// numeric values returns Null rather than 0.
+    fn sum_slice(&self, field: &str, positions: &[u32]) -> Value {
+        let mut total = 0.0f64;
+        let mut has_numeric = false;
+        for &pos in positions {
+            match self.arena.resolve_field(pos, field) {
+                Some(Value::Integer(i)) => {
+                    total += *i as f64;
+                    has_numeric = true;
+                }
+                Some(Value::Float(f)) => {
+                    total += *f;
+                    has_numeric = true;
+                }
+                _ => {}
+            }
+        }
+        if has_numeric {
+            Value::Float(total)
+        } else {
+            Value::Null
+        }
+    }
 }
 
 impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
@@ -57,26 +88,22 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
     }
 
     fn sum(&self, field: &str) -> Value {
-        let mut total = 0.0f64;
-        let mut has_numeric = false;
-        for &pos in self.partition {
-            match self.arena.resolve_field(pos, field) {
-                Some(Value::Integer(i)) => {
-                    total += *i as f64;
-                    has_numeric = true;
-                }
-                Some(Value::Float(f)) => {
-                    total += *f;
-                    has_numeric = true;
-                }
-                _ => {}
-            }
-        }
-        if has_numeric {
-            Value::Float(total)
+        self.sum_slice(field, self.partition)
+    }
+
+    fn cumulative_sum(&self, field: &str) -> Value {
+        // Running total over `[0..=current_pos]`. `current_pos` is
+        // already a valid index into `partition` for any row the
+        // evaluator dispatches against, so the inclusive slice is
+        // safe; the empty-slice / all-Null case falls through to
+        // `Value::Null` via the shared helper.
+        let end = self.current_pos.min(self.partition.len().saturating_sub(1));
+        let prefix = if self.partition.is_empty() {
+            &self.partition[..0]
         } else {
-            Value::Null
-        }
+            &self.partition[..=end]
+        };
+        self.sum_slice(field, prefix)
     }
 
     fn avg(&self, field: &str) -> Value {
@@ -227,11 +254,13 @@ mod tests {
                 has_header: true,
             },
         );
+        let mut budget = crate::pipeline::memory::MemoryBudget::new(u64::MAX, 0.80);
         Arena::build(
             &mut reader,
             &fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             usize::MAX,
             None,
+            &mut budget,
         )
         .unwrap()
     }

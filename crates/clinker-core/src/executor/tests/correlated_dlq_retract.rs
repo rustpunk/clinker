@@ -73,13 +73,13 @@ pipeline:
   name: strict_test
 error_handling:
   strategy: continue
-  correlation_key: employee_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: employee_id
     type: csv
     schema:
       - { name: employee_id, type: string }
@@ -127,13 +127,13 @@ pipeline:
   name: relaxed_clean
 error_handling:
   strategy: continue
-  correlation_key: emp_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: emp_id
     type: csv
     schema:
       - { name: emp_id, type: string }
@@ -187,7 +187,6 @@ pipeline:
   name: policy_default
 error_handling:
   strategy: continue
-  correlation_key: emp_id
   correlation_fanout_policy: all
 nodes:
 - type: source
@@ -195,6 +194,7 @@ nodes:
   config:
     name: src
     path: input.csv
+    correlation_key: emp_id
     type: csv
     schema:
       - { name: emp_id, type: string }
@@ -235,7 +235,6 @@ pipeline:
   name: policy_override
 error_handling:
   strategy: continue
-  correlation_key: emp_id
   correlation_fanout_policy: any
 nodes:
 - type: source
@@ -243,6 +242,7 @@ nodes:
   config:
     name: src
     path: input.csv
+    correlation_key: emp_id
     type: csv
     schema:
       - { name: emp_id, type: string }
@@ -296,13 +296,13 @@ pipeline:
   name: retract_reversible
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -449,13 +449,13 @@ pipeline:
   name: retract_buffer_required
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -570,13 +570,13 @@ pipeline:
   name: retract_downstream_transform
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -699,13 +699,13 @@ pipeline:
   name: e15w
 error_handling:
   strategy: continue
-  correlation_key: emp_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: emp_id
     type: csv
     schema:
       - { name: emp_id, type: string }
@@ -770,13 +770,13 @@ pipeline:
   name: empty_group_retract
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -897,13 +897,13 @@ pipeline:
   name: idempotent_retract
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1046,7 +1046,6 @@ pipeline:
   name: fanout_any_relaxed
 error_handling:
   strategy: continue
-  correlation_key: order_id
   correlation_fanout_policy: any
 nodes:
 - type: source
@@ -1054,6 +1053,7 @@ nodes:
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1131,7 +1131,6 @@ pipeline:
   name: fanout_all_relaxed
 error_handling:
   strategy: continue
-  correlation_key: order_id
   correlation_fanout_policy: all
 nodes:
 - type: source
@@ -1139,6 +1138,7 @@ nodes:
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1214,7 +1214,6 @@ pipeline:
   name: fanout_primary_relaxed
 error_handling:
   strategy: continue
-  correlation_key: order_id
   correlation_fanout_policy: primary
 nodes:
 - type: source
@@ -1222,6 +1221,7 @@ nodes:
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1306,13 +1306,13 @@ pipeline:
   memory_limit: "1"
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1405,13 +1405,13 @@ pipeline:
   name: chained_superset
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }
@@ -1482,13 +1482,13 @@ pipeline:
   name: chained_subset
 error_handling:
   strategy: continue
-  correlation_key: order_id
 nodes:
 - type: source
   name: src
   config:
     name: src
     path: input.csv
+    correlation_key: order_id
     type: csv
     schema:
       - { name: order_id, type: string }

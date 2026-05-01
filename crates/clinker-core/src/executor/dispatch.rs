@@ -71,7 +71,7 @@ fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
     for i in 0..schema.column_count() {
         if schema
             .field_metadata(i)
-            .is_some_and(|m| m.snapshot_of.is_some())
+            .is_some_and(|m| m.is_engine_stamped())
         {
             let idx = key.len();
             key.push(value_to_correlation_key(&record.values()[i], idx));
@@ -248,26 +248,28 @@ pub(crate) struct ExecutorContext<'a> {
     /// to thread the same lifetime as the borrowed plan-time refs.
     pub(crate) spill_root_path: Arc<std::path::Path>,
 
-    /// Columnar arena materialized once before the dispatcher walk
-    /// when the plan needs windowed/positional access. `Some` when
-    /// any Transform on the current DAG carries `window_index:
-    /// Some(_)`; `None` otherwise. The arena owns a stable record
-    /// ordering the windowed Transform arm reads through
-    /// `evaluate_record_with_window`. Held as `Arc` so the dispatcher
-    /// arm and any rayon-parallel windowed worker share one backing
-    /// store. Composition body recursion inherits the parent's arena
-    /// (cloned cheaply) — body pipelines that need their own arena
-    /// override this field at recursion entry.
-    pub(crate) arena: Option<Arc<crate::pipeline::arena::Arena>>,
+    /// Per-window arena+index registry. Slot `i` corresponds to
+    /// `plan.indices_to_build[i]`; source-rooted slots populate at
+    /// Phase-0 setup, node-rooted slots populate at their upstream
+    /// operator's dispatch-arm exit through
+    /// `finalize_node_rooted_windows`. Body executors push a fresh
+    /// per-body vec onto `bodies` at recursion entry and pop it at
+    /// exit; `ParentNode`-rooted slots in a body are inherited via
+    /// `Arc::clone` from the parent's `top` vec at body entry.
+    /// Replaces the singleton `(arena, indices)` pair the
+    /// source-only geometry shipped: the singleton silently broke
+    /// when a window sat downstream of an aggregate because the
+    /// aggregate emitted columns the source arena could not project.
+    pub(crate) window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
 
-    /// Per-source secondary indices co-built with [`Self::arena`].
-    /// Index `i` corresponds to source position `i` in the plan's
-    /// source list. Each entry maps composite group-by keys to arena
-    /// record positions, backing the windowed Transform arm's
-    /// partition lookup. `Some` iff [`Self::arena`] is `Some`; the
-    /// two are populated together by Phase-0 setup and torn down
-    /// together at the end of the walk.
-    pub(crate) indices: Option<Arc<Vec<crate::pipeline::index::SecondaryIndex>>>,
+    /// Pipeline-scoped memory budget shared across the source-rooted
+    /// Phase-0 arena and every node-rooted arena materialized at an
+    /// upstream operator's dispatch-arm exit. One declared
+    /// `memory_limit` envelopes the whole pipeline; per-arena charges
+    /// accumulate against this budget so a relaxed pipeline cannot
+    /// multiply its declared limit across N upstream operators by
+    /// accident.
+    pub(crate) memory_budget: crate::pipeline::memory::MemoryBudget,
 
     /// Per-correlation-group buffer holding deferred output writes
     /// and per-record error events. `Some` iff the plan carries a
@@ -402,6 +404,113 @@ impl ExecutorContext<'_> {
     }
 }
 
+/// Build node-rooted window runtimes for every IndexSpec rooted at
+/// `upstream_idx` in the current DAG, after that operator has finalized
+/// its emit buffer. Called from the upstream operator's dispatch arm
+/// (Aggregation, Combine, Transform-with-schema-change, Merge,
+/// Composition) — anything that may produce rows feeding a node-rooted
+/// window. `Sort` and `Route` are pass-through and do not finalize
+/// windows here; rooting walks past them at lowering time.
+///
+/// `rows` is the buffer the upstream operator just produced. The arena
+/// projects each row onto the spec's `arena_fields` against the spec's
+/// `anchor_schema` (which equals the upstream operator's
+/// `output_schema` at lowering time). The arena and SecondaryIndex are
+/// inserted into `ctx.window_runtime` at the spec's slot — into the
+/// active body's vec when `active_stack` is non-empty, otherwise into
+/// `top`.
+fn finalize_node_rooted_windows(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    upstream_idx: NodeIndex,
+    rows: &[(Record, u64)],
+) -> Result<(), PipelineError> {
+    use crate::executor::window_runtime::WindowRuntime;
+    use crate::pipeline::arena::Arena;
+    use crate::pipeline::index::SecondaryIndex;
+    use crate::plan::index::PlanIndexRoot;
+    use clinker_record::RecordStorage;
+
+    for (idx, spec) in current_dag.indices_to_build.iter().enumerate() {
+        let anchor_schema = match &spec.root {
+            PlanIndexRoot::Node {
+                upstream,
+                anchor_schema,
+            } if *upstream == upstream_idx => anchor_schema,
+            // ParentNode never matches a current-DAG upstream — body
+            // recursion installs ParentNode slots from the parent's
+            // runtime at body entry, not here.
+            _ => continue,
+        };
+        let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
+        let arena = Arena::from_records(
+            rows,
+            &spec.arena_fields,
+            anchor_schema,
+            &mut ctx.memory_budget,
+        )
+        .map_err(|e| PipelineError::Compilation {
+            transform_name: String::new(),
+            messages: vec![format!("E310 node-rooted arena build: {e}")],
+        })?;
+        let arena_len = arena.record_count() as u64;
+        ctx.collector
+            .record(arena_timer.finish(arena_len, arena_len));
+
+        // Node-rooted arenas project from already-coerced upstream
+        // output Records — the upstream operator's plan-time
+        // `output_schema` is the canonical type table, so no
+        // schema_pins overrides apply here. Source-rooted arenas
+        // need pins because raw reader Values land as strings; node-
+        // rooted Values arrive pre-typed.
+        let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = HashMap::new();
+        let index_name = format!(
+            "node({}):{}",
+            current_dag.graph[upstream_idx].name(),
+            spec.group_by.join(","),
+        );
+        let index_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
+            name: index_name,
+        });
+        let mut secondary_index = SecondaryIndex::build(&arena, &spec.group_by, &schema_pins)
+            .map_err(|e| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: vec![e.to_string()],
+            })?;
+        ctx.collector
+            .record(index_timer.finish(arena_len, arena_len));
+
+        // Per-partition sort. Source-declared `already_sorted` does not
+        // apply to a node-rooted arena: upstream emit order is the
+        // partition's underlying order, which the windowed evaluator
+        // sees normalized via this sort. lag/lead determinism over
+        // hash-aggregate non-deterministic emit comes from this step.
+        if !spec.already_sorted {
+            for partition in secondary_index.groups.values_mut() {
+                if !crate::pipeline::sort::is_sorted(&arena, partition, &spec.sort_by) {
+                    crate::pipeline::sort::sort_partition(&arena, partition, &spec.sort_by);
+                }
+            }
+        }
+
+        let runtime = WindowRuntime {
+            arena: Arc::new(arena),
+            index: Arc::new(secondary_index),
+        };
+        if !ctx.window_runtime.install(idx, runtime) {
+            return Err(PipelineError::Internal {
+                op: "executor",
+                node: current_dag.graph[upstream_idx].name().to_string(),
+                detail: format!(
+                    "node-rooted window slot {idx} out of bounds; \
+                     plan.indices_to_build size and runtime registry size diverged"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Execute one DAG node by routing it to its arm.
 ///
 /// Reads the node by `node_idx` from `current_dag.graph` and dispatches
@@ -451,10 +560,15 @@ pub(crate) fn dispatch_plan_node(
                 .as_ref()
                 .map(|target| {
                     (0..target.column_count())
-                        .filter_map(|i| {
-                            target
-                                .field_metadata(i)
-                                .and_then(|m| m.snapshot_of.as_ref().map(|name| (i, name.clone())))
+                        .filter_map(|i| match target.field_metadata(i) {
+                            Some(clinker_record::FieldMetadata::SourceCorrelation {
+                                source_field,
+                            }) => Some((i, source_field.clone())),
+                            // Aggregate-emitted synthetic CK columns are
+                            // stamped at aggregate finalize, not at source
+                            // ingest, so they are not part of this mapping.
+                            Some(clinker_record::FieldMetadata::AggregateGroupIndex { .. })
+                            | None => None,
                         })
                         .collect()
                 })
@@ -468,12 +582,10 @@ pub(crate) fn dispatch_plan_node(
                             // The reader's `Arc<Schema>` covers the user-declared
                             // columns; the plan-time target may extend that with
                             // engine-stamped tail columns (`$ck.<field>` shadow
-                            // columns from `error_handling.correlation_key`
+                            // columns from each source's own `correlation_key:`
                             // widening). Reader columns must equal the user-
                             // declared prefix of the target; tail slots are
-                            // filled by the snapshot stamp below. Build sources
-                            // missing a correlation-key field stamp `Value::Null`
-                            // — the Combine arm later inherits the driver's tag.
+                            // filled by the snapshot stamp below.
                             debug_assert!(
                                 target
                                     .columns()
@@ -590,19 +702,34 @@ pub(crate) fn dispatch_plan_node(
                 .unwrap_or_default();
 
             // Plan invariant: any Transform with `window_index: Some`
-            // requires the per-source arena and SecondaryIndex set
-            // populated by Phase-0 setup. Fail loudly if they're
-            // missing — the alternative (silently fall back to
-            // no-window eval) corrupts `$window.*` results.
-            if window_index.is_some() && (ctx.arena.is_none() || ctx.indices.is_none()) {
-                return Err(PipelineError::Internal {
-                    op: "executor",
-                    node: name.clone(),
-                    detail: format!(
-                        "transform {name:?} declares window_index but executor context has no arena+indices; \
-                         Phase-0 setup did not populate them"
-                    ),
-                });
+            // requires its WindowRuntime slot populated by either the
+            // source-rooted Phase-0 build (Source root) or the upstream
+            // operator's `finalize_node_rooted_windows` call (Node /
+            // ParentNode roots). Fail loudly if the slot is missing —
+            // the alternative (silently fall back to no-window eval)
+            // corrupts `$window.*` results.
+            if let Some(idx_num) = window_index {
+                let spec = current_dag.indices_to_build.get(idx_num).ok_or_else(|| {
+                    PipelineError::Internal {
+                        op: "executor",
+                        node: name.clone(),
+                        detail: format!(
+                            "transform {name:?} declares window_index {idx_num} \
+                             but plan.indices_to_build is too short"
+                        ),
+                    }
+                })?;
+                if ctx.window_runtime.resolve(&spec.root, idx_num).is_none() {
+                    return Err(PipelineError::Internal {
+                        op: "executor",
+                        node: name.clone(),
+                        detail: format!(
+                            "transform {name:?} declares window_index {idx_num} \
+                             but the runtime registry has no populated slot for that root; \
+                             upstream operator did not finalize its node-rooted windows"
+                        ),
+                    });
+                }
             }
 
             let mut output_records = Vec::with_capacity(input_records.len());
@@ -613,14 +740,17 @@ pub(crate) fn dispatch_plan_node(
             // triples per partition. The orchestrator's commit phase
             // reads them to recompute affected partitions over
             // `partition − retracted_rows` and emit per-output Deltas.
+            // The `Arc<Arena>` retained here keeps the node-rooted (or
+            // source-rooted) arena alive across the commit phase
+            // through `Arc::clone` from the resolved runtime.
             let buffered_window: Option<(usize, Vec<String>, Arc<crate::pipeline::arena::Arena>)> =
                 window_index.and_then(|idx_num| {
                     let spec = current_dag.indices_to_build.get(idx_num)?;
                     if !spec.requires_buffer_recompute {
                         return None;
                     }
-                    let arena = ctx.arena.as_ref()?.clone();
-                    Some((idx_num, spec.group_by.clone(), arena))
+                    let runtime = ctx.window_runtime.resolve(&spec.root, idx_num)?;
+                    Some((idx_num, spec.group_by.clone(), Arc::clone(&runtime.arena)))
                 });
             // RSS budget guard for buffer-mode admission. Polled every
             // 10K admitted rows so a runaway partition cannot blow the
@@ -635,7 +765,7 @@ pub(crate) fn dispatch_plan_node(
             };
             let mut buffered_admitted_since_check: u64 = 0;
 
-            for (record, rn) in input_records {
+            for (i, (record, rn)) in input_records.into_iter().enumerate() {
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
                 }
@@ -652,13 +782,43 @@ pub(crate) fn dispatch_plan_node(
                 let eval_result = {
                     let _guard = ctx.transform_timer.guard();
                     if let Some(idx_num) = window_index {
-                        // Phase-0 invariant: arena/indices Some when window_index Some.
-                        // record_pos = source_row - 1 holds because Phase-0 materializes
-                        // records in arena order; row number is preserved through
-                        // upstream Source/Transform/Route arms.
-                        let arena = ctx.arena.as_ref().unwrap();
-                        let indices = ctx.indices.as_ref().unwrap();
-                        let record_pos = (rn - 1) as u32;
+                        // Resolve the WindowRuntime via the spec's root.
+                        // Source-rooted windows root at Phase-0's source
+                        // arena; node-rooted windows root at the
+                        // upstream operator's finalize. The plan-time
+                        // invariant check above guarantees `resolve`
+                        // returns `Some`; reaching `None` here is an
+                        // upstream-arm bug (e.g. forgetting to call
+                        // `finalize_node_rooted_windows` after emit).
+                        let spec = &current_dag.indices_to_build[idx_num];
+                        let runtime =
+                            ctx.window_runtime
+                                .resolve(&spec.root, idx_num)
+                                .ok_or_else(|| PipelineError::Internal {
+                                    op: "executor",
+                                    node: name.clone(),
+                                    detail: format!(
+                                        "transform {name:?} window_index {idx_num} \
+                                         resolves to no runtime at per-record dispatch; \
+                                         upstream finalize was skipped"
+                                    ),
+                                })?;
+                        // record_pos semantics:
+                        // - Source(_)  → (rn - 1) as u32. Phase-0 materializes
+                        //   records in arena order, source row numbers
+                        //   start at 1, so the position is always `rn - 1`.
+                        // - Node{..} / ParentNode{..} → enumerate index `i`.
+                        //   The node-rooted arena was built from the
+                        //   upstream's emit buffer in iteration order;
+                        //   the per-record dispatch loop iterates the
+                        //   same buffer, so `i` equals the row's arena
+                        //   position by construction.
+                        let record_pos =
+                            if matches!(spec.root, crate::plan::index::PlanIndexRoot::Source(_)) {
+                                (rn - 1) as u32
+                            } else {
+                                i as u32
+                            };
                         evaluate_single_transform_windowed(
                             &record,
                             name,
@@ -666,8 +826,7 @@ pub(crate) fn dispatch_plan_node(
                             &eval_ctx,
                             current_dag,
                             idx_num,
-                            arena,
-                            indices,
+                            runtime,
                             record_pos,
                         )
                     } else {
@@ -690,6 +849,15 @@ pub(crate) fn dispatch_plan_node(
                             // `evaluate_single_transform_windowed`: a null
                             // component lands the row in a "no-partition" slot
                             // that the recompute phase treats as out-of-scope.
+                            let buffered_pos = {
+                                let spec = &current_dag.indices_to_build[*idx_num];
+                                if matches!(spec.root, crate::plan::index::PlanIndexRoot::Source(_))
+                                {
+                                    (rn - 1) as u32
+                                } else {
+                                    i as u32
+                                }
+                            };
                             let mut partition_key: Vec<GroupByKey> =
                                 Vec::with_capacity(partition_fields.len());
                             let mut all_resolved = true;
@@ -699,7 +867,7 @@ pub(crate) fn dispatch_plan_node(
                                     &val,
                                     field,
                                     None,
-                                    (rn - 1) as u32,
+                                    buffered_pos,
                                 ) {
                                     Ok(Some(k)) => partition_key.push(k),
                                     _ => {
@@ -709,7 +877,7 @@ pub(crate) fn dispatch_plan_node(
                                 }
                             }
                             if all_resolved {
-                                let arena_pos = (rn - 1) as u32;
+                                let arena_pos = buffered_pos;
                                 // Memory accounting: charge an upper-bound
                                 // estimate per buffered triple. The Record
                                 // body shares its `Arc<Schema>`; the
@@ -792,6 +960,16 @@ pub(crate) fn dispatch_plan_node(
                 }
             }
 
+            // Materialize node-rooted window runtimes for any IndexSpec
+            // rooted at THIS Transform. The schema-changing case is the
+            // only one that drives node-rooted lookups here:
+            // pure-passthrough Transforms feed downstream windows
+            // through their predecessor's runtime (Sort/Route walk-
+            // through at lowering time covers passthroughs that did not
+            // change schema). When the lowering pass roots a window at
+            // this Transform's `NodeIndex`, the call below installs the
+            // matching runtime; otherwise the helper is a no-op.
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
@@ -1092,6 +1270,13 @@ pub(crate) fn dispatch_plan_node(
                     }
                 }
             }
+            // Merge is rejected as a window root at compile time
+            // (E150d) because the multi-producer concatenation has no
+            // single producer identity for record_pos to anchor
+            // against. The call below is a defense-in-depth no-op:
+            // the helper iterates plan.indices_to_build and matches
+            // nothing because no spec roots at a Merge NodeIndex.
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
             ctx.node_buffers.insert(node_idx, merged);
         }
 
@@ -1359,8 +1544,14 @@ pub(crate) fn dispatch_plan_node(
                         });
                     }
                 };
+                let emits_synthetic = hash_box.emits_synthetic_ck();
+                let pre_finalize_len = emitted_rows.len();
                 match hash_box.finalize_in_place(&finalize_ctx, &mut emitted_rows) {
                     Ok(()) => {
+                        if emits_synthetic {
+                            ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
+                                (emitted_rows.len() - pre_finalize_len) as u64;
+                        }
                         let group_by_indices = hash_box.group_by_indices().to_vec();
                         let pre_retract_output_rows = emitted_rows.clone();
                         ctx.relaxed_aggregator_states.insert(
@@ -1450,6 +1641,14 @@ pub(crate) fn dispatch_plan_node(
 
             ctx.collector
                 .record(agg_timer.finish(input_count, out_rows.len() as u64));
+            // Materialize node-rooted window runtimes for any IndexSpec
+            // rooted at this aggregate. The aggregate emits columns the
+            // source arena cannot project (e.g. `total = sum(amount)`,
+            // `$ck.aggregate.<name>`); a downstream window's IndexSpec
+            // pins its `arena_fields` against the aggregate's
+            // `output_schema`, so the arena materializes from
+            // `out_rows` here, not from the source stream.
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
             ctx.node_buffers.insert(node_idx, out_rows);
         }
 
@@ -1734,6 +1933,11 @@ pub(crate) fn dispatch_plan_node(
             let port_records = collect_port_records(ctx, current_dag, node_idx, &composition_name)?;
             let output_records =
                 execute_composition_body(ctx, body, port_records, &composition_name)?;
+            // Materialize node-rooted window runtimes for any IndexSpec
+            // rooted at this composition's call-site NodeIndex. The
+            // body executor returned with `active_stack` already
+            // popped, so the install lands on `top` (parent scope).
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
@@ -2056,6 +2260,7 @@ pub(crate) fn dispatch_plan_node(
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
+                    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
                     return Ok(());
                 }
@@ -2104,6 +2309,7 @@ pub(crate) fn dispatch_plan_node(
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
+                    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
                     return Ok(());
                 }
@@ -2159,6 +2365,7 @@ pub(crate) fn dispatch_plan_node(
                     let probe_records_out = output_records.len() as u64;
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
+                    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
                     return Ok(());
                 }
@@ -2582,6 +2789,7 @@ pub(crate) fn dispatch_plan_node(
             let probe_records_out = output_records.len() as u64;
             ctx.collector
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
@@ -3013,6 +3221,8 @@ fn execute_composition_body(
     port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
     composition_name: &str,
 ) -> Result<Vec<(clinker_record::Record, u64)>, PipelineError> {
+    use crate::plan::index::PlanIndexRoot;
+
     // Resolve body and pre-compute everything that needs the
     // bound_body borrow before the swap so the body_dag clone is
     // independent of the artifacts borrow.
@@ -3022,6 +3232,28 @@ fn execute_composition_body(
         .ok_or_else(|| PipelineError::compose_body_missing(composition_name.to_string()))?;
 
     let body_dag = crate::plan::execution::ExecutionPlanDag::from_body(bound_body);
+
+    // Window runtime entry: install a fresh per-body vec sized to
+    // `body_indices_to_build.len()`. ParentNode-rooted slots inherit
+    // the parent's runtime via `Arc::clone` from `top` so the body's
+    // windowed Transform arm can resolve through to it without re-
+    // materializing the parent's arena. Node-rooted body slots stay
+    // `None` here — they populate when the body's upstream operator
+    // arm calls `finalize_node_rooted_windows` during the body walk.
+    let body_index_count = bound_body.body_indices_to_build.len();
+    let mut body_window_vec: Vec<Option<crate::executor::window_runtime::WindowRuntime>> =
+        (0..body_index_count).map(|_| None).collect();
+    for (idx, spec) in bound_body.body_indices_to_build.iter().enumerate() {
+        if matches!(spec.root, PlanIndexRoot::ParentNode { .. })
+            && let Some(parent_runtime) = ctx.window_runtime.resolve(&spec.root, idx)
+        {
+            // `resolve` for ParentNode in this position falls through
+            // to top[idx] (no body is on the active_stack yet), which
+            // is correct: the body inherits the parent operator's
+            // runtime by cloning its `Arc<Arena>` and `Arc<SecondaryIndex>`.
+            body_window_vec[idx] = Some(parent_runtime.clone());
+        }
+    }
 
     // Seed body-scope buffers from parent records keyed by port.
     let mut body_buffers: HashMap<NodeIndex, Vec<(clinker_record::Record, u64)>> = HashMap::new();
@@ -3053,6 +3285,16 @@ fn execute_composition_body(
     let saved_body_refs = ctx
         .current_body_node_input_refs
         .replace(bound_body.node_input_refs.clone());
+
+    // Push the body's window-runtime overlay onto the registry. The
+    // ParentNode-rooted slots were populated above via `Arc::clone`
+    // from the parent's `top` runtime; Node-rooted body slots stay
+    // `None` and populate when the body's upstream operator arm
+    // calls `finalize_node_rooted_windows` during the body walk.
+    // `active_stack.push` makes `resolve` route through this overlay
+    // for any window dispatched inside the body.
+    ctx.window_runtime.bodies.insert(body_id, body_window_vec);
+    ctx.window_runtime.active_stack.push(body_id);
 
     // Increment depth before recursing. Every exit path below
     // decrements before returning so the counter stays in sync —
@@ -3093,6 +3335,12 @@ fn execute_composition_body(
     ctx.node_buffers = saved_buffers;
     ctx.combine_source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
+    // Pop the window-runtime overlay so subsequent windows in the
+    // parent scope route through `top` again. Removing the body's
+    // entry releases the `Arc` clones (parent runtimes stay alive in
+    // `top`; body-local node-rooted runtimes drop here).
+    ctx.window_runtime.active_stack.pop();
+    ctx.window_runtime.bodies.remove(&body_id);
 
     walk_result?;
     Ok(output_records)

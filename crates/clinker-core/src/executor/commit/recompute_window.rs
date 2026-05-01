@@ -33,6 +33,7 @@ use crate::error::PipelineError;
 use crate::executor::dispatch::{ExecutorContext, RetainedWindowState};
 use crate::pipeline::arena::Arena;
 use crate::pipeline::window_context::PartitionWindowContext;
+use crate::plan::execution::ExecutionPlanDag;
 
 /// Run the wholesale recompute for every window in `scope.windows`.
 ///
@@ -41,6 +42,7 @@ use crate::pipeline::window_context::PartitionWindowContext;
 /// `Ok(vec![])` so non-window relaxed pipelines pay zero overhead.
 pub(crate) fn recompute_window_partitions(
     ctx: &mut ExecutorContext<'_>,
+    plan: &ExecutionPlanDag,
     scope: &RetractScope,
 ) -> Result<Vec<Delta>, PipelineError> {
     if scope.windows.is_empty() {
@@ -55,25 +57,34 @@ pub(crate) fn recompute_window_partitions(
         std::mem::take(&mut ctx.relaxed_window_states);
     let mut deltas: Vec<Delta> = Vec::new();
 
-    let arena = match ctx.arena.as_ref() {
-        Some(a) => Arc::clone(a),
-        None => {
-            // No arena materialized — buffer-mode admission could not
-            // have populated retained state. Defensive return.
-            return Ok(deltas);
-        }
-    };
-    let indices = match ctx.indices.as_ref() {
-        Some(i) => Arc::clone(i),
-        None => return Ok(deltas),
-    };
-
     for entry in &scope.windows {
         let Some(retained) = drained.remove(&entry.window_node) else {
             continue;
         };
         let window_index = retained.window_index;
         let transform_idx = retained.transform_idx;
+
+        // Resolve the WindowRuntime through the spec's root. Source-
+        // rooted windows root in Phase-0; node-rooted windows root at
+        // the upstream operator's finalize. Either way, the runtime
+        // owns the arena+index pair the dispatcher's window arm
+        // admitted retained state against — `Arc::clone` keeps both
+        // alive across the recompute pass without re-materializing.
+        let spec = match plan.indices_to_build.get(window_index) {
+            Some(s) => s,
+            None => continue,
+        };
+        let runtime = match ctx.window_runtime.resolve(&spec.root, window_index) {
+            Some(r) => r,
+            None => {
+                // No runtime materialized for this slot — buffer-mode
+                // admission could not have populated retained state.
+                // Defensive return.
+                continue;
+            }
+        };
+        let arena = Arc::clone(&runtime.arena);
+        let secondary_index = Arc::clone(&runtime.index);
 
         // Build a fresh evaluator mirroring the dispatcher's setup.
         // ProgramEvaluator carries per-evaluator state (regex caches,
@@ -89,7 +100,6 @@ pub(crate) fn recompute_window_partitions(
         // triple through the windowed evaluator. The original index
         // slice gives the canonical `order_by` ordering for
         // `range`/`rows` frames; filtering preserves order.
-        let secondary_index = &indices[window_index];
 
         for (partition_key, retracted_positions) in &entry.partition_retracts {
             let Some(original_partition) = secondary_index.get(partition_key) else {
