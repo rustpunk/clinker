@@ -925,15 +925,6 @@ impl PipelineConfig {
         self.source_bodies().any(|b| b.correlation_key.is_some())
     }
 
-    /// Look up a source's declared `correlation_key:` by source name.
-    /// Returns `None` for unknown source names and for sources that
-    /// declared no `correlation_key:`.
-    pub fn correlation_key_for_source(&self, name: &str) -> Option<&CorrelationKey> {
-        self.source_bodies()
-            .find(|b| b.source.name == name)
-            .and_then(|b| b.correlation_key.as_ref())
-    }
-
     /// Public iterator over output nodes.
     pub fn output_configs(&self) -> impl Iterator<Item = &OutputConfig> + '_ {
         self.nodes.iter().filter_map(|n| match &n.value {

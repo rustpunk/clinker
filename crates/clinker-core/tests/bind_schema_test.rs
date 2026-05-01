@@ -607,11 +607,11 @@ nodes:
     );
 }
 
-/// Pipeline-level `error_handling.correlation_key:` is removed; a
-/// fixture that still declares it must produce a clear
-/// `deny_unknown_fields` parse error pointing at the field. This
-/// test pins the migration: a YAML author who copied an old fixture
-/// gets a useful diagnostic instead of silent acceptance.
+/// Verifies that a fixture declaring pipeline-level
+/// `error_handling.correlation_key:` produces a clear
+/// `deny_unknown_fields` parse error pointing at the field — a YAML
+/// author who lands on the wrong key gets a useful diagnostic
+/// instead of silent acceptance.
 #[test]
 fn test_pipeline_level_correlation_key_is_unknown_field() {
     let yaml = r#"
