@@ -587,11 +587,6 @@ fn test_dag_execution_reqs_streaming() {
     }
 }
 
-/// NodeExecutionReqs for RequiresSortedInput derivation.
-#[test]
-#[ignore = "RequiresSortedInput derivation not yet wired for correlation keys"]
-fn test_dag_execution_reqs_sorted_input() {}
-
 /// JSON serialization roundtrip: schema_version, nodes, depends_on.
 #[test]
 fn test_dag_json_serialization_shape() {

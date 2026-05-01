@@ -11,15 +11,16 @@ Before any git commit, run the same checks as GitHub CI (`.github/workflows/ci.y
 3. `cargo test --workspace`
 4. `cargo check --benches --workspace` — `cargo test --workspace` does NOT compile benches; a changed crate API can leave bench call-sites broken and only surface in CI
 5. `cargo check --features bench-alloc -p clinker-benchmarks`
-6. `cargo deny check`
+6. `cargo test --benches -p clinker-benchmarks`
+7. `cargo deny check`
 
-Fix any issues before committing. All six must pass — these are the exact checks CI enforces on every PR.
+Fix any issues before committing. All seven must pass — these are the exact checks CI enforces on every PR. (CI also runs `cargo check` against `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` for `clinker-core`; cross-compile setup is optional locally.)
 
 ## Build & test commands
 
 ```bash
 cargo build --workspace          # Build all crates
-cargo test --workspace           # Run all tests (~1100 tests)
+cargo test --workspace           # Run all tests
 cargo test -p cxl                # Test a single crate
 cargo test -p clinker-core -- node_taxonomy  # Run tests matching a pattern
 cargo bench -p clinker-core      # Run benchmarks (arena, parallel, pipeline, sort, window)
@@ -85,7 +86,7 @@ Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload gen
   - `Aggregate` — grouped or windowed reduction
   - `Route` — predicate-based fan-out
   - `Merge` — streamwise concatenation of inputs
-  - `Combine` — N-ary record combining with mixed predicates (equi + range + arbitrary CXL); distinct from Merge and Transform+lookup. Active work on `feat/combine-node` (see `docs/internal/plans/cxl-engine/phase-combine-node/`).
+  - `Combine` — N-ary record combining with mixed predicates (equi + range + arbitrary CXL); distinct from Merge and Transform+lookup.
   - `Output` — sink writer
   - `Composition` — call-site node referencing a `.comp.yaml` reusable sub-pipeline; lowered in compile Stage 5 with body nodes stored in `CompileArtifacts.composition_bodies`.
 
@@ -205,6 +206,7 @@ All user-facing errors use `miette` for rich span-annotated diagnostics. CXL com
 - `bench-data/` — generated CSV inputs for benchmarks (with `.meta.json` sidecars describing schema/seed)
 - `lancedb/` — scratch/working LanceDB store used by integration tests
 - `docs/internal/plans/` — phase plans (e.g. `cxl-engine/phase-combine-node/`); gitignored, never `git add -f`
+- `notes/` — in-tree scratchpad for in-flight reasoning that belongs alongside the code it describes; durable across sessions, distinct from auto-memory
 
 ### Kiln IDE
 

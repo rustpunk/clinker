@@ -81,7 +81,7 @@ mod tests {
     /// V-5-1: Verify XLARGE generation completes without OOM.
     /// Run with `cargo test -- --ignored` (slow — generates ~600MB).
     #[test]
-    #[ignore]
+    #[ignore = "slow — generates ~600MB; run with cargo test -- --ignored"]
     fn test_xml_generator_xlarge_no_oom() {
         let xml = generate_xml(1_000_000, &FieldKind::default_layout(20), 10, 42);
         assert!(xml.len() > 100_000_000);

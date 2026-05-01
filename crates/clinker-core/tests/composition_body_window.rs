@@ -307,8 +307,8 @@ ENG,300
 
 /// A body Transform whose `analytic_window` references a payload column
 /// the upstream body operator did not emit. The body lowering pass's
-/// E150b validation must reject at compile time. (Phase 3a wired the
-/// body-side E150b validator; this is the test it earns.)
+/// E150b validation must reject at compile time. (The body-side E150b
+/// validator was wired earlier in this sprint; this is the test it earns.)
 #[test]
 fn body_window_referencing_field_outside_anchor_schema_raises_e150b() {
     let yaml = r#"

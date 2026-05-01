@@ -28,6 +28,7 @@
 //! | `E112`      | error    | Runtime composition recursion depth exceeded |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
+//! | `E15Y`      | error    | Aggregate with streaming strategy over relaxed-CK group_by |
 //! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
 //! | `W002`      | warning  | Node names differ only in case                       |
 //! | `W100`      | warning  | Aggregate lowering deferred (stub)                   |
