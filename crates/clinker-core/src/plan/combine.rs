@@ -2330,6 +2330,7 @@ mod tests {
                 worker_threads: 1,
             },
             node_properties: std::collections::HashMap::new(),
+            deferred_regions: std::collections::HashMap::new(),
         };
         (plan, artifacts)
     }
@@ -2643,6 +2644,7 @@ mod tests {
                 worker_threads: 1,
             },
             node_properties: std::collections::HashMap::new(),
+            deferred_regions: std::collections::HashMap::new(),
         };
         (plan, artifacts, merged_row)
     }

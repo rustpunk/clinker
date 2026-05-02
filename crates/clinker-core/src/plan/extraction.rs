@@ -477,6 +477,7 @@ mod tests {
                 worker_threads: 1,
             },
             node_properties: Default::default(),
+            deferred_regions: Default::default(),
         }
     }
 

@@ -859,6 +859,16 @@ pub struct ExecutionPlanDag {
     /// [`compute_node_properties`](ExecutionPlanDag::compute_node_properties)
     /// after transform compilation. Default-empty on construction.
     pub node_properties: HashMap<NodeIndex, crate::plan::properties::NodeProperties>,
+    /// Deferred-region metadata per relaxed-CK aggregate. Empty for
+    /// strict pipelines and CK-aligned aggregates. Populated by
+    /// `crate::plan::deferred_region::detect_deferred_regions` after
+    /// the window-buffer-recompute pass in compile Stage 5. Keyed by
+    /// every `NodeIndex` participating in a region (producer + members
+    /// + outputs) so dispatch-arm lookup is O(1). The `DeferredRegion`
+    /// type is `pub` to satisfy struct-literal construction in
+    /// `tests/combine_test.rs`; out-of-crate code is expected to treat
+    /// it as opaque.
+    pub deferred_regions: HashMap<NodeIndex, crate::plan::deferred_region::DeferredRegion>,
 }
 
 impl ExecutionPlanDag {
@@ -887,6 +897,7 @@ impl ExecutionPlanDag {
                 worker_threads: 1,
             },
             node_properties: HashMap::new(),
+            deferred_regions: HashMap::new(),
         }
     }
 
@@ -4505,6 +4516,7 @@ mod port_tag_guard_tests {
                 worker_threads: 1,
             },
             node_properties: HashMap::new(),
+            deferred_regions: HashMap::new(),
         }
     }
 

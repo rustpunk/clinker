@@ -232,6 +232,88 @@ impl Expr {
             | Expr::GroupKey { node_id, .. } => *node_id,
         }
     }
+
+    /// Accumulate the set of input column references this expression
+    /// (and its sub-expressions) reads. Used by the planner's
+    /// deferred-region column-pruning pass to compute the minimum
+    /// buffer schema a producing Aggregate needs to carry forward to
+    /// commit time.
+    ///
+    /// `$pipeline.*`, `$meta.*`, and `$ck.*` are skipped — they are
+    /// system namespaces, not record-schema columns. The deferred
+    /// buffer carries `$ck.*` shadow columns implicitly via row
+    /// identity, so they don't need tracking here. This mirrors the
+    /// analyzer's `walk_expr` namespace-exclusion convention.
+    pub fn support_into(&self, fields: &mut std::collections::HashSet<String>) {
+        match self {
+            Expr::FieldRef { name, .. } => {
+                if !is_system_namespace(name) {
+                    fields.insert(name.to_string());
+                }
+            }
+            Expr::QualifiedFieldRef { parts, .. } => {
+                if let Some(first) = parts.first() {
+                    if !is_system_namespace(first) {
+                        fields.insert(
+                            parts
+                                .iter()
+                                .map(|p| p.as_ref())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        );
+                    }
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+                lhs.support_into(fields);
+                rhs.support_into(fields);
+            }
+            Expr::Unary { operand, .. } => operand.support_into(fields),
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                condition.support_into(fields);
+                then_branch.support_into(fields);
+                if let Some(e) = else_branch {
+                    e.support_into(fields);
+                }
+            }
+            Expr::Match { subject, arms, .. } => {
+                if let Some(s) = subject {
+                    s.support_into(fields);
+                }
+                for arm in arms {
+                    arm.pattern.support_into(fields);
+                    arm.body.support_into(fields);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                receiver.support_into(fields);
+                for a in args {
+                    a.support_into(fields);
+                }
+            }
+            Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+                for a in args {
+                    a.support_into(fields);
+                }
+            }
+            Expr::PipelineAccess { .. }
+            | Expr::MetaAccess { .. }
+            | Expr::Now { .. }
+            | Expr::Wildcard { .. }
+            | Expr::Literal { .. }
+            | Expr::AggSlot { .. }
+            | Expr::GroupKey { .. } => {}
+        }
+    }
+}
+
+fn is_system_namespace(name: &str) -> bool {
+    name.starts_with("$pipeline") || name.starts_with("$meta") || name.starts_with("$ck")
 }
 
 #[derive(Debug, Clone)]
@@ -570,5 +652,93 @@ mod tests {
             span,
         };
         assert_eq!(expr.node_id(), id);
+    }
+}
+
+#[cfg(test)]
+mod support_into_tests {
+    use super::*;
+    use crate::parser::Parser;
+    use std::collections::HashSet;
+
+    /// Parse a single `emit out = <source>` and run `support_into` over the RHS.
+    /// Covers every `Expr` variant the parser can construct from concrete syntax.
+    fn fields_of(source: &str) -> HashSet<String> {
+        let parsed = Parser::parse(&format!("emit out = {source}"));
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let stmt = parsed.ast.statements.first().expect("one stmt");
+        let Statement::Emit { expr, .. } = stmt else {
+            panic!("not emit")
+        };
+        let mut fields = HashSet::new();
+        expr.support_into(&mut fields);
+        fields
+    }
+
+    #[test]
+    fn bare_field_ref() {
+        assert_eq!(fields_of("amount"), HashSet::from(["amount".into()]));
+    }
+
+    #[test]
+    fn binary_two_fields() {
+        assert_eq!(fields_of("a + b"), HashSet::from(["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn nested_if_coalesce() {
+        let f = fields_of("if x > 0 then y ?? z else w");
+        assert_eq!(
+            f,
+            HashSet::from(["x".into(), "y".into(), "z".into(), "w".into()])
+        );
+    }
+
+    #[test]
+    fn window_call_with_field_args() {
+        let f = fields_of("$window.sum(amount)");
+        assert!(f.contains("amount"));
+    }
+
+    #[test]
+    fn method_chain_on_window_call() {
+        let f = fields_of("$window.first(score).name");
+        assert!(f.contains("score"));
+    }
+
+    #[test]
+    fn qualified_field_ref() {
+        let f = fields_of("orders.total");
+        assert!(f.contains("orders.total"));
+    }
+
+    #[test]
+    fn pipeline_namespace_excluded() {
+        let f = fields_of("$pipeline.run_id");
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn meta_namespace_excluded() {
+        let f = fields_of("$meta.source");
+        assert!(f.is_empty());
+    }
+
+    /// `$ck.*` references appear only as engine-stamped FieldRef names — the
+    /// parser rejects `$ck.field` syntax (only `$pipeline`, `$window`, `$meta`
+    /// are recognized system namespaces). Construct the FieldRef directly to
+    /// exercise the namespace-exclusion path that fires on engine-injected
+    /// shadow-column references.
+    #[test]
+    fn ck_namespace_excluded() {
+        let span = Span::new(0, 0);
+        let expr = Expr::FieldRef {
+            node_id: NodeId(0),
+            name: "$ck.employee_id".into(),
+            span,
+        };
+        let mut f = HashSet::new();
+        expr.support_into(&mut f);
+        assert!(f.is_empty());
     }
 }
