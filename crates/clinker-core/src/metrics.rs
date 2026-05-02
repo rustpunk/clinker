@@ -104,6 +104,13 @@ pub struct RetractionMetrics {
     /// commit pass (per-partition emit during deferred dispatch).
     #[serde(default)]
     pub partitions_dispatched: u64,
+    /// Cascading-retraction loop iterations executed before
+    /// convergence. `0` on strict / fast-path runs; `>= 1` whenever
+    /// the orchestrator entered the relaxed loop. Values `> 1` mean
+    /// commit-pass dispatch widened the retract scope and the
+    /// orchestrator re-ran with the expanded set.
+    #[serde(default)]
+    pub iterations: u64,
     /// Aggregate-or-partition retract paths that took the documented
     /// degrade fallback at runtime.
     #[serde(default)]
@@ -127,6 +134,7 @@ impl From<&clinker_record::RetractionCounters> for RetractionMetrics {
         Self {
             groups_recomputed: c.groups_recomputed,
             partitions_dispatched: c.partitions_dispatched,
+            iterations: c.iterations,
             degrade_fallback_count: c.degrade_fallback_count,
             synthetic_ck_columns_emitted_total: c.synthetic_ck_columns_emitted_total,
             synthetic_ck_fanout_lookups_total: c.synthetic_ck_fanout_lookups_total,

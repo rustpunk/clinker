@@ -56,6 +56,9 @@ pub struct PipelineCounters {
 /// * how many windowed-Transform members the deferred-region
 ///   dispatcher re-evaluated on the commit pass
 ///   (`partitions_dispatched`),
+/// * how many cascading-retraction iterations the orchestrator ran
+///   before convergence (`iterations`) — surfaces operator-visible
+///   retraction depth so a deep cascade reads out as a single number,
 /// * how many groups or partitions fell into the documented degrade
 ///   fallback because the retract-affordable preconditions broke at
 ///   runtime (`degrade_fallback_count`).
@@ -73,6 +76,14 @@ pub struct RetractionCounters {
     /// per-partition emit during deferred dispatch, not an ahead-of-time
     /// recompute walk.
     pub partitions_dispatched: u64,
+    /// Cascading-retraction loop iterations executed before
+    /// convergence. Always `0` on strict / fast-path pipelines (the
+    /// orchestrator never enters the loop). Always `>= 1` on relaxed
+    /// pipelines that reached the orchestrator. Each increment is one
+    /// recompute-then-dispatch cycle; values `> 1` indicate downstream
+    /// failures during commit-pass dispatch widened the retract scope
+    /// and the orchestrator re-ran with the expanded set.
+    pub iterations: u64,
     /// Aggregate-or-partition retract paths that broke the
     /// retract-afford precondition (e.g. spilled aggregator state for a
     /// triggered group) and degraded to documented strict-collateral
@@ -154,6 +165,7 @@ mod tests {
         let c = PipelineCounters::default();
         assert_eq!(c.retraction.groups_recomputed, 0);
         assert_eq!(c.retraction.partitions_dispatched, 0);
+        assert_eq!(c.retraction.iterations, 0);
         assert_eq!(c.retraction.degrade_fallback_count, 0);
         assert_eq!(c.retraction.synthetic_ck_columns_emitted_total, 0);
         assert_eq!(c.retraction.synthetic_ck_fanout_lookups_total, 0);
@@ -165,6 +177,7 @@ mod tests {
         let mut c = PipelineCounters::default();
         c.retraction.groups_recomputed = 7;
         c.retraction.partitions_dispatched = 2;
+        c.retraction.iterations = 5;
         c.retraction.degrade_fallback_count = 1;
         c.retraction.synthetic_ck_columns_emitted_total = 4;
         c.retraction.synthetic_ck_fanout_lookups_total = 3;
@@ -172,6 +185,7 @@ mod tests {
         let snap = c.snapshot();
         assert_eq!(snap.retraction.groups_recomputed, 7);
         assert_eq!(snap.retraction.partitions_dispatched, 2);
+        assert_eq!(snap.retraction.iterations, 5);
         assert_eq!(snap.retraction.degrade_fallback_count, 1);
         assert_eq!(snap.retraction.synthetic_ck_columns_emitted_total, 4);
         assert_eq!(snap.retraction.synthetic_ck_fanout_lookups_total, 3);

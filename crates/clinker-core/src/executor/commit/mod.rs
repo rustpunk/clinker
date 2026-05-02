@@ -94,26 +94,19 @@ pub(crate) struct DlqEvent {
 /// Relaxed pipelines run the cascading-retraction loop described in
 /// the module-level docs.
 ///
-/// `commit_node_name` and `commit_group_by` mirror the
-/// `PlanNode::CorrelationCommit` carrier shape so the strict-path
-/// delegation can format DLQ trigger messages identically. Both are
-/// unused on the relaxed path because [`flush::flush_buffered`] reads
-/// the same defaults the orchestrator's flush boundary needs.
+/// The `PlanNode::CorrelationCommit` carrier's `name`,
+/// `commit_group_by`, and `max_group_buffer` fields are not threaded
+/// through here: [`commit_correlation_buffers`] reads
+/// `ctx.correlation_max_group_buffer` directly, and the per-group
+/// emission shape carries enough context in the buffer cell itself
+/// to format DLQ trigger messages without the carrier's name.
 pub(crate) fn orchestrate(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
-    commit_node_name: &str,
-    commit_group_by: &[String],
-    max_group_buffer: u64,
 ) -> Result<(), PipelineError> {
     if !is_relaxed_pipeline(ctx, current_dag) {
         ctx.commit_step_path = CommitStepPath::FastPath;
-        return commit_correlation_buffers(
-            ctx,
-            commit_node_name,
-            commit_group_by,
-            max_group_buffer,
-        );
+        return commit_correlation_buffers(ctx);
     }
     ctx.commit_step_path = CommitStepPath::ThreePhase;
 
@@ -172,6 +165,7 @@ pub(crate) fn orchestrate(
             );
         }
         iter += 1;
+        ctx.counters.retraction.iterations += 1;
 
         recompute_agg::recompute_aggregates(ctx, current_dag, &scope, &iteration_rows)?;
         // The deferred-region members route per-record errors into the
@@ -214,7 +208,7 @@ pub(crate) fn orchestrate(
     // sees the cumulative error history from every iteration.
     merge_archive_into_live(&mut ctx.correlation_buffers, error_archive);
 
-    flush::flush_buffered(ctx, &scope, commit_group_by)
+    flush::flush_buffered(ctx, &scope)
 }
 
 /// Capture every error_messages / error_rows entry from the live

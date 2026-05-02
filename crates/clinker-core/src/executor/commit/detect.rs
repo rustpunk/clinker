@@ -1,4 +1,4 @@
-//! Phase 1: detect retract scope.
+//! Detect retract scope (orchestrator step 1 of 3).
 //!
 //! Walks `ctx.correlation_buffers` for groups carrying at least one
 //! `error_rows` entry (the trigger set), then expands each to a set of

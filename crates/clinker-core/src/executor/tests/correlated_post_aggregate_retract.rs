@@ -201,11 +201,13 @@ O9,ENG,300
 ///
 /// Companion to `post_aggregate_failure_retracts_every_contributing_source_row`
 /// above: that test asserts bit-for-bit equivalence against a baseline
-/// rerun. This test directly exercises loop semantics — at least one
-/// commit-time DLQ trigger fires AND at least one group is recomputed,
-/// proving the orchestrator iterates rather than terminating after the
-/// first dispatch. The fixture mirrors the bit-for-bit test's shape so
-/// a regression in either surfaces the same failure mode.
+/// rerun. This test directly exercises loop semantics — exactly two
+/// iterations run (the seed pass that surfaces the /0 trigger plus
+/// one cascading pass that reruns dispatch with the HR rows added to
+/// the retract scope; the third call would observe an empty
+/// expand-delta and break before incrementing). The fixture mirrors
+/// the bit-for-bit test's shape so a regression in either surfaces
+/// the same failure mode.
 #[test]
 fn cascading_retraction_loop_converges_and_excludes_failing_partition() {
     let yaml = r#"
@@ -293,6 +295,17 @@ o9,ENG,300
         counters.retraction.groups_recomputed >= 1,
         "the cascading-retraction loop recomputes at least one group; got {}",
         counters.retraction.groups_recomputed
+    );
+    // Two iterations: the seed iteration retracts no rows and discovers
+    // the /0 trigger at commit; the second iteration runs recompute +
+    // dispatch with the HR contributing rows added to the retract
+    // scope, then `expand_with_dlq_events` returns an empty delta and
+    // the loop breaks before a third increment.
+    assert_eq!(
+        counters.retraction.iterations, 2,
+        "cascading-retraction loop must converge in exactly two \
+         iterations on this fixture (seed + one cascade); got {}",
+        counters.retraction.iterations
     );
 }
 

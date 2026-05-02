@@ -452,18 +452,34 @@ o3,HR,30
 }
 
 /// Combine inside a deferred region with a non-deferred build-side
-/// upstream Source that feeds records via `combine_source_records`
-/// (loaded once at executor entry from the build-side reader). The
-/// driver-side aggregate's commit-pass emit joins against the
-/// build-side hash; matched rows propagate through the deferred
-/// `tail` Transform to the writer. Pins that the Combine arm runs
-/// correctly inside a deferred region with a Source build side —
-/// the executor's existing combine-source loading path delivers the
-/// build-side records, and the deferred dispatcher's
-/// `seed_cross_region_inputs_for` is a no-op for this shape (the
-/// build-side has no cross-region edge into the Combine — it sits
-/// outside the region but produces directly into the Combine arm
-/// via `node_buffers[build_pred]`).
+/// Source. The Source arm tees its emit into
+/// `region_input_buffers[(None, edge_idx)]` for the edge crossing
+/// into the deferred Combine; at commit time the dispatcher's
+/// deferred subdag walk drives Combine against the post-recompute
+/// driver-side aggregate emit and the cross-region build-side
+/// records, and the joined records flow through the deferred `tail`
+/// Transform to the writer.
+///
+/// The fixture verifies the happy path end-to-end (both join keys
+/// match the build-side hash, both flow through the deferred member
+/// arm and reach the writer with the enriched columns) AND pins the
+/// orchestrator-loop convergence shape: with no DLQ events surfaced
+/// during commit-pass dispatch, `expand_with_dlq_events` returns an
+/// empty delta on the first check, the orchestrator breaks out of
+/// the loop, and `iterations == 1`. A regression that would re-add
+/// already-retracted source rows on every cascade pass would inflate
+/// this counter, so a tight equality is the cleanest pin.
+///
+/// Build-side rows that hit DLQ during the forward pass require
+/// either a Transform-mediated build chain (which breaks
+/// `combine_source_records` lookup since Combine's build input must
+/// resolve to a Source directly) or source-level validation (not yet
+/// available on `Source` nodes). The contract that an at-commit
+/// Combine rebuild reads from the cross-region buffer rather than
+/// re-reading the source IS pinned indirectly: a per-iteration
+/// re-load would shift source row numbers and change the
+/// `iterations` count under cascading retraction; today's
+/// architecture iterates exactly once on this happy fixture.
 #[test]
 fn combine_in_deferred_region_replays_build_side_through_region_input_buffer() {
     let yaml = r#"
@@ -582,9 +598,6 @@ ENG,500
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
-    // Header + HR + ENG. The Combine joined the post-recompute aggregate
-    // emit (HR=30, ENG=300) against the build-side hash (HR=100,
-    // ENG=500) and the tail Transform projected the enriched record.
     let rows: Vec<&str> = body_lines.iter().skip(1).copied().collect();
     let hr = rows
         .iter()
@@ -598,16 +611,27 @@ ENG,500
         .expect("ENG row reaches the writer through commit-time Combine");
     assert!(
         hr.contains(",100"),
-        "HR row must carry budget=100 from the build-side join; got {hr:?}"
+        "HR row must carry budget=100 from the cross-region build-side \
+         buffer; got {hr:?}"
     );
     assert!(
         eng.contains(",500"),
-        "ENG row must carry budget=500 from the build-side join; got {eng:?}"
+        "ENG row must carry budget=500 from the cross-region build-side \
+         buffer; got {eng:?}"
     );
     assert_eq!(
         report.counters.dlq_count, 0,
-        "no upstream errors expected; got {}",
+        "no errors expected on the happy fixture; got {}",
         report.counters.dlq_count
+    );
+    // Convergence pin: the orchestrator iterates exactly once. A
+    // regression re-adding already-retracted source rows on each
+    // cascade pass would inflate this counter.
+    assert_eq!(
+        report.counters.retraction.iterations, 1,
+        "happy-path Combine-in-region must converge on iteration 1; \
+         got {}",
+        report.counters.retraction.iterations
     );
 }
 

@@ -26,12 +26,6 @@ use crate::executor::dispatch::{ExecutorContext, commit_correlation_buffers};
 pub(crate) fn flush_buffered(
     ctx: &mut ExecutorContext<'_>,
     _scope: &RetractScope,
-    commit_group_by: &[String],
 ) -> Result<(), PipelineError> {
-    commit_correlation_buffers(
-        ctx,
-        "correlation_commit__terminal",
-        commit_group_by,
-        ctx.correlation_max_group_buffer,
-    )
+    commit_correlation_buffers(ctx)
 }

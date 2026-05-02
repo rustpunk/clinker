@@ -406,12 +406,13 @@ pub enum PlanNode {
         span: Span,
         /// Correlation key fields. The union of every source's
         /// declared `correlation_key:` field names, in declaration
-        /// order. Used by the dispatcher arm to format the group key
-        /// in DLQ trigger messages.
+        /// order. Read by the explain formatter for the
+        /// `[correlation_commit] <name> key=[<fields>]` header.
         commit_group_by: Vec<String>,
         /// Per-group buffer cap. Mirrors
-        /// `error_handling.max_group_buffer`; the dispatcher arm checks
-        /// against this when deciding overflow disposition.
+        /// `error_handling.max_group_buffer`; the runtime overflow
+        /// check reads it via `ctx.correlation_max_group_buffer`,
+        /// populated at executor construction.
         max_group_buffer: u64,
     },
     /// N-ary combine node.

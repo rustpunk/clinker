@@ -2915,19 +2915,8 @@ pub(crate) fn dispatch_plan_node(
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
-        PlanNode::CorrelationCommit {
-            ref name,
-            ref commit_group_by,
-            max_group_buffer,
-            ..
-        } => {
-            crate::executor::commit::orchestrate(
-                ctx,
-                current_dag,
-                name,
-                commit_group_by,
-                max_group_buffer,
-            )?;
+        PlanNode::CorrelationCommit { .. } => {
+            crate::executor::commit::orchestrate(ctx, current_dag)?;
         }
     }
 
@@ -3013,9 +3002,6 @@ pub(crate) struct CorrelationErrorRecord {
 /// identical; only the path that populates the buffer differs.
 pub(crate) fn commit_correlation_buffers(
     ctx: &mut ExecutorContext<'_>,
-    _commit_node_name: &str,
-    _commit_group_by: &[String],
-    _max_group_buffer: u64,
 ) -> Result<(), PipelineError> {
     use std::collections::BTreeMap;
 

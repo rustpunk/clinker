@@ -336,8 +336,11 @@ fn pass_a_body(body: &BoundBody, producer: NodeIndex) -> (HashSet<NodeIndex>, Ha
 /// from its projection rule.
 ///
 /// The walk terminates at the producer; the union of every set
-/// reaching the producer's outgoing edges is the buffer schema. Sorted
-/// alphabetically for deterministic snapshot output.
+/// reaching the producer's outgoing edges is the buffer schema. Final
+/// column ordering matches the producer's own `stored_output_schema`
+/// emit order via `project_in_producer_order`; an alphabetical
+/// ordering broke the downstream Output's `SchemaMismatch` check
+/// because `expected_input_schema` reads producer-emit order verbatim.
 fn pass_b_column_prune(
     graph: &DiGraph<PlanNode, PlanEdge>,
     artifacts: &CompileArtifacts,

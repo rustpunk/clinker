@@ -188,6 +188,7 @@ O3,20
     let r = &counters.retraction;
     assert_eq!(r.groups_recomputed, 0);
     assert_eq!(r.partitions_dispatched, 0);
+    assert_eq!(r.iterations, 0);
     assert_eq!(r.degrade_fallback_count, 0);
 }
 
@@ -197,6 +198,7 @@ fn retraction_metrics_serializes_via_spool_payload() {
     let runtime = clinker_record::RetractionCounters {
         groups_recomputed: 3,
         partitions_dispatched: 1,
+        iterations: 4,
         degrade_fallback_count: 2,
         synthetic_ck_columns_emitted_total: 11,
         synthetic_ck_fanout_lookups_total: 5,
@@ -206,6 +208,7 @@ fn retraction_metrics_serializes_via_spool_payload() {
     let payload = RetractionMetrics::from(&runtime);
     assert_eq!(payload.groups_recomputed, 3);
     assert_eq!(payload.partitions_dispatched, 1);
+    assert_eq!(payload.iterations, 4);
     assert_eq!(payload.degrade_fallback_count, 2);
     assert_eq!(payload.synthetic_ck_columns_emitted_total, 11);
     assert_eq!(payload.synthetic_ck_fanout_lookups_total, 5);
@@ -216,6 +219,7 @@ fn retraction_metrics_serializes_via_spool_payload() {
     let json = serde_json::to_string(&payload).expect("ser");
     assert!(json.contains("\"groups_recomputed\":3"));
     assert!(json.contains("\"partitions_dispatched\":1"));
+    assert!(json.contains("\"iterations\":4"));
     assert!(json.contains("\"degrade_fallback_count\":2"));
     assert!(json.contains("\"synthetic_ck_columns_emitted_total\":11"));
     assert!(json.contains("\"synthetic_ck_fanout_lookups_total\":5"));
