@@ -248,124 +248,6 @@ o3,ENG,100
     );
 }
 
-/// Cascading retraction converges and produces the post-retract output:
-/// a deferred-region Transform throws divide-by-zero on a recomputed
-/// aggregate value, the orchestrator folds the failure into the next
-/// iteration's retract scope, the failing aggregate's contributors are
-/// retracted, and the converged output excludes the failing department.
-/// Counters reflect at least one DLQ trigger (the failing aggregate
-/// emit) and at least one recomputed group (the retract path emitted a
-/// post-retract delta for the surviving departments).
-#[test]
-fn cascading_retraction_converges_and_excludes_failing_partition() {
-    let yaml = r#"
-pipeline:
-  name: cascading_retract
-error_handling:
-  strategy: continue
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    correlation_key: order_id
-    type: csv
-    schema:
-      - { name: order_id, type: string }
-      - { name: department, type: string }
-      - { name: amount, type: int }
-- type: aggregate
-  name: dept_totals
-  input: src
-  config:
-    group_by: [department]
-    cxl: |
-      emit department = department
-      emit total = sum(amount)
-- type: transform
-  name: ratio
-  input: dept_totals
-  config:
-    cxl: |
-      emit department = department
-      emit total = total
-      emit ratio = 1 / (total - 60)
-- type: output
-  name: out
-  input: ratio
-  config:
-    name: out
-    path: out.csv
-    type: csv
-    include_unmapped: true
-"#;
-    // HR sums to 60 → 1/(60-60) divides by zero. ENG sums to 600.
-    let csv = "\
-order_id,department,amount
-o1,HR,10
-o2,HR,10
-o3,HR,10
-o4,HR,10
-o5,HR,10
-o6,HR,10
-o7,ENG,100
-o8,ENG,200
-o9,ENG,300
-";
-
-    let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
-        primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
-    )]);
-    let buf = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
-    )]);
-    let params = PipelineRunParams {
-        execution_id: "test-exec".to_string(),
-        batch_id: "test-batch".to_string(),
-        pipeline_vars: Default::default(),
-        shutdown_token: None,
-    };
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("cascading-retract pipeline must converge");
-
-    let written = buf.as_string();
-    let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
-    assert!(
-        body_lines
-            .iter()
-            .skip(1)
-            .all(|line| !line.starts_with("HR,")),
-        "HR partition retracted across the cascading-retraction loop; \
-         must not appear in the converged output. Got: {body_lines:?}"
-    );
-    assert!(
-        body_lines
-            .iter()
-            .skip(1)
-            .any(|line| line.starts_with("ENG,")),
-        "ENG partition survives (its aggregate emit does not trigger /0); \
-         must reach the writer. Got: {body_lines:?}"
-    );
-
-    assert!(
-        report.counters.dlq_count >= 1,
-        "the HR aggregate emit's /0 lands in the DLQ; got {}",
-        report.counters.dlq_count
-    );
-    assert!(
-        report.counters.retraction.groups_recomputed >= 1,
-        "the cascading-retraction loop recomputes at least one group; got {}",
-        report.counters.retraction.groups_recomputed
-    );
-}
-
 /// Memory-budget overflow during deferred-buffer projection raises the
 /// E310 admission failure shape that the windowed-Transform's buffer-
 /// recompute path uses, so callers see a uniform error mode regardless
@@ -490,7 +372,8 @@ nodes:
 #[should_panic(expected = "cascading-retraction loop exceeded")]
 fn cascading_retraction_loop_cap_panics_with_documented_message() {
     use crate::executor::commit::with_test_loop_cap;
-    // Same shape as `cascading_retraction_converges_and_excludes_failing_partition`
+    // Same shape as the convergence test in
+    // `correlated_post_aggregate_retract::cascading_retraction_loop_converges_and_excludes_failing_partition`
     // — relaxed Aggregate + downstream Transform that fails on HR's
     // aggregate emit. Forcing cap=0 means the orchestrator's defensive
     // check fires before the first iteration body runs, exercising the

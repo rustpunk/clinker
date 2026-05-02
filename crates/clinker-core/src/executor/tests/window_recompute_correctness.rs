@@ -25,16 +25,29 @@
 //! scope. The deferred-region commit pass re-seeds the post-recompute
 //! aggregate emits into `node_buffers[dept_region_totals]` and
 //! redispatches `running` over `[HR/east, HR/west]` (the surviving
-//! slice in sort_by(region asc) order); the windowed Transform's emit
-//! lands directly in the buffered Output that the flush phase drains.
+//! slice in sort_by(region asc) order); `gate` then runs over the
+//! window's emits and the resulting record lands in the buffered
+//! Output that the flush phase drains.
 //!
-//! The load-bearing assertion is HR/west's `running_total == 35` — the
-//! cumulative sum after HR/north's contribution is removed. A
-//! 45 (the pre-retract value) means the windowed-Transform did not
-//! re-evaluate against the post-recompute aggregate emit on the
-//! commit pass. A 30 (the lone surviving row's own `total`) means the
-//! deferred dispatch keyed off an empty partition, which would itself
-//! be a bug.
+//! `gate`'s emit deliberately MUTATES `running_total` (adds 1 on the
+//! success path) rather than passing it through. Under deferred
+//! dispatch the windowed Transform's emit and `gate`'s emit both run
+//! at commit-time on post-recompute upstream data, so the writer sees
+//! `gate`'s mutated value. Under the prior value-equality replay
+//! architecture the same fixture would silently produce wrong output
+//! because the substitution would fail to match a mutated record
+//! against the recompute Delta — that failure mode is the reason this
+//! fixture exists.
+//!
+//! The load-bearing assertion is HR/west's `running_total == 36` —
+//! cumulative sum (35 = 30 + 5, after HR/north's 10 is removed) plus
+//! `gate`'s +1 mutation. A 46 (45 pre-retract sum + 1) means the
+//! windowed Transform did not re-evaluate against the post-recompute
+//! aggregate emit. A 35 (post-recompute sum WITHOUT `gate`'s
+//! mutation) means `gate` did not run at commit and the writer saw
+//! the window's emit directly. A 31 (30 + 1, lone surviving row's
+//! own total + mutation) means deferred dispatch keyed off an empty
+//! partition, which would itself be a bug.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -75,25 +88,28 @@ fn run_pipeline(
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
-/// `gate`'s emit produces records value-identical to `running`'s emit
-/// on the success path:
+/// `gate`'s emit deliberately mutates `running_total` on the success
+/// path — adding 1 to whatever the windowed Transform produced — so
+/// that the test proves deferred-dispatch's commit-time evaluation
+/// flows through to the writer:
 ///
 /// ```text
-/// emit running_total = running_total + 0 / (if region == "north" then 0 else 1)
+/// emit running_total = running_total + 1 / (if region == "north" then 0 else 1)
 /// ```
 ///
 /// For `region == "north"`, the divisor is `0`, so the evaluator
 /// returns `DivisionByZero` ("division by zero") and the failing record
 /// is parked in the correlation buffer (correlation buffering is active
 /// because the upstream aggregate's `group_by` omits the source CK).
-/// For non-north rows, `0 / 1 == 0`, so `running_total + 0 ==
-/// running_total` and the emitted record is byte-identical to the input
-/// from `running`. That identity is load-bearing: replay's
-/// `substitute_in_correlation_buffers` matches the recompute Delta's
-/// `retract_old_row` (the running emit) against buffered records by
-/// `Value`-list equality; if `gate` perturbed the record on the success
-/// path, the substitution would silently no-op and the recomputed
-/// `running_total = 35` would never reach the writer.
+/// For non-north rows, `1 / 1 == 1`, so `running_total + 1` is the
+/// emitted value. The +1 mutation is load-bearing: under deferred
+/// dispatch `gate` runs ONCE at commit-time on the post-recompute
+/// window emit, so the writer must see the post-recompute window value
+/// + 1. A test that used a value-identity gate (e.g. `+ 0 /`) could
+/// not distinguish "gate ran at commit on corrected data" from "the
+/// pre-retract gate emit happened to value-equal the post-recompute
+/// emit"; the +1 mutation makes the two outcomes structurally
+/// different at the writer.
 const PIPELINE: &str = r#"
 pipeline:
   name: window_recompute_correctness
@@ -143,7 +159,7 @@ nodes:
       emit department = department
       emit region = region
       emit total = total
-      emit running_total = running_total + 0 / (if region == "north" then 0 else 1)
+      emit running_total = running_total + 1 / (if region == "north" then 0 else 1)
 - type: output
   name: out
   input: gate
@@ -181,9 +197,14 @@ O5,ENG,west,50
 /// `cumulative_sum` is unchanged at 30; HR/west's drops from 45 to 35
 /// because HR/north's 10 is no longer in the prefix.
 ///
-/// Replay: substitutes the new rows into the buffered Output through
-/// the `gate` Transform's value-identical projection (see PIPELINE
-/// docstring for why `gate` is a no-op on the success path).
+/// Deferred-region commit pass: dispatches `running` and then `gate`
+/// over the post-recompute aggregate emits. The window's
+/// `cumulative_sum` evaluates fresh on `[HR/east, HR/west]`; `gate`
+/// then runs on each of `running`'s emits and adds 1, landing the
+/// final value in the buffered Output that flush drains. There is no
+/// substitution against pre-retract records — the writer never sees
+/// the pre-retract emits because they were never produced (forward
+/// pass short-circuited the deferred consumers).
 ///
 /// Strict assertions:
 ///
@@ -191,16 +212,20 @@ O5,ENG,west,50
 /// 2. The DLQ row carries `department=HR` and `region=north` and the
 ///    `division by zero` error message.
 /// 3. `partitions_dispatched >= 1` — the running windowed Transform
-///    is re-evaluated on the deferred-region commit pass.
+///    is dispatched on the deferred-region commit pass.
 /// 4. Output row count == 4 (HR/north excluded; HR/east + HR/west +
 ///    ENG/east + ENG/west reach the writer).
-/// 5. **Load-bearing**: HR/west's `running_total == 35` — proves the
-///    window-level recompute excluded HR/north's 10 from the cumulative
-///    sum AND that the resulting Delta successfully substituted into the
-///    buffered Output.
-/// 6. HR/east's `running_total == 30` (unchanged; first in partition).
-/// 7. ENG/east's `running_total == 300`; ENG/west's `running_total ==
-///    350` — ENG partition is not recomputed.
+/// 5. **Load-bearing**: HR/west's `running_total == 36` — proves
+///    BOTH that the window-level cumulative_sum excluded HR/north's
+///    10 (post-recompute aggregate emit) AND that `gate`'s +1
+///    mutation flowed through to the writer (commit-time evaluation
+///    on the post-recompute window emit).
+/// 6. HR/east's `running_total == 31` (= 30 + `gate`'s +1; first in
+///    partition so cumulative_sum is unchanged at 30).
+/// 7. ENG/east's `running_total == 301`; ENG/west's `running_total ==
+///    351` — ENG partition is not in the recompute scope, but `gate`
+///    still runs on every surviving record at commit, so the +1
+///    mutation appears uniformly across all written rows.
 #[test]
 fn post_aggregate_window_recompute_corrects_running_total() {
     let (counters, dlq, output) =
@@ -280,8 +305,9 @@ fn post_aggregate_window_recompute_corrects_running_total() {
     assert_eq!(hr_east.get("total").map(String::as_str), Some("30"));
     assert_eq!(
         hr_east.get("running_total").map(String::as_str),
-        Some("30"),
-        "HR/east is the first row in the partition; cumulative_sum is unchanged at 30"
+        Some("31"),
+        "HR/east is the first row in the partition; cumulative_sum is 30 \
+         and `gate` adds 1 → 31"
     );
 
     let hr_west = by_dept_region
@@ -290,11 +316,13 @@ fn post_aggregate_window_recompute_corrects_running_total() {
     assert_eq!(hr_west.get("total").map(String::as_str), Some("5"));
     assert_eq!(
         hr_west.get("running_total").map(String::as_str),
-        Some("35"),
-        "HR/west's running_total must be 35 (= 30 + 5) after the window-level \
-         recompute drops HR/north's 10 from the cumulative prefix. A 45 means \
-         the recompute Delta failed to substitute into the buffered Output \
-         (the load-bearing failure mode this test exists to catch)."
+        Some("36"),
+        "HR/west's running_total must be 36 (= 30 + 5 from cumulative_sum, \
+         + 1 from `gate`) after the deferred-region commit pass. A 46 means \
+         the windowed Transform did not re-evaluate against the post-recompute \
+         aggregate emit. A 35 means `gate` did not run at commit and the writer \
+         saw the window's emit directly. Either failure mode would prove the \
+         architecture broken in a way no other test catches."
     );
 
     let eng_east = by_dept_region
@@ -303,8 +331,9 @@ fn post_aggregate_window_recompute_corrects_running_total() {
     assert_eq!(eng_east.get("total").map(String::as_str), Some("300"));
     assert_eq!(
         eng_east.get("running_total").map(String::as_str),
-        Some("300"),
-        "ENG/east is unaffected by HR's retract"
+        Some("301"),
+        "ENG/east is unaffected by HR's retract; cumulative_sum is 300 \
+         and `gate` adds 1 → 301"
     );
 
     let eng_west = by_dept_region
@@ -313,7 +342,9 @@ fn post_aggregate_window_recompute_corrects_running_total() {
     assert_eq!(eng_west.get("total").map(String::as_str), Some("50"));
     assert_eq!(
         eng_west.get("running_total").map(String::as_str),
-        Some("350"),
-        "ENG/west = 300 + 50 = 350; the ENG partition is not in the recompute scope"
+        Some("351"),
+        "ENG/west = 300 + 50 from cumulative_sum + 1 from `gate` = 351; the \
+         ENG partition is not in the recompute scope but `gate` still runs \
+         on every surviving record at commit time"
     );
 }
