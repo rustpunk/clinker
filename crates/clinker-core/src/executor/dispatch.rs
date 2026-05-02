@@ -299,16 +299,6 @@ pub(crate) struct ExecutorContext<'a> {
     /// pipelines.
     pub(crate) relaxed_aggregator_degrade: Vec<NodeIndex>,
 
-    /// Per-window-node retained state for buffer-recompute mode. The
-    /// dispatcher's Transform arm populates this when the upstream
-    /// IndexSpec has `requires_buffer_recompute = true`; the
-    /// orchestrator's recompute-window phase reads it to rerun window
-    /// evaluation against `partition − retracted_rows` and emit
-    /// per-output Deltas. Strict pipelines and pipelines without a
-    /// relaxed-CK aggregate never instantiate the inner map, so the
-    /// streaming-emit path observes zero overhead.
-    pub(crate) relaxed_window_states: HashMap<NodeIndex, RetainedWindowState>,
-
     /// Tracks which commit-step path the orchestrator selected. Read by
     /// the zero-overhead-on-strict-pipeline test so the assertion
     /// proves the short-circuit is taken on every strict workload.
@@ -326,6 +316,19 @@ pub(crate) struct ExecutorContext<'a> {
     /// admission, mirroring the per-row accounting the windowed
     /// Transform arm uses for buffer-recompute mode.
     pub(crate) region_input_buffers: RegionInputBuffers,
+
+    /// Inverts the meaning of the per-operator deferred-region guard at
+    /// the top of `dispatch_plan_node`. `false` (forward pass) makes
+    /// every deferred-region member short-circuit so the producer's
+    /// emit can be parked for commit-time replay. `true` (commit-time
+    /// deferred dispatch) lifts the short-circuit so the same operator
+    /// arms run on the post-recompute aggregate emits the deferred
+    /// dispatcher seeds into the producer's `node_buffers` slot. The
+    /// flag is owned by the deferred dispatcher (set on entry, cleared
+    /// on exit) and never touched anywhere else; the single dispatcher
+    /// design — one set of operator arms, two pass modes — is the whole
+    /// architectural value of the deferred-region landing.
+    pub(crate) in_deferred_dispatch: bool,
 }
 
 /// Map keying (active composition body, outgoing edge id) to the rows
@@ -342,11 +345,11 @@ pub(crate) type RegionInputBuffers = HashMap<
 
 /// Which commit-step body the orchestrator selected for the current
 /// pipeline. `FastPath` short-circuits to the strict body and is the
-/// only path strict pipelines ever touch; `FivePhase` runs the full
-/// detect → recompute → replay → flush sequence. Surfaced on
-/// `ExecutorContext` so the zero-overhead-invariant test can assert
-/// the FastPath branch fires on the existing `correlated_dlq.rs`
-/// workload.
+/// only path strict pipelines ever touch; `ThreePhase` runs the
+/// detect → recompute → deferred-dispatch loop followed by a single
+/// flush. Surfaced on `ExecutorContext` so the
+/// zero-overhead-invariant test can assert the FastPath branch fires
+/// on every strict workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitStepPath {
     /// Default at executor start. Indicates the commit step has not
@@ -356,10 +359,10 @@ pub(crate) enum CommitStepPath {
     /// Strict pipeline (no relaxed-CK aggregate); orchestrator routed
     /// straight to the existing two-phase commit body.
     FastPath,
-    /// Relaxed pipeline (at least one aggregate whose `group_by` omits
-    /// a correlation-key field); orchestrator ran the full five-phase
-    /// protocol.
-    FivePhase,
+    /// Relaxed pipeline (at least one aggregate whose `group_by`
+    /// omits a correlation-key field); orchestrator ran the
+    /// cascading-retraction loop.
+    ThreePhase,
 }
 
 /// Per-aggregate state retained from the Aggregate dispatch arm so the
@@ -368,51 +371,6 @@ pub(crate) enum CommitStepPath {
 /// strict pipelines never instantiate this struct.
 pub(crate) struct RetainedAggregatorState {
     pub(crate) aggregator: Box<crate::aggregation::HashAggregator>,
-    /// Per-aggregate group-by column indices (mirroring
-    /// `CompiledAggregate.group_by_indices`). Used by the recompute
-    /// phase to extract group-key column values from finalized output
-    /// rows so pre-retract / post-retract pairs align.
-    pub(crate) group_by_indices: Vec<u32>,
-    /// Snapshot of the aggregate's original output rows produced by
-    /// the first `finalize_in_place` call. The recompute phase pairs
-    /// each entry against the post-retract finalize output to build
-    /// per-row deltas.
-    pub(crate) pre_retract_output_rows: Vec<crate::aggregation::SortRow>,
-}
-
-/// Per-window-node state retained for buffer-recompute mode. Captured
-/// during the windowed Transform arm's per-record evaluation when the
-/// IndexSpec has `requires_buffer_recompute = true`; the orchestrator's
-/// recompute-window phase consumes it to rerun window evaluation over
-/// `partition − retracted_rows`.
-///
-/// `partition_outputs` keys by the partition tuple (the window's
-/// `group_by` values, encoded as `Vec<GroupByKey>`); each value is the
-/// ordered list of `(arena_position, source_row, pre_retract_record)`
-/// triples emitted on the original walk. The arena positions point
-/// into the per-source `Arena` materialized at Phase-0 setup; combined
-/// with the SecondaryIndex partition slice (also keyed by the same
-/// tuple), they let the recompute phase reconstruct the surviving
-/// position list per partition without re-buffering record bodies.
-///
-/// `transform_idx` is the index into `compiled_transforms` for the
-/// owning Transform; the recompute phase uses it to instantiate a
-/// fresh `ProgramEvaluator` mirroring the dispatcher's setup. Strict
-/// pipelines and pipelines without a relaxed-CK aggregate never
-/// populate this struct.
-pub(crate) struct RetainedWindowState {
-    pub(crate) transform_idx: usize,
-    pub(crate) window_index: usize,
-    /// Per-partition emit log. Each entry's first field is the arena
-    /// position; the second is the original source-row number for
-    /// downstream replay; the third is the pre-retract output Record
-    /// the executor surfaced into `node_buffers` on the original walk
-    /// (needed as the retract-old half of the per-output Delta).
-    pub(crate) partition_outputs: HashMap<Vec<GroupByKey>, Vec<(u32, u64, Record)>>,
-    /// Per-record bytes accounted into the memory budget at
-    /// admission time. Held so the recompute phase can release the
-    /// charge after emitting Deltas.
-    pub(crate) charged_bytes: usize,
 }
 
 impl ExecutorContext<'_> {
@@ -438,15 +396,41 @@ impl ExecutorContext<'_> {
 /// deferred-region producer (a relaxed-CK Aggregate) so the emit buffer
 /// retains exactly the columns the deferred operators reach via
 /// `Expr::support_into`. Source row numbers carry through unchanged.
-fn project_rows_to_buffer_schema(
+///
+/// `pub(crate)` so the commit-time `recompute_aggregates` phase can
+/// project the post-retract finalize output onto the same buffer
+/// schema before re-seeding the producer's `node_buffers` slot for
+/// the deferred dispatcher to consume.
+pub(crate) fn project_rows_to_buffer_schema(
     rows: Vec<(Record, u64)>,
     buffer_schema: &[String],
 ) -> Vec<(Record, u64)> {
-    let narrow_schema: Arc<clinker_record::Schema> = buffer_schema
-        .iter()
-        .map(|s| Box::<str>::from(s.as_str()))
-        .collect::<SchemaBuilder>()
-        .build();
+    // Reuse the wide schema's field metadata for every narrow column;
+    // dropping it would silently strip `FieldMetadata::SourceCorrelation`
+    // / `AggregateGroupIndex` markers the downstream Output's
+    // `buffer_key_for_record` keys on, collapsing every narrow record
+    // into a per-row `null` group.
+    let narrow_schema: Arc<clinker_record::Schema> = match rows.first() {
+        Some((rec, _)) => {
+            let wide_schema = rec.schema();
+            let mut builder = SchemaBuilder::with_capacity(buffer_schema.len());
+            for col in buffer_schema {
+                let metadata = wide_schema
+                    .index(col)
+                    .and_then(|i| wide_schema.field_metadata(i).cloned());
+                builder = match metadata {
+                    Some(meta) => builder.with_field_meta(col.as_str(), meta),
+                    None => builder.with_field(col.as_str()),
+                };
+            }
+            builder.build()
+        }
+        None => buffer_schema
+            .iter()
+            .map(|s| Box::<str>::from(s.as_str()))
+            .collect::<SchemaBuilder>()
+            .build(),
+    };
     rows.into_iter()
         .map(|(record, rn)| {
             let wide_schema = record.schema();
@@ -563,7 +547,7 @@ fn tee_emit_to_region_input_buffers(
 /// inserted into `ctx.window_runtime` at the spec's slot — into the
 /// active body's vec when `active_stack` is non-empty, otherwise into
 /// `top`.
-fn finalize_node_rooted_windows(
+pub(crate) fn finalize_node_rooted_windows(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     upstream_idx: NodeIndex,
@@ -576,7 +560,7 @@ fn finalize_node_rooted_windows(
     use clinker_record::RecordStorage;
 
     for (idx, spec) in current_dag.indices_to_build.iter().enumerate() {
-        let anchor_schema = match &spec.root {
+        let plan_anchor = match &spec.root {
             PlanIndexRoot::Node {
                 upstream,
                 anchor_schema,
@@ -585,6 +569,26 @@ fn finalize_node_rooted_windows(
             // recursion installs ParentNode slots from the parent's
             // runtime at body entry, not here.
             _ => continue,
+        };
+        // The plan-time `anchor_schema` is the upstream operator's
+        // full `output_schema`. The forward pass invokes this helper
+        // with rows carrying that exact `Arc<Schema>`, so projection
+        // by `anchor_schema.index(field)` lands on the right value
+        // slots. The commit-pass deferred-region path invokes the
+        // helper with NARROW rows (column-pruned to
+        // `region.buffer_schema`), which carry their own `Arc<Schema>`
+        // — projecting against the wide plan-anchor would index off
+        // the end / into the wrong slot. Whenever the actual rows
+        // carry a different column count than the plan-anchor, drop
+        // back to the rows' own schema so projection indexes match
+        // the value vector. Empty `rows` keeps the plan-anchor (no
+        // narrowing observed) so the resulting empty arena still
+        // pins the canonical column set.
+        let anchor_schema = match rows.first() {
+            Some((rec, _)) if rec.schema().column_count() != plan_anchor.column_count() => {
+                rec.schema()
+            }
+            _ => plan_anchor,
         };
         let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
         let arena = Arena::from_records(
@@ -671,6 +675,15 @@ pub(crate) fn dispatch_plan_node(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
 ) -> Result<(), PipelineError> {
+    // Single deferred-region guard: skip every non-producer member on
+    // the forward pass so the producer's narrow emit can be parked for
+    // commit-time replay. The flag flips when the commit-time deferred
+    // dispatcher walks the same arms on post-recompute aggregate emits.
+    // One guard, two pass modes — the architectural payoff of routing
+    // both passes through the same operator arms.
+    if !ctx.in_deferred_dispatch && current_dag.is_deferred_consumer(node_idx) {
+        return Ok(());
+    }
     let node = current_dag.graph[node_idx].clone();
     match node {
         PlanNode::Source { ref name, .. } => {
@@ -799,14 +812,6 @@ pub(crate) fn dispatch_plan_node(
             window_index,
             ..
         } => {
-            // Deferred-region member: skip the per-record evaluation
-            // on the forward pass. The commit-time deferred dispatcher
-            // re-runs this Transform on post-recompute upstream emits;
-            // draining the predecessor's buffer here would leak the
-            // pre-recompute snapshot to the writer ahead of recompute.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             // Get input records: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
             let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
@@ -888,37 +893,6 @@ pub(crate) fn dispatch_plan_node(
 
             let mut output_records = Vec::with_capacity(input_records.len());
 
-            // Buffer-recompute mode opt-in. When the IndexSpec backing
-            // this Transform's window flags `requires_buffer_recompute`,
-            // capture per-record (arena_position, source_row, output)
-            // triples per partition. The orchestrator's commit phase
-            // reads them to recompute affected partitions over
-            // `partition − retracted_rows` and emit per-output Deltas.
-            // The `Arc<Arena>` retained here keeps the node-rooted (or
-            // source-rooted) arena alive across the commit phase
-            // through `Arc::clone` from the resolved runtime.
-            let buffered_window: Option<(usize, Vec<String>, Arc<crate::pipeline::arena::Arena>)> =
-                window_index.and_then(|idx_num| {
-                    let spec = current_dag.indices_to_build.get(idx_num)?;
-                    if !spec.requires_buffer_recompute {
-                        return None;
-                    }
-                    let runtime = ctx.window_runtime.resolve(&spec.root, idx_num)?;
-                    Some((idx_num, spec.group_by.clone(), Arc::clone(&runtime.arena)))
-                });
-            // RSS budget guard for buffer-mode admission. Polled every
-            // 10K admitted rows so a runaway partition cannot blow the
-            // hard limit before the recompute phase fires. Mirrors the
-            // combine-probe and hash-build guards already in this file.
-            let mut buffered_budget = if buffered_window.is_some() {
-                Some(MemoryBudget::from_config(
-                    ctx.config.pipeline.memory_limit.as_deref(),
-                ))
-            } else {
-                None
-            };
-            let mut buffered_admitted_since_check: u64 = 0;
-
             for (i, (record, rn)) in input_records.into_iter().enumerate() {
                 if let Some(exp) = expected_input.as_ref() {
                     check_input_schema(exp, record.schema(), name, "transform", &upstream_name)?;
@@ -995,87 +969,6 @@ pub(crate) fn dispatch_plan_node(
                 };
                 match eval_result {
                     Ok((modified_record, Ok(()))) => {
-                        if let Some((idx_num, partition_fields, _arena)) = &buffered_window {
-                            // Read partition_by values off the input record so
-                            // partition assignment is keyed by the same fields
-                            // the windowed evaluator partitioned on. Mirror the
-                            // null-coalesce semantics of
-                            // `evaluate_single_transform_windowed`: a null
-                            // component lands the row in a "no-partition" slot
-                            // that the recompute phase treats as out-of-scope.
-                            let buffered_pos = {
-                                let spec = &current_dag.indices_to_build[*idx_num];
-                                if matches!(spec.root, crate::plan::index::PlanIndexRoot::Source(_))
-                                {
-                                    (rn - 1) as u32
-                                } else {
-                                    i as u32
-                                }
-                            };
-                            let mut partition_key: Vec<GroupByKey> =
-                                Vec::with_capacity(partition_fields.len());
-                            let mut all_resolved = true;
-                            for field in partition_fields {
-                                let val = record.get(field).cloned().unwrap_or(Value::Null);
-                                match clinker_record::value_to_group_key(
-                                    &val,
-                                    field,
-                                    None,
-                                    buffered_pos,
-                                ) {
-                                    Ok(Some(k)) => partition_key.push(k),
-                                    _ => {
-                                        all_resolved = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if all_resolved {
-                                let arena_pos = buffered_pos;
-                                // Memory accounting: charge an upper-bound
-                                // estimate per buffered triple. The Record
-                                // body shares its `Arc<Schema>`; the
-                                // dominant cost is per-field Value
-                                // payload, so estimate as
-                                // `sizeof::<Value>() * column_count` plus
-                                // a conservative entry overhead.
-                                let row_bytes = std::mem::size_of::<Value>()
-                                    * modified_record.schema().column_count()
-                                    + std::mem::size_of::<(u32, u64, Record)>();
-                                let entry = ctx
-                                    .relaxed_window_states
-                                    .entry(node_idx)
-                                    .or_insert_with(|| RetainedWindowState {
-                                        transform_idx,
-                                        window_index: *idx_num,
-                                        partition_outputs: HashMap::new(),
-                                        charged_bytes: 0,
-                                    });
-                                entry
-                                    .partition_outputs
-                                    .entry(partition_key)
-                                    .or_default()
-                                    .push((arena_pos, rn, modified_record.clone()));
-                                entry.charged_bytes = entry.charged_bytes.saturating_add(row_bytes);
-                                buffered_admitted_since_check += 1;
-                                if buffered_admitted_since_check >= 10_000
-                                    && let Some(budget) = buffered_budget.as_mut()
-                                    && budget.should_abort()
-                                {
-                                    return Err(PipelineError::Compilation {
-                                        transform_name: name.clone(),
-                                        messages: vec![format!(
-                                            "E310 window buffer-recompute memory limit exceeded: \
-                                             hard limit {}",
-                                            budget.hard_limit()
-                                        )],
-                                    });
-                                }
-                                if buffered_admitted_since_check >= 10_000 {
-                                    buffered_admitted_since_check = 0;
-                                }
-                            }
-                        }
                         output_records.push((modified_record, rn));
                     }
                     Ok((_record, Err(SkipReason::Filtered))) => {
@@ -1135,14 +1028,6 @@ pub(crate) fn dispatch_plan_node(
             default: _,
             ..
         } => {
-            // Deferred-region member: skip branching dispatch on the
-            // forward pass — the commit-time deferred dispatcher re-runs
-            // this Route on post-recompute upstream emits. Draining
-            // predecessors here would commit branch decisions to a
-            // pre-recompute view of the records.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             // Body-context Routes that consume an input port have no
             // predecessor in the body's mini-DAG — the records are
             // seeded into this node's own buffer at composition entry.
@@ -1399,12 +1284,6 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Merge { ref name, .. } => {
-            // Deferred-region member: skip concatenation on the forward
-            // pass. The commit-time deferred dispatcher re-runs this
-            // Merge on post-recompute upstream emits.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             // Concatenate predecessor buffers in declaration order —
             // the order appearing in the Merge's `inputs:` YAML
             // array, which is stable across compile runs. Under
@@ -1500,13 +1379,6 @@ pub(crate) fn dispatch_plan_node(
             ref sort_fields,
             ..
         } => {
-            // Deferred-region member: skip sort on the forward pass.
-            // The commit-time deferred dispatcher re-runs this Sort on
-            // post-recompute upstream emits, so admitting records to a
-            // SortBuffer here would double-charge the sort.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             // Enforcer-sort dispatch. Carries `row_num` through
             // the sort permutation as the `SortBuffer<u64>`
             // payload — the Record itself carries every field
@@ -1776,14 +1648,10 @@ pub(crate) fn dispatch_plan_node(
                             ctx.counters.retraction.synthetic_ck_columns_emitted_total +=
                                 (emitted_rows.len() - pre_finalize_len) as u64;
                         }
-                        let group_by_indices = hash_box.group_by_indices().to_vec();
-                        let pre_retract_output_rows = emitted_rows.clone();
                         ctx.relaxed_aggregator_states.insert(
                             node_idx,
                             RetainedAggregatorState {
                                 aggregator: hash_box,
-                                group_by_indices,
-                                pre_retract_output_rows,
                             },
                         );
                         emitted_rows
@@ -1869,18 +1737,22 @@ pub(crate) fn dispatch_plan_node(
                 // Deferred-region producer. Project emits to the region's
                 // buffer schema (the planner already pruned this to the
                 // minimum columns the deferred operators reach via
-                // `Expr::support_into`), park narrow rows in
-                // `node_buffers[node_idx]`, and skip
-                // `finalize_node_rooted_windows`: every IndexSpec rooted
-                // here is consumed by a downstream operator INSIDE the
-                // same region, which does not run on the forward pass.
-                // The wide pre-retract rows held on
-                // `RetainedAggregatorState.pre_retract_output_rows`
-                // already cover the recompute-aggregates phase, so the
-                // narrow projection here costs nothing the recompute
-                // path needs.
+                // `Expr::support_into` plus every windowed-Transform
+                // member's `arena_fields`). Park narrow rows in
+                // `node_buffers[node_idx]` and build any node-rooted
+                // window runtimes against the same narrow projection so
+                // a windowed-Transform member finds its slot populated
+                // when the commit-time deferred dispatcher walks it —
+                // the forward pass produces these emits exactly once and
+                // every downstream member runs on the commit pass, so
+                // pre-building here matches the strict path's window
+                // lifecycle (forward-pass build, downstream consumption)
+                // without an extra commit-time materialization for the
+                // no-retraction case. Retraction iterations overwrite
+                // the slot in `recompute_aggregates::emit_post_recompute`.
                 let buffer_schema = region.buffer_schema.clone();
                 let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
+                finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &projected)?;
                 ctx.node_buffers.insert(node_idx, projected);
             } else {
@@ -1898,14 +1770,6 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Output { ref name, .. } => {
-            // Deferred-region exit: skip writer admission on the forward
-            // pass. The commit-time deferred dispatcher routes
-            // post-recompute records into this Output, so any record
-            // dropped here on a stale upstream buffer would be a
-            // pre-recompute leak.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
@@ -2113,13 +1977,6 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Composition { ref name, body, .. } => {
-            // Deferred-region member: skip recursive body execution on
-            // the forward pass. The commit-time deferred dispatcher
-            // re-enters this Composition on post-recompute upstream
-            // emits.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             // Recursive body execution: collect parent-scope records
             // per declared input port, swap `current_dag` to the body's
             // mini-DAG, walk the body's topo, then collect the body's
@@ -2212,13 +2069,6 @@ pub(crate) fn dispatch_plan_node(
             ref propagate_ck,
             ..
         } => {
-            // Deferred-region member: skip the join on the forward pass.
-            // The commit-time deferred dispatcher will re-run this
-            // Combine against the post-recompute upstream emits parked
-            // in `region_input_buffers` for its cross-region edges.
-            if current_dag.is_deferred_consumer(node_idx) {
-                return Ok(());
-            }
             use crate::config::pipeline_node::{MatchMode, OnMiss};
             use crate::executor::combine::{CombineResolver, CombineResolverMapping};
             use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
@@ -3096,7 +2946,13 @@ pub(crate) fn dispatch_plan_node(
 /// `CorrelationCommit` arm can detect overflow against the configured
 /// `max_group_buffer`. `overflowed` short-circuits further admissions
 /// once the cap has fired.
-#[derive(Debug, Default)]
+///
+/// `Clone` is derived so the relaxed-CK orchestrator can snapshot the
+/// forward-pass baseline state and restore it at the top of each
+/// cascading-retraction iteration. Records are `Arc`-shared, so cloning
+/// is cheap; per-iteration restore costs one `Arc::clone` per buffered
+/// slot plus one `HashMap` rebuild.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct CorrelationGroupBuffer {
     pub(crate) records: Vec<CorrelationRecordSlot>,
     pub(crate) error_rows: HashSet<u64>,
@@ -3150,12 +3006,12 @@ pub(crate) struct CorrelationErrorRecord {
 /// would otherwise contend for `ctx.writers.remove(name)`, leaving
 /// subsequent groups silently dropped.
 ///
-/// Exposed at `pub(crate)` so the relaxed-CK orchestrator's flush
-/// phase can delegate to this body after the upstream phases have
-/// substituted retracted aggregate output rows into the buffer. Both
-/// strict and relaxed pipelines share the per-group emission shape;
-/// the only difference is which records reach this point.
-pub(crate) fn commit_correlation_buffers_strict(
+/// Single source of truth for both strict and relaxed pipelines. The
+/// relaxed-CK orchestrator runs its cascading-retraction loop, then
+/// delegates here once the post-recompute aggregate output rows have
+/// been substituted into the buffer. The per-group emission shape is
+/// identical; only the path that populates the buffer differs.
+pub(crate) fn commit_correlation_buffers(
     ctx: &mut ExecutorContext<'_>,
     _commit_node_name: &str,
     _commit_group_by: &[String],

@@ -252,16 +252,16 @@ impl Expr {
                 }
             }
             Expr::QualifiedFieldRef { parts, .. } => {
-                if let Some(first) = parts.first() {
-                    if !is_system_namespace(first) {
-                        fields.insert(
-                            parts
-                                .iter()
-                                .map(|p| p.as_ref())
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        );
-                    }
+                if let Some(first) = parts.first()
+                    && !is_system_namespace(first)
+                {
+                    fields.insert(
+                        parts
+                            .iter()
+                            .map(|p| p.as_ref())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
                 }
             }
             Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {

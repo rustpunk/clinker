@@ -27,11 +27,10 @@
 //! 3. The retraction counters surfaced by the orchestrator
 //!    (`PipelineCounters.retraction.*`) increment in the expected
 //!    direction. The demo's geometry (relaxed-CK aggregate plus a
-//!    buffer-mode window upstream and a post-aggregate validation
+//!    windowed Transform downstream and a post-aggregate validation
 //!    Transform) exercises every counter path: `groups_recomputed`
-//!    for the aggregator's recompute step, `partitions_recomputed`
-//!    for the window's wholesale-recompute step,
-//!    `subdag_replay_rows` for the deltas pushed downstream,
+//!    for the aggregator's recompute step, `partitions_dispatched`
+//!    for the windowed Transform's commit-pass re-evaluation,
 //!    `synthetic_ck_columns_emitted_total` for the per-output-row
 //!    shadow column writes at finalize, and the
 //!    `synthetic_ck_fanout_*` pair for the detect-phase resolution
@@ -320,25 +319,20 @@ fn demo_retraction_counters_fire_in_the_expected_direction() {
         r.groups_recomputed
     );
 
-    // Window retract path: the partition containing the retracted row
-    // wholesale-recomputes its buffered output, so
-    // `partitions_recomputed` increments by exactly one (the HR
-    // partition the trigger row contributed to).
-    assert!(
-        r.partitions_recomputed > 0,
-        "partitions_recomputed must increment on relaxed retract under a buffer-mode window, \
-         got {}",
-        r.partitions_recomputed
-    );
-
-    // Replay phase: per-iteration counters are summed across the
-    // post-recompute deltas pushed downstream. The demo produces 18
-    // replay rows under a stable codebase; the loose `> 0` assertion
-    // is sufficient for the smoke-test invariant.
-    assert!(
-        r.subdag_replay_rows > 0,
-        "subdag_replay_rows must increment on relaxed retract, got {}",
-        r.subdag_replay_rows
+    // Deferred-region commit pass: this demo's window
+    // (`running_totals`) sits UPSTREAM of the relaxed-CK aggregate, so
+    // it runs on the forward pass and `partitions_dispatched` (which
+    // counts windowed-Transform dispatches inside deferred regions)
+    // stays at zero. The downstream `dept_validate` Transform inside
+    // the deferred region is non-windowed, so it does not increment
+    // this counter either. A pipeline with a windowed Transform
+    // DOWNSTREAM of a relaxed-CK aggregate is exercised by
+    // `executor::tests::correlated_window_after_aggregate_retract`.
+    assert_eq!(
+        r.partitions_dispatched, 0,
+        "demo geometry: window upstream of relaxed-CK aggregate keeps \
+         partitions_dispatched at zero; got {}",
+        r.partitions_dispatched
     );
 
     // The demo's per-group memory budget is well below the

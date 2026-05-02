@@ -1,30 +1,34 @@
-//! Phase 5: flush.
+//! Post-convergence flush.
 //!
-//! Drains the post-replay `correlation_buffers` and routes records to
-//! writers (clean groups) or the DLQ (dirty groups) per the resolved
-//! [`crate::config::CorrelationFanoutPolicy`]. Reuses the strict path's
-//! emission helpers — `commit_correlation_buffers_strict` is the
-//! single-source-of-truth flush body and the relaxed path delegates to
-//! it after the upstream phases have substituted the changed rows.
+//! Drains `correlation_buffers` to writers (clean groups) or the DLQ
+//! (dirty groups) per the resolved
+//! [`crate::config::CorrelationFanoutPolicy`]. The buffer state at
+//! entry is the converged set: forward-pass strict-Output admissions
+//! plus the FINAL cascading-retraction iteration's deferred-Output
+//! admissions (earlier iterations' deferred records were wiped at the
+//! top of each iteration via the orchestrator's baseline restore).
+//! Both strict and relaxed pipelines fan in here through the same
+//! [`commit_correlation_buffers`] body — the per-group emission shape
+//! is shared; only the path that populates the buffer differs.
 
 use super::detect::RetractScope;
 use crate::error::PipelineError;
-use crate::executor::dispatch::{ExecutorContext, commit_correlation_buffers_strict};
+use crate::executor::dispatch::{ExecutorContext, commit_correlation_buffers};
 
-/// Run the post-replay flush. Today this defers to the strict path's
-/// emission shape because Phase 6's retract pipeline mutates the
-/// `correlation_buffers` content (substituting new aggregate output
-/// rows) without changing the per-group dispositioning logic — clean
-/// stays clean, dirty stays dirty, overflow stays overflow. The
-/// per-output `CorrelationFanoutPolicy` resolution becomes load-bearing
-/// when ALL/PRIMARY downgrades start sparing collateral records, which
-/// the strict body honors via [`should_spare_collateral`] below.
+/// Drain the converged correlation buffer to writers and DLQ.
+///
+/// Each writer opens, accepts every record from its `output_name`
+/// queue, then flushes and closes — exactly once per Output per
+/// pipeline run. Per-iteration writer flushes would emit duplicates
+/// when a later iteration retracts an earlier-iteration emit; the
+/// orchestrator's baseline restore ensures that by the time this body
+/// runs, every deferred-Output queue holds only the converged set.
 pub(crate) fn flush_buffered(
     ctx: &mut ExecutorContext<'_>,
     _scope: &RetractScope,
     commit_group_by: &[String],
 ) -> Result<(), PipelineError> {
-    commit_correlation_buffers_strict(
+    commit_correlation_buffers(
         ctx,
         "correlation_commit__terminal",
         commit_group_by,

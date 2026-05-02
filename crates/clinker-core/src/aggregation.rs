@@ -1839,6 +1839,14 @@ impl HashAggregator {
         }
         if self.buffer_mode {
             for (key, buffered) in self.buffered_groups.iter() {
+                // Skip fully-retracted groups for the same reason the
+                // fold-mode arm below does: the relaxed-CK retract path
+                // can drain a group's contributions to empty, and
+                // emitting the identity-folded record would leak a
+                // phantom group the user never produced.
+                if buffered.input_rows.is_empty() {
+                    continue;
+                }
                 let folded = fold_buffered_state(&self.factory, buffered.clone())?;
                 let record = finalize_group_inner(
                     &self.factory,
@@ -1856,6 +1864,17 @@ impl HashAggregator {
             }
         } else {
             for (key, state) in self.groups.iter() {
+                // Skip groups whose lineage was fully retracted: under
+                // the relaxed-CK protocol every contributing source row
+                // can be removed via `retract_row`, leaving the group's
+                // accumulator at its identity element. Emitting that
+                // identity row leaks a "phantom" group into the output
+                // (e.g. `total=0, n=0`) that the user never produced;
+                // skipping aligns with a strict-path baseline that
+                // never saw the failing source rows.
+                if state.input_rows.is_empty() {
+                    continue;
+                }
                 let record = self.finalize_group(key, state, ctx)?;
                 let row_num = if state.min_row_num == u64::MAX {
                     0

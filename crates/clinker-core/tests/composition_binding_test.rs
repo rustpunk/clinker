@@ -40,28 +40,11 @@ fn test_compile_artifacts_fresh_body_id_monotonic() {
 #[test]
 fn test_compile_artifacts_insert_body_and_lookup() {
     use clinker_core::BoundBody;
-    use indexmap::IndexMap;
 
     let mut artifacts = CompileArtifacts::default();
     let id = artifacts.fresh_body_id();
 
-    let body = BoundBody {
-        signature_path: "compositions/test.comp.yaml".into(),
-        graph: petgraph::graph::DiGraph::new(),
-        topo_order: Vec::new(),
-        name_to_idx: std::collections::HashMap::new(),
-        port_name_to_node_idx: std::collections::HashMap::new(),
-        body_rows: std::collections::HashMap::new(),
-        node_input_refs: std::collections::HashMap::new(),
-        route_bodies: std::collections::HashMap::new(),
-        output_port_rows: IndexMap::new(),
-        output_port_to_node_idx: IndexMap::new(),
-        input_port_rows: IndexMap::new(),
-        nested_body_ids: vec![],
-        body_indices_to_build: Vec::new(),
-        body_window_configs: std::collections::HashMap::new(),
-        deferred_regions: std::collections::HashMap::new(),
-    };
+    let body = BoundBody::empty("compositions/test.comp.yaml".into());
 
     artifacts.insert_body(id, body.clone());
 

@@ -217,15 +217,15 @@ nodes:
     }
 }
 
-/// Test 3: Multi-Aggregate cascade — a relaxed Aggregate feeds a strict
-/// Aggregate (whose `group_by` covers every source-level CK field, so
-/// E15W stays silent) through Transform pairs. Pass A's "Aggregation
-/// (strict) → add to members; continue" rule merges them into one
-/// region rooted at the upstream producer; both Transforms join
-/// `members`. (Two relaxed Aggregates chained directly are forbidden
-/// by E15W — the runtime cannot prove correct retraction propagation
-/// through chained relaxed aggregates — so this fixture exercises the
-/// architecturally-valid relaxed→strict cascade.)
+/// Test 3: Multi-Aggregate cascade — two relaxed-CK Aggregates chained
+/// through Transform pairs. Pass A's forward BFS from the upstream
+/// producer absorbs the downstream Aggregate as a region member; the
+/// downstream Aggregate also independently seeds its own region (every
+/// relaxed-CK Aggregate is a region producer), but the outer region
+/// rooted at `agg1` covers the whole cascade — `t1`, `agg2`, and `t2`
+/// are all members. Both inner aggregates run at commit time on
+/// post-recompute upstream emits, so the cascade is safe under deferred
+/// dispatch.
 #[test]
 fn multi_aggregate_cascade_merges_into_one_region() {
     let yaml = r#"
@@ -240,9 +240,9 @@ nodes:
       name: src
       type: csv
       path: src.csv
-      correlation_key: id
+      correlation_key: order_id
       schema:
-        - { name: id, type: string }
+        - { name: order_id, type: string }
         - { name: dept, type: string }
         - { name: region, type: string }
         - { name: amount, type: int }
@@ -250,31 +250,30 @@ nodes:
     name: agg1
     input: src
     config:
-      group_by: [dept, region]
+      group_by: [dept]
       cxl: |
-        emit total1 = sum(amount)
+        emit total = sum(amount)
   - type: transform
     name: t1
     input: agg1
     config:
       cxl: |
         emit dept = dept
-        emit region = region
-        emit total1 = total1
-        emit id = "passthrough"
+        emit region = "all"
+        emit total = total
   - type: aggregate
     name: agg2
     input: t1
     config:
-      group_by: [id, dept]
+      group_by: [region]
       cxl: |
-        emit grand = sum(total1)
+        emit grand = sum(total)
   - type: transform
     name: t2
     input: agg2
     config:
       cxl: |
-        emit dept = dept
+        emit region = region
         emit grand = grand
   - type: output
     name: out
@@ -303,7 +302,7 @@ nodes:
     );
     assert!(
         region1.members.contains(&agg2_idx),
-        "downstream Aggregate (strict at the source-CK level) is a region member"
+        "downstream relaxed Aggregate is absorbed into the outer region as a member"
     );
     assert!(region1.members.contains(&t2_idx));
     assert!(region1.outputs.contains(&out_idx));
@@ -433,7 +432,9 @@ nodes:
 /// participating in the region. Parent-graph continuation through the
 /// Composition node is not propagated by the detector today (the parent
 /// walker only seeds from top-level Aggregates); per-body keying is the
-/// load-bearing dispatcher contract Phase 2 asserts on.
+/// load-bearing dispatcher contract — the executor dispatches body
+/// sub-DAGs against `BoundBody.deferred_regions`, so the body-local
+/// producer NodeIndex must be present in that map.
 #[test]
 fn composition_body_relaxed_aggregate_crosses_boundary() {
     let workspace = tempfile::tempdir().expect("tempdir");

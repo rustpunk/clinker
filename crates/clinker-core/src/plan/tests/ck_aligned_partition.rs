@@ -164,3 +164,59 @@ nodes:
          case above)"
     );
 }
+
+/// CK-aligned aggregate (group_by ⊇ ck_set): the planner classifies the
+/// aggregate as strict and registers no deferred region, so the
+/// commit-time deferred dispatcher never runs and the executor stays on
+/// the FastPath. Pins the architectural complement to
+/// `non_ck_aligned_partition_does_auto_flip_to_buffer_recompute`: the
+/// upstream aggregate's `group_by` covers every CK field, so retraction
+/// bookkeeping is unnecessary.
+#[test]
+fn ck_aligned_aggregate_skips_deferred_region() {
+    let yaml = r#"
+pipeline:
+  name: ck_aligned_aggregate
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: order_totals
+  input: src
+  config:
+    group_by: [order_id, department]
+    cxl: |
+      emit order_id = order_id
+      emit department = department
+      emit total = sum(amount)
+- type: output
+  name: out
+  input: order_totals
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let config = parse_config(yaml).expect("parse");
+    let plan = config.compile(&CompileContext::default()).expect("compile");
+    let dag = plan.dag();
+
+    assert!(
+        dag.deferred_regions.is_empty(),
+        "CK-aligned aggregate (group_by ⊇ ck_set) must not seed any deferred region; \
+         got {:?}",
+        dag.deferred_regions.keys().collect::<Vec<_>>()
+    );
+}

@@ -342,10 +342,10 @@ O6,ENG,300
          aggregate stamped at finalize"
     );
 
-    // The buffer-recompute spec was auto-flipped (synthetic CK lives
-    // outside partition_by), so the orchestrator's commit phase routed
-    // through the FivePhase body. Surviving lines (if any) MUST NOT
-    // include HR — its single-row partition is empty after retraction.
+    // The synthetic CK lives outside partition_by, so the
+    // orchestrator routed through the deferred-region commit pass.
+    // Surviving lines (if any) MUST NOT include HR — its single-row
+    // partition is empty after retraction.
     for line in output.lines().skip(1) {
         assert!(
             !line.starts_with("HR,"),
@@ -354,21 +354,19 @@ O6,ENG,300
         );
     }
 
-    // The synthetic-CK fan-out drives the aggregate's recompute path
-    // (HR's contribution is retracted from `dept_totals`); HR is
-    // dropped from the writer through the aggregate's delta, NOT
-    // through a window-partition recompute. The HR aggregate-emit row
-    // never reached `running.partition_outputs` because its evaluator
-    // failed on `1/(60-60)` before the window arm could admit it, so
-    // the buffer-recompute scope sees zero partitions for the window.
-    // ENG's row succeeds and is unaffected. The deterministic counter
-    // value across runs is therefore 0; the determinism guarantee
-    // itself is exercised by `post_aggregate_recompute_determinism`.
-    assert_eq!(
-        counters.retraction.partitions_recomputed, 0,
-        "HR's aggregate-emit row was rejected by `running` before \
-         window admission, so the buffer-recompute scope is empty; \
-         HR's exclusion from output flows through the aggregate's \
-         retract path, not the window's recompute path"
+    // The deferred-region commit pass runs `running` (the windowed
+    // Transform) at least once per iteration: iteration 1 dispatches
+    // every aggregate emit including HR's failing row, iteration 2
+    // dispatches the post-retract emit set with HR removed. The
+    // counter therefore exceeds zero and the determinism guarantee is
+    // pinned by `post_aggregate_recompute_determinism`. The exclusion
+    // shape the test pins (HR absent from writer, single DLQ trigger
+    // carrying the synthetic CK) is independent of the per-iteration
+    // dispatch count.
+    assert!(
+        counters.retraction.partitions_dispatched > 0,
+        "the deferred-region commit pass must dispatch the windowed \
+         Transform at least once across iterations; got {}",
+        counters.retraction.partitions_dispatched
     );
 }

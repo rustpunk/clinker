@@ -19,8 +19,13 @@
 //! - **Pass B (reverse-topo column propagation).** From each Output's
 //!   consumed columns, propagate `Expr::support_into` upstream through
 //!   each member operator, terminating at the producer. The producer's
-//!   `buffer_schema` is the union, sorted alphabetically for
-//!   deterministic `--explain` rendering.
+//!   `buffer_schema` filters the producer's `output_schema` columns to
+//!   that consumed set, preserving the producer's own emit order.
+//!   Producer-order matters because every downstream operator carries an
+//!   `expected: Arc<Schema>` stamped at plan-compile time against the
+//!   producer's `output_schema`; a buffer projection that reorders the
+//!   columns trips the per-record `check_input_schema` at the first
+//!   downstream consumer.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -31,6 +36,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::plan::execution::{PlanEdge, PlanNode, group_by_omits_any_ck_field};
+use crate::plan::index::IndexSpec;
 use crate::plan::properties::NodeProperties;
 
 /// Plan-time metadata for one deferred region: a relaxed-CK Aggregate
@@ -42,20 +48,26 @@ use crate::plan::properties::NodeProperties;
 /// buffer carries `buffer_schema` — exactly the columns the deferred
 /// operators reach via `Expr::support_into`.
 #[derive(Clone, Debug)]
-pub struct DeferredRegion {
+pub(crate) struct DeferredRegion {
     /// `NodeIndex` of the relaxed-CK Aggregate that seeds this region.
     /// For body-internal Aggregates, this is the body's local index;
     /// the parent-level flatten in `config/mod.rs` keys regions only
     /// by parent-graph indices, so consumers inside body executors
     /// must look up by their body-local map.
-    pub producer: NodeIndex,
+    pub(crate) producer: NodeIndex,
     /// Every non-producer, non-output operator inside the region.
-    pub members: HashSet<NodeIndex>,
+    pub(crate) members: HashSet<NodeIndex>,
     /// Correlation-buffered Outputs at the region's exit boundary.
-    pub outputs: HashSet<NodeIndex>,
+    pub(crate) outputs: HashSet<NodeIndex>,
     /// Minimum set of producer-emitted columns that the deferred
-    /// operators consume, sorted alphabetically.
-    pub buffer_schema: Vec<String>,
+    /// operators consume, ordered to match the producer's
+    /// `output_schema`. Producer-order is required because every
+    /// downstream operator's `check_input_schema` compares the
+    /// projected record's column list against the upstream's
+    /// stamped `output_schema`; reordering the columns (e.g.
+    /// alphabetical) trips a `SchemaMismatch` at the first
+    /// downstream consumer.
+    pub(crate) buffer_schema: Vec<String>,
 }
 
 /// Walk every relaxed-CK Aggregate in the top-level DAG (recursing
@@ -78,6 +90,7 @@ pub(crate) fn detect_deferred_regions(
     graph: &DiGraph<PlanNode, PlanEdge>,
     node_properties: &HashMap<NodeIndex, NodeProperties>,
     artifacts: &CompileArtifacts,
+    indices_to_build: &[IndexSpec],
 ) -> (
     Vec<DeferredRegion>,
     HashMap<CompositionBodyId, Vec<DeferredRegion>>,
@@ -94,7 +107,7 @@ pub(crate) fn detect_deferred_regions(
         if !group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
             continue;
         }
-        if let Some(region) = build_region(graph, artifacts, idx) {
+        if let Some(region) = build_region(graph, artifacts, indices_to_build, idx) {
             top_level.push(region);
         }
     }
@@ -173,10 +186,18 @@ fn body_parent_ck_of(body: &BoundBody, idx: NodeIndex) -> BTreeSet<String> {
 fn build_region(
     graph: &DiGraph<PlanNode, PlanEdge>,
     artifacts: &CompileArtifacts,
+    indices_to_build: &[IndexSpec],
     producer: NodeIndex,
 ) -> Option<DeferredRegion> {
     let (members, outputs) = pass_a_forward_bfs(graph, artifacts, producer);
-    let buffer_schema = pass_b_column_prune(graph, artifacts, producer, &members, &outputs);
+    let buffer_schema = pass_b_column_prune(
+        graph,
+        artifacts,
+        indices_to_build,
+        producer,
+        &members,
+        &outputs,
+    );
     Some(DeferredRegion {
         producer,
         members,
@@ -191,7 +212,7 @@ fn build_region(
 /// `Composition` node.
 fn build_body_region(body: &BoundBody, producer: NodeIndex) -> Option<DeferredRegion> {
     let (members, outputs) = pass_a_body(body, producer);
-    let buffer_schema = pass_b_body(body, producer, &members);
+    let buffer_schema = pass_b_body(body, &body.body_indices_to_build, producer, &members);
     Some(DeferredRegion {
         producer,
         members,
@@ -320,6 +341,7 @@ fn pass_a_body(body: &BoundBody, producer: NodeIndex) -> (HashSet<NodeIndex>, Ha
 fn pass_b_column_prune(
     graph: &DiGraph<PlanNode, PlanEdge>,
     artifacts: &CompileArtifacts,
+    indices_to_build: &[IndexSpec],
     producer: NodeIndex,
     members: &HashSet<NodeIndex>,
     outputs: &HashSet<NodeIndex>,
@@ -334,6 +356,26 @@ fn pass_b_column_prune(
         let cols = output_consumed_columns(graph, out_idx);
         consumed.entry(out_idx).or_default().extend(cols);
     }
+    // Seed each windowed-Transform member with its IndexSpec
+    // `arena_fields`. Window `partition_by` / `sort_by` columns live
+    // on the index spec, not the CXL program, so `support_into` alone
+    // would miss them — at commit time the deferred dispatcher must
+    // rebuild the node-rooted arena from the post-recompute narrow
+    // rows, and the arena projection requires every `arena_fields`
+    // entry to be present in the buffer schema.
+    for &m in members {
+        if let PlanNode::Transform {
+            window_index: Some(wi),
+            ..
+        } = &graph[m]
+            && let Some(spec) = indices_to_build.get(*wi)
+        {
+            let entry = consumed.entry(m).or_default();
+            for f in &spec.arena_fields {
+                entry.insert(f.clone());
+            }
+        }
+    }
 
     // Reverse-topo walk constrained to the region. Use a worklist:
     // pop a node, propagate its consumed set onto every upstream edge
@@ -342,6 +384,17 @@ fn pass_b_column_prune(
     // The region is a DAG embedded in the parent DAG; per-node
     // re-queueing on every consumer-side update converges in O(|E|).
     let mut worklist: VecDeque<NodeIndex> = outputs.iter().copied().collect();
+    for &m in members {
+        if matches!(
+            &graph[m],
+            PlanNode::Transform {
+                window_index: Some(_),
+                ..
+            }
+        ) {
+            worklist.push_back(m);
+        }
+    }
     while let Some(node) = worklist.pop_front() {
         let downstream_set = consumed.get(&node).cloned().unwrap_or_default();
         let upstream_set = propagate_through(graph, artifacts, node, &downstream_set);
@@ -363,35 +416,57 @@ fn pass_b_column_prune(
         }
     }
 
-    // The producer's buffer schema is the union of every consumer
-    // edge's set landing on it.
-    let mut buffer: BTreeSet<String> = BTreeSet::new();
-    if let Some(set) = consumed.get(&producer) {
-        for col in set {
-            buffer.insert(col.clone());
-        }
-    }
-    buffer.into_iter().collect()
+    // The producer's buffer schema filters its own `output_schema` to
+    // the consumed set, preserving emit order. A downstream operator's
+    // `check_input_schema` compares against the producer's stamped
+    // `output_schema` column list; a reordered buffer trips
+    // `SchemaMismatch` at the first consumer.
+    let mut consumed_at_producer = consumed.get(&producer).cloned().unwrap_or_default();
+    add_producer_engine_stamped_columns(
+        graph[producer].stored_output_schema(),
+        &mut consumed_at_producer,
+    );
+    project_in_producer_order(
+        graph[producer].stored_output_schema(),
+        &consumed_at_producer,
+    )
 }
 
 /// Body-graph Pass B. Simpler: bodies don't have Outputs, so the
 /// region's exit boundary is every leaf member. Seed each leaf with
 /// the union of `support_into` over its expressions, then propagate.
-fn pass_b_body(body: &BoundBody, producer: NodeIndex, members: &HashSet<NodeIndex>) -> Vec<String> {
+fn pass_b_body(
+    body: &BoundBody,
+    body_indices: &[IndexSpec],
+    producer: NodeIndex,
+    members: &HashSet<NodeIndex>,
+) -> Vec<String> {
     let mut consumed: HashMap<NodeIndex, HashSet<String>> = HashMap::new();
     let mut worklist: VecDeque<NodeIndex> = VecDeque::new();
 
     // Seed every leaf member (no outgoing edges into another member or
-    // producer) with the columns its own expressions read.
+    // producer) with the columns its own expressions read. Windowed
+    // Transforms additionally seed `arena_fields` so the post-recompute
+    // arena rebuild has every `partition_by` / `sort_by` column.
     for &m in members {
         let has_member_successor = body
             .graph
             .neighbors_directed(m, Direction::Outgoing)
             .any(|s| members.contains(&s));
-        if has_member_successor {
+        let mut seed: HashSet<String> = HashSet::new();
+        if let PlanNode::Transform {
+            window_index: Some(wi),
+            ..
+        } = &body.graph[m]
+            && let Some(spec) = body_indices.get(*wi)
+        {
+            for f in &spec.arena_fields {
+                seed.insert(f.clone());
+            }
+        }
+        if has_member_successor && seed.is_empty() {
             continue;
         }
-        let mut seed: HashSet<String> = HashSet::new();
         seed_from_node(&body.graph[m], &mut seed);
         consumed.insert(m, seed);
         worklist.push_back(m);
@@ -418,13 +493,66 @@ fn pass_b_body(body: &BoundBody, producer: NodeIndex, members: &HashSet<NodeInde
         }
     }
 
-    let mut buffer: BTreeSet<String> = BTreeSet::new();
-    if let Some(set) = consumed.get(&producer) {
-        for col in set {
-            buffer.insert(col.clone());
+    let mut consumed_at_producer = consumed.get(&producer).cloned().unwrap_or_default();
+    add_producer_engine_stamped_columns(
+        body.graph[producer].stored_output_schema(),
+        &mut consumed_at_producer,
+    );
+    project_in_producer_order(
+        body.graph[producer].stored_output_schema(),
+        &consumed_at_producer,
+    )
+}
+
+/// Force the producer's engine-stamped columns (synthetic-CK and
+/// source-CK shadows) into the consumed set so the narrow buffer
+/// schema retains them. Downstream operators' `expected_input_schema`
+/// is the producer's full `output_schema` — a buffer that drops these
+/// columns trips `SchemaMismatch` at the first consumer regardless of
+/// whether the operators' CXL programs reach them via `support_into`.
+fn add_producer_engine_stamped_columns(
+    producer_schema: Option<&std::sync::Arc<clinker_record::Schema>>,
+    consumed: &mut HashSet<String>,
+) {
+    let Some(schema) = producer_schema else {
+        return;
+    };
+    for i in 0..schema.column_count() {
+        if schema
+            .field_metadata(i)
+            .is_some_and(|m| m.is_engine_stamped())
+            && let Some(name) = schema.column_name(i)
+        {
+            consumed.insert(name.to_string());
         }
     }
-    buffer.into_iter().collect()
+}
+
+/// Filter the producer's `output_schema` columns to the consumed set,
+/// preserving the producer's emit order. Falls back to alphabetical
+/// over the consumed set when the producer has no stored schema (a
+/// planner contract violation in practice — every region producer is
+/// an Aggregate, which always carries `output_schema` — but kept total
+/// so a degraded plan does not panic the buffer build).
+fn project_in_producer_order(
+    producer_schema: Option<&std::sync::Arc<clinker_record::Schema>>,
+    consumed: &HashSet<String>,
+) -> Vec<String> {
+    if let Some(schema) = producer_schema {
+        let mut out: Vec<String> = Vec::with_capacity(consumed.len());
+        for col in schema.columns() {
+            let s = col.as_ref();
+            if consumed.contains(s) {
+                out.push(s.to_string());
+            }
+        }
+        return out;
+    }
+    let mut sorted: BTreeSet<String> = BTreeSet::new();
+    for col in consumed {
+        sorted.insert(col.clone());
+    }
+    sorted.into_iter().collect()
 }
 
 // ─── Per-operator propagation rules ────────────────────────────────────
@@ -598,6 +726,28 @@ fn seed_from_node(node: &PlanNode, set: &mut HashSet<String>) {
     }
 }
 
+/// Walk incoming edges from `start` until reaching an ancestor whose
+/// `stored_output_schema()` is `Some`. Skips row-preserving variants
+/// (Route / Sort / CorrelationCommit) that propagate their upstream's
+/// schema by reference rather than carrying their own.
+fn first_schema_bearing_ancestor(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> Option<&std::sync::Arc<clinker_record::Schema>> {
+    let mut cursor = graph
+        .neighbors_directed(start, Direction::Incoming)
+        .next()?;
+    loop {
+        if let Some(schema) = graph[cursor].stored_output_schema() {
+            return Some(schema);
+        }
+        match graph.neighbors_directed(cursor, Direction::Incoming).next() {
+            Some(next) => cursor = next,
+            None => return None,
+        }
+    }
+}
+
 /// Resolve the columns an Output's projection rule reads from its
 /// upstream's emitted shape.
 fn output_consumed_columns(
@@ -606,13 +756,15 @@ fn output_consumed_columns(
 ) -> HashSet<String> {
     let mut set: HashSet<String> = HashSet::new();
     // Output projection: read the resolved payload's mapping if any,
-    // else fall back to every column the upstream emits. The Output's
-    // upstream is the immediate predecessor on the parent graph.
-    let upstream = graph
-        .neighbors_directed(out_idx, Direction::Incoming)
-        .next();
-    let upstream_cols: Vec<String> = upstream
-        .and_then(|u| graph[u].stored_output_schema())
+    // else fall back to every column the upstream emits. Row-
+    // preserving variants (Route / Sort) carry no `stored_output_schema`
+    // of their own, so walk past them to the first ancestor that
+    // does. Without this walk, an Output downstream of a Route inside
+    // a deferred region would seed an empty consumed set, prune every
+    // column out of the producer's `buffer_schema`, and trip
+    // `SchemaMismatch` when the deferred dispatcher feeds the Route's
+    // pre-stamped expected schema against the narrow buffer.
+    let upstream_cols: Vec<String> = first_schema_bearing_ancestor(graph, out_idx)
         .map(|schema| {
             schema
                 .columns()

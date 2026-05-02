@@ -239,7 +239,7 @@ When an aggregate's `group_by` omits any CK field visible upstream, the engine r
 
 Aggregate output rows on the strict path inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row -- but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
 
-On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. The retraction protocol's compile-time and runtime constraints (`E15W` for non-deterministic builtins downstream, `E15Y` for `strategy: streaming` on a retraction-mode aggregate) are enforced automatically once the engine has classified the aggregate.
+On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. The retraction protocol's runtime constraint (`E15Y` for `strategy: streaming` on a retraction-mode aggregate) is enforced automatically once the engine has classified the aggregate. Operators downstream of a retraction-mode aggregate run only at commit time on the post-recompute aggregate emits, so non-deterministic CXL builtins (e.g. `now`) evaluate exactly once per output row and need no special-casing.
 
 #### Synthetic correlation column
 
@@ -339,7 +339,7 @@ An aggregate whose `group_by` omits any upstream CK field activates the retracti
 | Operator | Retraction cost |
 |---|---|
 | Source | None at retraction time. The CK shadow columns are stamped at ingest; replay never re-reads the source file. |
-| Transform | Re-evaluated against substituted upstream rows during sub-DAG replay. Cost = O(rows_substituted) per layer, no extra state held. Non-deterministic builtins (e.g. `now`) are rejected at compile time with E15W. |
+| Transform | Runs only at commit time on post-recompute aggregate emits when sitting inside a deferred region. Cost = O(rows_emitted_post_recompute) per region member, no extra state held. Non-deterministic CXL builtins (e.g. `now`) evaluate exactly once per output row, same as on a non-retraction pipeline. |
 | Aggregate (strict, `group_by` covers upstream CK lattice) | None. Strict aggregates short-circuit to today's two-phase commit body and pay zero retraction overhead. |
 | Aggregate (retraction-mode, Reversible bindings) | Per-row lineage map `(input_row_id → group_index)` carried alongside accumulator state — ~8 bytes/row plus the per-group `input_rows` Vec inline cost — plus one synthetic `$ck.aggregate.<name>` shadow column on every output row at ~16 bytes/row. Retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. Reversible accumulators: `sum`, `count`, `collect`, `any`. |
 | Aggregate (retraction-mode, BufferRequired bindings) | Per-group raw contributions held until commit, plus one synthetic `$ck.aggregate.<name>` shadow column on every output row at ~16 bytes/row. Memory cost = O(input_rows × Σ binding_value_size) plus the synthetic-column tail. Retract recomputes affected groups from `contributions − retracted_rows`. BufferRequired accumulators: `min`, `max`, `avg`, `weighted_avg`. |

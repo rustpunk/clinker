@@ -75,6 +75,9 @@ Window index [0] (root source(orders), partition_by ["department"]):
   retraction: window buffer recompute, partition cardinality unknown at plan time, per-row buffer ~3× sizeof(Value).
   worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.
 
+Deferred Region: dept_totals → [out]
+  buffer_schema: ["department", "total", "lo", "n", "$ck.aggregate.dept_totals"]
+
 === CXL Expressions ===
 
 Transform 'windowed':

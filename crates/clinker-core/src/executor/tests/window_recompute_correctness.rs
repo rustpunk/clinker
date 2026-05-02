@@ -4,10 +4,8 @@
 //! `post_aggregate_recompute_determinism.rs`. Those two pin the
 //! post-aggregate-window geometry where the failing predicate sits
 //! INSIDE the windowed Transform's emit list — so the failing row never
-//! reaches `partition_outputs`, and HR's exclusion flows through the
-//! aggregator's recompute path. As a result `partitions_recomputed`
-//! ends up zero in those tests; the window-level recompute is exercised
-//! only for run-to-run determinism, not for value correctness.
+//! reaches the windowed Transform's emit, and HR's exclusion flows
+//! through the aggregator's recompute path alone.
 //!
 //! This fixture closes that gap by routing the divide-by-zero through
 //! a SEPARATE downstream Transform (`gate`) that sits between the
@@ -19,25 +17,24 @@
 //!     Transform(gate, fails on region=="north") → Output
 //! ```
 //!
-//! `running` admits all three HR rows (east, north, west) into its
-//! window's `partition_outputs`. `gate` fails on HR/north — the failure
-//! routes via the correlation buffer (the upstream aggregate's relaxed-CK
-//! lattice keeps buffering active). The detect phase decodes the
-//! synthetic `$ck.aggregate.dept_region_totals` lineage on the failing
-//! cell back to the source row that fed HR/north, then drops that
-//! source row's id into the running window's HR partition retract list.
-//! `partitions_recomputed` increments to 1; the recompute pass reruns
-//! `cumulative_sum` over `[HR/east, HR/west]` (the surviving slice in
-//! sort_by(region asc) order) and emits Deltas pairing pre-retract
-//! outputs with post-retract ones. Replay substitutes the new rows into
-//! the buffered Output.
+//! `gate` fails on HR/north — the failure routes via the correlation
+//! buffer (the upstream aggregate's relaxed-CK lattice keeps buffering
+//! active). The detect phase decodes the synthetic
+//! `$ck.aggregate.dept_region_totals` lineage on the failing cell back
+//! to the source row that fed HR/north and folds that into the retract
+//! scope. The deferred-region commit pass re-seeds the post-recompute
+//! aggregate emits into `node_buffers[dept_region_totals]` and
+//! redispatches `running` over `[HR/east, HR/west]` (the surviving
+//! slice in sort_by(region asc) order); the windowed Transform's emit
+//! lands directly in the buffered Output that the flush phase drains.
 //!
 //! The load-bearing assertion is HR/west's `running_total == 35` — the
 //! cumulative sum after HR/north's contribution is removed. A
-//! 45 (the pre-retract value) means the window-level recompute's
-//! Delta substitution did not land in the buffered Output. A 30 (the
-//! lone surviving row's own `total`) means the recompute keyed off an
-//! empty partition, which would itself be a bug.
+//! 45 (the pre-retract value) means the windowed-Transform did not
+//! re-evaluate against the post-recompute aggregate emit on the
+//! commit pass. A 30 (the lone surviving row's own `total`) means the
+//! deferred dispatch keyed off an empty partition, which would itself
+//! be a bug.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -193,8 +190,8 @@ O5,ENG,west,50
 /// 1. `dlq_count == 1` — exactly the HR/north trigger.
 /// 2. The DLQ row carries `department=HR` and `region=north` and the
 ///    `division by zero` error message.
-/// 3. `partitions_recomputed == 1` — the running window's HR partition
-///    is recomputed once. ENG is untouched.
+/// 3. `partitions_dispatched >= 1` — the running windowed Transform
+///    is re-evaluated on the deferred-region commit pass.
 /// 4. Output row count == 4 (HR/north excluded; HR/east + HR/west +
 ///    ENG/east + ENG/west reach the writer).
 /// 5. **Load-bearing**: HR/west's `running_total == 35` — proves the
@@ -235,12 +232,11 @@ fn post_aggregate_window_recompute_corrects_running_total() {
         "trigger record must carry region=north"
     );
 
-    assert_eq!(
-        counters.retraction.partitions_recomputed, 1,
-        "the running window's HR partition is recomputed exactly once; \
-         ENG is untouched. A value of 0 here would mean the failing \
-         row never reached the window's `partition_outputs` and the \
-         test geometry collapses to the existing in-emit-failure tests."
+    assert!(
+        counters.retraction.partitions_dispatched >= 1,
+        "the running windowed Transform must dispatch on the deferred-region \
+         commit pass; got {}",
+        counters.retraction.partitions_dispatched,
     );
 
     let mut by_dept_region: HashMap<(String, String), HashMap<String, String>> = HashMap::new();

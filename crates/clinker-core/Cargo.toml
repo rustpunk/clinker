@@ -104,3 +104,7 @@ harness = false
 name = "combine_grace_hash"
 harness = false
 
+[[bench]]
+name = "deferred_buffer_pruning"
+harness = false
+

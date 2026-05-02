@@ -162,9 +162,32 @@ pub struct BoundBody {
     /// Every NodeIndex participating in a body-internal region
     /// (producer + members + outputs) is keyed to a clone of the
     /// region so dispatcher arms get O(1) lookup. Empty for bodies
-    /// without a relaxed-CK Aggregate. The field is `pub` for the
-    /// same reason `ExecutionPlanDag.deferred_regions` is — out-of-
-    /// crate test code struct-literal-constructs `BoundBody`, which
-    /// forces field visibility to match the type's visibility.
-    pub deferred_regions: HashMap<NodeIndex, DeferredRegion>,
+    /// without a relaxed-CK Aggregate.
+    pub(crate) deferred_regions: HashMap<NodeIndex, DeferredRegion>,
+}
+
+impl BoundBody {
+    /// Empty body keyed by `signature_path`. Used by the artifact-
+    /// registry tests (and out-of-crate fixtures) that need a `BoundBody`
+    /// shell without populating its mini-DAG; the bind path constructs a
+    /// fully-populated body via `bind_composition` and never calls this.
+    pub fn empty(signature_path: PathBuf) -> Self {
+        Self {
+            signature_path,
+            graph: DiGraph::new(),
+            topo_order: Vec::new(),
+            name_to_idx: HashMap::new(),
+            port_name_to_node_idx: HashMap::new(),
+            body_rows: HashMap::new(),
+            node_input_refs: HashMap::new(),
+            route_bodies: HashMap::new(),
+            output_port_rows: IndexMap::new(),
+            output_port_to_node_idx: IndexMap::new(),
+            input_port_rows: IndexMap::new(),
+            nested_body_ids: Vec::new(),
+            body_indices_to_build: Vec::new(),
+            body_window_configs: HashMap::new(),
+            deferred_regions: HashMap::new(),
+        }
+    }
 }

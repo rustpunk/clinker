@@ -1,12 +1,11 @@
-//! Determinism guard for the buffer-recompute partition counter.
+//! Determinism guard for the deferred-region windowed-Transform
+//! dispatch counter.
 //!
-//! Runs the test-#7 fixture (HR retracted by `1/(60-60)` post-aggregate
-//! window) 100 times and asserts that the resulting
-//! `partitions_recomputed` value is identical across every run. The
-//! fixture is deterministic by construction; any value churn surfaces
-//! HashMap-iteration leakage into the counter (or phantom-key admission
-//! into `partition_retracts`), both of which are silent-partial-behavior
-//! smells.
+//! Runs the post-aggregate window fixture (HR retracted by `1/(60-60)`)
+//! 100 times and asserts that the resulting `partitions_dispatched`
+//! value is identical across every run. The fixture is deterministic by
+//! construction; any value churn surfaces HashMap-iteration leakage into
+//! the counter, a silent-partial-behavior smell.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -96,30 +95,27 @@ fn run_once() -> u64 {
     let report =
         PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
             .expect("buffer-recompute pipeline must execute");
-    report.counters.retraction.partitions_recomputed
+    report.counters.retraction.partitions_dispatched
 }
 
 #[test]
-fn partitions_recomputed_is_deterministic_across_100_runs() {
+fn partitions_dispatched_is_deterministic_across_100_runs() {
     let counts: HashSet<u64> = (0..100).map(|_| run_once()).collect();
     assert_eq!(
         counts.len(),
         1,
-        "non-deterministic partitions_recomputed: observed values = {counts:?}"
+        "non-deterministic partitions_dispatched: observed values = {counts:?}"
     );
-    // Why: HR's aggregate-emit row fails on `1/(60-60)` inside the
-    // `running` Transform's evaluator. The whole record evaluation
-    // returns Err, so HR is never admitted to the window's
-    // `partition_outputs`; the retract scope sees no window partitions
-    // to recompute (the aggregate's recompute path is what drops HR
-    // from the writer output, via the synthetic-CK fan-out lineage).
-    // ENG's row succeeds and is unaffected by the trigger group.
+    // The deferred-region dispatcher walks every windowed-Transform
+    // member of every reachable region exactly once per commit-pass
+    // iteration; the fixture's geometry has the `running` windowed
+    // Transform inside the `dept_totals`-rooted region, so the
+    // counter is fully determined by the topology, not by HashMap
+    // iteration order.
     let value = *counts.iter().next().unwrap();
-    assert_eq!(
-        value, 0,
-        "post-aggregate window recompute touches zero partitions when \
-         the failing aggregate-emit row never reached the window's \
-         partition_outputs (ENG's row is unaffected; HR's row was \
-         rejected by the ratio evaluator before window admission)"
+    assert!(
+        value > 0,
+        "the post-aggregate windowed-Transform must dispatch at least \
+         once on the deferred-region commit pass; got {value}"
     );
 }
