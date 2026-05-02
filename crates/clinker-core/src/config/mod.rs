@@ -2038,6 +2038,7 @@ impl PipelineConfig {
             output_projections,
             parallelism,
             node_properties: HashMap::new(),
+            deferred_regions: HashMap::new(),
         };
 
         // ── Enrichment pipeline ─────────────────────────────────────
@@ -2152,6 +2153,31 @@ impl PipelineConfig {
         for body in artifacts.composition_bodies.values_mut() {
             crate::plan::execution::derive_window_buffer_recompute_flags_in_body(body);
         }
+
+        // Deferred-region detection. Runs after retraction flags and
+        // window-buffer-recompute flags so each relaxed-CK Aggregate is
+        // already classified. The walk produces one `DeferredRegion`
+        // per producer; we flatten the list into a NodeIndex-keyed map
+        // so dispatcher arms can do O(1) lookup at every participating
+        // node (producer, members, outputs).
+        let regions = crate::plan::deferred_region::detect_deferred_regions(
+            &dag.graph,
+            &dag.node_properties,
+            &artifacts,
+        );
+        let mut region_map: HashMap<
+            petgraph::graph::NodeIndex,
+            crate::plan::deferred_region::DeferredRegion,
+        > = HashMap::new();
+        for region in regions {
+            let producer = region.producer;
+            let members = region.members.clone();
+            let outputs = region.outputs.clone();
+            for k in std::iter::once(producer).chain(members).chain(outputs) {
+                region_map.insert(k, region.clone());
+            }
+        }
+        dag.deferred_regions = region_map;
 
         // E15Y: an aggregate whose `group_by` omits any correlation-key
         // field cannot also use `strategy: streaming`. Streaming

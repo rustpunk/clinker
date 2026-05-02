@@ -2,6 +2,7 @@ pub mod bind_schema;
 pub mod combine;
 pub mod compiled;
 pub mod composition_body;
+pub mod deferred_region;
 pub mod execution;
 pub mod explain_provenance;
 pub mod extraction;

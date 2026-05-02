@@ -4271,6 +4271,7 @@ nodes:
                 worker_threads: 1,
             },
             node_properties: std::collections::HashMap::new(),
+            deferred_regions: std::collections::HashMap::new(),
         };
         let mut diags = Vec::new();
         select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
