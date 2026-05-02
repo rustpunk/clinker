@@ -60,6 +60,7 @@ fn test_compile_artifacts_insert_body_and_lookup() {
         nested_body_ids: vec![],
         body_indices_to_build: Vec::new(),
         body_window_configs: std::collections::HashMap::new(),
+        deferred_regions: std::collections::HashMap::new(),
     };
 
     artifacts.insert_body(id, body.clone());

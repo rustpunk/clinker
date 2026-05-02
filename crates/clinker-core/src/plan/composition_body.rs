@@ -8,6 +8,7 @@ use cxl::typecheck::Row;
 use indexmap::IndexMap;
 use petgraph::graph::{DiGraph, NodeIndex};
 
+use super::deferred_region::DeferredRegion;
 use super::execution::{PlanEdge, PlanNode};
 
 /// Opaque handle into `CompileArtifacts.composition_bodies`. Each
@@ -148,4 +149,22 @@ pub struct BoundBody {
     /// pass to construct `body_indices_to_build` and backfill
     /// `window_index` onto each body Transform.
     pub body_window_configs: HashMap<String, crate::plan::index::LocalWindowConfig>,
+
+    /// Deferred-region metadata for relaxed-CK Aggregates that live
+    /// inside this body. Keys are NodeIndex values in this body's
+    /// local mini-DAG (`graph`), distinct from
+    /// `ExecutionPlanDag.deferred_regions` whose keys live in the
+    /// parent graph's NodeIndex space — the two spaces collide
+    /// numerically because each graph numbers from zero, so the
+    /// dispatcher consults the right map by which scope it is
+    /// currently executing.
+    ///
+    /// Every NodeIndex participating in a body-internal region
+    /// (producer + members + outputs) is keyed to a clone of the
+    /// region so dispatcher arms get O(1) lookup. Empty for bodies
+    /// without a relaxed-CK Aggregate. The field is `pub` for the
+    /// same reason `ExecutionPlanDag.deferred_regions` is — out-of-
+    /// crate test code struct-literal-constructs `BoundBody`, which
+    /// forces field visibility to match the type's visibility.
+    pub deferred_regions: HashMap<NodeIndex, DeferredRegion>,
 }

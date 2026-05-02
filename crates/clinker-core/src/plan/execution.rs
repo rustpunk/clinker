@@ -897,8 +897,46 @@ impl ExecutionPlanDag {
                 worker_threads: 1,
             },
             node_properties: HashMap::new(),
-            deferred_regions: HashMap::new(),
+            // Body-local deferred regions ride along on the transient
+            // DAG so dispatcher arms reading `current_dag.deferred_regions`
+            // see body-internal producers without any arm-side branching.
+            // Body NodeIndex space matches `body.graph`, so the keys
+            // remain valid against the cloned graph above.
+            deferred_regions: body.deferred_regions.clone(),
         }
+    }
+
+    /// `Some(region)` iff `idx` participates in any deferred region on
+    /// this DAG (producer, member, or output). Dispatcher arms call
+    /// this at the top of every operator branch to decide whether to
+    /// short-circuit to the deferred buffer.
+    pub(crate) fn deferred_region_at(
+        &self,
+        idx: NodeIndex,
+    ) -> Option<&crate::plan::deferred_region::DeferredRegion> {
+        self.deferred_regions.get(&idx)
+    }
+
+    /// `true` iff `idx` is a non-producer participant in some deferred
+    /// region (member or output). Operator arms use this to skip work
+    /// on the forward pass — the deferred dispatch at commit will run
+    /// the operator on post-recompute aggregate emits.
+    pub(crate) fn is_deferred_consumer(&self, idx: NodeIndex) -> bool {
+        self.deferred_regions
+            .get(&idx)
+            .is_some_and(|r| r.producer != idx)
+    }
+
+    /// `Some(region)` iff `idx` is the producer of a deferred region.
+    /// The Aggregation arm uses this to project emits to
+    /// `region.buffer_schema` before parking them in `node_buffers`.
+    pub(crate) fn deferred_region_at_producer(
+        &self,
+        idx: NodeIndex,
+    ) -> Option<&crate::plan::deferred_region::DeferredRegion> {
+        self.deferred_regions
+            .get(&idx)
+            .filter(|r| r.producer == idx)
     }
 
     /// Whether any node requires arena allocation (window functions).
@@ -4625,6 +4663,7 @@ mod port_tag_guard_tests {
             nested_body_ids: Vec::new(),
             body_indices_to_build: Vec::new(),
             body_window_configs: HashMap::new(),
+            deferred_regions: HashMap::new(),
         };
         artifacts.insert_body(body_id, body);
         let diags = diagnose_untagged_composition_edges(&dag, &artifacts);

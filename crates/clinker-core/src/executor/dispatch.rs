@@ -313,7 +313,32 @@ pub(crate) struct ExecutorContext<'a> {
     /// the zero-overhead-on-strict-pipeline test so the assertion
     /// proves the short-circuit is taken on every strict workload.
     pub(crate) commit_step_path: CommitStepPath,
+
+    /// Per-edge buffer parking records that cross from a non-deferred
+    /// upstream into a deferred-region member (typically Combine's
+    /// build-side input). Populated by the upstream operator's arm at
+    /// emit time; drained by the commit-time deferred dispatcher in a
+    /// later phase. Keyed by `(active body, EdgeIndex)` because
+    /// top-level and body graphs maintain disjoint EdgeIndex namespaces
+    /// — the body id disambiguates collisions.
+    ///
+    /// Charges against `ctx.memory_budget` via `charge_arena_bytes` per
+    /// admission, mirroring the per-row accounting the windowed
+    /// Transform arm uses for buffer-recompute mode.
+    pub(crate) region_input_buffers: RegionInputBuffers,
 }
+
+/// Map keying (active composition body, outgoing edge id) to the rows
+/// that crossed from a non-deferred upstream into a deferred-region
+/// consumer along that edge. The body id is `None` for top-level edges;
+/// each composition body has its own EdgeIndex namespace.
+pub(crate) type RegionInputBuffers = HashMap<
+    (
+        Option<crate::plan::CompositionBodyId>,
+        petgraph::graph::EdgeIndex,
+    ),
+    Vec<(Record, u64)>,
+>;
 
 /// Which commit-step body the orchestrator selected for the current
 /// pipeline. `FastPath` short-circuits to the strict body and is the
@@ -402,6 +427,125 @@ impl ExecutorContext<'_> {
     pub(crate) fn spill_root(&self) -> &Arc<tempfile::TempDir> {
         &self.spill_root
     }
+}
+
+/// Project every record in `rows` onto the column set in
+/// `buffer_schema`, returning narrow `Record` instances on a fresh,
+/// per-call `Arc<Schema>` shared by every emitted Record.
+///
+/// Mirrors the column-pruning pattern at
+/// `pipeline::arena::project_records_into_minimal`. Invoked once at the
+/// deferred-region producer (a relaxed-CK Aggregate) so the emit buffer
+/// retains exactly the columns the deferred operators reach via
+/// `Expr::support_into`. Source row numbers carry through unchanged.
+fn project_rows_to_buffer_schema(
+    rows: Vec<(Record, u64)>,
+    buffer_schema: &[String],
+) -> Vec<(Record, u64)> {
+    let narrow_schema: Arc<clinker_record::Schema> = buffer_schema
+        .iter()
+        .map(|s| Box::<str>::from(s.as_str()))
+        .collect::<SchemaBuilder>()
+        .build();
+    rows.into_iter()
+        .map(|(record, rn)| {
+            let wide_schema = record.schema();
+            let mut values = Vec::with_capacity(buffer_schema.len());
+            for col in buffer_schema {
+                let v = wide_schema
+                    .index(col)
+                    .and_then(|i| record.values().get(i).cloned())
+                    .unwrap_or(Value::Null);
+                values.push(v);
+            }
+            let mut narrow = Record::new(Arc::clone(&narrow_schema), values);
+            for (k, v) in record.iter_meta() {
+                let _ = narrow.set_meta(k, v.clone());
+            }
+            (narrow, rn)
+        })
+        .collect()
+}
+
+/// Tee `emit_rows` into `region_input_buffers` for every outgoing edge
+/// from `producer_idx` whose target is a deferred-region member or
+/// output AND whose source (`producer_idx`) is NOT in the same region.
+/// Internal-region edges are skipped — they live in `node_buffers`
+/// already. Edges leaving the region's producer toward a member are
+/// also skipped because the producer's own `node_buffers[producer_idx]`
+/// is the canonical entry point the commit-time deferred dispatcher
+/// reads from.
+///
+/// Charges per-row size against `ctx.memory_budget.charge_arena_bytes`;
+/// returns the same `E310`-shape `PipelineError::Compilation` the
+/// windowed Transform's buffer-recompute path raises on overflow so
+/// downstream callers see a uniform admission failure mode.
+fn tee_emit_to_region_input_buffers(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    producer_idx: NodeIndex,
+    emit_rows: &[(Record, u64)],
+) -> Result<(), PipelineError> {
+    use petgraph::visit::EdgeRef;
+    let producer_region_producer = current_dag
+        .deferred_region_at(producer_idx)
+        .map(|r| r.producer);
+    let active_body = ctx.window_runtime.active_stack.last().copied();
+    let mut crossing_edges: Vec<petgraph::graph::EdgeIndex> = Vec::new();
+    for edge_ref in current_dag
+        .graph
+        .edges_directed(producer_idx, petgraph::Direction::Outgoing)
+    {
+        let target = edge_ref.target();
+        let target_region_producer = current_dag.deferred_region_at(target).map(|r| r.producer);
+        let crosses = match (producer_region_producer, target_region_producer) {
+            // Non-deferred source feeding a deferred consumer: park
+            // narrow rows so the commit-time dispatcher can re-feed
+            // the deferred member without losing the upstream emit.
+            (None, Some(_)) => true,
+            // Distinct deferred regions abutting at this edge.
+            (Some(p), Some(t)) if p != t => true,
+            // Same region (internal edge) or both non-deferred: no
+            // cross-region tee needed; node_buffers carries the
+            // payload already.
+            _ => false,
+        };
+        if crosses {
+            crossing_edges.push(edge_ref.id());
+        }
+    }
+    if crossing_edges.is_empty() {
+        return Ok(());
+    }
+    // Approximate per-row cost: per-Value payload + tuple overhead.
+    // Mirrors the windowed Transform's per-row charge to keep both
+    // admission paths consistent against a single shared budget.
+    let row_bytes_each: u64 = emit_rows
+        .first()
+        .map(|(rec, _)| {
+            (std::mem::size_of::<Value>() * rec.schema().column_count()
+                + std::mem::size_of::<(Record, u64)>()) as u64
+        })
+        .unwrap_or(0);
+    for edge_id in crossing_edges {
+        for (record, rn) in emit_rows {
+            if row_bytes_each > 0 && ctx.memory_budget.charge_arena_bytes(row_bytes_each) {
+                return Err(PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: vec![format!(
+                        "E310 deferred-region buffer admission exceeded \
+                         memory limit: hard limit {}",
+                        ctx.memory_budget.hard_limit()
+                    )],
+                });
+            }
+            ctx.region_input_buffers
+                .entry((active_body, edge_id))
+                .or_default()
+                .push((record.clone(), *rn));
+        }
+    }
+    Ok(())
 }
 
 /// Build node-rooted window runtimes for every IndexSpec rooted at
@@ -646,6 +790,7 @@ pub(crate) fn dispatch_plan_node(
                     .map(|(r, rn)| (canonicalize(r), *rn))
                     .collect()
             };
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
             ctx.node_buffers.insert(node_idx, records);
         }
 
@@ -654,6 +799,14 @@ pub(crate) fn dispatch_plan_node(
             window_index,
             ..
         } => {
+            // Deferred-region member: skip the per-record evaluation
+            // on the forward pass. The commit-time deferred dispatcher
+            // re-runs this Transform on post-recompute upstream emits;
+            // draining the predecessor's buffer here would leak the
+            // pre-recompute snapshot to the writer ahead of recompute.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             // Get input records: first check own buffer (set by Route
             // node for branch dispatch), then fall back to predecessor.
             let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
@@ -680,6 +833,7 @@ pub(crate) fn dispatch_plan_node(
                 Some(&idx) => idx,
                 None => {
                     // No transform found — pass through
+                    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
                     ctx.node_buffers.insert(node_idx, input_records);
                     return Ok(());
                 }
@@ -970,6 +1124,7 @@ pub(crate) fn dispatch_plan_node(
             // this Transform's `NodeIndex`, the call below installs the
             // matching runtime; otherwise the helper is a no-op.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
@@ -980,6 +1135,14 @@ pub(crate) fn dispatch_plan_node(
             default: _,
             ..
         } => {
+            // Deferred-region member: skip branching dispatch on the
+            // forward pass — the commit-time deferred dispatcher re-runs
+            // this Route on post-recompute upstream emits. Draining
+            // predecessors here would commit branch decisions to a
+            // pre-recompute view of the records.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             // Body-context Routes that consume an input port have no
             // predecessor in the body's mini-DAG — the records are
             // seeded into this node's own buffer at composition entry.
@@ -1184,13 +1347,64 @@ pub(crate) fn dispatch_plan_node(
                 }
             }
 
-            // Put branch buffers into node_buffers keyed by successor
+            // Put branch buffers into node_buffers keyed by successor.
+            // For successors that fall inside a deferred region while
+            // this Route does not, also park the per-branch records on
+            // the matching outgoing edge so the commit-time deferred
+            // dispatcher receives the same records the forward branch
+            // assignment selected. Internal-region edges and edges
+            // between two non-deferred operators skip the tee — the
+            // node_buffers entry already covers them.
+            let route_region_producer =
+                current_dag.deferred_region_at(node_idx).map(|r| r.producer);
+            let active_body = ctx.window_runtime.active_stack.last().copied();
             for (succ_idx, buf) in branch_buffers {
+                let succ_region_producer =
+                    current_dag.deferred_region_at(succ_idx).map(|r| r.producer);
+                let crosses = match (route_region_producer, succ_region_producer) {
+                    (None, Some(_)) => true,
+                    (Some(p), Some(t)) if p != t => true,
+                    _ => false,
+                };
+                if crosses && let Some(edge) = current_dag.graph.find_edge(node_idx, succ_idx) {
+                    let row_bytes_each: u64 = buf
+                        .first()
+                        .map(|(rec, _)| {
+                            (std::mem::size_of::<Value>() * rec.schema().column_count()
+                                + std::mem::size_of::<(Record, u64)>())
+                                as u64
+                        })
+                        .unwrap_or(0);
+                    for (record, rn) in &buf {
+                        if row_bytes_each > 0
+                            && ctx.memory_budget.charge_arena_bytes(row_bytes_each)
+                        {
+                            return Err(PipelineError::Compilation {
+                                transform_name: String::new(),
+                                messages: vec![format!(
+                                    "E310 deferred-region buffer admission exceeded \
+                                     memory limit: hard limit {}",
+                                    ctx.memory_budget.hard_limit()
+                                )],
+                            });
+                        }
+                        ctx.region_input_buffers
+                            .entry((active_body, edge))
+                            .or_default()
+                            .push((record.clone(), *rn));
+                    }
+                }
                 ctx.node_buffers.insert(succ_idx, buf);
             }
         }
 
         PlanNode::Merge { ref name, .. } => {
+            // Deferred-region member: skip concatenation on the forward
+            // pass. The commit-time deferred dispatcher re-runs this
+            // Merge on post-recompute upstream emits.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             // Concatenate predecessor buffers in declaration order —
             // the order appearing in the Merge's `inputs:` YAML
             // array, which is stable across compile runs. Under
@@ -1277,6 +1491,7 @@ pub(crate) fn dispatch_plan_node(
             // the helper iterates plan.indices_to_build and matches
             // nothing because no spec roots at a Merge NodeIndex.
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
             ctx.node_buffers.insert(node_idx, merged);
         }
 
@@ -1285,6 +1500,13 @@ pub(crate) fn dispatch_plan_node(
             ref sort_fields,
             ..
         } => {
+            // Deferred-region member: skip sort on the forward pass.
+            // The commit-time deferred dispatcher re-runs this Sort on
+            // post-recompute upstream emits, so admitting records to a
+            // SortBuffer here would double-charge the sort.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             // Enforcer-sort dispatch. Carries `row_num` through
             // the sort permutation as the `SortBuffer<u64>`
             // payload — the Record itself carries every field
@@ -1302,6 +1524,7 @@ pub(crate) fn dispatch_plan_node(
                 .unwrap_or_default();
 
             if input_records.is_empty() {
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
                 ctx.node_buffers.insert(node_idx, Vec::new());
                 return Ok(());
             }
@@ -1373,6 +1596,7 @@ pub(crate) fn dispatch_plan_node(
             }
             ctx.collector
                 .record(sort_timer.finish(sort_count, sort_count));
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
             ctx.node_buffers.insert(node_idx, out);
         }
 
@@ -1641,18 +1865,47 @@ pub(crate) fn dispatch_plan_node(
 
             ctx.collector
                 .record(agg_timer.finish(input_count, out_rows.len() as u64));
-            // Materialize node-rooted window runtimes for any IndexSpec
-            // rooted at this aggregate. The aggregate emits columns the
-            // source arena cannot project (e.g. `total = sum(amount)`,
-            // `$ck.aggregate.<name>`); a downstream window's IndexSpec
-            // pins its `arena_fields` against the aggregate's
-            // `output_schema`, so the arena materializes from
-            // `out_rows` here, not from the source stream.
-            finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
-            ctx.node_buffers.insert(node_idx, out_rows);
+            if let Some(region) = current_dag.deferred_region_at_producer(node_idx) {
+                // Deferred-region producer. Project emits to the region's
+                // buffer schema (the planner already pruned this to the
+                // minimum columns the deferred operators reach via
+                // `Expr::support_into`), park narrow rows in
+                // `node_buffers[node_idx]`, and skip
+                // `finalize_node_rooted_windows`: every IndexSpec rooted
+                // here is consumed by a downstream operator INSIDE the
+                // same region, which does not run on the forward pass.
+                // The wide pre-retract rows held on
+                // `RetainedAggregatorState.pre_retract_output_rows`
+                // already cover the recompute-aggregates phase, so the
+                // narrow projection here costs nothing the recompute
+                // path needs.
+                let buffer_schema = region.buffer_schema.clone();
+                let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &projected)?;
+                ctx.node_buffers.insert(node_idx, projected);
+            } else {
+                // Materialize node-rooted window runtimes for any IndexSpec
+                // rooted at this aggregate. The aggregate emits columns the
+                // source arena cannot project (e.g. `total = sum(amount)`,
+                // `$ck.aggregate.<name>`); a downstream window's IndexSpec
+                // pins its `arena_fields` against the aggregate's
+                // `output_schema`, so the arena materializes from
+                // `out_rows` here, not from the source stream.
+                finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out_rows)?;
+                ctx.node_buffers.insert(node_idx, out_rows);
+            }
         }
 
         PlanNode::Output { ref name, .. } => {
+            // Deferred-region exit: skip writer admission on the forward
+            // pass. The commit-time deferred dispatcher routes
+            // post-recompute records into this Output, so any record
+            // dropped here on a stale upstream buffer would be a
+            // pre-recompute leak.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             // Get input records: check own buffer first (Route
             // nodes store records at the successor's index), then
             // fall back to predecessor buffers.
@@ -1860,6 +2113,13 @@ pub(crate) fn dispatch_plan_node(
         }
 
         PlanNode::Composition { ref name, body, .. } => {
+            // Deferred-region member: skip recursive body execution on
+            // the forward pass. The commit-time deferred dispatcher
+            // re-enters this Composition on post-recompute upstream
+            // emits.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             // Recursive body execution: collect parent-scope records
             // per declared input port, swap `current_dag` to the body's
             // mini-DAG, walk the body's topo, then collect the body's
@@ -1938,6 +2198,7 @@ pub(crate) fn dispatch_plan_node(
             // body executor returned with `active_stack` already
             // popped, so the install lands on `top` (parent scope).
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
@@ -1951,6 +2212,13 @@ pub(crate) fn dispatch_plan_node(
             ref propagate_ck,
             ..
         } => {
+            // Deferred-region member: skip the join on the forward pass.
+            // The commit-time deferred dispatcher will re-run this
+            // Combine against the post-recompute upstream emits parked
+            // in `region_input_buffers` for its cross-region edges.
+            if current_dag.is_deferred_consumer(node_idx) {
+                return Ok(());
+            }
             use crate::config::pipeline_node::{MatchMode, OnMiss};
             use crate::executor::combine::{CombineResolver, CombineResolverMapping};
             use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
@@ -2261,6 +2529,7 @@ pub(crate) fn dispatch_plan_node(
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
                     return Ok(());
                 }
@@ -2310,6 +2579,7 @@ pub(crate) fn dispatch_plan_node(
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
                     return Ok(());
                 }
@@ -2366,6 +2636,7 @@ pub(crate) fn dispatch_plan_node(
                     ctx.collector
                         .record(probe_timer.finish(probe_records_in, probe_records_out));
                     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
                     ctx.node_buffers.insert(node_idx, output_records);
                     return Ok(());
                 }
@@ -2790,6 +3061,7 @@ pub(crate) fn dispatch_plan_node(
             ctx.collector
                 .record(probe_timer.finish(probe_records_in, probe_records_out));
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
             ctx.node_buffers.insert(node_idx, output_records);
         }
 

@@ -955,6 +955,7 @@ fn bind_composition(
         nested_body_ids,
         body_indices_to_build: Vec::new(),
         body_window_configs,
+        deferred_regions: HashMap::new(),
     };
     artifacts.insert_body(body_id, bound_body);
     artifacts
