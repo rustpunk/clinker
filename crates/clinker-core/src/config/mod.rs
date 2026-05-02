@@ -2156,11 +2156,16 @@ impl PipelineConfig {
 
         // Deferred-region detection. Runs after retraction flags and
         // window-buffer-recompute flags so each relaxed-CK Aggregate is
-        // already classified. The walk produces one `DeferredRegion`
-        // per producer; we flatten the list into a NodeIndex-keyed map
-        // so dispatcher arms can do O(1) lookup at every participating
-        // node (producer, members, outputs).
-        let regions = crate::plan::deferred_region::detect_deferred_regions(
+        // already classified. The walk returns top-level regions
+        // (producer in `dag.graph`) separately from body-internal
+        // regions (producer in some `BoundBody.graph`); we flatten each
+        // bucket into a NodeIndex-keyed map at the right scope so
+        // dispatcher arms can do O(1) lookup at every participating
+        // node (producer, members, outputs). The two index spaces are
+        // disjoint by scope — body-local NodeIndex values can
+        // numerically collide with parent-graph indices, so they live
+        // on `BoundBody.deferred_regions`, not on the parent map.
+        let (top_regions, body_regions) = crate::plan::deferred_region::detect_deferred_regions(
             &dag.graph,
             &dag.node_properties,
             &artifacts,
@@ -2169,7 +2174,7 @@ impl PipelineConfig {
             petgraph::graph::NodeIndex,
             crate::plan::deferred_region::DeferredRegion,
         > = HashMap::new();
-        for region in regions {
+        for region in top_regions {
             let producer = region.producer;
             let members = region.members.clone();
             let outputs = region.outputs.clone();
@@ -2178,6 +2183,20 @@ impl PipelineConfig {
             }
         }
         dag.deferred_regions = region_map;
+
+        for (body_id, regions) in body_regions {
+            let Some(body) = artifacts.composition_bodies.get_mut(&body_id) else {
+                continue;
+            };
+            for region in regions {
+                let producer = region.producer;
+                let members = region.members.clone();
+                let outputs = region.outputs.clone();
+                for k in std::iter::once(producer).chain(members).chain(outputs) {
+                    body.deferred_regions.insert(k, region.clone());
+                }
+            }
+        }
 
         // E15Y: an aggregate whose `group_by` omits any correlation-key
         // field cannot also use `strategy: streaming`. Streaming

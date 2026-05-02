@@ -29,7 +29,7 @@ use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::plan::bind_schema::CompileArtifacts;
-use crate::plan::composition_body::BoundBody;
+use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::plan::execution::{PlanEdge, PlanNode, group_by_omits_any_ck_field};
 use crate::plan::properties::NodeProperties;
 
@@ -62,14 +62,28 @@ pub struct DeferredRegion {
 /// through composition bodies via `artifacts.composition_bodies`) and
 /// return one `DeferredRegion` per producer.
 ///
-/// Body-internal Aggregates produce regions whose indices are body-
-/// local; the caller is responsible for keying them appropriately.
+/// Returns a tuple `(top_level, per_body)`:
+///
+/// - `top_level` — regions whose `producer` is a parent-graph
+///   `NodeIndex`. The caller flattens these into
+///   `ExecutionPlanDag.deferred_regions`.
+/// - `per_body` — regions seeded by body-internal Aggregates, keyed by
+///   the body that owns them. The caller flattens each entry into the
+///   matching `BoundBody.deferred_regions`. The two index spaces are
+///   separated because a body-local NodeIndex can numerically collide
+///   with a parent-graph NodeIndex (each graph numbers from zero); the
+///   dispatcher consults the right map by which scope it is currently
+///   executing.
 pub(crate) fn detect_deferred_regions(
     graph: &DiGraph<PlanNode, PlanEdge>,
     node_properties: &HashMap<NodeIndex, NodeProperties>,
     artifacts: &CompileArtifacts,
-) -> Vec<DeferredRegion> {
-    let mut regions = Vec::new();
+) -> (
+    Vec<DeferredRegion>,
+    HashMap<CompositionBodyId, Vec<DeferredRegion>>,
+) {
+    let mut top_level = Vec::new();
+    let mut per_body: HashMap<CompositionBodyId, Vec<DeferredRegion>> = HashMap::new();
 
     // Top-level relaxed-CK aggregates.
     for idx in graph.node_indices() {
@@ -81,7 +95,7 @@ pub(crate) fn detect_deferred_regions(
             continue;
         }
         if let Some(region) = build_region(graph, artifacts, idx) {
-            regions.push(region);
+            top_level.push(region);
         }
     }
 
@@ -89,7 +103,7 @@ pub(crate) fn detect_deferred_regions(
     // body's parent-CK at each Aggregate from the upstream stored
     // schema (mirrors `apply_retraction_flags_in_body`), and seed a
     // region inside the body's mini-DAG.
-    for body in artifacts.composition_bodies.values() {
+    for (body_id, body) in &artifacts.composition_bodies {
         for idx in body.graph.node_indices() {
             let PlanNode::Aggregation { config, .. } = &body.graph[idx] else {
                 continue;
@@ -99,12 +113,12 @@ pub(crate) fn detect_deferred_regions(
                 continue;
             }
             if let Some(region) = build_body_region(body, idx) {
-                regions.push(region);
+                per_body.entry(*body_id).or_default().push(region);
             }
         }
     }
 
-    regions
+    (top_level, per_body)
 }
 
 /// Resolve the upstream node's CK set from `node_properties` for a

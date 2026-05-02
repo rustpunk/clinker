@@ -1354,6 +1354,7 @@ impl PipelineExecutor {
             relaxed_aggregator_degrade: Vec::new(),
             relaxed_window_states: HashMap::new(),
             commit_step_path: dispatch::CommitStepPath::NotSelected,
+            region_input_buffers: HashMap::new(),
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2431,6 +2432,7 @@ mod tests {
     mod correlated_window_after_aggregate_retract;
     mod correlated_window_retract;
     mod cross_source_window_topology;
+    mod deferred_dispatch;
     mod format_dispatch;
     mod multi_output;
     mod post_aggregate_lag_lead;

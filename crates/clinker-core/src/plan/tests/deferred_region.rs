@@ -14,21 +14,22 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::config::{CompileContext, PipelineConfig, parse_config};
+use crate::plan::CompiledPlan;
 use crate::plan::execution::ExecutionPlanDag;
 
 fn compile(yaml: &str) -> ExecutionPlanDag {
-    let config: PipelineConfig = parse_config(yaml).expect("parse");
-    config
-        .compile(&CompileContext::default())
-        .expect("compile")
-        .dag()
-        .clone()
+    compile_full(yaml).dag().clone()
 }
 
-fn compile_with_dir(yaml: &str, workspace_root: &std::path::Path) -> ExecutionPlanDag {
+fn compile_full(yaml: &str) -> CompiledPlan {
+    let config: PipelineConfig = parse_config(yaml).expect("parse");
+    config.compile(&CompileContext::default()).expect("compile")
+}
+
+fn compile_with_dir_full(yaml: &str, workspace_root: &std::path::Path) -> CompiledPlan {
     let config: PipelineConfig = parse_config(yaml).expect("parse");
     let ctx = CompileContext::with_pipeline_dir(workspace_root, PathBuf::from("pipelines"));
-    config.compile(&ctx).expect("compile").dag().clone()
+    config.compile(&ctx).expect("compile")
 }
 
 fn node_idx_for(plan: &ExecutionPlanDag, node_name: &str) -> NodeIndex {
@@ -36,6 +37,16 @@ fn node_idx_for(plan: &ExecutionPlanDag, node_name: &str) -> NodeIndex {
         .node_indices()
         .find(|&i| plan.graph[i].name() == node_name)
         .unwrap_or_else(|| panic!("node {node_name:?} not found in plan"))
+}
+
+fn body_node_idx_for(
+    body: &crate::plan::composition_body::BoundBody,
+    node_name: &str,
+) -> NodeIndex {
+    body.graph
+        .node_indices()
+        .find(|&i| body.graph[i].name() == node_name)
+        .unwrap_or_else(|| panic!("body node {node_name:?} not found"))
 }
 
 /// Test 1: Simple region — Source(CK=order_id) → Aggregate(group_by=dept,
@@ -415,8 +426,14 @@ nodes:
 }
 
 /// Test 5: Composition body containing a relaxed-CK Aggregate. The
-/// region must cross the body↔parent boundary: the body's internal
-/// Transform AND the parent's downstream Transform are members.
+/// body-internal Aggregate seeds a region inside the body's mini-DAG;
+/// the body-local map (`BoundBody.deferred_regions`) keys the
+/// body-internal Aggregate as producer and its downstream body
+/// Transform as a member, with O(1) lookup at every body NodeIndex
+/// participating in the region. Parent-graph continuation through the
+/// Composition node is not propagated by the detector today (the parent
+/// walker only seeds from top-level Aggregates); per-body keying is the
+/// load-bearing dispatcher contract Phase 2 asserts on.
 #[test]
 fn composition_body_relaxed_aggregate_crosses_boundary() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -497,34 +514,56 @@ nodes:
       path: out.csv
       include_unmapped: true
 "#;
-    let plan = compile_with_dir(yaml, workspace.path());
+    let compiled = compile_with_dir_full(yaml, workspace.path());
+    let plan = compiled.dag();
 
-    // The body-internal Aggregate seeds a region in the body's
-    // mini-DAG; the flatten in config/mod.rs writes both parent-graph
-    // and body-local NodeIndex values into the same flat HashMap.
-    // Body-local indices can collide with parent indices because each
-    // graph numbers nodes from 0, so we cannot assert directly on
-    // `plan.deferred_regions[&parent_idx]` for body-local entries.
-    // The contract this test verifies: at least one region exists
-    // touching parent-graph nodes downstream of the composition
-    // boundary. Body-aware keying (e.g. `(CompositionBodyId,
-    // NodeIndex)`) lands when a runtime consumer needs to disambiguate.
-    let comp_idx = node_idx_for(&plan, "body");
-    let parent_t_idx = node_idx_for(&plan, "parent_t");
-    let out_idx = node_idx_for(&plan, "out");
+    // Parent-graph indices for the composition call site and the
+    // downstream chain. The body-internal Aggregate seeds a region
+    // whose body-local NodeIndex space is disjoint from the parent
+    // graph; the dispatcher consults the right map by which scope it
+    // is currently executing.
+    let comp_idx = node_idx_for(plan, "body");
+    let parent_t_idx = node_idx_for(plan, "parent_t");
+    let out_idx = node_idx_for(plan, "out");
 
-    // The body-internal relaxed Aggregate produces a body-local
-    // region; the parent-graph walk does NOT see body internals as
-    // relaxed because the parent walker only inspects top-level
-    // Aggregates. What we assert here is that the body-local region
-    // detection ran and produced at least one region covering the
-    // body-internal Aggregate. The load-bearing invariant: the
-    // detector reaches body-internal Aggregates at all.
-    let saw_any_region = !plan.deferred_regions.is_empty();
+    // Body-local regions: look up the bound body via the composition's
+    // name → body-id assignment, then assert the body-internal
+    // Aggregate is the producer, the body's Transform is a member, and
+    // both NodeIndex slots are keyed for O(1) dispatcher lookup.
+    let artifacts = compiled.artifacts();
+    let body_id = artifacts
+        .composition_body_assignments
+        .get("body")
+        .copied()
+        .expect("composition 'body' must be assigned a CompositionBodyId");
+    let bound = compiled
+        .body_of(body_id)
+        .expect("body_id must resolve to a BoundBody");
+    let body_agg_idx = body_node_idx_for(bound, "dept_totals");
+    let body_xform_idx = body_node_idx_for(bound, "agg_emit");
+
+    let body_region = bound
+        .deferred_regions
+        .get(&body_agg_idx)
+        .expect("body-internal Aggregate keys its body-local region");
+    assert_eq!(body_region.producer, body_agg_idx);
     assert!(
-        saw_any_region,
-        "composition body containing a relaxed Aggregate must produce at least \
-         one region (body-local or parent-flow)"
+        body_region.members.contains(&body_xform_idx),
+        "body Transform agg_emit is a member of the body-local region"
+    );
+    assert!(
+        bound.deferred_regions.contains_key(&body_xform_idx),
+        "body Transform agg_emit is keyed in the body-local map for O(1) dispatch"
+    );
+
+    // The parent-flat map carries no entries seeded by body-internal
+    // Aggregates today — the parent walker only seeds from top-level
+    // Aggregates, and there are none in this fixture.
+    assert!(
+        plan.deferred_regions.is_empty(),
+        "parent-graph map carries only top-level-Aggregate regions; \
+         body-internal regions live on BoundBody.deferred_regions; got {:?}",
+        plan.deferred_regions.keys().collect::<Vec<_>>()
     );
 
     // Sanity: the parent-side downstream chain (parent_t, out) is reachable
@@ -644,15 +683,77 @@ nodes:
       path: out.csv
       include_unmapped: true
 "#;
-    let plan = compile_with_dir(yaml, workspace.path());
+    let compiled = compile_with_dir_full(yaml, workspace.path());
+    let plan = compiled.dag();
 
-    // Detector must walk the nested-body chain and produce at least
-    // one region covering the inner body's relaxed Aggregate.
+    let outer_idx = node_idx_for(plan, "outer");
+    let out_idx = node_idx_for(plan, "out");
+
+    // Body-local: the inner body owns the relaxed Aggregate; the outer
+    // body owns no relaxed Aggregate of its own and thus has no body-
+    // local region keyed on its mini-DAG. Walk the assignments to
+    // locate both bodies and verify the load-bearing one carries the
+    // expected producer.
+    let artifacts = compiled.artifacts();
+    let outer_body_id = artifacts
+        .composition_body_assignments
+        .get("outer")
+        .copied()
+        .expect("outer composition assignment");
+    let outer_body = compiled
+        .body_of(outer_body_id)
+        .expect("outer BoundBody resolves");
     assert!(
-        !plan.deferred_regions.is_empty(),
-        "nested composition body containing a relaxed Aggregate must produce \
-         at least one region"
+        outer_body.deferred_regions.is_empty(),
+        "outer body has no relaxed Aggregate of its own; its body-local map stays empty",
     );
+
+    // Inner body assignment lives under the body-internal Composition
+    // node `inner_call` inside `outer_wrap.comp.yaml`.
+    let inner_body_id = artifacts
+        .composition_body_assignments
+        .get("inner_call")
+        .copied()
+        .expect("inner_call composition assignment");
+    let inner_body = compiled
+        .body_of(inner_body_id)
+        .expect("inner BoundBody resolves");
+    let inner_agg_idx = body_node_idx_for(inner_body, "dept_totals");
+    let inner_region = inner_body
+        .deferred_regions
+        .get(&inner_agg_idx)
+        .expect("inner body-internal Aggregate keys its body-local region");
+    assert_eq!(inner_region.producer, inner_agg_idx);
+    assert!(
+        inner_body.deferred_regions.contains_key(&inner_agg_idx),
+        "inner body-local map carries the producer NodeIndex for O(1) dispatch"
+    );
+
+    // Parent-flat map carries no body-internal regions today (the
+    // parent walker only seeds from top-level Aggregates).
+    assert!(
+        plan.deferred_regions.is_empty(),
+        "parent-graph map stays empty for nested-body fixtures with no \
+         top-level Aggregate; got {:?}",
+        plan.deferred_regions.keys().collect::<Vec<_>>()
+    );
+
+    // Sanity: the parent's downstream (`out`) is reachable from the
+    // outer Composition via outgoing edges.
+    let mut downstream: std::collections::HashSet<NodeIndex> = std::collections::HashSet::new();
+    let mut stack: Vec<NodeIndex> = plan
+        .graph
+        .neighbors_directed(outer_idx, Direction::Outgoing)
+        .collect();
+    while let Some(n) = stack.pop() {
+        if !downstream.insert(n) {
+            continue;
+        }
+        for s in plan.graph.neighbors_directed(n, Direction::Outgoing) {
+            stack.push(s);
+        }
+    }
+    assert!(downstream.contains(&out_idx));
 }
 
 /// Test 7: Output fan-out via Route — Source → Aggregate(relaxed) →
