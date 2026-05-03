@@ -1074,21 +1074,23 @@ o6,ENG,300
     );
 }
 
-/// Two-level nested composition wrapping a relaxed-CK Aggregate, with a
-/// parent-side Transform that mutates the body Aggregate's emit. The
-/// commit-pass harvest chain runs end-to-end:
+/// Two-level nested composition wrapping a relaxed-CK Aggregate at the
+/// inner body's terminal output port, with a parent-side Transform that
+/// mutates the body Aggregate's emit. The commit-pass harvest chain
+/// runs end-to-end:
 ///
-/// 1. Inner body's commit-pass dispatch produces the inner aggregate's
-///    `(department, total)` rows through the body's passthrough
-///    Transform — the passthrough is the body's terminal output port,
-///    and its `support_into` widens the deferred region's
-///    `buffer_schema` to include both columns so the harvest carries
-///    them across the scope boundary.
+/// 1. Inner body's commit-pass dispatch re-finalizes the relaxed
+///    Aggregate; `emit_post_recompute` projects the post-recompute
+///    rows to the deferred region's `buffer_schema`. The body's
+///    output port is the Aggregate itself, so the cross-scope
+///    continuation-demand seed in `pass_b_body` is what keeps
+///    `(department, total)` in `buffer_schema` — the body has no
+///    member operator widening the schema on its own.
 /// 2. Those rows are harvested into the outer body's
 ///    `node_buffers[inner_comp_idx]`.
 /// 3. The outer body has no continuation members beyond the inner
-///    Composition (it's a passthrough wrapper), so its harvest
-///    re-surfaces the same rows through the outer output port.
+///    Composition (it's a wrapper), so its harvest re-surfaces the
+///    same rows through the outer output port.
 /// 4. The parent harvest seeds `node_buffers[outer_comp_idx]` and the
 ///    parent's continuation Transform `bump` runs on the same commit
 ///    pass with `in_deferred_dispatch=true`, applying `+1` to `total`.
@@ -1114,7 +1116,7 @@ fn composition_body_harvest_runs_parent_continuation_on_post_recompute_data() {
         - { name: department, type: string }
         - { name: amount, type: int }
   outputs:
-    out: passthrough
+    out: dept_totals
   config_schema: {}
 
 nodes:
@@ -1126,13 +1128,6 @@ nodes:
       cxl: |
         emit department = department
         emit total = sum(amount)
-  - type: transform
-    name: passthrough
-    input: dept_totals
-    config:
-      cxl: |
-        emit department = department
-        emit total = total
 "#,
     )
     .expect("write inner");
@@ -1316,7 +1311,7 @@ fn composition_body_harvest_with_cascading_retraction_preserves_mutation() {
         - { name: department, type: string }
         - { name: amount, type: int }
   outputs:
-    out: passthrough
+    out: dept_totals
   config_schema: {}
 
 nodes:
@@ -1328,13 +1323,6 @@ nodes:
       cxl: |
         emit department = department
         emit total = sum(amount)
-  - type: transform
-    name: passthrough
-    input: dept_totals
-    config:
-      cxl: |
-        emit department = department
-        emit total = total
 "#,
     )
     .expect("write inner");
@@ -1494,6 +1482,166 @@ o6,ENG,300
     assert!(
         !rows.iter().any(|r| r.contains("HR")),
         "HR was DLQ'd by the parent `bump` /0 — it must NOT appear in the writer output; got rows {rows:?}"
+    );
+}
+
+/// Bare-Aggregate-at-output-port body harvest: the composition body
+/// holds a single relaxed-CK Aggregate node which is itself the body's
+/// terminal output port. No in-body Transform sits between the
+/// Aggregate and the port. The plan-time deferred-region detector
+/// must seed the body's `buffer_schema` with the columns the parent's
+/// continuation Transform reads, so the harvest carries a record
+/// shape the parent's stamped `expected_input_schema` accepts. The
+/// parent's continuation Transform mutates `total` by `+1`; the
+/// writer must capture the mutated rows. Pins the cross-scope demand
+/// path end-to-end without an in-body identity Transform softening
+/// the geometry.
+#[test]
+fn body_with_aggregate_at_output_port_harvests_through_parent_continuation() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+
+    std::fs::write(
+        comp_dir.join("bare_agg.comp.yaml"),
+        r#"_compose:
+  name: bare_agg
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: dept_totals
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+"#,
+    )
+    .expect("write bare_agg comp");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: bare_agg_harvest
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: composition
+    name: body
+    input: src
+    use: ../compositions/bare_agg.comp.yaml
+    inputs:
+      inp: src
+  - type: transform
+    name: bump
+    input: body
+    config:
+      cxl: |
+        emit department = department
+        emit total = total
+        emit total_plus_one = total + 1
+  - type: output
+    name: out
+    input: bump
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let csv = "\
+order_id,department,amount
+o1,HR,10
+o2,HR,20
+o3,HR,30
+o4,ENG,100
+o5,ENG,200
+o6,ENG,300
+";
+    let config = crate::config::parse_config(yaml).expect("parse");
+    let ctx = crate::config::CompileContext::with_pipeline_dir(
+        workspace.path(),
+        std::path::PathBuf::from("pipelines"),
+    );
+    let _compiled = config
+        .compile(&ctx)
+        .expect("bare-Aggregate body + parent continuation must compile");
+
+    let primary = "src".to_string();
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        primary.clone(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "test-exec".to_string(),
+        batch_id: "test-batch".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+    };
+    let report = PipelineExecutor::run_with_readers_writers_in_context(
+        &config, &primary, readers, writers, &params, ctx,
+    )
+    .expect("bare-Aggregate body + parent continuation must run without error");
+
+    assert_eq!(
+        report.counters.dlq_count, 0,
+        "no DLQ entries expected — `bump` is a total CXL projection over the body emits; got {}",
+        report.counters.dlq_count
+    );
+
+    let written = buf.as_string();
+    let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        body_lines.len(),
+        3,
+        "expected header + HR row + ENG row, got {body_lines:?}"
+    );
+    let rows: Vec<&str> = body_lines.iter().skip(1).copied().collect();
+    let hr = rows
+        .iter()
+        .find(|r| r.contains("HR"))
+        .copied()
+        .unwrap_or_else(|| panic!("HR row must reach parent Output; got rows {rows:?}"));
+    assert!(
+        hr.contains("60") && hr.contains("61"),
+        "HR row must carry total=60 (sum of HR amounts) and total_plus_one=61 from the parent `bump` Transform; got {hr:?}"
+    );
+    let eng = rows
+        .iter()
+        .find(|r| r.contains("ENG"))
+        .copied()
+        .unwrap_or_else(|| panic!("ENG row must reach parent Output; got rows {rows:?}"));
+    assert!(
+        eng.contains("600") && eng.contains("601"),
+        "ENG row must carry total=600 (sum of ENG amounts) and total_plus_one=601 from the parent `bump` Transform; got {eng:?}"
     );
 }
 

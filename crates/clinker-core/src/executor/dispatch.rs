@@ -3457,9 +3457,26 @@ fn execute_composition_body(
         }
     }
 
-    // Harvest output before restoring parent buffers.
+    // Harvest output before restoring parent buffers. When the output
+    // port aliases a deferred-region producer (a relaxed-CK Aggregate
+    // sitting at the body's terminal port), the producer's forward
+    // emit is NOT a final stream — the commit-pass body→parent
+    // harvest path re-emits the post-recompute narrow rows into the
+    // parent's `node_buffers[composition_idx]`. Returning the forward
+    // emit here would double-feed the parent's continuation: once
+    // through the parent Composition arm's `node_buffers.insert`, then
+    // again when `recurse_into_body` extends the slot with the
+    // commit-pass harvest. Drop the forward emit so the commit pass
+    // is the single source of records for that slot.
     let output_records = match (&walk_result, output_idx) {
-        (Ok(()), Some(idx)) => ctx.node_buffers.remove(&idx).unwrap_or_default(),
+        (Ok(()), Some(idx)) => {
+            let drained = ctx.node_buffers.remove(&idx).unwrap_or_default();
+            if body_dag.deferred_region_at_producer(idx).is_some() {
+                Vec::new()
+            } else {
+                drained
+            }
+        }
         _ => Vec::new(),
     };
 

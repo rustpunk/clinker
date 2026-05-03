@@ -846,7 +846,13 @@ fn pass_b_body(
             continue;
         }
         seed_from_node(&body.graph[m], &mut seed);
-        consumed.insert(m, seed);
+        // Merge into the entry rather than overwrite — when `m` is
+        // also an output-port node, the cross-scope seed populated
+        // above must survive the body-internal seed. Plain `insert`
+        // would clobber the parent continuation's column demand and
+        // narrow the buffer below what downstream parent operators
+        // expect.
+        consumed.entry(m).or_default().extend(seed);
         worklist.push_back(m);
     }
 
@@ -1126,7 +1132,7 @@ fn seed_from_node(node: &PlanNode, set: &mut HashSet<String>) {
 /// walk. Cycles are impossible by construction — `bind_schema` rejects
 /// recursive composition references at E107 — so a revisit signals a
 /// planner-side regression rather than a malformed user input.
-fn continuation_support(
+pub(crate) fn continuation_support(
     body: CompositionBodyId,
     port: &str,
     analysis: &DeferredRegionAnalysis,
@@ -1164,9 +1170,6 @@ fn continuation_support(
                 .get(&s)
                 .and_then(|m| m.get(&call_site.composition_idx)),
         };
-        let Some(cont) = cont else {
-            continue;
-        };
 
         // Resolve the graph that contains this call site's continuation
         // members. `scope=None` lives in the parent DAG; `scope=Some(s)`
@@ -1179,27 +1182,53 @@ fn continuation_support(
             },
         };
 
-        for &member_idx in &cont.members {
-            let member_node = &containing_graph[member_idx];
-            if let PlanNode::Composition { body: inner, .. } = member_node {
-                if let Some(inner_body) = artifacts.body_of(*inner) {
-                    let inner_ports: Vec<String> =
-                        inner_body.output_port_to_node_idx.keys().cloned().collect();
-                    for inner_port in inner_ports {
-                        let nested = continuation_support(
-                            *inner,
-                            &inner_port,
+        if let Some(cont) = cont {
+            for &member_idx in &cont.members {
+                let member_node = &containing_graph[member_idx];
+                if let PlanNode::Composition { body: inner, .. } = member_node {
+                    if let Some(inner_body) = artifacts.body_of(*inner) {
+                        let inner_ports: Vec<String> =
+                            inner_body.output_port_to_node_idx.keys().cloned().collect();
+                        for inner_port in inner_ports {
+                            let nested = continuation_support(
+                                *inner,
+                                &inner_port,
+                                analysis,
+                                parent_graph,
+                                artifacts,
+                                memo,
+                                active,
+                            );
+                            acc.extend(nested);
+                        }
+                    }
+                } else {
+                    seed_from_node(member_node, &mut acc);
+                }
+            }
+        } else if let Some(s) = call_site.scope {
+            // No continuation registered at this call site: composition
+            // is at the outer body's output port (every Composition with
+            // no in-scope downstream must alias one of the body's output
+            // ports — the bind pass enforces that body topologies have
+            // no orphan operators). Chase up to the outer body's call
+            // sites at the matching output port so the demand chains
+            // across the boundary instead of dead-ending here.
+            if let Some(outer_body) = artifacts.body_of(s) {
+                for (outer_port, outer_port_node) in &outer_body.output_port_to_node_idx {
+                    if *outer_port_node == call_site.composition_idx {
+                        let chained = continuation_support(
+                            s,
+                            outer_port.as_str(),
                             analysis,
                             parent_graph,
                             artifacts,
                             memo,
                             active,
                         );
-                        acc.extend(nested);
+                        acc.extend(chained);
                     }
                 }
-            } else {
-                seed_from_node(member_node, &mut acc);
             }
         }
     }
