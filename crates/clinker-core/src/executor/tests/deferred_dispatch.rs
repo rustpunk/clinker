@@ -1074,6 +1074,429 @@ o6,ENG,300
     );
 }
 
+/// Two-level nested composition wrapping a relaxed-CK Aggregate, with a
+/// parent-side Transform that mutates the body Aggregate's emit. The
+/// commit-pass harvest chain runs end-to-end:
+///
+/// 1. Inner body's commit-pass dispatch produces the inner aggregate's
+///    `(department, total)` rows through the body's passthrough
+///    Transform — the passthrough is the body's terminal output port,
+///    and its `support_into` widens the deferred region's
+///    `buffer_schema` to include both columns so the harvest carries
+///    them across the scope boundary.
+/// 2. Those rows are harvested into the outer body's
+///    `node_buffers[inner_comp_idx]`.
+/// 3. The outer body has no continuation members beyond the inner
+///    Composition (it's a passthrough wrapper), so its harvest
+///    re-surfaces the same rows through the outer output port.
+/// 4. The parent harvest seeds `node_buffers[outer_comp_idx]` and the
+///    parent's continuation Transform `bump` runs on the same commit
+///    pass with `in_deferred_dispatch=true`, applying `+1` to `total`.
+/// 5. The parent Output writes the mutated rows.
+///
+/// Asserts both surviving rows reach the writer with the parent
+/// Transform's mutation applied; no DLQ entries because the mutation
+/// is total.
+#[test]
+fn composition_body_harvest_runs_parent_continuation_on_post_recompute_data() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+
+    std::fs::write(
+        comp_dir.join("inner_relaxed.comp.yaml"),
+        r#"_compose:
+  name: inner_relaxed
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: passthrough
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+  - type: transform
+    name: passthrough
+    input: dept_totals
+    config:
+      cxl: |
+        emit department = department
+        emit total = total
+"#,
+    )
+    .expect("write inner");
+
+    std::fs::write(
+        comp_dir.join("outer_wrap.comp.yaml"),
+        r#"_compose:
+  name: outer_wrap
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: inner_call
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner_call
+    input: inp
+    use: ./inner_relaxed.comp.yaml
+    inputs:
+      inp: inp
+"#,
+    )
+    .expect("write outer");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: composition_harvest_continuation
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: composition
+    name: outer
+    input: src
+    use: ../compositions/outer_wrap.comp.yaml
+    inputs:
+      inp: src
+  - type: transform
+    name: bump
+    input: outer
+    config:
+      cxl: |
+        emit department = department
+        emit total = total
+        emit total_plus_one = total + 1
+  - type: output
+    name: out
+    input: bump
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let csv = "\
+order_id,department,amount
+o1,HR,10
+o2,HR,20
+o3,HR,30
+o4,ENG,100
+o5,ENG,200
+o6,ENG,300
+";
+    let config = crate::config::parse_config(yaml).expect("parse");
+    let ctx = crate::config::CompileContext::with_pipeline_dir(
+        workspace.path(),
+        std::path::PathBuf::from("pipelines"),
+    );
+    let _compiled = config
+        .compile(&ctx)
+        .expect("nested composition + parent continuation must compile");
+
+    let primary = "src".to_string();
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        primary.clone(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "test-exec".to_string(),
+        batch_id: "test-batch".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+    };
+    let report = PipelineExecutor::run_with_readers_writers_in_context(
+        &config, &primary, readers, writers, &params, ctx,
+    )
+    .expect("nested composition + parent continuation must run without error");
+
+    assert_eq!(
+        report.counters.dlq_count, 0,
+        "no DLQ entries expected — `bump` is a total CXL projection over the body emits; got {}",
+        report.counters.dlq_count
+    );
+
+    let written = buf.as_string();
+    let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        body_lines.len(),
+        3,
+        "expected header + HR row + ENG row, got {body_lines:?}"
+    );
+    let rows: Vec<&str> = body_lines.iter().skip(1).copied().collect();
+    let hr = rows
+        .iter()
+        .find(|r| r.contains("HR"))
+        .copied()
+        .unwrap_or_else(|| panic!("HR row must reach parent Output; got rows {rows:?}"));
+    assert!(
+        hr.contains("60") && hr.contains("61"),
+        "HR row must carry total=60 (sum of HR amounts) and total_plus_one=61 from the parent `bump` Transform; got {hr:?}"
+    );
+    let eng = rows
+        .iter()
+        .find(|r| r.contains("ENG"))
+        .copied()
+        .unwrap_or_else(|| panic!("ENG row must reach parent Output; got rows {rows:?}"));
+    assert!(
+        eng.contains("600") && eng.contains("601"),
+        "ENG row must carry total=600 (sum of ENG amounts) and total_plus_one=601 from the parent `bump` Transform; got {eng:?}"
+    );
+}
+
+/// Same nested-composition geometry as the harvest happy-path test, but
+/// the parent-side Transform's CXL trips /0 on HR's body emit. The
+/// cascading-retraction loop must:
+///
+/// 1. Run the body's commit-pass dispatch and harvest both
+///    `(HR, total=60)` and `(ENG, total=600)` rows through the chain
+///    into `node_buffers[outer_comp_idx]`.
+/// 2. Run the parent continuation Transform `bump`; its `1 / (total - 60)`
+///    raises /0 on HR.
+/// 3. Surface that error as a DLQ event whose lineage resolves through
+///    the unified cross-scope `aggregate_idx_by_name` to the body's
+///    `dept_totals` aggregate.
+/// 4. Iterate: the next `detect_retract_scope` folds the contributing
+///    HR source rows back into the body aggregator's input, recomputes
+///    without HR, harvests the surviving ENG row through the chain,
+///    runs `bump` cleanly on it, and the parent Output writes only the
+///    ENG row.
+///
+/// Pins the cap-widening fix for cross-boundary lineage: the loop's
+/// termination cap must include body node counts, otherwise the
+/// retraction can panic with the documented cap-exceeded message.
+#[test]
+fn composition_body_harvest_with_cascading_retraction_preserves_mutation() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+
+    std::fs::write(
+        comp_dir.join("inner_relaxed.comp.yaml"),
+        r#"_compose:
+  name: inner_relaxed
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: passthrough
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+  - type: transform
+    name: passthrough
+    input: dept_totals
+    config:
+      cxl: |
+        emit department = department
+        emit total = total
+"#,
+    )
+    .expect("write inner");
+
+    std::fs::write(
+        comp_dir.join("outer_wrap.comp.yaml"),
+        r#"_compose:
+  name: outer_wrap
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: inner_call
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner_call
+    input: inp
+    use: ./inner_relaxed.comp.yaml
+    inputs:
+      inp: inp
+"#,
+    )
+    .expect("write outer");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: composition_harvest_cascading_retract
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  - type: composition
+    name: outer
+    input: src
+    use: ../compositions/outer_wrap.comp.yaml
+    inputs:
+      inp: src
+  - type: transform
+    name: bump
+    input: outer
+    config:
+      cxl: |
+        emit department = department
+        emit total = total
+        emit safe_ratio = 1 / (total - 60)
+  - type: output
+    name: out
+    input: bump
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let csv = "\
+order_id,department,amount
+o1,HR,10
+o2,HR,20
+o3,HR,30
+o4,ENG,100
+o5,ENG,200
+o6,ENG,300
+";
+    let config = crate::config::parse_config(yaml).expect("parse");
+    let ctx = crate::config::CompileContext::with_pipeline_dir(
+        workspace.path(),
+        std::path::PathBuf::from("pipelines"),
+    );
+    let _compiled = config
+        .compile(&ctx)
+        .expect("nested composition + cascading-retract pipeline must compile");
+
+    let primary = "src".to_string();
+    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        primary.clone(),
+        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "test-exec".to_string(),
+        batch_id: "test-batch".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+    };
+    let report = PipelineExecutor::run_with_readers_writers_in_context(
+        &config, &primary, readers, writers, &params, ctx,
+    )
+    .expect("nested composition + cascading retract must run without error");
+
+    // The parent Transform's /0 on HR routes the error into the
+    // correlation buffers; cascading retraction folds HR's source rows
+    // back to the body aggregator. The DLQ surfaces at least one HR
+    // entry; mirror the existing tests' >=1 convention rather than
+    // asserting an exact count, since the precise number depends on
+    // whether the orchestrator hands the retraction lineage one
+    // composite trigger or one per contributing source row.
+    assert!(
+        report.counters.dlq_count >= 1,
+        "the parent Transform's /0 on HR's body emit must surface in the DLQ via the cross-scope retraction path; got {}",
+        report.counters.dlq_count
+    );
+    let hr_dlq = report.dlq_entries.iter().find(|e| {
+        e.original_record
+            .values()
+            .iter()
+            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_ref() == "HR"))
+    });
+    assert!(
+        hr_dlq.is_some(),
+        "DLQ must carry an entry whose original_record references HR; got: {:?}",
+        report.dlq_entries
+    );
+
+    let written = buf.as_string();
+    let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        body_lines.len() >= 2,
+        "expected header + at least the surviving ENG row in writer output, got {body_lines:?}"
+    );
+    let rows: Vec<&str> = body_lines.iter().skip(1).copied().collect();
+    let eng = rows
+        .iter()
+        .find(|r| r.contains("ENG"))
+        .copied()
+        .unwrap_or_else(|| {
+            panic!("ENG row must reach parent Output via harvest + parent continuation after HR is retracted; got rows {rows:?}")
+        });
+    // 1 / (600 - 60) = 1 / 540 = 0 in CXL integer division (matches the
+    // ratio expressions in the existing relaxed_ratio.comp.yaml fixtures
+    // earlier in this file).
+    assert!(
+        eng.contains("600") && eng.contains(",0"),
+        "ENG row must carry total=600 and safe_ratio=0 (integer division 1/540); got {eng:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("HR")),
+        "HR was DLQ'd by the parent `bump` /0 — it must NOT appear in the writer output; got rows {rows:?}"
+    );
+}
+
 /// Output fan-out writers do not double-flush across cascading-
 /// retraction iterations: a Route distributes the deferred Aggregate's
 /// emit to two Output sinks. Iteration 1's deferred dispatch admits

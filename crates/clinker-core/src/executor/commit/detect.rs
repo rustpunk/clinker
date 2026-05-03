@@ -62,17 +62,33 @@ pub(crate) fn detect_retract_scope(
     trigger_keys.sort_by_key(|k| format_group_key(k));
     scope.trigger_group_keys = trigger_keys.clone();
 
-    // Aggregate-name → DAG NodeIndex map, built once per detect call so
+    // Aggregate-name → NodeIndex map, built once per detect call so
     // synthetic-CK column lookups below do not re-scan node weights for
-    // every trigger key.
-    let aggregate_idx_by_name: HashMap<&str, NodeIndex> = current_dag
+    // every trigger key. Spans the parent DAG plus every composition
+    // body's graph so a parent-scope error cell carrying a body
+    // aggregate's synthetic-CK column resolves back to the body's
+    // (body-local) NodeIndex — the same key that addresses
+    // ctx.relaxed_aggregator_states, populated by the body forward-pass
+    // arm under the body-local index. Aggregate names are unique across
+    // the pipeline because compile-time path qualification prepends
+    // each body's call-site name, but `entry().or_insert` is used
+    // defensively so a parent-scope name stays authoritative if that
+    // qualification ever weakens.
+    let mut aggregate_idx_by_name: HashMap<String, NodeIndex> = current_dag
         .graph
         .node_indices()
         .filter_map(|idx| match &current_dag.graph[idx] {
-            PlanNode::Aggregation { name, .. } => Some((name.as_str(), idx)),
+            PlanNode::Aggregation { name, .. } => Some((name.clone(), idx)),
             _ => None,
         })
         .collect();
+    for body in ctx.artifacts.composition_bodies.values() {
+        for idx in body.graph.node_indices() {
+            if let PlanNode::Aggregation { name, .. } = &body.graph[idx] {
+                aggregate_idx_by_name.entry(name.clone()).or_insert(idx);
+            }
+        }
+    }
 
     // For each triggered group, classify its key columns by their
     // `FieldMetadata` to decide which row IDs feed `affected_row_ids`.
