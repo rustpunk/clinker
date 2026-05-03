@@ -2207,6 +2207,17 @@ impl PipelineConfig {
             }
         }
 
+        // The call-site index is populated by the planner above but the
+        // consumer (continuation-support column propagation) lands in
+        // the next commit. Touching every field here keeps the
+        // dead-code lint quiet without an `#[allow]` attribute that
+        // would need scrubbing once the real read appears.
+        for sites in analysis.body_call_sites.values() {
+            for site in sites {
+                let _ = (&site.scope, site.composition_idx);
+            }
+        }
+
         // E15Y: an aggregate whose `group_by` omits any correlation-key
         // field cannot also use `strategy: streaming`. Streaming
         // aggregates emit at group-boundary close, before the terminal

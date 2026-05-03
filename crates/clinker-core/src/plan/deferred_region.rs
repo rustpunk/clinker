@@ -98,6 +98,21 @@ pub(crate) struct ParentContinuation {
     pub(crate) outputs: HashSet<NodeIndex>,
 }
 
+/// One call site of a composition body — a `PlanNode::Composition`
+/// node that targets the body. Combined with the analysis's
+/// continuation maps, this is enough to look up the parent operators
+/// downstream of the call: `scope=None` →
+/// `top_continuations[composition_idx]`; `scope=Some(bid)` →
+/// `body_continuations[bid][composition_idx]`.
+#[derive(Clone, Debug)]
+pub(crate) struct CompositionCallSite {
+    /// `None` for parent-scope calls; `Some(outer_body_id)` for
+    /// body-internal calls.
+    pub(crate) scope: Option<CompositionBodyId>,
+    /// `NodeIndex` of the calling Composition in its containing graph.
+    pub(crate) composition_idx: NodeIndex,
+}
+
 /// Aggregate output of [`detect_deferred_regions`]: every
 /// relaxed-CK-Aggregate region (top-level + per-body) plus every
 /// Composition continuation that the commit-time dispatcher must
@@ -114,6 +129,16 @@ pub(crate) struct DeferredRegionAnalysis {
     pub(crate) top_continuations: HashMap<NodeIndex, ParentContinuation>,
     pub(crate) body_continuations:
         HashMap<CompositionBodyId, HashMap<NodeIndex, ParentContinuation>>,
+    /// Per-body call-site index — every parent-scope or
+    /// outer-body-scope `PlanNode::Composition` that targets the body.
+    /// `Vec`, not single entry, because the architectural contract is
+    /// "buffer_schema is the union of every consumer's demand across
+    /// all call sites": today's `bind_composition` allocates a fresh
+    /// `CompositionBodyId` per call (Vec is always length 1) but
+    /// encoding singular hardcodes an implementation accident; future
+    /// allocator policies (memoization, body-sharing) require the
+    /// union.
+    pub(crate) body_call_sites: HashMap<CompositionBodyId, Vec<CompositionCallSite>>,
 }
 
 /// Walk every relaxed-CK Aggregate in the top-level DAG (recursing
@@ -152,6 +177,7 @@ pub(crate) fn detect_deferred_regions(
     let mut top_continuations: HashMap<NodeIndex, ParentContinuation> = HashMap::new();
     let mut body_continuations: HashMap<CompositionBodyId, HashMap<NodeIndex, ParentContinuation>> =
         HashMap::new();
+    let mut body_call_sites: HashMap<CompositionBodyId, Vec<CompositionCallSite>> = HashMap::new();
 
     // Top-level relaxed-CK aggregates.
     for idx in graph.node_indices() {
@@ -199,11 +225,21 @@ pub(crate) fn detect_deferred_regions(
     // Top-level Composition continuations. Every Composition whose
     // body (or any nested body) carries a deferred region needs the
     // parent's downstream chain re-executed after the commit-time
-    // harvest.
+    // harvest. The call-site index is populated unconditionally — the
+    // continuation map filters by region presence, but a future
+    // consumer may demand columns from a body that today carries no
+    // region, so the index must be complete.
     for idx in graph.node_indices() {
-        if !matches!(&graph[idx], PlanNode::Composition { .. }) {
+        let PlanNode::Composition { body, .. } = &graph[idx] else {
             continue;
-        }
+        };
+        body_call_sites
+            .entry(*body)
+            .or_default()
+            .push(CompositionCallSite {
+                scope: None,
+                composition_idx: idx,
+            });
         if let Some(cont) = compute_continuation_from(idx, graph, &bodies_with_region) {
             top_continuations.insert(idx, cont);
         }
@@ -212,12 +248,20 @@ pub(crate) fn detect_deferred_regions(
     // Body-internal Composition continuations: nested Composition
     // nodes whose own body carries a deferred region. The outer body
     // dispatcher walks these once it has harvested the nested body's
-    // output records.
+    // output records. Call-site index population is unconditional, as
+    // above.
     for (body_id, body) in &artifacts.composition_bodies {
         for idx in body.graph.node_indices() {
-            if !matches!(&body.graph[idx], PlanNode::Composition { .. }) {
+            let PlanNode::Composition { body: nested, .. } = &body.graph[idx] else {
                 continue;
-            }
+            };
+            body_call_sites
+                .entry(*nested)
+                .or_default()
+                .push(CompositionCallSite {
+                    scope: Some(*body_id),
+                    composition_idx: idx,
+                });
             if let Some(cont) = compute_body_continuation_from(idx, body, &bodies_with_region) {
                 body_continuations
                     .entry(*body_id)
@@ -232,6 +276,7 @@ pub(crate) fn detect_deferred_regions(
         body_regions,
         top_continuations,
         body_continuations,
+        body_call_sites,
     }
 }
 
