@@ -757,6 +757,319 @@ nodes:
     assert!(downstream.contains(&out_idx));
 }
 
+/// A parent DAG whose composition body carries a relaxed-CK Aggregate
+/// must produce a parent-continuation entry keyed at the Composition
+/// node, with the downstream parent Transform in `members` and the
+/// parent Output in `outputs`. Phase B will use this to drive the
+/// parent's continuation at commit time after harvesting body output
+/// records.
+#[test]
+fn composition_body_region_emits_parent_continuation() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+    std::fs::write(
+        comp_dir.join("relaxed_body.comp.yaml"),
+        r#"_compose:
+  name: relaxed_body
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: dept, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: agg_emit
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [dept]
+      cxl: |
+        emit total = sum(amount)
+  - type: transform
+    name: agg_emit
+    input: dept_totals
+    config:
+      cxl: |
+        emit dept = dept
+        emit total = total
+"#,
+    )
+    .expect("write comp");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: continuation_emit
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      correlation_key: id
+      schema:
+        - { name: id, type: string }
+        - { name: dept, type: string }
+        - { name: amount, type: int }
+  - type: composition
+    name: body
+    input: src
+    use: ../compositions/relaxed_body.comp.yaml
+    inputs:
+      inp: src
+  - type: transform
+    name: parent_t
+    input: body
+    config:
+      cxl: |
+        emit dept = dept
+        emit total = total
+  - type: output
+    name: out
+    input: parent_t
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let compiled = compile_with_dir_full(yaml, workspace.path());
+    let plan = compiled.dag();
+
+    let comp_idx = node_idx_for(plan, "body");
+    let parent_t_idx = node_idx_for(plan, "parent_t");
+    let out_idx = node_idx_for(plan, "out");
+
+    let cont = plan
+        .parent_continuations
+        .get(&comp_idx)
+        .expect("composition with relaxed-body region must register a continuation");
+    assert_eq!(
+        cont.composition_idx, comp_idx,
+        "continuation seed must equal its key"
+    );
+    assert!(
+        cont.members.contains(&parent_t_idx),
+        "parent Transform downstream of the composition is a continuation member; got members={:?}",
+        cont.members
+    );
+    assert!(
+        cont.outputs.contains(&out_idx),
+        "parent Output is the continuation's exit boundary; got outputs={:?}",
+        cont.outputs
+    );
+    assert!(
+        !cont.members.contains(&comp_idx) && !cont.outputs.contains(&comp_idx),
+        "the seed Composition is excluded from members and outputs",
+    );
+
+    // The forward-pass deferral hook must agree: the parent Transform
+    // and Output now register as deferred consumers via the
+    // continuation surface, so their forward-pass arms short-circuit.
+    assert!(
+        plan.is_deferred_consumer(parent_t_idx),
+        "parent Transform should short-circuit on the forward pass via the continuation",
+    );
+    assert!(
+        plan.is_deferred_consumer(out_idx),
+        "parent Output should short-circuit on the forward pass via the continuation",
+    );
+}
+
+/// A nested composition (outer wrapping inner-relaxed) must register a
+/// continuation in the OUTER body for the inner Composition node, AND
+/// a continuation in the parent DAG for the outer Composition. Phase B
+/// will walk these bottom-up: harvest inner-body output → run outer
+/// body's continuation → harvest outer-body output → run parent's
+/// continuation.
+#[test]
+fn recursive_composition_chains_continuations_at_each_boundary() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+
+    // Inner body: relaxed Aggregate followed by a Transform so the
+    // body has a member node downstream of the producer.
+    std::fs::write(
+        comp_dir.join("inner_relaxed.comp.yaml"),
+        r#"_compose:
+  name: inner_relaxed
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: dept, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: inner_emit
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [dept]
+      cxl: |
+        emit total = sum(amount)
+  - type: transform
+    name: inner_emit
+    input: dept_totals
+    config:
+      cxl: |
+        emit dept = dept
+        emit total = total
+"#,
+    )
+    .expect("write inner");
+
+    // Outer body wraps the inner with a follow-up Transform so the
+    // outer body has a body-internal continuation member downstream of
+    // the inner Composition.
+    std::fs::write(
+        comp_dir.join("outer_wrap.comp.yaml"),
+        r#"_compose:
+  name: outer_wrap
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: dept, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: outer_emit
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner_call
+    input: inp
+    use: ./inner_relaxed.comp.yaml
+    inputs:
+      inp: inp
+  - type: transform
+    name: outer_emit
+    input: inner_call
+    config:
+      cxl: |
+        emit dept = dept
+        emit total = total
+"#,
+    )
+    .expect("write outer");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: recursive_continuations
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      correlation_key: id
+      schema:
+        - { name: id, type: string }
+        - { name: dept, type: string }
+        - { name: amount, type: int }
+  - type: composition
+    name: outer
+    input: src
+    use: ../compositions/outer_wrap.comp.yaml
+    inputs:
+      inp: src
+  - type: transform
+    name: parent_t
+    input: outer
+    config:
+      cxl: |
+        emit dept = dept
+        emit total = total
+  - type: output
+    name: out
+    input: parent_t
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let compiled = compile_with_dir_full(yaml, workspace.path());
+    let plan = compiled.dag();
+
+    let outer_idx = node_idx_for(plan, "outer");
+    let parent_t_idx = node_idx_for(plan, "parent_t");
+    let out_idx = node_idx_for(plan, "out");
+
+    // Parent DAG: continuation for the outer Composition with the
+    // parent Transform + Output downstream.
+    let parent_cont = plan.parent_continuations.get(&outer_idx).expect(
+        "outer composition with relaxed-descendant body must register a parent continuation",
+    );
+    assert_eq!(parent_cont.composition_idx, outer_idx);
+    assert!(
+        parent_cont.members.contains(&parent_t_idx),
+        "parent Transform is a continuation member; got members={:?}",
+        parent_cont.members
+    );
+    assert!(
+        parent_cont.outputs.contains(&out_idx),
+        "parent Output is the continuation exit; got outputs={:?}",
+        parent_cont.outputs
+    );
+
+    // Outer body: continuation for the inner Composition with the
+    // outer body's own Transform downstream. Resolve the outer body
+    // and the inner Composition's body-local NodeIndex.
+    let artifacts = compiled.artifacts();
+    let outer_body_id = artifacts
+        .composition_body_assignments
+        .get("outer")
+        .copied()
+        .expect("outer composition assignment");
+    let outer_body = compiled
+        .body_of(outer_body_id)
+        .expect("outer BoundBody resolves");
+    let inner_call_idx = body_node_idx_for(outer_body, "inner_call");
+    let outer_emit_idx = body_node_idx_for(outer_body, "outer_emit");
+
+    let body_cont = outer_body
+        .parent_continuations
+        .get(&inner_call_idx)
+        .expect("outer body must register a continuation for the inner Composition");
+    assert_eq!(body_cont.composition_idx, inner_call_idx);
+    assert!(
+        body_cont.members.contains(&outer_emit_idx),
+        "outer body's Transform downstream of the inner Composition is a member; \
+         got members={:?}",
+        body_cont.members
+    );
+    // The outer body has no Outputs of its own (body Outputs surface
+    // through `output_port_to_node_idx`, not as PlanNode::Output), so
+    // the continuation's `outputs` set is empty.
+    assert!(
+        body_cont.outputs.is_empty(),
+        "body-internal continuation has no Outputs; got {:?}",
+        body_cont.outputs
+    );
+}
+
 /// Test 7: Output fan-out via Route — Source → Aggregate(relaxed) →
 /// Route → [Output1, Output2, Output3]. The region's `outputs` set must
 /// hold all three.

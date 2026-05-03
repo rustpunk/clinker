@@ -8,7 +8,7 @@ use cxl::typecheck::Row;
 use indexmap::IndexMap;
 use petgraph::graph::{DiGraph, NodeIndex};
 
-use super::deferred_region::DeferredRegion;
+use super::deferred_region::{DeferredRegion, ParentContinuation};
 use super::execution::{PlanEdge, PlanNode};
 
 /// Opaque handle into `CompileArtifacts.composition_bodies`. Each
@@ -164,6 +164,17 @@ pub struct BoundBody {
     /// region so dispatcher arms get O(1) lookup. Empty for bodies
     /// without a relaxed-CK Aggregate.
     pub(crate) deferred_regions: HashMap<NodeIndex, DeferredRegion>,
+
+    /// Parent-continuation metadata for nested Composition nodes whose
+    /// inner body (transitively) carries a deferred region. Keyed by
+    /// the outer-body NodeIndex of the nested Composition node;
+    /// cloned into the transient body DAG by
+    /// [`crate::plan::execution::ExecutionPlanDag::from_body`] so the
+    /// commit-time dispatcher walking the outer body sees the same
+    /// continuation surface as the parent dispatcher does. Empty for
+    /// bodies that contain no nested Composition with a deferred
+    /// region somewhere below.
+    pub(crate) parent_continuations: HashMap<NodeIndex, ParentContinuation>,
 }
 
 impl BoundBody {
@@ -188,6 +199,35 @@ impl BoundBody {
             body_indices_to_build: Vec::new(),
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
         }
     }
+}
+
+/// True when `body` carries a deferred region directly OR any nested
+/// composition body reachable through its mini-DAG does.
+///
+/// Plan-time and commit-time gates both consult this: the
+/// orchestrator's `is_relaxed_pipeline` check and the dispatcher's
+/// composition-recursion gate must agree on whether a body warrants
+/// the relaxed path. The plan-time continuation walker uses the same
+/// predicate to decide whether a given Composition node has a
+/// continuation worth recording. Centralized here so the three sites
+/// stay synchronized; a divergent answer between plan and runtime
+/// would silently strand commit-time work.
+pub(crate) fn body_or_descendants_have_deferred_region(
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    body: &BoundBody,
+) -> bool {
+    if !body.deferred_regions.is_empty() {
+        return true;
+    }
+    body.graph.node_indices().any(|idx| {
+        let PlanNode::Composition { body: nested, .. } = &body.graph[idx] else {
+            return false;
+        };
+        artifacts
+            .body_of(*nested)
+            .is_some_and(|b| body_or_descendants_have_deferred_region(artifacts, b))
+    })
 }

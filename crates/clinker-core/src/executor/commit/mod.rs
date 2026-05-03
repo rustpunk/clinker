@@ -335,32 +335,17 @@ fn is_relaxed_pipeline(ctx: &ExecutorContext<'_>, current_dag: &ExecutionPlanDag
     // their nested compositions may still reach a body with a
     // deferred region. The recursion mirrors the dispatcher's nested-
     // body walk in `recurse_into_body`.
-    fn body_or_descendants_have_deferred_region(
-        ctx: &ExecutorContext<'_>,
-        body: &crate::plan::composition_body::BoundBody,
-    ) -> bool {
-        if !body.deferred_regions.is_empty() {
-            return true;
-        }
-        body.graph.node_indices().any(|idx| {
-            let crate::plan::execution::PlanNode::Composition { body: nested, .. } =
-                &body.graph[idx]
-            else {
-                return false;
-            };
-            ctx.artifacts
-                .body_of(*nested)
-                .is_some_and(|b| body_or_descendants_have_deferred_region(ctx, b))
-        })
-    }
     current_dag.graph.node_indices().any(|idx| {
         let crate::plan::execution::PlanNode::Composition { body, .. } = &current_dag.graph[idx]
         else {
             return false;
         };
-        ctx.artifacts
-            .body_of(*body)
-            .is_some_and(|b| body_or_descendants_have_deferred_region(ctx, b))
+        ctx.artifacts.body_of(*body).is_some_and(|b| {
+            crate::plan::composition_body::body_or_descendants_have_deferred_region(
+                ctx.artifacts,
+                b,
+            )
+        })
     })
 }
 

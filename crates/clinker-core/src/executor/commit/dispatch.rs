@@ -154,10 +154,12 @@ fn dispatch_deferred_inner(
         // deferred region. A pure-passthrough wrapper body (no
         // deferred region of its own) still owns the parent path
         // through which a nested body's deferred dispatch must fire.
-        let needs_recurse = ctx
-            .artifacts
-            .body_of(body_id)
-            .is_some_and(|b| body_or_descendants_have_deferred_region(ctx, b));
+        let needs_recurse = ctx.artifacts.body_of(body_id).is_some_and(|b| {
+            crate::plan::composition_body::body_or_descendants_have_deferred_region(
+                ctx.artifacts,
+                b,
+            )
+        });
         if !needs_recurse {
             continue;
         }
@@ -165,28 +167,6 @@ fn dispatch_deferred_inner(
     }
 
     Ok(())
-}
-
-/// True when `body` carries a deferred region directly OR any nested
-/// composition body reachable through its mini-DAG does. Mirrors the
-/// recursive walk in `is_relaxed_pipeline` so the dispatcher's body
-/// recursion gate stays consistent with the orchestrator's relaxed-
-/// path gate.
-fn body_or_descendants_have_deferred_region(
-    ctx: &ExecutorContext<'_>,
-    body: &crate::plan::composition_body::BoundBody,
-) -> bool {
-    if !body.deferred_regions.is_empty() {
-        return true;
-    }
-    body.graph.node_indices().any(|idx| {
-        let PlanNode::Composition { body: nested, .. } = &body.graph[idx] else {
-            return false;
-        };
-        ctx.artifacts
-            .body_of(*nested)
-            .is_some_and(|b| body_or_descendants_have_deferred_region(ctx, b))
-    })
 }
 
 /// Walk one region's members in topological order over a sub-graph

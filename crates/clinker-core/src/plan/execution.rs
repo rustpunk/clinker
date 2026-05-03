@@ -867,6 +867,15 @@ pub struct ExecutionPlanDag {
     /// every `NodeIndex` participating in a region (producer + members
     /// + outputs) so dispatch-arm lookup is O(1).
     pub(crate) deferred_regions: HashMap<NodeIndex, crate::plan::deferred_region::DeferredRegion>,
+    /// Parent-continuation metadata per Composition node whose body
+    /// (transitively) carries a deferred region. Keyed by the
+    /// Composition's `NodeIndex` in this DAG. Populated alongside
+    /// `deferred_regions` in compile Stage 5; the commit-time
+    /// dispatcher consults this map after harvesting body output
+    /// records to drive the parent's downstream chain on
+    /// post-recompute data.
+    pub(crate) parent_continuations:
+        HashMap<NodeIndex, crate::plan::deferred_region::ParentContinuation>,
 }
 
 impl ExecutionPlanDag {
@@ -895,6 +904,7 @@ impl ExecutionPlanDag {
             parallelism,
             node_properties: HashMap::new(),
             deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
         }
     }
 
@@ -929,6 +939,11 @@ impl ExecutionPlanDag {
             // Body NodeIndex space matches `body.graph`, so the keys
             // remain valid against the cloned graph above.
             deferred_regions: body.deferred_regions.clone(),
+            // Body-internal Composition continuations ride along the
+            // same way: when the outer body's dispatcher walks a
+            // nested Composition, it reads continuations from the same
+            // surface as the parent dispatcher uses.
+            parent_continuations: body.parent_continuations.clone(),
         }
     }
 
@@ -944,13 +959,19 @@ impl ExecutionPlanDag {
     }
 
     /// `true` iff `idx` is a non-producer participant in some deferred
-    /// region (member or output). Operator arms use this to skip work
-    /// on the forward pass — the deferred dispatch at commit will run
-    /// the operator on post-recompute aggregate emits.
+    /// region (member or output) OR a member/output of a Composition
+    /// parent-continuation. Operator arms use this to skip work on the
+    /// forward pass — the commit-time deferred dispatch will run the
+    /// operator on post-recompute data (aggregate emits or harvested
+    /// body output records, depending on the surface).
     pub(crate) fn is_deferred_consumer(&self, idx: NodeIndex) -> bool {
         self.deferred_regions
             .get(&idx)
             .is_some_and(|r| r.producer != idx)
+            || self
+                .parent_continuations
+                .values()
+                .any(|c| c.members.contains(&idx) || c.outputs.contains(&idx))
     }
 
     /// `Some(region)` iff `idx` is the producer of a deferred region.
@@ -4543,6 +4564,7 @@ mod port_tag_guard_tests {
             },
             node_properties: HashMap::new(),
             deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
         }
     }
 
@@ -4652,6 +4674,7 @@ mod port_tag_guard_tests {
             body_indices_to_build: Vec::new(),
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
         };
         artifacts.insert_body(body_id, body);
         let diags = diagnose_untagged_composition_edges(&dag, &artifacts);

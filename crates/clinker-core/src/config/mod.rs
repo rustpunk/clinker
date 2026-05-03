@@ -2163,7 +2163,7 @@ impl PipelineConfig {
         // disjoint by scope — body-local NodeIndex values can
         // numerically collide with parent-graph indices, so they live
         // on `BoundBody.deferred_regions`, not on the parent map.
-        let (top_regions, body_regions) = crate::plan::deferred_region::detect_deferred_regions(
+        let analysis = crate::plan::deferred_region::detect_deferred_regions(
             &dag.graph,
             &dag.node_properties,
             &artifacts,
@@ -2173,7 +2173,7 @@ impl PipelineConfig {
             petgraph::graph::NodeIndex,
             crate::plan::deferred_region::DeferredRegion,
         > = HashMap::new();
-        for region in top_regions {
+        for region in analysis.top_level {
             let producer = region.producer;
             let members = region.members.clone();
             let outputs = region.outputs.clone();
@@ -2182,8 +2182,9 @@ impl PipelineConfig {
             }
         }
         dag.deferred_regions = region_map;
+        dag.parent_continuations = analysis.top_continuations;
 
-        for (body_id, regions) in body_regions {
+        for (body_id, regions) in analysis.body_regions {
             let Some(body) = artifacts.composition_bodies.get_mut(&body_id) else {
                 continue;
             };
@@ -2194,6 +2195,15 @@ impl PipelineConfig {
                 for k in std::iter::once(producer).chain(members).chain(outputs) {
                     body.deferred_regions.insert(k, region.clone());
                 }
+            }
+        }
+
+        for (body_id, conts) in analysis.body_continuations {
+            let Some(body) = artifacts.composition_bodies.get_mut(&body_id) else {
+                continue;
+            };
+            for (idx, cont) in conts {
+                body.parent_continuations.insert(idx, cont);
             }
         }
 
