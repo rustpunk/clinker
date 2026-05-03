@@ -1024,6 +1024,111 @@ fn seed_from_node(node: &PlanNode, set: &mut HashSet<String>) {
     }
 }
 
+/// Union of column reads demanded by every parent operator that
+/// consumes records flowing out of `(body, port)`. Recurses through
+/// `PlanNode::Composition` continuation members via
+/// `analysis.body_call_sites` so demand chains across nested body
+/// boundaries; memoizes per `(body, port)` so deeply nested chains
+/// converge in O(call-graph edges).
+///
+/// `parent_graph` is the top-level DAG (used for call sites whose
+/// `scope == None`); per-body graphs are reached through
+/// `artifacts.body_of(scope)` for `scope == Some(_)` call sites.
+///
+/// # Panics
+///
+/// Panics if `(body, port)` is revisited while still on the active
+/// walk. Cycles are impossible by construction — `bind_schema` rejects
+/// recursive composition references at E107 — so a revisit signals a
+/// planner-side regression rather than a malformed user input.
+//
+// Caller wires up alongside the seed-threading change to pass_b_body in
+// the next commit; suppression is sprint-boundary acceptable per
+// CLAUDE.md (transitional state cleared before sprint close).
+#[allow(dead_code)]
+fn continuation_support(
+    body: CompositionBodyId,
+    port: &str,
+    analysis: &DeferredRegionAnalysis,
+    parent_graph: &DiGraph<PlanNode, PlanEdge>,
+    artifacts: &CompileArtifacts,
+    memo: &mut HashMap<(CompositionBodyId, String), HashSet<String>>,
+    active: &mut HashSet<(CompositionBodyId, String)>,
+) -> HashSet<String> {
+    let key = (body, port.to_string());
+    if let Some(cached) = memo.get(&key) {
+        return cached.clone();
+    }
+    if !active.insert(key.clone()) {
+        panic!(
+            "continuation_support revisited ({:?}, {:?}) during active walk; \
+             composition recursion is rejected at bind time (E107), so this \
+             indicates a planner-side regression in body_call_sites or the \
+             continuation maps",
+            body, port,
+        );
+    }
+
+    let mut acc: HashSet<String> = HashSet::new();
+    let call_sites: &[CompositionCallSite] = analysis
+        .body_call_sites
+        .get(&body)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    for call_site in call_sites {
+        let cont = match call_site.scope {
+            None => analysis.top_continuations.get(&call_site.composition_idx),
+            Some(s) => analysis
+                .body_continuations
+                .get(&s)
+                .and_then(|m| m.get(&call_site.composition_idx)),
+        };
+        let Some(cont) = cont else {
+            continue;
+        };
+
+        // Resolve the graph that contains this call site's continuation
+        // members. `scope=None` lives in the parent DAG; `scope=Some(s)`
+        // lives in the outer body's mini-DAG.
+        let containing_graph: &DiGraph<PlanNode, PlanEdge> = match call_site.scope {
+            None => parent_graph,
+            Some(s) => match artifacts.body_of(s) {
+                Some(b) => &b.graph,
+                None => continue,
+            },
+        };
+
+        for &member_idx in &cont.members {
+            let member_node = &containing_graph[member_idx];
+            if let PlanNode::Composition { body: inner, .. } = member_node {
+                if let Some(inner_body) = artifacts.body_of(*inner) {
+                    let inner_ports: Vec<String> =
+                        inner_body.output_port_to_node_idx.keys().cloned().collect();
+                    for inner_port in inner_ports {
+                        let nested = continuation_support(
+                            *inner,
+                            &inner_port,
+                            analysis,
+                            parent_graph,
+                            artifacts,
+                            memo,
+                            active,
+                        );
+                        acc.extend(nested);
+                    }
+                }
+            } else {
+                seed_from_node(member_node, &mut acc);
+            }
+        }
+    }
+
+    active.remove(&key);
+    memo.insert(key, acc.clone());
+    acc
+}
+
 /// Walk incoming edges from `start` until reaching an ancestor whose
 /// `stored_output_schema()` is `Some`. Skips row-preserving variants
 /// (Route / Sort / CorrelationCommit) that propagate their upstream's
