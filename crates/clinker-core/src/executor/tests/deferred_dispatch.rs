@@ -645,17 +645,14 @@ ENG,500
 /// (parent-scope); the HR contributing source rows surface as a DLQ
 /// trigger after the cascading-retraction loop converges.
 ///
-/// Architectural caveat: the current `recurse_into_body` runs the
-/// body's commit-time deferred dispatch but does NOT harvest the
-/// body's output port records back to the parent's
-/// `node_buffers[composition_idx]`. The parent Output therefore sees
-/// nothing — that propagation path is on the follow-up surface.
-/// This test pins what IS wired: the body's commit-pass DLQ trigger
-/// fires (proving `recurse_into_body` invoked the body's deferred
-/// dispatch), the body's relaxed aggregator was retracted (proving
-/// `recompute_aggregates` ran on body-local indices), and the source
-/// row is identifiable in the DLQ (proving the body's
-/// `detect_retract_scope` resolved synthetic-CK lineage).
+/// The body's commit-pass output-port records propagate through the
+/// body→parent harvest in `recurse_into_body`: the post-recompute
+/// ratio row for ENG is drained from the body's output-port slot,
+/// seeded into the parent's `node_buffers[composition_idx]`, and the
+/// parent's continuation (the Output node) runs through the same
+/// `dispatch_plan_node` arms with `in_deferred_dispatch=true`. The
+/// surviving (non-DLQ'd) row therefore reaches the parent Output;
+/// HR's failed contribution does not.
 #[test]
 fn composition_body_relaxed_aggregate_runs_under_commit_time_dispatch() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -810,21 +807,60 @@ o6,ENG,300
         "DLQ must carry an entry whose original_record references HR; got: {:?}",
         report.dlq_entries
     );
+
+    // Body→parent harvest + continuation dispatch: ENG's surviving
+    // (non-DLQ) row must reach the parent Output through the new
+    // commit-pass harvest path. The body's commit-time deferred
+    // dispatcher emits the post-recompute ratio row through the body's
+    // output port; `recurse_into_body` harvests that row into the
+    // parent's `node_buffers[composition_idx]` slot and drives the
+    // parent continuation (just the Output node here) on the same
+    // commit pass.
+    let written = buf.as_string();
+    let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        body_lines.len() >= 2,
+        "expected header + at least ENG row in writer output, got {body_lines:?}"
+    );
+    let rows: Vec<&str> = body_lines.iter().skip(1).copied().collect();
+    let eng = rows
+        .iter()
+        .find(|r| r.contains("ENG"))
+        .copied()
+        .unwrap_or_else(|| {
+            panic!("ENG row must reach parent Output via harvest path; got rows {rows:?}")
+        });
+    assert!(
+        eng.contains("600"),
+        "ENG row must carry the body Aggregate's post-recompute total=600; got {eng:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("HR")),
+        "HR was DLQ'd by the body Transform's /0 — it must NOT appear in the writer output; got rows {rows:?}"
+    );
 }
 
 /// Recursive composition: outer body wraps inner body whose internal
 /// Aggregate is relaxed-CK and whose downstream Transform fails on
 /// the HR aggregate emit. The orchestrator's commit-time deferred
 /// dispatcher walks parent-graph regions (none), then iterates every
-/// parent-graph Composition node and recurses into bound bodies whose
-/// `deferred_regions` are non-empty. The OUTER body has no deferred
-/// regions of its own (its internals are pure passthroughs), so the
-/// outer recursion would skip — but the outer body executes the inner
-/// composition during the FORWARD pass, retaining the inner body's
-/// aggregator state. Re-entering the outer body's recurse explicitly
-/// must propagate to the inner body's `recurse_into_body` so the
-/// inner's commit-pass dispatch fires and its body Transform's /0
-/// surfaces in the DLQ.
+/// parent-graph Composition node and recurses into bound bodies that
+/// (transitively) carry a deferred region. The outer body has no
+/// deferred region of its own but its inner body does, so the outer
+/// recurse fires and propagates into the inner body's
+/// `recurse_into_body`, where the inner's commit-pass dispatch fires
+/// and its body Transform's /0 surfaces in the DLQ.
+///
+/// The body→parent harvest then chains across both nesting levels:
+/// the inner body's commit-pass output port records flow into the
+/// outer body's `node_buffers[inner_composition_idx]`; the outer
+/// body's continuation walk is empty here (the outer body is a pure
+/// passthrough wrapping the inner Composition), but the outer body's
+/// own output port surfaces those same records back to the parent's
+/// `node_buffers[outer_composition_idx]` via a second harvest, and
+/// the parent's continuation (just the Output node) runs over them.
+/// ENG's surviving row therefore reaches the parent Output; HR does
+/// not.
 #[test]
 fn recursive_composition_inner_body_relaxed_aggregate_dispatches_at_commit() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -1004,6 +1040,37 @@ o6,ENG,300
         "DLQ must carry the HR-tagged trigger from the inner body's \
          deferred region; got: {:?}",
         report.dlq_entries
+    );
+
+    // Body→parent harvest chains across both nesting levels: the
+    // inner body's post-recompute ratio row for ENG flows through
+    // the inner output port into the outer body's
+    // `node_buffers[inner_comp_idx]`, then through the outer output
+    // port into the parent's `node_buffers[outer_comp_idx]`, and the
+    // parent's continuation drives the Output node over it. ENG's
+    // surviving row must land in the writer; HR was DLQ'd by the
+    // inner body Transform's /0 and must NOT appear.
+    let written = buf.as_string();
+    let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        body_lines.len() >= 2,
+        "expected header + at least ENG row in writer output, got {body_lines:?}"
+    );
+    let rows: Vec<&str> = body_lines.iter().skip(1).copied().collect();
+    let eng = rows
+        .iter()
+        .find(|r| r.contains("ENG"))
+        .copied()
+        .unwrap_or_else(|| {
+            panic!("ENG row must reach parent Output via two-level harvest; got rows {rows:?}")
+        });
+    assert!(
+        eng.contains("600"),
+        "ENG row must carry the inner Aggregate's post-recompute total=600; got {eng:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("HR")),
+        "HR was DLQ'd by the inner body Transform's /0 — it must NOT appear in the writer output; got rows {rows:?}"
     );
 }
 

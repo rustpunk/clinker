@@ -501,32 +501,53 @@ fn tee_emit_to_region_input_buffers(
     if crossing_edges.is_empty() {
         return Ok(());
     }
-    // Approximate per-row cost: per-Value payload + tuple overhead.
-    // Mirrors the windowed Transform's per-row charge to keep both
-    // admission paths consistent against a single shared budget.
-    let row_bytes_each: u64 = emit_rows
+    for edge_id in crossing_edges {
+        charge_harvest_admission(ctx, emit_rows)?;
+        for (record, rn) in emit_rows {
+            ctx.region_input_buffers
+                .entry((active_body, edge_id))
+                .or_default()
+                .push((record.clone(), *rn));
+        }
+    }
+    Ok(())
+}
+
+/// Per-row arena charge against `ctx.memory_budget` for records about
+/// to be admitted into a deferred-region buffer (cross-region tee on
+/// the forward pass, body→parent harvest on the commit pass). Returns
+/// the same `E310`-shape `PipelineError::Compilation` as the windowed
+/// Transform's buffer-recompute path so every admission site fails
+/// uniformly when the per-pipeline memory limit is exhausted.
+///
+/// Per-row size mirrors the per-Value-slot accounting the cross-region
+/// tee uses so a runaway body cannot evade the per-pipeline budget by
+/// routing its output through the harvest path instead of the
+/// forward-pass tee.
+pub(crate) fn charge_harvest_admission(
+    ctx: &mut ExecutorContext<'_>,
+    rows: &[(Record, u64)],
+) -> Result<(), PipelineError> {
+    let row_bytes_each: u64 = rows
         .first()
         .map(|(rec, _)| {
             (std::mem::size_of::<Value>() * rec.schema().column_count()
                 + std::mem::size_of::<(Record, u64)>()) as u64
         })
         .unwrap_or(0);
-    for edge_id in crossing_edges {
-        for (record, rn) in emit_rows {
-            if row_bytes_each > 0 && ctx.memory_budget.charge_arena_bytes(row_bytes_each) {
-                return Err(PipelineError::Compilation {
-                    transform_name: String::new(),
-                    messages: vec![format!(
-                        "E310 deferred-region buffer admission exceeded \
-                         memory limit: hard limit {}",
-                        ctx.memory_budget.hard_limit()
-                    )],
-                });
-            }
-            ctx.region_input_buffers
-                .entry((active_body, edge_id))
-                .or_default()
-                .push((record.clone(), *rn));
+    if row_bytes_each == 0 {
+        return Ok(());
+    }
+    for _ in rows {
+        if ctx.memory_budget.charge_arena_bytes(row_bytes_each) {
+            return Err(PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: vec![format!(
+                    "E310 deferred-region buffer admission exceeded \
+                     memory limit: hard limit {}",
+                    ctx.memory_budget.hard_limit()
+                )],
+            });
         }
     }
     Ok(())

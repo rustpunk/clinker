@@ -46,7 +46,7 @@ use super::detect::RetractScope;
 use crate::error::PipelineError;
 use crate::executor::dispatch::{ExecutorContext, dispatch_plan_node};
 use crate::plan::CompositionBodyId;
-use crate::plan::deferred_region::DeferredRegion;
+use crate::plan::deferred_region::{DeferredRegion, ParentContinuation};
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// Walk every [`DeferredRegion`] reachable from `current_dag` (top-level
@@ -153,7 +153,15 @@ fn dispatch_deferred_inner(
         // Recurse when the body OR any descendant body carries a
         // deferred region. A pure-passthrough wrapper body (no
         // deferred region of its own) still owns the parent path
-        // through which a nested body's deferred dispatch must fire.
+        // through which a nested body's deferred dispatch must fire,
+        // and the parent-continuation harvest must run for any
+        // Composition whose body has a `parent_continuations` entry —
+        // both cases are subsumed by
+        // `body_or_descendants_have_deferred_region`, which returns
+        // true exactly when at least one body in the chain carries a
+        // deferred region (the same predicate the plan-time
+        // continuation walker uses to decide whether to record a
+        // continuation in the first place).
         let needs_recurse = ctx.artifacts.body_of(body_id).is_some_and(|b| {
             crate::plan::composition_body::body_or_descendants_have_deferred_region(
                 ctx.artifacts,
@@ -324,7 +332,11 @@ fn seed_cross_region_inputs_for(
 /// `execute_composition_body` does, run a body-scoped detect +
 /// recompute against the body's relaxed-CK aggregates, recursively
 /// dispatch the body's deferred regions on the body's transient DAG,
-/// then restore parent scope.
+/// harvest the body's output-port records back to the parent's
+/// `node_buffers[composition_idx]` slot, then drive the parent's
+/// continuation (operators downstream of the Composition node,
+/// recorded plan-time in `parent_dag.parent_continuations`) through
+/// the same `dispatch_plan_node` arms with `in_deferred_dispatch=true`.
 ///
 /// Scope is per-DAG: the body's recompute fires only on body-internal
 /// relaxed-CK aggregates (those whose `node_idx` lives in the body's
@@ -336,17 +348,15 @@ fn seed_cross_region_inputs_for(
 /// effect inside the body's `relaxed_aggregator_states` keyed by
 /// body-local indices, and vice versa.
 ///
-/// The composition's output port records are NOT re-harvested to the
-/// parent's `node_buffers[composition_idx]` slot here. The parent
-/// region (if any) does not re-execute the Composition arm on the
-/// commit pass; the parent's downstream members already saw the
-/// forward-pass composition emit. Cross-scope harvest of the body's
-/// post-recompute output back to the parent's commit pass is a
-/// follow-up — only relevant when a body-internal aggregate's
-/// post-retract emit must propagate through a parent-side deferred
-/// operator, which today's compose surface does not produce because
-/// every parent region treats Composition as a passthrough for
-/// `buffer_schema` propagation.
+/// Harvest order: the body's commit-pass output-port records are
+/// drained from `node_buffers` BEFORE the parent-scope swap restores
+/// the parent's buffers (otherwise the body-local entries would be
+/// dropped on the floor). After the swap, the harvested rows are
+/// charged against the per-pipeline memory budget via
+/// `charge_harvest_admission` and seeded into the parent's slot. The
+/// continuation walk then runs against the parent DAG so its members
+/// see the seeded slot via the same predecessor-walk logic the
+/// forward pass uses.
 fn recurse_into_body(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
@@ -354,9 +364,6 @@ fn recurse_into_body(
     body_id: CompositionBodyId,
     events: &mut Vec<DlqEvent>,
 ) -> Result<(), PipelineError> {
-    let _ = composition_idx;
-    let _ = parent_dag;
-
     let bound_body = match ctx.artifacts.body_of(body_id) {
         Some(b) => b,
         None => return Ok(()),
@@ -384,7 +391,7 @@ fn recurse_into_body(
     ctx.window_runtime.bodies.insert(body_id, body_window_vec);
     ctx.window_runtime.active_stack.push(body_id);
 
-    let walk_result = (|| -> Result<(), PipelineError> {
+    let walk_and_harvest = (|| -> Result<Vec<(Record, u64)>, PipelineError> {
         // Body-scoped detect + recompute: detect against the body's
         // own DAG so the producer/region walk uses body-local
         // NodeIndices; recompute against that body scope so each
@@ -438,18 +445,119 @@ fn recurse_into_body(
 
         let inner_events = dispatch_deferred_subdag(ctx, &body_dag, &body_scope)?;
         events.extend(inner_events);
-        Ok(())
+
+        // Drain every declared output port BEFORE the parent-scope
+        // swap drops body buffers. `output_port_to_node_idx` is
+        // order-stable (IndexMap); today's bodies declare exactly one
+        // port, but draining the full set keeps a future multi-port
+        // body covered without an extra code path.
+        let mut harvested: Vec<(Record, u64)> = Vec::new();
+        for body_out_idx in bound_body.output_port_to_node_idx.values() {
+            if let Some(rows) = ctx.node_buffers.remove(body_out_idx) {
+                harvested.extend(rows);
+            }
+        }
+        Ok(harvested)
     })();
 
-    // Restore parent scope. The window-runtime body overlay is
-    // popped first so subsequent parent-scope walks route through
-    // `top` again, mirroring the forward-pass body executor's exit
-    // ordering.
+    // Restore parent scope on every exit. The window-runtime body
+    // overlay is popped first so subsequent parent-scope walks route
+    // through `top` again, mirroring the forward-pass body executor's
+    // exit ordering.
     ctx.window_runtime.active_stack.pop();
     ctx.window_runtime.bodies.remove(&body_id);
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.combine_source_records = saved_combine;
     ctx.node_buffers = saved_buffers;
 
-    walk_result
+    let harvested = walk_and_harvest?;
+
+    if !harvested.is_empty() {
+        // Speculative parent-scope admission — same per-row charge
+        // the forward-pass `tee_emit_to_region_input_buffers` applies,
+        // so a runaway body cannot evade the per-pipeline budget by
+        // routing its output through the harvest path instead.
+        crate::executor::dispatch::charge_harvest_admission(ctx, &harvested)?;
+        ctx.node_buffers
+            .entry(composition_idx)
+            .or_default()
+            .extend(harvested);
+    }
+
+    if let Some(continuation) = parent_dag
+        .parent_continuations
+        .get(&composition_idx)
+        .cloned()
+    {
+        dispatch_continuation(ctx, parent_dag, &continuation, events)?;
+    }
+
+    Ok(())
+}
+
+/// Walk the parent-DAG continuation downstream of a Composition node
+/// in topological order, filtered to the continuation participants
+/// (`composition_idx ∪ members ∪ outputs`), driving each non-seed
+/// node through `dispatch_plan_node` with `in_deferred_dispatch=true`.
+///
+/// The seed Composition node is skipped — its `node_buffers` slot is
+/// already populated by the harvest, and redispatching the
+/// Composition arm would re-execute the body's forward pass on stale
+/// baseline buffers. Members and outputs run.
+///
+/// Captures any DLQ entries the dispatched arms produce into `events`
+/// so the orchestrator's outer cascading-retract loop sees them and
+/// can widen the next iteration's scope.
+fn dispatch_continuation(
+    ctx: &mut ExecutorContext<'_>,
+    parent_dag: &ExecutionPlanDag,
+    continuation: &ParentContinuation,
+    events: &mut Vec<DlqEvent>,
+) -> Result<(), PipelineError> {
+    let in_continuation: HashSet<NodeIndex> = continuation
+        .members
+        .iter()
+        .chain(continuation.outputs.iter())
+        .chain(std::iter::once(&continuation.composition_idx))
+        .copied()
+        .collect();
+
+    let mut topo_walk = Topo::new(&parent_dag.graph);
+    let mut topo: Vec<NodeIndex> = Vec::new();
+    while let Some(idx) = topo_walk.next(&parent_dag.graph) {
+        if in_continuation.contains(&idx) {
+            topo.push(idx);
+        }
+    }
+
+    // Clear stale forward-pass `node_buffers` entries for non-seed
+    // continuation participants. Route's branch dispatch (and similar
+    // own-buffer-write arms) parks records into successor slots
+    // BEFORE the consumer arm short-circuits on the deferred guard,
+    // so those slots carry pre-harvest records the commit pass must
+    // not re-read. The Composition seed's slot is preserved — it
+    // carries the harvest.
+    for &m in &continuation.members {
+        ctx.node_buffers.remove(&m);
+    }
+    for &o in &continuation.outputs {
+        ctx.node_buffers.remove(&o);
+    }
+
+    for idx in topo {
+        if idx == continuation.composition_idx {
+            continue;
+        }
+        let dlq_len_before = ctx.dlq_entries.len();
+        dispatch_plan_node(ctx, parent_dag, idx)?;
+        if ctx.dlq_entries.len() > dlq_len_before {
+            for entry in &ctx.dlq_entries[dlq_len_before..] {
+                events.push(DlqEvent {
+                    source_row: entry.source_row,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
