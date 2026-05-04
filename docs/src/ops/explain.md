@@ -123,7 +123,6 @@ Group cardinality is honestly surfaced as "unknown at plan time" -- the planner 
 `clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:
 
 ```bash
-clinker explain --code E15W   # non-deterministic CXL builtin downstream of a retraction-mode aggregate
 clinker explain --code E15Y   # retraction-mode aggregate incompatible with strategy: streaming
 ```
 

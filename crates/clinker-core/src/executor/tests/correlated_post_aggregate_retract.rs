@@ -192,6 +192,123 @@ O9,ENG,300
     );
 }
 
+/// Cascading-retraction loop convergence on a downstream-Transform
+/// trigger. The deferred-region Transform throws divide-by-zero on a
+/// recomputed aggregate value at commit time; the orchestrator folds
+/// the failure into the next iteration's retract scope; the failing
+/// aggregate's contributors are retracted via the synthetic-CK
+/// lineage; the converged output excludes the failing department.
+///
+/// Companion to `post_aggregate_failure_retracts_every_contributing_source_row`
+/// above: that test asserts bit-for-bit equivalence against a baseline
+/// rerun. This test directly exercises loop semantics — exactly two
+/// iterations run (the seed pass that surfaces the /0 trigger plus
+/// one cascading pass that reruns dispatch with the HR rows added to
+/// the retract scope; the third call would observe an empty
+/// expand-delta and break before incrementing). The fixture mirrors
+/// the bit-for-bit test's shape so a regression in either surfaces
+/// the same failure mode.
+#[test]
+fn cascading_retraction_loop_converges_and_excludes_failing_partition() {
+    let yaml = r#"
+pipeline:
+  name: cascading_retract
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_totals
+  input: src
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: transform
+  name: ratio
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+      emit ratio = 1 / (total - 60)
+- type: output
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "\
+order_id,department,amount
+o1,HR,10
+o2,HR,10
+o3,HR,10
+o4,HR,10
+o5,HR,10
+o6,HR,10
+o7,ENG,100
+o8,ENG,200
+o9,ENG,300
+";
+
+    let (counters, _dlq, output) =
+        run_pipeline(yaml, csv).expect("cascading-retract pipeline must converge");
+
+    let body_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        body_lines
+            .iter()
+            .skip(1)
+            .all(|line| !line.starts_with("HR,")),
+        "HR partition retracted across the cascading-retraction loop; \
+         must not appear in the converged output. Got: {body_lines:?}"
+    );
+    assert!(
+        body_lines
+            .iter()
+            .skip(1)
+            .any(|line| line.starts_with("ENG,")),
+        "ENG partition survives (its aggregate emit does not trigger /0); \
+         must reach the writer. Got: {body_lines:?}"
+    );
+
+    assert!(
+        counters.dlq_count >= 1,
+        "the HR aggregate emit's /0 lands in the DLQ; got {}",
+        counters.dlq_count
+    );
+    assert!(
+        counters.retraction.groups_recomputed >= 1,
+        "the cascading-retraction loop recomputes at least one group; got {}",
+        counters.retraction.groups_recomputed
+    );
+    // Two iterations: the seed iteration retracts no rows and discovers
+    // the /0 trigger at commit; the second iteration runs recompute +
+    // dispatch with the HR contributing rows added to the retract
+    // scope, then `expand_with_dlq_events` returns an empty delta and
+    // the loop breaks before a third increment.
+    assert_eq!(
+        counters.retraction.iterations, 2,
+        "cascading-retraction loop must converge in exactly two \
+         iterations on this fixture (seed + one cascade); got {}",
+        counters.retraction.iterations
+    );
+}
+
 /// Aggregator state degraded mid-run (tiny memory budget forces spill
 /// or buffer-mode admission failure). When the relaxed-CK aggregator
 /// has no retained state for the failing group, the synthetic-CK

@@ -2331,6 +2331,7 @@ mod tests {
             },
             node_properties: std::collections::HashMap::new(),
             deferred_regions: std::collections::HashMap::new(),
+            parent_continuations: std::collections::HashMap::new(),
         };
         (plan, artifacts)
     }
@@ -2645,6 +2646,7 @@ mod tests {
             },
             node_properties: std::collections::HashMap::new(),
             deferred_regions: std::collections::HashMap::new(),
+            parent_continuations: std::collections::HashMap::new(),
         };
         (plan, artifacts, merged_row)
     }

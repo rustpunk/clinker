@@ -163,27 +163,11 @@ O6,ENG,200
         counters.retraction.groups_recomputed
     );
 
-    // subdag_replay_rows is iteratively summed across replay layers.
-    // The post-aggregate sub-DAG here is Aggregate → Output, one hop,
-    // so the counter equals the number of deltas times the number of
-    // replay iterations the loop visits.
-    assert!(
-        counters.retraction.subdag_replay_rows >= 1,
-        "subdag_replay_rows must increment on relaxed retract, got {}",
-        counters.retraction.subdag_replay_rows
-    );
-
-    // output_rows_retracted_total counts buffered output cells the
-    // flush phase substituted. The HR aggregate output reaches the
-    // buffer and gets retracted in place.
-    assert!(
-        counters.retraction.output_rows_retracted_total >= 1,
-        "output_rows_retracted_total must increment on relaxed retract, got {}",
-        counters.retraction.output_rows_retracted_total
-    );
-
-    // No window in this fixture, no degrade fallback expected.
-    assert_eq!(counters.retraction.partitions_recomputed, 0);
+    // No window in this fixture (Aggregate → Output sub-DAG, one
+    // hop), so the deferred-region commit pass never re-evaluates a
+    // windowed Transform and `partitions_dispatched` stays at zero.
+    // No degrade fallback either.
+    assert_eq!(counters.retraction.partitions_dispatched, 0);
     assert_eq!(counters.retraction.degrade_fallback_count, 0);
 }
 
@@ -203,9 +187,8 @@ O3,20
 
     let r = &counters.retraction;
     assert_eq!(r.groups_recomputed, 0);
-    assert_eq!(r.partitions_recomputed, 0);
-    assert_eq!(r.subdag_replay_rows, 0);
-    assert_eq!(r.output_rows_retracted_total, 0);
+    assert_eq!(r.partitions_dispatched, 0);
+    assert_eq!(r.iterations, 0);
     assert_eq!(r.degrade_fallback_count, 0);
 }
 
@@ -214,9 +197,8 @@ fn retraction_metrics_serializes_via_spool_payload() {
     // Verify the runtime → spool conversion preserves every field.
     let runtime = clinker_record::RetractionCounters {
         groups_recomputed: 3,
-        partitions_recomputed: 1,
-        subdag_replay_rows: 17,
-        output_rows_retracted_total: 4,
+        partitions_dispatched: 1,
+        iterations: 4,
         degrade_fallback_count: 2,
         synthetic_ck_columns_emitted_total: 11,
         synthetic_ck_fanout_lookups_total: 5,
@@ -225,9 +207,8 @@ fn retraction_metrics_serializes_via_spool_payload() {
 
     let payload = RetractionMetrics::from(&runtime);
     assert_eq!(payload.groups_recomputed, 3);
-    assert_eq!(payload.partitions_recomputed, 1);
-    assert_eq!(payload.subdag_replay_rows, 17);
-    assert_eq!(payload.output_rows_retracted_total, 4);
+    assert_eq!(payload.partitions_dispatched, 1);
+    assert_eq!(payload.iterations, 4);
     assert_eq!(payload.degrade_fallback_count, 2);
     assert_eq!(payload.synthetic_ck_columns_emitted_total, 11);
     assert_eq!(payload.synthetic_ck_fanout_lookups_total, 5);
@@ -237,9 +218,8 @@ fn retraction_metrics_serializes_via_spool_payload() {
     // fields under a `retraction` object.
     let json = serde_json::to_string(&payload).expect("ser");
     assert!(json.contains("\"groups_recomputed\":3"));
-    assert!(json.contains("\"partitions_recomputed\":1"));
-    assert!(json.contains("\"subdag_replay_rows\":17"));
-    assert!(json.contains("\"output_rows_retracted_total\":4"));
+    assert!(json.contains("\"partitions_dispatched\":1"));
+    assert!(json.contains("\"iterations\":4"));
     assert!(json.contains("\"degrade_fallback_count\":2"));
     assert!(json.contains("\"synthetic_ck_columns_emitted_total\":11"));
     assert!(json.contains("\"synthetic_ck_fanout_lookups_total\":5"));

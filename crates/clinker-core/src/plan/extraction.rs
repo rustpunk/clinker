@@ -478,6 +478,7 @@ mod tests {
             },
             node_properties: Default::default(),
             deferred_regions: Default::default(),
+            parent_continuations: Default::default(),
         }
     }
 

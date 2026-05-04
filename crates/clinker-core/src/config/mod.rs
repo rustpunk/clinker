@@ -2030,16 +2030,14 @@ impl PipelineConfig {
                 .unwrap_or(4),
         };
 
-        let mut dag = ExecutionPlanDag {
+        let mut dag = ExecutionPlanDag::from_parts(
             graph,
             topo_order,
             source_dag,
-            indices_to_build: indices,
+            indices,
             output_projections,
             parallelism,
-            node_properties: HashMap::new(),
-            deferred_regions: HashMap::new(),
-        };
+        );
 
         // ── Enrichment pipeline ─────────────────────────────────────
         let source_bodies: Vec<&crate::config::pipeline_node::SourceBody> =
@@ -2165,16 +2163,17 @@ impl PipelineConfig {
         // disjoint by scope — body-local NodeIndex values can
         // numerically collide with parent-graph indices, so they live
         // on `BoundBody.deferred_regions`, not on the parent map.
-        let (top_regions, body_regions) = crate::plan::deferred_region::detect_deferred_regions(
+        let analysis = crate::plan::deferred_region::detect_deferred_regions(
             &dag.graph,
             &dag.node_properties,
             &artifacts,
+            &dag.indices_to_build,
         );
         let mut region_map: HashMap<
             petgraph::graph::NodeIndex,
             crate::plan::deferred_region::DeferredRegion,
         > = HashMap::new();
-        for region in top_regions {
+        for region in analysis.top_level {
             let producer = region.producer;
             let members = region.members.clone();
             let outputs = region.outputs.clone();
@@ -2183,8 +2182,9 @@ impl PipelineConfig {
             }
         }
         dag.deferred_regions = region_map;
+        dag.parent_continuations = analysis.top_continuations;
 
-        for (body_id, regions) in body_regions {
+        for (body_id, regions) in analysis.body_regions {
             let Some(body) = artifacts.composition_bodies.get_mut(&body_id) else {
                 continue;
             };
@@ -2195,6 +2195,15 @@ impl PipelineConfig {
                 for k in std::iter::once(producer).chain(members).chain(outputs) {
                     body.deferred_regions.insert(k, region.clone());
                 }
+            }
+        }
+
+        for (body_id, conts) in analysis.body_continuations {
+            let Some(body) = artifacts.composition_bodies.get_mut(&body_id) else {
+                continue;
+            };
+            for (idx, cont) in conts {
+                body.parent_continuations.insert(idx, cont);
             }
         }
 
@@ -2379,92 +2388,6 @@ impl PipelineConfig {
                         LabeledSpan::primary(node.span(), String::new()),
                     ));
                 }
-            }
-        }
-
-        // E15W — content-relaxed aggregate + non-deterministic operator
-        // downstream. The correlation-commit replay phase rewrites
-        // affected aggregate output rows by re-running the deterministic
-        // portion of the post-aggregate sub-DAG; a Transform that calls
-        // `now` (or any future non-deterministic builtin) would produce
-        // a different value on replay than at first execution, breaking
-        // the post-retract substitution proof. Reject at compile time
-        // so users see the limitation before they hit a silent diverge
-        // at runtime.
-        let relaxed_aggs_present = dag.graph.node_indices().any(|idx| {
-            let crate::plan::execution::PlanNode::Aggregation { config, .. } = &dag.graph[idx]
-            else {
-                return false;
-            };
-            let parent_ck = dag
-                .graph
-                .neighbors_directed(idx, petgraph::Direction::Incoming)
-                .next()
-                .and_then(|p| dag.node_properties.get(&p))
-                .map(|p| p.ck_set.clone())
-                .unwrap_or_default();
-            crate::plan::execution::group_by_omits_any_ck_field(&config.group_by, &parent_ck)
-        });
-        if relaxed_aggs_present {
-            for node in dag.graph.node_weights() {
-                if let crate::plan::execution::PlanNode::Transform {
-                    name,
-                    resolved: Some(payload),
-                    ..
-                } = node
-                    && crate::plan::execution::cxl_has_nondeterministic_call(&payload.typed)
-                {
-                    diags.push(Diagnostic::error(
-                        "E15W",
-                        format!(
-                            "E15W transform '{}' calls a non-deterministic CXL builtin \
-                             (e.g. `now`) downstream of an aggregate that activates the \
-                             retraction protocol. Replay during correlation-commit would \
-                             not produce the same row twice, breaking the post-retract \
-                             substitution proof. Remove the non-deterministic call, or \
-                             include every correlation-key field in the aggregate's \
-                             `group_by` so the aggregate stays on the strict-collateral \
-                             path.",
-                            name
-                        ),
-                        LabeledSpan::primary(node.span(), String::new()),
-                    ));
-                }
-            }
-
-            // Chained-aggregate stack guard. When a content-relaxed
-            // aggregate feeds another aggregate whose `group_by` does
-            // NOT cover the parent's visible CK set, the runtime
-            // cannot prove correct retraction propagation: the inner
-            // retract delta would have to thread through the outer
-            // aggregator's accumulator state, which has no lineage
-            // entry for the inner-aggregate output rows. Reject at
-            // plan time so the user sees the limit before they hit
-            // silent corruption at runtime. The outer aggregate is
-            // safe iff its `group_by` covers every CK field its
-            // upstream lattice carries — then it stays on the strict-
-            // collateral path and observes inner retract effects only
-            // through the wholesale group rebuild.
-            let chained_violations = collect_chained_aggregate_e15w_violations(&dag);
-            for (downstream_node_idx, upstream_name) in chained_violations {
-                let node = &dag.graph[downstream_node_idx];
-                let downstream_name = node.name();
-                diags.push(Diagnostic::error(
-                    "E15W",
-                    format!(
-                        "E15W aggregate '{}' is downstream of relaxed aggregate '{}' but \
-                         its `group_by` omits at least one correlation-key field visible \
-                         upstream. The runtime cannot prove correct retraction propagation \
-                         through chained aggregates with narrower group_by than the upstream \
-                         CK lattice — the outer aggregate's accumulator state holds no \
-                         lineage entry for the inner aggregate's output rows. \
-                         Either widen the downstream `group_by` to include every \
-                         correlation-key field flowing in, or restructure the pipeline so \
-                         the relaxed aggregate is terminal.",
-                        downstream_name, upstream_name
-                    ),
-                    LabeledSpan::primary(node.span(), String::new()),
-                ));
             }
         }
 
@@ -3639,131 +3562,4 @@ fn extend_aggregate_group_by_with_shadow_in_body(
         parent_ck_set.insert(idx, ck);
     }
     extend_aggregate_group_by_with_shadow_for_graph(&mut body.graph, &parent_ck_set);
-}
-
-/// Find every (downstream-aggregate, upstream-aggregate-name) pair that
-/// constitutes a chained-aggregate retraction violation under the
-/// pipeline correlation key.
-///
-/// A chained aggregate is a `PlanNode::Aggregation` reachable downstream
-/// (transitively) of another `PlanNode::Aggregation`. The downstream
-/// aggregate violates the retraction protocol's substitution proof when
-/// the *upstream* aggregate is content-relaxed (its `group_by` omits a
-/// correlation-key field, activating the retraction protocol) AND the
-/// downstream aggregate's `group_by` omits any correlation-key field.
-/// The downstream aggregate then has no lineage entry through which the
-/// inner retract can rebuild its accumulator state, and the runtime
-/// would silently produce stale output.
-///
-/// Returns one entry per violating downstream aggregate; the first
-/// upstream relaxed aggregate found is reported as the cause for the
-/// diagnostic message. Multiple distinct upstream aggregates feeding
-/// the same downstream collapse to a single diagnostic — the user
-/// resolution (widen the downstream `group_by` or restructure) is the
-/// same regardless of which upstream they look at first.
-fn collect_chained_aggregate_e15w_violations(
-    dag: &crate::plan::execution::ExecutionPlanDag,
-) -> Vec<(petgraph::graph::NodeIndex, String)> {
-    use crate::plan::execution::{PlanNode, group_by_omits_any_ck_field};
-    use petgraph::Direction;
-    use petgraph::graph::NodeIndex;
-    use petgraph::visit::EdgeRef;
-    use std::collections::{BTreeSet, HashSet, VecDeque};
-
-    let aggregate_parent_ck = |idx: NodeIndex| -> BTreeSet<String> {
-        dag.graph
-            .neighbors_directed(idx, Direction::Incoming)
-            .next()
-            .and_then(|p| dag.node_properties.get(&p))
-            .map(|p| p.ck_set.clone())
-            .unwrap_or_default()
-    };
-
-    // Collect the union of source-level CK fields reachable upstream
-    // of `start`. Used to compute the originally-contributing CK set
-    // for the chained-aggregate violation test below; once a relaxed
-    // aggregate has run, the lattice value at the downstream
-    // aggregate's parent has dropped the CK fields the inner aggregate
-    // omitted, so the lattice alone cannot tell whether the downstream
-    // group_by would cover the original source identity.
-    let upstream_source_ck = |start: NodeIndex| -> BTreeSet<String> {
-        let mut visited: HashSet<NodeIndex> = HashSet::new();
-        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
-        queue.push_back(start);
-        let mut acc: BTreeSet<String> = BTreeSet::new();
-        while let Some(idx) = queue.pop_front() {
-            if !visited.insert(idx) {
-                continue;
-            }
-            if matches!(dag.graph[idx], PlanNode::Source { .. })
-                && let Some(props) = dag.node_properties.get(&idx)
-            {
-                acc.extend(props.ck_set.iter().cloned());
-            }
-            for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
-                queue.push_back(edge.source());
-            }
-        }
-        acc
-    };
-
-    let mut findings: Vec<(NodeIndex, String)> = Vec::new();
-
-    for downstream_idx in dag.graph.node_indices() {
-        let PlanNode::Aggregation { config, .. } = &dag.graph[downstream_idx] else {
-            continue;
-        };
-
-        // BFS upstream from the downstream aggregate, looking for the
-        // first relaxed aggregate ancestor. `seen` prevents revisits in
-        // a diamond-shaped DAG.
-        let mut seen: HashSet<NodeIndex> = HashSet::new();
-        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
-        for edge in dag
-            .graph
-            .edges_directed(downstream_idx, Direction::Incoming)
-        {
-            let pred = edge.source();
-            if seen.insert(pred) {
-                queue.push_back(pred);
-            }
-        }
-        let mut upstream_relaxed_name: Option<String> = None;
-        while let Some(idx) = queue.pop_front() {
-            if let PlanNode::Aggregation {
-                name,
-                config: upstream_cfg,
-                ..
-            } = &dag.graph[idx]
-            {
-                let upstream_parent_ck = aggregate_parent_ck(idx);
-                if group_by_omits_any_ck_field(&upstream_cfg.group_by, &upstream_parent_ck) {
-                    upstream_relaxed_name = Some(name.clone());
-                    break;
-                }
-            }
-            for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
-                let pred = edge.source();
-                if seen.insert(pred) {
-                    queue.push_back(pred);
-                }
-            }
-        }
-        let Some(upstream_name) = upstream_relaxed_name else {
-            continue;
-        };
-
-        // The downstream aggregate is safe iff its `group_by` covers
-        // every source-level CK field flowing in. The lattice at the
-        // downstream parent has been narrowed by the inner relaxed
-        // aggregate, so we walk to the source roots to recover the
-        // original CK identity that needs to be preserved.
-        let source_ck = upstream_source_ck(downstream_idx);
-        if !group_by_omits_any_ck_field(&config.group_by, &source_ck) {
-            continue;
-        }
-        findings.push((downstream_idx, upstream_name));
-    }
-
-    findings
 }

@@ -1,23 +1,21 @@
-//! Phase 1: detect retract scope.
+//! Detect retract scope (orchestrator step 1 of 3).
 //!
 //! Walks `ctx.correlation_buffers` for groups carrying at least one
 //! `error_rows` entry (the trigger set), then expands each to a set of
 //! affected `(aggregate_node, group_key)` pairs by intersecting the
 //! trigger group's CK fields with each downstream Aggregate's
-//! `group_by`. The window-affected list runs the same expansion against
-//! every Transform with a buffer-recompute IndexSpec, mapping retract
-//! row IDs to the partitions they originally landed in.
+//! `group_by`.
 
 use std::collections::{BTreeSet, HashMap};
 
 use clinker_record::{FieldMetadata, GroupByKey, Schema};
 use petgraph::graph::NodeIndex;
 
+use super::DlqEvent;
 use crate::executor::dispatch::ExecutorContext;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 
-/// Output of the detect phase. Consumed by `recompute_agg`,
-/// `recompute_window`, and `flush`.
+/// Output of the detect phase. Consumed by `recompute_agg` and `flush`.
 #[derive(Debug, Default)]
 pub(crate) struct RetractScope {
     /// Affected aggregate node + group keys that need rerun. Each
@@ -31,25 +29,15 @@ pub(crate) struct RetractScope {
     /// `Ord`; the keys are pre-sorted by formatted-string before they
     /// land here so deterministic emission is preserved.
     pub(crate) trigger_group_keys: Vec<Vec<GroupByKey>>,
-    /// Affected window-bearing Transform nodes. Each entry pairs the
-    /// Transform's NodeIndex with the per-partition retract row id
-    /// list. Populated only when the planner flagged the IndexSpec
-    /// for buffer-recompute and the dispatcher captured per-partition
-    /// admission state on `ExecutorContext.relaxed_window_states`.
-    /// `partition_retracts[i].0` is the partition tuple; the
-    /// associated `Vec<u32>` is the set of arena positions to drop
-    /// from that partition's surviving slice.
-    pub(crate) windows: Vec<WindowRetractEntry>,
-}
-
-/// One affected window-bearing Transform plus the per-partition retract
-/// row id lists. `partition_retracts` is keyed by the partition tuple
-/// (the same `Vec<GroupByKey>` shape the dispatcher's window arm used
-/// to admit rows into `RetainedWindowState.partition_outputs`).
-#[derive(Debug)]
-pub(crate) struct WindowRetractEntry {
-    pub(crate) window_node: NodeIndex,
-    pub(crate) partition_retracts: Vec<(Vec<GroupByKey>, Vec<u32>)>,
+    /// Union of every source row id that has been folded into the
+    /// scope across all iterations of the orchestrator's commit loop.
+    /// Used by [`Self::expand_with_dlq_events`] to compute the
+    /// per-iteration delta — a DLQ event whose `source_row` is already
+    /// in this set is a no-op for the loop. Termination follows
+    /// directly: source rows are bounded, so a strictly-monotone set
+    /// caps the loop at `|source_rows|` iterations regardless of how
+    /// many DLQ events each iteration produces.
+    pub(crate) seen_source_rows: BTreeSet<u32>,
 }
 
 /// Compute the retract scope from `ctx.correlation_buffers` plus the
@@ -74,17 +62,33 @@ pub(crate) fn detect_retract_scope(
     trigger_keys.sort_by_key(|k| format_group_key(k));
     scope.trigger_group_keys = trigger_keys.clone();
 
-    // Aggregate-name → DAG NodeIndex map, built once per detect call so
+    // Aggregate-name → NodeIndex map, built once per detect call so
     // synthetic-CK column lookups below do not re-scan node weights for
-    // every trigger key.
-    let aggregate_idx_by_name: HashMap<&str, NodeIndex> = current_dag
+    // every trigger key. Spans the parent DAG plus every composition
+    // body's graph so a parent-scope error cell carrying a body
+    // aggregate's synthetic-CK column resolves back to the body's
+    // (body-local) NodeIndex — the same key that addresses
+    // ctx.relaxed_aggregator_states, populated by the body forward-pass
+    // arm under the body-local index. Aggregate names are unique across
+    // the pipeline because compile-time path qualification prepends
+    // each body's call-site name, but `entry().or_insert` is used
+    // defensively so a parent-scope name stays authoritative if that
+    // qualification ever weakens.
+    let mut aggregate_idx_by_name: HashMap<String, NodeIndex> = current_dag
         .graph
         .node_indices()
         .filter_map(|idx| match &current_dag.graph[idx] {
-            PlanNode::Aggregation { name, .. } => Some((name.as_str(), idx)),
+            PlanNode::Aggregation { name, .. } => Some((name.clone(), idx)),
             _ => None,
         })
         .collect();
+    for body in ctx.artifacts.composition_bodies.values() {
+        for idx in body.graph.node_indices() {
+            if let PlanNode::Aggregation { name, .. } = &body.graph[idx] {
+                aggregate_idx_by_name.entry(name.clone()).or_insert(idx);
+            }
+        }
+    }
 
     // For each triggered group, classify its key columns by their
     // `FieldMetadata` to decide which row IDs feed `affected_row_ids`.
@@ -227,19 +231,17 @@ pub(crate) fn detect_retract_scope(
         .retraction
         .synthetic_ck_fanout_rows_expanded_total += synthetic_ck_rows_expanded;
 
-    if affected_row_ids.is_empty() {
-        return scope;
-    }
-
-    // Aggregates: every aggregate node whose `group_by` omits a CK
-    // field visible upstream — those activate the retraction protocol.
-    // The lattice on `node_properties` already encodes the per-source
-    // CK identity per node, so the classification below stays
-    // consistent with the planner's assignment of relaxed-mode flags.
-    // We don't pre-filter against the trigger's CK set here because
-    // `retract_row` is idempotent on row IDs that don't appear in the
-    // aggregator's lineage — the lookup either succeeds or returns an
-    // error which the recompute phase routes to the degrade-fallback.
+    // Aggregates: every relaxed-CK aggregate in the DAG, populated
+    // eagerly so the orchestrator's cascading-retraction loop can route
+    // a source-row id discovered by deferred dispatch through every
+    // aggregator's `retract_row` regardless of whether the initial
+    // detect pass surfaced any triggers. `retract_row` is idempotent on
+    // ids that don't appear in an aggregator's lineage — the lookup
+    // succeeds or returns "not found" which the recompute phase
+    // tolerates as a wide-fanout no-op. The lattice on
+    // `node_properties` already encodes the per-source CK identity per
+    // node, so the classification below stays consistent with the
+    // planner's assignment of relaxed-mode flags.
     for idx in current_dag.graph.node_indices() {
         if let PlanNode::Aggregation { config, .. } = &current_dag.graph[idx] {
             let parent_ck = current_dag
@@ -257,50 +259,52 @@ pub(crate) fn detect_retract_scope(
         }
     }
 
-    // Windows: every Transform whose IndexSpec is flagged for
-    // buffer-recompute. Walk the captured per-partition admission
-    // state and drop each retract row id into its origin partition.
-    //
-    // The buffered triple is `(arena_pos, rn, record)`. `rn` is the
-    // source row number — the source's row id for source-rooted
-    // windows, and the contributing group's `min_row_num` (still a
-    // real source row id) for windows rooted on a relaxed-CK
-    // aggregate's emit. `arena_pos` is a position in the upstream's
-    // arena: equal to `rn - 1` for source-rooted windows, but a
-    // dispatcher iteration index (in the upstream emit's hash-map
-    // order) for node-rooted windows. `affected_row_ids` carries
-    // source row ids; comparing against `arena_pos` only happens to
-    // collide with source row ids in the source-rooted case, and
-    // even there only by chance off-by-one. Filter on `rn` so the
-    // two id spaces align across both rooting flavors and partition
-    // membership in the retract scope is deterministic regardless
-    // of upstream emit-order non-determinism.
-    for (&window_node, retained) in &ctx.relaxed_window_states {
-        let mut partition_retracts: Vec<(Vec<GroupByKey>, Vec<u32>)> = Vec::new();
-        for (partition_key, rows) in &retained.partition_outputs {
-            let drops: Vec<u32> = rows
-                .iter()
-                .filter_map(|(arena_pos, rn, _)| {
-                    if affected_row_ids.contains(&(*rn as u32)) {
-                        Some(*arena_pos)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !drops.is_empty() {
-                partition_retracts.push((partition_key.clone(), drops));
-            }
-        }
-        if !partition_retracts.is_empty() {
-            scope.windows.push(WindowRetractEntry {
-                window_node,
-                partition_retracts,
-            });
-        }
-    }
+    // Seed the cumulative source-row set with the initial trigger fan-in.
+    // The orchestrator's commit loop folds each iteration's deferred-DLQ
+    // events into this set via [`RetractScope::expand_with_dlq_events`];
+    // a strictly-monotone set against a bounded source-row universe is
+    // the structural termination proof for the loop.
+    scope.seen_source_rows = affected_row_ids;
 
     scope
+}
+
+impl RetractScope {
+    /// Fold a batch of deferred-dispatch DLQ events into this scope and
+    /// return the entries whose `source_row` was not already covered.
+    ///
+    /// The orchestrator drives one extra commit-loop iteration per
+    /// non-empty return value: the new triggers widen
+    /// `aggregates[*].1` so the next `recompute_aggregates` call
+    /// retracts the additional source rows from each relaxed-CK
+    /// aggregator. Empty return signals convergence — every deferred
+    /// failure observed on this iteration was already accounted for by
+    /// a prior iteration's retract scope, so further looping cannot
+    /// surface new state changes.
+    ///
+    /// Each appended row id flows through `retract_row`'s "not found"
+    /// tolerance for aggregates whose lineage doesn't include it, so
+    /// the wide-fanout shape (every relaxed-CK aggregate sees every
+    /// new row id) stays correct without per-aggregate filtering.
+    pub(crate) fn expand_with_dlq_events(&mut self, events: &[DlqEvent]) -> Vec<u32> {
+        let mut new_rows: Vec<u32> = Vec::new();
+        for event in events {
+            let row_u32 = match u32::try_from(event.source_row) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if !self.seen_source_rows.insert(row_u32) {
+                continue;
+            }
+            new_rows.push(row_u32);
+        }
+        if !new_rows.is_empty() {
+            for (_, retract_ids) in &mut self.aggregates {
+                retract_ids.extend(new_rows.iter().copied());
+            }
+        }
+        new_rows
+    }
 }
 
 /// Position of `target_col_idx` within the buffer-key tuple emitted by

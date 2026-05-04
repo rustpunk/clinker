@@ -940,23 +940,19 @@ fn bind_composition(
     // `name_to_idx` so body-internal port-input references can resolve
     // to a parent-DAG `NodeIndex` and emit
     // `PlanIndexRoot::ParentNode { upstream, .. }`.
-    let bound_body = BoundBody {
-        signature_path: resolved_path,
-        graph: body_graph,
-        topo_order: body_topo,
-        name_to_idx: body_name_to_idx,
-        port_name_to_node_idx,
-        body_rows,
-        node_input_refs,
-        route_bodies,
-        output_port_rows: output_port_rows.clone(),
-        output_port_to_node_idx,
-        input_port_rows,
-        nested_body_ids,
-        body_indices_to_build: Vec::new(),
-        body_window_configs,
-        deferred_regions: HashMap::new(),
-    };
+    let mut bound_body = BoundBody::empty(resolved_path);
+    bound_body.graph = body_graph;
+    bound_body.topo_order = body_topo;
+    bound_body.name_to_idx = body_name_to_idx;
+    bound_body.port_name_to_node_idx = port_name_to_node_idx;
+    bound_body.body_rows = body_rows;
+    bound_body.node_input_refs = node_input_refs;
+    bound_body.route_bodies = route_bodies;
+    bound_body.output_port_rows = output_port_rows.clone();
+    bound_body.output_port_to_node_idx = output_port_to_node_idx;
+    bound_body.input_port_rows = input_port_rows;
+    bound_body.nested_body_ids = nested_body_ids;
+    bound_body.body_window_configs = body_window_configs;
     artifacts.insert_body(body_id, bound_body);
     artifacts
         .composition_body_assignments

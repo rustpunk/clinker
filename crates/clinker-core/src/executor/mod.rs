@@ -354,7 +354,7 @@ impl CompiledRoute {
 }
 
 /// Record that failed evaluation, queued for DLQ output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DlqEntry {
     pub source_row: u64,
     pub category: crate::dlq::DlqErrorCategory,
@@ -500,9 +500,33 @@ impl PipelineExecutor {
     pub(crate) fn run_with_readers_writers(
         config: &PipelineConfig,
         primary: &str,
+        readers: HashMap<String, Box<dyn Read + Send>>,
+        writers: HashMap<String, Box<dyn Write + Send>>,
+        params: &PipelineRunParams,
+    ) -> Result<ExecutionReport, PipelineError> {
+        Self::run_with_readers_writers_in_context(
+            config,
+            primary,
+            readers,
+            writers,
+            params,
+            crate::config::CompileContext::default(),
+        )
+    }
+
+    /// Variant of [`Self::run_with_readers_writers`] that accepts an
+    /// explicit [`crate::config::CompileContext`]. Tests use this to
+    /// supply a temp-dir workspace root without mutating CWD —
+    /// `CompileContext::default()` reads CWD at call time, which is
+    /// not thread-safe across parallel test runs that need different
+    /// workspace roots.
+    pub(crate) fn run_with_readers_writers_in_context(
+        config: &PipelineConfig,
+        primary: &str,
         mut readers: HashMap<String, Box<dyn Read + Send>>,
         writers: HashMap<String, Box<dyn Write + Send>>,
         params: &PipelineRunParams,
+        compile_ctx: crate::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
 
@@ -551,7 +575,6 @@ impl PipelineExecutor {
         // ordered by the upstream node's bound `Row`. The author-
         // declared superset never reaches the index resolver.
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
-        let compile_ctx = crate::config::CompileContext::default();
         let validated_plan =
             config
                 .compile(&compile_ctx)
@@ -1352,9 +1375,9 @@ impl PipelineExecutor {
             correlation_max_group_buffer,
             relaxed_aggregator_states: HashMap::new(),
             relaxed_aggregator_degrade: Vec::new(),
-            relaxed_window_states: HashMap::new(),
             commit_step_path: dispatch::CommitStepPath::NotSelected,
             region_input_buffers: HashMap::new(),
+            in_deferred_dispatch: false,
         };
 
         // Walk DAG in topological order. `topo_order` is cloned so
@@ -2442,5 +2465,6 @@ mod tests {
     mod post_combine_array_field;
     mod post_combine_synthetic_ck;
     mod post_combine_window_strategies;
+    mod strict_pipeline_zero_overhead;
     mod window_recompute_correctness;
 }

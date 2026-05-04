@@ -117,9 +117,10 @@ nodes:
 }
 
 /// Relaxed-CK pipeline that does NOT trigger any DLQ events. Exercises
-/// the orchestrator's full FivePhase path with an empty retract scope:
-/// every group is clean, the recompute / replay phases are no-ops, and
-/// the flush phase produces the same output as the strict path.
+/// the orchestrator's full ThreePhase path with an empty retract scope:
+/// every group is clean, the recompute / deferred-dispatch phases are
+/// no-ops, and the flush phase produces the same output as the strict
+/// path.
 #[test]
 fn relaxed_pipeline_no_failures_emits_normally() {
     let yaml = r#"
@@ -556,13 +557,11 @@ O8,HR,50
 }
 
 /// End-to-end retraction with a downstream Transform deriving a column
-/// from the relaxed-CK aggregate's output. The Transform is determined
-/// downstream — under the E15W policy it cannot use a non-deterministic
-/// builtin, so it computes a deterministic per-group derived value
-/// (`emit per_capita = total / n`). The bit-for-bit assertion proves
-/// the downstream Transform observes the retract-corrected aggregate
-/// state, not the pre-retract state: a stale aggregate output would
-/// surface as a wrong per_capita.
+/// from the relaxed-CK aggregate's output. The Transform computes a
+/// deterministic per-group derived value (`emit per_capita = total / n`).
+/// The bit-for-bit assertion proves the downstream Transform observes
+/// the retract-corrected aggregate state, not the pre-retract state: a
+/// stale aggregate output would surface as a wrong per_capita.
 #[test]
 fn end_to_end_retraction_downstream_transform_observes_corrected_state() {
     let yaml = r#"
@@ -686,69 +685,6 @@ O8,HR,40
     assert!(
         output.contains("ENG,600,3,200"),
         "ENG total=600 n=3 per_capita=200 expected, got: {output}"
-    );
-}
-
-/// E15W rejection — a Transform downstream of a relaxed-CK aggregate
-/// cannot call a non-deterministic builtin. The compile-time check
-/// surfaces the diagnostic at config parse time.
-#[test]
-fn e15w_rejects_now_under_relaxed_aggregate() {
-    let yaml = r#"
-pipeline:
-  name: e15w
-error_handling:
-  strategy: continue
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    correlation_key: emp_id
-    type: csv
-    schema:
-      - { name: emp_id, type: string }
-      - { name: dept, type: string }
-      - { name: amount, type: int }
-- type: aggregate
-  name: dept_totals
-  input: src
-  config:
-    group_by: [dept]
-    cxl: 'emit dept = dept
-
-      emit total = sum(amount)
-
-      '
-- type: transform
-  name: stamp
-  input: dept_totals
-  config:
-    cxl: 'emit dept = dept
-
-      emit total = total
-
-      emit emitted_at = now
-
-      '
-- type: output
-  name: out
-  input: stamp
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let diags = config
-        .compile(&crate::config::CompileContext::default())
-        .expect_err("E15W must reject `now` downstream of relaxed-CK aggregate");
-    assert!(
-        diags.iter().any(|d| d.code == "E15W"),
-        "expected E15W diagnostic, got codes: {:?}",
-        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }
 
@@ -1035,7 +971,7 @@ O6,ENG,200,6
 /// CK group is rolled back — the strict-collateral DLQ shape.
 ///
 /// Sibling test to [`fanout_policy_resolution_pipeline_default`], but
-/// driven through the FivePhase orchestrator (a relaxed aggregate is
+/// driven through the ThreePhase orchestrator (a relaxed aggregate is
 /// present) rather than the FastPath strict body. Documents that the
 /// orchestrator's flush step honors `Any` identically to the strict
 /// path's flush.
@@ -1390,162 +1326,4 @@ nodes:
             );
         }
     }
-}
-
-/// Chained-aggregate compile guard: an upstream relaxed aggregate
-/// feeding a downstream aggregate whose `group_by` is a SUPERSET of
-/// the pipeline correlation key compiles cleanly. The downstream
-/// aggregate stays on the strict-collateral path; the runtime treats
-/// the inner retract as a wholesale rebuild contribution against the
-/// outer aggregator.
-#[test]
-fn chained_aggregate_with_superset_group_by_compiles_clean() {
-    let yaml = r#"
-pipeline:
-  name: chained_superset
-error_handling:
-  strategy: continue
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    correlation_key: order_id
-    type: csv
-    schema:
-      - { name: order_id, type: string }
-      - { name: region, type: string }
-      - { name: department, type: string }
-      - { name: amount, type: int }
-- type: aggregate
-  name: inner
-  input: src
-  config:
-    group_by: [department]
-    cxl: 'emit department = department
-
-      emit subtotal = sum(amount)
-
-      '
-- type: aggregate
-  name: outer
-  input: inner
-  config:
-    group_by: [department, "$ck.order_id"]
-    cxl: 'emit department = department
-
-      emit grand_total = sum(subtotal)
-
-      '
-- type: output
-  name: out
-  input: outer
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let result = config.compile(&crate::config::CompileContext::default());
-    match result {
-        Ok(_) => {}
-        Err(diags) => {
-            // Compile may surface unrelated diagnostics from this novel
-            // shape (e.g. inner aggregate's $ck.order_id propagation
-            // into outer); only fail when the chained-aggregate E15W
-            // fires.
-            let chained_e15w_present = diags
-                .iter()
-                .any(|d| d.code == "E15W" && d.message.contains("downstream of relaxed aggregate"));
-            assert!(
-                !chained_e15w_present,
-                "chained-aggregate E15W must not fire when outer group_by ⊇ correlation_key; \
-                 got diagnostics: {:?}",
-                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-            );
-        }
-    }
-}
-
-/// Chained-aggregate compile guard: an upstream relaxed aggregate
-/// feeding a downstream aggregate whose `group_by` OMITS at least one
-/// correlation-key field must produce E15W with the chained-aggregate
-/// help text. Distinct trigger from the non-deterministic-builtin
-/// E15W; both share the diagnostic code and reuse the same miette
-/// emit shape.
-#[test]
-fn chained_aggregate_with_subset_group_by_emits_e15w() {
-    let yaml = r#"
-pipeline:
-  name: chained_subset
-error_handling:
-  strategy: continue
-nodes:
-- type: source
-  name: src
-  config:
-    name: src
-    path: input.csv
-    correlation_key: order_id
-    type: csv
-    schema:
-      - { name: order_id, type: string }
-      - { name: region, type: string }
-      - { name: department, type: string }
-      - { name: amount, type: int }
-- type: aggregate
-  name: inner
-  input: src
-  config:
-    group_by: [department]
-    cxl: 'emit department = department
-
-      emit subtotal = sum(amount)
-
-      '
-- type: aggregate
-  name: outer
-  input: inner
-  config:
-    group_by: [department]
-    cxl: 'emit department = department
-
-      emit grand_total = sum(subtotal)
-
-      '
-- type: output
-  name: out
-  input: outer
-  config:
-    name: out
-    path: output.csv
-    type: csv
-    include_unmapped: true
-"#;
-    let config = crate::config::parse_config(yaml).expect("parse");
-    let diags = config
-        .compile(&crate::config::CompileContext::default())
-        .expect_err("E15W must reject chained relaxed aggregate with non-superset group_by");
-    let chained_diag = diags
-        .iter()
-        .find(|d| d.code == "E15W" && d.message.contains("downstream of relaxed aggregate"));
-    assert!(
-        chained_diag.is_some(),
-        "expected E15W chained-aggregate diagnostic, got: {:?}",
-        diags
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
-    );
-    let msg = &chained_diag.unwrap().message;
-    assert!(
-        msg.contains("'outer'") && msg.contains("'inner'"),
-        "diagnostic must name both downstream and upstream aggregates, got: {msg}"
-    );
-    assert!(
-        msg.contains("correlation-key"),
-        "diagnostic must reference the correlation-key requirement, got: {msg}"
-    );
 }

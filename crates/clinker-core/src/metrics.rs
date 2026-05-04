@@ -100,15 +100,17 @@ pub struct RetractionMetrics {
     /// Aggregate groups whose accumulator state was rerun.
     #[serde(default)]
     pub groups_recomputed: u64,
-    /// Window partitions whose stored row buffer was wholesale-rerun.
+    /// Windowed-Transform members re-evaluated on the deferred-region
+    /// commit pass (per-partition emit during deferred dispatch).
     #[serde(default)]
-    pub partitions_recomputed: u64,
-    /// Total record-deltas the replay phase pushed downstream.
+    pub partitions_dispatched: u64,
+    /// Cascading-retraction loop iterations executed before
+    /// convergence. `0` on strict / fast-path runs; `>= 1` whenever
+    /// the orchestrator entered the relaxed loop. Values `> 1` mean
+    /// commit-pass dispatch widened the retract scope and the
+    /// orchestrator re-ran with the expanded set.
     #[serde(default)]
-    pub subdag_replay_rows: u64,
-    /// Output rows the post-replay flush retracted.
-    #[serde(default)]
-    pub output_rows_retracted_total: u64,
+    pub iterations: u64,
     /// Aggregate-or-partition retract paths that took the documented
     /// degrade fallback at runtime.
     #[serde(default)]
@@ -131,9 +133,8 @@ impl From<&clinker_record::RetractionCounters> for RetractionMetrics {
     fn from(c: &clinker_record::RetractionCounters) -> Self {
         Self {
             groups_recomputed: c.groups_recomputed,
-            partitions_recomputed: c.partitions_recomputed,
-            subdag_replay_rows: c.subdag_replay_rows,
-            output_rows_retracted_total: c.output_rows_retracted_total,
+            partitions_dispatched: c.partitions_dispatched,
+            iterations: c.iterations,
             degrade_fallback_count: c.degrade_fallback_count,
             synthetic_ck_columns_emitted_total: c.synthetic_ck_columns_emitted_total,
             synthetic_ck_fanout_lookups_total: c.synthetic_ck_fanout_lookups_total,

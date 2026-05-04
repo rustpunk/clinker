@@ -19,8 +19,13 @@
 //! - **Pass B (reverse-topo column propagation).** From each Output's
 //!   consumed columns, propagate `Expr::support_into` upstream through
 //!   each member operator, terminating at the producer. The producer's
-//!   `buffer_schema` is the union, sorted alphabetically for
-//!   deterministic `--explain` rendering.
+//!   `buffer_schema` filters the producer's `output_schema` columns to
+//!   that consumed set, preserving the producer's own emit order.
+//!   Producer-order matters because every downstream operator carries an
+//!   `expected: Arc<Schema>` stamped at plan-compile time against the
+//!   producer's `output_schema`; a buffer projection that reorders the
+//!   columns trips the per-record `check_input_schema` at the first
+//!   downstream consumer.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -31,6 +36,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use crate::plan::bind_schema::CompileArtifacts;
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::plan::execution::{PlanEdge, PlanNode, group_by_omits_any_ck_field};
+use crate::plan::index::IndexSpec;
 use crate::plan::properties::NodeProperties;
 
 /// Plan-time metadata for one deferred region: a relaxed-CK Aggregate
@@ -42,50 +48,140 @@ use crate::plan::properties::NodeProperties;
 /// buffer carries `buffer_schema` — exactly the columns the deferred
 /// operators reach via `Expr::support_into`.
 #[derive(Clone, Debug)]
-pub struct DeferredRegion {
+pub(crate) struct DeferredRegion {
     /// `NodeIndex` of the relaxed-CK Aggregate that seeds this region.
     /// For body-internal Aggregates, this is the body's local index;
     /// the parent-level flatten in `config/mod.rs` keys regions only
     /// by parent-graph indices, so consumers inside body executors
     /// must look up by their body-local map.
-    pub producer: NodeIndex,
+    pub(crate) producer: NodeIndex,
     /// Every non-producer, non-output operator inside the region.
-    pub members: HashSet<NodeIndex>,
+    pub(crate) members: HashSet<NodeIndex>,
     /// Correlation-buffered Outputs at the region's exit boundary.
-    pub outputs: HashSet<NodeIndex>,
+    pub(crate) outputs: HashSet<NodeIndex>,
     /// Minimum set of producer-emitted columns that the deferred
-    /// operators consume, sorted alphabetically.
-    pub buffer_schema: Vec<String>,
+    /// operators consume, ordered to match the producer's
+    /// `output_schema`. Producer-order is required because every
+    /// downstream operator's `check_input_schema` compares the
+    /// projected record's column list against the upstream's
+    /// stamped `output_schema`; reordering the columns (e.g.
+    /// alphabetical) trips a `SchemaMismatch` at the first
+    /// downstream consumer.
+    pub(crate) buffer_schema: Vec<String>,
+}
+
+/// Plan-time continuation metadata for a Composition node whose
+/// (transitively) bound body carries a deferred region.
+///
+/// `members` are the operators reachable downstream of the Composition
+/// in the containing DAG, up to but not including any strict-CK or
+/// relaxed-CK Aggregation (which owns its own forward-pass emit or its
+/// own DeferredRegion respectively). `outputs` are the correlation-
+/// buffered Outputs at the continuation's exit boundary. The
+/// commit-time dispatcher walks these in topological order via
+/// `dispatch_plan_node` with `in_deferred_dispatch=true` after
+/// harvesting body output records into `node_buffers[composition_idx]`.
+///
+/// Distinct from [`DeferredRegion`]: a region has a relaxed-CK
+/// Aggregate as producer, while a continuation is rooted at a
+/// Composition node whose post-harvest buffer slot acts as the
+/// producer-equivalent. The two surfaces are disjoint by construction.
+#[derive(Clone, Debug)]
+pub(crate) struct ParentContinuation {
+    /// `NodeIndex` of the Composition node in the containing DAG. The
+    /// post-harvest seed lands in `node_buffers[composition_idx]`.
+    pub(crate) composition_idx: NodeIndex,
+    /// Operators between the Composition and the continuation's exit
+    /// boundary. Excludes the seed Composition itself.
+    pub(crate) members: HashSet<NodeIndex>,
+    /// Outputs at the continuation's exit boundary.
+    pub(crate) outputs: HashSet<NodeIndex>,
+}
+
+/// One call site of a composition body — a `PlanNode::Composition`
+/// node that targets the body. Combined with the analysis's
+/// continuation maps, this is enough to look up the parent operators
+/// downstream of the call: `scope=None` →
+/// `top_continuations[composition_idx]`; `scope=Some(bid)` →
+/// `body_continuations[bid][composition_idx]`.
+#[derive(Clone, Debug)]
+pub(crate) struct CompositionCallSite {
+    /// `None` for parent-scope calls; `Some(outer_body_id)` for
+    /// body-internal calls.
+    pub(crate) scope: Option<CompositionBodyId>,
+    /// `NodeIndex` of the calling Composition in its containing graph.
+    pub(crate) composition_idx: NodeIndex,
+}
+
+/// Aggregate output of [`detect_deferred_regions`]: every
+/// relaxed-CK-Aggregate region (top-level + per-body) plus every
+/// Composition continuation that the commit-time dispatcher must
+/// re-execute after harvesting body output records.
+///
+/// Continuations are tracked separately from regions because they are
+/// rooted at Composition nodes (no Aggregate producer), but the two
+/// maps live alongside each other on the same scope: top-level
+/// continuations key into the parent DAG, body continuations into the
+/// outer body's mini-DAG.
+pub(crate) struct DeferredRegionAnalysis {
+    pub(crate) top_level: Vec<DeferredRegion>,
+    pub(crate) body_regions: HashMap<CompositionBodyId, Vec<DeferredRegion>>,
+    pub(crate) top_continuations: HashMap<NodeIndex, ParentContinuation>,
+    pub(crate) body_continuations:
+        HashMap<CompositionBodyId, HashMap<NodeIndex, ParentContinuation>>,
+    /// Per-body call-site index — every parent-scope or
+    /// outer-body-scope `PlanNode::Composition` that targets the body.
+    /// `Vec`, not single entry, because the architectural contract is
+    /// "buffer_schema is the union of every consumer's demand across
+    /// all call sites": today's `bind_composition` allocates a fresh
+    /// `CompositionBodyId` per call (Vec is always length 1) but
+    /// encoding singular hardcodes an implementation accident; future
+    /// allocator policies (memoization, body-sharing) require the
+    /// union.
+    pub(crate) body_call_sites: HashMap<CompositionBodyId, Vec<CompositionCallSite>>,
 }
 
 /// Walk every relaxed-CK Aggregate in the top-level DAG (recursing
 /// through composition bodies via `artifacts.composition_bodies`) and
-/// return one `DeferredRegion` per producer.
+/// return one [`DeferredRegion`] per producer plus a
+/// [`ParentContinuation`] entry for every Composition node whose body
+/// carries a deferred region.
 ///
-/// Returns a tuple `(top_level, per_body)`:
+/// The four returned maps live at disjoint scopes:
 ///
 /// - `top_level` — regions whose `producer` is a parent-graph
 ///   `NodeIndex`. The caller flattens these into
 ///   `ExecutionPlanDag.deferred_regions`.
-/// - `per_body` — regions seeded by body-internal Aggregates, keyed by
-///   the body that owns them. The caller flattens each entry into the
-///   matching `BoundBody.deferred_regions`. The two index spaces are
-///   separated because a body-local NodeIndex can numerically collide
-///   with a parent-graph NodeIndex (each graph numbers from zero); the
-///   dispatcher consults the right map by which scope it is currently
-///   executing.
+/// - `body_regions` — regions seeded by body-internal Aggregates,
+///   keyed by the body that owns them. The caller flattens each entry
+///   into the matching `BoundBody.deferred_regions`. The two index
+///   spaces are separated because a body-local NodeIndex can
+///   numerically collide with a parent-graph NodeIndex (each graph
+///   numbers from zero); the dispatcher consults the right map by
+///   which scope it is currently executing.
+/// - `top_continuations` — Composition nodes in the parent DAG whose
+///   body carries a deferred region; populates
+///   `ExecutionPlanDag.parent_continuations`.
+/// - `body_continuations` — Composition nodes inside an outer body
+///   whose nested body carries a deferred region; the caller flattens
+///   each entry onto `BoundBody.parent_continuations` of the outer
+///   body.
 pub(crate) fn detect_deferred_regions(
     graph: &DiGraph<PlanNode, PlanEdge>,
     node_properties: &HashMap<NodeIndex, NodeProperties>,
     artifacts: &CompileArtifacts,
-) -> (
-    Vec<DeferredRegion>,
-    HashMap<CompositionBodyId, Vec<DeferredRegion>>,
-) {
+    indices_to_build: &[IndexSpec],
+) -> DeferredRegionAnalysis {
     let mut top_level = Vec::new();
-    let mut per_body: HashMap<CompositionBodyId, Vec<DeferredRegion>> = HashMap::new();
+    let mut body_regions: HashMap<CompositionBodyId, Vec<DeferredRegion>> = HashMap::new();
+    let mut top_continuations: HashMap<NodeIndex, ParentContinuation> = HashMap::new();
+    let mut body_continuations: HashMap<CompositionBodyId, HashMap<NodeIndex, ParentContinuation>> =
+        HashMap::new();
+    let mut body_call_sites: HashMap<CompositionBodyId, Vec<CompositionCallSite>> = HashMap::new();
 
-    // Top-level relaxed-CK aggregates.
+    // Top-level relaxed-CK aggregates. Top-level pass_b_column_prune
+    // already seeds via Output reads, so this step does not depend on
+    // the continuation analysis below.
     for idx in graph.node_indices() {
         let PlanNode::Aggregation { config, .. } = &graph[idx] else {
             continue;
@@ -94,15 +190,112 @@ pub(crate) fn detect_deferred_regions(
         if !group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
             continue;
         }
-        if let Some(region) = build_region(graph, artifacts, idx) {
+        if let Some(region) = build_region(graph, artifacts, indices_to_build, idx) {
             top_level.push(region);
         }
     }
 
-    // Body-internal relaxed-CK aggregates. Walk every body, derive the
-    // body's parent-CK at each Aggregate from the upstream stored
-    // schema (mirrors `apply_retraction_flags_in_body`), and seed a
-    // region inside the body's mini-DAG.
+    // Pre-compute which bodies carry (or transitively contain) a
+    // deferred region. The continuation walker consults this set so a
+    // body-internal Aggregate that has not yet been flattened onto
+    // `BoundBody.deferred_regions` is still recognized as a region
+    // producer for continuation eligibility. This must run before
+    // continuation detection but does not depend on body-region
+    // construction — region presence is determined by the same
+    // relaxed-CK Aggregate filter that `build_body_region` applies.
+    let mut bodies_with_region: HashSet<CompositionBodyId> = HashSet::new();
+    for (body_id, body) in &artifacts.composition_bodies {
+        for idx in body.graph.node_indices() {
+            let PlanNode::Aggregation { config, .. } = &body.graph[idx] else {
+                continue;
+            };
+            let parent_ck = body_parent_ck_of(body, idx);
+            if group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
+                bodies_with_region.insert(*body_id);
+                break;
+            }
+        }
+    }
+    propagate_body_region_membership(artifacts, &mut bodies_with_region);
+
+    // Top-level Composition continuations. Every Composition whose
+    // body (or any nested body) carries a deferred region needs the
+    // parent's downstream chain re-executed after the commit-time
+    // harvest. The call-site index is populated unconditionally — the
+    // continuation map filters by region presence, but the
+    // continuation_support walker traverses by body identity and may
+    // demand columns from a body that today carries no region.
+    for idx in graph.node_indices() {
+        let PlanNode::Composition { body, .. } = &graph[idx] else {
+            continue;
+        };
+        body_call_sites
+            .entry(*body)
+            .or_default()
+            .push(CompositionCallSite {
+                scope: None,
+                composition_idx: idx,
+            });
+        if let Some(cont) = compute_continuation_from(idx, graph, &bodies_with_region) {
+            top_continuations.insert(idx, cont);
+        }
+    }
+
+    // Body-internal Composition continuations: nested Composition
+    // nodes whose own body carries a deferred region. The outer body
+    // dispatcher walks these once it has harvested the nested body's
+    // output records. Call-site index population is unconditional, as
+    // above.
+    for (body_id, body) in &artifacts.composition_bodies {
+        for idx in body.graph.node_indices() {
+            let PlanNode::Composition { body: nested, .. } = &body.graph[idx] else {
+                continue;
+            };
+            body_call_sites
+                .entry(*nested)
+                .or_default()
+                .push(CompositionCallSite {
+                    scope: Some(*body_id),
+                    composition_idx: idx,
+                });
+            if let Some(cont) = compute_body_continuation_from(idx, body, &bodies_with_region) {
+                body_continuations
+                    .entry(*body_id)
+                    .or_default()
+                    .insert(idx, cont);
+            }
+        }
+    }
+
+    // Assemble the analysis with `body_regions` empty so the
+    // continuation_support walker reads `body_call_sites`,
+    // `top_continuations`, and `body_continuations` off the struct
+    // directly. The walker never reads `body_regions`, so building it
+    // last (after the body-region loop below) is safe and avoids a
+    // second view type whose fields would shadow the analysis.
+    let mut analysis = DeferredRegionAnalysis {
+        top_level,
+        body_regions: HashMap::new(),
+        top_continuations,
+        body_continuations,
+        body_call_sites,
+    };
+
+    // Body-internal relaxed-CK aggregates. With continuations and the
+    // call-site index already populated, each body's output ports can
+    // be pre-seeded with the columns the parent's continuation
+    // operators will demand. The seed flows upstream through every
+    // body-internal member to the producer's `buffer_schema`, closing
+    // the cross-scope demand gap that pass_b_body's body-internal
+    // walk would otherwise miss.
+    //
+    // Memo and active set are reused across every body within one
+    // call: the memo key is `(body, port)`, so cross-body collisions
+    // cannot occur, and amortizing the recursive expansion across
+    // sibling call sites keeps the walk linear in call-graph edges.
+    let mut continuation_memo: HashMap<(CompositionBodyId, String), HashSet<String>> =
+        HashMap::new();
+    let mut continuation_active: HashSet<(CompositionBodyId, String)> = HashSet::new();
     for (body_id, body) in &artifacts.composition_bodies {
         for idx in body.graph.node_indices() {
             let PlanNode::Aggregation { config, .. } = &body.graph[idx] else {
@@ -112,13 +305,176 @@ pub(crate) fn detect_deferred_regions(
             if !group_by_omits_any_ck_field(&config.group_by, &parent_ck) {
                 continue;
             }
-            if let Some(region) = build_body_region(body, idx) {
-                per_body.entry(*body_id).or_default().push(region);
+            let mut output_port_seeds: HashMap<NodeIndex, HashSet<String>> = HashMap::new();
+            for (port_name, port_node) in &body.output_port_to_node_idx {
+                let demand = continuation_support(
+                    *body_id,
+                    port_name.as_str(),
+                    &analysis,
+                    graph,
+                    artifacts,
+                    &mut continuation_memo,
+                    &mut continuation_active,
+                );
+                output_port_seeds.insert(*port_node, demand);
+            }
+            if let Some(region) = build_body_region(body, idx, &output_port_seeds) {
+                body_regions.entry(*body_id).or_default().push(region);
             }
         }
     }
 
-    (top_level, per_body)
+    analysis.body_regions = body_regions;
+    analysis
+}
+
+/// Saturating walk that grows `bodies_with_region` to include every
+/// body whose mini-DAG transitively reaches a body already in the set
+/// via a nested `PlanNode::Composition`. Mirrors the runtime
+/// `body_or_descendants_have_deferred_region` recursion but consults
+/// the pre-built per-body region set instead of the not-yet-populated
+/// `BoundBody.deferred_regions` field. Iterates to a fixed point so
+/// arbitrary nesting depth converges in a single pass through every
+/// body per round.
+fn propagate_body_region_membership(
+    artifacts: &CompileArtifacts,
+    bodies_with_region: &mut HashSet<CompositionBodyId>,
+) {
+    loop {
+        let mut grew = false;
+        for (body_id, body) in &artifacts.composition_bodies {
+            if bodies_with_region.contains(body_id) {
+                continue;
+            }
+            let reaches = body.graph.node_indices().any(|idx| {
+                let PlanNode::Composition { body: nested, .. } = &body.graph[idx] else {
+                    return false;
+                };
+                bodies_with_region.contains(nested)
+            });
+            if reaches {
+                bodies_with_region.insert(*body_id);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+}
+
+/// Compute the parent-DAG continuation downstream of a Composition
+/// node when the bound body carries a deferred region.
+///
+/// `None` when the body has no deferred region anywhere below, or when
+/// the BFS produces neither a member nor an Output (a Composition
+/// terminating in nothing reachable). Walks outgoing edges in the
+/// parent DAG, halting recursion at every Output (added to `outputs`)
+/// and at every Aggregation (excluded from both sets — strict
+/// aggregates own their forward-pass emit; relaxed aggregates own a
+/// DeferredRegion). The seed Composition itself is never added.
+fn compute_continuation_from(
+    c_idx: NodeIndex,
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    bodies_with_region: &HashSet<CompositionBodyId>,
+) -> Option<ParentContinuation> {
+    let PlanNode::Composition { body, .. } = &graph[c_idx] else {
+        return None;
+    };
+    if !bodies_with_region.contains(body) {
+        return None;
+    }
+    let (members, outputs) = continuation_bfs(graph, c_idx);
+    if members.is_empty() && outputs.is_empty() {
+        return None;
+    }
+    let cont = ParentContinuation {
+        composition_idx: c_idx,
+        members,
+        outputs,
+    };
+    debug_assert_eq!(
+        cont.composition_idx, c_idx,
+        "ParentContinuation seed must match its key in parent_continuations",
+    );
+    Some(cont)
+}
+
+/// Body-graph variant of [`compute_continuation_from`]. Walks the
+/// outer body's mini-DAG starting at a nested Composition node,
+/// returning `None` when the nested body carries no deferred region
+/// or when the BFS yields no continuation work.
+fn compute_body_continuation_from(
+    c_idx: NodeIndex,
+    body: &BoundBody,
+    bodies_with_region: &HashSet<CompositionBodyId>,
+) -> Option<ParentContinuation> {
+    let PlanNode::Composition {
+        body: nested_id, ..
+    } = &body.graph[c_idx]
+    else {
+        return None;
+    };
+    if !bodies_with_region.contains(nested_id) {
+        return None;
+    }
+    let (members, outputs) = continuation_bfs(&body.graph, c_idx);
+    if members.is_empty() && outputs.is_empty() {
+        return None;
+    }
+    let cont = ParentContinuation {
+        composition_idx: c_idx,
+        members,
+        outputs,
+    };
+    debug_assert_eq!(
+        cont.composition_idx, c_idx,
+        "ParentContinuation seed must match its key in parent_continuations",
+    );
+    Some(cont)
+}
+
+/// Forward BFS over outgoing edges in `graph` from `seed`, collecting
+/// reachable non-Aggregation nodes into `members` (Outputs go into
+/// `outputs` and halt recursion).
+///
+/// The seed node is never added to either set. Aggregations halt
+/// recursion AND are excluded from both sets — a strict aggregate
+/// already runs on the forward pass; a relaxed aggregate already owns
+/// a DeferredRegion. Either way, the continuation's responsibility
+/// ends at the aggregate boundary.
+fn continuation_bfs(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    seed: NodeIndex,
+) -> (HashSet<NodeIndex>, HashSet<NodeIndex>) {
+    let mut members: HashSet<NodeIndex> = HashSet::new();
+    let mut outputs: HashSet<NodeIndex> = HashSet::new();
+    let mut visited: HashSet<NodeIndex> = HashSet::new();
+    let mut queue: VecDeque<NodeIndex> = VecDeque::new();
+    visited.insert(seed);
+    for succ in graph.neighbors_directed(seed, Direction::Outgoing) {
+        queue.push_back(succ);
+    }
+    while let Some(node) = queue.pop_front() {
+        if !visited.insert(node) {
+            continue;
+        }
+        match &graph[node] {
+            PlanNode::Output { .. } => {
+                outputs.insert(node);
+            }
+            PlanNode::Aggregation { .. } => {
+                // Halt; the aggregate is not part of the continuation.
+            }
+            _ => {
+                members.insert(node);
+                for succ in graph.neighbors_directed(node, Direction::Outgoing) {
+                    queue.push_back(succ);
+                }
+            }
+        }
+    }
+    (members, outputs)
 }
 
 /// Resolve the upstream node's CK set from `node_properties` for a
@@ -173,10 +529,18 @@ fn body_parent_ck_of(body: &BoundBody, idx: NodeIndex) -> BTreeSet<String> {
 fn build_region(
     graph: &DiGraph<PlanNode, PlanEdge>,
     artifacts: &CompileArtifacts,
+    indices_to_build: &[IndexSpec],
     producer: NodeIndex,
 ) -> Option<DeferredRegion> {
     let (members, outputs) = pass_a_forward_bfs(graph, artifacts, producer);
-    let buffer_schema = pass_b_column_prune(graph, artifacts, producer, &members, &outputs);
+    let buffer_schema = pass_b_column_prune(
+        graph,
+        artifacts,
+        indices_to_build,
+        producer,
+        &members,
+        &outputs,
+    );
     Some(DeferredRegion {
         producer,
         members,
@@ -187,11 +551,25 @@ fn build_region(
 
 /// Body-graph variant of `build_region`. Body Aggregates seed regions
 /// confined to the body's mini-DAG; cross-body propagation back to the
-/// parent is handled by the parent-level walk reaching the body via a
-/// `Composition` node.
-fn build_body_region(body: &BoundBody, producer: NodeIndex) -> Option<DeferredRegion> {
+/// parent is handled by `output_port_seeds`, which carries the
+/// continuation-demand columns the parent's continuation operators
+/// will read out of harvested records. The seeds pre-populate each
+/// output-port node's consumed set so the reverse-topo walk
+/// propagates parent demand upstream alongside the body-internal
+/// demand.
+fn build_body_region(
+    body: &BoundBody,
+    producer: NodeIndex,
+    output_port_seeds: &HashMap<NodeIndex, HashSet<String>>,
+) -> Option<DeferredRegion> {
     let (members, outputs) = pass_a_body(body, producer);
-    let buffer_schema = pass_b_body(body, producer, &members);
+    let buffer_schema = pass_b_body(
+        body,
+        &body.body_indices_to_build,
+        producer,
+        &members,
+        output_port_seeds,
+    );
     Some(DeferredRegion {
         producer,
         members,
@@ -315,11 +693,15 @@ fn pass_a_body(body: &BoundBody, producer: NodeIndex) -> (HashSet<NodeIndex>, Ha
 /// from its projection rule.
 ///
 /// The walk terminates at the producer; the union of every set
-/// reaching the producer's outgoing edges is the buffer schema. Sorted
-/// alphabetically for deterministic snapshot output.
+/// reaching the producer's outgoing edges is the buffer schema. Final
+/// column ordering matches the producer's own `stored_output_schema`
+/// emit order via `project_in_producer_order`; an alphabetical
+/// ordering broke the downstream Output's `SchemaMismatch` check
+/// because `expected_input_schema` reads producer-emit order verbatim.
 fn pass_b_column_prune(
     graph: &DiGraph<PlanNode, PlanEdge>,
     artifacts: &CompileArtifacts,
+    indices_to_build: &[IndexSpec],
     producer: NodeIndex,
     members: &HashSet<NodeIndex>,
     outputs: &HashSet<NodeIndex>,
@@ -334,6 +716,26 @@ fn pass_b_column_prune(
         let cols = output_consumed_columns(graph, out_idx);
         consumed.entry(out_idx).or_default().extend(cols);
     }
+    // Seed each windowed-Transform member with its IndexSpec
+    // `arena_fields`. Window `partition_by` / `sort_by` columns live
+    // on the index spec, not the CXL program, so `support_into` alone
+    // would miss them — at commit time the deferred dispatcher must
+    // rebuild the node-rooted arena from the post-recompute narrow
+    // rows, and the arena projection requires every `arena_fields`
+    // entry to be present in the buffer schema.
+    for &m in members {
+        if let PlanNode::Transform {
+            window_index: Some(wi),
+            ..
+        } = &graph[m]
+            && let Some(spec) = indices_to_build.get(*wi)
+        {
+            let entry = consumed.entry(m).or_default();
+            for f in &spec.arena_fields {
+                entry.insert(f.clone());
+            }
+        }
+    }
 
     // Reverse-topo walk constrained to the region. Use a worklist:
     // pop a node, propagate its consumed set onto every upstream edge
@@ -342,6 +744,17 @@ fn pass_b_column_prune(
     // The region is a DAG embedded in the parent DAG; per-node
     // re-queueing on every consumer-side update converges in O(|E|).
     let mut worklist: VecDeque<NodeIndex> = outputs.iter().copied().collect();
+    for &m in members {
+        if matches!(
+            &graph[m],
+            PlanNode::Transform {
+                window_index: Some(_),
+                ..
+            }
+        ) {
+            worklist.push_back(m);
+        }
+    }
     while let Some(node) = worklist.pop_front() {
         let downstream_set = consumed.get(&node).cloned().unwrap_or_default();
         let upstream_set = propagate_through(graph, artifacts, node, &downstream_set);
@@ -363,37 +776,83 @@ fn pass_b_column_prune(
         }
     }
 
-    // The producer's buffer schema is the union of every consumer
-    // edge's set landing on it.
-    let mut buffer: BTreeSet<String> = BTreeSet::new();
-    if let Some(set) = consumed.get(&producer) {
-        for col in set {
-            buffer.insert(col.clone());
-        }
-    }
-    buffer.into_iter().collect()
+    // The producer's buffer schema filters its own `output_schema` to
+    // the consumed set, preserving emit order. A downstream operator's
+    // `check_input_schema` compares against the producer's stamped
+    // `output_schema` column list; a reordered buffer trips
+    // `SchemaMismatch` at the first consumer.
+    let mut consumed_at_producer = consumed.get(&producer).cloned().unwrap_or_default();
+    add_producer_engine_stamped_columns(
+        graph[producer].stored_output_schema(),
+        &mut consumed_at_producer,
+    );
+    project_in_producer_order(
+        graph[producer].stored_output_schema(),
+        &consumed_at_producer,
+    )
 }
 
-/// Body-graph Pass B. Simpler: bodies don't have Outputs, so the
-/// region's exit boundary is every leaf member. Seed each leaf with
-/// the union of `support_into` over its expressions, then propagate.
-fn pass_b_body(body: &BoundBody, producer: NodeIndex, members: &HashSet<NodeIndex>) -> Vec<String> {
+/// Body-graph Pass B. Bodies don't have Outputs of their own — the
+/// region's exit boundary is every leaf member plus every output-port
+/// node. Output-port seeds carry the parent continuation's column
+/// demand across the composition boundary so the reverse-topo walk
+/// can propagate that demand upstream alongside the body-internal
+/// demand. The producer's `buffer_schema` then carries every column
+/// any consumer reads, regardless of scope.
+fn pass_b_body(
+    body: &BoundBody,
+    body_indices: &[IndexSpec],
+    producer: NodeIndex,
+    members: &HashSet<NodeIndex>,
+    output_port_seeds: &HashMap<NodeIndex, HashSet<String>>,
+) -> Vec<String> {
     let mut consumed: HashMap<NodeIndex, HashSet<String>> = HashMap::new();
     let mut worklist: VecDeque<NodeIndex> = VecDeque::new();
 
+    // Pre-seed each output-port node with the parent continuation's
+    // column demand. The HashSet dedupes against any later
+    // body-internal seeding of the same port-node, so the leaf-seed
+    // loop below remains correct even when the port-node is itself a
+    // body-internal leaf member.
+    for (port_node, demand) in output_port_seeds {
+        consumed
+            .entry(*port_node)
+            .or_default()
+            .extend(demand.iter().cloned());
+        worklist.push_back(*port_node);
+    }
+
     // Seed every leaf member (no outgoing edges into another member or
-    // producer) with the columns its own expressions read.
+    // producer) with the columns its own expressions read. Windowed
+    // Transforms additionally seed `arena_fields` so the post-recompute
+    // arena rebuild has every `partition_by` / `sort_by` column.
     for &m in members {
         let has_member_successor = body
             .graph
             .neighbors_directed(m, Direction::Outgoing)
             .any(|s| members.contains(&s));
-        if has_member_successor {
+        let mut seed: HashSet<String> = HashSet::new();
+        if let PlanNode::Transform {
+            window_index: Some(wi),
+            ..
+        } = &body.graph[m]
+            && let Some(spec) = body_indices.get(*wi)
+        {
+            for f in &spec.arena_fields {
+                seed.insert(f.clone());
+            }
+        }
+        if has_member_successor && seed.is_empty() {
             continue;
         }
-        let mut seed: HashSet<String> = HashSet::new();
         seed_from_node(&body.graph[m], &mut seed);
-        consumed.insert(m, seed);
+        // Merge into the entry rather than overwrite — when `m` is
+        // also an output-port node, the cross-scope seed populated
+        // above must survive the body-internal seed. Plain `insert`
+        // would clobber the parent continuation's column demand and
+        // narrow the buffer below what downstream parent operators
+        // expect.
+        consumed.entry(m).or_default().extend(seed);
         worklist.push_back(m);
     }
 
@@ -418,13 +877,66 @@ fn pass_b_body(body: &BoundBody, producer: NodeIndex, members: &HashSet<NodeInde
         }
     }
 
-    let mut buffer: BTreeSet<String> = BTreeSet::new();
-    if let Some(set) = consumed.get(&producer) {
-        for col in set {
-            buffer.insert(col.clone());
+    let mut consumed_at_producer = consumed.get(&producer).cloned().unwrap_or_default();
+    add_producer_engine_stamped_columns(
+        body.graph[producer].stored_output_schema(),
+        &mut consumed_at_producer,
+    );
+    project_in_producer_order(
+        body.graph[producer].stored_output_schema(),
+        &consumed_at_producer,
+    )
+}
+
+/// Force the producer's engine-stamped columns (synthetic-CK and
+/// source-CK shadows) into the consumed set so the narrow buffer
+/// schema retains them. Downstream operators' `expected_input_schema`
+/// is the producer's full `output_schema` — a buffer that drops these
+/// columns trips `SchemaMismatch` at the first consumer regardless of
+/// whether the operators' CXL programs reach them via `support_into`.
+fn add_producer_engine_stamped_columns(
+    producer_schema: Option<&std::sync::Arc<clinker_record::Schema>>,
+    consumed: &mut HashSet<String>,
+) {
+    let Some(schema) = producer_schema else {
+        return;
+    };
+    for i in 0..schema.column_count() {
+        if schema
+            .field_metadata(i)
+            .is_some_and(|m| m.is_engine_stamped())
+            && let Some(name) = schema.column_name(i)
+        {
+            consumed.insert(name.to_string());
         }
     }
-    buffer.into_iter().collect()
+}
+
+/// Filter the producer's `output_schema` columns to the consumed set,
+/// preserving the producer's emit order. Falls back to alphabetical
+/// over the consumed set when the producer has no stored schema (a
+/// planner contract violation in practice — every region producer is
+/// an Aggregate, which always carries `output_schema` — but kept total
+/// so a degraded plan does not panic the buffer build).
+fn project_in_producer_order(
+    producer_schema: Option<&std::sync::Arc<clinker_record::Schema>>,
+    consumed: &HashSet<String>,
+) -> Vec<String> {
+    if let Some(schema) = producer_schema {
+        let mut out: Vec<String> = Vec::with_capacity(consumed.len());
+        for col in schema.columns() {
+            let s = col.as_ref();
+            if consumed.contains(s) {
+                out.push(s.to_string());
+            }
+        }
+        return out;
+    }
+    let mut sorted: BTreeSet<String> = BTreeSet::new();
+    for col in consumed {
+        sorted.insert(col.clone());
+    }
+    sorted.into_iter().collect()
 }
 
 // ─── Per-operator propagation rules ────────────────────────────────────
@@ -598,6 +1110,156 @@ fn seed_from_node(node: &PlanNode, set: &mut HashSet<String>) {
     }
 }
 
+/// Union of column reads demanded by every parent operator that
+/// consumes records flowing out of `(body, port)`. Recurses through
+/// `PlanNode::Composition` continuation members via
+/// `analysis.body_call_sites` so demand chains across nested body
+/// boundaries; memoizes per `(body, port)` so deeply nested chains
+/// converge in O(call-graph edges).
+///
+/// `parent_graph` is the top-level DAG (used for call sites whose
+/// `scope == None`); per-body graphs are reached through
+/// `artifacts.body_of(scope)` for `scope == Some(_)` call sites.
+///
+/// `analysis.body_regions` is unused by this walker — the caller
+/// passes a partially-assembled analysis whose `body_regions` may be
+/// empty, and the walker's correctness depends only on the
+/// continuation maps and the call-site index.
+///
+/// # Panics
+///
+/// Panics if `(body, port)` is revisited while still on the active
+/// walk. Cycles are impossible by construction — `bind_schema` rejects
+/// recursive composition references at E107 — so a revisit signals a
+/// planner-side regression rather than a malformed user input.
+pub(crate) fn continuation_support(
+    body: CompositionBodyId,
+    port: &str,
+    analysis: &DeferredRegionAnalysis,
+    parent_graph: &DiGraph<PlanNode, PlanEdge>,
+    artifacts: &CompileArtifacts,
+    memo: &mut HashMap<(CompositionBodyId, String), HashSet<String>>,
+    active: &mut HashSet<(CompositionBodyId, String)>,
+) -> HashSet<String> {
+    let key = (body, port.to_string());
+    if let Some(cached) = memo.get(&key) {
+        return cached.clone();
+    }
+    if !active.insert(key.clone()) {
+        panic!(
+            "continuation_support revisited ({:?}, {:?}) during active walk; \
+             composition recursion is rejected at bind time (E107), so this \
+             indicates a planner-side regression in body_call_sites or the \
+             continuation maps",
+            body, port,
+        );
+    }
+
+    let mut acc: HashSet<String> = HashSet::new();
+    let call_sites: &[CompositionCallSite] = analysis
+        .body_call_sites
+        .get(&body)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    for call_site in call_sites {
+        let cont = match call_site.scope {
+            None => analysis.top_continuations.get(&call_site.composition_idx),
+            Some(s) => analysis
+                .body_continuations
+                .get(&s)
+                .and_then(|m| m.get(&call_site.composition_idx)),
+        };
+
+        // Resolve the graph that contains this call site's continuation
+        // members. `scope=None` lives in the parent DAG; `scope=Some(s)`
+        // lives in the outer body's mini-DAG.
+        let containing_graph: &DiGraph<PlanNode, PlanEdge> = match call_site.scope {
+            None => parent_graph,
+            Some(s) => match artifacts.body_of(s) {
+                Some(b) => &b.graph,
+                None => continue,
+            },
+        };
+
+        if let Some(cont) = cont {
+            for &member_idx in &cont.members {
+                let member_node = &containing_graph[member_idx];
+                if let PlanNode::Composition { body: inner, .. } = member_node {
+                    if let Some(inner_body) = artifacts.body_of(*inner) {
+                        let inner_ports: Vec<String> =
+                            inner_body.output_port_to_node_idx.keys().cloned().collect();
+                        for inner_port in inner_ports {
+                            let nested = continuation_support(
+                                *inner,
+                                &inner_port,
+                                analysis,
+                                parent_graph,
+                                artifacts,
+                                memo,
+                                active,
+                            );
+                            acc.extend(nested);
+                        }
+                    }
+                } else {
+                    seed_from_node(member_node, &mut acc);
+                }
+            }
+        } else if let Some(s) = call_site.scope {
+            // No continuation registered at this call site: composition
+            // is at the outer body's output port (every Composition with
+            // no in-scope downstream must alias one of the body's output
+            // ports — the bind pass enforces that body topologies have
+            // no orphan operators). Chase up to the outer body's call
+            // sites at the matching output port so the demand chains
+            // across the boundary instead of dead-ending here.
+            if let Some(outer_body) = artifacts.body_of(s) {
+                for (outer_port, outer_port_node) in &outer_body.output_port_to_node_idx {
+                    if *outer_port_node == call_site.composition_idx {
+                        let chained = continuation_support(
+                            s,
+                            outer_port.as_str(),
+                            analysis,
+                            parent_graph,
+                            artifacts,
+                            memo,
+                            active,
+                        );
+                        acc.extend(chained);
+                    }
+                }
+            }
+        }
+    }
+
+    active.remove(&key);
+    memo.insert(key, acc.clone());
+    acc
+}
+
+/// Walk incoming edges from `start` until reaching an ancestor whose
+/// `stored_output_schema()` is `Some`. Skips row-preserving variants
+/// (Route / Sort / CorrelationCommit) that propagate their upstream's
+/// schema by reference rather than carrying their own.
+fn first_schema_bearing_ancestor(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> Option<&std::sync::Arc<clinker_record::Schema>> {
+    let mut cursor = graph
+        .neighbors_directed(start, Direction::Incoming)
+        .next()?;
+    loop {
+        if let Some(schema) = graph[cursor].stored_output_schema() {
+            return Some(schema);
+        }
+        match graph.neighbors_directed(cursor, Direction::Incoming).next() {
+            Some(next) => cursor = next,
+            None => return None,
+        }
+    }
+}
+
 /// Resolve the columns an Output's projection rule reads from its
 /// upstream's emitted shape.
 fn output_consumed_columns(
@@ -606,13 +1268,15 @@ fn output_consumed_columns(
 ) -> HashSet<String> {
     let mut set: HashSet<String> = HashSet::new();
     // Output projection: read the resolved payload's mapping if any,
-    // else fall back to every column the upstream emits. The Output's
-    // upstream is the immediate predecessor on the parent graph.
-    let upstream = graph
-        .neighbors_directed(out_idx, Direction::Incoming)
-        .next();
-    let upstream_cols: Vec<String> = upstream
-        .and_then(|u| graph[u].stored_output_schema())
+    // else fall back to every column the upstream emits. Row-
+    // preserving variants (Route / Sort) carry no `stored_output_schema`
+    // of their own, so walk past them to the first ancestor that
+    // does. Without this walk, an Output downstream of a Route inside
+    // a deferred region would seed an empty consumed set, prune every
+    // column out of the producer's `buffer_schema`, and trip
+    // `SchemaMismatch` when the deferred dispatcher feeds the Route's
+    // pre-stamped expected schema against the narrow buffer.
+    let upstream_cols: Vec<String> = first_schema_bearing_ancestor(graph, out_idx)
         .map(|schema| {
             schema
                 .columns()

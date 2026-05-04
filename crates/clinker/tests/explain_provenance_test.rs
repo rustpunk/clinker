@@ -134,30 +134,6 @@ fn test_explain_error_code_e105_outputs_doc_content() {
 }
 
 #[test]
-fn test_explain_error_code_e15w_retraction_help() {
-    let output = Command::new(clinker_bin())
-        .arg("explain")
-        .arg("--code")
-        .arg("E15W")
-        .output()
-        .expect("spawn clinker");
-    assert!(
-        output.status.success(),
-        "clinker explain --code E15W must succeed.\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("E15W"),
-        "E15W doc must reference its own code.\nstdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("retraction"),
-        "E15W doc must mention the retraction protocol.\nstdout: {stdout}"
-    );
-}
-
-#[test]
 fn test_explain_error_code_e15y_streaming_help() {
     let output = Command::new(clinker_bin())
         .arg("explain")

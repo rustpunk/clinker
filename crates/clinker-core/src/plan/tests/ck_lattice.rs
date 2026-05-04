@@ -768,10 +768,9 @@ nodes:
 /// `propagate_ck` because synthetic CK is engine-managed lineage —
 /// the user-facing knob does not gate it.
 ///
-/// Stacked relaxed aggregates are forbidden by E15W (the outer
-/// aggregator has no lineage entry for the inner aggregate's output
-/// rows), so each synthetic CK lives on a separate branch and the
-/// Combine is the meeting point.
+/// Each synthetic CK lives on a separate aggregate branch; the Combine
+/// is where the two lineages meet, so the lattice union surfaces both
+/// shadow columns on the combined output.
 #[test]
 fn ck_lattice_combine_unions_synthetic_from_independent_aggregate_branches() {
     let yaml = r#"

@@ -4260,19 +4260,17 @@ nodes:
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
         });
 
-        let mut plan = ExecutionPlanDag {
+        let mut plan = ExecutionPlanDag::from_parts(
             graph,
-            topo_order: Vec::new(),
-            source_dag: Vec::new(),
-            indices_to_build: Vec::new(),
-            output_projections: Vec::new(),
-            parallelism: clinker_core::plan::execution::ParallelismProfile {
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            clinker_core::plan::execution::ParallelismProfile {
                 per_transform: Vec::new(),
                 worker_threads: 1,
             },
-            node_properties: std::collections::HashMap::new(),
-            deferred_regions: std::collections::HashMap::new(),
-        };
+        );
         let mut diags = Vec::new();
         select_combine_strategies(&mut plan, &artifacts, &mut diags, None);
         if let PlanNode::Combine { strategy, .. } = &plan.graph[combine_idx] {

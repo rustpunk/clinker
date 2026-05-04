@@ -406,12 +406,13 @@ pub enum PlanNode {
         span: Span,
         /// Correlation key fields. The union of every source's
         /// declared `correlation_key:` field names, in declaration
-        /// order. Used by the dispatcher arm to format the group key
-        /// in DLQ trigger messages.
+        /// order. Read by the explain formatter for the
+        /// `[correlation_commit] <name> key=[<fields>]` header.
         commit_group_by: Vec<String>,
         /// Per-group buffer cap. Mirrors
-        /// `error_handling.max_group_buffer`; the dispatcher arm checks
-        /// against this when deciding overflow disposition.
+        /// `error_handling.max_group_buffer`; the runtime overflow
+        /// check reads it via `ctx.correlation_max_group_buffer`,
+        /// populated at executor construction.
         max_group_buffer: u64,
     },
     /// N-ary combine node.
@@ -864,14 +865,49 @@ pub struct ExecutionPlanDag {
     /// `crate::plan::deferred_region::detect_deferred_regions` after
     /// the window-buffer-recompute pass in compile Stage 5. Keyed by
     /// every `NodeIndex` participating in a region (producer + members
-    /// + outputs) so dispatch-arm lookup is O(1). The `DeferredRegion`
-    /// type is `pub` to satisfy struct-literal construction in
-    /// `tests/combine_test.rs`; out-of-crate code is expected to treat
-    /// it as opaque.
-    pub deferred_regions: HashMap<NodeIndex, crate::plan::deferred_region::DeferredRegion>,
+    /// + outputs) so dispatch-arm lookup is O(1).
+    pub(crate) deferred_regions: HashMap<NodeIndex, crate::plan::deferred_region::DeferredRegion>,
+    /// Parent-continuation metadata per Composition node whose body
+    /// (transitively) carries a deferred region. Keyed by the
+    /// Composition's `NodeIndex` in this DAG. Populated alongside
+    /// `deferred_regions` in compile Stage 5; the commit-time
+    /// dispatcher consults this map after harvesting body output
+    /// records to drive the parent's downstream chain on
+    /// post-recompute data.
+    pub(crate) parent_continuations:
+        HashMap<NodeIndex, crate::plan::deferred_region::ParentContinuation>,
 }
 
 impl ExecutionPlanDag {
+    /// Construct from already-computed parts. The compile path supplies
+    /// the populated graph + topology + per-transform plan metadata;
+    /// `node_properties` and `deferred_regions` are populated by later
+    /// passes against the returned DAG via `&mut`. Test fixtures that
+    /// drive a single planner pass against a hand-built graph (e.g. the
+    /// combine-strategy tests in `crates/clinker-core/tests/`) call this
+    /// with empty topo / sources / output projections — every consumer
+    /// they exercise reads only `graph` and the per-pass metadata.
+    pub fn from_parts(
+        graph: DiGraph<PlanNode, PlanEdge>,
+        topo_order: Vec<NodeIndex>,
+        source_dag: Vec<SourceTier>,
+        indices_to_build: Vec<IndexSpec>,
+        output_projections: Vec<OutputSpec>,
+        parallelism: ParallelismProfile,
+    ) -> Self {
+        Self {
+            graph,
+            topo_order,
+            source_dag,
+            indices_to_build,
+            output_projections,
+            parallelism,
+            node_properties: HashMap::new(),
+            deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
+        }
+    }
+
     /// Build a transient `ExecutionPlanDag` whose graph + topo_order
     /// alias a composition body's mini-DAG, with empty top-level
     /// fields (source_dag, indices_to_build, output_projections,
@@ -903,6 +939,11 @@ impl ExecutionPlanDag {
             // Body NodeIndex space matches `body.graph`, so the keys
             // remain valid against the cloned graph above.
             deferred_regions: body.deferred_regions.clone(),
+            // Body-internal Composition continuations ride along the
+            // same way: when the outer body's dispatcher walks a
+            // nested Composition, it reads continuations from the same
+            // surface as the parent dispatcher uses.
+            parent_continuations: body.parent_continuations.clone(),
         }
     }
 
@@ -918,13 +959,19 @@ impl ExecutionPlanDag {
     }
 
     /// `true` iff `idx` is a non-producer participant in some deferred
-    /// region (member or output). Operator arms use this to skip work
-    /// on the forward pass — the deferred dispatch at commit will run
-    /// the operator on post-recompute aggregate emits.
+    /// region (member or output) OR a member/output of a Composition
+    /// parent-continuation. Operator arms use this to skip work on the
+    /// forward pass — the commit-time deferred dispatch will run the
+    /// operator on post-recompute data (aggregate emits or harvested
+    /// body output records, depending on the surface).
     pub(crate) fn is_deferred_consumer(&self, idx: NodeIndex) -> bool {
         self.deferred_regions
             .get(&idx)
             .is_some_and(|r| r.producer != idx)
+            || self
+                .parent_continuations
+                .values()
+                .any(|c| c.members.contains(&idx) || c.outputs.contains(&idx))
     }
 
     /// `Some(region)` iff `idx` is the producer of a deferred region.
@@ -1343,6 +1390,36 @@ impl ExecutionPlanDag {
                 "  worst-case partition memory ceiling under degrade: O(largest partition × per-row-size); degrade-fallback drops the affected partition's recompute and DLQ's its rows.\n",
             );
             out.push('\n');
+        }
+
+        // Deferred regions: every relaxed-CK aggregate's commit-time
+        // sub-DAG. Sorted by producer name for deterministic snapshot
+        // output. Walk the per-producer view (each region keys every
+        // participating NodeIndex back to the same struct, so dedup
+        // by producer).
+        if !self.deferred_regions.is_empty() {
+            let mut by_producer: std::collections::BTreeMap<
+                String,
+                &crate::plan::deferred_region::DeferredRegion,
+            > = std::collections::BTreeMap::new();
+            for region in self.deferred_regions.values() {
+                let producer_name = self.graph[region.producer].name().to_string();
+                by_producer.entry(producer_name).or_insert(region);
+            }
+            for (producer_name, region) in by_producer {
+                let mut output_names: Vec<&str> = region
+                    .outputs
+                    .iter()
+                    .map(|idx| self.graph[*idx].name())
+                    .collect();
+                output_names.sort();
+                out.push_str(&format!(
+                    "Deferred Region: {producer_name} → [{}]\n",
+                    output_names.join(", ")
+                ));
+                out.push_str(&format!("  buffer_schema: {:?}\n", region.buffer_schema,));
+                out.push('\n');
+            }
         }
     }
 
@@ -4049,74 +4126,6 @@ fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> 
     }
 }
 
-/// Detect whether a CXL `TypedProgram` calls any non-deterministic builtin.
-///
-/// Today's CXL surface has one non-deterministic builtin: `now` (the
-/// `now` keyword reads wall-clock time at evaluation). The walker
-/// returns `true` if any `Expr::Now` appears anywhere in the program's
-/// statements; the result drives the E15W diagnostic, which rejects a
-/// relaxed-CK aggregate feeding a Transform that calls a non-deterministic
-/// operator (replay would not produce the same row twice, breaking the
-/// post-retract substitution proof). New non-deterministic builtins
-/// added later in CXL must extend this walker — the central check
-/// keeps the planner consistent with whatever the language admits.
-pub(crate) fn cxl_has_nondeterministic_call(typed: &TypedProgram) -> bool {
-    use cxl::ast::Expr;
-
-    fn walk(e: &Expr) -> bool {
-        match e {
-            Expr::Now { .. } => true,
-            Expr::Binary { lhs, rhs, .. } => walk(lhs) || walk(rhs),
-            Expr::Unary { operand, .. } => walk(operand),
-            Expr::MethodCall { receiver, args, .. } => walk(receiver) || args.iter().any(walk),
-            Expr::Match { subject, arms, .. } => {
-                subject.as_deref().map(walk).unwrap_or(false)
-                    || arms.iter().any(|a| walk(&a.pattern) || walk(&a.body))
-            }
-            Expr::IfThenElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                walk(condition)
-                    || walk(then_branch)
-                    || else_branch.as_deref().map(walk).unwrap_or(false)
-            }
-            Expr::Coalesce { lhs, rhs, .. } => walk(lhs) || walk(rhs),
-            Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => args.iter().any(walk),
-            Expr::Literal { .. }
-            | Expr::FieldRef { .. }
-            | Expr::QualifiedFieldRef { .. }
-            | Expr::PipelineAccess { .. }
-            | Expr::MetaAccess { .. }
-            | Expr::Wildcard { .. }
-            | Expr::AggSlot { .. }
-            | Expr::GroupKey { .. } => false,
-        }
-    }
-
-    for stmt in &typed.program.statements {
-        let mut exprs: Vec<&Expr> = Vec::new();
-        match stmt {
-            Statement::Emit { expr, .. } | Statement::Let { expr, .. } => exprs.push(expr),
-            Statement::Filter { predicate, .. } => exprs.push(predicate),
-            Statement::Trace { guard, message, .. } => {
-                if let Some(g) = guard.as_deref() {
-                    exprs.push(g);
-                }
-                exprs.push(message);
-            }
-            Statement::ExprStmt { expr, .. } => exprs.push(expr),
-            Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
-        }
-        if exprs.iter().any(|e| walk(e)) {
-            return true;
-        }
-    }
-    false
-}
-
 /// True when an aggregate's `group_by` omits at least one field of the
 /// parent's visible CK set.
 ///
@@ -4555,6 +4564,7 @@ mod port_tag_guard_tests {
             },
             node_properties: HashMap::new(),
             deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
         }
     }
 
@@ -4664,6 +4674,7 @@ mod port_tag_guard_tests {
             body_indices_to_build: Vec::new(),
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
+            parent_continuations: HashMap::new(),
         };
         artifacts.insert_body(body_id, body);
         let diags = diagnose_untagged_composition_edges(&dag, &artifacts);
