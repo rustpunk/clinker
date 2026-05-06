@@ -189,6 +189,37 @@ impl PathTemplate {
     }
 }
 
+/// Render every Output node's `path:` template in place, with `n` set
+/// to `None` so collision counters do not appear in the resolved base
+/// path. Both the non-split file opener (in `clinker::main`) and the
+/// split file factory (in `executor::build_format_writer`) consume the
+/// rendered string downstream — pre-resolving here keeps tokens out of
+/// the executor.
+///
+/// Errors propagate the first template parse / render failure, with
+/// the offending output's name embedded in the message so the caller
+/// can attach a span.
+pub fn resolve_output_path_templates_in_place(
+    config: &mut crate::config::PipelineConfig,
+    ctx: &TemplateContext<'_>,
+) -> Result<(), crate::config::ConfigError> {
+    use crate::config::ConfigError;
+    use crate::config::PipelineNode;
+
+    for spanned in config.nodes.iter_mut() {
+        if let PipelineNode::Output { config: body, .. } = &mut spanned.value {
+            let template = PathTemplate::parse(&body.output.path).map_err(|e| {
+                ConfigError::Validation(format!("output {:?}: {e}", body.output.name))
+            })?;
+            let resolved = template.render(ctx).map_err(|e| {
+                ConfigError::Validation(format!("output {:?}: {e}", body.output.name))
+            })?;
+            body.output.path = resolved;
+        }
+    }
+    Ok(())
+}
+
 const KNOWN_TOKENS: &[&str] = &[
     "source_name",
     "channel",

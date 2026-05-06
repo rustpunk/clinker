@@ -423,7 +423,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Load pipeline YAML directly — single-model scan, no composition or
     // channel overlay at this entry point.
-    let pipeline_config = clinker_core::config::load_config_with_vars(&args.config, &[])
+    let mut pipeline_config = clinker_core::config::load_config_with_vars(&args.config, &[])
         .map_err(PipelineError::Config)?;
 
     // Resolve workspace_root ONCE at the entry point.
@@ -511,23 +511,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         shutdown_token: None,
     };
 
-    // Run the pipeline using file-based I/O — open readers for ALL sources
-    // (primary + lookup references) and writers for ALL outputs.
-    let first_source = pipeline_config
-        .source_configs()
-        .next()
-        .expect("pipeline has at least one source");
-    let input_path = first_source.path.clone();
-
-    let mut readers: std::collections::HashMap<String, Box<dyn std::io::Read + Send>> =
-        std::collections::HashMap::new();
-    for source in pipeline_config.source_configs() {
-        let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&source.path)?);
-        readers.insert(source.name.clone(), reader);
-    }
-
-    let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
-        std::collections::HashMap::new();
+    // Resolve {token} expressions in every Output's path: once here, so
+    // both the file open below and the split file factory deeper in the
+    // executor see literal paths. {n} stays as `None` — the collision
+    // counter is applied later via `append_suffix_before_ext`.
     let pipeline_hash = pipeline_config.source_hash;
     let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
     let mut source_name_by_node: std::collections::HashMap<String, String> =
@@ -550,43 +537,66 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         })
         .and_then(|os| os.into_string().ok());
 
-    for output in pipeline_config.output_configs() {
-        let template = clinker_core::output::path_template::PathTemplate::parse(&output.path)
-            .map_err(PipelineError::Config)?;
-        let template_has_n = template.contains_token("n");
-        let unique_suffix_width = output.unique_suffix_width;
+    let template_ctx = clinker_core::output::path_template::TemplateContext {
+        source_name_default: source_name_default.as_deref(),
+        source_name_by_node: source_name_by_node.clone(),
+        channel: None,
+        pipeline_hash,
+        timestamp: Some(&timestamp_str),
+        execution_id: Some(&execution_id),
+        batch_id: Some(&batch_id),
+        n: None,
+        unique_suffix_width: 0,
+    };
+    clinker_core::output::path_template::resolve_output_path_templates_in_place(
+        &mut pipeline_config,
+        &template_ctx,
+    )
+    .map_err(PipelineError::Config)?;
 
+    // Run the pipeline using file-based I/O — open readers for ALL sources
+    // (primary + lookup references) and writers for ALL outputs.
+    let first_source = pipeline_config
+        .source_configs()
+        .next()
+        .expect("pipeline has at least one source");
+    let input_path = first_source.path.clone();
+
+    let mut readers: std::collections::HashMap<String, Box<dyn std::io::Read + Send>> =
+        std::collections::HashMap::new();
+    for source in pipeline_config.source_configs() {
+        let reader: Box<dyn std::io::Read + Send> = Box::new(std::fs::File::open(&source.path)?);
+        readers.insert(source.name.clone(), reader);
+    }
+
+    let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
+        std::collections::HashMap::new();
+    for output in pipeline_config.output_configs() {
+        // Split outputs route file creation through SplittingWriter's
+        // per-`{seq}` factory inside build_format_writer, which applies
+        // `if_exists` itself. The non-split sink below would otherwise
+        // pre-create an empty bare file that then gets dropped — bypass
+        // it with a sink writer for split outputs.
+        if output.split.is_some() {
+            writers.insert(output.name.clone(), Box::new(std::io::sink()));
+            continue;
+        }
+        let bare = std::path::PathBuf::from(&output.path);
+        let unique_suffix_width = output.unique_suffix_width;
         let path_for_n =
             |n: Option<u64>| -> Result<std::path::PathBuf, clinker_core::config::ConfigError> {
-                let ctx = clinker_core::output::path_template::TemplateContext {
-                    source_name_default: source_name_default.as_deref(),
-                    source_name_by_node: source_name_by_node.clone(),
-                    channel: None,
-                    pipeline_hash,
-                    timestamp: Some(&timestamp_str),
-                    execution_id: Some(&execution_id),
-                    batch_id: Some(&batch_id),
-                    n,
-                    unique_suffix_width,
-                };
-                let rendered = template.render(&ctx)?;
-                let path = std::path::PathBuf::from(rendered);
-                if let Some(k) = n
-                    && !template_has_n
-                {
-                    let suffix = if unique_suffix_width == 0 {
-                        format!("-{k}")
-                    } else {
-                        format!("-{:0>width$}", k, width = unique_suffix_width as usize)
-                    };
-                    Ok(clinker_core::output::open::append_suffix_before_ext(
-                        &path, &suffix,
-                    ))
-                } else {
-                    Ok(path)
-                }
+                Ok(match n {
+                    None => bare.clone(),
+                    Some(k) => {
+                        let suffix = if unique_suffix_width == 0 {
+                            format!("-{k}")
+                        } else {
+                            format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                        };
+                        clinker_core::output::open::append_suffix_before_ext(&bare, &suffix)
+                    }
+                })
             };
-
         let (_resolved_path, file) =
             clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
         writers.insert(output.name.clone(), Box::new(file));
