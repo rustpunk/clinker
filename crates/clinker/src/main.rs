@@ -423,14 +423,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Load pipeline YAML directly — single-model scan, no composition or
     // channel overlay at this entry point.
-    let yaml = std::fs::read_to_string(&args.config).map_err(PipelineError::Io)?;
-    let interpolated = clinker_core::config::interpolate_env_vars(&yaml, &[]).map_err(|e| {
-        PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
-    })?;
-    let pipeline_config: clinker_core::config::PipelineConfig =
-        clinker_core::yaml::from_str(&interpolated).map_err(|e| {
-            PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
-        })?;
+    let pipeline_config = clinker_core::config::load_config_with_vars(&args.config, &[])
+        .map_err(PipelineError::Config)?;
 
     // Resolve workspace_root ONCE at the entry point.
     // Production CLI path — never call env::current_dir() inside compile().
@@ -534,9 +528,68 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
+    let pipeline_hash = pipeline_config.source_hash;
+    let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let mut source_name_by_node: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for src in pipeline_config.source_configs() {
+        if let Some(stem) = std::path::Path::new(&src.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            source_name_by_node.insert(src.name.clone(), stem.to_string());
+        }
+    }
+    let source_name_default: Option<String> = pipeline_config
+        .source_configs()
+        .next()
+        .and_then(|s| {
+            std::path::Path::new(&s.path)
+                .file_stem()
+                .map(|st| st.to_owned())
+        })
+        .and_then(|os| os.into_string().ok());
+
     for output in pipeline_config.output_configs() {
-        let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output.path)?);
-        writers.insert(output.name.clone(), writer);
+        let template = clinker_core::output::path_template::PathTemplate::parse(&output.path)
+            .map_err(PipelineError::Config)?;
+        let template_has_n = template.contains_token("n");
+        let unique_suffix_width = output.unique_suffix_width;
+
+        let path_for_n =
+            |n: Option<u64>| -> Result<std::path::PathBuf, clinker_core::config::ConfigError> {
+                let ctx = clinker_core::output::path_template::TemplateContext {
+                    source_name_default: source_name_default.as_deref(),
+                    source_name_by_node: source_name_by_node.clone(),
+                    channel: None,
+                    pipeline_hash,
+                    timestamp: Some(&timestamp_str),
+                    execution_id: Some(&execution_id),
+                    batch_id: Some(&batch_id),
+                    n,
+                    unique_suffix_width,
+                };
+                let rendered = template.render(&ctx)?;
+                let path = std::path::PathBuf::from(rendered);
+                if let Some(k) = n
+                    && !template_has_n
+                {
+                    let suffix = if unique_suffix_width == 0 {
+                        format!("-{k}")
+                    } else {
+                        format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                    };
+                    Ok(clinker_core::output::open::append_suffix_before_ext(
+                        &path, &suffix,
+                    ))
+                } else {
+                    Ok(path)
+                }
+            };
+
+        let (_resolved_path, file) =
+            clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
+        writers.insert(output.name.clone(), Box::new(file));
     }
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
