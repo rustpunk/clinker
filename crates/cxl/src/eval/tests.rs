@@ -18,16 +18,16 @@ fn empty_row() -> Row {
 /// Dummy storage for no-window evaluation tests.
 struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
+    fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+    fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
         None
     }
-    fn available_fields(&self, _: u32) -> Vec<&str> {
+    fn available_fields(&self, _: u64) -> Vec<&str> {
         vec![]
     }
-    fn record_count(&self) -> u32 {
+    fn record_count(&self) -> u64 {
         0
     }
 }
@@ -551,21 +551,21 @@ mod any_all {
     }
 
     impl RecordStorage for RowsStorage {
-        fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
+        fn resolve_field(&self, index: u64, name: &str) -> Option<&Value> {
             if name == "flag" {
                 self.rows.get(index as usize)
             } else {
                 None
             }
         }
-        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+        fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
             None
         }
-        fn available_fields(&self, _: u32) -> Vec<&str> {
+        fn available_fields(&self, _: u64) -> Vec<&str> {
             vec!["flag"]
         }
-        fn record_count(&self) -> u32 {
-            self.rows.len() as u32
+        fn record_count(&self) -> u64 {
+            self.rows.len() as u64
         }
     }
 
@@ -583,7 +583,7 @@ mod any_all {
                 .rows
                 .len()
                 .checked_sub(1)
-                .map(|i| RecordView::new(self.storage, i as u32))
+                .map(|i| RecordView::new(self.storage, i as u64))
         }
         fn lag(&self, _: usize) -> Option<RecordView<'a, RowsStorage>> {
             None
@@ -613,7 +613,7 @@ mod any_all {
             self.storage.rows.len()
         }
         fn partition_record(&self, index: usize) -> RecordView<'a, RowsStorage> {
-            RecordView::new(self.storage, index as u32)
+            RecordView::new(self.storage, index as u64)
         }
         fn collect(&self, _: &str) -> Value {
             Value::Null

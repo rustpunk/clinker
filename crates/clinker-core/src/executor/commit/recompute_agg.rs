@@ -44,7 +44,7 @@ pub(crate) fn recompute_aggregates(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     scope: &RetractScope,
-    new_retract_rows: &[u32],
+    new_retract_rows: &[u64],
 ) -> Result<(), PipelineError> {
     if scope.aggregates.is_empty() || new_retract_rows.is_empty() {
         return Ok(());
@@ -100,7 +100,7 @@ pub(crate) fn recompute_aggregates(
 /// "row not in this aggregator's lineage" case (treated as no-op).
 fn retract_and_refinalize(
     retained: &mut crate::executor::dispatch::RetainedAggregatorState,
-    retract_ids: &[u32],
+    retract_ids: &[u64],
 ) -> Result<(), HashAggError> {
     for &row_id in retract_ids {
         if let Err(e) = retained.aggregator.retract_row(row_id) {

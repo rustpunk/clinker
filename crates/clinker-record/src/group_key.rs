@@ -52,19 +52,19 @@ impl GroupByKey {
 #[derive(Debug)]
 pub enum GroupKeyError {
     /// NaN value in a group_by / distinct field.
-    NanInGroupBy { field: String, row: u32 },
+    NanInGroupBy { field: String, row: u64 },
     /// Float value in an integer-pinned field.
     TypeMismatch {
         field: String,
         expected: &'static str,
         got: &'static str,
-        row: u32,
+        row: u64,
     },
     /// Unsupported type (e.g. Array) used as group key.
     UnsupportedType {
         field: String,
         type_name: &'static str,
-        row: u32,
+        row: u64,
     },
 }
 
@@ -119,7 +119,7 @@ pub fn value_to_group_key(
     val: &Value,
     field: &str,
     schema_pin: Option<&FieldDef>,
-    row: u32,
+    row: u64,
 ) -> Result<Option<GroupByKey>, GroupKeyError> {
     match val {
         Value::Null => Ok(None),

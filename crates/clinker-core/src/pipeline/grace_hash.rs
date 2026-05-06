@@ -1841,16 +1841,16 @@ fn emit_for_probe<'a>(
 struct NullStorage;
 
 impl clinker_record::RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
+    fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+    fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
         None
     }
-    fn available_fields(&self, _: u32) -> Vec<&str> {
+    fn available_fields(&self, _: u64) -> Vec<&str> {
         vec![]
     }
-    fn record_count(&self) -> u32 {
+    fn record_count(&self) -> u64 {
         0
     }
 }

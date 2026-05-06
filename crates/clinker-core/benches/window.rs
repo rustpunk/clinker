@@ -10,7 +10,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 
 /// Build an Arena with numeric fields for window benchmarks.
-fn build_numeric_arena(partition_size: usize) -> (Arena, Vec<u32>) {
+fn build_numeric_arena(partition_size: usize) -> (Arena, Vec<u64>) {
     let schema = Arc::new(Schema::new(vec!["amount".into(), "category".into()]));
     let mut rng = fastrand::Rng::with_seed(42);
     let mut minimals = Vec::with_capacity(partition_size);
@@ -20,7 +20,7 @@ fn build_numeric_arena(partition_size: usize) -> (Arena, Vec<u32>) {
             Value::String(format!("cat_{}", i % 50).into_boxed_str()),
         ]));
     }
-    let positions: Vec<u32> = (0..partition_size as u32).collect();
+    let positions: Vec<u64> = (0..partition_size as u64).collect();
     (Arena::from_parts(schema, minimals), positions)
 }
 

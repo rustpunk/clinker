@@ -260,16 +260,16 @@ fn sum_cpu_io_totals(
 /// Used to satisfy the `S: RecordStorage` type parameter when `window` is `None`.
 pub(crate) struct NullStorage;
 impl RecordStorage for NullStorage {
-    fn resolve_field(&self, _: u32, _: &str) -> Option<&Value> {
+    fn resolve_field(&self, _: u64, _: &str) -> Option<&Value> {
         None
     }
-    fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+    fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
         None
     }
-    fn available_fields(&self, _: u32) -> Vec<&str> {
+    fn available_fields(&self, _: u64) -> Vec<&str> {
         vec![]
     }
-    fn record_count(&self) -> u32 {
+    fn record_count(&self) -> u64 {
         0
     }
 }
@@ -930,7 +930,7 @@ impl PipelineExecutor {
                     transform_name: String::new(),
                     messages: vec![format!("E310 source-arena build: {e}")],
                 })?;
-                let arena_len = arena.record_count() as u64;
+                let arena_len = arena.record_count();
                 collector.record(arena_timer.finish(arena_len, arena_len));
 
                 let index_name = format!("{}:{}", source_name, spec.group_by.join(","));
@@ -2121,7 +2121,7 @@ pub(crate) fn evaluate_single_transform_windowed(
     plan: &ExecutionPlanDag,
     window_index: usize,
     runtime: &crate::executor::window_runtime::WindowRuntime,
-    record_pos: u32,
+    record_pos: u64,
 ) -> Result<(Record, Result<(), SkipReason>), (String, cxl::eval::EvalError)> {
     let spec = &plan.indices_to_build[window_index];
     let arena = runtime.arena.as_ref();
