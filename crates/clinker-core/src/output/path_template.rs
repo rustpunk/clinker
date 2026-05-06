@@ -187,6 +187,16 @@ impl PathTemplate {
             })
             .collect()
     }
+
+    /// Whether the template has at least one `{source_name}` token
+    /// without an explicit `:NODE` argument. Used to gate the
+    /// "ambiguous source" diagnostic for outputs that fan in from
+    /// multiple Source ancestors.
+    pub fn has_unqualified_source_name(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s, Segment::Token(t) if t.name == "source_name" && t.arg.is_none()))
+    }
 }
 
 /// Render every Output node's `path:` template in place, with `n` set
@@ -196,9 +206,14 @@ impl PathTemplate {
 /// rendered string downstream — pre-resolving here keeps tokens out of
 /// the executor.
 ///
-/// Errors propagate the first template parse / render failure, with
-/// the offending output's name embedded in the message so the caller
-/// can attach a span.
+/// `{source_name}` resolution is per-output: ancestry traces backward
+/// through node `input:` references, and the unqualified token requires
+/// exactly one Source ancestor. Multi-source fan-in forces the user to
+/// disambiguate via `{source_name:NODE}`, which is in turn validated
+/// against the ancestor set.
+///
+/// `ctx.source_name_default` and `ctx.source_name_by_node` are ignored;
+/// per-output ancestry supersedes them.
 pub fn resolve_output_path_templates_in_place(
     config: &mut crate::config::PipelineConfig,
     ctx: &TemplateContext<'_>,
@@ -206,18 +221,161 @@ pub fn resolve_output_path_templates_in_place(
     use crate::config::ConfigError;
     use crate::config::PipelineNode;
 
+    let output_names: Vec<String> = config
+        .nodes
+        .iter()
+        .filter_map(|s| match &s.value {
+            PipelineNode::Output { config: body, .. } => Some(body.output.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let ancestry: HashMap<String, Vec<SourceAncestor>> = output_names
+        .iter()
+        .map(|name| (name.clone(), source_ancestors_of(config, name)))
+        .collect();
+
     for spanned in config.nodes.iter_mut() {
-        if let PipelineNode::Output { config: body, .. } = &mut spanned.value {
-            let template = PathTemplate::parse(&body.output.path).map_err(|e| {
-                ConfigError::Validation(format!("output {:?}: {e}", body.output.name))
-            })?;
-            let resolved = template.render(ctx).map_err(|e| {
-                ConfigError::Validation(format!("output {:?}: {e}", body.output.name))
-            })?;
-            body.output.path = resolved;
+        let PipelineNode::Output { config: body, .. } = &mut spanned.value else {
+            continue;
+        };
+        let output_name = body.output.name.clone();
+        let template = PathTemplate::parse(&body.output.path)
+            .map_err(|e| ConfigError::Validation(format!("output {output_name:?}: {e}")))?;
+
+        let ancestors = ancestry.get(&output_name).cloned().unwrap_or_default();
+        let mut by_node: HashMap<String, String> = HashMap::new();
+        for a in &ancestors {
+            by_node.insert(a.node_name.clone(), a.stem.clone());
         }
+        let unique_default = if ancestors.len() == 1 {
+            Some(ancestors[0].stem.clone())
+        } else {
+            None
+        };
+
+        if template.contains_token("source_name") {
+            for arg in template.source_name_args() {
+                if !by_node.contains_key(arg) {
+                    let names: Vec<&str> = ancestors.iter().map(|a| a.node_name.as_str()).collect();
+                    return Err(ConfigError::Validation(format!(
+                        "output {output_name:?}: {{source_name:{arg}}} references {arg:?}, \
+                         which is not a Source ancestor; ancestors are: [{}]",
+                        names.join(", ")
+                    )));
+                }
+            }
+            let total_source_name_tokens = template
+                .referenced_tokens()
+                .iter()
+                .filter(|t| **t == "source_name")
+                .count();
+            // referenced_tokens deduplicates; check for any unqualified token
+            // by counting source_name appearances in segments directly.
+            if template.has_unqualified_source_name() && unique_default.is_none() {
+                let names: Vec<&str> = ancestors.iter().map(|a| a.node_name.as_str()).collect();
+                return Err(ConfigError::Validation(format!(
+                    "output {output_name:?}: {{source_name}} is ambiguous — output traces \
+                     back to {} sources [{}]; use {{source_name:NODE}} to disambiguate",
+                    ancestors.len(),
+                    names.join(", "),
+                )));
+            }
+            let _ = total_source_name_tokens;
+        }
+
+        let local_ctx = TemplateContext {
+            source_name_default: unique_default.as_deref(),
+            source_name_by_node: by_node,
+            channel: ctx.channel,
+            pipeline_hash: ctx.pipeline_hash,
+            timestamp: ctx.timestamp,
+            execution_id: ctx.execution_id,
+            batch_id: ctx.batch_id,
+            n: None,
+            unique_suffix_width: 0,
+        };
+        let resolved = template
+            .render(&local_ctx)
+            .map_err(|e| ConfigError::Validation(format!("output {output_name:?}: {e}")))?;
+        body.output.path = resolved;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SourceAncestor {
+    node_name: String,
+    stem: String,
+}
+
+/// BFS backward through node `input:` references from `output_name` to
+/// every Source ancestor. Returns each ancestor's node name plus its
+/// file-path stem.
+fn source_ancestors_of(
+    config: &crate::config::PipelineConfig,
+    output_name: &str,
+) -> Vec<SourceAncestor> {
+    use crate::config::PipelineNode;
+    use crate::config::node_header::NodeInput;
+    use std::collections::{HashSet, VecDeque};
+
+    let by_name: HashMap<&str, &PipelineNode> = config
+        .nodes
+        .iter()
+        .map(|s| (s.value.name(), &s.value))
+        .collect();
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut sources: Vec<SourceAncestor> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::from([output_name.to_string()]);
+
+    let target_name_of = |inp: &NodeInput| -> String {
+        match inp {
+            NodeInput::Single(s) => s.clone(),
+            NodeInput::Port { node, .. } => node.clone(),
+        }
+    };
+
+    while let Some(name) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(node) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        match node {
+            PipelineNode::Source { config: src, .. } => {
+                let stem = std::path::Path::new(&src.source.path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                sources.push(SourceAncestor {
+                    node_name: src.source.name.clone(),
+                    stem,
+                });
+            }
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Composition { header, .. } => {
+                queue.push_back(target_name_of(&header.input.value));
+            }
+            PipelineNode::Merge { header, .. } => {
+                for inp in &header.inputs {
+                    queue.push_back(target_name_of(&inp.value));
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for inp in header.input.values() {
+                    queue.push_back(target_name_of(&inp.value));
+                }
+            }
+        }
+    }
+    sources
 }
 
 const KNOWN_TOKENS: &[&str] = &[
@@ -491,6 +649,16 @@ mod tests {
     fn source_name_args_collected() {
         let t = PathTemplate::parse("{source_name:left}-{source_name:right}.csv").unwrap();
         assert_eq!(t.source_name_args(), vec!["left", "right"]);
+    }
+
+    #[test]
+    fn has_unqualified_source_name_detects_bare_token() {
+        let t = PathTemplate::parse("{source_name}.csv").unwrap();
+        assert!(t.has_unqualified_source_name());
+        let t = PathTemplate::parse("{source_name:foo}.csv").unwrap();
+        assert!(!t.has_unqualified_source_name());
+        let t = PathTemplate::parse("{source_name}-{source_name:foo}.csv").unwrap();
+        assert!(t.has_unqualified_source_name());
     }
 
     #[test]
