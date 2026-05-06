@@ -2458,6 +2458,7 @@ mod tests {
     mod deferred_dispatch;
     mod format_dispatch;
     mod multi_output;
+    mod post_aggregate_any_all;
     mod post_aggregate_lag_lead;
     mod post_aggregate_recompute_determinism;
     mod post_aggregate_window;

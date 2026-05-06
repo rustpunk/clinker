@@ -530,3 +530,264 @@ fn test_log_level4_guard_short_circuits() {
     );
     assert_eq!(output.get("val"), Some(&Value::Integer(42)));
 }
+
+// ---------------------------------------------------------------------------
+// $window.any / $window.all — three-valued logic
+//
+// Mirrors BinOp::And/Or in eval/mod.rs:801–829 by construction. Tests use a
+// minimal in-memory `RowsStorage` + `RowsWindow` so each test row can hold
+// explicit `Value::Bool` / `Value::Null` predicate inputs without going
+// through CSV/coercion.
+// ---------------------------------------------------------------------------
+
+mod any_all {
+    use super::*;
+    use crate::typecheck::row::QualifiedField;
+    use clinker_record::{RecordView, WindowContext};
+
+    /// Storage that returns the i-th row's `flag` field by index.
+    struct RowsStorage {
+        rows: Vec<Value>,
+    }
+
+    impl RecordStorage for RowsStorage {
+        fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
+            if name == "flag" {
+                self.rows.get(index as usize)
+            } else {
+                None
+            }
+        }
+        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+            None
+        }
+        fn available_fields(&self, _: u32) -> Vec<&str> {
+            vec!["flag"]
+        }
+        fn record_count(&self) -> u32 {
+            self.rows.len() as u32
+        }
+    }
+
+    /// Window over the entire RowsStorage — every row is in the partition.
+    struct RowsWindow<'a> {
+        storage: &'a RowsStorage,
+    }
+
+    impl<'a> WindowContext<'a, RowsStorage> for RowsWindow<'a> {
+        fn first(&self) -> Option<RecordView<'a, RowsStorage>> {
+            (!self.storage.rows.is_empty()).then(|| RecordView::new(self.storage, 0))
+        }
+        fn last(&self) -> Option<RecordView<'a, RowsStorage>> {
+            self.storage
+                .rows
+                .len()
+                .checked_sub(1)
+                .map(|i| RecordView::new(self.storage, i as u32))
+        }
+        fn lag(&self, _: usize) -> Option<RecordView<'a, RowsStorage>> {
+            None
+        }
+        fn lead(&self, _: usize) -> Option<RecordView<'a, RowsStorage>> {
+            None
+        }
+        fn count(&self) -> i64 {
+            self.storage.rows.len() as i64
+        }
+        fn sum(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn cumulative_sum(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn avg(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn min(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn max(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn partition_len(&self) -> usize {
+            self.storage.rows.len()
+        }
+        fn partition_record(&self, index: usize) -> RecordView<'a, RowsStorage> {
+            RecordView::new(self.storage, index as u32)
+        }
+        fn collect(&self, _: &str) -> Value {
+            Value::Null
+        }
+        fn distinct(&self, _: &str) -> Value {
+            Value::Null
+        }
+    }
+
+    fn eval_window(src: &str, partition: Vec<Value>) -> Value {
+        let parsed = Parser::parse(src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = resolve_program(parsed.ast, &["flag"], parsed.node_count)
+            .unwrap_or_else(|d| panic!("resolve: {:?}", d));
+        let row = Row::closed(
+            indexmap::IndexMap::from([(
+                QualifiedField::bare("flag"),
+                crate::typecheck::types::Type::Bool,
+            )]),
+            Span::new(0, 0),
+        );
+        let typed = type_check(resolved, &row).unwrap_or_else(|d| panic!("type: {:?}", d));
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let storage = RowsStorage { rows: partition };
+        let resolver = HashMapResolver::new(HashMap::new());
+        let window = RowsWindow { storage: &storage };
+        eval_program::<RowsStorage>(&typed, &ctx, &resolver, Some(&window))
+            .unwrap_or_else(|e| panic!("eval: {}", e))
+            .into_values()
+            .next()
+            .unwrap_or(Value::Null)
+    }
+
+    fn b(v: bool) -> Value {
+        Value::Bool(v)
+    }
+    fn n() -> Value {
+        Value::Null
+    }
+
+    #[test]
+    fn any_short_circuits_on_true() {
+        assert_eq!(
+            eval_window(
+                "emit r = $window.any(flag)",
+                vec![b(true), b(false), b(false)]
+            ),
+            Value::Bool(true)
+        );
+        // True before null → still true (short-circuit fires before null is seen).
+        assert_eq!(
+            eval_window("emit r = $window.any(flag)", vec![b(true), n(), b(false)]),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn any_all_false_returns_false() {
+        assert_eq!(
+            eval_window(
+                "emit r = $window.any(flag)",
+                vec![b(false), b(false), b(false)]
+            ),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn any_null_with_no_true_returns_null() {
+        assert_eq!(
+            eval_window("emit r = $window.any(flag)", vec![n(), b(false), b(false)]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_window("emit r = $window.any(flag)", vec![b(false), n(), b(false)]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn all_short_circuits_on_false() {
+        assert_eq!(
+            eval_window(
+                "emit r = $window.all(flag)",
+                vec![b(true), b(false), b(true)]
+            ),
+            Value::Bool(false)
+        );
+        // False before null → still false (short-circuit fires before null is seen).
+        assert_eq!(
+            eval_window("emit r = $window.all(flag)", vec![b(false), n(), b(true)]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn all_all_true_returns_true() {
+        assert_eq!(
+            eval_window(
+                "emit r = $window.all(flag)",
+                vec![b(true), b(true), b(true)]
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn all_null_with_no_false_returns_null() {
+        assert_eq!(
+            eval_window("emit r = $window.all(flag)", vec![n(), b(true), b(true)]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_window("emit r = $window.all(flag)", vec![b(true), n(), b(true)]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn empty_partition_returns_identity() {
+        // Defensive — unreachable in practice (current row is always in
+        // partition), but identity for iterated or/and:
+        // any → false, all → true.
+        assert_eq!(
+            eval_window("emit r = $window.any(flag)", vec![]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_window("emit r = $window.all(flag)", vec![]),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn agrees_with_iterated_or_and_two_rows() {
+        // Algebraic identity: any([a, b]) ≡ a or b; all([a, b]) ≡ a and b.
+        // BinOp::And/Or in eval/mod.rs:801–829 are the source of truth;
+        // any/all over the same inputs must produce the same Value.
+        let pairs = [
+            (b(true), b(true)),
+            (b(true), b(false)),
+            (b(false), b(true)),
+            (b(false), b(false)),
+            (b(true), n()),
+            (n(), b(true)),
+            (b(false), n()),
+            (n(), b(false)),
+            (n(), n()),
+        ];
+        for (a, b_val) in pairs {
+            let from_any =
+                eval_window("emit r = $window.any(flag)", vec![a.clone(), b_val.clone()]);
+            let expected_any = match (&a, &b_val) {
+                (Value::Bool(true), _) | (_, Value::Bool(true)) => Value::Bool(true),
+                (Value::Bool(false), Value::Bool(false)) => Value::Bool(false),
+                _ => Value::Null,
+            };
+            assert_eq!(
+                from_any, expected_any,
+                "any({a:?}, {b_val:?}) must match iterated or"
+            );
+
+            let from_all =
+                eval_window("emit r = $window.all(flag)", vec![a.clone(), b_val.clone()]);
+            let expected_all = match (&a, &b_val) {
+                (Value::Bool(false), _) | (_, Value::Bool(false)) => Value::Bool(false),
+                (Value::Bool(true), Value::Bool(true)) => Value::Bool(true),
+                _ => Value::Null,
+            };
+            assert_eq!(
+                from_all, expected_all,
+                "all({a:?}, {b_val:?}) must match iterated and"
+            );
+        }
+    }
+}
