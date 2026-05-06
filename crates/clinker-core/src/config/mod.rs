@@ -43,6 +43,14 @@ pub struct PipelineConfig {
     /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+    /// BLAKE3 hash of the post-env-var-interpolated source YAML bytes.
+    /// Stamped by [`load_config_with_vars`]; zero array for in-memory
+    /// configs that did not flow through a file load (e.g. tests).
+    /// Threaded onto `CompiledPlan` at compile time so the executor can
+    /// expand `{pipeline_hash}` template tokens and stamp provenance
+    /// sidecars without needing to re-read the source.
+    #[serde(skip)]
+    pub source_hash: [u8; 32],
 }
 
 /// Pipeline-level metadata and global settings.
@@ -3374,13 +3382,18 @@ pub fn convert_pipeline_vars(
 
 /// Load and parse a pipeline config from a YAML file path with extra variables.
 /// `extra_vars` are checked before system env vars during interpolation.
+///
+/// Stamps `config.source_hash` with the BLAKE3 of the post-env-var
+/// interpolated YAML so the executor can resolve `{pipeline_hash}` tokens
+/// and write provenance sidecars without retaining the source bytes.
 pub fn load_config_with_vars(
     path: &std::path::Path,
     extra_vars: &[(&str, &str)],
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
-    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    config.source_hash = *blake3::hash(interpolated.as_bytes()).as_bytes();
     validate_config(&config)?;
     Ok(config)
 }
