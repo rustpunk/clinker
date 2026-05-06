@@ -23,8 +23,9 @@ cargo build --workspace          # Build all crates
 cargo test --workspace           # Run all tests
 cargo test -p cxl                # Test a single crate
 cargo test -p clinker-core -- node_taxonomy  # Run tests matching a pattern
-cargo bench -p clinker-core      # Run benchmarks (arena, parallel, pipeline, sort, window)
-cargo bench -p cxl               # Run CXL benchmarks (eval, parse)
+cargo bench -p clinker-core      # arena, parallel, pipeline, sort, window, combine, combine_grace_hash, combine_iejoin, combine_nary_3input, composition, deferred_buffer_pruning, provenance
+cargo bench -p cxl               # CXL benchmarks (eval, parse)
+cargo bench -p clinker-benchmarks # Cross-crate harness (e2e_matrix, e2e_xlarge)
 cargo deny check                 # License/ban/advisory audit (pure Rust policy)
 ```
 
