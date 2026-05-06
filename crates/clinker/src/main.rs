@@ -434,6 +434,54 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     );
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
 
+    // Run identity values flow through Output path templates and the
+    // provenance sidecar. Generated before --explain so resolved-path
+    // summaries match the values the actual run would use. The id pair
+    // re-rolls per invocation; consumers correlate runs via batch_id.
+    let execution_id = uuid::Uuid::now_v7().to_string();
+    let batch_id = args.resolved_batch_id();
+    let pipeline_hash = pipeline_config.source_hash;
+    let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let mut source_name_by_node: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for src in pipeline_config.source_configs() {
+        if let Some(stem) = std::path::Path::new(&src.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            source_name_by_node.insert(src.name.clone(), stem.to_string());
+        }
+    }
+    let source_name_default: Option<String> = pipeline_config
+        .source_configs()
+        .next()
+        .and_then(|s| {
+            std::path::Path::new(&s.path)
+                .file_stem()
+                .map(|st| st.to_owned())
+        })
+        .and_then(|os| os.into_string().ok());
+    let template_ctx = clinker_core::output::path_template::TemplateContext {
+        source_name_default: source_name_default.as_deref(),
+        source_name_by_node: source_name_by_node.clone(),
+        channel: None,
+        pipeline_hash,
+        timestamp: Some(&timestamp_str),
+        execution_id: Some(&execution_id),
+        batch_id: Some(&batch_id),
+        n: None,
+        unique_suffix_width: 0,
+    };
+    clinker_core::output::path_template::resolve_output_path_templates_in_place(
+        &mut pipeline_config,
+        &template_ctx,
+    )
+    .map_err(PipelineError::Config)?;
+
+    if args.explain.is_some() || (args.dry_run && args.dry_run_n.is_none()) {
+        print_resolved_outputs(&pipeline_config);
+    }
+
     if let Some(format) = args.explain {
         let compiled_plan =
             pipeline_config
@@ -495,9 +543,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .and_then(|m| m.spool_dir.as_deref());
     let spool_dir = metrics::resolve_spool_dir(args.metrics_spool_dir.as_deref(), yaml_spool);
 
-    // Build runtime parameters
-    let execution_id = uuid::Uuid::now_v7().to_string();
-    let batch_id = args.resolved_batch_id();
+    // Build runtime parameters. execution_id/batch_id were generated
+    // earlier so the path-template context could embed them.
     let pipeline_vars = pipeline_config
         .pipeline
         .vars
@@ -510,49 +557,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         pipeline_vars,
         shutdown_token: None,
     };
-
-    // Resolve {token} expressions in every Output's path: once here, so
-    // both the file open below and the split file factory deeper in the
-    // executor see literal paths. {n} stays as `None` — the collision
-    // counter is applied later via `append_suffix_before_ext`.
-    let pipeline_hash = pipeline_config.source_hash;
-    let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    let mut source_name_by_node: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for src in pipeline_config.source_configs() {
-        if let Some(stem) = std::path::Path::new(&src.path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            source_name_by_node.insert(src.name.clone(), stem.to_string());
-        }
-    }
-    let source_name_default: Option<String> = pipeline_config
-        .source_configs()
-        .next()
-        .and_then(|s| {
-            std::path::Path::new(&s.path)
-                .file_stem()
-                .map(|st| st.to_owned())
-        })
-        .and_then(|os| os.into_string().ok());
-
-    let template_ctx = clinker_core::output::path_template::TemplateContext {
-        source_name_default: source_name_default.as_deref(),
-        source_name_by_node: source_name_by_node.clone(),
-        channel: None,
-        pipeline_hash,
-        timestamp: Some(&timestamp_str),
-        execution_id: Some(&execution_id),
-        batch_id: Some(&batch_id),
-        n: None,
-        unique_suffix_width: 0,
-    };
-    clinker_core::output::path_template::resolve_output_path_templates_in_place(
-        &mut pipeline_config,
-        &template_ctx,
-    )
-    .map_err(PipelineError::Config)?;
 
     // Run the pipeline using file-based I/O — open readers for ALL sources
     // (primary + lookup references) and writers for ALL outputs.
@@ -760,6 +764,46 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
 /// Resolve thread count from CLI args or default to `num_cpus`.
 fn num_threads(args: &RunArgs) -> usize {
     args.threads.unwrap_or_else(num_cpus::get)
+}
+
+/// Render a "Resolved Outputs" block listing each output's expanded
+/// path, collision policy, and sidecar opt-in. Called after path
+/// templates resolve, before --explain or --dry-run early-returns.
+///
+/// `{n}` is shown literally (not expanded) when the policy is
+/// `unique_suffix` so the user can see where the collision counter
+/// would land at runtime.
+fn print_resolved_outputs(config: &clinker_core::config::PipelineConfig) {
+    use clinker_core::config::IfExistsPolicy;
+    println!("=== Resolved Outputs ===");
+    println!();
+    for output in config.output_configs() {
+        let policy = match output.if_exists {
+            IfExistsPolicy::Overwrite => "overwrite",
+            IfExistsPolicy::Error => "error",
+            IfExistsPolicy::UniqueSuffix => "unique_suffix",
+        };
+        let split_note = match &output.split {
+            Some(s) => format!(" (split, naming={:?})", s.naming),
+            None => String::new(),
+        };
+        let unique_note = if matches!(output.if_exists, IfExistsPolicy::UniqueSuffix) {
+            let width = output.unique_suffix_width;
+            if width == 0 {
+                " — collisions append `-{n}` before extension".to_string()
+            } else {
+                format!(" — collisions append `-{{n:0{width}}}` before extension")
+            }
+        } else {
+            String::new()
+        };
+        println!("  '{}' → {}{}", output.name, output.path, split_note,);
+        println!(
+            "      [if_exists={policy}, write_meta={}]{unique_note}",
+            output.write_meta,
+        );
+    }
+    println!();
 }
 
 /// Best-effort hostname for the metrics payload.
