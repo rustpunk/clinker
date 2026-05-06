@@ -122,7 +122,7 @@ pub(crate) fn orchestrate(
     // the per-iteration delta returned by `expand_with_dlq_events`,
     // because `retract_row` is not idempotent on a row already taken
     // out of the aggregator's contributions.
-    let initial_rows: Vec<u32> = scope.seen_source_rows.iter().copied().collect();
+    let initial_rows: Vec<u64> = scope.seen_source_rows.iter().copied().collect();
 
     // Snapshot the forward-pass baseline buffer state. The strict-Output
     // records and forward-pass error events captured here are stable
@@ -168,7 +168,7 @@ pub(crate) fn orchestrate(
     // records.
     let mut error_archive: HashMap<Vec<GroupByKey>, CorrelationGroupBuffer> = HashMap::new();
 
-    let mut iteration_rows: Vec<u32> = initial_rows;
+    let mut iteration_rows: Vec<u64> = initial_rows;
     loop {
         if iter >= cap {
             panic!(
@@ -198,9 +198,7 @@ pub(crate) fn orchestrate(
         archive_iteration_errors(&mut error_archive, ctx.correlation_buffers.as_ref());
         let mut new_events: Vec<DlqEvent> = direct_events;
         for row in &post_dispatch_scope.seen_source_rows {
-            new_events.push(DlqEvent {
-                source_row: *row as u64,
-            });
+            new_events.push(DlqEvent { source_row: *row });
         }
         let new_triggers = scope.expand_with_dlq_events(&new_events);
         if new_triggers.is_empty() {

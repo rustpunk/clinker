@@ -174,21 +174,21 @@ impl Arena {
 }
 
 impl RecordStorage for Arena {
-    fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
+    fn resolve_field(&self, index: u64, name: &str) -> Option<&Value> {
         let col = self.schema.index(name)?;
         self.records.get(index as usize)?.get(col)
     }
 
-    fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<&Value> {
+    fn resolve_qualified(&self, _index: u64, _source: &str, _field: &str) -> Option<&Value> {
         None // Arena is single-source; qualified lookups go through PartitionLookup
     }
 
-    fn available_fields(&self, _index: u32) -> Vec<&str> {
+    fn available_fields(&self, _index: u64) -> Vec<&str> {
         self.schema.columns().iter().map(|s| &**s).collect()
     }
 
-    fn record_count(&self) -> u32 {
-        u32::try_from(self.records.len()).expect("Arena exceeds u32::MAX records")
+    fn record_count(&self) -> u64 {
+        self.records.len() as u64
     }
 }
 

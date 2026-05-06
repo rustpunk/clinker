@@ -34,7 +34,7 @@ fn bench_sort_single_field(c: &mut Criterion) {
 
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
-        let positions_template: Vec<u32> = (0..count as u32).collect();
+        let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -60,7 +60,7 @@ fn bench_sort_multi_field(c: &mut Criterion) {
 
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
-        let positions_template: Vec<u32> = (0..count as u32).collect();
+        let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -83,7 +83,7 @@ fn bench_sort_with_nulls(c: &mut Criterion) {
     for null_pct in [0, 10, 50] {
         let null_ratio = null_pct as f64 / 100.0;
         let arena = build_arena(MEDIUM, 10, null_ratio);
-        let positions_template: Vec<u32> = (0..MEDIUM as u32).collect();
+        let positions_template: Vec<u64> = (0..MEDIUM as u64).collect();
 
         group.throughput(Throughput::Elements(MEDIUM as u64));
         group.bench_with_input(BenchmarkId::new("null_pct", null_pct), &null_pct, |b, _| {
@@ -110,7 +110,7 @@ fn bench_sort_presorted(c: &mut Criterion) {
             .map(|i| MinimalRecord::new(vec![Value::Integer(i as i64), Value::Null]))
             .collect();
         let arena = Arena::from_parts(schema, minimals);
-        let positions_template: Vec<u32> = (0..count as u32).collect();
+        let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
@@ -137,7 +137,7 @@ fn bench_sort_reverse(c: &mut Criterion) {
             .map(|i| MinimalRecord::new(vec![Value::Integer(i as i64), Value::Null]))
             .collect();
         let arena = Arena::from_parts(schema, minimals);
-        let positions_template: Vec<u32> = (0..count as u32).collect();
+        let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {

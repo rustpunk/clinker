@@ -18,7 +18,7 @@ pub use clinker_record::{GroupByKey, GroupKeyError, value_to_group_key};
 /// Secondary index: maps composite group keys to Arena record positions.
 #[derive(Debug)]
 pub struct SecondaryIndex {
-    pub groups: HashMap<Vec<GroupByKey>, Vec<u32>>,
+    pub groups: HashMap<Vec<GroupByKey>, Vec<u64>>,
 }
 
 impl SecondaryIndex {
@@ -34,7 +34,7 @@ impl SecondaryIndex {
         group_by: &[String],
         schema_pins: &HashMap<String, FieldDef>,
     ) -> Result<Self, GroupKeyError> {
-        let mut groups: HashMap<Vec<GroupByKey>, Vec<u32>> = HashMap::new();
+        let mut groups: HashMap<Vec<GroupByKey>, Vec<u64>> = HashMap::new();
         let record_count = storage.record_count();
 
         for pos in 0..record_count {
@@ -66,7 +66,7 @@ impl SecondaryIndex {
     }
 
     /// Look up a partition by its composite group key. Returns the position list.
-    pub fn get(&self, key: &[GroupByKey]) -> Option<&[u32]> {
+    pub fn get(&self, key: &[GroupByKey]) -> Option<&[u64]> {
         self.groups.get(key).map(|v| v.as_slice())
     }
 
@@ -103,18 +103,18 @@ mod tests {
     }
 
     impl RecordStorage for TestStorage {
-        fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
+        fn resolve_field(&self, index: u64, name: &str) -> Option<&Value> {
             let col = self.schema.index(name)?;
             self.records.get(index as usize)?.get(col)
         }
-        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+        fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
             None
         }
-        fn available_fields(&self, _: u32) -> Vec<&str> {
+        fn available_fields(&self, _: u64) -> Vec<&str> {
             self.schema.columns().iter().map(|s| &**s).collect()
         }
-        fn record_count(&self) -> u32 {
-            self.records.len() as u32
+        fn record_count(&self) -> u64 {
+            self.records.len() as u64
         }
     }
 

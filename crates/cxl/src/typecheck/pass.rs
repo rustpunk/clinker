@@ -675,6 +675,32 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
+                // any/all: enforce arity 1 and Bool-typed predicate so
+                // the eval-time three-valued fold has a well-typed input.
+                if is_predicate_fn {
+                    match args.len() {
+                        1 => {
+                            let arg_ty = self.get_type(args[0].node_id());
+                            let inner = arg_ty.unwrap_nullable();
+                            if !matches!(inner, Type::Bool | Type::Any) {
+                                self.error(
+                                    args[0].span(),
+                                    format!(
+                                        "window.{}() requires a Bool argument, got {}",
+                                        function, arg_ty
+                                    ),
+                                    Some("Use a boolean expression like `amount > 100`".into()),
+                                );
+                            }
+                        }
+                        n => self.error(
+                            *span,
+                            format!("window.{}() takes exactly 1 argument, got {}", function, n),
+                            None,
+                        ),
+                    }
+                }
+
                 let ty = if let Some(def) = self.registry.lookup_window(function) {
                     Type::from_type_tag(def.return_type)
                 } else {
@@ -1307,6 +1333,44 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("cannot be called inside")),
             "Expected nested window diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_any_requires_bool_arg() {
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit val = $window.any(amount)", &["amount"], &schema);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Bool")),
+            "Expected Bool requirement diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_all_requires_bool_arg() {
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit val = $window.all(amount)", &["amount"], &schema);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Bool")),
+            "Expected Bool requirement diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_any_arity_rejected() {
+        let diags = typecheck_err("emit val = $window.any()", &[], &empty_row());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("takes exactly 1 argument")),
+            "Expected arity diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

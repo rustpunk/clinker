@@ -40,7 +40,7 @@ fn value_to_correlation_key(v: &Value, idx: usize) -> GroupByKey {
     if v.is_null() {
         return GroupByKey::Null;
     }
-    value_to_group_key(v, "__correlation_key", None, idx as u32)
+    value_to_group_key(v, "__correlation_key", None, idx as u64)
         .ok()
         .flatten()
         .unwrap_or(GroupByKey::Null)
@@ -622,7 +622,7 @@ pub(crate) fn finalize_node_rooted_windows(
             transform_name: String::new(),
             messages: vec![format!("E310 node-rooted arena build: {e}")],
         })?;
-        let arena_len = arena.record_count() as u64;
+        let arena_len = arena.record_count();
         ctx.collector
             .record(arena_timer.finish(arena_len, arena_len));
 
@@ -953,7 +953,7 @@ pub(crate) fn dispatch_plan_node(
                                     ),
                                 })?;
                         // record_pos semantics:
-                        // - Source(_)  → (rn - 1) as u32. Phase-0 materializes
+                        // - Source(_)  → rn - 1. Phase-0 materializes
                         //   records in arena order, source row numbers
                         //   start at 1, so the position is always `rn - 1`.
                         // - Node{..} / ParentNode{..} → enumerate index `i`.
@@ -964,9 +964,9 @@ pub(crate) fn dispatch_plan_node(
                         //   position by construction.
                         let record_pos =
                             if matches!(spec.root, crate::plan::index::PlanIndexRoot::Source(_)) {
-                                (rn - 1) as u32
+                                rn - 1
                             } else {
-                                i as u32
+                                i as u64
                             };
                         evaluate_single_transform_windowed(
                             &record,

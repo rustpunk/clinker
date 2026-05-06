@@ -700,7 +700,51 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
                         Ok(Value::Null)
                     }
                 }
-                "any" | "all" => Ok(Value::Null), // Evaluator-driven: implemented in Task 5.4
+                // `any` is iterated `or`; `all` is iterated `and`. The
+                // fold must agree with BinOp::And/Or above (lines
+                // 801–829), which are Kleene three-valued and silently
+                // treat non-Bool/non-Null operands as Null. Mirroring
+                // both properties keeps the algebraic identity
+                // `any([a, b, c]) ≡ a or b or c` correctness-preserving
+                // under rewrites.
+                //
+                // Typecheck (typecheck/pass.rs) rejects non-Bool argument
+                // types and nested $window.* inside the predicate before
+                // we reach this arm.
+                "any" | "all" => {
+                    let predicate = args.first().ok_or_else(|| {
+                        EvalError::new(
+                            EvalErrorKind::ArityMismatch {
+                                name: function.to_string(),
+                                expected: 1,
+                                got: 0,
+                            },
+                            *span,
+                        )
+                    })?;
+                    let want_any = &**function == "any";
+                    let mut found_null = false;
+                    for i in 0..w.partition_len() {
+                        let row = w.partition_record(i);
+                        match eval_expr(predicate, typed, ctx, &row, window, env, meta_state)? {
+                            Value::Bool(true) if want_any => return Ok(Value::Bool(true)),
+                            Value::Bool(false) if !want_any => return Ok(Value::Bool(false)),
+                            Value::Bool(_) => {}
+                            // Null and non-Bool runtime values both
+                            // collapse to "null seen" — same catch-all
+                            // as BinOp::And/Or.
+                            _ => found_null = true,
+                        }
+                    }
+                    Ok(if found_null {
+                        Value::Null
+                    } else {
+                        // Identity for the iterated operator:
+                        //   any (iterated or) → false
+                        //   all (iterated and) → true
+                        Value::Bool(!want_any)
+                    })
+                }
                 _ => Ok(Value::Null),
             }
         }
