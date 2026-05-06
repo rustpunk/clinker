@@ -96,7 +96,7 @@ impl PathTemplate {
                     }
                     let mut body = String::new();
                     let mut closed = false;
-                    while let Some(bc) = chars.next() {
+                    for bc in chars.by_ref() {
                         if bc == '}' {
                             closed = true;
                             break;
