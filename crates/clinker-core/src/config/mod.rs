@@ -296,6 +296,18 @@ pub struct OutputConfig {
     /// today's behavior unchanged for every existing pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
+    /// Collision policy when the resolved output path already exists.
+    /// Defaults to `Overwrite` to preserve today's `File::create` behavior.
+    #[serde(default, skip_serializing_if = "IfExistsPolicy::is_default")]
+    pub if_exists: IfExistsPolicy,
+    /// Zero-pad width for the `{n}` collision counter when
+    /// `if_exists = unique_suffix`. `0` (default) emits the bare integer.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub unique_suffix_width: u8,
+    /// Write a `<resolved_path>.meta.json` provenance sidecar after the
+    /// output stream is flushed. Opt-in.
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub write_meta: bool,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
@@ -320,6 +332,33 @@ impl IncludeMetadata {
     pub fn is_none(&self) -> bool {
         matches!(self, IncludeMetadata::None)
     }
+}
+
+/// Collision policy when an Output node's resolved path already exists.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExistsPolicy {
+    /// Truncate and overwrite. Today's `File::create` behavior.
+    #[default]
+    Overwrite,
+    /// Refuse to clobber; emit a diagnostic. `--force` downgrades to `Overwrite`.
+    Error,
+    /// Walk integer suffixes via `OpenOptions::create_new` until one succeeds.
+    UniqueSuffix,
+}
+
+impl IfExistsPolicy {
+    pub fn is_default(&self) -> bool {
+        matches!(self, IfExistsPolicy::Overwrite)
+    }
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
+}
+
+fn is_false_bool(b: &bool) -> bool {
+    !*b
 }
 
 /// Output file splitting configuration.
