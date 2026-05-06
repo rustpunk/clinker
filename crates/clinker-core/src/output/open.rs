@@ -42,7 +42,7 @@ where
                 let f = File::create(&bare).map_err(PipelineError::Io)?;
                 return Ok((bare, f));
             }
-            check_overwrite(&bare, false, false).map_err(|d| {
+            check_overwrite(&bare).map_err(|d| {
                 PipelineError::Config(ConfigError::Validation(format!(
                     "{}: {}",
                     d.code, d.message

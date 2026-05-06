@@ -159,22 +159,6 @@ impl PathTemplate {
             .any(|s| matches!(s, Segment::Token(t) if t.name == name))
     }
 
-    /// Names of every distinct token referenced (for compile-time
-    /// validation against the known token set).
-    pub fn referenced_tokens(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self
-            .segments
-            .iter()
-            .filter_map(|s| match s {
-                Segment::Token(t) => Some(t.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        names.sort();
-        names.dedup();
-        names
-    }
-
     /// Source-node arg references in `{source_name:NODE}` form, in order
     /// of appearance. Used by compile-time validation to confirm each
     /// referenced node is a real Source ancestor of the output.
@@ -265,13 +249,6 @@ pub fn resolve_output_path_templates_in_place(
                     )));
                 }
             }
-            let total_source_name_tokens = template
-                .referenced_tokens()
-                .iter()
-                .filter(|t| **t == "source_name")
-                .count();
-            // referenced_tokens deduplicates; check for any unqualified token
-            // by counting source_name appearances in segments directly.
             if template.has_unqualified_source_name() && unique_default.is_none() {
                 let names: Vec<&str> = ancestors.iter().map(|a| a.node_name.as_str()).collect();
                 return Err(ConfigError::Validation(format!(
@@ -281,7 +258,6 @@ pub fn resolve_output_path_templates_in_place(
                     names.join(", "),
                 )));
             }
-            let _ = total_source_name_tokens;
         }
 
         let local_ctx = TemplateContext {
@@ -634,15 +610,6 @@ mod tests {
     fn unterminated_token_errors() {
         let err = PathTemplate::parse("file-{channel.csv").unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref m) if m.contains("unterminated")));
-    }
-
-    #[test]
-    fn referenced_tokens_lists_used_names() {
-        let t = PathTemplate::parse("{source_name}-{channel}-{pipeline_hash}.csv").unwrap();
-        assert_eq!(
-            t.referenced_tokens(),
-            vec!["channel", "pipeline_hash", "source_name"]
-        );
     }
 
     #[test]
