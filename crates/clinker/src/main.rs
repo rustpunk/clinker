@@ -644,6 +644,53 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .map_err(PipelineError::Format)?;
     }
 
+    // Provenance sidecars for outputs that opted in via `write_meta`.
+    // Per-output record/byte/route counts are not yet surfaced from the
+    // executor; identity, timing, and DLQ-by-category come through.
+    for output in pipeline_config.output_configs() {
+        if !output.write_meta {
+            continue;
+        }
+        let mut dlq_counts: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for e in dlq_entries {
+            if e.stage.as_deref() == Some(&format!("output:{}", output.name)) {
+                *dlq_counts.entry(format!("{:?}", e.category)).or_default() += 1;
+            }
+        }
+        let elapsed_ms = (report.finished_at - report.started_at)
+            .num_milliseconds()
+            .max(0) as u64;
+        let hash_full = clinker_core::output::sidecar::hash_to_hex(&pipeline_hash);
+        let hash_short = hash_full[..8.min(hash_full.len())].to_string();
+        let sidecar = clinker_core::output::sidecar::OutputSidecar {
+            pipeline_path: args.config.to_string_lossy().into_owned(),
+            pipeline_hash: hash_full,
+            pipeline_hash_short: hash_short,
+            channel: None,
+            clinker_version: env!("CARGO_PKG_VERSION").to_string(),
+            run_started_at: report.started_at.to_rfc3339(),
+            run_finished_at: report.finished_at.to_rfc3339(),
+            elapsed_total_ms: elapsed_ms,
+            execution_id: Some(execution_id.clone()),
+            batch_id: Some(batch_id.clone()),
+            output_name: output.name.clone(),
+            resolved_path: output.path.clone(),
+            record_count: 0,
+            bytes_written: 0,
+            dlq_counts,
+            route_counts: std::collections::BTreeMap::new(),
+            node_timings_ms: std::collections::BTreeMap::new(),
+        };
+        let target = std::path::PathBuf::from(&output.path);
+        if let Err(e) = clinker_core::output::sidecar::write_sidecar(&target, &sidecar) {
+            tracing::warn!(
+                "failed to write provenance sidecar for output {:?}: {e:?}",
+                output.name
+            );
+        }
+    }
+
     tracing::info!(
         "Pipeline complete: {} total, {} ok, {} written, {} dlq",
         counters.total_count,
