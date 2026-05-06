@@ -532,25 +532,77 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         readers.insert(source.name.clone(), reader);
     }
 
+    // Outputs are written atomically: each output writes to a sibling
+    // tempfile, then renames into place after the pipeline completes
+    // successfully. On crash or pipeline error, the tempfile is left in
+    // place (and its path logged) so an operator can inspect partial
+    // output without the final path showing a truncated file.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
+    let mut output_temps: Vec<(String, std::path::PathBuf, tempfile::NamedTempFile)> = Vec::new();
     for output in pipeline_config.output_configs() {
-        let writer: Box<dyn std::io::Write + Send> = Box::new(std::fs::File::create(&output.path)?);
+        let final_path: std::path::PathBuf = output.path.clone().into();
+        let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
+        let temp = match parent {
+            Some(dir) => {
+                if !dir.exists() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                tempfile::NamedTempFile::new_in(dir)?
+            }
+            None => tempfile::NamedTempFile::new_in(".")?,
+        };
+        let handle = temp.reopen()?;
+        let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
+        output_temps.push((output.name.clone(), final_path, temp));
     }
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
-    let report = PipelineExecutor::run_plan_with_readers_writers(
+    let report = match PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,
         writers,
         &run_params,
-    )?;
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            for (name, final_path, temp) in output_temps {
+                let kept = temp.into_temp_path().keep().ok();
+                tracing::warn!(
+                    output = %name,
+                    final_path = %final_path.display(),
+                    partial_path = ?kept,
+                    "pipeline failed; partial output preserved at temp path",
+                );
+            }
+            return Err(e);
+        }
+    };
+
+    // Pipeline succeeded — atomically promote each tempfile to its
+    // final path. Failure here aborts the run with the temp file still
+    // on disk under its tempfile name.
+    for (_name, final_path, temp) in output_temps {
+        temp.persist(&final_path).map_err(|e| {
+            tracing::error!(
+                final_path = %final_path.display(),
+                "failed to atomically rename output into place; temp file preserved",
+            );
+            std::io::Error::other(format!(
+                "atomic output rename failed for {}: {}",
+                final_path.display(),
+                e.error
+            ))
+        })?;
+    }
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
 
-    // Write DLQ if there are entries and DLQ path is configured
+    // Write DLQ if there are entries and DLQ path is configured.
+    // Same atomic temp+rename discipline as primary outputs above —
+    // operators inspecting DLQ output should never see a truncated file.
     if !dlq_entries.is_empty()
         && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
         && let Some(ref dlq_path) = dlq_config.path
@@ -563,11 +615,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             );
             r.schema().map_err(PipelineError::Format)?
         };
-        let dlq_writer = std::fs::File::create(dlq_path)?;
+        let dlq_path_buf: std::path::PathBuf = dlq_path.clone().into();
+        let dlq_dir = dlq_path_buf
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if !dlq_dir.exists() {
+            std::fs::create_dir_all(&dlq_dir)?;
+        }
+        let dlq_temp = tempfile::NamedTempFile::new_in(&dlq_dir)?;
+        let dlq_temp_handle = dlq_temp.reopen()?;
         let include_reason = dlq_config.include_reason.unwrap_or(true);
         let include_source_row = dlq_config.include_source_row.unwrap_or(true);
         clinker_core::dlq::write_dlq(
-            dlq_writer,
+            dlq_temp_handle,
             dlq_entries,
             &input_schema,
             &input_path,
@@ -575,6 +637,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             include_source_row,
         )
         .map_err(PipelineError::Format)?;
+        dlq_temp.persist(&dlq_path_buf).map_err(|e| {
+            tracing::error!(
+                final_path = %dlq_path_buf.display(),
+                "failed to atomically rename DLQ output into place; temp file preserved",
+            );
+            PipelineError::Io(std::io::Error::other(format!(
+                "atomic DLQ rename failed for {}: {}",
+                dlq_path_buf.display(),
+                e.error
+            )))
+        })?;
     }
 
     tracing::info!(
