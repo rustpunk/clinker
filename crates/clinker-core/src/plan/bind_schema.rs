@@ -211,7 +211,70 @@ pub fn bind_schema(
         &mut schema_by_name,
     );
 
+    validate_state_writers(nodes, diags);
+
     artifacts
+}
+
+/// Compile-time check: at most one state node writes any given
+/// `(scope, var)` pair. Multiple writers produce non-deterministic
+/// last-write-wins behavior — the locked-decision design forbids it
+/// and demands the user collapse the writes into a single state node
+/// (Hop / Talend canonical anti-pattern).
+///
+/// Init-phase and runtime-phase writers are tracked together for now;
+/// future Phase E refinement could distinguish them since init runs to
+/// completion before runtime and a converging-init writer is
+/// architecturally distinct from a converging-runtime writer.
+///
+/// Emits E170 with primary span on the second writer and secondary
+/// span on the first (the chronologically-first span in declaration
+/// order is the "canonical" writer; downstream nodes are duplicates).
+fn validate_state_writers(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
+    let mut seen: std::collections::HashMap<(crate::config::VarScope, String), (Span, String)> =
+        std::collections::HashMap::new();
+    let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
+        let line = spanned.referenced.line() as u32;
+        if line > 0 {
+            Span::line_only(line)
+        } else {
+            Span::SYNTHETIC
+        }
+    };
+    for spanned in nodes {
+        let PipelineNode::State { header, config } = &spanned.value else {
+            continue;
+        };
+        let span = span_for(spanned);
+        for assignment in &config.set {
+            let key = (config.scope, assignment.var.clone());
+            if let Some((first_span, first_node)) = seen.get(&key) {
+                let scope_str = match config.scope {
+                    crate::config::VarScope::Pipeline => "$pipeline",
+                    crate::config::VarScope::Source => "$source",
+                    crate::config::VarScope::Record => "$record",
+                };
+                diags.push(
+                    Diagnostic::error(
+                        "E170",
+                        format!(
+                            "scoped variable '{}.{}' has multiple writers: \
+                             state node {:?} duplicates the write from earlier \
+                             state node {:?} — collapse into a single state node",
+                            scope_str, assignment.var, header.name, first_node
+                        ),
+                        LabeledSpan::primary(span, "second writer".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        *first_span,
+                        Some("first writer".to_string()),
+                    )),
+                );
+            } else {
+                seen.insert(key, (span, header.name.clone()));
+            }
+        }
+    }
 }
 
 /// Build a placeholder `TypedProgram` carrying only `output_row`, for

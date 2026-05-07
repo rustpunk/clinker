@@ -966,7 +966,7 @@ pub struct StateAssignment {
 
 /// The scope a `state` node writes to. Mirrors
 /// `clinker_core::config::ScopedVarsDecl`'s three partitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VarScope {
     Pipeline,
@@ -1784,6 +1784,75 @@ nodes:
                 .node_indices()
                 .map(|i| dag.graph[i].type_tag())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_state_node_multi_writer_emits_e170() {
+        // Phase F-1: two state nodes both writing $pipeline.cutoff is
+        // an E170 multi-writer error — the design forbids ambiguous
+        // last-write-wins semantics, mirroring Hop's documented
+        // anti-pattern. Each writer carries its own span on the diag.
+        let yaml = r#"
+pipeline:
+  name: state_multi_writer
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: writer_one
+    input: src
+    config:
+      scope: pipeline
+      set:
+        - var: cutoff
+          cxl: "amount"
+  - type: state
+    name: writer_two
+    input: writer_one
+    config:
+      scope: pipeline
+      set:
+        - var: cutoff
+          cxl: "amount + 1"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("multi-writer should reject at compile");
+        let e170 = err_diags
+            .iter()
+            .find(|d| d.code == "E170")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected E170, got: {:?}",
+                    err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            e170.message.contains("writer_two"),
+            "diagnostic should name the second writer, got: {}",
+            e170.message
+        );
+        assert!(
+            e170.message.contains("writer_one"),
+            "diagnostic should name the first writer, got: {}",
+            e170.message
+        );
+        assert_eq!(
+            e170.secondary.len(),
+            1,
+            "expected one secondary span pointing at the first writer"
         );
     }
 
