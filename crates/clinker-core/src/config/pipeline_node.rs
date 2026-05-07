@@ -1735,4 +1735,95 @@ nodes:
             panic!("expected State variant at index 1");
         }
     }
+
+    #[test]
+    fn test_state_node_pipeline_scope_lowers_to_plan_node() {
+        // Phase D smoke test: a runtime-phase pipeline-scope state
+        // node compiles end-to-end and lowers to `PlanNode::State`
+        // with the typechecked assignment programs.
+        let yaml = r#"
+pipeline:
+  name: state_lowering_smoke
+  vars:
+    pipeline:
+      cutoff: { type: int, default: 0 }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: int }
+  - type: state
+    name: write_cutoff
+    input: src
+    config:
+      scope: pipeline
+      set:
+        - var: cutoff
+          cxl: "amount"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let plan = cfg
+            .compile(&ctx)
+            .expect("pipeline-scope state should compile");
+        let dag = plan.dag();
+        let has_state_node = dag.graph.node_indices().any(|idx| {
+            matches!(
+                &dag.graph[idx],
+                crate::plan::execution::PlanNode::State { .. }
+            )
+        });
+        assert!(
+            has_state_node,
+            "expected PlanNode::State in lowered DAG, got: {:?}",
+            dag.graph
+                .node_indices()
+                .map(|i| dag.graph[i].type_tag())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_state_node_record_scope_emits_e162() {
+        // Phase D-2 (record scope) is not wired; the lowering pass
+        // surfaces E162 so a pipeline using it fails compile loudly.
+        let yaml = r#"
+pipeline:
+  name: state_record_scope_unsupported
+  vars:
+    record:
+      score: { type: float }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: cfg.csv
+      schema:
+        - { name: amount, type: float }
+  - type: state
+    name: score_writer
+    input: src
+    config:
+      scope: record
+      set:
+        - var: score
+          cxl: "amount"
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("record-scope state should reject at compile");
+        assert!(
+            err_diags.iter().any(|d| d.code == "E162"),
+            "expected E162 diagnostic, got: {:?}",
+            err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
 }

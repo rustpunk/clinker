@@ -281,7 +281,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
         pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
         pipeline_counters: clinker_record::PipelineCounters::default(),
-        pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+        pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
     };
     let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
     // REPL has no real batch context — use the same placeholder as the
@@ -691,7 +691,7 @@ mod tests {
             pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+            pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =
@@ -739,7 +739,7 @@ mod tests {
             pipeline_execution_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_batch_id: std::sync::Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_counters: clinker_record::PipelineCounters::default(),
-            pipeline_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
+            pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =

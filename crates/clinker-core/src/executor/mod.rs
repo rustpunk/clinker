@@ -2213,7 +2213,7 @@ fn build_stable_eval_context(
         pipeline_execution_id: Arc::from(execution_id),
         pipeline_batch_id: Arc::from(batch_id),
         pipeline_counters: PipelineCounters::default(),
-        pipeline_vars: Arc::new(pipeline_vars.clone()),
+        pipeline_vars: Arc::new(std::sync::RwLock::new(pipeline_vars.clone())),
     }
 }
 

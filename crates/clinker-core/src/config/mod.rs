@@ -3171,17 +3171,63 @@ pub(crate) fn lower_node_to_plan_node(
             span,
             output_schema: schema_from_bound(name),
         }),
-        PipelineNode::State { .. } => {
-            // State nodes are not yet wired into the executor (Phase D).
-            // Surface a compile error so a pipeline with a state node
-            // fails loudly rather than silently dropping the node from
-            // the plan and severing downstream input edges.
-            diags.push(crate::error::Diagnostic::error(
-                "E160",
-                format!("state node {name:?}: executor wiring lands in Phase D; not runnable yet"),
-                LabeledSpan::primary(span, String::new()),
-            ));
-            None
+        PipelineNode::State { config, .. } => {
+            // Phase D wires runtime-phase pipeline-scope writes only —
+            // source-scope and record-scope writes still need
+            // per-source / per-record runtime slots that Phase D-2 /
+            // D-3 will add. Reject those early so the user sees an
+            // explicit incremental-feature diagnostic instead of a
+            // silent no-op.
+            use crate::config::{Phase as ConfPhase, VarScope};
+            if config.scope != VarScope::Pipeline {
+                diags.push(crate::error::Diagnostic::error(
+                    "E162",
+                    format!(
+                        "state node {name:?}: scope `{:?}` not yet wired into the executor \
+                         (Phase D currently supports `pipeline` only; source and record \
+                         scope writes land in follow-up commits)",
+                        config.scope
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                ));
+                return None;
+            }
+            if config.phase == ConfPhase::Init {
+                diags.push(crate::error::Diagnostic::error(
+                    "E163",
+                    format!(
+                        "state node {name:?}: `phase: init` not yet wired (Phase E will run \
+                         the init sub-DAG to completion before runtime)"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                ));
+                return None;
+            }
+            // Pull each assignment's typed program out of
+            // `artifacts.typed`. `bind_schema` populates these under
+            // synthetic per-assignment keys; if any are missing, a
+            // CXL error already surfaced and we skip lowering.
+            let mut compiled_assignments = Vec::with_capacity(config.set.len());
+            for assignment in &config.set {
+                let assignment_key = format!("{name}::{}", assignment.var);
+                let typed = match artifacts.typed.get(&assignment_key) {
+                    Some(t) => t.clone(),
+                    None => return None,
+                };
+                compiled_assignments.push(crate::plan::execution::CompiledStateAssignment {
+                    var: assignment.var.clone(),
+                    typed,
+                });
+            }
+            Some(PlanNode::State {
+                name: name.to_string(),
+                span,
+                resolved: Some(Box::new(crate::plan::execution::PlanStatePayload {
+                    scope: config.scope,
+                    phase: config.phase,
+                    assignments: compiled_assignments,
+                })),
+            })
         }
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding

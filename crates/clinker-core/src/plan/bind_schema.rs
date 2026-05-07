@@ -404,18 +404,46 @@ fn bind_schema_inner(
                         .insert(name, Arc::new(synthetic_typed_program(row)));
                 }
             }
-            PipelineNode::State { header, .. } => {
+            PipelineNode::State { header, config } => {
                 // State is a pass-through for records — its output row
-                // equals its upstream row. Phase D will run CXL
-                // typecheck on the assignments; for now we just
-                // propagate the row so downstream nodes see a stable
-                // schema during compile.
+                // equals its upstream row. We also typecheck each
+                // assignment's CXL expression against the upstream
+                // schema and store the typed program under a synthetic
+                // `<node_name>::<var>` key so the lowering pass can
+                // collect them into `PlanStatePayload.assignments`.
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts
                         .typed
-                        .insert(name, Arc::new(synthetic_typed_program(row)));
+                        .insert(name.clone(), Arc::new(synthetic_typed_program(row.clone())));
+
+                    for assignment in &config.set {
+                        let assignment_name = format!("{name}::{}", assignment.var);
+                        // Wrap the assignment expression as an emit so
+                        // the CXL parser accepts it (bare expressions
+                        // aren't valid Programs). The emit-field name
+                        // is synthetic — the executor's State arm
+                        // pulls the first (and only) emitted value out
+                        // of the eval result and writes it under the
+                        // assignment's `var:` key in the runtime
+                        // registry.
+                        let wrapped = format!("emit __state_value = {}", assignment.cxl.source);
+                        match typecheck_cxl(
+                            &assignment_name,
+                            &wrapped,
+                            &row,
+                            AggregateMode::Row,
+                            span,
+                            &bind_ctx.scoped_vars,
+                        ) {
+                            Ok(mut typed) => {
+                                typed.output_row = row.clone();
+                                artifacts.typed.insert(assignment_name, Arc::new(typed));
+                            }
+                            Err(d) => diags.push(d),
+                        }
+                    }
                 }
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).

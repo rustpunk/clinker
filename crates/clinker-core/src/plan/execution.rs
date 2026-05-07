@@ -322,6 +322,21 @@ pub enum PlanNode {
         #[serde(skip)]
         resolved: Option<Box<PlanOutputPayload>>,
     },
+    /// Scoped-variable writer node.
+    ///
+    /// Pass-through for records (the input record forwards unchanged on
+    /// the output edge). The side effect is one CXL evaluation per
+    /// assignment in [`PlanStatePayload::compiled`], with the resulting
+    /// value written into the scope-specific runtime registry. Phase D
+    /// wires pipeline-scope runtime writes only; source-scope and
+    /// record-scope writes follow in Phase D-2 / D-3.
+    State {
+        name: String,
+        #[serde(skip)]
+        span: Span,
+        #[serde(skip)]
+        resolved: Option<Box<PlanStatePayload>>,
+    },
     /// Planner-synthesized sort enforcer.
     ///
     /// Inserted by `ExecutionPlanDag::insert_enforcer_sorts` on edges feeding
@@ -528,6 +543,31 @@ pub struct PlanOutputPayload {
     pub fan_out_per_source_file: bool,
 }
 
+/// Fully-resolved State payload — one compiled CXL program per
+/// assignment, plus the scope and phase from the YAML config.
+///
+/// Phase D wires runtime-phase pipeline-scope writes; source-scope and
+/// record-scope are rejected at lowering with E162 until Phase D-2 /
+/// D-3 land. Init-phase orchestration is Phase E.
+#[derive(Debug, Clone)]
+pub struct PlanStatePayload {
+    pub scope: crate::config::VarScope,
+    pub phase: crate::config::Phase,
+    /// One typed program per assignment, keyed by the variable name
+    /// being written. Programs are wrapped in `Arc` to match the
+    /// `compiled_transforms` storage convention so the executor can
+    /// share them without cloning.
+    pub assignments: Vec<CompiledStateAssignment>,
+}
+
+/// One compiled state assignment — variable name + typed CXL program
+/// for the value expression.
+#[derive(Debug, Clone)]
+pub struct CompiledStateAssignment {
+    pub var: String,
+    pub typed: std::sync::Arc<cxl::typecheck::TypedProgram>,
+}
+
 impl PlanNode {
     /// Get the name of this node regardless of variant.
     pub fn name(&self) -> &str {
@@ -537,6 +577,7 @@ impl PlanNode {
             | PlanNode::Route { name, .. }
             | PlanNode::Merge { name, .. }
             | PlanNode::Output { name, .. }
+            | PlanNode::State { name, .. }
             | PlanNode::Sort { name, .. }
             | PlanNode::Aggregation { name, .. }
             | PlanNode::Composition { name, .. }
@@ -554,6 +595,7 @@ impl PlanNode {
             | PlanNode::Route { span, .. }
             | PlanNode::Merge { span, .. }
             | PlanNode::Output { span, .. }
+            | PlanNode::State { span, .. }
             | PlanNode::Sort { span, .. }
             | PlanNode::Aggregation { span, .. }
             | PlanNode::Composition { span, .. }
@@ -606,6 +648,7 @@ impl PlanNode {
             PlanNode::Route { .. }
             | PlanNode::Sort { .. }
             | PlanNode::Output { .. }
+            | PlanNode::State { .. }
             | PlanNode::CorrelationCommit { .. } => {
                 let name = self.name();
                 let idx = match dag
@@ -635,6 +678,7 @@ impl PlanNode {
             | PlanNode::Merge { output_schema, .. } => Some(output_schema),
             PlanNode::Route { .. }
             | PlanNode::Output { .. }
+            | PlanNode::State { .. }
             | PlanNode::Sort { .. }
             | PlanNode::CorrelationCommit { .. } => None,
         }
@@ -715,6 +759,7 @@ impl PlanNode {
             PlanNode::Route { .. } => "route",
             PlanNode::Merge { .. } => "merge",
             PlanNode::Output { .. } => "output",
+            PlanNode::State { .. } => "state",
             PlanNode::Sort { .. } => "sort",
             PlanNode::Aggregation { .. } => "aggregation",
             PlanNode::Composition { .. } => "composition",
@@ -742,6 +787,7 @@ impl PlanNode {
             }
             PlanNode::Merge { name, .. } => format!("[merge] {name}"),
             PlanNode::Output { name, .. } => format!("[output] {name}"),
+            PlanNode::State { name, .. } => format!("[state] {name}"),
             PlanNode::Sort { name, .. } => format!("[sort] {name}"),
             PlanNode::Aggregation { name, strategy, .. } => {
                 let s = match strategy {
@@ -1791,6 +1837,7 @@ impl ExecutionPlanDag {
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
+                | PlanNode::State { .. }
                 | PlanNode::Sort { .. }
                 | PlanNode::Composition { .. }
                 | PlanNode::CorrelationCommit { .. } => {
@@ -1939,6 +1986,7 @@ impl ExecutionPlanDag {
                 PlanNode::Source { .. }
                 | PlanNode::Transform { .. }
                 | PlanNode::Output { .. }
+                | PlanNode::State { .. }
                 | PlanNode::Sort { .. }
                 | PlanNode::Composition { .. }
                 | PlanNode::CorrelationCommit { .. } => {
@@ -4068,6 +4116,32 @@ fn compute_one(
             // Output so the inclusion-flag interaction (writer-default
             // strip vs `include_correlation_keys: true`) can consult the
             // surviving CK columns.
+            let parent = match parents.first() {
+                Some(p) => p,
+                None => return NodeProperties::unordered_single(),
+            };
+            let provenance = if parent.ordering.sort_order.is_some() {
+                OrderingProvenance::Preserved {
+                    from_node: name.clone(),
+                }
+            } else {
+                parent.ordering.provenance.clone()
+            };
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: parent.ordering.sort_order.clone(),
+                    provenance,
+                },
+                partitioning: parent.partitioning.clone(),
+                ck_set: parent.ck_set.clone(),
+            }
+        }
+
+        PlanNode::State { name, .. } => {
+            // State is a record pass-through: it does not transform the
+            // record stream, so it inherits parent ordering / partitioning
+            // / CK set unchanged. Provenance points at this node when
+            // upstream ordering exists so explain chains through.
             let parent = match parents.first() {
                 Some(p) => p,
                 None => return NodeProperties::unordered_single(),

@@ -3112,6 +3112,99 @@ pub(crate) fn dispatch_plan_node(
             ctx.node_buffers.insert(node_idx, output_records);
         }
 
+        PlanNode::State {
+            ref name,
+            ref resolved,
+            ..
+        } => {
+            // Phase D: pipeline-scope runtime writes. Records flow
+            // through unchanged; the side effect is that for each
+            // record, we evaluate every assignment's CXL program and
+            // write the result into `ctx.stable.pipeline_vars` via
+            // `set_pipeline_var`. Source-scope and record-scope are
+            // rejected at lowering with E162 (Phase D-2 / D-3).
+            //
+            // Last-write-wins per record: the design's locked decision
+            // is "single writer per (scope, var)" enforced at compile
+            // time in Phase F, so multiple records flowing through the
+            // same state node produce a coherent stream of values
+            // (each record's evaluation overwrites the previous).
+            let payload = resolved
+                .as_deref()
+                .expect("PlanNode::State.resolved populated by lowering");
+            let input_records = if let Some(own_buf) = ctx.node_buffers.remove(&node_idx) {
+                own_buf
+            } else {
+                let predecessors: Vec<NodeIndex> = current_dag
+                    .graph
+                    .neighbors_directed(node_idx, Direction::Incoming)
+                    .collect();
+                predecessors
+                    .iter()
+                    .find_map(|&p| {
+                        let remaining_consumers = current_dag
+                            .graph
+                            .neighbors_directed(p, Direction::Outgoing)
+                            .filter(|&succ| succ > node_idx)
+                            .count();
+                        if remaining_consumers == 0 {
+                            ctx.node_buffers.remove(&p)
+                        } else {
+                            ctx.node_buffers.get(&p).cloned()
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+
+            for assignment in &payload.assignments {
+                let mut evaluator =
+                    cxl::eval::ProgramEvaluator::new(assignment.typed.clone(), false);
+                for (record, rn) in &input_records {
+                    let file_idx = (rn.saturating_sub(1)) as usize;
+                    let eval_ctx = EvalContext {
+                        stable: ctx.stable,
+                        source_file: ctx
+                            .source_file_arcs
+                            .get(file_idx)
+                            .unwrap_or(&ctx.source_file_arcs[0]),
+                        source_row: *rn,
+                        source_path: ctx
+                            .source_file_arcs
+                            .get(file_idx)
+                            .unwrap_or(&ctx.source_file_arcs[0]),
+                        source_count: ctx.source_count,
+                        source_batch: ctx.source_batch_arc,
+                        ingestion_timestamp: ctx.source_ingestion_timestamp,
+                    };
+                    match evaluator.eval_record::<NullStorage>(&eval_ctx, record, None) {
+                        Ok(cxl::eval::EvalResult::Emit { fields, .. }) => {
+                            // The single emitted field carries the
+                            // evaluated value; the field name is
+                            // synthetic (the typecheck wraps the
+                            // assignment in a single emit), so take
+                            // the first value.
+                            if let Some((_, value)) = fields.into_iter().next() {
+                                ctx.stable.set_pipeline_var(&assignment.var, value);
+                            }
+                        }
+                        Ok(cxl::eval::EvalResult::Skip(_)) => {}
+                        Err(e) => {
+                            return Err(crate::error::PipelineError::Compilation {
+                                transform_name: format!("state:{name}"),
+                                messages: vec![format!(
+                                    "state assignment {:?} eval error: {e:?}",
+                                    assignment.var
+                                )],
+                            });
+                        }
+                    }
+                }
+            }
+
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
+            ctx.node_buffers.insert(node_idx, input_records);
+        }
+
         PlanNode::CorrelationCommit { .. } => {
             crate::executor::commit::orchestrate(ctx, current_dag)?;
         }

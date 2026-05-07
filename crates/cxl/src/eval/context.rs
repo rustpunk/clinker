@@ -1,8 +1,25 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::{NaiveDateTime, Utc};
 use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
+
+/// Shared, lock-protected store for `$pipeline.<key>` runtime values.
+///
+/// Values arrive from two sources:
+/// 1. **Init-time defaults** — populated from `PipelineMeta.vars.pipeline.*`
+///    declarations at pipeline start (Phase A) and pre-runtime State
+///    nodes marked `phase: init` (Phase E).
+/// 2. **Runtime writes** — emitted by Phase D's `state` node arm,
+///    one write per record (last-write-wins per the locked design
+///    decision).
+///
+/// `Arc<RwLock<...>>` keeps the read fast path lock-free for everyone
+/// holding the `Arc` while still allowing `state` nodes to mutate
+/// without `&mut StableEvalContext`. The RwLock contention cost on the
+/// hot read path (every `$pipeline.<key>` resolve) is small relative
+/// to the surrounding CXL eval; revisit if a profile says otherwise.
+pub type PipelineVarStore = Arc<RwLock<IndexMap<String, Value>>>;
 
 /// Injectable clock for testability. Production uses WallClock; tests use FixedClock.
 pub trait Clock: Send + Sync {
@@ -51,8 +68,10 @@ pub struct StableEvalContext {
     pub pipeline_batch_id: Arc<str>,
     /// pipeline.total_count / ok_count / dlq_count.
     pub pipeline_counters: PipelineCounters,
-    /// pipeline.vars.* — user-defined constants from YAML config.
-    pub pipeline_vars: Arc<IndexMap<String, Value>>,
+    /// pipeline.vars.* — user-declared variables. Holds init-time
+    /// defaults plus any runtime writes from `state` nodes (Phase D).
+    /// See [`PipelineVarStore`] for locking rationale.
+    pub pipeline_vars: PipelineVarStore,
 }
 
 impl StableEvalContext {
@@ -70,7 +89,24 @@ impl StableEvalContext {
             "dlq_count" => Some(Value::Integer(self.pipeline_counters.dlq_count as i64)),
             "filtered_count" => Some(Value::Integer(self.pipeline_counters.filtered_count as i64)),
             "distinct_count" => Some(Value::Integer(self.pipeline_counters.distinct_count as i64)),
-            _ => self.pipeline_vars.get(member).cloned(),
+            _ => self
+                .pipeline_vars
+                .read()
+                .ok()
+                .and_then(|map| map.get(member).cloned()),
+        }
+    }
+
+    /// Write a value into the pipeline-scope runtime registry.
+    ///
+    /// Called by the executor's `state` node arm (Phase D). Reads via
+    /// [`Self::resolve_pipeline_stable`] observe the new value
+    /// immediately; the locking discipline matches a Rust `RwLock` —
+    /// concurrent readers and a single writer per moment, with no
+    /// guarantee of FIFO ordering between competing writers.
+    pub fn set_pipeline_var(&self, name: &str, value: Value) {
+        if let Ok(mut map) = self.pipeline_vars.write() {
+            map.insert(name.to_string(), value);
         }
     }
 
@@ -91,7 +127,7 @@ impl StableEvalContext {
             pipeline_execution_id: Arc::from("00000000-0000-0000-0000-000000000000"),
             pipeline_batch_id: Arc::from("test-batch-000"),
             pipeline_counters: PipelineCounters::default(),
-            pipeline_vars: Arc::new(IndexMap::new()),
+            pipeline_vars: Arc::new(RwLock::new(IndexMap::new())),
         }
     }
 }
