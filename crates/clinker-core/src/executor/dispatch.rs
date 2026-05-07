@@ -182,11 +182,19 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) compiled_transforms: &'a [CompiledTransform],
     pub(crate) transform_by_name: HashMap<&'a str, usize>,
     pub(crate) stable: &'a StableEvalContext,
-    pub(crate) source_file_arc: &'a Arc<str>,
-    /// Backing storage for `$source.path` — full canonical path. Equal to
-    /// `source_file_arc` today (different label only after §5 introduces
-    /// the shortest-unique-suffix `$source.file_label` for path templates).
-    pub(crate) source_path_arc: &'a Arc<str>,
+    /// Per-record source-file `Arc<str>`s, indexed by `source_row - 1`
+    /// (since `source_row` is 1-based). For literal-`path:` sources
+    /// every entry is the same Arc; for `glob`/`regex`/`paths` sources
+    /// entries vary across the file boundaries set by
+    /// `MultiFileFormatReader::current_source_file()`. Doubles as the
+    /// `$source.path` storage today (full canonical path).
+    pub(crate) source_file_arcs: &'a [Arc<str>],
+    /// Stand-in `Arc<str>` for dispatch sites that have no live record
+    /// (combine/finalize/post-aggregate emits with `source_row: 0`).
+    /// Set to `Arc::from("<merged>")` for multi-file sources after
+    /// merge/combine consumed the partition; matches the first
+    /// per-record Arc otherwise.
+    pub(crate) synthetic_source_file: &'a Arc<str>,
     /// Backing storage for `$source.batch` — per-source-run UUID v7,
     /// shared across all records ingested from this source. Distinct from
     /// `pipeline.batch_id` which is single-valued per pipeline run.
@@ -934,9 +942,9 @@ pub(crate) fn dispatch_plan_node(
                 }
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: ctx.source_file_arc,
+                    source_file: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
                     source_row: rn,
-                    source_path: ctx.source_path_arc,
+                    source_path: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -1209,9 +1217,9 @@ pub(crate) fn dispatch_plan_node(
                 for (record, rn) in input_records {
                     let eval_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.source_file_arc,
+                        source_file: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
                         source_row: rn,
-                        source_path: ctx.source_path_arc,
+                        source_path: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -1614,9 +1622,9 @@ pub(crate) fn dispatch_plan_node(
             for (record, row_num) in &input {
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: ctx.source_file_arc,
+                    source_file: &ctx.source_file_arcs[(row_num.saturating_sub(1)) as usize],
                     source_row: *row_num,
-                    source_path: ctx.source_path_arc,
+                    source_path: &ctx.source_file_arcs[(row_num.saturating_sub(1)) as usize],
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -1668,9 +1676,9 @@ pub(crate) fn dispatch_plan_node(
             // pipelines pay zero overhead.
             let finalize_ctx = EvalContext {
                 stable: ctx.stable,
-                source_file: ctx.source_file_arc,
+                source_file: ctx.synthetic_source_file,
                 source_row: 0,
-                source_path: ctx.source_path_arc,
+                source_path: ctx.synthetic_source_file,
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2407,9 +2415,9 @@ pub(crate) fn dispatch_plan_node(
                     let combine_output_schema_arc = combine_output_schema.clone();
                     let iejoin_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.source_file_arc,
+                        source_file: ctx.synthetic_source_file,
                         source_row: 0,
-                        source_path: ctx.source_path_arc,
+                        source_path: ctx.synthetic_source_file,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2460,9 +2468,9 @@ pub(crate) fn dispatch_plan_node(
                     let combine_output_schema_arc = combine_output_schema.clone();
                     let grace_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.source_file_arc,
+                        source_file: ctx.synthetic_source_file,
                         source_row: 0,
-                        source_path: ctx.source_path_arc,
+                        source_path: ctx.synthetic_source_file,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2521,9 +2529,9 @@ pub(crate) fn dispatch_plan_node(
                     let combine_output_schema_arc = combine_output_schema.clone();
                     let sm_ctx = EvalContext {
                         stable: ctx.stable,
-                        source_file: ctx.source_file_arc,
+                        source_file: ctx.synthetic_source_file,
                         source_row: 0,
-                        source_path: ctx.source_path_arc,
+                        source_path: ctx.synthetic_source_file,
                         source_count: ctx.source_count,
                         source_batch: ctx.source_batch_arc,
                         ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2568,9 +2576,9 @@ pub(crate) fn dispatch_plan_node(
             let estimated_rows = Some(build_records.len());
             let hash_table_ctx = EvalContext {
                 stable: ctx.stable,
-                source_file: ctx.source_file_arc,
+                source_file: ctx.synthetic_source_file,
                 source_row: 0,
-                source_path: ctx.source_path_arc,
+                source_path: ctx.synthetic_source_file,
                 source_count: ctx.source_count,
                 source_batch: ctx.source_batch_arc,
                 ingestion_timestamp: ctx.source_ingestion_timestamp,
@@ -2620,9 +2628,9 @@ pub(crate) fn dispatch_plan_node(
             for (probe_record, rn) in driver_buf {
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
-                    source_file: ctx.source_file_arc,
+                    source_file: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
                     source_row: rn,
-                    source_path: ctx.source_path_arc,
+                    source_path: &ctx.source_file_arcs[(rn.saturating_sub(1)) as usize],
                     source_count: ctx.source_count,
                     source_batch: ctx.source_batch_arc,
                     ingestion_timestamp: ctx.source_ingestion_timestamp,

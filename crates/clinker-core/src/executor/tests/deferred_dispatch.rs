@@ -186,9 +186,12 @@ o1,HR,10
 o2,HR,20
 o3,ENG,100
 ";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -305,9 +308,12 @@ nodes:
     let csv = format!("order_id,department,payload\no1,HR,{big}\no2,ENG,{big}\n");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.into_bytes())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -428,9 +434,12 @@ o2,HR,20
 o3,HR,30
 ";
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -569,16 +578,20 @@ ENG,500
 
     let config = crate::config::parse_config(yaml).expect("parse");
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "dept_lookup".to_string(),
-            Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
     let buf = SharedBuffer::new();
@@ -761,9 +774,12 @@ o6,ENG,300
     );
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -997,9 +1013,12 @@ o6,ENG,300
     );
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1219,9 +1238,12 @@ o6,ENG,300
         .expect("nested composition + parent continuation must compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1414,9 +1436,12 @@ o6,ENG,300
         .expect("nested composition + cascading-retract pipeline must compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1591,9 +1616,12 @@ o6,ENG,300
         .expect("bare-Aggregate body + parent continuation must compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -1733,9 +1761,12 @@ o5,ENG,200
 o6,ENG,300
 ";
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let big_buf = SharedBuffer::new();
     let small_buf = SharedBuffer::new();
@@ -1914,16 +1945,20 @@ nodes:
     }
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.into_bytes()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.into_bytes())),
+            ),
         ),
         (
             "dept_lookup".to_string(),
-            Box::new(std::io::Cursor::new(lookup_csv.into_bytes()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.into_bytes())),
+            ),
         ),
     ]);
     let buf = SharedBuffer::new();

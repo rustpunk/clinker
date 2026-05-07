@@ -66,9 +66,12 @@ o6,ENG,300
 ";
     let config = crate::config::parse_config(yaml).expect("parse");
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(

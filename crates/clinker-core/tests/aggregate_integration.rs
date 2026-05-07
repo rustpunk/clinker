@@ -56,9 +56,12 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_core::executor::Execution
     let config = parse_config(yaml).unwrap();
     let params = test_params(&config);
 
-    let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
+    let readers = HashMap::from([(
         config.source_configs().next().unwrap().name.clone(),
-        Box::new(Cursor::new(csv_input.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
 
     let buf = SharedBuffer::new();

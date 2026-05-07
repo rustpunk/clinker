@@ -150,6 +150,15 @@ pub enum PartitioningKind {
     /// No key guarantee; records for the same key may appear in different
     /// partitions. Reserved for future phases (parallel multi-file ingest).
     RoundRobin { num_partitions: usize },
+    /// Records logically partitioned by per-record source-file provenance.
+    /// Set by Source nodes whose matcher (`glob`/`regex`/`paths`) can
+    /// resolve to multiple files at runtime. Each file forms one
+    /// partition; downstream stateful nodes (Aggregate, Sort, Window,
+    /// Combine) treat the partition keys as an implicit prefix of their
+    /// effective grouping until an explicit `Merge` consumes the
+    /// partition. `keys` carries the CXL-level identifiers used as
+    /// partition keys (typically `["$source.file"]`).
+    FilePartitioned { keys: Vec<String> },
 }
 
 /// Provenance explaining how a node's `Partitioning` was derived.
@@ -161,6 +170,29 @@ pub enum PartitioningProvenance {
     Preserved { from_node: String },
     /// Introduced by an explicit partitioning stage.
     IntroducedBy { at_node: String, reason: String },
+    /// Introduced by a Source whose matcher can resolve to multiple
+    /// files at runtime — `$source.file` becomes the implicit partition
+    /// key for downstream stateful nodes.
+    IntroducedByMultiFileSource { source_name: String },
+    /// Destroyed by an explicit `Merge` node — the user asked to cross
+    /// file partition boundaries. After this node, downstream stateful
+    /// operators see a single combined stream.
+    DestroyedByMerge { at_node: String },
+    /// Destroyed by a `Combine` node — combine emits unpartitioned
+    /// output regardless of input partitioning.
+    DestroyedByCombine { at_node: String },
+}
+
+impl PartitioningKind {
+    /// Borrow the partition keys (if any) carried by a partitioned
+    /// stream. Returns an empty slice for `Single` and `RoundRobin`.
+    pub fn partition_keys(&self) -> &[String] {
+        match self {
+            PartitioningKind::Single | PartitioningKind::RoundRobin { .. } => &[],
+            PartitioningKind::HashPartitioned { keys, .. }
+            | PartitioningKind::FilePartitioned { keys } => keys,
+        }
+    }
 }
 
 impl NodeProperties {

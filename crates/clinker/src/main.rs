@@ -566,12 +566,47 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .expect("pipeline has at least one source");
     let input_path = first_source.path_str().to_string();
 
-    let mut readers: std::collections::HashMap<String, Box<dyn std::io::Read + Send>> =
-        std::collections::HashMap::new();
+    // Build the source reader registry. Each source's matcher
+    // (`path` / `glob` / `regex` / `paths`) resolves through the
+    // discovery layer; every matched file becomes one `FileSlot` and
+    // the executor's `MultiFileFormatReader` concatenates them into
+    // a single record stream stamped with `$source.file` per record.
+    let mut readers: clinker_core::executor::SourceReaders = std::collections::HashMap::new();
+    let workspace_root = args
+        .config
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     for source in pipeline_config.source_configs() {
-        let reader: Box<dyn std::io::Read + Send> =
-            Box::new(std::fs::File::open(source.path_str())?);
-        readers.insert(source.name.clone(), reader);
+        let outcome =
+            clinker_core::source::discovery::discover(source, &workspace_root).map_err(|e| {
+                clinker_core::error::PipelineError::Config(
+                    clinker_core::config::ConfigError::Validation(format!(
+                        "source '{}' discovery failed: {e}",
+                        source.name
+                    )),
+                )
+            })?;
+        let mut slots: Vec<clinker_core::source::multi_file::FileSlot> = Vec::new();
+        for f in outcome.files() {
+            let file = std::fs::File::open(&f.path)?;
+            slots.push(clinker_core::source::multi_file::FileSlot::new(
+                f.path.clone(),
+                Box::new(file),
+            ));
+        }
+        // EmptyWarn / EmptySkip outcomes leave `slots` empty; the
+        // executor short-circuits via the empty-list guard upstream.
+        if slots.is_empty() {
+            // Stash a single empty reader so the executor's "missing
+            // reader" check passes. Records flow through as zero-row
+            // sources.
+            slots.push(clinker_core::source::multi_file::FileSlot::new(
+                "<empty>",
+                Box::new(std::io::empty()),
+            ));
+        }
+        readers.insert(source.name.clone(), slots);
     }
 
     // Outputs are written atomically: each output writes to a sibling

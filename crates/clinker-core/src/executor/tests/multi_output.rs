@@ -331,10 +331,12 @@ fn run_multi_output(
     let params = test_params(&config);
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-            as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
         .iter()
@@ -706,9 +708,12 @@ nodes:
     let params = test_params(&config);
 
     let csv = "id,amount\n1,100\n2,10\n3,200\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let good_buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
@@ -997,9 +1002,12 @@ nodes:
     let params = test_params(&config);
 
     let csv = "id,amount\n1,100\n2,10\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
         (
@@ -1169,9 +1177,12 @@ nodes:
 
     // Enough records that "b" gets traffic and will error
     let csv = "id,amount\n1,100\n2,10\n3,200\n4,20\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
         (
@@ -1261,9 +1272,12 @@ nodes:
     let params = test_params(&config);
 
     let csv = "id,amount\n1,100\n2,10\n";
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     // Both writers will fail on flush → PipelineError::Multiple
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
@@ -1679,9 +1693,12 @@ nodes:
     let params = test_params(&config);
     let input_csv = "id,name\n1,Alice\n2,Bob\n";
 
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = [(
+    let readers: crate::executor::SourceReaders = [(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(input_csv.to_string())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(input_csv.to_string())),
+        ),
     )]
     .into_iter()
     .collect();
@@ -1743,9 +1760,12 @@ nodes:
     let params = test_params(&config);
     let input_csv = "x\n42\n";
 
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = [(
+    let readers: crate::executor::SourceReaders = [(
         "src".to_string(),
-        Box::new(std::io::Cursor::new(input_csv.to_string())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(input_csv.to_string())),
+        ),
     )]
     .into_iter()
     .collect();

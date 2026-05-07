@@ -280,12 +280,15 @@ fn run_pipeline(yaml: &str, inputs: Vec<(&str, Vec<u8>)>) -> HashMap<String, Str
     let config = parse_config(yaml).expect("parse_config");
     let params = test_params(&config);
 
-    let readers: HashMap<String, Box<dyn Read + Send>> = inputs
+    let readers: clinker_core::executor::SourceReaders = inputs
         .into_iter()
         .map(|(name, bytes)| {
             (
                 name.to_string(),
-                Box::new(Cursor::new(bytes)) as Box<dyn Read + Send>,
+                clinker_core::executor::single_file_reader(
+                    "test.csv",
+                    Box::new(Cursor::new(bytes)),
+                ),
             )
         })
         .collect();

@@ -132,6 +132,10 @@ impl FormatReader for CoercingReader {
             None => Ok(None),
         }
     }
+
+    fn current_source_file(&self) -> Option<&Arc<str>> {
+        self.inner.current_source_file()
+    }
 }
 
 /// Unwrap Nullable to get the inner type for coercion.

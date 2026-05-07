@@ -57,9 +57,9 @@ fn run_format_test(
     let config = crate::config::parse_config(yaml).unwrap();
     let output_buf = SharedBuffer::new();
 
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         input_name.to_string(),
-        Box::new(input_data) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader("test.csv", Box::new(input_data)),
     )]);
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         config.output_configs().next().unwrap().name.clone(),

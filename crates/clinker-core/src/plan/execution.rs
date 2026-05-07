@@ -3687,12 +3687,36 @@ fn compute_one(
                         .collect::<BTreeSet<String>>()
                 })
                 .unwrap_or_default();
+            // Multi-file matchers (`glob` / `regex` / `paths`) produce
+            // a `FilePartitioned` lineage carrying `$source.file` as the
+            // implicit partition key. Literal `path:` is single-file
+            // and stays `Single`. The runtime per-row source-file Arc
+            // tagging set up by the executor's source-ingestion phase
+            // (§6) makes the partition key visible to downstream
+            // stateful nodes.
+            let is_multi_file = body
+                .map(|b| {
+                    b.source.glob.is_some() || b.source.regex.is_some() || b.source.paths.is_some()
+                })
+                .unwrap_or(false);
+            let partitioning = if is_multi_file {
+                Partitioning {
+                    kind: PartitioningKind::FilePartitioned {
+                        keys: vec!["$source.file".to_string()],
+                    },
+                    provenance: PartitioningProvenance::IntroducedByMultiFileSource {
+                        source_name: name.clone(),
+                    },
+                }
+            } else {
+                single_stream_partitioning()
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order,
                     provenance,
                 },
-                partitioning: single_stream_partitioning(),
+                partitioning,
                 ck_set,
             }
         }
@@ -3819,7 +3843,26 @@ fn compute_one(
             let all_match = parents
                 .iter()
                 .all(|p| sort_orders_equal(&p.ordering.sort_order, &first_so));
-            let partitioning = if parents
+            // Merge is the explicit opt-out from per-file partitioning:
+            // when any parent carries `FilePartitioned`, the merged
+            // stream is unpartitioned (the user asked to cross file
+            // boundaries). Provenance carries the merge node's name so
+            // `--explain` can chain from a downstream global aggregate
+            // back to where partitioning was dropped.
+            let any_file_partitioned = parents.iter().any(|p| {
+                matches!(
+                    p.partitioning.kind,
+                    PartitioningKind::FilePartitioned { .. }
+                )
+            });
+            let partitioning = if any_file_partitioned {
+                Partitioning {
+                    kind: PartitioningKind::Single,
+                    provenance: PartitioningProvenance::DestroyedByMerge {
+                        at_node: name.clone(),
+                    },
+                }
+            } else if parents
                 .iter()
                 .all(|p| matches!(p.partitioning.kind, PartitioningKind::Single))
             {
@@ -3915,12 +3958,32 @@ fn compute_one(
             if omits_ck {
                 ck_set.insert(format!("$ck.aggregate.{name}"));
             }
+            // Preserve parent FilePartitioned through aggregation —
+            // the aggregate produces one row per (partition, group)
+            // tuple, and downstream stages can still route per-file.
+            // Single-stream parents stay Single (today's behavior).
+            let agg_partitioning = match parents.first() {
+                Some(p)
+                    if matches!(
+                        p.partitioning.kind,
+                        PartitioningKind::FilePartitioned { .. }
+                    ) =>
+                {
+                    Partitioning {
+                        kind: p.partitioning.kind.clone(),
+                        provenance: PartitioningProvenance::Preserved {
+                            from_node: name.clone(),
+                        },
+                    }
+                }
+                _ => single_stream_partitioning(),
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
                     provenance: OrderingProvenance::NoOrdering,
                 },
-                partitioning: single_stream_partitioning(),
+                partitioning: agg_partitioning,
                 ck_set,
             }
         }
@@ -4031,6 +4094,27 @@ fn compute_one(
                 })
                 .collect();
             ck_set.extend(synthetic);
+            // Combine destroys file partitioning the same way it
+            // destroys ordering: hash-build/probe / IEJoin / grace
+            // hash do not preserve any per-input partitioning. Emit
+            // the dedicated `DestroyedByCombine` provenance variant so
+            // downstream consumers (and `--explain`) can chain back to
+            // the destruction site.
+            let combine_partitioning = if parents.iter().any(|p| {
+                matches!(
+                    p.partitioning.kind,
+                    PartitioningKind::FilePartitioned { .. }
+                )
+            }) {
+                Partitioning {
+                    kind: PartitioningKind::Single,
+                    provenance: PartitioningProvenance::DestroyedByCombine {
+                        at_node: name.clone(),
+                    },
+                }
+            } else {
+                single_stream_partitioning()
+            };
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,
@@ -4039,7 +4123,7 @@ fn compute_one(
                         confidence: crate::plan::properties::Confidence::Proven,
                     },
                 },
-                partitioning: single_stream_partitioning(),
+                partitioning: combine_partitioning,
                 ck_set,
             }
         }

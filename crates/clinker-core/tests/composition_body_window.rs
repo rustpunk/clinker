@@ -253,9 +253,12 @@ ENG,300
     let plan = config.compile(&ctx).expect("compile");
 
     let primary = "src".to_string();
-    let readers: HashMap<String, Box<dyn Read + Send>> = HashMap::from([(
+    let readers = HashMap::from([(
         primary.clone(),
-        Box::new(Cursor::new(csv.as_bytes().to_vec())) as Box<dyn Read + Send>,
+        clinker_core::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(

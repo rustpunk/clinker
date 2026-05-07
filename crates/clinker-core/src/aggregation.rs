@@ -3165,6 +3165,17 @@ pub fn qualifies_for_streaming(
                 ),
             };
         }
+        PartitioningKind::FilePartitioned { .. } => {
+            // FilePartitioned: records are file-sequential at ingest, so
+            // each file's records arrive contiguously. Streaming
+            // aggregation is eligible *if* the user's group_by is also
+            // covered by the parent's `sort_order` — the per-file
+            // contiguity gives an implicit `$source.file` prefix that
+            // never disagrees, and the user-typed sort_order takes care
+            // of the rest. The runtime per-row `$source.file` Arc
+            // (§6) becomes part of the aggregate group key without the
+            // user having to type it.
+        }
     }
 
     // (b) Ordering check.

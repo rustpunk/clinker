@@ -83,9 +83,12 @@ fn run_once() -> u64 {
         shutdown_token: None,
     };
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(CSV.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(CSV.as_bytes().to_vec())),
+        ),
     )]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(

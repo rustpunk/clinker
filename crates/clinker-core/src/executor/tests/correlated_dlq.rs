@@ -28,10 +28,12 @@ fn run_correlated_pipeline(
     };
 
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-            as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
     )]);
 
     let buf = SharedBuffer::new();
@@ -384,9 +386,12 @@ nodes:
         shutdown_token: None,
     };
     let primary = config.source_configs().next().unwrap().name.clone();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+    let readers: crate::executor::SourceReaders = HashMap::from([(
         primary.clone(),
-        Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())) as Box<dyn std::io::Read + Send>,
+        crate::executor::single_file_reader(
+            "test.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
     )]);
     let buf_a = SharedBuffer::new();
     let buf_b = SharedBuffer::new();
@@ -884,16 +889,20 @@ nodes:
     };
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "departments".to_string(),
-            Box::new(std::io::Cursor::new(departments_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(departments_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
 
@@ -1061,21 +1070,27 @@ nodes:
     };
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "products".to_string(),
-            Box::new(std::io::Cursor::new(products_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(products_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "categories".to_string(),
-            Box::new(std::io::Cursor::new(categories_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(categories_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
 
@@ -1281,16 +1296,20 @@ nodes:
     };
 
     let primary = "orders".to_string();
-    let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+    let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
-            Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
         ),
         (
             "sessions".to_string(),
-            Box::new(std::io::Cursor::new(sessions_csv.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(sessions_csv.as_bytes().to_vec())),
+            ),
         ),
     ]);
 

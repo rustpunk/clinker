@@ -140,9 +140,9 @@ pub(crate) fn emit_post_recompute(
     let mut new_rows: Vec<crate::aggregation::SortRow> = Vec::new();
     let finalize_ctx = EvalContext {
         stable: ctx.stable,
-        source_file: ctx.source_file_arc,
+        source_file: ctx.synthetic_source_file,
         source_row: 0,
-        source_path: ctx.source_path_arc,
+        source_path: ctx.synthetic_source_file,
         source_count: ctx.source_count,
         source_batch: ctx.source_batch_arc,
         ingestion_timestamp: ctx.source_ingestion_timestamp,

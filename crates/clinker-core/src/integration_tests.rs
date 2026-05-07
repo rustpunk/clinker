@@ -17,10 +17,12 @@ mod tests {
 
         let first_source = config.source_configs().next().unwrap().name.clone();
         let first_output = config.output_configs().next().unwrap().name.clone();
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        let readers: crate::executor::SourceReaders = HashMap::from([(
             first_source.clone(),
-            Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec()))
-                as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(csv_input.as_bytes().to_vec())),
+            ),
         )]);
         let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
             first_output,
@@ -841,9 +843,12 @@ nodes:
         let config = config::parse_config(yaml).unwrap();
 
         // `src` is registered, but we pass "nonexistent" as primary.
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([(
+        let readers: crate::executor::SourceReaders = HashMap::from([(
             "src".to_string(),
-            Box::new(std::io::Cursor::new(b"id\n1\n".to_vec())) as Box<dyn std::io::Read + Send>,
+            crate::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(b"id\n1\n".to_vec())),
+            ),
         )]);
         let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
             "dest".to_string(),
@@ -911,7 +916,7 @@ nodes:
 
         // Readers map is EMPTY — the primary is declared in config
         // but no reader is registered for it.
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::new();
+        let readers: crate::executor::SourceReaders = HashMap::new();
         let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
             "dest".to_string(),
             Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
@@ -1013,16 +1018,20 @@ nodes:
         let orders = "order_id,product_id,quantity\nORD-1,PROD-A,5\nORD-2,PROD-B,3\n";
         let products = "product_id,product_name\nPROD-A,Widget\nPROD-B,Gadget\n";
 
-        let readers: HashMap<String, Box<dyn std::io::Read + Send>> = HashMap::from([
+        let readers: crate::executor::SourceReaders = HashMap::from([
             (
                 "products".to_string(),
-                Box::new(std::io::Cursor::new(products.as_bytes().to_vec()))
-                    as Box<dyn std::io::Read + Send>,
+                crate::executor::single_file_reader(
+                    "test.csv",
+                    Box::new(std::io::Cursor::new(products.as_bytes().to_vec())),
+                ),
             ),
             (
                 "orders".to_string(),
-                Box::new(std::io::Cursor::new(orders.as_bytes().to_vec()))
-                    as Box<dyn std::io::Read + Send>,
+                crate::executor::single_file_reader(
+                    "test.csv",
+                    Box::new(std::io::Cursor::new(orders.as_bytes().to_vec())),
+                ),
             ),
         ]);
         let out_buf = SharedBuffer::new();
