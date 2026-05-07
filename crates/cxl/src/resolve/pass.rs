@@ -372,6 +372,39 @@ impl<'a> Resolver<'a> {
                     });
                 }
             }
+            Expr::QualifiedSourceAccess {
+                node_id,
+                input_name: _,
+                field,
+                span,
+            } => {
+                // Item 6: `$source.<input_name>.<field>` — the qualified
+                // form used downstream of Merge/Combine. Field must be
+                // declared in `vars.source`; the input_name's structural
+                // validity is checked at plan time (not at resolve, which
+                // doesn't know DAG structure). Builtin source members are
+                // NOT valid via the qualified form (qualifier addresses
+                // user-declared scope only).
+                if self.scoped_vars.source.contains_key(&**field) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.source.keys().map(|s| s.as_str()).collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!(
+                            "unknown source member '$source.<input>.{field}' (qualified form)"
+                        ),
+                        help: best_match(field, &declared, 3)
+                            .map(|s| format!("did you mean '{s}'?"))
+                            .or_else(|| {
+                                Some(
+                                    "declare it in the pipeline `vars.source` block".into(),
+                                )
+                            }),
+                    });
+                }
+            }
             Expr::MetaAccess { node_id, .. } => {
                 // Metadata keys are runtime-resolved — accept any field name
                 self.bind(*node_id, ResolvedBinding::PipelineMember);
@@ -783,6 +816,52 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("$source.unknown")),
             "expected diagnostic for unknown $source member: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_qualified_source_member_declared() {
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .source
+            .insert("batch_id".to_string(), ScopedVarType::String);
+        let parsed = Parser::parse("emit b = $source.salesforce.batch_id");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared source var should resolve through qualified form");
+        let has_pipeline = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(
+            has_pipeline,
+            "Expected PipelineMember binding for declared $source.<input>.batch_id"
+        );
+    }
+
+    #[test]
+    fn test_resolve_qualified_source_member_undeclared() {
+        let parsed = Parser::parse("emit b = $source.salesforce.unknown_field");
+        assert!(parsed.errors.is_empty());
+        let registry = ScopedVarsRegistry::default();
+        let err = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect_err("undeclared qualified source field should fail");
+        assert!(
+            err.iter().any(|d| d.message.contains("unknown_field")),
+            "expected diagnostic for undeclared qualified $source member: {err:?}"
         );
     }
 

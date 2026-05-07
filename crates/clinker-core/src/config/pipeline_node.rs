@@ -678,6 +678,24 @@ impl PipelineNode {
         }
     }
 
+    /// Name of the upstream consumer-side input, when the variant has
+    /// exactly one. Returns `None` for `Source` (no input), `Merge`
+    /// and `Combine` (multiple inputs — caller must walk them
+    /// individually).
+    pub fn input_node_name(&self) -> Option<&str> {
+        match self {
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. }
+            | PipelineNode::Composition { header, .. } => Some(header.input.value.name()),
+            PipelineNode::Source { .. }
+            | PipelineNode::Merge { .. }
+            | PipelineNode::Combine { .. } => None,
+        }
+    }
+
     /// String tag of the variant for display.
     pub fn type_tag(&self) -> &'static str {
         match self {

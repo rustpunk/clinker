@@ -291,6 +291,7 @@ fn walk_expr(
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }

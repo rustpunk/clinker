@@ -383,7 +383,8 @@ mod tests {
     }
 
     /// Structural assertion: `Record` holds exactly `schema`, `values`,
-    /// and `metadata`. Adding or renaming a field fails compilation.
+    /// `metadata`, and `record_vars`. Adding or renaming a field fails
+    /// compilation.
     #[test]
     fn test_record_struct_has_exactly_schema_values_metadata_fields() {
         let schema = test_schema();
@@ -393,6 +394,7 @@ mod tests {
             schema: _,
             values: _,
             metadata: _,
+            record_vars: _,
         } = rec;
     }
 

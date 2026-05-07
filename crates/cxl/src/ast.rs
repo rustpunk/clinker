@@ -167,6 +167,21 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    /// Qualified per-input source-scope read: `$source.<input_name>.<field>`.
+    ///
+    /// Used downstream of `Merge` / `Combine` to disambiguate which
+    /// upstream Source's source-scope value to read. The plain
+    /// [`Expr::SourceAccess`] form is rejected by E172 in that
+    /// context (Phase F-2b) — this variant is the explicit
+    /// alternative. `input_name` matches the upstream Merge/Combine
+    /// input name; `field` resolves against the same
+    /// `vars.source.<key>` declaration as the unqualified form.
+    QualifiedSourceAccess {
+        node_id: NodeId,
+        input_name: Box<str>,
+        field: Box<str>,
+        span: Span,
+    },
     /// The `now` keyword — wall-clock DateTime at the point of evaluation.
     Now {
         node_id: NodeId,
@@ -225,6 +240,7 @@ impl Expr {
             | Expr::SourceAccess { span, .. }
             | Expr::MetaAccess { span, .. }
             | Expr::RecordAccess { span, .. }
+            | Expr::QualifiedSourceAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. }
             | Expr::AggCall { span, .. }
@@ -250,6 +266,7 @@ impl Expr {
             | Expr::SourceAccess { node_id, .. }
             | Expr::MetaAccess { node_id, .. }
             | Expr::RecordAccess { node_id, .. }
+            | Expr::QualifiedSourceAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. }
             | Expr::AggCall { node_id, .. }
@@ -330,6 +347,7 @@ impl Expr {
             | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::RecordAccess { .. }
+            | Expr::QualifiedSourceAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::Literal { .. }

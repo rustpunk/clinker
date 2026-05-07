@@ -155,6 +155,7 @@ fn walk_expr(expr: &Expr, refs: &mut Vec<String>) {
         }
         Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. } => {
             // pipeline.*/source.*/record.*/meta.* not allowed in module constants —
@@ -267,6 +268,7 @@ fn contains_self_call(fn_name: &str, expr: &Expr) -> bool {
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }

@@ -456,6 +456,22 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::QualifiedSourceAccess { node_id, field, .. } => {
+                // Item 6: qualified source access only addresses
+                // user-declared keys (builtin source members aren't
+                // valid through the qualifier). Type comes from the
+                // same registry as the unqualified form.
+                let ty = self
+                    .scoped_vars
+                    .source
+                    .get(&**field)
+                    .copied()
+                    .map(scoped_var_type_to_type)
+                    .unwrap_or(Type::Any);
+                self.set_type(*node_id, ty.clone());
+                ty
+            }
+
             Expr::MetaAccess { node_id, .. } => {
                 self.set_type(*node_id, Type::Any);
                 Type::Any
@@ -1031,6 +1047,7 @@ impl<'a> TypeChecker<'a> {
             | Expr::QualifiedFieldRef { .. }
             | Expr::PipelineAccess { .. }
             | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::RecordAccess { .. }
             | Expr::Now { .. }

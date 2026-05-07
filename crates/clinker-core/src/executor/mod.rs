@@ -2354,7 +2354,104 @@ fn build_stable_eval_context(
         pipeline_counters: PipelineCounters::default(),
         pipeline_vars: Arc::new(std::sync::RwLock::new(pipeline_vars.clone())),
         source_vars: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        source_input_arcs: Arc::new(compute_source_input_arcs(config)),
     }
+}
+
+/// Walk the YAML config to map every `Merge` / `Combine` named input to
+/// the source-file `Arc<str>`s of the upstream `Source` node(s) it
+/// transitively reads from. Used by `Expr::QualifiedSourceAccess` eval
+/// to look up `source_vars` entries written by upstream source-scope
+/// state nodes (Item 6 — qualified post-merge `$source.<input>.<key>`
+/// reads).
+///
+/// For Merge, each entry in `inputs:` becomes its own input name (the
+/// referenced node name itself, since Merge does not rename). For
+/// Combine, the IndexMap key is the input name. Walk-back follows the
+/// consumer-side `input:` field through Transform/Aggregate/Route/State
+/// nodes until a Source is reached; nested Merges fan out, collecting
+/// every reachable Source's path Arc.
+fn compute_source_input_arcs(
+    config: &PipelineConfig,
+) -> std::collections::HashMap<String, Vec<Arc<str>>> {
+    use crate::config::pipeline_node::PipelineNode;
+    let mut by_name: HashMap<&str, &PipelineNode> = HashMap::new();
+    for node in &config.nodes {
+        by_name.insert(node.value.name(), &node.value);
+    }
+    let mut out: std::collections::HashMap<String, Vec<Arc<str>>> =
+        std::collections::HashMap::new();
+    for node in &config.nodes {
+        match &node.value {
+            PipelineNode::Combine { header, .. } => {
+                for (input_name, upstream) in header.input.iter() {
+                    let arcs = arcs_reachable_from(&by_name, upstream.value.name());
+                    if !arcs.is_empty() {
+                        out.entry(input_name.clone()).or_default().extend(arcs);
+                    }
+                }
+            }
+            PipelineNode::Merge { header, .. } => {
+                for upstream in &header.inputs {
+                    let upstream_name = upstream.value.name();
+                    let arcs = arcs_reachable_from(&by_name, upstream_name);
+                    if !arcs.is_empty() {
+                        out.entry(upstream_name.to_string())
+                            .or_default()
+                            .extend(arcs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for arcs in out.values_mut() {
+        arcs.sort();
+        arcs.dedup();
+    }
+    out
+}
+
+fn arcs_reachable_from(
+    by_name: &HashMap<&str, &crate::config::pipeline_node::PipelineNode>,
+    start: &str,
+) -> Vec<Arc<str>> {
+    use crate::config::pipeline_node::PipelineNode;
+    let mut out = Vec::new();
+    let mut stack = vec![start.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(node) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        match node {
+            PipelineNode::Source { config: body, .. } => {
+                let path = body.source.path_str();
+                if !path.is_empty() {
+                    out.push(Arc::from(path));
+                }
+            }
+            PipelineNode::Merge { header, .. } => {
+                for upstream in &header.inputs {
+                    stack.push(upstream.value.name().to_string());
+                }
+            }
+            PipelineNode::Combine { header, .. } => {
+                for upstream in header.input.values() {
+                    stack.push(upstream.value.name().to_string());
+                }
+            }
+            other => {
+                if let Some(input) = other.input_node_name() {
+                    stack.push(input.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Evaluate a single transform against a record, returning the

@@ -283,6 +283,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         pipeline_counters: clinker_record::PipelineCounters::default(),
         pipeline_vars: std::sync::Arc::new(std::sync::RwLock::new(indexmap::IndexMap::new())),
         source_vars: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        source_input_arcs: std::sync::Arc::new(std::collections::HashMap::new()),
     };
     let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
     // REPL has no real batch context — use the same placeholder as the
@@ -544,6 +545,9 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
         cxl::ast::Expr::PipelineAccess { field, .. } => format!("$pipeline.{}", field),
         cxl::ast::Expr::SourceAccess { field, .. } => format!("$source.{}", field),
+        cxl::ast::Expr::QualifiedSourceAccess {
+            input_name, field, ..
+        } => format!("$source.{}.{}", input_name, field),
         cxl::ast::Expr::MetaAccess { field, .. } => format!("$meta.{}", field),
         cxl::ast::Expr::RecordAccess { field, .. } => format!("$record.{}", field),
         cxl::ast::Expr::Binary { op, lhs, rhs, .. } => {
@@ -696,6 +700,7 @@ mod tests {
             source_vars: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            source_input_arcs: std::sync::Arc::new(std::collections::HashMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =
@@ -747,6 +752,7 @@ mod tests {
             source_vars: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            source_input_arcs: std::sync::Arc::new(std::collections::HashMap::new()),
         };
         let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from("test");
         let source_batch_arc: std::sync::Arc<str> =

@@ -431,6 +431,35 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
 
         Expr::SourceAccess { field, .. } => Ok(ctx.resolve_source(field).unwrap_or(Value::Null)),
 
+        Expr::QualifiedSourceAccess {
+            input_name, field, ..
+        } => {
+            // Item 6: `$source.<input_name>.<field>` looks up the
+            // value the state node wrote for records flowing through
+            // upstream Source `<input_name>`. The plan-time
+            // `source_input_arcs` map (built by clinker-core's
+            // `build_stable_eval_context`) gives the source-file Arcs
+            // for each input name; we scan them and return the first
+            // matching `resolve_source_var` hit.
+            //
+            // Per-input single-writer + same-program-eval invariants
+            // (Phase F-1's E170) make values across multi-file Sources
+            // of the same input trivially agree, so first-match
+            // semantics is well-defined.
+            if let Some(arcs) = ctx
+                .stable
+                .source_input_arcs
+                .get(input_name.as_ref())
+            {
+                for arc in arcs {
+                    if let Some(v) = ctx.stable.resolve_source_var(arc, field) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Ok(Value::Null)
+        }
+
         Expr::MetaAccess { field, .. } => {
             // Check locally-emitted metadata first (same transform), then resolver
             if let Some(val) = meta_state.get(&**field) {

@@ -842,7 +842,8 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
-        | Expr::GroupKey { .. } => {}
+        | Expr::GroupKey { .. }
+        | Expr::QualifiedSourceAccess { .. } => {}
     }
 }
 
@@ -3445,6 +3446,7 @@ fn walk_for_unknown_refs(
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
         | Expr::MetaAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::Now { .. }

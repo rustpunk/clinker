@@ -89,6 +89,12 @@ pub struct StableEvalContext {
     /// outer `HashMap` keys by per-record `source_file` Arc; the inner
     /// `IndexMap` mirrors the [`PipelineVarStore`] shape.
     pub source_vars: SourceVarStore,
+    /// Plan-time map from Merge/Combine input-name to the source-file
+    /// `Arc<str>`s of the upstream Source(s) reachable from that input.
+    /// Used by [`Expr::QualifiedSourceAccess`] eval (Item 6) to look
+    /// up the right `source_vars` entry for `$source.<input_name>.<key>`
+    /// reads. Empty for non-pipeline contexts.
+    pub source_input_arcs: Arc<std::collections::HashMap<String, Vec<Arc<str>>>>,
 }
 
 impl StableEvalContext {
@@ -170,6 +176,7 @@ impl StableEvalContext {
             pipeline_counters: PipelineCounters::default(),
             pipeline_vars: Arc::new(RwLock::new(IndexMap::new())),
             source_vars: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_input_arcs: Arc::new(std::collections::HashMap::new()),
         }
     }
 }

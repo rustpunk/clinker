@@ -284,6 +284,7 @@ pub fn eval_expr_in_agg_scope(
         Expr::MetaAccess { .. }
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {
             what: "$meta/$pipeline/$source/$record access",
         }),

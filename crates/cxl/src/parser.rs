@@ -911,14 +911,31 @@ impl Parser {
                         })
                     }
                     "source" => {
-                        let nid = self.alloc_id();
-                        let field = self.expect_ident("source property name")?;
-                        let end = self.prev_span();
-                        Ok(Expr::SourceAccess {
-                            node_id: nid,
-                            field: field.into(),
-                            span: Span::new(start.start as usize, end.end as usize),
-                        })
+                        let first = self.expect_ident("source property name")?;
+                        // Item 6: peek for a qualified `.field` suffix so
+                        // `$source.<input_name>.<field>` parses as a
+                        // QualifiedSourceAccess. The plain `$source.<field>`
+                        // form remains a SourceAccess.
+                        if *self.peek() == Token::Dot {
+                            self.advance();
+                            let nid = self.alloc_id();
+                            let field = self.expect_ident("source property name")?;
+                            let end = self.prev_span();
+                            Ok(Expr::QualifiedSourceAccess {
+                                node_id: nid,
+                                input_name: first.into(),
+                                field: field.into(),
+                                span: Span::new(start.start as usize, end.end as usize),
+                            })
+                        } else {
+                            let nid = self.alloc_id();
+                            let end = self.prev_span();
+                            Ok(Expr::SourceAccess {
+                                node_id: nid,
+                                field: first.into(),
+                                span: Span::new(start.start as usize, end.end as usize),
+                            })
+                        }
                     }
                     "record" => {
                         let nid = self.alloc_id();
@@ -1611,6 +1628,21 @@ mod tests {
                 assert_eq!(&**field, "row");
             }
             _ => panic!("expected SourceAccess"),
+        }
+    }
+
+    #[test]
+    fn test_parse_qualified_source_access() {
+        let r = parse_ok("let x = $source.salesforce.batch_id");
+        let expr = let_expr(&r);
+        match expr {
+            Expr::QualifiedSourceAccess {
+                input_name, field, ..
+            } => {
+                assert_eq!(&**input_name, "salesforce");
+                assert_eq!(&**field, "batch_id");
+            }
+            other => panic!("expected QualifiedSourceAccess, got {other:?}"),
         }
     }
 
