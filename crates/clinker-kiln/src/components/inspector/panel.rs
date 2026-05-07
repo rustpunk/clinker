@@ -35,7 +35,7 @@ pub fn InspectorPanel(stage_id: String) -> Element {
     };
     let (kind_label, kind_attr, subtitle, cxl_source) = match &node_spanned.value {
         PipelineNode::Source { config: body, .. } => {
-            ("SOURCE", "source", body.source.path.clone(), None)
+            ("SOURCE", "source", body.source.display_target(), None)
         }
         PipelineNode::Transform { config: body, .. } => (
             "TRANSFORM",
