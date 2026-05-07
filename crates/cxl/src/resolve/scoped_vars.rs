@@ -58,6 +58,11 @@ pub struct ScopedVarsRegistry {
     pub hidden_pipeline: IndexMap<String, ScopedVarType>,
     pub hidden_source: IndexMap<String, ScopedVarType>,
     pub hidden_record: IndexMap<String, ScopedVarType>,
+    /// Static config knobs read via `$vars.<key>`. Channel-overridable,
+    /// frozen at pipeline start. Distinct from the per-scope tiers
+    /// above (which are producer-written); a `$vars.*` read is global
+    /// and DAG-position-independent.
+    pub static_vars: IndexMap<String, ScopedVarType>,
 }
 
 /// Per-scope tag for `ScopedVarsRegistry::hidden_lookup`.

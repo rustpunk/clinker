@@ -141,6 +141,18 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    /// Static configuration knob: `$vars.<key>`. Declared in the
+    /// pipeline's top-level `vars:` block with an optional default;
+    /// resolves to a value frozen at pipeline start (channel overrides
+    /// applied once at startup). Distinct from `$pipeline.*` /
+    /// `$source.*` / `$record.*` which are producer-written scoped
+    /// state with DAG-descendant read semantics; `$vars.*` is read-only
+    /// and visible from any node.
+    VarsAccess {
+        node_id: NodeId,
+        key: Box<str>,
+        span: Span,
+    },
     /// Per-record source provenance: `$source.file`, `$source.row`.
     /// Distinct namespace from `$pipeline.*` (pipeline-stable per-run state)
     /// because per-record values cannot be pipeline-scope when one Source
@@ -237,6 +249,7 @@ impl Expr {
             | Expr::Coalesce { span, .. }
             | Expr::WindowCall { span, .. }
             | Expr::PipelineAccess { span, .. }
+            | Expr::VarsAccess { span, .. }
             | Expr::SourceAccess { span, .. }
             | Expr::MetaAccess { span, .. }
             | Expr::RecordAccess { span, .. }
@@ -263,6 +276,7 @@ impl Expr {
             | Expr::Coalesce { node_id, .. }
             | Expr::WindowCall { node_id, .. }
             | Expr::PipelineAccess { node_id, .. }
+            | Expr::VarsAccess { node_id, .. }
             | Expr::SourceAccess { node_id, .. }
             | Expr::MetaAccess { node_id, .. }
             | Expr::RecordAccess { node_id, .. }
@@ -344,6 +358,7 @@ impl Expr {
                 }
             }
             Expr::PipelineAccess { .. }
+            | Expr::VarsAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
             | Expr::RecordAccess { .. }

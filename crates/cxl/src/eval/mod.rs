@@ -429,6 +429,13 @@ pub fn eval_expr<'w, S: RecordStorage + 'w>(
             Ok(ctx.resolve_pipeline(field).unwrap_or(Value::Null))
         }
 
+        Expr::VarsAccess { key, .. } => Ok(ctx
+            .stable
+            .static_vars
+            .get(key.as_ref())
+            .cloned()
+            .unwrap_or(Value::Null)),
+
         Expr::SourceAccess { field, .. } => Ok(ctx.resolve_source(field).unwrap_or(Value::Null)),
 
         Expr::QualifiedSourceAccess {

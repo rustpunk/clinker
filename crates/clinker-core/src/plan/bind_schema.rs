@@ -843,7 +843,12 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }
         | Expr::GroupKey { .. }
-        | Expr::QualifiedSourceAccess { .. } => {}
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::VarsAccess { .. } => {
+            // $vars.* reads are global static config — no producer, no
+            // DAG-descendant rule applies. Skipped from the scope-read
+            // accounting that drives E170/E171/E175 validation.
+        }
     }
 }
 
@@ -3445,6 +3450,7 @@ fn walk_for_unknown_refs(
         Expr::FieldRef { .. }
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::MetaAccess { .. }

@@ -327,6 +327,30 @@ impl<'a> Resolver<'a> {
                     });
                 }
             }
+            Expr::VarsAccess { node_id, key, span } => {
+                if self.scoped_vars.static_vars.contains_key(&**key) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else {
+                    let declared: Vec<&str> = self
+                        .scoped_vars
+                        .static_vars
+                        .keys()
+                        .map(|s| s.as_str())
+                        .collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown vars key '$vars.{key}'"),
+                        help: best_match(key, &declared, 3)
+                            .map(|s| format!("did you mean '$vars.{s}'?"))
+                            .or_else(|| {
+                                Some(
+                                    "declare it in the pipeline's top-level `vars:` block"
+                                        .into(),
+                                )
+                            }),
+                    });
+                }
+            }
             Expr::SourceAccess {
                 node_id,
                 field,

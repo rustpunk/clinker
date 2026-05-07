@@ -439,6 +439,18 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::VarsAccess { node_id, key, .. } => {
+                let ty = self
+                    .scoped_vars
+                    .static_vars
+                    .get(&**key)
+                    .copied()
+                    .map(scoped_var_type_to_type)
+                    .unwrap_or(Type::Any);
+                self.set_type(*node_id, ty.clone());
+                ty
+            }
+
             Expr::SourceAccess { node_id, field, .. } => {
                 let ty = match &**field {
                     "file" | "path" | "batch" => Type::String,
@@ -1046,6 +1058,7 @@ impl<'a> TypeChecker<'a> {
             Expr::Literal { .. }
             | Expr::QualifiedFieldRef { .. }
             | Expr::PipelineAccess { .. }
+            | Expr::VarsAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::QualifiedSourceAccess { .. }
             | Expr::MetaAccess { .. }

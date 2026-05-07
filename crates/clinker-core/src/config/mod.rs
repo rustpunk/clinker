@@ -64,8 +64,21 @@ pub struct PipelineMeta {
     /// record). Pipeline-scope defaults seed the runtime registry at init;
     /// source- and record-scope entries are placeholders for runtime writes
     /// by `state` nodes (no readers yet).
+    ///
+    /// Stage 5 of the variable-system redesign deletes this nested form;
+    /// the new flat `static_vars` field below carries the static-config
+    /// half (read via `$vars.<key>`), and producer-declared scoped state
+    /// moves to per-node `declares:` blocks. The YAML key
+    /// `static_vars` is a transitional name — Stage 5 renames it to
+    /// `vars` once the nested form is gone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vars: Option<ScopedVarsDecl>,
+    /// Static configuration knobs read via `$vars.<key>`. Flat top-level
+    /// shape: `static_vars: { fuzzy_threshold: { type: float, default:
+    /// 0.85 } }`. Channel-overridable, frozen at pipeline start. No
+    /// producer; no DAG-descendant rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_vars: Option<IndexMap<String, ScopedVarDecl>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_formats: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +196,24 @@ impl From<ScopedVarType> for cxl::resolve::ScopedVarType {
 /// Build a CXL-side [`cxl::resolve::ScopedVarsRegistry`] from a parsed
 /// pipeline-level [`ScopedVarsDecl`]. The CXL crate doesn't depend on
 /// `clinker-core`, so this conversion lives here at the boundary.
+///
+/// `static_vars` is the flat top-level `static_vars:` block (read via
+/// `$vars.<key>`); when None, the registry's `static_vars` tier stays
+/// empty.
+pub fn scoped_vars_registry_with_static(
+    decl: &ScopedVarsDecl,
+    static_vars: Option<&IndexMap<String, ScopedVarDecl>>,
+) -> cxl::resolve::ScopedVarsRegistry {
+    let mut reg = scoped_vars_registry(decl);
+    if let Some(sv) = static_vars {
+        reg.static_vars = sv
+            .iter()
+            .map(|(k, d)| (k.clone(), d.var_type.into()))
+            .collect();
+    }
+    reg
+}
+
 pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRegistry {
     cxl::resolve::ScopedVarsRegistry {
         pipeline: decl
@@ -206,6 +237,9 @@ pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRe
         hidden_pipeline: indexmap::IndexMap::new(),
         hidden_source: indexmap::IndexMap::new(),
         hidden_record: indexmap::IndexMap::new(),
+        // Stage 1 — empty until the new top-level flat `vars:`
+        // parser lands; Stage 2 populates from that block.
+        static_vars: indexmap::IndexMap::new(),
     }
 }
 
@@ -1789,12 +1823,10 @@ impl PipelineConfig {
         // E200 diagnostics surface here with per-node spans. Also
         // recurses into composition bodies via bind_composition,
         // populating CompileArtifacts.composition_bodies.
-        let scoped_vars_registry = self
-            .pipeline
-            .vars
-            .as_ref()
-            .map(scoped_vars_registry)
-            .unwrap_or_default();
+        let scoped_vars_registry = scoped_vars_registry_with_static(
+            self.pipeline.vars.as_ref().unwrap_or(&ScopedVarsDecl::default()),
+            self.pipeline.static_vars.as_ref(),
+        );
         let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
@@ -3811,6 +3843,22 @@ fn check_default_type(
 pub fn convert_pipeline_vars(vars: &ScopedVarsDecl) -> IndexMap<String, clinker_record::Value> {
     vars.pipeline
         .iter()
+        .filter_map(|(name, decl)| {
+            decl.default
+                .as_ref()
+                .map(|default| (name.clone(), default_to_value(decl.var_type, default)))
+        })
+        .collect()
+}
+
+/// Convert a flat `static_vars:` block into the runtime `$vars.*`
+/// value map. Entries without a `default` resolve to `Value::Null`
+/// at read time (the eval arm does the unwrap_or). Channels override
+/// these values once at pipeline start (Stage 7 wiring).
+pub fn convert_static_vars(
+    vars: &IndexMap<String, ScopedVarDecl>,
+) -> IndexMap<String, clinker_record::Value> {
+    vars.iter()
         .filter_map(|(name, decl)| {
             decl.default
                 .as_ref()

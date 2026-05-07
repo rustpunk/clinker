@@ -283,6 +283,7 @@ pub fn eval_expr_in_agg_scope(
         }
         Expr::MetaAccess { .. }
         | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. } => Err(AggregateEvalError::UnsupportedResidual {

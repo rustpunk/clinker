@@ -642,12 +642,15 @@ impl PipelineExecutor {
                 })?;
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
-        let scoped_vars: cxl::resolve::ScopedVarsRegistry = config
-            .pipeline
-            .vars
-            .as_ref()
-            .map(crate::config::scoped_vars_registry)
-            .unwrap_or_default();
+        let scoped_vars: cxl::resolve::ScopedVarsRegistry =
+            crate::config::scoped_vars_registry_with_static(
+                config
+                    .pipeline
+                    .vars
+                    .as_ref()
+                    .unwrap_or(&crate::config::ScopedVarsDecl::default()),
+                config.pipeline.static_vars.as_ref(),
+            );
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()
             .map(|t| {
@@ -2353,7 +2356,20 @@ fn build_stable_eval_context(
         pipeline_vars: Arc::new(std::sync::RwLock::new(pipeline_vars.clone())),
         source_vars: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         source_input_arcs: Arc::new(compute_source_input_arcs(config)),
+        static_vars: Arc::new(build_static_vars(config)),
     }
+}
+
+/// Build the `$vars.*` runtime value map from the pipeline's
+/// `static_vars:` block. Each entry's `default` field (post-validation,
+/// already coerced to the declared type) becomes the frozen runtime
+/// value. Stage 7 will overlay channel `pipeline.vars.<key>`
+/// overrides on top of this before the pipeline starts.
+fn build_static_vars(config: &PipelineConfig) -> IndexMap<String, Value> {
+    let Some(decls) = config.pipeline.static_vars.as_ref() else {
+        return IndexMap::new();
+    };
+    crate::config::convert_static_vars(decls)
 }
 
 /// Walk the YAML config to map every `Merge` / `Combine` named input to

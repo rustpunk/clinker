@@ -95,6 +95,13 @@ pub struct StableEvalContext {
     /// up the right `source_vars` entry for `$source.<input_name>.<key>`
     /// reads. Empty for non-pipeline contexts.
     pub source_input_arcs: Arc<std::collections::HashMap<String, Vec<Arc<str>>>>,
+    /// Static configuration knobs read via `$vars.<key>`. Built from
+    /// the pipeline's top-level `vars:` block (channel overrides
+    /// applied) and frozen for the pipeline run. Distinct from
+    /// `pipeline_vars` (which holds producer-written `$pipeline.*`
+    /// state); `static_vars` is the immutable configuration surface
+    /// channels override.
+    pub static_vars: Arc<IndexMap<String, Value>>,
 }
 
 impl StableEvalContext {
@@ -177,6 +184,7 @@ impl StableEvalContext {
             pipeline_vars: Arc::new(RwLock::new(IndexMap::new())),
             source_vars: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_input_arcs: Arc::new(std::collections::HashMap::new()),
+            static_vars: Arc::new(IndexMap::new()),
         }
     }
 }

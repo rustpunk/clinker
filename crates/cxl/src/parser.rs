@@ -892,11 +892,12 @@ impl Parser {
                 })
             }
 
-            // $pipeline.field, $source.field, $record.field, $window.fn(), $meta.field
+            // $pipeline.field, $vars.key, $source.field, $record.field, $window.fn(), $meta.field
             Token::Dollar => {
                 self.advance(); // consume '$'
-                let ns =
-                    self.expect_ident("system namespace (pipeline, source, record, window, meta)")?;
+                let ns = self.expect_ident(
+                    "system namespace (pipeline, vars, source, record, window, meta)",
+                )?;
                 self.expect_token(&Token::Dot, "'.'")?;
 
                 match ns.as_str() {
@@ -907,6 +908,16 @@ impl Parser {
                         Ok(Expr::PipelineAccess {
                             node_id: nid,
                             field: field.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
+                    "vars" => {
+                        let nid = self.alloc_id();
+                        let key = self.expect_ident("vars key name")?;
+                        let end = self.prev_span();
+                        Ok(Expr::VarsAccess {
+                            node_id: nid,
+                            key: key.into(),
                             span: Span::new(start.start as usize, end.end as usize),
                         })
                     }
