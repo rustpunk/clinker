@@ -2009,6 +2009,109 @@ nodes:
     }
 
     #[test]
+    fn test_state_node_post_merge_source_read_emits_e172() {
+        // Phase F-2b: a Transform downstream of a Merge that reads
+        // user-declared `$source.<custom>` is rejected — each record
+        // carries its own source's value, but cross-source intent
+        // is ambiguous in the current syntax. Builtin $source.*
+        // (file, row, path, count, batch, ingestion_timestamp)
+        // remain valid post-merge.
+        let yaml = r#"
+pipeline:
+  name: state_post_merge_read
+  vars:
+    source:
+      label: { type: string }
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: string }
+  - type: state
+    name: write_a
+    input: a
+    config:
+      scope: source
+      set:
+        - var: label
+          cxl: "\"a\""
+  - type: merge
+    name: merged
+    inputs: [write_a, b]
+  - type: transform
+    name: post_merge_reader
+    input: merged
+    config:
+      cxl: |
+        emit observed = $source.label
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let err_diags = cfg
+            .compile(&ctx)
+            .expect_err("post-merge $source.<custom> read should reject");
+        assert!(
+            err_diags.iter().any(|d| d.code == "E172"),
+            "expected E172, got: {:?}",
+            err_diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_state_node_post_merge_source_builtin_ok() {
+        // Phase F-2b sanity: builtin $source.* members (file, row,
+        // batch, etc.) remain valid post-merge — each record's
+        // builtin provenance is per-record naturally.
+        let yaml = r#"
+pipeline:
+  name: state_post_merge_builtin_ok
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: id, type: string }
+  - type: merge
+    name: merged
+    inputs: [a, b]
+  - type: transform
+    name: post_merge_reader
+    input: merged
+    config:
+      cxl: |
+        emit origin_file = $source.file
+"#;
+        let cfg = crate::config::parse_config(yaml).expect("config parses");
+        let ctx = crate::config::CompileContext::default();
+        let _plan = cfg
+            .compile(&ctx)
+            .expect("post-merge builtin $source.* read should compile");
+    }
+
+    #[test]
     fn test_state_node_init_phase_with_runtime_descendant_emits_e164() {
         // Phase E v1: init state nodes must be terminal — a
         // downstream node consuming from them is rejected with E164

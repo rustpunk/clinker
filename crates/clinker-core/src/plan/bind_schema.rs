@@ -214,8 +214,152 @@ pub fn bind_schema(
     validate_state_writers(nodes, diags);
     validate_init_phase_terminals(nodes, diags);
     validate_read_after_write(nodes, &artifacts, diags);
+    validate_post_merge_source_reads(nodes, &artifacts, diags);
 
     artifacts
+}
+
+/// Compile-time check: nodes downstream of `Merge` / `Combine` must
+/// not read user-declared `$source.<key>` (custom keys); the
+/// per-source-file Arc keying that backs source-scope state means
+/// each record reads its OWN origin source's value, but in cross-
+/// source comparison contexts the user might intend "give me Source
+/// A's batch_id and Source B's batch_id" — which is ambiguous in the
+/// current syntax. Avoids Talend's `globalMap`-collapse-after-merge
+/// surprise (each record sees its own source value, but the
+/// cross-source intent is silently lost).
+///
+/// Builtin `$source.*` members (`file`, `row`, `path`, `count`,
+/// `batch`, `ingestion_timestamp`) remain valid post-merge — those
+/// are per-record provenance and the per-record-source semantic is
+/// the desired one.
+///
+/// Emits E172 with primary span on the offending CXL reference and a
+/// secondary span on the closest Merge/Combine ancestor.
+fn validate_post_merge_source_reads(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // Compute per-node "closest merge/combine ancestor" map. A node is
+    // post-merge iff this entry is `Some(_)`. The same declaration-
+    // order walk used by `validate_read_after_write` works here
+    // because Stage-3 already proved topological soundness.
+    let mut post_merge: std::collections::HashMap<String, Option<(String, Span)>> =
+        std::collections::HashMap::new();
+    for spanned in nodes {
+        let name = spanned.value.name().to_string();
+        let span = span_for_node(spanned);
+        let direct_inputs: Vec<String> = match &spanned.value {
+            PipelineNode::Source { .. } => Vec::new(),
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::State { header, .. }
+            | PipelineNode::Composition { header, .. } => upstream_target_name(&header.input.value)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            PipelineNode::Merge { header, .. } => header
+                .inputs
+                .iter()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+            PipelineNode::Combine { header, .. } => header
+                .input
+                .values()
+                .filter_map(|i| upstream_target_name(&i.value))
+                .map(String::from)
+                .collect(),
+        };
+        // A Merge or Combine node IS the merge ancestor for everything
+        // downstream — including itself in the lookup so its own
+        // direct descendants pick it up.
+        let self_is_merge = matches!(
+            &spanned.value,
+            PipelineNode::Merge { .. } | PipelineNode::Combine { .. }
+        );
+        let inherited = direct_inputs
+            .iter()
+            .find_map(|inp| post_merge.get(inp).cloned().unwrap_or(None));
+        let entry = if self_is_merge {
+            Some((name.clone(), span))
+        } else {
+            inherited
+        };
+        post_merge.insert(name, entry);
+    }
+
+    // Walk every CXL-bearing node's typed program(s); for each
+    // `$source.<custom>` read in a post-merge node, emit E172.
+    for spanned in nodes {
+        let reader_name = spanned.value.name().to_string();
+        let Some(Some((merge_name, merge_span))) = post_merge.get(&reader_name).cloned() else {
+            continue;
+        };
+        let mut typed_keys: Vec<String> = Vec::new();
+        match &spanned.value {
+            PipelineNode::Transform { .. }
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Combine { .. } => {
+                if artifacts.typed.contains_key(&reader_name) {
+                    typed_keys.push(reader_name.clone());
+                }
+            }
+            PipelineNode::State { config, .. } => {
+                for assignment in &config.set {
+                    typed_keys.push(format!("{reader_name}::{}", assignment.var));
+                }
+            }
+            _ => {}
+        }
+        let span = span_for_node(spanned);
+        for key in typed_keys {
+            let Some(typed) = artifacts.typed.get(&key) else {
+                continue;
+            };
+            let mut reads: Vec<(crate::config::VarScope, String)> = Vec::new();
+            for stmt in &typed.program.statements {
+                collect_scope_reads_in_statement(stmt, &mut reads);
+            }
+            for (scope, var) in reads {
+                if scope != crate::config::VarScope::Source {
+                    continue;
+                }
+                if is_builtin_source_member(&var) {
+                    continue;
+                }
+                diags.push(
+                    Diagnostic::error(
+                        "E172",
+                        format!(
+                            "node {reader_name:?} reads user-declared $source.{var} downstream \
+                             of Merge/Combine node {merge_name:?}: post-merge cross-source \
+                             access is ambiguous (each record carries its own source's value, \
+                             but cross-source comparison requires explicit per-input \
+                             qualification). Project the value into a record field before \
+                             merging, or write a per-input value via a state node placed \
+                             upstream of the merge."
+                        ),
+                        LabeledSpan::primary(span, "post-merge reader".to_string()),
+                    )
+                    .with_secondary(LabeledSpan::new(
+                        merge_span,
+                        Some("merge / combine ancestor".to_string()),
+                    )),
+                );
+            }
+        }
+    }
+}
+
+fn is_builtin_source_member(field: &str) -> bool {
+    matches!(
+        field,
+        "file" | "row" | "path" | "count" | "batch" | "ingestion_timestamp"
+    )
 }
 
 /// Compile-time check: every `$pipeline.<key>` / `$source.<key>` /
