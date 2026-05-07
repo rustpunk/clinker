@@ -149,10 +149,10 @@ pub struct ScopedVarDecl {
 
 /// Scoped-variable primitive type set.
 ///
-/// Mirrors the CXL primitive types the typecheck pass will use to validate
-/// `$pipeline.<key>` / `$source.<key>` / `$row.<key>` reads in the
-/// follow-up Phase B commit. `Date` and `DateTime` accept ISO-8601 string
-/// defaults (parsed at the eval boundary, not at YAML load).
+/// Mirrors the CXL primitive types the typecheck pass uses to validate
+/// `$pipeline.<key>` / `$source.<key>` / `$row.<key>` reads. `Date` and
+/// `DateTime` accept ISO-8601 string defaults (parsed at the eval
+/// boundary, not at YAML load).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScopedVarType {
@@ -162,6 +162,42 @@ pub enum ScopedVarType {
     Bool,
     Date,
     DateTime,
+}
+
+impl From<ScopedVarType> for cxl::resolve::ScopedVarType {
+    fn from(t: ScopedVarType) -> Self {
+        match t {
+            ScopedVarType::String => cxl::resolve::ScopedVarType::String,
+            ScopedVarType::Int => cxl::resolve::ScopedVarType::Int,
+            ScopedVarType::Float => cxl::resolve::ScopedVarType::Float,
+            ScopedVarType::Bool => cxl::resolve::ScopedVarType::Bool,
+            ScopedVarType::Date => cxl::resolve::ScopedVarType::Date,
+            ScopedVarType::DateTime => cxl::resolve::ScopedVarType::DateTime,
+        }
+    }
+}
+
+/// Build a CXL-side [`cxl::resolve::ScopedVarsRegistry`] from a parsed
+/// pipeline-level [`ScopedVarsDecl`]. The CXL crate doesn't depend on
+/// `clinker-core`, so this conversion lives here at the boundary.
+pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRegistry {
+    cxl::resolve::ScopedVarsRegistry {
+        pipeline: decl
+            .pipeline
+            .iter()
+            .map(|(k, d)| (k.clone(), d.var_type.into()))
+            .collect(),
+        source: decl
+            .source
+            .iter()
+            .map(|(k, d)| (k.clone(), d.var_type.into()))
+            .collect(),
+        row: decl
+            .row
+            .iter()
+            .map(|(k, d)| (k.clone(), d.var_type.into()))
+            .collect(),
+    }
 }
 
 /// Input source configuration.
@@ -1742,12 +1778,19 @@ impl PipelineConfig {
         // E200 diagnostics surface here with per-node spans. Also
         // recurses into composition bodies via bind_composition,
         // populating CompileArtifacts.composition_bodies.
+        let scoped_vars_registry = self
+            .pipeline
+            .vars
+            .as_ref()
+            .map(scoped_vars_registry)
+            .unwrap_or_default();
         let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
             ctx,
             &symbol_table,
             &ctx.pipeline_dir,
+            scoped_vars_registry,
         );
         // Only abort on non-composition CXL errors (E200/E201) and
         // source-CK validation errors (E153). Composition binding

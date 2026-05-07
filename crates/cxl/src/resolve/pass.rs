@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::levenshtein::best_match;
+use super::scoped_vars::ScopedVarsRegistry;
 use crate::ast::{Expr, MatchArm, NodeId, Program, Statement};
 use crate::lexer::Span;
 
@@ -94,6 +95,29 @@ pub fn resolve_program_with_modules(
     node_count: u32,
     module_exports: &HashMap<String, ModuleExports>,
 ) -> Result<ResolvedProgram, Vec<ResolveDiagnostic>> {
+    resolve_program_with_modules_and_vars(
+        program,
+        fields,
+        node_count,
+        module_exports,
+        &ScopedVarsRegistry::default(),
+    )
+}
+
+/// Run Phase B with module + scoped-vars awareness.
+///
+/// `scoped_vars` carries the pipeline's declared `$pipeline.<key>` /
+/// `$source.<key>` / `$row.<key>` registry. Empty registry preserves the
+/// pre-Phase-B behavior — only builtin members of each namespace resolve.
+/// Production call sites build the registry from
+/// `clinker_core::config::ScopedVarsDecl`.
+pub fn resolve_program_with_modules_and_vars(
+    program: Program,
+    fields: &[&str],
+    node_count: u32,
+    module_exports: &HashMap<String, ModuleExports>,
+    scoped_vars: &ScopedVarsRegistry,
+) -> Result<ResolvedProgram, Vec<ResolveDiagnostic>> {
     let mut resolver = Resolver {
         fields,
         let_vars: Vec::new(),
@@ -102,6 +126,7 @@ pub fn resolve_program_with_modules(
         context: ResolveContext::Primary,
         module_aliases: HashMap::new(),
         module_exports,
+        scoped_vars,
     };
 
     for stmt in &program.statements {
@@ -129,6 +154,9 @@ struct Resolver<'a> {
     module_aliases: HashMap<String, String>,
     /// Available module exports, keyed by module path
     module_exports: &'a HashMap<String, ModuleExports>,
+    /// User-declared `$pipeline.<key>` / `$source.<key>` / `$row.<key>`
+    /// registry consulted alongside the builtin member sets.
+    scoped_vars: &'a ScopedVarsRegistry,
 }
 
 impl<'a> Resolver<'a> {
@@ -250,13 +278,31 @@ impl<'a> Resolver<'a> {
                 field,
                 span,
             } => {
-                if PIPELINE_MEMBERS.contains(&&**field) {
+                let is_builtin = PIPELINE_MEMBERS.contains(&&**field);
+                let is_declared = self.scoped_vars.pipeline.contains_key(&**field);
+                if is_builtin || is_declared {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
                 } else {
-                    // Could be a user-defined pipeline.vars.* variable
-                    // For now, accept anything under pipeline.* and let runtime resolve
-                    self.bind(*node_id, ResolvedBinding::PipelineMember);
-                    let _ = span;
+                    let declared: Vec<&str> = self
+                        .scoped_vars
+                        .pipeline
+                        .keys()
+                        .map(|s| s.as_str())
+                        .collect();
+                    let candidates: Vec<&str> = PIPELINE_MEMBERS
+                        .iter()
+                        .copied()
+                        .chain(declared.iter().copied())
+                        .collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown pipeline member '$pipeline.{field}'"),
+                        help: best_match(field, &candidates, 3)
+                            .map(|s| format!("did you mean '$pipeline.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.pipeline` block".into())
+                            }),
+                    });
                 }
             }
             Expr::SourceAccess {
@@ -264,14 +310,26 @@ impl<'a> Resolver<'a> {
                 field,
                 span,
             } => {
-                if SOURCE_MEMBERS.contains(&&**field) {
+                let is_builtin = SOURCE_MEMBERS.contains(&&**field);
+                let is_declared = self.scoped_vars.source.contains_key(&**field);
+                if is_builtin || is_declared {
                     self.bind(*node_id, ResolvedBinding::PipelineMember);
                 } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.source.keys().map(|s| s.as_str()).collect();
+                    let candidates: Vec<&str> = SOURCE_MEMBERS
+                        .iter()
+                        .copied()
+                        .chain(declared.iter().copied())
+                        .collect();
                     self.diagnostics.push(ResolveDiagnostic {
                         span: *span,
                         message: format!("unknown source member '$source.{field}'"),
-                        help: best_match(field, SOURCE_MEMBERS, 3)
-                            .map(|s| format!("did you mean '$source.{s}'?")),
+                        help: best_match(field, &candidates, 3)
+                            .map(|s| format!("did you mean '$source.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.source` block".into())
+                            }),
                     });
                 }
             }
@@ -530,6 +588,50 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Some(ResolvedBinding::LetVar(0))));
         assert!(has_let_binding, "Expected LetVar(0) binding for x");
+    }
+
+    #[test]
+    fn test_resolve_undeclared_pipeline_member() {
+        // After Phase B, undeclared $pipeline.<key> is a hard error;
+        // pre-Phase-B it silently resolved to a runtime null. Empty
+        // registry (the resolve_ok / resolve_err helpers' default) means
+        // the user has declared no pipeline-scope variables.
+        let diags = resolve_err("emit val = $pipeline.cutoff_date", &[]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("$pipeline.cutoff_date")),
+            "expected diagnostic for undeclared $pipeline member: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_declared_pipeline_member() {
+        // Build a registry that declares `cutoff_date`; the resolver
+        // should accept the read and bind it as PipelineMember.
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .pipeline
+            .insert("cutoff_date".to_string(), ScopedVarType::Date);
+        let parsed = Parser::parse("emit ok = $pipeline.cutoff_date");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared pipeline var should resolve");
+        let has_pipeline = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(
+            has_pipeline,
+            "Expected PipelineMember binding for declared cutoff_date"
+        );
     }
 
     #[test]

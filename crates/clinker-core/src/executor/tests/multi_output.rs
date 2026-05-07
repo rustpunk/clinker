@@ -43,7 +43,7 @@ fn test_params(config: &crate::config::PipelineConfig) -> PipelineRunParams {
 fn compile_test_route(route_yaml: &str, fields: &[&str]) -> CompiledRoute {
     let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    PipelineExecutor::compile_route(&route_config, &emitted_fields).unwrap()
+    PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default()).unwrap()
 }
 
 /// Helper: build an EvalContext for route evaluation tests.
@@ -1838,7 +1838,8 @@ default: fallback
 "#;
     let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields = vec!["amount".to_string()];
-    let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
+    let result =
+        PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default());
     match result {
         Err(e) => {
             let err = e.to_string();
@@ -1863,7 +1864,8 @@ default: low
 "#;
     let route_config: crate::config::RouteConfig = crate::yaml::from_str(route_yaml).unwrap();
     let emitted_fields = vec!["amount".to_string()];
-    let result = PipelineExecutor::compile_route(&route_config, &emitted_fields);
+    let result =
+        PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default());
     assert!(
         result.is_ok(),
         "boolean route condition should pass typecheck: {}",
