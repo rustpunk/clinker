@@ -1499,8 +1499,35 @@ impl PipelineExecutor {
         // of `plan` for the loop body — `&mut ctx` already borrows
         // `ctx.current_dag` (which aliases `plan`) at the field
         // granularity through every dispatcher call.
-        for node_idx in plan.topo_order.clone() {
-            dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+        //
+        // Phase E-2: two-pass walk for init-phase orchestration.
+        // Pass 1 dispatches every node in the init-phase ancestor
+        // closure (Source/Aggregate/etc. feeding `phase: init` state
+        // nodes, plus the state nodes themselves). Pass 2 dispatches
+        // every other node — the runtime DAG. Init state nodes are
+        // E164-validated as terminal, so Pass 2 never references
+        // their output edge. The dispatcher's `remaining_consumers`
+        // heuristic counts neighbors based on graph structure
+        // (pass-independent), so a Source feeding both an init
+        // branch and a runtime branch correctly clones its buffer
+        // for Pass 1's first consumer and removes it for Pass 2's
+        // last consumer.
+        let init_phase_set = compute_init_phase_node_set(plan);
+        if !init_phase_set.is_empty() {
+            for node_idx in plan.topo_order.clone() {
+                if init_phase_set.contains(&node_idx) {
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                }
+            }
+            for node_idx in plan.topo_order.clone() {
+                if !init_phase_set.contains(&node_idx) {
+                    dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                }
+            }
+        } else {
+            for node_idx in plan.topo_order.clone() {
+                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+            }
         }
 
         // Take the pipeline-scoped TempDir out of the context. Held
@@ -2195,6 +2222,52 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
 /// Called ONCE per pipeline run at the top of `execute_dag_branching`. The
 /// returned `StableEvalContext` is reused (via borrow) at every per-record
 /// dispatch site, killing the prior `String::clone` + `IndexMap::clone`
+/// Compute the init-phase ancestor closure for a compiled plan.
+///
+/// Walks every `PlanNode::State` whose payload phase is
+/// [`crate::config::Phase::Init`] and unions their transitive
+/// upstream ancestors via reverse-BFS along the graph's incoming
+/// edges. The state nodes themselves are included.
+///
+/// Returns an empty set when no init-phase state nodes exist — the
+/// caller then falls through to a single-pass topo walk identical to
+/// the pre-Phase-E-2 behavior.
+///
+/// Phase E v1's E164 validation guarantees init state nodes are
+/// terminal (no runtime descendants), so the closure forms a
+/// well-bounded init sub-DAG that Pass 1 can run to completion
+/// before Pass 2 starts.
+fn compute_init_phase_node_set(
+    plan: &crate::plan::execution::ExecutionPlanDag,
+) -> std::collections::HashSet<petgraph::graph::NodeIndex> {
+    use crate::config::Phase as ConfPhase;
+    use crate::plan::execution::PlanNode;
+    let mut set: std::collections::HashSet<petgraph::graph::NodeIndex> =
+        std::collections::HashSet::new();
+    let mut stack: Vec<petgraph::graph::NodeIndex> = plan
+        .graph
+        .node_indices()
+        .filter(|&idx| match &plan.graph[idx] {
+            PlanNode::State {
+                resolved: Some(p), ..
+            } => p.phase == ConfPhase::Init,
+            _ => false,
+        })
+        .collect();
+    while let Some(idx) = stack.pop() {
+        if !set.insert(idx) {
+            continue;
+        }
+        for parent in plan
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+        {
+            stack.push(parent);
+        }
+    }
+    set
+}
+
 /// per-record allocation profile. `pipeline_start_time` must be frozen at
 /// pipeline start so `$pipeline.start_time` is deterministic within a run.
 /// The `now` keyword uses `ctx.stable.clock.now()` (wall-clock) and is
