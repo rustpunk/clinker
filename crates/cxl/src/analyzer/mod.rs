@@ -292,6 +292,7 @@ fn walk_expr(
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }

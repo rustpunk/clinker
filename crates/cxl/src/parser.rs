@@ -892,10 +892,11 @@ impl Parser {
                 })
             }
 
-            // $pipeline.field, $source.field, $window.fn(), $meta.field
+            // $pipeline.field, $source.field, $record.field, $window.fn(), $meta.field
             Token::Dollar => {
                 self.advance(); // consume '$'
-                let ns = self.expect_ident("system namespace (pipeline, source, window, meta)")?;
+                let ns =
+                    self.expect_ident("system namespace (pipeline, source, record, window, meta)")?;
                 self.expect_token(&Token::Dot, "'.'")?;
 
                 match ns.as_str() {
@@ -914,6 +915,16 @@ impl Parser {
                         let field = self.expect_ident("source property name")?;
                         let end = self.prev_span();
                         Ok(Expr::SourceAccess {
+                            node_id: nid,
+                            field: field.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
+                    "record" => {
+                        let nid = self.alloc_id();
+                        let field = self.expect_ident("record property name")?;
+                        let end = self.prev_span();
+                        Ok(Expr::RecordAccess {
                             node_id: nid,
                             field: field.into(),
                             span: Span::new(start.start as usize, end.end as usize),
@@ -955,8 +966,8 @@ impl Parser {
                     }
                     other => Err(self.error(
                         &format!("unknown system namespace '${other}'"),
-                        "Valid system namespaces are: pipeline, source, window, meta",
-                        "Use $pipeline.field, $source.field, $window.fn(), or $meta.field",
+                        "Valid system namespaces are: pipeline, source, record, window, meta",
+                        "Use $pipeline.field, $source.field, $record.field, $window.fn(), or $meta.field",
                     )),
                 }
             }

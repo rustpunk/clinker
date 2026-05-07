@@ -461,6 +461,22 @@ impl<'a> TypeChecker<'a> {
                 Type::Any
             }
 
+            Expr::RecordAccess { node_id, field, .. } => {
+                // `$record.<key>` reads against the declared registry —
+                // the resolver already rejected undeclared keys, so a miss
+                // here implies an internal bug. Fall through to Any rather
+                // than re-emitting a diagnostic.
+                let ty = self
+                    .scoped_vars
+                    .record
+                    .get(&**field)
+                    .copied()
+                    .map(scoped_var_type_to_type)
+                    .unwrap_or(Type::Any);
+                self.set_type(*node_id, ty.clone());
+                ty
+            }
+
             Expr::Now { node_id, .. } => {
                 self.set_type(*node_id, Type::DateTime);
                 Type::DateTime
@@ -1016,6 +1032,7 @@ impl<'a> TypeChecker<'a> {
             | Expr::PipelineAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
+            | Expr::RecordAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::AggSlot { .. }

@@ -2589,6 +2589,7 @@ fn walk_for_unknown_refs(
         | Expr::PipelineAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::MetaAccess { .. }
+        | Expr::RecordAccess { .. }
         | Expr::Now { .. }
         | Expr::Wildcard { .. }
         | Expr::AggSlot { .. }

@@ -155,6 +155,18 @@ pub enum Expr {
         field: Box<str>,
         span: Span,
     },
+    /// User-declared per-record scoped variable: `$record.<key>`.
+    ///
+    /// Distinct from [`Expr::MetaAccess`] (`$meta.*`): `$meta.*` is a
+    /// per-record sidecar bound to a single CXL program (one transform's
+    /// `emit $meta.x = ...`), while `$record.<key>` is a typed,
+    /// declared-at-pipeline-top, multi-writer slot resettable across
+    /// transforms via the `state` node (Phase D).
+    RecordAccess {
+        node_id: NodeId,
+        field: Box<str>,
+        span: Span,
+    },
     /// The `now` keyword — wall-clock DateTime at the point of evaluation.
     Now {
         node_id: NodeId,
@@ -212,6 +224,7 @@ impl Expr {
             | Expr::PipelineAccess { span, .. }
             | Expr::SourceAccess { span, .. }
             | Expr::MetaAccess { span, .. }
+            | Expr::RecordAccess { span, .. }
             | Expr::Now { span, .. }
             | Expr::Wildcard { span, .. }
             | Expr::AggCall { span, .. }
@@ -236,6 +249,7 @@ impl Expr {
             | Expr::PipelineAccess { node_id, .. }
             | Expr::SourceAccess { node_id, .. }
             | Expr::MetaAccess { node_id, .. }
+            | Expr::RecordAccess { node_id, .. }
             | Expr::Now { node_id, .. }
             | Expr::Wildcard { node_id, .. }
             | Expr::AggCall { node_id, .. }
@@ -315,6 +329,7 @@ impl Expr {
             Expr::PipelineAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::MetaAccess { .. }
+            | Expr::RecordAccess { .. }
             | Expr::Now { .. }
             | Expr::Wildcard { .. }
             | Expr::Literal { .. }

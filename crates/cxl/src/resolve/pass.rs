@@ -337,6 +337,29 @@ impl<'a> Resolver<'a> {
                 // Metadata keys are runtime-resolved — accept any field name
                 self.bind(*node_id, ResolvedBinding::PipelineMember);
             }
+            Expr::RecordAccess {
+                node_id,
+                field,
+                span,
+            } => {
+                // `$record.<key>` has no builtin members today (those are
+                // tracked in #44). Only declared user-scope vars resolve.
+                if self.scoped_vars.record.contains_key(&**field) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.record.keys().map(|s| s.as_str()).collect();
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown record member '$record.{field}'"),
+                        help: best_match(field, &declared, 3)
+                            .map(|s| format!("did you mean '$record.{s}'?"))
+                            .or_else(|| {
+                                Some("declare it in the pipeline `vars.record` block".into())
+                            }),
+                    });
+                }
+            }
             Expr::Now { .. } => {
                 // `now` is a keyword, no binding needed — evaluator handles directly
             }
@@ -588,6 +611,47 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Some(ResolvedBinding::LetVar(0))));
         assert!(has_let_binding, "Expected LetVar(0) binding for x");
+    }
+
+    #[test]
+    fn test_resolve_undeclared_record_member() {
+        // `$record.<key>` has no builtins yet — declared user keys are
+        // the only way to resolve. With an empty registry, every read
+        // is rejected with the help suggesting the `vars.record` block.
+        let diags = resolve_err("emit val = $record.fuzzy_score", &[]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("$record.fuzzy_score")),
+            "expected diagnostic for undeclared $record member: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_declared_record_member() {
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .record
+            .insert("fuzzy_score".to_string(), ScopedVarType::Float);
+        let parsed = Parser::parse("emit ok = $record.fuzzy_score");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &[],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared record var should resolve");
+        let has_pipeline = resolved
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember)));
+        assert!(
+            has_pipeline,
+            "Expected PipelineMember binding for declared fuzzy_score"
+        );
     }
 
     #[test]
