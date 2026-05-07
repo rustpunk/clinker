@@ -46,7 +46,7 @@ mod tests {
             &config,
             &first_source,
             readers,
-            writers,
+            writers.into(),
             &params,
         )?;
 
@@ -865,7 +865,7 @@ nodes:
             &config,
             "nonexistent",
             readers,
-            writers,
+            writers.into(),
             &params,
         );
 
@@ -928,8 +928,13 @@ nodes:
             shutdown_token: None,
         };
 
-        let result =
-            PipelineExecutor::run_with_readers_writers(&config, "src", readers, writers, &params);
+        let result = PipelineExecutor::run_with_readers_writers(
+            &config,
+            "src",
+            readers,
+            writers.into(),
+            &params,
+        );
 
         match result {
             Err(PipelineError::Config(crate::config::ConfigError::Validation(msg))) => {
@@ -1047,8 +1052,11 @@ nodes:
         };
 
         let report = PipelineExecutor::run_with_readers_writers(
-            &config, "orders", // explicit primary — NOT the first-declared source
-            readers, writers, &params,
+            &config,
+            "orders", // explicit primary — NOT the first-declared source
+            readers,
+            writers.into(),
+            &params,
         )
         .expect("pipeline must execute when primary is declared second");
 

@@ -577,6 +577,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Side-table: per-source discovered file paths, used by the
+    // fan-out output setup below to pre-render `{source_file}` per
+    // matched file. Mirrors the FileSlot Arcs the executor stamps on
+    // each record so fan-out writers key correctly.
+    let mut source_files_by_name: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
     for source in pipeline_config.source_configs() {
         let outcome =
             clinker_core::source::discovery::discover(source, &workspace_root).map_err(|e| {
@@ -598,13 +604,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 )
             })?;
         let mut slots: Vec<clinker_core::source::multi_file::FileSlot> = Vec::new();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
         for f in outcome.files() {
             let file = std::fs::File::open(&f.path)?;
             slots.push(clinker_core::source::multi_file::FileSlot::new(
                 f.path.clone(),
                 Box::new(file),
             ));
+            paths.push(f.path.clone());
         }
+        source_files_by_name.insert(source.name.clone(), paths);
         // EmptyWarn / EmptySkip outcomes leave `slots` empty; the
         // executor short-circuits via the empty-list guard upstream.
         if slots.is_empty() {
@@ -642,6 +651,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // path on OutputConfig).
     let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
+    // Compile the plan up front so output-side fan-out detection
+    // (§5) can read `fan_out_per_source_file` flags before the writer
+    // setup decides whether to open one writer or N.
+    let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
+    let mut fan_out_writers: std::collections::HashMap<
+        String,
+        std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
+    > = std::collections::HashMap::new();
     for output in pipeline_config.output_configs() {
         // Split outputs route file creation through SplittingWriter's
         // per-`{seq}` factory inside build_format_writer, which applies
@@ -651,6 +668,48 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         if output.split.is_some() {
             writers.insert(output.name.clone(), Box::new(std::io::sink()));
             resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
+            continue;
+        }
+        // Fan-out path: when the plan flagged this Output for per-
+        // source-file routing, render the template once per matched
+        // source file. Each rendered path gets its own writer; the
+        // dispatcher routes records by `$source.file` Arc.
+        if output_is_fan_out(compiled_plan.dag(), &output.name) {
+            let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name);
+            let files = upstream_source
+                .as_ref()
+                .and_then(|s| source_files_by_name.get(s.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            let mut per_file: std::collections::HashMap<
+                std::sync::Arc<str>,
+                Box<dyn std::io::Write + Send>,
+            > = std::collections::HashMap::new();
+            for path in files {
+                let file_arc: std::sync::Arc<str> =
+                    std::sync::Arc::from(path.to_string_lossy().into_owned());
+                let label = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("source")
+                    .to_string();
+                let resolved = output
+                    .path
+                    .replace("{source_file}", &label)
+                    .replace("{source_path}", &path.to_string_lossy());
+                let resolved_path = std::path::PathBuf::from(&resolved);
+                if let Some(parent) = resolved_path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && !parent.exists()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let file = std::fs::File::create(&resolved_path)?;
+                per_file.insert(file_arc, Box::new(file));
+            }
+            fan_out_writers.insert(output.name.clone(), per_file);
+            // Skip the atomic-tempfile path; fan-out outputs write
+            // directly. Atomic per-file commit is a follow-up.
             continue;
         }
         let bare = std::path::PathBuf::from(&output.path);
@@ -695,11 +754,14 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         });
     }
 
-    let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
+    let registry = clinker_core::executor::WriterRegistry {
+        single: writers,
+        fan_out: fan_out_writers,
+    };
     let report = match PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,
-        writers,
+        registry,
         &run_params,
     ) {
         Ok(report) => report,
@@ -936,6 +998,70 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     Ok(exit_code)
+}
+
+/// Whether the named Output is flagged for per-source-file fan-out by
+/// the plan-time `populate_fan_out_flags` pass. Returns `false` for
+/// outputs whose template lacks per-record tokens or whose input is
+/// `Single`-partitioned.
+fn output_is_fan_out(
+    dag: &clinker_core::plan::execution::ExecutionPlanDag,
+    output_name: &str,
+) -> bool {
+    use clinker_core::plan::execution::PlanNode;
+    dag.graph
+        .node_indices()
+        .find(|i| dag.graph[*i].name() == output_name)
+        .and_then(|i| match &dag.graph[i] {
+            PlanNode::Output { resolved, .. } => {
+                resolved.as_ref().map(|r| r.fan_out_per_source_file)
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Walk back from the named Output through Transform/Sort/Aggregate/
+/// Combine nodes to find the FilePartitioned upstream Source that
+/// feeds it. For Combine nodes the driver's `$source.file` lineage
+/// flows through (each output record derives from a driver record),
+/// so we pick whichever parent is FilePartitioned. Returns `None`
+/// when the chain runs through a Merge that consumed partitioning.
+fn upstream_source_for_output(
+    dag: &clinker_core::plan::execution::ExecutionPlanDag,
+    output_name: &str,
+) -> Option<String> {
+    use clinker_core::plan::execution::PlanNode;
+    use clinker_core::plan::properties::PartitioningKind;
+    let start = dag
+        .graph
+        .node_indices()
+        .find(|i| dag.graph[*i].name() == output_name)?;
+    let mut cur = start;
+    loop {
+        match &dag.graph[cur] {
+            PlanNode::Source { name, .. } => return Some(name.clone()),
+            PlanNode::Merge { .. } => return None,
+            PlanNode::Combine { .. } => {
+                // Pick the FilePartitioned parent (the driver after
+                // the partition propagation pass). Falls back to
+                // `None` if the combine destroyed partitioning.
+                let parents: Vec<_> = dag.graph.neighbors(cur).collect();
+                let next = parents.into_iter().find(|p| {
+                    dag.node_properties.get(p).is_some_and(|np| {
+                        matches!(
+                            np.partitioning.kind,
+                            PartitioningKind::FilePartitioned { .. }
+                        )
+                    })
+                })?;
+                cur = next;
+            }
+            _ => {
+                cur = dag.graph.neighbors(cur).next()?;
+            }
+        }
+    }
 }
 
 fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {

@@ -204,9 +204,14 @@ o3,ENG,100
         pipeline_vars: Default::default(),
         shutdown_token: None,
     };
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("pipeline must run without error");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("pipeline must run without error");
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -332,8 +337,13 @@ nodes:
     // build (E310 from the source-rooted Phase-0 arena). Either path
     // surfaces the E310 admission failure shape; assert the err string
     // carries that signature.
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    );
     let err = result.expect_err(
         "tight memory limit must surface as a typed admission failure on the \
          deferred buffer's projection or upstream spill path",
@@ -455,7 +465,11 @@ o3,HR,30
     let config = crate::config::parse_config(yaml).expect("parse");
     with_test_loop_cap(0, || {
         let _ = PipelineExecutor::run_with_readers_writers(
-            &config, &primary, readers, writers, &params,
+            &config,
+            &primary,
+            readers,
+            writers.into(),
+            &params,
         );
     });
 }
@@ -605,9 +619,14 @@ ENG,500
         pipeline_vars: Default::default(),
         shutdown_token: None,
     };
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("combine-in-region pipeline must converge");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("combine-in-region pipeline must converge");
 
     let written = buf.as_string();
     let body_lines: Vec<&str> = written.lines().filter(|l| !l.is_empty()).collect();
@@ -802,7 +821,12 @@ o6,ENG,300
     // time, which is not safe under cargo's default parallel test
     // runner.
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("composition pipeline must run without error");
 
@@ -1032,7 +1056,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("recursive composition pipeline must run without error");
 
@@ -1257,7 +1286,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("nested composition + parent continuation must run without error");
 
@@ -1455,7 +1489,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("nested composition + cascading retract must run without error");
 
@@ -1635,7 +1674,12 @@ o6,ENG,300
         shutdown_token: None,
     };
     let report = PipelineExecutor::run_with_readers_writers_in_context(
-        &config, &primary, readers, writers, &params, ctx,
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
     )
     .expect("bare-Aggregate body + parent continuation must run without error");
 
@@ -1787,9 +1831,14 @@ o6,ENG,300
         shutdown_token: None,
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("fan-out pipeline must converge");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("fan-out pipeline must converge");
 
     let big_out = big_buf.as_string();
     let small_out = small_buf.as_string();
@@ -1973,8 +2022,13 @@ nodes:
         shutdown_token: None,
     };
     let config = crate::config::parse_config(yaml).expect("parse");
-    let result =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params);
+    let result = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    );
 
     // The pipeline either errors at the build-side cross-region tee
     // (`tee_emit_to_region_input_buffers` raising E310 from

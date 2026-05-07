@@ -85,8 +85,13 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 

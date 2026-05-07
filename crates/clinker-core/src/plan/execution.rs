@@ -517,6 +517,15 @@ pub struct PlanTransformPayload {
 pub struct PlanOutputPayload {
     pub output: OutputConfig,
     pub validated_path: Option<crate::security::ValidatedPath>,
+    /// Plan-time flag: this Output's path template uses a per-record
+    /// token (`{source_file}` / `{source_path}`) AND its parent
+    /// partitioning is `FilePartitioned`. The CLI pre-opens one writer
+    /// per source file and the dispatcher routes each record to the
+    /// right writer by `$source.file` Arc. Set by
+    /// [`ExecutionPlanDag::populate_fan_out_flags`] after partition
+    /// propagation. Defaults to `false` for single-file sources or
+    /// templates without per-record tokens.
+    pub fan_out_per_source_file: bool,
 }
 
 impl PlanNode {
@@ -3407,7 +3416,71 @@ impl ExecutionPlanDag {
             self.node_properties.insert(idx, props);
         }
 
+        self.populate_fan_out_flags();
         Ok(())
+    }
+
+    /// Mark every Output whose path template references a per-record
+    /// token (`{source_file}` / `{source_path}`) AND whose parent
+    /// partitioning is `FilePartitioned` for runtime fan-out routing.
+    /// The CLI consults this flag to pre-open one writer per source file
+    /// rather than one global writer; the dispatcher routes each record
+    /// to the right writer via `$source.file`.
+    ///
+    /// Single-file sources keep `fan_out_per_source_file: false` and
+    /// behave as before. Outputs whose template lacks per-record tokens
+    /// also stay single, regardless of upstream partitioning — the
+    /// emitted single file just concatenates records from every source
+    /// file into one writer in arrival order.
+    fn populate_fan_out_flags(&mut self) {
+        use crate::output::path_template::PathTemplate;
+
+        // Snapshot indices and partitioning so we can mutate plan
+        // payloads without holding the immutable borrow on
+        // `node_properties`.
+        let output_indices: Vec<NodeIndex> = self
+            .graph
+            .node_indices()
+            .filter(|i| matches!(self.graph[*i], PlanNode::Output { .. }))
+            .collect();
+        let parent_partitioning: HashMap<NodeIndex, PartitioningKind> = output_indices
+            .iter()
+            .filter_map(|&i| {
+                let parent_idx = self
+                    .graph
+                    .neighbors_directed(i, petgraph::Direction::Incoming)
+                    .next()?;
+                self.node_properties
+                    .get(&parent_idx)
+                    .map(|p| (i, p.partitioning.kind.clone()))
+            })
+            .collect();
+
+        for idx in output_indices {
+            let Some(parent_part) = parent_partitioning.get(&idx) else {
+                continue;
+            };
+            let is_partitioned = matches!(parent_part, PartitioningKind::FilePartitioned { .. });
+            if !is_partitioned {
+                continue;
+            }
+            let PlanNode::Output {
+                resolved: Some(payload),
+                ..
+            } = &mut self.graph[idx]
+            else {
+                continue;
+            };
+            // Parse the template to detect per-record tokens. Failed
+            // parses leave the flag at `false`; the existing path-
+            // validation pass surfaces the parse error separately.
+            let Ok(template) = PathTemplate::parse(&payload.output.path) else {
+                continue;
+            };
+            if template.has_per_record_tokens() {
+                payload.fan_out_per_source_file = true;
+            }
+        }
     }
 
     /// Mark every [`IndexSpec`] whose owning window-bearing Transform
@@ -4094,27 +4167,36 @@ fn compute_one(
                 })
                 .collect();
             ck_set.extend(synthetic);
-            // Combine destroys file partitioning the same way it
-            // destroys ordering: hash-build/probe / IEJoin / grace
-            // hash do not preserve any per-input partitioning. Emit
-            // the dedicated `DestroyedByCombine` provenance variant so
-            // downstream consumers (and `--explain`) can chain back to
-            // the destruction site.
-            let combine_partitioning = if parents.iter().any(|p| {
-                matches!(
-                    p.partitioning.kind,
-                    PartitioningKind::FilePartitioned { .. }
-                )
-            }) {
-                Partitioning {
-                    kind: PartitioningKind::Single,
-                    provenance: PartitioningProvenance::DestroyedByCombine {
-                        at_node: name.clone(),
-                    },
-                }
-            } else {
-                single_stream_partitioning()
-            };
+            // Combine destroys parent ORDERING (hash-build/probe /
+            // IEJoin / grace hash do not preserve driver-input order),
+            // but PRESERVES the driver's per-file PARTITIONING. Output
+            // records derive from driver records — each emitted row
+            // carries the driver's `$source.file` lineage, so a
+            // downstream Output template with `{source_file}` still
+            // fans out per driver-source file.
+            //
+            // We pick the first `FilePartitioned` parent rather than
+            // strictly `parents[0]` because the YAML `input:` map
+            // declaration order doesn't reliably make it through to
+            // the topo-walk parent ordering. Build inputs that happen
+            // to be FilePartitioned (atypical) inherit through here
+            // too — that's still correct: the output records carry
+            // SOMEONE's `$source.file`, and a downstream fan-out
+            // routes accordingly. The combine post-pass
+            // `select_combine_strategies` lands after this pass and
+            // can refine in future iterations.
+            let combine_partitioning = parents
+                .iter()
+                .find_map(|p| match &p.partitioning.kind {
+                    PartitioningKind::FilePartitioned { .. } => Some(Partitioning {
+                        kind: p.partitioning.kind.clone(),
+                        provenance: PartitioningProvenance::Preserved {
+                            from_node: name.clone(),
+                        },
+                    }),
+                    _ => None,
+                })
+                .unwrap_or_else(single_stream_partitioning);
             NodeProperties {
                 ordering: Ordering {
                     sort_order: None,

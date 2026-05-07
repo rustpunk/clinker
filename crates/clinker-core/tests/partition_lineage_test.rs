@@ -208,6 +208,74 @@ nodes:
 }
 
 #[test]
+fn combine_preserves_driver_file_partitioning() {
+    // Driver source has glob → FilePartitioned. Build source has
+    // literal path → Single (lookup table). Combine output records
+    // derive from driver records; each output row carries the
+    // driver's `$source.file` lineage. So Combine must *preserve*
+    // the driver's FilePartitioned, not destroy it.
+    let yaml = r#"
+pipeline:
+  name: t
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      glob: data/orders_*.csv
+      schema:
+        - { name: id, type: string }
+        - { name: dept_id, type: string }
+  - type: source
+    name: depts
+    config:
+      name: depts
+      type: csv
+      path: data/depts.csv
+      schema:
+        - { name: dept_id, type: string }
+        - { name: dept_name, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      depts: depts
+    config:
+      where: orders.dept_id == depts.dept_id
+      propagate_ck: driver
+      cxl: |
+        emit id = orders.id
+        emit dept_id = orders.dept_id
+        emit dept_name = depts.dept_name
+  - type: output
+    name: out
+    input: enriched
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let cfg = compile(yaml);
+    let plan = cfg.dag();
+    let combine_props = props_for_node(plan, "enriched");
+    assert!(
+        matches!(
+            combine_props.partitioning.kind,
+            PartitioningKind::FilePartitioned { .. }
+        ),
+        "combine should preserve driver's FilePartitioned, got {:?}",
+        combine_props.partitioning.kind
+    );
+    match &combine_props.partitioning.provenance {
+        PartitioningProvenance::Preserved { from_node } => {
+            assert_eq!(from_node, "enriched");
+        }
+        other => panic!("expected Preserved provenance through combine, got {other:?}"),
+    }
+}
+
+#[test]
 fn output_inherits_file_partitioning() {
     let yaml = r#"
 pipeline:

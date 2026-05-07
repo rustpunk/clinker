@@ -95,9 +95,14 @@ fn run_once() -> u64 {
         config.output_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("buffer-recompute pipeline must execute");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("buffer-recompute pipeline must execute");
     report.counters.retraction.partitions_dispatched
 }
 

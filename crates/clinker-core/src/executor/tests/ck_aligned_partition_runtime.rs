@@ -84,9 +84,14 @@ o6,ENG,300
         pipeline_vars: Default::default(),
         shutdown_token: None,
     };
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .expect("pipeline must run");
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .expect("pipeline must run");
     let counters = report.counters;
 
     // o3 (HR, 30) hits divide-by-zero → 1 DLQ. Other rows reach the

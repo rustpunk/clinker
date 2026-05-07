@@ -94,7 +94,7 @@ nodes:
         "out".to_string(),
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
+    PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers.into(), &params)
         .expect("pipeline must run under memory pressure");
     let output = buf.as_string();
 

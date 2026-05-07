@@ -3044,6 +3044,7 @@ pub(crate) fn lower_node_to_plan_node(
             resolved: Some(Box::new(PlanOutputPayload {
                 output: config.output.clone(),
                 validated_path: None,
+                fan_out_per_source_file: false,
             })),
         }),
         PipelineNode::Route { config, .. } => Some(PlanNode::Route {

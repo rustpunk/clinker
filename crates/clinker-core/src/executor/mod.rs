@@ -191,6 +191,32 @@ pub fn build_transform_specs(config: &PipelineConfig) -> Vec<TransformSpec> {
 /// stamps each record with the file it came from.
 pub type SourceReaders = HashMap<String, Vec<crate::source::multi_file::FileSlot>>;
 
+/// Output writer registry. Holds two parallel maps:
+///
+/// - `single`: one writer per output name (the legacy shape; matches
+///   one-Output-to-one-file pipelines).
+/// - `fan_out`: per-source-file writers for outputs flagged
+///   `fan_out_per_source_file` in the plan. Outer key is the output
+///   name; inner key is the source-file `Arc<str>` (matching the
+///   per-record Arcs in `ExecutorContext.source_file_arcs`).
+///
+/// Auto-converts from `HashMap<String, Box<dyn Write + Send>>` so
+/// existing callers that don't need fan-out keep the simpler shape.
+#[derive(Default)]
+pub struct WriterRegistry {
+    pub single: HashMap<String, Box<dyn Write + Send>>,
+    pub fan_out: HashMap<String, HashMap<std::sync::Arc<str>, Box<dyn Write + Send>>>,
+}
+
+impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
+    fn from(single: HashMap<String, Box<dyn Write + Send>>) -> Self {
+        Self {
+            single,
+            fan_out: HashMap::new(),
+        }
+    }
+}
+
 /// Helper for callers (mostly tests and benchmarks) that have a single
 /// in-memory reader per source: wraps it in the one-element
 /// `Vec<FileSlot>` shape that the executor's reader registry expects.
@@ -453,10 +479,10 @@ impl PipelineExecutor {
     ///     );
     /// }
     /// ```
-    pub fn run_plan_with_readers_writers(
+    pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
         readers: SourceReaders,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         let config = plan.config();
@@ -470,7 +496,7 @@ impl PipelineExecutor {
                         .to_string(),
                 ))
             })?;
-        Self::run_with_readers_writers(config, &primary_name, readers, writers, params)
+        Self::run_with_readers_writers(config, &primary_name, readers, writers.into(), params)
     }
 
     /// Same as [`Self::run_plan_with_readers_writers`] but with an
@@ -483,14 +509,14 @@ impl PipelineExecutor {
     /// declared in the pipeline config, and a reader for that name
     /// must be present in `readers`. Violations surface as
     /// `PipelineError::Config(ConfigError::Validation(..))`.
-    pub fn run_plan_with_readers_writers_with_primary(
+    pub fn run_plan_with_readers_writers_with_primary<W: Into<WriterRegistry>>(
         plan: &crate::plan::CompiledPlan,
         primary: &str,
         readers: SourceReaders,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), primary, readers, writers, params)
+        Self::run_with_readers_writers(plan.config(), primary, readers, writers.into(), params)
     }
 
     /// `&CompiledPlan`-consuming `--explain` text entry.
@@ -525,7 +551,7 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         primary: &str,
         readers: SourceReaders,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: WriterRegistry,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
         Self::run_with_readers_writers_in_context(
@@ -548,7 +574,7 @@ impl PipelineExecutor {
         config: &PipelineConfig,
         primary: &str,
         mut readers: SourceReaders,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: WriterRegistry,
         params: &PipelineRunParams,
         compile_ctx: crate::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
@@ -783,8 +809,12 @@ impl PipelineExecutor {
         let required_arena = plan.required_arena();
 
         // Validate that all configured outputs have registered writers.
+        // Either the single-writer slot or the fan-out slot must contain
+        // the output's name; the dispatcher consults whichever applies.
         for output in &output_configs {
-            if !writers.contains_key(&output.name) {
+            let registered = writers.single.contains_key(&output.name)
+                || writers.fan_out.contains_key(&output.name);
+            if !registered {
                 return Err(PipelineError::Config(
                     crate::config::ConfigError::Validation(format!(
                         "no writer registered for output '{}'",
@@ -847,7 +877,7 @@ impl PipelineExecutor {
         mut format_reader: Box<dyn FormatReader>,
         readers: &mut SourceReaders,
         source_configs: &[crate::config::SourceConfig],
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         compiled_routes_by_name: HashMap<String, CompiledRoute>,
@@ -1309,7 +1339,7 @@ impl PipelineExecutor {
         all_records: Vec<(Record, u64)>,
         per_record_source_files: Vec<Arc<str>>,
         combine_source_records: HashMap<String, Vec<(Record, u64)>>,
-        writers: HashMap<String, Box<dyn Write + Send>>,
+        writers: WriterRegistry,
         transforms: &[CompiledTransform],
         compiled_route: Option<CompiledRoute>,
         compiled_routes_by_name: HashMap<String, CompiledRoute>,
@@ -1429,7 +1459,8 @@ impl PipelineExecutor {
             node_buffers: HashMap::new(),
             combine_source_records,
             all_records,
-            writers,
+            writers: writers.single,
+            fan_out_writers: writers.fan_out,
             compiled_route,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -2566,7 +2597,11 @@ mod tests {
         };
 
         let report = PipelineExecutor::run_with_readers_writers(
-            &config, &primary, readers, writers, &params,
+            &config,
+            &primary,
+            readers,
+            writers.into(),
+            &params,
         )?;
 
         let output = output_buf.as_string();

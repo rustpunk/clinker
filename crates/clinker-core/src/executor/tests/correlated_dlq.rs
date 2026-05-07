@@ -42,8 +42,13 @@ fn run_correlated_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)?;
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )?;
     Ok((report.counters, report.dlq_entries, buf.as_string()))
 }
 
@@ -405,9 +410,14 @@ nodes:
             Box::new(buf_b.clone()) as Box<dyn std::io::Write + Send>,
         ),
     ]);
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
 
     let out_a = buf_a.as_string();
     let out_b = buf_b.as_string();
@@ -912,9 +922,14 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     // Group A driver records: A,1 (clean) and A,3 (clean) survive
@@ -1100,9 +1115,14 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     // Department A: O1 and O3 succeed validate; O2 fails (trigger).
@@ -1319,9 +1339,14 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_with_readers_writers(&config, &primary, readers, writers, &params)
-            .unwrap();
+    let report = PipelineExecutor::run_with_readers_writers(
+        &config,
+        &primary,
+        readers,
+        writers.into(),
+        &params,
+    )
+    .unwrap();
     let output = buf.as_string();
 
     assert_eq!(
