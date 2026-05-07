@@ -534,3 +534,89 @@ nodes:
     let lines = body_lines_sorted(&out);
     assert_eq!(lines, vec!["1,9", "2,9", "3,9"]);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Fixture 7 — multi-file Source, source-scope state writes per-file
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn state_source_scope_per_file_isolation() {
+    // Source-scope vars are keyed by the per-record `source_file`
+    // `Arc<str>`. A glob-fed Source produces records whose Arcs swap
+    // at each file boundary; the state node writes the var into the
+    // per-file slot, and downstream reads see the per-file value.
+    use clinker_core::source::multi_file::FileSlot;
+    use std::path::PathBuf;
+
+    let yaml = r#"
+pipeline:
+  name: state_source_multi_file
+  vars:
+    source:
+      file_label:
+        type: string
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      glob: ./*.csv
+      files:
+        on_no_match: skip
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: state
+    name: capture
+    input: orders
+    config:
+      scope: source
+      set:
+        - var: file_label
+          cxl: "tag"
+  - type: transform
+    name: read_back
+    input: capture
+    config:
+      cxl: |
+        emit id = id
+        emit label = $source.file_label
+  - type: output
+    name: out
+    input: read_back
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile multi-file pipeline");
+    let file_a = FileSlot::new(
+        PathBuf::from("orders_a.csv"),
+        Box::new(Cursor::new(
+            "id,tag\n1,alpha\n2,alpha\n".as_bytes().to_vec(),
+        )),
+    );
+    let file_b = FileSlot::new(
+        PathBuf::from("orders_b.csv"),
+        Box::new(Cursor::new("id,tag\n3,beta\n".as_bytes().to_vec())),
+    );
+    let readers: clinker_core::executor::SourceReaders =
+        HashMap::from([("orders".to_string(), vec![file_a, file_b])]);
+    let buf = SharedBuffer::default();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        config.output_configs().next().unwrap().name.clone(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params(&config))
+        .expect("pipeline run");
+    let out = buf.as_string();
+    let lines = body_lines_sorted(&out);
+    // Per-file slot: rows 1 and 2 (from orders_a.csv) carry "alpha";
+    // row 3 (from orders_b.csv) carries "beta". Each Arc keys its own
+    // entry in `source_vars`.
+    assert_eq!(lines, vec!["1,alpha", "2,alpha", "3,beta"]);
+}
