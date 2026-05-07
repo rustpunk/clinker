@@ -643,13 +643,14 @@ impl PipelineExecutor {
         let resolved_transforms_owned = crate::executor::build_transform_specs(config);
         let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
         let scoped_vars: cxl::resolve::ScopedVarsRegistry =
-            crate::config::scoped_vars_registry_with_static(
+            crate::config::build_scoped_vars_registry(
                 config
                     .pipeline
                     .vars
                     .as_ref()
                     .unwrap_or(&crate::config::ScopedVarsDecl::default()),
                 config.pipeline.static_vars.as_ref(),
+                &config.nodes,
             );
         let mut compiled_transforms: Vec<CompiledTransform> = resolved_transforms
             .iter()

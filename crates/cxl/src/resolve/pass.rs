@@ -343,10 +343,7 @@ impl<'a> Resolver<'a> {
                         help: best_match(key, &declared, 3)
                             .map(|s| format!("did you mean '$vars.{s}'?"))
                             .or_else(|| {
-                                Some(
-                                    "declare it in the pipeline's top-level `vars:` block"
-                                        .into(),
-                                )
+                                Some("declare it in the pipeline's top-level `vars:` block".into())
                             }),
                     });
                 }

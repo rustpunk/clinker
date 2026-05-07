@@ -2,4 +2,4 @@
 source: crates/clinker-core/tests/state_node_diagnostics.rs
 expression: render_diags(&diags)
 ---
-E170: scoped variable '$pipeline.x' has multiple writers: state node "w2" duplicates the write from earlier state node "w1" — collapse into a single state node
+E170: scoped variable '$pipeline.x' has multiple writers: "w2" duplicates the write from earlier writer "w1" — collapse into a single producer

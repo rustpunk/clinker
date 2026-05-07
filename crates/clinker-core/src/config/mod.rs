@@ -214,6 +214,41 @@ pub fn scoped_vars_registry_with_static(
     reg
 }
 
+/// Build the resolver-side scoped-vars registry from the union of:
+/// (a) the legacy nested `vars:` block — pre-redesign tier sources
+///     for `$pipeline.<custom>` / `$source.<custom>` / `$record.<custom>`,
+/// (b) the new flat `static_vars:` block — frozen `$vars.<key>` config,
+/// (c) every Transform's `config.declares:` entries — producer-declared
+///     scoped state, the writer-site declaration site Stage 5 makes the
+///     sole authority once the legacy nested form is deleted.
+///
+/// During the transition (Stages 2-4), all three sources feed the
+/// registry. Stage 5 deletes (a). Each `declares:` entry merges into
+/// the per-scope tier (pipeline/source/record); collisions with
+/// (a)-declared keys are resolved last-write-wins (the declares:
+/// entry wins — it's the new authority).
+pub fn build_scoped_vars_registry(
+    legacy_decl: &ScopedVarsDecl,
+    static_vars: Option<&IndexMap<String, ScopedVarDecl>>,
+    nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
+) -> cxl::resolve::ScopedVarsRegistry {
+    use crate::config::pipeline_node::{PipelineNode, VarScope};
+    let mut reg = scoped_vars_registry_with_static(legacy_decl, static_vars);
+    for spanned in nodes {
+        if let PipelineNode::Transform { config, .. } = &spanned.value {
+            for entry in &config.declares {
+                let target = match entry.scope {
+                    VarScope::Pipeline => &mut reg.pipeline,
+                    VarScope::Source => &mut reg.source,
+                    VarScope::Record => &mut reg.record,
+                };
+                target.insert(entry.name.clone(), entry.var_type.into());
+            }
+        }
+    }
+    reg
+}
+
 pub fn scoped_vars_registry(decl: &ScopedVarsDecl) -> cxl::resolve::ScopedVarsRegistry {
     cxl::resolve::ScopedVarsRegistry {
         pipeline: decl
@@ -1823,9 +1858,13 @@ impl PipelineConfig {
         // E200 diagnostics surface here with per-node spans. Also
         // recurses into composition bodies via bind_composition,
         // populating CompileArtifacts.composition_bodies.
-        let scoped_vars_registry = scoped_vars_registry_with_static(
-            self.pipeline.vars.as_ref().unwrap_or(&ScopedVarsDecl::default()),
+        let scoped_vars_registry = build_scoped_vars_registry(
+            self.pipeline
+                .vars
+                .as_ref()
+                .unwrap_or(&ScopedVarsDecl::default()),
             self.pipeline.static_vars.as_ref(),
+            &self.nodes,
         );
         let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,

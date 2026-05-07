@@ -234,6 +234,56 @@ pub fn bind_schema(
 ///
 /// Reuses `validate_state_writers`'s writer-map shape and
 /// `validate_read_after_write`'s AST walker (`collect_scope_reads_*`).
+/// Iterate every (scope, var) writer in the pipeline, regardless of
+/// the writer's variant kind (State node `set:` entry or Transform
+/// `config.declares:` entry). Used by every plan validator that
+/// keys off the producer registry.
+///
+/// During the redesign transition, both kinds coexist: legacy State
+/// nodes still write via dispatch, and new Transforms write via
+/// inline `emit $<scope>.<key>` routing. Stage 5 deletes State, after
+/// which only the Transform branch remains.
+struct WriterInfo<'a> {
+    scope: crate::config::VarScope,
+    var: &'a str,
+    node_name: &'a str,
+    span: Span,
+    phase: crate::config::Phase,
+}
+
+fn iter_writers<'a>(nodes: &'a [Spanned<PipelineNode>]) -> Vec<WriterInfo<'a>> {
+    let mut out = Vec::new();
+    for spanned in nodes {
+        let span = span_for_node(spanned);
+        match &spanned.value {
+            PipelineNode::State { header, config } => {
+                for assignment in &config.set {
+                    out.push(WriterInfo {
+                        scope: config.scope,
+                        var: &assignment.var,
+                        node_name: &header.name,
+                        span,
+                        phase: config.phase,
+                    });
+                }
+            }
+            PipelineNode::Transform { header, config } => {
+                for entry in &config.declares {
+                    out.push(WriterInfo {
+                        scope: entry.scope,
+                        var: &entry.name,
+                        node_name: &header.name,
+                        span,
+                        phase: config.phase,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn validate_init_phase_isolation(
     nodes: &[Spanned<PipelineNode>],
     artifacts: &CompileArtifacts,
@@ -241,19 +291,14 @@ fn validate_init_phase_isolation(
 ) {
     use crate::config::{Phase as ConfPhase, VarScope};
 
-    // Build (scope, var) → (writer-name, writer-phase) map, segregating
-    // writers by phase so a runtime-only var can be distinguished from
-    // an init-written-or-mixed var.
+    // Build (scope, var) → (writer-name, writer-phase) map from every
+    // declared writer regardless of variant kind.
     let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
         std::collections::HashMap::new();
-    for spanned in nodes {
-        if let PipelineNode::State { header, config } = &spanned.value {
-            for assignment in &config.set {
-                writers
-                    .entry((config.scope, assignment.var.clone()))
-                    .or_insert_with(|| (header.name.clone(), config.phase));
-            }
-        }
+    for w in iter_writers(nodes) {
+        writers
+            .entry((w.scope, w.var.to_string()))
+            .or_insert_with(|| (w.node_name.to_string(), w.phase));
     }
     if writers.is_empty() {
         return;
@@ -496,14 +541,10 @@ fn validate_read_after_write(
     // descendant ancestry is irrelevant for those reads.
     let mut writers: std::collections::HashMap<(VarScope, String), (String, ConfPhase)> =
         std::collections::HashMap::new();
-    for spanned in nodes {
-        if let PipelineNode::State { header, config } = &spanned.value {
-            for assignment in &config.set {
-                writers
-                    .entry((config.scope, assignment.var.clone()))
-                    .or_insert_with(|| (header.name.clone(), config.phase));
-            }
-        }
+    for w in iter_writers(nodes) {
+        writers
+            .entry((w.scope, w.var.to_string()))
+            .or_insert_with(|| (w.node_name.to_string(), w.phase));
     }
     if writers.is_empty() {
         return;
@@ -880,6 +921,11 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
             {
                 Some(header.name.as_str())
             }
+            PipelineNode::Transform { header, config }
+                if config.phase == crate::config::Phase::Init =>
+            {
+                Some(header.name.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -974,46 +1020,35 @@ fn validate_init_phase_terminals(nodes: &[Spanned<PipelineNode>], diags: &mut Ve
 fn validate_state_writers(nodes: &[Spanned<PipelineNode>], diags: &mut Vec<Diagnostic>) {
     let mut seen: std::collections::HashMap<(crate::config::VarScope, String), (Span, String)> =
         std::collections::HashMap::new();
-    let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
-        let line = spanned.referenced.line() as u32;
-        if line > 0 {
-            Span::line_only(line)
-        } else {
-            Span::SYNTHETIC
-        }
+    let scope_str = |scope: crate::config::VarScope| match scope {
+        crate::config::VarScope::Pipeline => "$pipeline",
+        crate::config::VarScope::Source => "$source",
+        crate::config::VarScope::Record => "$record",
     };
-    for spanned in nodes {
-        let PipelineNode::State { header, config } = &spanned.value else {
-            continue;
-        };
-        let span = span_for(spanned);
-        for assignment in &config.set {
-            let key = (config.scope, assignment.var.clone());
-            if let Some((first_span, first_node)) = seen.get(&key) {
-                let scope_str = match config.scope {
-                    crate::config::VarScope::Pipeline => "$pipeline",
-                    crate::config::VarScope::Source => "$source",
-                    crate::config::VarScope::Record => "$record",
-                };
-                diags.push(
-                    Diagnostic::error(
-                        "E170",
-                        format!(
-                            "scoped variable '{}.{}' has multiple writers: \
-                             state node {:?} duplicates the write from earlier \
-                             state node {:?} — collapse into a single state node",
-                            scope_str, assignment.var, header.name, first_node
-                        ),
-                        LabeledSpan::primary(span, "second writer".to_string()),
-                    )
-                    .with_secondary(LabeledSpan::new(
-                        *first_span,
-                        Some("first writer".to_string()),
-                    )),
-                );
-            } else {
-                seen.insert(key, (span, header.name.clone()));
-            }
+    for w in iter_writers(nodes) {
+        let key = (w.scope, w.var.to_string());
+        if let Some((first_span, first_node)) = seen.get(&key) {
+            diags.push(
+                Diagnostic::error(
+                    "E170",
+                    format!(
+                        "scoped variable '{}.{}' has multiple writers: \
+                         {:?} duplicates the write from earlier writer {:?} — \
+                         collapse into a single producer",
+                        scope_str(w.scope),
+                        w.var,
+                        w.node_name,
+                        first_node
+                    ),
+                    LabeledSpan::primary(w.span, "second writer".to_string()),
+                )
+                .with_secondary(LabeledSpan::new(
+                    *first_span,
+                    Some("first writer".to_string()),
+                )),
+            );
+        } else {
+            seen.insert(key, (w.span, w.node_name.to_string()));
         }
     }
 }
