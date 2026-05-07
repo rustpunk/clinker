@@ -423,14 +423,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Load pipeline YAML directly — single-model scan, no composition or
     // channel overlay at this entry point.
-    let yaml = std::fs::read_to_string(&args.config).map_err(PipelineError::Io)?;
-    let interpolated = clinker_core::config::interpolate_env_vars(&yaml, &[]).map_err(|e| {
-        PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
-    })?;
-    let pipeline_config: clinker_core::config::PipelineConfig =
-        clinker_core::yaml::from_str(&interpolated).map_err(|e| {
-            PipelineError::Config(clinker_core::config::ConfigError::Validation(e.to_string()))
-        })?;
+    let mut pipeline_config = clinker_core::config::load_config_with_vars(&args.config, &[])
+        .map_err(PipelineError::Config)?;
 
     // Resolve workspace_root ONCE at the entry point.
     // Production CLI path — never call env::current_dir() inside compile().
@@ -439,6 +433,54 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             .map_err(|e| PipelineError::Config(clinker_core::config::ConfigError::Io(e)))?,
     );
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
+
+    // Run identity values flow through Output path templates and the
+    // provenance sidecar. Generated before --explain so resolved-path
+    // summaries match the values the actual run would use. The id pair
+    // re-rolls per invocation; consumers correlate runs via batch_id.
+    let execution_id = uuid::Uuid::now_v7().to_string();
+    let batch_id = args.resolved_batch_id();
+    let pipeline_hash = pipeline_config.source_hash;
+    let timestamp_str = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let mut source_name_by_node: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for src in pipeline_config.source_configs() {
+        if let Some(stem) = std::path::Path::new(&src.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            source_name_by_node.insert(src.name.clone(), stem.to_string());
+        }
+    }
+    let source_name_default: Option<String> = pipeline_config
+        .source_configs()
+        .next()
+        .and_then(|s| {
+            std::path::Path::new(&s.path)
+                .file_stem()
+                .map(|st| st.to_owned())
+        })
+        .and_then(|os| os.into_string().ok());
+    let template_ctx = clinker_core::output::path_template::TemplateContext {
+        source_name_default: source_name_default.as_deref(),
+        source_name_by_node: source_name_by_node.clone(),
+        channel: None,
+        pipeline_hash,
+        timestamp: Some(&timestamp_str),
+        execution_id: Some(&execution_id),
+        batch_id: Some(&batch_id),
+        n: None,
+        unique_suffix_width: 0,
+    };
+    clinker_core::output::path_template::resolve_output_path_templates_in_place(
+        &mut pipeline_config,
+        &template_ctx,
+    )
+    .map_err(PipelineError::Config)?;
+
+    if args.explain.is_some() || (args.dry_run && args.dry_run_n.is_none()) {
+        print_resolved_outputs(&pipeline_config);
+    }
 
     if let Some(format) = args.explain {
         let compiled_plan =
@@ -501,9 +543,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .and_then(|m| m.spool_dir.as_deref());
     let spool_dir = metrics::resolve_spool_dir(args.metrics_spool_dir.as_deref(), yaml_spool);
 
-    // Build runtime parameters
-    let execution_id = uuid::Uuid::now_v7().to_string();
-    let batch_id = args.resolved_batch_id();
+    // Build runtime parameters. execution_id/batch_id were generated
+    // earlier so the path-template context could embed them.
     let pipeline_vars = pipeline_config
         .pipeline
         .vars
@@ -534,14 +575,58 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     // Outputs are written atomically: each output writes to a sibling
     // tempfile, then renames into place after the pipeline completes
-    // successfully. On crash or pipeline error, the tempfile is left in
-    // place (and its path logged) so an operator can inspect partial
-    // output without the final path showing a truncated file.
+    // successfully. On crash or pipeline error, the writing tempfile is
+    // left in place (and its path logged) so an operator can inspect
+    // partial output without the final path showing a truncated file.
+    //
+    // Cross-process race-safety for `if_exists: unique_suffix` comes
+    // from `OpenOptions::create_new` reservations: each output's
+    // resolved path holds a 0-byte placeholder file from the moment
+    // `open_output` returns until persist atomically replaces it.  The
+    // placeholder is wrapped in a `tempfile::TempPath`, mirroring what
+    // the rest of the codebase already does for tempfile cleanup, so
+    // any unwind path (panic, mid-persist failure, the explicit Err
+    // arm below) auto-unlinks remaining placeholders via `Drop`.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
-    let mut output_temps: Vec<(String, std::path::PathBuf, tempfile::NamedTempFile)> = Vec::new();
+    let mut output_temps: Vec<PendingOutput> = Vec::new();
+    // output_name → final resolved path, kept after output_temps is
+    // consumed by the persist loop so the provenance sidecar can
+    // record the actual file written (not the bare template-rendered
+    // path on OutputConfig).
+    let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
     for output in pipeline_config.output_configs() {
-        let final_path: std::path::PathBuf = output.path.clone().into();
+        // Split outputs route file creation through SplittingWriter's
+        // per-`{seq}` factory inside build_format_writer, which applies
+        // `if_exists` itself. The atomic tempfile pattern below is for
+        // single-file outputs only; for splits, install a sink writer
+        // here so the executor's drop of `raw_writer` is harmless.
+        if output.split.is_some() {
+            writers.insert(output.name.clone(), Box::new(std::io::sink()));
+            resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
+            continue;
+        }
+        let bare = std::path::PathBuf::from(&output.path);
+        let unique_suffix_width = output.unique_suffix_width;
+        let path_for_n =
+            |n: Option<u64>| -> Result<std::path::PathBuf, clinker_core::config::ConfigError> {
+                Ok(match n {
+                    None => bare.clone(),
+                    Some(k) => {
+                        let suffix = if unique_suffix_width == 0 {
+                            format!("-{k}")
+                        } else {
+                            format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                        };
+                        clinker_core::output::open::append_suffix_before_ext(&bare, &suffix)
+                    }
+                })
+            };
+        let (final_path, reservation_file) =
+            clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
+        drop(reservation_file);
+        let reservation = tempfile::TempPath::try_from_path(&final_path)?;
         let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
         let temp = match parent {
             Some(dir) => {
@@ -555,7 +640,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let handle = temp.reopen()?;
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
-        output_temps.push((output.name.clone(), final_path, temp));
+        resolved_output_paths.insert(output.name.clone(), final_path.clone());
+        output_temps.push(PendingOutput {
+            name: output.name.clone(),
+            final_path,
+            temp,
+            reservation,
+        });
     }
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
@@ -567,23 +658,37 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     ) {
         Ok(report) => report,
         Err(e) => {
-            for (name, final_path, temp) in output_temps {
-                let kept = temp.into_temp_path().keep().ok();
+            // Reservations auto-unlink via TempPath::Drop when output_temps
+            // is dropped at end of scope. We just need to preserve the
+            // writing tempfiles for operator inspection and log.
+            for pending in output_temps {
+                let kept = pending.temp.into_temp_path().keep().ok();
                 tracing::warn!(
-                    output = %name,
-                    final_path = %final_path.display(),
+                    output = %pending.name,
+                    final_path = %pending.final_path.display(),
                     partial_path = ?kept,
                     "pipeline failed; partial output preserved at temp path",
                 );
+                // pending.reservation drops here, unlinking the placeholder.
             }
             return Err(e);
         }
     };
 
     // Pipeline succeeded — atomically promote each tempfile to its
-    // final path. Failure here aborts the run with the temp file still
-    // on disk under its tempfile name.
-    for (_name, final_path, temp) in output_temps {
+    // final path. Order: persist first (rename atomically replaces the
+    // reservation placeholder); only on success forget the reservation
+    // so its TempPath::Drop does not unlink the now-persisted output.
+    // Then fsync the parent dir so the rename's metadata is durable
+    // across a crash (Linux ext4/xfs default mount options do not
+    // synchronously flush parent-dir entries on rename).
+    for pending in output_temps {
+        let PendingOutput {
+            name: _,
+            final_path,
+            temp,
+            reservation,
+        } = pending;
         temp.persist(&final_path).map_err(|e| {
             tracing::error!(
                 final_path = %final_path.display(),
@@ -595,6 +700,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 e.error
             ))
         })?;
+        // Persist replaced the placeholder atomically; the file at
+        // `final_path` is now the actual output. Forget the TempPath
+        // so Drop does not unlink it. Equivalent to `keep()` but avoids
+        // surfacing platform-specific keep failures that, post-persist,
+        // would just confuse the operator.
+        std::mem::forget(reservation);
+        if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(e) = fsync_dir(parent)
+        {
+            tracing::warn!(
+                final_path = %final_path.display(),
+                error = %e,
+                "fsync(parent_dir) failed; rename metadata may not survive a crash",
+            );
+        }
     }
 
     let counters = &report.counters;
@@ -648,6 +768,56 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 e.error
             )))
         })?;
+    }
+
+    // Provenance sidecars for outputs that opted in via `write_meta`.
+    // Per-output record/byte/route counts are not yet surfaced from the
+    // executor; identity, timing, and DLQ-by-category come through.
+    for output in pipeline_config.output_configs() {
+        if !output.write_meta {
+            continue;
+        }
+        let mut dlq_counts: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for e in dlq_entries {
+            if e.stage.as_deref() == Some(&format!("output:{}", output.name)) {
+                *dlq_counts.entry(format!("{:?}", e.category)).or_default() += 1;
+            }
+        }
+        let elapsed_ms = (report.finished_at - report.started_at)
+            .num_milliseconds()
+            .max(0) as u64;
+        let hash_full = clinker_core::output::sidecar::hash_to_hex(&pipeline_hash);
+        let hash_short = hash_full[..8.min(hash_full.len())].to_string();
+        let target = resolved_output_paths
+            .get(&output.name)
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from(&output.path));
+        let sidecar = clinker_core::output::sidecar::OutputSidecar {
+            pipeline_path: args.config.to_string_lossy().into_owned(),
+            pipeline_hash: hash_full,
+            pipeline_hash_short: hash_short,
+            channel: None,
+            clinker_version: env!("CARGO_PKG_VERSION").to_string(),
+            run_started_at: report.started_at.to_rfc3339(),
+            run_finished_at: report.finished_at.to_rfc3339(),
+            elapsed_total_ms: elapsed_ms,
+            execution_id: Some(execution_id.clone()),
+            batch_id: Some(batch_id.clone()),
+            output_name: output.name.clone(),
+            resolved_path: target.to_string_lossy().into_owned(),
+            record_count: 0,
+            bytes_written: 0,
+            dlq_counts,
+            route_counts: std::collections::BTreeMap::new(),
+            node_timings_ms: std::collections::BTreeMap::new(),
+        };
+        if let Err(e) = clinker_core::output::sidecar::write_sidecar(&target, &sidecar) {
+            tracing::warn!(
+                "failed to write provenance sidecar for output {:?}: {e:?}",
+                output.name
+            );
+        }
     }
 
     tracing::info!(
@@ -770,6 +940,79 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
 /// Resolve thread count from CLI args or default to `num_cpus`.
 fn num_threads(args: &RunArgs) -> usize {
     args.threads.unwrap_or_else(num_cpus::get)
+}
+
+/// One per-output bookkeeping record carried from writer-loop to
+/// persist-loop. The `reservation` field is the 0-byte placeholder
+/// created by `open_output`; its `TempPath::Drop` auto-unlinks if
+/// anything between writer-loop and persist tears down (panic, Err
+/// arm, mid-persist failure).
+struct PendingOutput {
+    name: String,
+    final_path: std::path::PathBuf,
+    temp: tempfile::NamedTempFile,
+    reservation: tempfile::TempPath,
+}
+
+/// Force durable persistence of `dir`'s entry metadata to disk.
+///
+/// Called immediately after `tempfile::persist` (rename) so a crash
+/// between the rename returning and the kernel writing the parent-dir
+/// metadata cannot leave the rename invisible. Linux ext4/xfs default
+/// mount options do not implicitly fsync the parent dir on rename;
+/// see <https://yakking.branchable.com/posts/atomic-file-creation-tmpfile/>.
+///
+/// On non-Unix targets this is a no-op — opening directories for
+/// `fsync` is a Unix-ism, and Windows' `MoveFileExW` provides
+/// equivalent durability via the journal.
+#[cfg(unix)]
+fn fsync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Render a "Resolved Outputs" block listing each output's expanded
+/// path, collision policy, and sidecar opt-in. Called after path
+/// templates resolve, before --explain or --dry-run early-returns.
+///
+/// `{n}` is shown literally (not expanded) when the policy is
+/// `unique_suffix` so the user can see where the collision counter
+/// would land at runtime.
+fn print_resolved_outputs(config: &clinker_core::config::PipelineConfig) {
+    use clinker_core::config::IfExistsPolicy;
+    println!("=== Resolved Outputs ===");
+    println!();
+    for output in config.output_configs() {
+        let policy = match output.if_exists {
+            IfExistsPolicy::Overwrite => "overwrite",
+            IfExistsPolicy::Error => "error",
+            IfExistsPolicy::UniqueSuffix => "unique_suffix",
+        };
+        let split_note = match &output.split {
+            Some(s) => format!(" (split, naming={:?})", s.naming),
+            None => String::new(),
+        };
+        let unique_note = if matches!(output.if_exists, IfExistsPolicy::UniqueSuffix) {
+            let width = output.unique_suffix_width;
+            if width == 0 {
+                " — collisions append `-{n}` before extension".to_string()
+            } else {
+                format!(" — collisions append `-{{n:0{width}}}` before extension")
+            }
+        } else {
+            String::new()
+        };
+        println!("  '{}' → {}{}", output.name, output.path, split_note,);
+        println!(
+            "      [if_exists={policy}, write_meta={}]{unique_note}",
+            output.write_meta,
+        );
+    }
+    println!();
 }
 
 /// Best-effort hostname for the metrics payload.

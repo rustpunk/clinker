@@ -31,6 +31,10 @@ pub struct CompiledPlan {
     config: PipelineConfig,
     artifacts: CompileArtifacts,
     channel_identity: Option<ChannelIdentity>,
+    /// BLAKE3 of the post-env-var-interpolated source YAML, copied
+    /// from `PipelineConfig.source_hash` at compile time. Zero array
+    /// for in-memory configs that did not flow through file load.
+    pipeline_hash: [u8; 32],
 }
 
 impl CompiledPlan {
@@ -39,11 +43,13 @@ impl CompiledPlan {
         config: PipelineConfig,
         artifacts: CompileArtifacts,
     ) -> Self {
+        let pipeline_hash = config.source_hash;
         Self {
             dag,
             config,
             artifacts,
             channel_identity: None,
+            pipeline_hash,
         }
     }
 
@@ -102,5 +108,13 @@ impl CompiledPlan {
     /// Stamp a channel identity onto this compiled plan.
     pub fn set_channel_identity(&mut self, identity: ChannelIdentity) {
         self.channel_identity = Some(identity);
+    }
+
+    /// BLAKE3 of the post-env-var-interpolated source YAML.
+    ///
+    /// Returns all-zeroes for in-memory configs constructed without a
+    /// file load (e.g. `parse_config`-driven tests).
+    pub fn pipeline_hash(&self) -> &[u8; 32] {
+        &self.pipeline_hash
     }
 }

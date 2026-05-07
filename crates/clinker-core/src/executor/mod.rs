@@ -1958,11 +1958,28 @@ pub(crate) fn build_format_writer(
         let policy = build_split_policy(split);
         let output_path = output.path.clone();
         let naming = split.naming.clone();
+        let if_exists = output.if_exists;
+        let unique_suffix_width = output.unique_suffix_width;
 
         let file_factory: clinker_format::splitting::FileFactory =
             Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                let path = apply_split_naming(&output_path, &naming, seq);
-                let file = std::fs::File::create(path)?;
+                let bare = std::path::PathBuf::from(apply_split_naming(&output_path, &naming, seq));
+                let path_for_n =
+                    |n: Option<u64>| -> Result<std::path::PathBuf, crate::config::ConfigError> {
+                        Ok(match n {
+                            None => bare.clone(),
+                            Some(k) => {
+                                let suffix = if unique_suffix_width == 0 {
+                                    format!("-{k}")
+                                } else {
+                                    format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                                };
+                                crate::output::open::append_suffix_before_ext(&bare, &suffix)
+                            }
+                        })
+                    };
+                let (_path, file) = crate::output::open::open_output(if_exists, false, path_for_n)
+                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
                 Ok(Box::new(BufWriter::with_capacity(65536, file)))
             });
 

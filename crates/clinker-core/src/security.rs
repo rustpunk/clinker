@@ -148,12 +148,19 @@ fn sec_diag(message: String) -> Diagnostic {
     )
 }
 
-/// Check if output file exists (overwrite protection).
+/// Refuse to clobber an existing output file.
+///
+/// Returns a `Diagnostic` if `path` already exists; otherwise `Ok(())`.
+/// Force/clobber-overrides are owned upstream by the
+/// [`crate::output::open::open_output`] policy layer — `--force` and
+/// `if_exists: overwrite` both downgrade to `Overwrite` *before* this
+/// function runs, so the parameter list stays minimal and the caller
+/// keeps a single decision point.
 #[allow(clippy::result_large_err)] // Diagnostic is the agreed error type.
-pub fn check_overwrite(path: &Path, force: bool, config_overwrite: bool) -> Result<(), Diagnostic> {
-    if path.exists() && !force && !config_overwrite {
+pub fn check_overwrite(path: &Path) -> Result<(), Diagnostic> {
+    if path.exists() {
         return Err(sec_diag(format!(
-            "output file already exists: {path:?} — use --force or set overwrite: true to overwrite"
+            "output file already exists: {path:?} — use --force or set if_exists: overwrite"
         )));
     }
     Ok(())
@@ -384,30 +391,12 @@ nodes:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("existing.csv");
         fs::write(&path, "data").unwrap();
-        let err = check_overwrite(&path, false, false).unwrap_err();
+        let err = check_overwrite(&path).unwrap_err();
         assert!(err.message.contains("already exists"));
     }
 
     #[test]
-    fn test_overwrite_force_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing.csv");
-        fs::write(&path, "data").unwrap();
-        assert!(check_overwrite(&path, true, false).is_ok());
-    }
-
-    #[test]
-    fn test_overwrite_config_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing.csv");
-        fs::write(&path, "data").unwrap();
-        assert!(check_overwrite(&path, false, true).is_ok());
-    }
-
-    #[test]
     fn test_overwrite_nonexistent_ok() {
-        assert!(
-            check_overwrite(Path::new("/tmp/nonexistent_clinker_test.csv"), false, false).is_ok()
-        );
+        assert!(check_overwrite(Path::new("/tmp/nonexistent_clinker_test.csv")).is_ok());
     }
 }

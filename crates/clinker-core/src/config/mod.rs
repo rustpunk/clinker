@@ -43,6 +43,14 @@ pub struct PipelineConfig {
     /// Kiln IDE metadata: pipeline-level notes. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+    /// BLAKE3 hash of the post-env-var-interpolated source YAML bytes.
+    /// Stamped by [`load_config_with_vars`]; zero array for in-memory
+    /// configs that did not flow through a file load (e.g. tests).
+    /// Threaded onto `CompiledPlan` at compile time so the executor can
+    /// expand `{pipeline_hash}` template tokens and stamp provenance
+    /// sidecars without needing to re-read the source.
+    #[serde(skip)]
+    pub source_hash: [u8; 32],
 }
 
 /// Pipeline-level metadata and global settings.
@@ -296,6 +304,18 @@ pub struct OutputConfig {
     /// today's behavior unchanged for every existing pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_fanout_policy: Option<CorrelationFanoutPolicy>,
+    /// Collision policy when the resolved output path already exists.
+    /// Defaults to `Overwrite` to preserve today's `File::create` behavior.
+    #[serde(default, skip_serializing_if = "IfExistsPolicy::is_default")]
+    pub if_exists: IfExistsPolicy,
+    /// Zero-pad width for the `{n}` collision counter when
+    /// `if_exists = unique_suffix`. `0` (default) emits the bare integer.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub unique_suffix_width: u8,
+    /// Write a `<resolved_path>.meta.json` provenance sidecar after the
+    /// output stream is flushed. Opt-in.
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub write_meta: bool,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// Kiln IDE metadata: stage notes + field annotations. Ignored by the engine.
@@ -320,6 +340,33 @@ impl IncludeMetadata {
     pub fn is_none(&self) -> bool {
         matches!(self, IncludeMetadata::None)
     }
+}
+
+/// Collision policy when an Output node's resolved path already exists.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExistsPolicy {
+    /// Truncate and overwrite. Today's `File::create` behavior.
+    #[default]
+    Overwrite,
+    /// Refuse to clobber; emit a diagnostic. `--force` downgrades to `Overwrite`.
+    Error,
+    /// Walk integer suffixes via `OpenOptions::create_new` until one succeeds.
+    UniqueSuffix,
+}
+
+impl IfExistsPolicy {
+    pub fn is_default(&self) -> bool {
+        matches!(self, IfExistsPolicy::Overwrite)
+    }
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
+}
+
+fn is_false_bool(b: &bool) -> bool {
+    !*b
 }
 
 /// Output file splitting configuration.
@@ -3335,13 +3382,18 @@ pub fn convert_pipeline_vars(
 
 /// Load and parse a pipeline config from a YAML file path with extra variables.
 /// `extra_vars` are checked before system env vars during interpolation.
+///
+/// Stamps `config.source_hash` with the BLAKE3 of the post-env-var
+/// interpolated YAML so the executor can resolve `{pipeline_hash}` tokens
+/// and write provenance sidecars without retaining the source bytes.
 pub fn load_config_with_vars(
     path: &std::path::Path,
     extra_vars: &[(&str, &str)],
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
-    let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
+    config.source_hash = *blake3::hash(interpolated.as_bytes()).as_bytes();
     validate_config(&config)?;
     Ok(config)
 }
