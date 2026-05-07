@@ -15,7 +15,7 @@ use crate::config::{NullOrder, SortField, SortOrder};
 /// Null handling applied per-field via `NullOrder`.
 pub fn sort_partition<S: RecordStorage>(
     storage: &S,
-    positions: &mut Vec<u32>,
+    positions: &mut Vec<u64>,
     sort_by: &[SortField],
 ) {
     // First pass: drop nulls for any field with NullOrder::Drop
@@ -35,7 +35,7 @@ pub fn sort_partition<S: RecordStorage>(
 /// Check if a partition is already sorted (linear scan).
 ///
 /// Returns true if all consecutive pairs are in the correct order.
-pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u32], sort_by: &[SortField]) -> bool {
+pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u64], sort_by: &[SortField]) -> bool {
     positions
         .windows(2)
         .all(|pair| compare_records(storage, pair[0], pair[1], sort_by) != Ordering::Greater)
@@ -44,8 +44,8 @@ pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u32], sort_by: &[So
 /// Compare two records by sort_by fields.
 fn compare_records<S: RecordStorage>(
     storage: &S,
-    a: u32,
-    b: u32,
+    a: u64,
+    b: u64,
     sort_by: &[SortField],
 ) -> Ordering {
     for sf in sort_by {
@@ -148,18 +148,18 @@ mod tests {
     }
 
     impl RecordStorage for TestStorage {
-        fn resolve_field(&self, index: u32, name: &str) -> Option<&Value> {
+        fn resolve_field(&self, index: u64, name: &str) -> Option<&Value> {
             let col = self.schema.index(name)?;
             self.records.get(index as usize)?.get(col)
         }
-        fn resolve_qualified(&self, _: u32, _: &str, _: &str) -> Option<&Value> {
+        fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
             None
         }
-        fn available_fields(&self, _: u32) -> Vec<&str> {
+        fn available_fields(&self, _: u64) -> Vec<&str> {
             self.schema.columns().iter().map(|s| &**s).collect()
         }
-        fn record_count(&self) -> u32 {
-            self.records.len() as u32
+        fn record_count(&self) -> u64 {
+            self.records.len() as u64
         }
     }
 
@@ -183,7 +183,7 @@ mod tests {
                 vec![Value::Integer(40)],
             ],
         );
-        let mut positions: Vec<u32> = vec![0, 1, 2, 3, 4];
+        let mut positions: Vec<u64> = vec![0, 1, 2, 3, 4];
         sort_partition(
             &storage,
             &mut positions,
@@ -204,7 +204,7 @@ mod tests {
                 vec![Value::Integer(40)],
             ],
         );
-        let mut positions: Vec<u32> = vec![0, 1, 2, 3, 4];
+        let mut positions: Vec<u64> = vec![0, 1, 2, 3, 4];
         sort_partition(
             &storage,
             &mut positions,
@@ -223,7 +223,7 @@ mod tests {
                 vec![Value::Integer(10)],
             ],
         );
-        let mut positions: Vec<u32> = vec![0, 1, 2];
+        let mut positions: Vec<u64> = vec![0, 1, 2];
         sort_partition(
             &storage,
             &mut positions,
@@ -244,7 +244,7 @@ mod tests {
                 vec![Value::Integer(10)],
             ],
         );
-        let mut positions: Vec<u32> = vec![0, 1, 2];
+        let mut positions: Vec<u64> = vec![0, 1, 2];
         sort_partition(
             &storage,
             &mut positions,
@@ -265,7 +265,7 @@ mod tests {
                 vec![Value::Integer(10)],
             ],
         );
-        let mut positions: Vec<u32> = vec![0, 1, 2];
+        let mut positions: Vec<u64> = vec![0, 1, 2];
         sort_partition(
             &storage,
             &mut positions,
@@ -285,7 +285,7 @@ mod tests {
                 vec![Value::Integer(30)],
             ],
         );
-        let positions: Vec<u32> = vec![0, 1, 2];
+        let positions: Vec<u64> = vec![0, 1, 2];
         assert!(is_sorted(
             &storage,
             &positions,
@@ -304,7 +304,7 @@ mod tests {
                 vec![Value::String("B".into()), Value::Integer(100)],
             ],
         );
-        let mut positions: Vec<u32> = vec![0, 1, 2, 3];
+        let mut positions: Vec<u64> = vec![0, 1, 2, 3];
         sort_partition(
             &storage,
             &mut positions,

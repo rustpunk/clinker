@@ -6,22 +6,22 @@ use crate::storage::RecordStorage;
 
 /// Zero-allocation view into an arena-backed record.
 ///
-/// 16 bytes: pointer + u32 index + padding. `Copy` and stack-allocated.
+/// 16 bytes: pointer + u64 index. `Copy` and stack-allocated.
 /// Implements `FieldResolver` by delegating to the underlying `RecordStorage`.
 #[derive(Clone, Copy)]
 pub struct RecordView<'a, S: RecordStorage + ?Sized> {
     storage: &'a S,
-    index: u32,
+    index: u64,
 }
 
 impl<'a, S: RecordStorage + ?Sized> RecordView<'a, S> {
     /// Create a new view into the storage at the given record index.
-    pub fn new(storage: &'a S, index: u32) -> Self {
+    pub fn new(storage: &'a S, index: u64) -> Self {
         Self { storage, index }
     }
 
     /// The record index this view points to.
-    pub fn index(&self) -> u32 {
+    pub fn index(&self) -> u64 {
         self.index
     }
 }

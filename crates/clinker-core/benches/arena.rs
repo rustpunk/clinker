@@ -54,7 +54,7 @@ fn bench_arena_field_access(c: &mut Criterion) {
             &record_count,
             |b, _| {
                 b.iter(|| {
-                    for pos in 0..record_count as u32 {
+                    for pos in 0..record_count as u64 {
                         black_box(arena.resolve_field(pos, "f4"));
                     }
                 });

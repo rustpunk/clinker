@@ -406,7 +406,7 @@ fn recurse_into_body(
         // re-runs the body detect against the updated
         // `correlation_buffers`.
         let body_scope = super::detect::detect_retract_scope(ctx, &body_dag);
-        let body_initial_rows: Vec<u32> = body_scope.seen_source_rows.iter().copied().collect();
+        let body_initial_rows: Vec<u64> = body_scope.seen_source_rows.iter().copied().collect();
         super::recompute_agg::recompute_aggregates(
             ctx,
             &body_dag,

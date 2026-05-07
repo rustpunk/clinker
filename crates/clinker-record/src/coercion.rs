@@ -177,7 +177,14 @@ pub fn coerce_to_datetime(value: &Value, formats: &[&str]) -> Result<Value, Coer
     match value {
         Value::Null => Ok(Value::Null),
         Value::DateTime(_) => Ok(value.clone()),
-        Value::Date(d) => Ok(Value::DateTime(d.and_hms_opt(0, 0, 0).unwrap())),
+        Value::Date(d) => {
+            d.and_hms_opt(0, 0, 0)
+                .map(Value::DateTime)
+                .ok_or_else(|| CoercionError::ParseFailure {
+                    input: d.to_string(),
+                    target: "DateTime",
+                })
+        }
         Value::String(s) => {
             let chain = if formats.is_empty() {
                 DEFAULT_DATETIME_FORMATS
@@ -274,6 +281,25 @@ mod tests {
         // US datetime format
         let v = Value::String("01/15/2024 10:30:00".into());
         assert_eq!(coerce_to_datetime(&v, &[]).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_coerce_date_to_datetime_promotes_at_midnight() {
+        let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let expected = Value::DateTime(d.and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!(coerce_to_datetime(&Value::Date(d), &[]).unwrap(), expected);
+
+        // Boundary dates: midnight must be representable across chrono's
+        // entire NaiveDate range, so the (now Result-returning) error
+        // path is unreachable for valid Dates.
+        for d in [
+            NaiveDate::MIN,
+            NaiveDate::MAX,
+            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2000, 2, 29).unwrap(),
+        ] {
+            assert!(coerce_to_datetime(&Value::Date(d), &[]).is_ok());
+        }
     }
 
     #[test]

@@ -573,51 +573,101 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         readers.insert(source.name.clone(), reader);
     }
 
+    // Outputs are written atomically: each output writes to a sibling
+    // tempfile, then renames into place after the pipeline completes
+    // successfully. On crash or pipeline error, the tempfile is left in
+    // place (and its path logged) so an operator can inspect partial
+    // output without the final path showing a truncated file.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
+        std::collections::HashMap::new();
+    let mut output_temps: Vec<(String, std::path::PathBuf, tempfile::NamedTempFile)> = Vec::new();
+    // output_name → final resolved path, kept after output_temps is
+    // consumed by the persist loop so the provenance sidecar can
+    // record the actual file written (not the bare template-rendered
+    // path on OutputConfig).
+    let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
     for output in pipeline_config.output_configs() {
         // Split outputs route file creation through SplittingWriter's
         // per-`{seq}` factory inside build_format_writer, which applies
-        // `if_exists` itself. The non-split sink below would otherwise
-        // pre-create an empty bare file that then gets dropped — bypass
-        // it with a sink writer for split outputs.
+        // `if_exists` itself. The atomic tempfile pattern below is for
+        // single-file outputs only; for splits, install a sink writer
+        // here so the executor's drop of `raw_writer` is harmless.
         if output.split.is_some() {
             writers.insert(output.name.clone(), Box::new(std::io::sink()));
+            resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
             continue;
         }
         let bare = std::path::PathBuf::from(&output.path);
-        let unique_suffix_width = output.unique_suffix_width;
-        let path_for_n =
-            |n: Option<u64>| -> Result<std::path::PathBuf, clinker_core::config::ConfigError> {
-                Ok(match n {
-                    None => bare.clone(),
-                    Some(k) => {
-                        let suffix = if unique_suffix_width == 0 {
-                            format!("-{k}")
-                        } else {
-                            format!("-{:0>width$}", k, width = unique_suffix_width as usize)
-                        };
-                        clinker_core::output::open::append_suffix_before_ext(&bare, &suffix)
-                    }
-                })
-            };
-        let (_resolved_path, file) =
-            clinker_core::output::open::open_output(output.if_exists, args.force, path_for_n)?;
-        writers.insert(output.name.clone(), Box::new(file));
+        let final_path = clinker_core::output::open::resolve_output_path(
+            &bare,
+            output.if_exists,
+            args.force,
+            output.unique_suffix_width,
+        )
+        .map_err(PipelineError::Config)?;
+        let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
+        let temp = match parent {
+            Some(dir) => {
+                if !dir.exists() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                tempfile::NamedTempFile::new_in(dir)?
+            }
+            None => tempfile::NamedTempFile::new_in(".")?,
+        };
+        let handle = temp.reopen()?;
+        let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
+        writers.insert(output.name.clone(), writer);
+        resolved_output_paths.insert(output.name.clone(), final_path.clone());
+        output_temps.push((output.name.clone(), final_path, temp));
     }
 
     let compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
-    let report = PipelineExecutor::run_plan_with_readers_writers(
+    let report = match PipelineExecutor::run_plan_with_readers_writers(
         &compiled_plan,
         readers,
         writers,
         &run_params,
-    )?;
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            for (name, final_path, temp) in output_temps {
+                let kept = temp.into_temp_path().keep().ok();
+                tracing::warn!(
+                    output = %name,
+                    final_path = %final_path.display(),
+                    partial_path = ?kept,
+                    "pipeline failed; partial output preserved at temp path",
+                );
+            }
+            return Err(e);
+        }
+    };
+
+    // Pipeline succeeded — atomically promote each tempfile to its
+    // final path. Failure here aborts the run with the temp file still
+    // on disk under its tempfile name.
+    for (_name, final_path, temp) in output_temps {
+        temp.persist(&final_path).map_err(|e| {
+            tracing::error!(
+                final_path = %final_path.display(),
+                "failed to atomically rename output into place; temp file preserved",
+            );
+            std::io::Error::other(format!(
+                "atomic output rename failed for {}: {}",
+                final_path.display(),
+                e.error
+            ))
+        })?;
+    }
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
 
-    // Write DLQ if there are entries and DLQ path is configured
+    // Write DLQ if there are entries and DLQ path is configured.
+    // Same atomic temp+rename discipline as primary outputs above —
+    // operators inspecting DLQ output should never see a truncated file.
     if !dlq_entries.is_empty()
         && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
         && let Some(ref dlq_path) = dlq_config.path
@@ -630,11 +680,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             );
             r.schema().map_err(PipelineError::Format)?
         };
-        let dlq_writer = std::fs::File::create(dlq_path)?;
+        let dlq_path_buf: std::path::PathBuf = dlq_path.clone().into();
+        let dlq_dir = dlq_path_buf
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if !dlq_dir.exists() {
+            std::fs::create_dir_all(&dlq_dir)?;
+        }
+        let dlq_temp = tempfile::NamedTempFile::new_in(&dlq_dir)?;
+        let dlq_temp_handle = dlq_temp.reopen()?;
         let include_reason = dlq_config.include_reason.unwrap_or(true);
         let include_source_row = dlq_config.include_source_row.unwrap_or(true);
         clinker_core::dlq::write_dlq(
-            dlq_writer,
+            dlq_temp_handle,
             dlq_entries,
             &input_schema,
             &input_path,
@@ -642,6 +702,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             include_source_row,
         )
         .map_err(PipelineError::Format)?;
+        dlq_temp.persist(&dlq_path_buf).map_err(|e| {
+            tracing::error!(
+                final_path = %dlq_path_buf.display(),
+                "failed to atomically rename DLQ output into place; temp file preserved",
+            );
+            PipelineError::Io(std::io::Error::other(format!(
+                "atomic DLQ rename failed for {}: {}",
+                dlq_path_buf.display(),
+                e.error
+            )))
+        })?;
     }
 
     // Provenance sidecars for outputs that opted in via `write_meta`.
@@ -663,6 +734,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             .max(0) as u64;
         let hash_full = clinker_core::output::sidecar::hash_to_hex(&pipeline_hash);
         let hash_short = hash_full[..8.min(hash_full.len())].to_string();
+        let target = resolved_output_paths
+            .get(&output.name)
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from(&output.path));
         let sidecar = clinker_core::output::sidecar::OutputSidecar {
             pipeline_path: args.config.to_string_lossy().into_owned(),
             pipeline_hash: hash_full,
@@ -675,14 +750,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             execution_id: Some(execution_id.clone()),
             batch_id: Some(batch_id.clone()),
             output_name: output.name.clone(),
-            resolved_path: output.path.clone(),
+            resolved_path: target.to_string_lossy().into_owned(),
             record_count: 0,
             bytes_written: 0,
             dlq_counts,
             route_counts: std::collections::BTreeMap::new(),
             node_timings_ms: std::collections::BTreeMap::new(),
         };
-        let target = std::path::PathBuf::from(&output.path);
         if let Err(e) = clinker_core::output::sidecar::write_sidecar(&target, &sidecar) {
             tracing::warn!(
                 "failed to write provenance sidecar for output {:?}: {e:?}",

@@ -21,7 +21,7 @@ pub(crate) struct RetractScope {
     /// Affected aggregate node + group keys that need rerun. Each
     /// entry's `Vec<u32>` carries the runtime-DLQ-triggered input row
     /// IDs to retract from that aggregate's per-group state.
-    pub(crate) aggregates: Vec<(NodeIndex, Vec<u32>)>,
+    pub(crate) aggregates: Vec<(NodeIndex, Vec<u64>)>,
     /// Trigger group keys (correlation-buffer keys) that drove the
     /// scope expansion. Used by `flush` to format DLQ trigger messages
     /// against the same group identifier the strict path emits. `Vec`
@@ -37,7 +37,7 @@ pub(crate) struct RetractScope {
     /// directly: source rows are bounded, so a strictly-monotone set
     /// caps the loop at `|source_rows|` iterations regardless of how
     /// many DLQ events each iteration produces.
-    pub(crate) seen_source_rows: BTreeSet<u32>,
+    pub(crate) seen_source_rows: BTreeSet<u64>,
 }
 
 /// Compute the retract scope from `ctx.correlation_buffers` plus the
@@ -108,7 +108,7 @@ pub(crate) fn detect_retract_scope(
     // instantiated), the synthetic-CK lookup misses and the existing
     // degrade-fallback in `recompute_agg.rs` routes the affected group
     // through strict-collateral DLQ.
-    let mut affected_row_ids: BTreeSet<u32> = BTreeSet::new();
+    let mut affected_row_ids: BTreeSet<u64> = BTreeSet::new();
     // Accumulate counter deltas locally so the immutable borrow of
     // `ctx.correlation_buffers` (and the immutable hand to
     // `ctx.relaxed_aggregator_states`) does not collide with the
@@ -219,7 +219,7 @@ pub(crate) fn detect_retract_scope(
         // silently no-opping. Skip the raw union in that case.
         if has_source_ck || !had_synthetic_lookup {
             for &row in &group.error_rows {
-                affected_row_ids.insert(row as u32);
+                affected_row_ids.insert(row);
             }
         }
     }
@@ -286,17 +286,14 @@ impl RetractScope {
     /// tolerance for aggregates whose lineage doesn't include it, so
     /// the wide-fanout shape (every relaxed-CK aggregate sees every
     /// new row id) stays correct without per-aggregate filtering.
-    pub(crate) fn expand_with_dlq_events(&mut self, events: &[DlqEvent]) -> Vec<u32> {
-        let mut new_rows: Vec<u32> = Vec::new();
+    pub(crate) fn expand_with_dlq_events(&mut self, events: &[DlqEvent]) -> Vec<u64> {
+        let mut new_rows: Vec<u64> = Vec::new();
         for event in events {
-            let row_u32 = match u32::try_from(event.source_row) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if !self.seen_source_rows.insert(row_u32) {
+            let row = event.source_row;
+            if !self.seen_source_rows.insert(row) {
                 continue;
             }
-            new_rows.push(row_u32);
+            new_rows.push(row);
         }
         if !new_rows.is_empty() {
             for (_, retract_ids) in &mut self.aggregates {

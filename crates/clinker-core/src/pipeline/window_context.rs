@@ -12,12 +12,12 @@ use crate::pipeline::arena::Arena;
 /// `current_pos` is the index *within the partition* of the record being evaluated.
 pub struct PartitionWindowContext<'a> {
     arena: &'a Arena,
-    partition: &'a [u32],
+    partition: &'a [u64],
     current_pos: usize,
 }
 
 impl<'a> PartitionWindowContext<'a> {
-    pub fn new(arena: &'a Arena, partition: &'a [u32], current_pos: usize) -> Self {
+    pub fn new(arena: &'a Arena, partition: &'a [u64], current_pos: usize) -> Self {
         Self {
             arena,
             partition,
@@ -33,7 +33,7 @@ impl<'a> PartitionWindowContext<'a> {
     /// Float values participate, every other resolved Value (including
     /// String, Date, Null) is silently skipped, and a slice with no
     /// numeric values returns Null rather than 0.
-    fn sum_slice(&self, field: &str, positions: &[u32]) -> Value {
+    fn sum_slice(&self, field: &str, positions: &[u64]) -> Value {
         let mut total = 0.0f64;
         let mut has_numeric = false;
         for &pos in positions {
@@ -271,7 +271,7 @@ mod tests {
             "name,amount\nAlice,100\nBob,200\nCarol,300\n",
             &["name", "amount"],
         );
-        let partition: Vec<u32> = vec![0, 1, 2];
+        let partition: Vec<u64> = vec![0, 1, 2];
         let ctx = PartitionWindowContext::new(&arena, &partition, 1);
 
         let first = ctx.first().unwrap();
@@ -286,7 +286,7 @@ mod tests {
             "name,amount\nA,10\nB,20\nC,30\nD,40\nE,50\n",
             &["name", "amount"],
         );
-        let partition: Vec<u32> = vec![0, 1, 2, 3, 4];
+        let partition: Vec<u64> = vec![0, 1, 2, 3, 4];
         let ctx = PartitionWindowContext::new(&arena, &partition, 3);
 
         let lag = ctx.lag(1).unwrap();
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_window_lag_out_of_bounds() {
         let arena = make_arena("name\nA\nB\n", &["name"]);
-        let partition: Vec<u32> = vec![0, 1];
+        let partition: Vec<u64> = vec![0, 1];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         assert!(ctx.lag(1).is_none());
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn test_window_count() {
         let arena = make_arena("x\na\nb\nc\nd\ne\n", &["x"]);
-        let partition: Vec<u32> = vec![0, 1, 2, 3, 4];
+        let partition: Vec<u64> = vec![0, 1, 2, 3, 4];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
         assert_eq!(ctx.count(), 5);
     }
@@ -321,7 +321,7 @@ mod tests {
         // For a proper numeric test, we'd need non-CSV input or post-coercion.
         // Let's test the "non-numeric returns null" case and a String-numeric coercion case.
         let arena = make_arena("amount\n10\n20\n30\n", &["amount"]);
-        let partition: Vec<u32> = vec![0, 1, 2];
+        let partition: Vec<u64> = vec![0, 1, 2];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         // CSV reads as strings, so sum/avg return Null for string fields
@@ -337,7 +337,7 @@ mod tests {
     fn test_window_min_max() {
         // String comparison for CSV-sourced data
         let arena = make_arena("name\nBob\nAlice\nCarol\n", &["name"]);
-        let partition: Vec<u32> = vec![0, 1, 2];
+        let partition: Vec<u64> = vec![0, 1, 2];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         assert_eq!(ctx.min("name"), Value::String("Alice".into()));
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn test_window_sum_non_numeric() {
         let arena = make_arena("name\nAlice\nBob\n", &["name"]);
-        let partition: Vec<u32> = vec![0, 1];
+        let partition: Vec<u64> = vec![0, 1];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
         assert_eq!(ctx.sum("name"), Value::Null);
     }
@@ -356,7 +356,7 @@ mod tests {
     fn test_window_any_all() {
         // any/all are evaluator-driven (not on this trait), but we test partition_len/partition_record
         let arena = make_arena("amount\n50\n150\n200\n", &["amount"]);
-        let partition: Vec<u32> = vec![0, 1, 2];
+        let partition: Vec<u64> = vec![0, 1, 2];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         assert_eq!(ctx.partition_len(), 3);
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn test_window_collect() {
         let arena = make_arena("name\nAlice\nBob\nCarol\n", &["name"]);
-        let partition: Vec<u32> = vec![0, 1, 2];
+        let partition: Vec<u64> = vec![0, 1, 2];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         match ctx.collect("name") {
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn test_window_distinct() {
         let arena = make_arena("dept\nA\nB\nA\nC\n", &["dept"]);
-        let partition: Vec<u32> = vec![0, 1, 2, 3];
+        let partition: Vec<u64> = vec![0, 1, 2, 3];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         match ctx.distinct("dept") {
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn test_window_single_record_partition() {
         let arena = make_arena("name\nAlice\n", &["name"]);
-        let partition: Vec<u32> = vec![0];
+        let partition: Vec<u64> = vec![0];
         let ctx = PartitionWindowContext::new(&arena, &partition, 0);
 
         // first == last for single record

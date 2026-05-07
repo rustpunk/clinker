@@ -156,16 +156,16 @@ mod tests {
     struct DummyStorage;
 
     impl RecordStorage for DummyStorage {
-        fn resolve_field(&self, _index: u32, _name: &str) -> Option<&Value> {
+        fn resolve_field(&self, _index: u64, _name: &str) -> Option<&Value> {
             None
         }
-        fn resolve_qualified(&self, _index: u32, _source: &str, _field: &str) -> Option<&Value> {
+        fn resolve_qualified(&self, _index: u64, _source: &str, _field: &str) -> Option<&Value> {
             None
         }
-        fn available_fields(&self, _index: u32) -> Vec<&str> {
+        fn available_fields(&self, _index: u64) -> Vec<&str> {
             vec![]
         }
-        fn record_count(&self) -> u32 {
+        fn record_count(&self) -> u64 {
             0
         }
     }
